@@ -29,9 +29,21 @@ from app.langgraph.integration import (
     workspace_role_integration,
     WorkspaceRoleIntegration
 )
+from app.langgraph.strategy_agent import (
+    StrategyAgent,
+    strategy_agent
+)
+from app.langgraph.strategy_models import (
+    StrategyOption,
+    StrategyType,
+    StrategyStatus,
+    StrategyState,
+    UserObjective,
+    StrategyValidationResult
+)
 
 __all__ = [
-    # Main agent
+    # Role-Based Main Agent
     "RoleBasedAgent",
     "role_agent",
     "enforce_role_gate",
@@ -58,6 +70,16 @@ __all__ = [
     
     # Integration
     "workspace_role_integration",
-    "WorkspaceRoleIntegration"
+    "WorkspaceRoleIntegration",
+    
+    # Strategy & Objective Agent
+    "StrategyAgent",
+    "strategy_agent",
+    "StrategyOption",
+    "StrategyType",
+    "StrategyStatus",
+    "StrategyState",
+    "UserObjective",
+    "StrategyValidationResult"
 ]
 

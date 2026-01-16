@@ -1,0 +1,91 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Data
+data/
+*.db
+*.sqlite
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Distribution / packaging
+*.whl
+
+# Temporary files
+*.tmp
+tmp/
+temp/
+
+# GCP Credentials (SENSITIVE - DO NOT COMMIT)
+*.json
+*-service-account*.json
+bns-ai-*.json
+
+# Auto-generated Documentation
+ARCHITECTURE.md
+PROJECT_SUMMARY.md
+STRUCTURE.txt
+QUICKSTART.md
+ROLE_AGENT_DOCUMENTATION.md
+ROLE_AGENT_QUICKSTART.md
+LANGGRAPH_SUMMARY.md
+DOCUMENT_PROCESSING.md
+COMPLETE_INTEGRATION_SUMMARY.md
+GOOGLE_GEMINI_INTEGRATION.md
+FINAL_SYSTEM_SUMMARY.md
+DEPENDENCY_FIX.md
+SETUP_FIXES.md
+GCP_OCR_MIGRATION.md
+TEST_INSTRUCTIONS.md
+
+# Keep only README.md for repo documentation
+

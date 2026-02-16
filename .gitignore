@@ -71,23 +71,16 @@ temp/
 bns-ai-*.json
 
 # Auto-generated Documentation
-ARCHITECTURE.md
-PROJECT_SUMMARY.md
+*.md
+!README.md
+
+diagnose_socket.py
+example_ai_socket_usage.py
+example_socket_usage.py
 STRUCTURE.txt
-QUICKSTART.md
-ROLE_AGENT_DOCUMENTATION.md
-ROLE_AGENT_QUICKSTART.md
-LANGGRAPH_SUMMARY.md
-DOCUMENT_PROCESSING.md
-COMPLETE_INTEGRATION_SUMMARY.md
-GOOGLE_GEMINI_INTEGRATION.md
-FINAL_SYSTEM_SUMMARY.md
-DEPENDENCY_FIX.md
-SETUP_FIXES.md
-GCP_OCR_MIGRATION.md
-TEST_INSTRUCTIONS.md
-STRATEGY_AGENT_DOCS.md
-STRATEGY_AGENT_SUMMARY.md
-KNOWN_ISSUES.md
+test_backend_payload.py
+test_socket_ai_service.py
+test_socket_signature.py
+test_strategy_generation.py
 # Keep only README.md for repo documentation
 

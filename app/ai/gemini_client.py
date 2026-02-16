@@ -23,7 +23,7 @@ class GeminiClient:
     
     def __init__(self):
         self.model_name = settings.gemini_model  # gemini-2.5-flash
-        self.embedding_model_name = "models/text-embedding-004"
+        self.embedding_model_name = "models/gemini-embedding-001"
         self.model = None
         self.embedding_model = None
         self._initialized = False

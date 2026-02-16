@@ -67,6 +67,14 @@ class FileProcessor:
             return "[Image content - GCP Vision API not available]"
         
         try:
+            # Set up authentication if credentials path is provided
+            from app.core.config import settings
+            import os
+            
+            if settings.google_application_credentials and os.path.exists(settings.google_application_credentials):
+                os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = settings.google_application_credentials
+                logger.debug(f"Set GOOGLE_APPLICATION_CREDENTIALS: {settings.google_application_credentials}")
+            
             # Initialize the GCP Vision client
             client = vision.ImageAnnotatorClient()
             

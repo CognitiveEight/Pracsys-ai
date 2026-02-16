@@ -41,6 +41,22 @@ from app.langgraph.strategy_models import (
     UserObjective,
     StrategyValidationResult
 )
+from app.langgraph.intelligence_chat_agent import (
+    IntelligenceChatAgent,
+    intelligence_chat_agent
+)
+from app.langgraph.chat_models import (
+    ChatIntent,
+    ChatMessage,
+    ChatResponse,
+    ChatContext,
+    ConfidenceLevel,
+    SourceReference
+)
+from app.langgraph.chat_integration import (
+    process_workspace_chat,
+    create_chat_context_from_state
+)
 
 __all__ = [
     # Role-Based Main Agent
@@ -80,6 +96,18 @@ __all__ = [
     "StrategyStatus",
     "StrategyState",
     "UserObjective",
-    "StrategyValidationResult"
+    "StrategyValidationResult",
+    
+    # Intelligence Chat Module
+    "IntelligenceChatAgent",
+    "intelligence_chat_agent",
+    "ChatIntent",
+    "ChatMessage",
+    "ChatResponse",
+    "ChatContext",
+    "ConfidenceLevel",
+    "SourceReference",
+    "process_workspace_chat",
+    "create_chat_context_from_state"
 ]
 

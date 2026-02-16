@@ -29,11 +29,20 @@ class DocumentProcessor:
         self.max_file_size = 500 * 1024 * 1024  # 500MB
     
     async def initialize(self):
-        """Initialize HTTP client."""
+        """Initialize HTTP client and vector store."""
         self.http_client = httpx.AsyncClient(
             timeout=300.0,  # 5 minutes for large files
             follow_redirects=True
         )
+        
+        # Initialize vector store
+        try:
+            await vector_store.initialize()
+            logger.success("✅ Vector store initialized")
+        except Exception as e:
+            logger.warning(f"⚠️ Vector store initialization failed: {e}")
+            logger.warning("Documents will be processed but not stored in vector DB")
+        
         logger.info("Document processor initialized")
     
     async def cleanup(self):
@@ -95,20 +104,27 @@ class DocumentProcessor:
             )
             
             # Store in vector database (user-scoped)
+            stored_in_vector_db = False
             if extracted_text and readability_result["readable"]:
-                await self._store_in_vector_db(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    document_id=document_id,
-                    text=extracted_text,
-                    filename=filename,
-                    metadata={
-                        **(metadata or {}),
-                        **extraction_metadata,
-                        "readability": readability_result,
-                        "file_size": file_size
-                    }
-                )
+                try:
+                    await self._store_in_vector_db(
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        document_id=document_id,
+                        text=extracted_text,
+                        filename=filename,
+                        metadata={
+                            **(metadata or {}),
+                            **extraction_metadata,
+                            "readability": readability_result,
+                            "file_size": file_size
+                        }
+                    )
+                    stored_in_vector_db = True
+                except Exception as vector_error:
+                    logger.warning(f"Could not store in vector DB: {vector_error}")
+                    # Continue processing even if vector storage fails
+                    stored_in_vector_db = False
             
             # Prepare result
             result = {
@@ -122,7 +138,7 @@ class DocumentProcessor:
                 "readable": readability_result["readable"],
                 "metadata": extraction_metadata,
                 "readability_breakdown": readability_result,
-                "stored_in_vector_db": extracted_text and readability_result["readable"]
+                "stored_in_vector_db": stored_in_vector_db
             }
             
             # Log audit event

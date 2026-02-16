@@ -7,7 +7,7 @@ from typing import Literal, List, Dict, Any, Optional
 from datetime import datetime
 from enum import Enum
 
-from app.agents.role_models import Role
+from app.agents.role_models import Role, RoleEnum
 
 
 # Strategy Types (aligned with legal reasoning)
@@ -49,7 +49,7 @@ class StrategyOption:
     
     # Metadata
     relevance_score: float = 0.0  # 0.0-1.0
-    compatible_roles: List[Role] = field(default_factory=list)
+    compatible_roles: List[RoleEnum] = field(default_factory=list)
     requires_evidence_types: List[str] = field(default_factory=list)
     estimated_complexity: str = "MEDIUM"  # LOW, MEDIUM, HIGH
     
@@ -213,33 +213,33 @@ class StrategyState:
 
 
 # Role-Strategy Compatibility Matrix
-ROLE_STRATEGY_COMPATIBILITY: Dict[Role, List[StrategyType]] = {
-    Role.PETITIONER: [
+ROLE_STRATEGY_COMPATIBILITY: Dict[RoleEnum, List[StrategyType]] = {
+    RoleEnum.PETITIONER: [
         "PROSECUTION_OR_RELIEF",
         "EVIDENCE_STRENGTHENING",
         "NEGOTIATED_SETTLEMENT",
         "PROCEDURAL_COMPLIANCE"
     ],
-    Role.RESPONDENT: [
+    RoleEnum.RESPONDENT: [
         "DEFENSIVE_DISMISSAL",
         "NEGOTIATED_SETTLEMENT",
         "EVIDENCE_STRENGTHENING",
         "FACTUAL_CLARIFICATION",
         "PROCEDURAL_COMPLIANCE"
     ],
-    Role.MEDIATOR: [
+    RoleEnum.MEDIATOR: [
         "NEGOTIATED_SETTLEMENT",
         "FACTUAL_CLARIFICATION",
         "PROCEDURAL_COMPLIANCE"
     ],
-    Role.ADJUDICATOR: [
+    RoleEnum.ADJUDICATOR: [
         "FACTUAL_CLARIFICATION",
         "PROCEDURAL_COMPLIANCE"
     ]
 }
 
 
-def is_strategy_compatible_with_role(strategy_type: StrategyType, role: Role) -> bool:
+def is_strategy_compatible_with_role(strategy_type: StrategyType, role: RoleEnum) -> bool:
     """
     Check if a strategy type is compatible with a role.
     
@@ -253,7 +253,7 @@ def is_strategy_compatible_with_role(strategy_type: StrategyType, role: Role) ->
     return strategy_type in ROLE_STRATEGY_COMPATIBILITY.get(role, [])
 
 
-def get_incompatibility_reason(strategy_type: StrategyType, role: Role) -> str:
+def get_incompatibility_reason(strategy_type: StrategyType, role: RoleEnum) -> str:
     """
     Get explanation for why a strategy is incompatible with a role.
     
@@ -265,17 +265,17 @@ def get_incompatibility_reason(strategy_type: StrategyType, role: Role) -> str:
         Explanation string
     """
     explanations = {
-        (Role.MEDIATOR, "PROSECUTION_OR_RELIEF"): 
+        (RoleEnum.MEDIATOR, "PROSECUTION_OR_RELIEF"): 
             "Mediators must remain neutral and cannot pursue adversarial relief",
-        (Role.MEDIATOR, "DEFENSIVE_DISMISSAL"):
+        (RoleEnum.MEDIATOR, "DEFENSIVE_DISMISSAL"):
             "Mediators cannot take defensive positions",
-        (Role.ADJUDICATOR, "PROSECUTION_OR_RELIEF"):
+        (RoleEnum.ADJUDICATOR, "PROSECUTION_OR_RELIEF"):
             "Adjudicators must remain neutral and cannot advocate for relief",
-        (Role.ADJUDICATOR, "DEFENSIVE_DISMISSAL"):
+        (RoleEnum.ADJUDICATOR, "DEFENSIVE_DISMISSAL"):
             "Adjudicators cannot take defensive positions",
-        (Role.ADJUDICATOR, "NEGOTIATED_SETTLEMENT"):
+        (RoleEnum.ADJUDICATOR, "NEGOTIATED_SETTLEMENT"):
             "Adjudicators decide matters, they don't negotiate settlements",
-        (Role.ADJUDICATOR, "EVIDENCE_STRENGTHENING"):
+        (RoleEnum.ADJUDICATOR, "EVIDENCE_STRENGTHENING"):
             "Adjudicators evaluate evidence, they don't strengthen it"
     }
     

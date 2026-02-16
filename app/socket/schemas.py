@@ -1,28 +1,229 @@
 """
 Pydantic schemas for socket event data validation.
+Updated to match backend Socket.IO specification.
 """
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict, Literal
 from datetime import datetime
 from pydantic import BaseModel, Field, HttpUrl
 
 
+# ============================================================================
+# Backend Event Payload Schemas (Server → AI)
+# ============================================================================
+
+class EvidenceFilePayload(BaseModel):
+    """
+    Schema for evidence file in workspace payloads.
+    Matches backend workspace_created and workspace_sync event structure.
+    """
+    
+    originalName: str  # Original filename
+    storeFileName: str  # GCS stored filename with UUID
+    filename: str  # Display filename with annexure prefix
+    extension: str  # File extension
+    fileHash: str  # SHA-256 hash
+    url: str  # GCS pre-signed URL
+    path: str  # GCS storage path
+    uploadedAt: str  # ISO date string
+    id: Optional[str] = Field(None, alias="_id")  # MongoDB ObjectId (maps to backend's _id)
+    
+    class Config:
+        populate_by_name = True
+
+
+class WorkspaceCreatedPayload(BaseModel):
+    """
+    Schema for workspace_created event (Server → AI_Maverick).
+    Emitted to ai_service room when new workspace is created.
+    """
+    
+    workspaceId: str
+    userId: str
+    title: str
+    workspaceRole: str
+    evidenceFiles: List[EvidenceFilePayload] = []
+    createdAt: str  # ISO timestamp
+    
+    class Config:
+        populate_by_name = True
+
+
+class WorkspaceSyncPayload(BaseModel):
+    """
+    Schema for workspace_sync event (Server → AI_Maverick).
+    Emitted to ai_service room when workspace is updated.
+    When user deletes documents from Supporting Material, backend may send
+    deletedDocumentIds so AI can remove them from vector store and regenerate strategy.
+    """
+    
+    workspaceId: str
+    userId: str
+    title: Optional[str] = None
+    status: Optional[str] = None
+    evidenceFiles: Optional[List[EvidenceFilePayload]] = None
+    deletedDocumentIds: Optional[List[str]] = None  # Document IDs removed from Supporting Material
+    updatedAt: str  # ISO timestamp
+    
+    class Config:
+        populate_by_name = True
+
+
+class ConversationHistoryItem(BaseModel):
+    """Schema for conversation history item."""
+    
+    role: Literal["USER", "AI"]
+    content: str
+
+
+class UserMessageRequestPayload(BaseModel):
+    """
+    Schema for user_message_request event (Server → AI_Maverick).
+    User message forwarded to AI service in ai_service room.
+    
+    Note: Backend sends 'content' field, not 'message'.
+    """
+    
+    content: str  # User message content (backend sends 'content', not 'message')
+    chat_type: str  # ChatType from backend
+    conversation_history: List[ConversationHistoryItem] = []
+    workspaceId: Optional[str] = None
+    userId: Optional[str] = None
+    chatId: Optional[str] = None
+    timestamp: str  # ISO timestamp
+    
+    class Config:
+        populate_by_name = True
+
+
+# ============================================================================
+# AI Response Schemas (AI → Server)
+# ============================================================================
+
+class AIResponseMetadata(BaseModel):
+    """
+    Metadata for AI response.
+    Per backend documentation for ai_response event.
+    """
+    
+    messageId: Optional[str] = None  # Optional message identifier
+    aiModel: Optional[str] = None  # AI model name (e.g., "gemini-pro")
+    tokensUsed: Optional[int] = None  # Number of tokens used
+    responseTime: Optional[float] = None  # Response time in milliseconds
+    error: Optional[str] = None  # Error message if any
+    
+    # Additional fields for internal use (not in backend spec)
+    confidence: Optional[str] = None
+    detectedIntent: Optional[str] = None
+    
+    class Config:
+        populate_by_name = True
+
+
+class AIResponsePayload(BaseModel):
+    """
+    Schema for ai_response event (AI_Maverick → Server).
+    AI service sends response back to server.
+    """
+    
+    chatId: str
+    workspaceId: str
+    userId: str
+    content: str
+    metadata: Optional[AIResponseMetadata] = None
+    
+    class Config:
+        populate_by_name = True
+
+
+# ============================================================================
+# Strategy & Objective Schemas (AI → Server)
+# ============================================================================
+
+class StrategyPayload(BaseModel):
+    """
+    Schema for a single strategy option.
+    """
+    
+    strategyId: str
+    strategyType: str
+    title: str
+    description: str
+    rationale: str
+    preconditions: List[str] = []
+    risks: List[str] = []
+    downstreamImpact: Dict[str, str] = {}
+    relevanceScore: float = 0.0
+    compatibleRoles: List[str] = []
+    requiresEvidenceTypes: List[str] = []
+    estimatedComplexity: str = "MEDIUM"
+    status: str = "SUGGESTED"
+    createdAt: str  # ISO timestamp
+    
+    class Config:
+        populate_by_name = True
+
+
+class StrategiesGeneratedPayload(BaseModel):
+    """
+    Schema for strategies_generated event (AI_Maverick → Server).
+    Emitted after documents are processed and strategies are generated.
+    """
+    
+    workspaceId: str
+    userId: str
+    role: str
+    isUpdate: bool = False
+    strategies: List[StrategyPayload] = []
+    strategyCount: int = 0
+    basedOnDocuments: int = 0
+    averageReadability: float = 0.0
+    timestamp: str  # ISO timestamp
+    
+    class Config:
+        populate_by_name = True
+
+
+class StrategiesUpdatedPayload(BaseModel):
+    """
+    Schema for strategies_updated event (AI_Maverick → Server).
+    Emitted when new documents are added and strategies are regenerated.
+    """
+    
+    workspaceId: str
+    userId: str
+    role: str
+    isUpdate: bool = True
+    strategies: List[StrategyPayload] = []
+    strategyCount: int = 0
+    basedOnDocuments: int = 0
+    averageReadability: float = 0.0
+    timestamp: str  # ISO timestamp
+    
+    class Config:
+        populate_by_name = True
+
+
+# ============================================================================
+# Legacy Schemas (for backward compatibility)
+# ============================================================================
+
 class EvidenceFile(BaseModel):
-    """Schema for evidence file data."""
+    """Legacy schema for evidence file data."""
     
     filename: str
     url: str
     path: str
     uploadedAt: datetime
-    id: str = Field(alias="_id")  # Changed from _id to id
+    id: str = Field(alias="_id")
     
     class Config:
         populate_by_name = True
 
 
 class WorkspaceData(BaseModel):
-    """Schema for workspace data payload."""
+    """Legacy schema for workspace data payload."""
     
-    id: str = Field(alias="_id")  # Changed from _id to id
+    id: str = Field(alias="_id")
     userId: str
     title: str
     workspaceRole: str
@@ -32,14 +233,14 @@ class WorkspaceData(BaseModel):
     evidenceFiles: List[EvidenceFile] = []
     createdAt: datetime
     updatedAt: datetime
-    v: int = Field(default=0, alias="__v")  # Changed from __v to v
+    v: int = Field(default=0, alias="__v")
     
     class Config:
         populate_by_name = True
 
 
 class SocketResponse(BaseModel):
-    """Schema for socket response data."""
+    """Legacy schema for socket response data."""
     
     status: bool
     statusCode: int

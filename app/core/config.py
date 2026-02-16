@@ -26,8 +26,20 @@ class Settings(BaseSettings):
     socket_path: str = "/socket.io"
     socket_namespace: str = "/"
     socket_reconnection: bool = True
-    socket_reconnection_attempts: int = 5
-    socket_reconnection_delay: int = 1000
+    socket_reconnection_attempts: int = 0  # 0 means infinite attempts
+    socket_reconnection_delay: int = 0  # 0 means immediate reconnection
+    socket_secret_key: Optional[str] = None  # Secret key for HMAC signature (SOCKET_SECRET_KEY env var)
+    
+    # AI Service Authentication
+    # Payload for HMAC signature - JSON string of AI user object
+    socket_ai_payload: Optional[str] = None  # AI user payload for signature (from backend)
+    
+    # Socket.IO Event Names (per backend specification)
+    # Events AI listens to: workspace_created, workspace_sync, user_message_request
+    # Events AI emits: ai_response
+    
+    # Signature encoding (per backend spec: urlsafe base64)
+    socket_signature_encoding: str = "urlsafe"  # Options: "urlsafe" or "standard"
     
     # API Keys - Google Services
     google_api_key: Optional[str] = None

@@ -10,7 +10,8 @@ from qdrant_client.models import (
     PointStruct,
     Filter,
     FieldCondition,
-    MatchValue
+    MatchValue,
+    MatchAny,
 )
 from qdrant_client.http import models
 from loguru import logger
@@ -103,13 +104,16 @@ class QdrantStore:
             # Generate embedding (placeholder - will implement with actual embedding model)
             embedding = await self._generate_embedding(content)
             
-            # Create point
+            # Create point (original_document_id for filtering: chunks use same doc id)
             point_id = str(uuid4())
+            meta = metadata or {}
             payload = {
                 "workspace_id": workspace_id,
                 "document_id": document_id,
                 "content": content,
-                "metadata": metadata or {}
+                "metadata": meta,
+                "original_document_id": meta.get("original_document_id", document_id),
+                "uploaded_at": meta.get("uploaded_at"),
             }
             
             point = PointStruct(
@@ -208,6 +212,138 @@ class QdrantStore:
                 details={"workspace_id": workspace_id, "error": str(e)}
             )
     
+    async def get_all_documents(
+        self,
+        workspace_id: str,
+        limit_per_batch: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve all document contents for a workspace, grouped by original_document_id.
+        Returns list of {"document_id", "content", "uploaded_at"} sorted by uploaded_at (oldest first).
+
+        Args:
+            workspace_id: Workspace identifier
+            limit_per_batch: Scroll batch size
+
+        Returns:
+            List of document dicts with combined content per document, sorted by upload order
+        """
+        try:
+            workspace_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="workspace_id",
+                        match=MatchValue(value=workspace_id)
+                    )
+                ]
+            )
+            seen_point_ids = set()
+            doc_chunks: Dict[str, List[tuple]] = {}  # original_document_id -> [(uploaded_at, content), ...]
+
+            offset = None
+            while True:
+                result, next_offset = self.client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=workspace_filter,
+                    limit=limit_per_batch,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for point in result:
+                    if point.id in seen_point_ids:
+                        continue
+                    seen_point_ids.add(point.id)
+                    payload = point.payload or {}
+                    content = (payload.get("content") or "").strip()
+                    if not content or len(content) < 20:
+                        continue
+                    orig_id = payload.get("original_document_id") or payload.get("document_id")
+                    uploaded_at = payload.get("uploaded_at") or ""
+                    meta = payload.get("metadata") or {}
+                    if not orig_id:
+                        orig_id = meta.get("original_document_id") or payload.get("document_id")
+                    if orig_id not in doc_chunks:
+                        doc_chunks[orig_id] = []
+                    doc_chunks[orig_id].append((uploaded_at, content))
+
+                if next_offset is None:
+                    break
+                offset = next_offset
+
+            # Combine chunks per document and sort by uploaded_at
+            out = []
+            for doc_id, chunks in doc_chunks.items():
+                chunks_sorted = sorted(chunks, key=lambda x: (x[0] or "", x[1]))
+                combined = " ".join(c for _, c in chunks_sorted)
+                uploaded_at = chunks_sorted[0][0] if chunks_sorted else ""
+                out.append({
+                    "document_id": doc_id,
+                    "content": combined,
+                    "uploaded_at": uploaded_at,
+                })
+            out.sort(key=lambda x: (x["uploaded_at"] or "", x["document_id"]))
+            logger.debug(
+                "Retrieved {} documents for workspace {}",
+                len(out),
+                workspace_id,
+            )
+            return out
+
+        except Exception as e:
+            logger.error("get_all_documents failed: {}", str(e))
+            raise VectorStoreError(
+                "get_all_documents failed",
+                details={"workspace_id": workspace_id, "error": str(e)}
+            )
+
+    async def delete_documents(
+        self,
+        workspace_id: str,
+        document_ids: List[str],
+    ) -> bool:
+        """
+        Delete all chunks for the given document IDs in a workspace.
+
+        Args:
+            workspace_id: Workspace identifier
+            document_ids: List of document IDs (original_document_id) to remove
+
+        Returns:
+            True if successful
+        """
+        if not document_ids:
+            return True
+        try:
+            delete_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="workspace_id",
+                        match=MatchValue(value=workspace_id)
+                    ),
+                    FieldCondition(
+                        key="original_document_id",
+                        match=MatchAny(any=document_ids)
+                    ),
+                ]
+            )
+            self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=models.FilterSelector(filter=delete_filter),
+            )
+            logger.info(
+                "Deleted documents {} for workspace {}",
+                document_ids,
+                workspace_id,
+            )
+            return True
+        except Exception as e:
+            logger.error("Failed to delete documents: {}", str(e))
+            raise VectorStoreError(
+                "Failed to delete documents",
+                details={"workspace_id": workspace_id, "document_ids": document_ids, "error": str(e)}
+            )
+
     async def delete_workspace(self, workspace_id: str) -> bool:
         """
         Delete all documents for a workspace.

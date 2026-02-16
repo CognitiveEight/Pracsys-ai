@@ -15,7 +15,7 @@ from app.langgraph.strategy_models import (
     get_incompatibility_reason,
     ROLE_STRATEGY_COMPATIBILITY
 )
-from app.agents.role_models import Role
+from app.agents.role_models import Role, RoleEnum
 from app.observability.audit import audit_logger
 
 
@@ -62,17 +62,20 @@ def strategy_suggestion_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # Generate strategy options based on role
     suggestions = []
     
-    if role == Role.PETITIONER:
+    # Convert role to RoleEnum if it's a string
+    role_enum = RoleEnum(role) if isinstance(role, str) else role
+    
+    if role_enum == RoleEnum.PETITIONER:
         suggestions = _generate_petitioner_strategies(workspace_snapshot, workspace_id)
-    elif role == Role.RESPONDENT:
+    elif role_enum == RoleEnum.RESPONDENT:
         suggestions = _generate_respondent_strategies(workspace_snapshot, workspace_id)
-    elif role == Role.MEDIATOR:
+    elif role_enum == RoleEnum.MEDIATOR:
         suggestions = _generate_mediator_strategies(workspace_snapshot, workspace_id)
-    elif role == Role.ADJUDICATOR:
+    elif role_enum == RoleEnum.ADJUDICATOR:
         suggestions = _generate_adjudicator_strategies(workspace_snapshot, workspace_id)
     
     # Filter and rank by relevance
-    suggestions = [s for s in suggestions if is_strategy_compatible_with_role(s.strategy_type, role)]
+    suggestions = [s for s in suggestions if is_strategy_compatible_with_role(s.strategy_type, role_enum)]
     suggestions.sort(key=lambda x: x.relevance_score, reverse=True)
     
     # Take top 3
@@ -398,7 +401,7 @@ def _generate_petitioner_strategies(snapshot: Dict[str, Any], workspace_id: str)
                 "Timeline": "Calculate procedural deadlines"
             },
             relevance_score=0.9,
-            compatible_roles=[Role.PETITIONER],
+            compatible_roles=[RoleEnum.PETITIONER],
             requires_evidence_types=["supporting_documents", "proof_of_claim"],
             estimated_complexity="HIGH",
             created_at=datetime.utcnow()
@@ -416,7 +419,7 @@ def _generate_petitioner_strategies(snapshot: Dict[str, Any], workspace_id: str)
                 "Timeline": "Extended preparation phase"
             },
             relevance_score=0.7,
-            compatible_roles=[Role.PETITIONER, Role.RESPONDENT],
+            compatible_roles=[RoleEnum.PETITIONER, RoleEnum.RESPONDENT],
             requires_evidence_types=["all_available"],
             estimated_complexity="MEDIUM",
             created_at=datetime.utcnow()
@@ -444,7 +447,7 @@ def _generate_respondent_strategies(snapshot: Dict[str, Any], workspace_id: str)
                 "Drafting": "Enable dismissal motion templates"
             },
             relevance_score=0.85,
-            compatible_roles=[Role.RESPONDENT],
+            compatible_roles=[RoleEnum.RESPONDENT],
             requires_evidence_types=["procedural_records"],
             estimated_complexity="HIGH",
             created_at=datetime.utcnow()
@@ -462,7 +465,7 @@ def _generate_respondent_strategies(snapshot: Dict[str, Any], workspace_id: str)
                 "Timeline": "Flexible based on negotiations"
             },
             relevance_score=0.75,
-            compatible_roles=[Role.RESPONDENT, Role.PETITIONER, Role.MEDIATOR],
+            compatible_roles=[RoleEnum.RESPONDENT, RoleEnum.PETITIONER, RoleEnum.MEDIATOR],
             requires_evidence_types=["valuation_documents"],
             estimated_complexity="MEDIUM",
             created_at=datetime.utcnow()
@@ -490,7 +493,7 @@ def _generate_mediator_strategies(snapshot: Dict[str, Any], workspace_id: str) -
                 "Documentation": "Track compromise proposals"
             },
             relevance_score=0.9,
-            compatible_roles=[Role.MEDIATOR],
+            compatible_roles=[RoleEnum.MEDIATOR],
             requires_evidence_types=["all_party_positions"],
             estimated_complexity="MEDIUM",
             created_at=datetime.utcnow()
@@ -518,7 +521,7 @@ def _generate_adjudicator_strategies(snapshot: Dict[str, Any], workspace_id: str
                 "Timeline": "May require additional hearings"
             },
             relevance_score=0.85,
-            compatible_roles=[Role.ADJUDICATOR, Role.MEDIATOR],
+            compatible_roles=[RoleEnum.ADJUDICATOR, RoleEnum.MEDIATOR],
             requires_evidence_types=["all_evidence"],
             estimated_complexity="MEDIUM",
             created_at=datetime.utcnow()
@@ -562,9 +565,11 @@ def _derive_strategy_from_objective(objective: UserObjective, role: Role,
         strategy_type = "FACTUAL_CLARIFICATION"
     else:
         # Default based on role
-        if role == Role.PETITIONER:
+        # Convert role to RoleEnum if it's a string
+        role_enum = RoleEnum(role) if isinstance(role, str) else role
+        if role_enum == RoleEnum.PETITIONER:
             strategy_type = "PROSECUTION_OR_RELIEF"
-        elif role == Role.RESPONDENT:
+        elif role_enum == RoleEnum.RESPONDENT:
             strategy_type = "DEFENSIVE_DISMISSAL"
         else:
             strategy_type = "FACTUAL_CLARIFICATION"

@@ -7,6 +7,7 @@ from loguru import logger
 
 from app.core.config import settings
 from app.socket.client import SocketClient
+from app.socket.events import event_handler
 from app.vectorstore.qdrant import QdrantStore
 from app.processing.document_processor import document_processor
 from app.ai.gemini_client import gemini_client
@@ -49,6 +50,10 @@ class ApplicationLifecycle:
             # Initialize socket client
             logger.info("Initializing socket client...")
             self.socket_client = SocketClient()
+            
+            # Register socket client with event handler
+            logger.info("Registering socket client with event handler...")
+            event_handler.set_socket_client(self.socket_client)
             
             # Connect to socket server
             logger.info("Connecting to socket server: {}", settings.socket_url)

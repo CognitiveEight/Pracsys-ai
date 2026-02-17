@@ -2,6 +2,8 @@
 Main document processor coordinating file handling, readability scoring,
 and vector storage.
 """
+import json
+import re
 from typing import Dict, Any, List
 from pathlib import Path
 import httpx
@@ -50,6 +52,141 @@ class DocumentProcessor:
         if self.http_client:
             await self.http_client.aclose()
         logger.info("Document processor cleaned up")
+
+    def _extractive_summary_fallback(self, extracted_text: str, max_chars: int = 280) -> str:
+        """Build a short extractive summary when AI summary is unavailable (used only as last resort)."""
+        if not extracted_text or len(extracted_text.strip()) < 20:
+            return "Insufficient extractable content."
+        text = extracted_text.strip()
+        for sep in (". ", ".\n", "\n\n"):
+            parts = text.split(sep, 2)
+            if len(parts) >= 2:
+                first = (parts[0] + ".").strip()
+                if 30 <= len(first) <= max_chars:
+                    return first
+                if len(first) > max_chars:
+                    return first[: max_chars - 1].rsplit(" ", 1)[0] + "…"
+        return text[: max_chars - 1] + "…" if len(text) > max_chars else text
+
+    def _salvage_summary_from_truncated_json(self, raw: str) -> str:
+        """If Gemini returned truncated JSON (e.g. Unterminated string), extract the summary value."""
+        if not raw or "summary" not in raw:
+            return ""
+        idx = raw.find('"summary"')
+        if idx < 0:
+            return ""
+        # Find the opening quote of the value (after ": or ": )
+        colon = raw.find(":", idx + 9)
+        if colon < 0:
+            return ""
+        start_quote = raw.find('"', colon + 1)
+        if start_quote < 0:
+            return ""
+        start = start_quote + 1
+        end = start
+        while end < len(raw):
+            if raw[end] == "\\" and end + 1 < len(raw):
+                end += 2
+                continue
+            if raw[end] == '"':
+                return raw[start:end].strip()
+            end += 1
+        return raw[start:].strip()
+
+    async def _get_english_summary_fallback(self, extracted_text: str) -> str:
+        """Get a one-sentence English summary from Gemini when main JSON fails (avoids Hindi/extractive)."""
+        if not extracted_text or len(extracted_text.strip()) < 20:
+            return "Insufficient extractable content."
+        try:
+            from app.ai.gemini_client import gemini_client
+            gemini_client.initialize()
+            snippet = (extracted_text.strip()[:800] + "...") if len(extracted_text) > 800 else extracted_text.strip()
+            prompt = f"""Summarize the following document excerpt in one short sentence in English only. Output nothing but that single sentence, no quotes, no JSON.
+
+Document excerpt:
+{snippet}"""
+            out = await gemini_client.generate(prompt, temperature=0.2, max_tokens=150)
+            out = (out or "").strip()
+            if out and "Error" not in out[:50] and len(out) >= 15:
+                return out
+        except Exception as e:
+            logger.debug("English summary fallback failed: {}", str(e))
+        return self._extractive_summary_fallback(extracted_text)
+
+    async def _get_summary_and_evidentiary_strength(self, extracted_text: str, filename: str) -> Dict[str, str]:
+        """
+        Generate a short summary and evidentiary strength for the document using AI.
+        Summary is always requested in English. Returns {"summary": str, "evidentiary_strength": "Low"|"Medium"|"High"}.
+        """
+        fallback_extractive = self._extractive_summary_fallback(extracted_text)
+        if not extracted_text or len(extracted_text.strip()) < 30:
+            english_fallback = await self._get_english_summary_fallback(extracted_text)
+            return {"summary": english_fallback, "evidentiary_strength": "Low"}
+        try:
+            from app.ai.gemini_client import gemini_client
+            gemini_client.initialize()
+            text_snippet = (extracted_text.strip()[:4000] + "...") if len(extracted_text) > 4000 else extracted_text.strip()
+            prompt = f"""You are a legal document analyst. For the document excerpt below, output a single JSON object with two keys:
+- "summary": 2-3 short sentences in English only summarizing what the document is about and its relevance. Keep the summary under 250 characters. Write in English regardless of the document language.
+- "evidentiaryStrength": exactly one of "Low", "Medium", or "High" (how useful as evidence).
+
+Document excerpt:
+{text_snippet}
+
+Output only the JSON object, no markdown, no code block, no other text. Example:
+{{"summary": "This document is a complaint letter to the police regarding a hacked social media account.", "evidentiaryStrength": "High"}}"""
+            raw = await gemini_client.generate(prompt, temperature=0.2, max_tokens=600)
+            if not raw or "Error" in (raw[:80] or ""):
+                english_fallback = await self._get_english_summary_fallback(extracted_text)
+                return {"summary": english_fallback, "evidentiary_strength": "Medium"}
+            raw_clean = raw.strip()
+            if "```" in raw_clean:
+                code = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw_clean)
+                if code:
+                    raw_clean = (code.group(1) or "").strip()
+            start = raw_clean.find("{")
+            if start >= 0:
+                depth = 0
+                for i in range(start, len(raw_clean)):
+                    if raw_clean[i] == "{":
+                        depth += 1
+                    elif raw_clean[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            raw_clean = raw_clean[start : i + 1]
+                            break
+            if not raw_clean or not raw_clean.strip().startswith("{"):
+                logger.debug(
+                    "Summary JSON not found (response len={}). First 300 chars: {}",
+                    len(raw),
+                    (raw[:300] if raw else "")
+                )
+                english_fallback = await self._get_english_summary_fallback(extracted_text)
+                return {"summary": english_fallback, "evidentiary_strength": "Medium"}
+            data = json.loads(raw_clean)
+            summary = (data.get("summary") or "").strip()
+            if not summary:
+                summary = await self._get_english_summary_fallback(extracted_text)
+            strength = (data.get("evidentiaryStrength") or data.get("evidentiary_strength") or "Medium").strip()
+            if strength not in ("Low", "Medium", "High"):
+                strength = "Medium"
+            return {"summary": summary, "evidentiary_strength": strength}
+        except json.JSONDecodeError as e:
+            logger.warning(
+                "Summary JSON parse failed: {}; raw (first 400 chars): {}",
+                str(e),
+                (raw[:400] if raw else "")
+            )
+            # Try to salvage partial summary from truncated JSON (e.g. "Unterminated string")
+            salvaged = self._salvage_summary_from_truncated_json(raw)
+            if salvaged and len(salvaged) >= 25:
+                return {"summary": salvaged, "evidentiary_strength": "Medium"}
+            english_fallback = await self._get_english_summary_fallback(extracted_text)
+            return {"summary": english_fallback, "evidentiary_strength": "Medium"}
+        except Exception as e:
+            logger.warning("Summary/evidentiary strength generation failed: {}", str(e))
+            english_fallback = await self._get_english_summary_fallback(extracted_text)
+            return {"summary": english_fallback, "evidentiary_strength": "Medium"}
     
     @tracer.trace("process_document")
     async def process_document(
@@ -126,6 +263,9 @@ class DocumentProcessor:
                     # Continue processing even if vector storage fails
                     stored_in_vector_db = False
             
+            # Generate summary and evidentiary strength for the document
+            summary_strength = await self._get_summary_and_evidentiary_strength(extracted_text, filename)
+            
             # Prepare result
             result = {
                 "success": True,
@@ -138,7 +278,9 @@ class DocumentProcessor:
                 "readable": readability_result["readable"],
                 "metadata": extraction_metadata,
                 "readability_breakdown": readability_result,
-                "stored_in_vector_db": stored_in_vector_db
+                "stored_in_vector_db": stored_in_vector_db,
+                "summary": summary_strength["summary"],
+                "evidentiary_strength": summary_strength["evidentiary_strength"],
             }
             
             # Log audit event
@@ -179,7 +321,9 @@ class DocumentProcessor:
                 "filename": filename,
                 "error": str(e),
                 "readability_score": 0,
-                "readable": False
+                "readable": False,
+                "summary": "",
+                "evidentiary_strength": "N/A",
             }
     
     @tracer.trace("process_batch")

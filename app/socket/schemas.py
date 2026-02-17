@@ -15,6 +15,7 @@ class EvidenceFilePayload(BaseModel):
     """
     Schema for evidence file in workspace payloads.
     Matches backend workspace_created and workspace_sync event structure.
+    When backend sends isDeleted: true, the document should be removed from vector store.
     """
     
     originalName: str  # Original filename
@@ -26,6 +27,7 @@ class EvidenceFilePayload(BaseModel):
     path: str  # GCS storage path
     uploadedAt: str  # ISO date string
     id: Optional[str] = Field(None, alias="_id")  # MongoDB ObjectId (maps to backend's _id)
+    isDeleted: Optional[bool] = Field(False, alias="isDeleted")  # True when user deleted this document
     
     class Config:
         populate_by_name = True

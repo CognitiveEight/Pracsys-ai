@@ -228,6 +228,8 @@ class QdrantStore:
         Returns:
             List of document dicts with combined content per document, sorted by upload order
         """
+        if self.client is None:
+            await self.initialize()
         try:
             workspace_filter = Filter(
                 must=[
@@ -314,6 +316,8 @@ class QdrantStore:
         """
         if not document_ids:
             return True
+        if self.client is None:
+            await self.initialize()
         try:
             delete_filter = Filter(
                 must=[

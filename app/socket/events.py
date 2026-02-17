@@ -186,7 +186,7 @@ class SocketEventHandler:
                 combined_document_content = combined_document_content[:max_content_length] + "..."
                 logger.info(f"Truncated document content to {max_content_length} characters")
 
-            # When no documents (e.g. all deleted), return a clear fallback payload
+            # When no documents (e.g. all deleted), return fallback so backend can clear strategy / show empty state
             doc_count = len(all_docs)
             if doc_count == 0:
                 fallback_payload = {
@@ -194,13 +194,11 @@ class SocketEventHandler:
                     "userId": user_id,
                     "role": workspace_role,
                     "isUpdate": is_update,
-                    "caseSummary": f"No supporting documents in this workspace. Upload documents in Supporting Material to generate strategy and objective for your {workspace_role} role.",
-                    "strategicObjective": "Upload case documents to enable AI-generated strategy and recommendations.",
-                    "recommendations": [
-                        "Upload relevant case files and evidence in Supporting Material",
-                        "After upload, strategy and objective will update automatically",
-                        "You can add or remove documents; strategy will reflect the current set"
-                    ],
+                    "isEmpty": True,
+                    "caseSummary": "",
+                    "strategicObjective": "",
+                    "recommendations": [],
+                    "suggestionChips": [],
                     "analysis": {
                         "documentCount": 0,
                         "averageReadability": 0,
@@ -210,7 +208,7 @@ class SocketEventHandler:
                     },
                     "timestamp": datetime.utcnow().isoformat()
                 }
-                logger.info("No documents in workspace; returning fallback strategy payload")
+                logger.info("No documents in workspace; returning empty strategy payload (isEmpty=true)")
                 return fallback_payload
 
             # Generate AI-powered case summary and strategic objective
@@ -280,9 +278,16 @@ OUTPUT (JSON only, complete all fields):
     "Specific action 2 with legal basis",
     "Specific action 3 with procedural steps",
     "Specific action 4 with strategic outcome"
+  ],
+  "suggestionChips": [
+    "Short actionable chip 1 (2-5 words)",
+    "Short actionable chip 2",
+    "Short actionable chip 3"
   ]
 }}
-```"""
+```
+
+suggestionChips: 3-5 short, actionable next-step labels (2-5 words each) specific to this case and role. Examples: "Review Title Deeds", "Map Legal Heirs", "Draft Demand Notice", "File FIR", "Preserve Digital Evidence". No full sentences."""
 
                 ai_response = await gemini_client.generate(
                     prompt=structured_prompt,
@@ -375,6 +380,10 @@ OUTPUT (JSON only, complete all fields):
                         case_summary = analysis_data.get("caseSummary", "")
                         strategic_objective = analysis_data.get("strategicObjective", "")
                         recommendations = analysis_data.get("recommendations", [])
+                        suggestion_chips = analysis_data.get("suggestionChips") or analysis_data.get("suggestion_chips") or []
+                        if isinstance(suggestion_chips, str):
+                            suggestion_chips = [suggestion_chips] if suggestion_chips else []
+                        suggestion_chips = [str(s).strip() for s in suggestion_chips if s][:6]
                         
                         # Validate we got meaningful content
                         if case_summary and strategic_objective and recommendations:
@@ -382,6 +391,7 @@ OUTPUT (JSON only, complete all fields):
                             logger.info(f"   - Case Summary: {len(case_summary)} chars")
                             logger.info(f"   - Strategic Objective: {len(strategic_objective)} chars")
                             logger.info(f"   - Recommendations: {len(recommendations)} items")
+                            logger.info(f"   - Suggestion chips: {len(suggestion_chips)} items")
                         else:
                             logger.warning("⚠️ AI response incomplete, using partial data + fallback")
                             # Use what we got and fill in missing pieces
@@ -396,6 +406,8 @@ OUTPUT (JSON only, complete all fields):
                                     "Assess evidence strength under BSA",
                                     "Develop detailed action plan"
                                 ][:4]  # Ensure we have at least 4
+                            if not suggestion_chips:
+                                suggestion_chips = ["Review documents", "Analyze provisions", "Draft action plan"]
                             logger.info("✅ Using hybrid AI + fallback content")
                             
                     except json.JSONDecodeError as json_error:
@@ -415,6 +427,7 @@ OUTPUT (JSON only, complete all fields):
                             
                             # Extract recommendations from the partial JSON
                             recommendations = []
+                            suggestion_chips = []
                             if recommendations_match and len(recommendations_match) > 2:
                                 # Filter out field names, keep only actual recommendations
                                 potential_recs = [r for r in recommendations_match 
@@ -439,6 +452,8 @@ OUTPUT (JSON only, complete all fields):
                                 ]
                                 recommendations.extend(default_recs)
                                 recommendations = recommendations[:4]  # Keep only 4
+                            if not suggestion_chips:
+                                suggestion_chips = ["Review evidence", "File legal action", "Preserve documents"]
                             
                             logger.success("✅ Using hybrid: AI-extracted content + fallback where needed")
                         else:
@@ -459,6 +474,7 @@ OUTPUT (JSON only, complete all fields):
                     "Assess the strength of available evidence under BSA (Bharatiya Sakshya Adhiniyam)",
                     "Develop a detailed action plan with specific legal remedies and procedural steps"
                 ]
+                suggestion_chips = ["Review documents", "Analyze BNS provisions", "Assess evidence", "Draft action plan"]
             
             # Format the response (use doc_count from vector store when batch_result not provided, e.g. after delete)
             strategies_payload = {
@@ -469,6 +485,7 @@ OUTPUT (JSON only, complete all fields):
                 "caseSummary": case_summary,
                 "strategicObjective": strategic_objective,
                 "recommendations": recommendations,
+                "suggestionChips": suggestion_chips if suggestion_chips else [],
                 "analysis": {
                     "documentCount": doc_count,
                     "averageReadability": (batch_result or {}).get("average_readability_score", 0),
@@ -487,7 +504,132 @@ OUTPUT (JSON only, complete all fields):
             logger.error(f"Error generating strategies: {e}")
             logger.exception(e)
             return None
-    
+
+    def _salvage_workspace_metadata_from_truncated_json(self, raw: str) -> Dict[str, Any]:
+        """Extract caseTitle, caseCategory and subcategories from truncated Gemini JSON."""
+        import re
+        result = {"caseTitle": "", "caseCategory": "General", "subcategories": []}
+        if not raw:
+            return result
+        # Salvage caseTitle: "caseTitle": "VALUE" (for document-based display title)
+        title_match = re.search(r'"caseTitle"\s*:\s*"([^"]*)"', raw)
+        if not title_match:
+            title_match = re.search(r'"caseTitle"\s*:\s*"([^"]*)$', raw)
+        if title_match:
+            val = title_match.group(1).strip()
+            if val:
+                result["caseTitle"] = val
+        # Salvage caseCategory
+        if "caseCategory" in raw:
+            cat_match = re.search(r'"caseCategory"\s*:\s*"([^"]*)"', raw)
+            if not cat_match:
+                cat_match = re.search(r'"caseCategory"\s*:\s*"([^"]*)$', raw)
+            if cat_match:
+                val = cat_match.group(1).strip().upper()
+                if val and len(val) >= 2:
+                    result["caseCategory"] = val if ("LAW" in val or "ACT" in val) else (val + " LAW")
+        # Salvage subcategories
+        sub_match = re.search(r'"subcategories"\s*:\s*\[(.*?)\]', raw, re.DOTALL)
+        if not sub_match:
+            sub_match = re.search(r'"subcategories"\s*:\s*\[(.*)$', raw, re.DOTALL)
+        if sub_match:
+            inner = sub_match.group(1)
+            subs = re.findall(r'"([^"]+)"', inner)
+            result["subcategories"] = [s.strip() for s in subs if s.strip()][:5]
+        return result
+
+    async def _get_workspace_category_and_subcategory(
+        self,
+        workspace_id: str,
+        user_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Infer case title (from documents), case category and subcategories from workspace documents using AI.
+        Returns {"caseTitle": str, "caseCategory": str, "subcategories": List[str]}. caseTitle is fixed once; do not overwrite on sync.
+        """
+        import json
+        import re
+        try:
+            from app.vectorstore.qdrant import vector_store
+            from app.ai.gemini_client import gemini_client
+            all_docs = []
+            try:
+                all_docs = await vector_store.get_all_documents(workspace_id=workspace_id)
+            except Exception as e:
+                logger.warning("Could not retrieve documents for category: {}", str(e))
+                return {"caseTitle": "", "caseCategory": "General", "subcategories": []}
+            if not all_docs:
+                return {"caseTitle": "", "caseCategory": "General", "subcategories": []}
+            parts = []
+            for i, doc in enumerate(all_docs, 1):
+                content = (doc.get("content") or "").strip()
+                if content and len(content) >= 20:
+                    parts.append(f"--- Document {i} ---\n{content}")
+            combined = "\n\n".join(parts) if parts else ""
+            if not combined:
+                return {"caseTitle": "", "caseCategory": "General", "subcategories": []}
+            combined = (combined[:5000] + "...") if len(combined) > 5000 else combined
+            gemini_client.initialize()
+            prompt = f"""Based on the document content below, output a JSON object with:
+- caseTitle: one short formal case title from the documents (e.g. "Umesh Malik vs Social Media Hacking Complaint" or "Complaint re Hacked Account - Shubham Malik"). Use parties/subject from the docs, not generic text.
+- caseCategory: exactly one category in UPPERCASE (e.g. CRIMINAL LAW, CYBER LAW, CIVIL LAW).
+- subcategories: array of 1-3 relevant Indian acts (e.g. "Bharatiya Nyaya Sanhita", "Information Technology Act, 2000").
+
+Document content:
+{combined}
+
+Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "caseCategory": "CRIMINAL LAW", "subcategories": ["Bharatiya Nyaya Sanhita", "IT Act 2000"]}}"""
+            raw = await gemini_client.generate(prompt, temperature=0.2, max_tokens=700)
+            if not raw or "Error" in (raw[:80] or ""):
+                return {"caseTitle": "", "caseCategory": "General", "subcategories": []}
+            raw_clean = raw.strip()
+            if "```" in raw_clean:
+                code = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw_clean)
+                if code:
+                    raw_clean = (code.group(1) or "").strip()
+            start = raw_clean.find("{")
+            if start >= 0:
+                depth = 0
+                for i in range(start, len(raw_clean)):
+                    if raw_clean[i] == "{":
+                        depth += 1
+                    elif raw_clean[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            raw_clean = raw_clean[start : i + 1]
+                            break
+            if not raw_clean or not raw_clean.strip().startswith("{"):
+                salvaged = self._salvage_workspace_metadata_from_truncated_json(raw)
+                if salvaged.get("caseCategory") != "General" or salvaged.get("subcategories") or salvaged.get("caseTitle"):
+                    return salvaged
+                return {"caseTitle": "", "caseCategory": "General", "subcategories": []}
+            try:
+                data = json.loads(raw_clean)
+            except json.JSONDecodeError:
+                salvaged = self._salvage_workspace_metadata_from_truncated_json(raw)
+                if salvaged.get("caseCategory") != "General" or salvaged.get("subcategories") or salvaged.get("caseTitle"):
+                    logger.info("Used salvaged workspace metadata from truncated response")
+                    return salvaged
+                return {"caseTitle": "", "caseCategory": "General", "subcategories": []}
+            case_title = (data.get("caseTitle") or "").strip()
+            case_category = (data.get("caseCategory") or "General").strip().upper()
+            if case_category and "LAW" not in case_category and "ACT" not in case_category:
+                case_category = case_category + " LAW"
+            subcategories = data.get("subcategories") or data.get("subcategory") or []
+            if isinstance(subcategories, str):
+                subcategories = [subcategories] if subcategories else []
+            subcategories = [str(s).strip() for s in subcategories if s][:5]
+            logger.info(
+                "Workspace metadata: caseTitle={}, caseCategory={}, subcategories={}",
+                case_title[:50] if case_title else "",
+                case_category,
+                subcategories,
+            )
+            return {"caseTitle": case_title, "caseCategory": case_category or "General", "subcategories": subcategories}
+        except Exception as e:
+            logger.warning("Workspace category/subcategory generation failed: {}", str(e))
+            return {"caseTitle": "", "caseCategory": "General", "subcategories": []}
+
     # ========================================================================
     # Connection Events
     # ========================================================================
@@ -640,7 +782,7 @@ OUTPUT (JSON only, complete all fields):
                     # Send processing results back to backend
                     if self._socket_client:
                         try:
-                            # Prepare document results with readability scores
+                            # Prepare document results with readability scores, summary, and evidentiary strength
                             document_results = []
                             for result in batch_result.get("results", []):
                                 doc_result = {
@@ -651,7 +793,9 @@ OUTPUT (JSON only, complete all fields):
                                     "readabilityRating": result.get("readability_rating", "Unknown"),
                                     "readable": result.get("readable", False),
                                     "extractedTextLength": result.get("extracted_text_length", 0),
-                                    "storedInVectorDb": result.get("stored_in_vector_db", False)
+                                    "storedInVectorDb": result.get("stored_in_vector_db", False),
+                                    "summary": result.get("summary", ""),
+                                    "evidentiaryStrength": result.get("evidentiary_strength", "N/A"),
                                 }
                                 if not result.get("success"):
                                     doc_result["error"] = result.get("error", "Unknown error")
@@ -696,6 +840,8 @@ OUTPUT (JSON only, complete all fields):
                                 logger.info(f"  Success: {doc.get('success')}")
                                 logger.info(f"  Readability Score: {doc.get('readabilityScore')}%")
                                 logger.info(f"  Readability Rating: {doc.get('readabilityRating')}")
+                                logger.info(f"  Summary: {(doc.get('summary') or '')[:100]}{'...' if len(doc.get('summary') or '') > 100 else ''}")
+                                logger.info(f"  Evidentiary Strength: {doc.get('evidentiaryStrength', 'N/A')}")
                                 logger.info(f"  Readable: {doc.get('readable')}")
                                 logger.info(f"  Extracted Text Length: {doc.get('extractedTextLength')} chars")
                                 logger.info(f"  Stored in Vector DB: {doc.get('storedInVectorDb')}")
@@ -711,7 +857,38 @@ OUTPUT (JSON only, complete all fields):
                             )
                             logger.success("✅ Document assessments sent to backend")
                             logger.info(f"📊 Sent: {batch_result.get('successful')}/{batch_result.get('total_files')} files, avg readability: {batch_result.get('average_readability_score'):.2f}%")
-                            
+
+                            # Emit workspace_metadata: title from documents (AI case title), category, subcategories. Title is set once only.
+                            if batch_result.get("successful", 0) > 0:
+                                try:
+                                    meta = await self._get_workspace_category_and_subcategory(
+                                        workspace_id=payload.workspaceId,
+                                        user_id=payload.userId,
+                                    )
+                                    workspace_metadata_payload = {
+                                        "featureType": "workspace_metadata",
+                                        "workspaceId": payload.workspaceId,
+                                        "userId": payload.userId,
+                                        "payload": {
+                                            "workspaceTitle": meta.get("caseTitle") or "",
+                                            "updateTitle": True,
+                                            "caseCategory": meta.get("caseCategory", "General"),
+                                            "subcategories": meta.get("subcategories", []),
+                                        },
+                                    }
+                                    await self._socket_client.emit(
+                                        "document_feature_response",
+                                        workspace_metadata_payload
+                                    )
+                                    logger.success(
+                                        "✅ Workspace metadata sent: title={} (from docs, fixed), category={}, subcategories={}",
+                                        (meta.get("caseTitle") or "")[:50],
+                                        meta.get("caseCategory"),
+                                        meta.get("subcategories"),
+                                    )
+                                except Exception as meta_err:
+                                    logger.warning("Failed to emit workspace_metadata: {}", str(meta_err))
+
                             # STEP 4: Generate strategies and objectives based on processed documents
                             if batch_result.get("successful", 0) > 0:
                                 logger.info("🎯 Generating strategies and objectives from processed documents...")
@@ -867,12 +1044,20 @@ OUTPUT (JSON only, complete all fields):
             # Validate and parse payload
             payload = WorkspaceSyncPayload(**data)
 
-            # Normalize deleted IDs: backend may send deletedDocumentIds (camelCase) or deleted_document_ids (snake_case)
+            # Normalize deleted IDs: from deletedDocumentIds and from evidenceFiles with isDeleted: true
             deleted_ids = list(payload.deletedDocumentIds or [])
             if not deleted_ids and isinstance(data, dict):
                 deleted_ids = list(data.get("deleted_document_ids") or data.get("deletedDocumentIds") or [])
+            # Backend may send isDeleted: true on each evidence file instead of/in addition to deletedDocumentIds
+            if payload.evidenceFiles:
+                for file in payload.evidenceFiles:
+                    is_deleted = getattr(file, "isDeleted", None) or (getattr(file, "is_deleted", None) if hasattr(file, "is_deleted") else None)
+                    if is_deleted:
+                        file_id = getattr(file, "id", None) or (getattr(file, "_id", None) if hasattr(file, "_id") else None)
+                        if file_id and str(file_id) not in deleted_ids:
+                            deleted_ids.append(str(file_id))
             if deleted_ids:
-                logger.info("🗑️ Resolved deletedDocumentIds from payload: {}", deleted_ids)
+                logger.info("🗑️ Resolved deleted document IDs (from payload + isDeleted): {}", deleted_ids)
             
             logger.info(
                 "🔄 Workspace sync: {} (User: {})",
@@ -931,13 +1116,21 @@ OUTPUT (JSON only, complete all fields):
                     logger.error("Error handling document deletion: {}", str(del_err))
                     logger.exception(del_err)
 
-            # Process new evidence files if any (skip files that were just deleted)
+            # Process new evidence files if any (skip files that are deleted: isDeleted true or in deleted_ids)
             files_to_process = []
             if payload.evidenceFiles:
                 for file in payload.evidenceFiles:
+                    is_deleted = getattr(file, "isDeleted", False) or getattr(file, "is_deleted", False)
+                    if is_deleted:
+                        logger.info(
+                            "Skipping evidence file (isDeleted=true): {} ({})",
+                            getattr(file, "filename", ""),
+                            getattr(file, "id", ""),
+                        )
+                        continue
                     file_id = (getattr(file, "id", None) or (file.__dict__.get("id") if hasattr(file, "__dict__") else None)) or None
                     if file_id and str(file_id) in deleted_ids:
-                        logger.info("Skipping evidence file (deleted): {} ({})", getattr(file, "filename", ""), file_id)
+                        logger.info("Skipping evidence file (in deleted list): {} ({})", getattr(file, "filename", ""), file_id)
                         continue
                     file_dict = {
                         "url": file.url,
@@ -978,7 +1171,7 @@ OUTPUT (JSON only, complete all fields):
                     # Send processing results back to backend
                     if self._socket_client:
                         try:
-                            # Prepare document results
+                            # Prepare document results (with summary and evidentiary strength)
                             document_results = []
                             for result in batch_result.get("results", []):
                                 doc_result = {
@@ -989,7 +1182,9 @@ OUTPUT (JSON only, complete all fields):
                                     "readabilityRating": result.get("readability_rating", "Unknown"),
                                     "readable": result.get("readable", False),
                                     "extractedTextLength": result.get("extracted_text_length", 0),
-                                    "storedInVectorDb": result.get("stored_in_vector_db", False)
+                                    "storedInVectorDb": result.get("stored_in_vector_db", False),
+                                    "summary": result.get("summary", ""),
+                                    "evidentiaryStrength": result.get("evidentiary_strength", "N/A"),
                                 }
                                 if not result.get("success"):
                                     doc_result["error"] = result.get("error", "Unknown error")
@@ -1016,7 +1211,37 @@ OUTPUT (JSON only, complete all fields):
                                 document_assessment_payload
                             )
                             logger.success("✅ Document assessments (sync) sent to backend")
-                            
+
+                            # Emit workspace_metadata on sync: do NOT send title (send empty) so backend keeps existing title unchanged
+                            if batch_result.get("successful", 0) > 0:
+                                try:
+                                    meta = await self._get_workspace_category_and_subcategory(
+                                        workspace_id=payload.workspaceId,
+                                        user_id=payload.userId,
+                                    )
+                                    workspace_metadata_payload = {
+                                        "featureType": "workspace_metadata",
+                                        "workspaceId": payload.workspaceId,
+                                        "userId": payload.userId,
+                                        "payload": {
+                                            "workspaceTitle": "",
+                                            "updateTitle": False,
+                                            "caseCategory": meta.get("caseCategory", "General"),
+                                            "subcategories": meta.get("subcategories", []),
+                                        },
+                                    }
+                                    await self._socket_client.emit(
+                                        "document_feature_response",
+                                        workspace_metadata_payload
+                                    )
+                                    logger.success(
+                                        "✅ Workspace metadata (sync) sent: title=unchanged, category={}, subcategories={}",
+                                        meta.get("caseCategory"),
+                                        meta.get("subcategories"),
+                                    )
+                                except Exception as meta_err:
+                                    logger.warning("Failed to emit workspace_metadata (sync): {}", str(meta_err))
+
                             # Regenerate strategies from ALL documents in workspace (including new uploads)
                             if batch_result.get("successful", 0) > 0:
                                 logger.info("🎯 Regenerating strategies from all documents in workspace...")

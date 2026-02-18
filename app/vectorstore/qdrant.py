@@ -1,6 +1,11 @@
 """
 Qdrant vector store integration for document storage and retrieval.
+
+Note: Qdrant Python client is synchronous (blocking HTTP). We run initialization
+in a thread pool so the event loop stays responsive and the socket connection
+is not dropped during init/timeouts.
 """
+import asyncio
 from typing import List, Dict, Any, Optional
 from uuid import uuid4
 from qdrant_client import QdrantClient
@@ -30,25 +35,46 @@ class QdrantStore:
         self.collection_name = settings.qdrant_collection_name
         self.vector_size = 768  # Google Gemini embedding size (text-embedding-004)
     
+    def _initialize_sync(self) -> None:
+        """
+        Synchronous init: create client and ensure collection.
+        Called from a thread so the event loop is not blocked (Qdrant client is sync).
+        """
+        if settings.qdrant_api_key:
+            self.client = QdrantClient(
+                url=settings.qdrant_url,
+                api_key=settings.qdrant_api_key,
+                timeout=settings.qdrant_timeout_seconds,
+            )
+        else:
+            self.client = QdrantClient(
+                url=settings.qdrant_url,
+                timeout=settings.qdrant_timeout_seconds,
+            )
+        collections = self.client.get_collections().collections
+        collection_names = [col.name for col in collections]
+        if self.collection_name not in collection_names:
+            logger.info("Creating collection: {}", self.collection_name)
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(
+                    size=self.vector_size,
+                    distance=Distance.COSINE
+                )
+            )
+            logger.success("Collection created: {}", self.collection_name)
+        else:
+            logger.debug("Collection already exists: {}", self.collection_name)
+
     async def initialize(self) -> None:
-        """Initialize Qdrant client and create collection if needed."""
+        """
+        Initialize Qdrant client and create collection if needed.
+        Runs blocking Qdrant calls in a thread so the event loop (and socket) stay responsive.
+        """
         try:
             logger.info("Initializing Qdrant client...")
-            
-            # Initialize client
-            if settings.qdrant_api_key:
-                self.client = QdrantClient(
-                    url=settings.qdrant_url,
-                    api_key=settings.qdrant_api_key
-                )
-            else:
-                self.client = QdrantClient(url=settings.qdrant_url)
-            
-            # Create collection if it doesn't exist
-            await self._ensure_collection_exists()
-            
+            await asyncio.to_thread(self._initialize_sync)
             logger.success("Qdrant client initialized")
-            
         except Exception as e:
             logger.error("Failed to initialize Qdrant: {}", str(e))
             raise VectorStoreError(
@@ -57,7 +83,7 @@ class QdrantStore:
             )
     
     async def _ensure_collection_exists(self) -> None:
-        """Create collection if it doesn't exist."""
+        """Create collection if it doesn't exist. Used when client already exists (e.g. after lazy init)."""
         try:
             collections = self.client.get_collections().collections
             collection_names = [col.name for col in collections]
@@ -122,10 +148,11 @@ class QdrantStore:
                 payload=payload
             )
             
-            # Upsert point
-            self.client.upsert(
+            # Upsert point (run in thread so event loop is not blocked)
+            await asyncio.to_thread(
+                self.client.upsert,
                 collection_name=self.collection_name,
-                points=[point]
+                points=[point],
             )
             
             logger.debug(
@@ -178,12 +205,13 @@ class QdrantStore:
                 ]
             )
             
-            # Search
-            results = self.client.search(
+            # Search (run in thread so event loop is not blocked)
+            results = await asyncio.to_thread(
+                self.client.search,
                 collection_name=self.collection_name,
                 query_vector=query_embedding,
                 query_filter=workspace_filter,
-                limit=limit
+                limit=limit,
             )
             
             # Format results
@@ -212,6 +240,64 @@ class QdrantStore:
                 details={"workspace_id": workspace_id, "error": str(e)}
             )
     
+    def _get_all_documents_sync(
+        self,
+        workspace_id: str,
+        limit_per_batch: int,
+    ) -> List[Dict[str, Any]]:
+        """Sync scroll + combine; run via to_thread to avoid blocking the event loop."""
+        workspace_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="workspace_id",
+                    match=MatchValue(value=workspace_id)
+                )
+            ]
+        )
+        seen_point_ids = set()
+        doc_chunks: Dict[str, List[tuple]] = {}
+        offset = None
+        while True:
+            result, next_offset = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=workspace_filter,
+                limit=limit_per_batch,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for point in result:
+                if point.id in seen_point_ids:
+                    continue
+                seen_point_ids.add(point.id)
+                payload = point.payload or {}
+                content = (payload.get("content") or "").strip()
+                if not content or len(content) < 20:
+                    continue
+                orig_id = payload.get("original_document_id") or payload.get("document_id")
+                uploaded_at = payload.get("uploaded_at") or ""
+                meta = payload.get("metadata") or {}
+                if not orig_id:
+                    orig_id = meta.get("original_document_id") or payload.get("document_id")
+                if orig_id not in doc_chunks:
+                    doc_chunks[orig_id] = []
+                doc_chunks[orig_id].append((uploaded_at, content))
+            if next_offset is None:
+                break
+            offset = next_offset
+        out = []
+        for doc_id, chunks in doc_chunks.items():
+            chunks_sorted = sorted(chunks, key=lambda x: (x[0] or "", x[1]))
+            combined = " ".join(c for _, c in chunks_sorted)
+            uploaded_at = chunks_sorted[0][0] if chunks_sorted else ""
+            out.append({
+                "document_id": doc_id,
+                "content": combined,
+                "uploaded_at": uploaded_at,
+            })
+        out.sort(key=lambda x: (x["uploaded_at"] or "", x["document_id"]))
+        return out
+
     async def get_all_documents(
         self,
         workspace_id: str,
@@ -231,67 +317,17 @@ class QdrantStore:
         if self.client is None:
             await self.initialize()
         try:
-            workspace_filter = Filter(
-                must=[
-                    FieldCondition(
-                        key="workspace_id",
-                        match=MatchValue(value=workspace_id)
-                    )
-                ]
+            out = await asyncio.to_thread(
+                self._get_all_documents_sync,
+                workspace_id,
+                limit_per_batch,
             )
-            seen_point_ids = set()
-            doc_chunks: Dict[str, List[tuple]] = {}  # original_document_id -> [(uploaded_at, content), ...]
-
-            offset = None
-            while True:
-                result, next_offset = self.client.scroll(
-                    collection_name=self.collection_name,
-                    scroll_filter=workspace_filter,
-                    limit=limit_per_batch,
-                    offset=offset,
-                    with_payload=True,
-                    with_vectors=False,
-                )
-                for point in result:
-                    if point.id in seen_point_ids:
-                        continue
-                    seen_point_ids.add(point.id)
-                    payload = point.payload or {}
-                    content = (payload.get("content") or "").strip()
-                    if not content or len(content) < 20:
-                        continue
-                    orig_id = payload.get("original_document_id") or payload.get("document_id")
-                    uploaded_at = payload.get("uploaded_at") or ""
-                    meta = payload.get("metadata") or {}
-                    if not orig_id:
-                        orig_id = meta.get("original_document_id") or payload.get("document_id")
-                    if orig_id not in doc_chunks:
-                        doc_chunks[orig_id] = []
-                    doc_chunks[orig_id].append((uploaded_at, content))
-
-                if next_offset is None:
-                    break
-                offset = next_offset
-
-            # Combine chunks per document and sort by uploaded_at
-            out = []
-            for doc_id, chunks in doc_chunks.items():
-                chunks_sorted = sorted(chunks, key=lambda x: (x[0] or "", x[1]))
-                combined = " ".join(c for _, c in chunks_sorted)
-                uploaded_at = chunks_sorted[0][0] if chunks_sorted else ""
-                out.append({
-                    "document_id": doc_id,
-                    "content": combined,
-                    "uploaded_at": uploaded_at,
-                })
-            out.sort(key=lambda x: (x["uploaded_at"] or "", x["document_id"]))
             logger.debug(
                 "Retrieved {} documents for workspace {}",
                 len(out),
                 workspace_id,
             )
             return out
-
         except Exception as e:
             logger.error("get_all_documents failed: {}", str(e))
             raise VectorStoreError(
@@ -331,7 +367,8 @@ class QdrantStore:
                     ),
                 ]
             )
-            self.client.delete(
+            await asyncio.to_thread(
+                self.client.delete,
                 collection_name=self.collection_name,
                 points_selector=models.FilterSelector(filter=delete_filter),
             )
@@ -369,12 +406,13 @@ class QdrantStore:
                 ]
             )
             
-            # Delete points
-            self.client.delete(
+            # Delete points (run in thread so event loop is not blocked)
+            await asyncio.to_thread(
+                self.client.delete,
                 collection_name=self.collection_name,
                 points_selector=models.FilterSelector(
                     filter=workspace_filter
-                )
+                ),
             )
             
             logger.info("Deleted all documents for workspace: {}", workspace_id)

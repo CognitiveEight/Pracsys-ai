@@ -14,6 +14,7 @@ from app.socket.schemas import (
     AIResponseMetadata
 )
 from app.workspace.manager import workspace_manager
+from app.workspace.custom_instructions import set_custom_instructions, build_custom_instruction_suffix
 from app.observability.audit import audit_logger
 from app.utils.exceptions import SocketEventError
 from app.langgraph.integration import workspace_role_integration
@@ -288,7 +289,9 @@ OUTPUT (JSON only, complete all fields):
 ```
 
 suggestionChips: 3-5 short, actionable next-step labels (2-5 words each) specific to this case and role. Examples: "Review Title Deeds", "Map Legal Heirs", "Draft Demand Notice", "File FIR", "Preserve Digital Evidence". No full sentences."""
-
+                custom_suffix = build_custom_instruction_suffix(workspace_id)
+                if custom_suffix:
+                    structured_prompt = structured_prompt.rstrip() + "\n\n" + custom_suffix
                 ai_response = await gemini_client.generate(
                     prompt=structured_prompt,
                     temperature=0.4,  # Lower temperature for more structured output
@@ -702,6 +705,20 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
             # Validate and parse payload
             payload = WorkspaceCreatedPayload(**data)
             
+            # Store custom instructions if provided (structure, tone, description)
+            custom = data.get("customInstructions") or {}
+            structure = getattr(payload, "structure", None) or custom.get("structure")
+            tone = getattr(payload, "tone", None) or custom.get("tone")
+            description = getattr(payload, "description", None) or custom.get("description")
+            if structure or tone or description:
+                set_custom_instructions(
+                    payload.workspaceId,
+                    structure=structure,
+                    tone=tone,
+                    description=description,
+                )
+                logger.info("Custom instructions set: structure={}, tone={}, description={}", structure, tone, (description[:50] + "..." if description and len(description) > 50 else description))
+            
             logger.info(
                 "📦 Workspace created: {} - {} (User: {}, Role: {})",
                 payload.workspaceId,
@@ -1043,6 +1060,21 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
 
             # Validate and parse payload
             payload = WorkspaceSyncPayload(**data)
+
+            # Update custom instructions if provided (structure, tone, description)
+            custom = (data or {}).get("customInstructions") or {}
+            structure = getattr(payload, "structure", None) or custom.get("structure")
+            tone = getattr(payload, "tone", None) or custom.get("tone")
+            description = getattr(payload, "description", None) or custom.get("description")
+            if structure is not None or tone is not None or description is not None:
+                set_custom_instructions(
+                    payload.workspaceId,
+                    structure=structure,
+                    tone=tone,
+                    description=description,
+                )
+                if structure or tone or description:
+                    logger.info("Custom instructions updated: structure={}, tone={}", structure, tone)
 
             # Normalize deleted IDs: from deletedDocumentIds and from evidenceFiles with isDeleted: true
             deleted_ids = list(payload.deletedDocumentIds or [])

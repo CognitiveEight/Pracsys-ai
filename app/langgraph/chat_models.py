@@ -173,6 +173,9 @@ class ChatContext:
     # Chat history for context
     chat_history: List[Dict[str, Any]] = field(default_factory=list)
     
+    # Optional custom instructions (structure, tone, description) - appended to prompts when set
+    custom_instruction_suffix: Optional[str] = None
+    
     def validate(self) -> tuple[bool, List[str]]:
         """
         Validate that critical inputs are present.
@@ -201,7 +204,9 @@ class ChatContext:
             "approved_facts": self.approved_facts,
             "applicable_laws": self.applicable_laws,
             "active_module": self.active_module,
-            "chat_history_length": len(self.chat_history)
+            "chat_history_length": len(self.chat_history),
+            "custom_instruction_suffix": self.custom_instruction_suffix,
+            "chat_history": self.chat_history,
         }
 
 

@@ -37,6 +37,8 @@ class WorkspaceCreatedPayload(BaseModel):
     """
     Schema for workspace_created event (Server → AI_Maverick).
     Emitted to ai_service room when new workspace is created.
+    Optional customInstructions: structure (Default|Bullet Points|Paragraphs),
+    tone (Default(Empathetic)|Formal|Assertive), description (free text).
     """
     
     workspaceId: str
@@ -45,6 +47,9 @@ class WorkspaceCreatedPayload(BaseModel):
     workspaceRole: str
     evidenceFiles: List[EvidenceFilePayload] = []
     createdAt: str  # ISO timestamp
+    structure: Optional[str] = None  # Default | Bullet Points | Paragraphs
+    tone: Optional[str] = None  # Default(Empathetic) | Formal | Assertive
+    description: Optional[str] = None  # Optional custom description, e.g. "Use Indian legal terms only"
     
     class Config:
         populate_by_name = True
@@ -56,6 +61,7 @@ class WorkspaceSyncPayload(BaseModel):
     Emitted to ai_service room when workspace is updated.
     When user deletes documents from Supporting Material, backend may send
     deletedDocumentIds so AI can remove them from vector store and regenerate strategy.
+    Optional custom instructions: structure, tone, description (same as workspace_created).
     """
     
     workspaceId: str
@@ -65,6 +71,9 @@ class WorkspaceSyncPayload(BaseModel):
     evidenceFiles: Optional[List[EvidenceFilePayload]] = None
     deletedDocumentIds: Optional[List[str]] = None  # Document IDs removed from Supporting Material
     updatedAt: str  # ISO timestamp
+    structure: Optional[str] = None
+    tone: Optional[str] = None
+    description: Optional[str] = None
     
     class Config:
         populate_by_name = True

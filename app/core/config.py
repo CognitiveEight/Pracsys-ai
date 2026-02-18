@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: Optional[str] = None
     qdrant_collection_name: str = "simplertoday"
+    qdrant_timeout_seconds: float = 60.0  # Request timeout for Qdrant (delete/index can be slow)
     
     # Redis Configuration
     redis_host: str = "localhost"

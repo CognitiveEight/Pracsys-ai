@@ -9,6 +9,7 @@ import uuid
 from app.langgraph.intelligence_chat_agent import intelligence_chat_agent
 from app.langgraph.chat_models import ChatContext, ChatMessage, ChatResponse
 from app.workspace.manager import workspace_manager
+from app.workspace.custom_instructions import build_custom_instruction_suffix
 
 
 async def process_workspace_chat(
@@ -75,6 +76,9 @@ async def process_workspace_chat(
     # Get chat history
     chat_history = workspace_ctx.get_metadata("chat_history", [])
     
+    # Custom instructions (structure, tone, description) for this workspace
+    custom_suffix = build_custom_instruction_suffix(workspace_id)
+    
     # Build chat context
     chat_context = ChatContext(
         workspace_id=workspace_id,
@@ -86,7 +90,8 @@ async def process_workspace_chat(
         applicable_laws=applicable_laws,
         confidence_scores=confidence_scores,
         active_module=active_module,
-        chat_history=chat_history
+        chat_history=chat_history,
+        custom_instruction_suffix=custom_suffix or None,
     )
     
     # Generate message ID

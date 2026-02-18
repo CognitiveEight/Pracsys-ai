@@ -129,6 +129,11 @@ APPLICABLE LAWS ({len(applicable_laws)} available):
     # Combine all sections
     full_context = "\n".join(context_sections)
     
+    # Append user custom instructions (structure, tone, description) when set
+    custom_suffix = chat_context.get("custom_instruction_suffix") or ""
+    if custom_suffix:
+        full_context = full_context.rstrip() + "\n\n" + custom_suffix
+    
     logger.success(f"✅ Context built: {len(full_context)} chars")
     logger.info(f"📋 Role: {role}, Module: {active_module}, Facts: {len(approved_facts)}")
     

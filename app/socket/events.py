@@ -203,6 +203,7 @@ class SocketEventHandler:
                     "caseSummary": "",
                     "strategicObjective": "",
                     "recommendations": [],
+                    "possibleNextSteps": [],
                     "suggestionChips": [],
                     "analysis": {
                         "documentCount": 0,
@@ -233,11 +234,14 @@ class SocketEventHandler:
 
 3. **Detailed Recommendations** (3-4 bullet points): Specific steps or considerations based on the case facts.
 
+4. **Possible Next Steps** (3-5 bullet points): Immediate, actionable next steps that should be taken right away. These should be concrete, specific actions that can be executed immediately (e.g., "File FIR at local police station", "Preserve digital evidence", "Contact legal counsel", "Gather witness statements"). Focus on immediate actions rather than long-term strategy.
+
 **Format your response as JSON**:
 {{
   "caseSummary": "...",
   "strategicObjective": "...",
-  "recommendations": ["...", "...", "..."]
+  "recommendations": ["...", "...", "..."],
+  "possibleNextSteps": ["...", "...", "...", "..."]
 }}
 
 **Important**: 
@@ -264,6 +268,7 @@ TASK:
 1. Case summary (2-3 sentences with key facts and parties)
 2. Strategic objective (1-2 sentences specific to {workspace_role})
 3. Four actionable recommendations
+4. Possible next steps (3-5 immediate, concrete actions that should be taken right away)
 
 LEGAL FRAMEWORK (CRITICAL):
 - Use BNS (Bharatiya Nyaya Sanhita) - NOT IPC
@@ -283,6 +288,13 @@ OUTPUT (JSON only, complete all fields):
     "Specific action 2 with legal basis",
     "Specific action 3 with procedural steps",
     "Specific action 4 with strategic outcome"
+  ],
+  "possibleNextSteps": [
+    "Immediate action 1 (e.g., File FIR, Preserve evidence)",
+    "Immediate action 2 (e.g., Contact relevant authority)",
+    "Immediate action 3 (e.g., Gather documents)",
+    "Immediate action 4 (e.g., Consult legal counsel)",
+    "Immediate action 5 (e.g., Secure witness statements)"
   ],
   "suggestionChips": [
     "Chip 1", "Chip 2", "Chip 3", "Chip 4", "Chip 5", "Chip 6", "Chip 7", "Chip 8",
@@ -386,6 +398,10 @@ suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words eac
                         case_summary = analysis_data.get("caseSummary", "")
                         strategic_objective = analysis_data.get("strategicObjective", "")
                         recommendations = analysis_data.get("recommendations", [])
+                        possible_next_steps = analysis_data.get("possibleNextSteps") or analysis_data.get("possible_next_steps") or []
+                        if isinstance(possible_next_steps, str):
+                            possible_next_steps = [possible_next_steps] if possible_next_steps else []
+                        possible_next_steps = [str(s).strip() for s in possible_next_steps if s][:5]
                         suggestion_chips = analysis_data.get("suggestionChips") or analysis_data.get("suggestion_chips") or []
                         if isinstance(suggestion_chips, str):
                             suggestion_chips = [suggestion_chips] if suggestion_chips else []
@@ -397,6 +413,7 @@ suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words eac
                             logger.info(f"   - Case Summary: {len(case_summary)} chars")
                             logger.info(f"   - Strategic Objective: {len(strategic_objective)} chars")
                             logger.info(f"   - Recommendations: {len(recommendations)} items")
+                            logger.info(f"   - Possible Next Steps: {len(possible_next_steps)} items")
                             logger.info(f"   - Suggestion chips: {len(suggestion_chips)} items")
                         else:
                             logger.warning("⚠️ AI response incomplete, using partial data + fallback")
@@ -412,6 +429,14 @@ suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words eac
                                     "Assess evidence strength under BSA",
                                     "Develop detailed action plan"
                                 ][:4]  # Ensure we have at least 4
+                            if not possible_next_steps or len(possible_next_steps) < 3:
+                                possible_next_steps = possible_next_steps + [
+                                    "Review all uploaded documents immediately",
+                                    "Preserve and secure all evidence",
+                                    "Consult with legal counsel",
+                                    "Identify and contact relevant parties",
+                                    "Prepare initial documentation"
+                                ][:5]  # Ensure we have at least 3-5
                             if not suggestion_chips:
                                 suggestion_chips = [
                                     "Review documents", "Analyze provisions", "Draft action plan",
@@ -437,15 +462,24 @@ suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words eac
                             case_summary = case_summary_match.group(1) if case_summary_match else ""
                             strategic_objective = objective_match.group(1) if objective_match else ""
                             
-                            # Extract recommendations from the partial JSON
+                            # Extract recommendations and possible next steps from the partial JSON
                             recommendations = []
+                            possible_next_steps = []
                             suggestion_chips = []
                             if recommendations_match and len(recommendations_match) > 2:
                                 # Filter out field names, keep only actual recommendations
                                 potential_recs = [r for r in recommendations_match 
-                                                if r not in ['caseSummary', 'strategicObjective', 'recommendations']
+                                                if r not in ['caseSummary', 'strategicObjective', 'recommendations', 'possibleNextSteps', 'possible_next_steps']
                                                 and len(r) > 20]  # Recommendations should be substantial
                                 recommendations = potential_recs[:4]  # Take up to 4
+                                # Try to extract possible next steps if present
+                                possible_next_steps_match = re.search(r'"possibleNextSteps"\s*:\s*\[(.*?)\]', json_str, re.DOTALL)
+                                if not possible_next_steps_match:
+                                    possible_next_steps_match = re.search(r'"possible_next_steps"\s*:\s*\[(.*?)\]', json_str, re.DOTALL)
+                                if possible_next_steps_match:
+                                    next_steps_inner = possible_next_steps_match.group(1)
+                                    next_steps = re.findall(r'"([^"]+)"', next_steps_inner)
+                                    possible_next_steps = [s.strip() for s in next_steps if s.strip()][:5]
                             
                             logger.info(f"   Extracted: Summary={bool(case_summary)}, Objective={bool(strategic_objective)}, Recs={len(recommendations)}")
                             
@@ -492,6 +526,13 @@ suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words eac
                     "Assess the strength of available evidence under BSA (Bharatiya Sakshya Adhiniyam)",
                     "Develop a detailed action plan with specific legal remedies and procedural steps"
                 ]
+                possible_next_steps = [
+                    "Review all uploaded documents immediately",
+                    "Preserve and secure all evidence",
+                    "Consult with legal counsel",
+                    "Identify and contact relevant parties",
+                    "Prepare initial documentation"
+                ]
                 suggestion_chips = [
                     "Review documents", "Analyze BNS provisions", "Assess evidence", "Draft action plan",
                     "Review evidence", "File legal action", "Preserve documents", "Map legal heirs",
@@ -508,6 +549,7 @@ suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words eac
                 "caseSummary": case_summary,
                 "strategicObjective": strategic_objective,
                 "recommendations": recommendations,
+                "possibleNextSteps": possible_next_steps if possible_next_steps else [],
                 "suggestionChips": suggestion_chips if suggestion_chips else [],
                 "analysis": {
                     "documentCount": doc_count,
@@ -528,7 +570,7 @@ suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words eac
             logger.exception(e)
             return None
 
-    def _salvage_workspace_metadata_from_truncated_json(self, raw: str) -> Dict[str, Any]:
+    def _salvage_workspace_metadata_from_truncated_json(self, raw: str, combined: str = "") -> Dict[str, Any]:
         """Extract caseTitle, caseCategory, subcategories and description from truncated Gemini JSON."""
         import re
         result = {"caseTitle": "", "caseCategory": "General", "subcategories": [], "description": ""}
@@ -559,15 +601,419 @@ suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words eac
             inner = sub_match.group(1)
             subs = re.findall(r'"([^"]+)"', inner)
             result["subcategories"] = [s.strip() for s in subs if s.strip()][:5]
-        # Salvage description (short case description, 1-2 lines)
+        # Salvage description (short case summary, 3-4 lines only)
         desc_match = re.search(r'"description"\s*:\s*"([^"]*)"', raw)
         if not desc_match:
             desc_match = re.search(r'"description"\s*:\s*"([^"]*)$', raw)
         if desc_match:
             val = desc_match.group(1).strip()
-            if val:
-                result["description"] = val[:300] if len(val) > 300 else val
+            if val and self._is_valid_short_summary(val):
+                lines = [ln.strip() for ln in val.replace("\\n", "\n").split("\n") if ln.strip()]
+                if len(lines) < 3:
+                    while len(lines) < 3:
+                        lines.append("Additional details are provided in the supporting documents.")
+                elif len(lines) > 4:
+                    lines = lines[:4]
+                lines = [ln[:120] if len(ln) > 120 else ln for ln in lines]
+                result["description"] = "\n".join(lines)[:500]
         return result
+
+    def _is_valid_short_summary(self, description: str) -> bool:
+        """Return False if description looks like raw document paste or is not a short summary."""
+        if not description or not description.strip():
+            return False
+        # Reject if it contains document labels or raw paste
+        if "--- Document" in description or "Document 1 ---" in description or "Document 2 ---" in description:
+            return False
+        # Reject if too long (short summary should be at most ~500 chars for 3-4 lines)
+        if len(description) > 550:
+            return False
+        # Reject if more than 4 lines
+        lines = [ln.strip() for ln in description.split("\n") if ln.strip()]
+        if len(lines) > 4:
+            return False
+        # Reject if any single line is very long (likely raw text)
+        if any(len(ln) > 200 for ln in lines):
+            return False
+        return True
+
+    def _is_generic_description(self, text: str) -> bool:
+        """Return True if description is the known generic placeholder."""
+        if not text or len(text.strip()) < 20:
+            return True
+        generic_phrases = [
+            "Legal matter based on uploaded documents",
+            "The case involves parties and issues requiring legal review",
+            "The matter requires appropriate legal action",
+            "Supporting documents provide further context",
+            "parties and issues requiring legal review",  # Partial match
+            "appropriate legal action",  # Partial match
+        ]
+        # Check if it contains the exact generic block or 2+ generic phrases
+        exact_generic = "Legal matter based on uploaded documents" in text and "The case involves parties and issues requiring legal review" in text
+        phrase_count = sum(1 for p in generic_phrases if p in text)
+        return exact_generic or phrase_count >= 2
+
+    async def _generate_case_summary_from_documents(self, combined: str) -> str:
+        """Use AI to generate a case-specific 3-4 line summary from document content. Works for any language."""
+        import re
+        if not combined or len(combined.strip()) < 30:
+            return ""
+        try:
+            from app.ai.gemini_client import gemini_client
+            gemini_client.initialize()
+            doc_content = combined[:4000].replace("--- Document", "\nDocument")
+
+            for attempt in range(2):  # First attempt + one retry if generic
+                if attempt == 0:
+                    prompt = f"""You are summarizing a legal case document. The document may be in Hindi, English, or mixed languages.
+
+TASK: Write a SHORT CASE SUMMARY in English. Requirements:
+- Exactly 3 or 4 lines. Each line = one short sentence (max 120 characters).
+- Line 1: Name the ACTUAL parties (real names of people/organizations) and the SPECIFIC dispute or issue (e.g. "contract breach", "social media hacking", "defamation", "cricket association dispute").
+- Line 2: State ONE or TWO concrete facts or allegations from the document (be specific, not vague).
+- Line 3: State the SPECIFIC relief, investigation, or action sought (e.g. "seeks FIR", "requests damages", "demands investigation").
+- Line 4 (optional): One more specific detail from the case.
+
+FORBIDDEN PHRASES - DO NOT USE THESE EXACT WORDS:
+- "Legal matter based on uploaded documents"
+- "The case involves parties and issues requiring legal review"
+- "The matter requires appropriate legal action"
+- "Supporting documents provide further context"
+
+You MUST extract and name the REAL parties and REAL dispute from the document. If the document mentions names like "Umesh Malik", "BCCI", "Karnataka State Cricket Association", "Shubham Malik", etc., USE THOSE NAMES. If it mentions hacking, contract issues, defamation, etc., STATE THAT SPECIFIC ISSUE.
+
+IMPORTANT: Output exactly 3 or 4 lines. Put each sentence on its own line (use a newline after each sentence). Do not output a single paragraph.
+
+Document content:
+{doc_content}
+
+Case summary (3-4 lines, one sentence per line):"""
+                else:
+                    prompt = f"""CRITICAL: Your previous response was too generic. For the SAME document below, write a SPECIFIC case summary.
+
+You MUST extract REAL information:
+- Line 1: Find and name the ACTUAL complainant/petitioner and respondent/defendant from the document (e.g. if document says "Umesh Malik" or "BCCI" or "Karnataka State Cricket Association", USE THOSE NAMES). Then state the SPECIFIC dispute type (e.g. "social media account hacking", "contract violation", "defamation", "cricket association dispute").
+- Line 2: Extract ONE concrete fact from the document (e.g. "hacked social media account", "edited videos made viral", "contract terms violated", "payment not received").
+- Line 3: Extract the SPECIFIC relief sought (e.g. "seeks FIR under IT Act", "requests investigation", "demands compensation", "requests contract enforcement").
+- Line 4 (optional): One more specific detail.
+
+DO NOT use these phrases: "Legal matter based on uploaded documents", "parties and issues requiring legal review", "appropriate legal action", "Supporting documents provide further context".
+
+Read the document carefully and extract REAL names and REAL facts. Output exactly 3 or 4 lines. Put each sentence on its own line (newline after each sentence).
+
+Document content:
+{doc_content}
+
+Specific case summary (3-4 lines, one sentence per line):"""
+
+                raw = await gemini_client.generate(prompt, temperature=0.2 if attempt == 0 else 0.4, max_tokens=500)
+                if not raw:
+                    logger.warning("AI returned empty response for case summary (attempt {})", attempt + 1)
+                    continue
+                # Split by newline first
+                lines = [ln.strip() for ln in raw.strip().split("\n") if ln.strip()][:4]
+                # If model returned 1–2 lines (e.g. one paragraph), split by sentence to get 3–4 lines
+                if len(lines) < 3 and lines:
+                    combined_text = " ".join(lines)
+                    logger.debug("Attempting sentence split on: {}", combined_text[:100])
+                    # Split on sentence endings: period, exclamation, or question mark followed by space or end
+                    # Use lookahead to keep the punctuation
+                    sentences = re.split(r"([.!?])\s+", combined_text)
+                    # Reconstruct sentences with punctuation
+                    reconstructed = []
+                    for i in range(0, len(sentences) - 1, 2):
+                        if i + 1 < len(sentences):
+                            sentence = (sentences[i] + sentences[i + 1]).strip()
+                        else:
+                            sentence = sentences[i].strip()
+                        if sentence and len(sentence) > 8:  # Lower threshold for short valid sentences
+                            # Ensure sentence ends with punctuation
+                            if not re.search(r"[.!?]$", sentence):
+                                sentence += "."
+                            reconstructed.append(sentence)
+                    # If we didn't get good splits, try simpler period-based split
+                    if len(reconstructed) < 2:
+                        sentences = re.split(r"\.\s+", combined_text)
+                        reconstructed = []
+                        for s in sentences:
+                            s = s.strip()
+                            if s and len(s) > 8:
+                                if not s.endswith("."):
+                                    s += "."
+                                reconstructed.append(s)
+                    if len(reconstructed) >= 2:  # Accept 2+ sentences (better than failing)
+                        lines = reconstructed[:4]
+                        logger.info("Sentence split successful: {} sentences from {} lines", len(lines), len([ln.strip() for ln in raw.strip().split("\n") if ln.strip()]))
+                if len(lines) < 2:  # Require at least 2 lines (be more lenient)
+                    logger.warning("AI returned only {} lines (need at least 2) for case summary (attempt {})", len(lines), attempt + 1)
+                    continue
+                summary = "\n".join(lines[:4])
+                lines = [ln[:120] if len(ln) > 120 else ln for ln in summary.split("\n")]
+                summary = "\n".join(lines)[:500]
+                if not self._is_valid_short_summary(summary):
+                    logger.warning("AI summary failed validation (attempt {}): {}", attempt + 1, summary[:100])
+                    continue
+                if self._is_generic_description(summary):
+                    logger.warning("AI returned generic description (attempt {}): {}", attempt + 1, summary[:100])
+                    if attempt == 0:
+                        logger.info("Retrying with stricter prompt")
+                    continue
+                logger.info("Successfully generated case-specific description (attempt {})", attempt + 1)
+                return summary
+
+            logger.error("Failed to generate case-specific description after {} attempts", 2)
+            # Try simple fallback before giving up
+            logger.info("Attempting simple fallback for case summary generation")
+            simple_result = await self._generate_case_summary_from_documents_simple(combined)
+            if simple_result:
+                logger.info("Simple fallback succeeded: {}", simple_result[:80])
+                return simple_result
+            return ""
+        except Exception as e:
+            logger.warning("AI case summary generation failed: {}", str(e))
+            # Try simple fallback on exception too
+            try:
+                simple_result = await self._generate_case_summary_from_documents_simple(combined)
+                if simple_result:
+                    logger.info("Simple fallback succeeded after exception: {}", simple_result[:80])
+                    return simple_result
+            except Exception:
+                pass
+            return ""
+
+    async def _generate_case_summary_from_documents_simple(self, combined: str) -> str:
+        """Simpler fallback: generate case summary with minimal prompt when main method fails."""
+        import re
+        if not combined or len(combined.strip()) < 30:
+            return ""
+        try:
+            from app.ai.gemini_client import gemini_client
+            gemini_client.initialize()
+            doc_content = combined[:3000].replace("--- Document", "\nDocument")
+            prompt = f"""Summarize this legal case in exactly 3-4 short sentences in English. Name the actual parties and the actual dispute. Be specific. Put each sentence on its own line (newline after each sentence).
+
+{doc_content}
+
+Summary (3-4 lines, one sentence per line):"""
+            raw = await gemini_client.generate(prompt, temperature=0.5, max_tokens=400)
+            if not raw:
+                return ""
+            lines = [ln.strip() for ln in raw.strip().split("\n") if ln.strip()][:4]
+            if len(lines) < 2 and lines:  # More lenient: accept 2+ lines
+                combined_text = " ".join(lines)
+                # Split on sentence endings
+                sentences = re.split(r"([.!?])\s+", combined_text)
+                reconstructed = []
+                for i in range(0, len(sentences) - 1, 2):
+                    if i + 1 < len(sentences):
+                        sentence = (sentences[i] + sentences[i + 1]).strip()
+                    else:
+                        sentence = sentences[i].strip()
+                    if sentence and len(sentence) > 8:
+                        if not re.search(r"[.!?]$", sentence):
+                            sentence += "."
+                        reconstructed.append(sentence)
+                # Fallback to simple period split
+                if len(reconstructed) < 2:
+                    sentences = re.split(r"\.\s+", combined_text)
+                    reconstructed = []
+                    for s in sentences:
+                        s = s.strip()
+                        if s and len(s) > 8:
+                            if not s.endswith("."):
+                                s += "."
+                            reconstructed.append(s)
+                if len(reconstructed) >= 2:
+                    lines = reconstructed[:4]
+            if len(lines) < 2:  # Require at least 2 lines
+                return ""
+            summary = "\n".join(lines[:4])
+            lines = [ln[:120] if len(ln) > 120 else ln for ln in summary.split("\n")]
+            summary = "\n".join(lines)[:500]
+            if self._is_valid_short_summary(summary) and not self._is_generic_description(summary):
+                return summary
+            return ""
+        except Exception:
+            return ""
+
+    def _generate_case_description_from_content(self, doc_text: str) -> str:
+        """Synchronous fallback: generate short summary from content. Prefer _generate_case_summary_from_documents (async) for case-specific text."""
+        if not doc_text or len(doc_text.strip()) < 50:
+            return "Legal matter based on uploaded documents.\nThe case involves parties and issues requiring legal review.\nThe matter requires appropriate legal action.\nSupporting documents provide further context."
+        
+        import re
+        # Match "--- Document N ---" (avoid [^---] set-difference warning: use [^-]* = any chars except dash)
+        cleaned = re.sub(r"---\s*Document\s*\d+[^-]*---", " ", doc_text, flags=re.IGNORECASE)
+        cleaned = cleaned.strip()
+        if len(cleaned) < 30:
+            cleaned = doc_text
+        
+        sentences = []
+        for s in cleaned.split("."):
+            s = s.strip()
+            if len(s) < 15 or len(s) > 180:
+                continue
+            if s.startswith("---") or "Document" in s or s.isdigit():
+                continue
+            sentences.append(s + ".")
+        
+        short_sentences = [s for s in sentences if len(s) <= 120][:4]
+        if len(short_sentences) >= 3:
+            return "\n".join(short_sentences[:4])
+        return "Legal matter based on uploaded documents.\nThe case involves parties and issues requiring legal review.\nThe matter requires appropriate legal action.\nSupporting documents provide further context."
+
+    def _ensure_metadata_complete(self, metadata: Dict[str, Any], combined: str = "") -> Dict[str, Any]:
+        """Ensure all metadata fields have non-empty values."""
+        result = metadata.copy()
+        # Ensure category
+        if not result.get("caseCategory") or result.get("caseCategory") == "General":
+            result["caseCategory"] = "CIVIL LAW"
+        elif "LAW" not in result["caseCategory"] and "ACT" not in result["caseCategory"]:
+            result["caseCategory"] = result["caseCategory"] + " LAW"
+        # Ensure subcategories
+        if not result.get("subcategories"):
+            result["subcategories"] = ["Bharatiya Nyaya Sanhita"] if "CRIMINAL" in result.get("caseCategory", "") else ["Indian Contract Act, 1872"]
+        # Ensure description (3-4 lines minimum) - must be a short summary, not raw document text
+        desc = result.get("description") or ""
+        if not desc.strip() or not self._is_valid_short_summary(desc):
+            result["description"] = ""
+        if not result.get("description"):
+            # Only use generic fallback if we have NO document content
+            # If we have document content, async path should have generated description
+            # If async failed, leave empty rather than use generic (better than wrong description)
+            if not combined or len(combined.strip()) < 50:
+                result["description"] = "Legal matter based on uploaded documents.\nThe case involves parties and issues requiring legal review.\nThe matter requires appropriate legal action.\nSupporting documents provide further context."
+            else:
+                # We have document content but description is empty - async generation likely failed
+                # Try sync extraction as last resort, but only if it returns non-generic content
+                doc_text = combined[:800].replace("\n", " ")
+                extracted = self._generate_case_description_from_content(doc_text)
+                # Only use if it's not the generic fallback
+                if extracted and not self._is_generic_description(extracted):
+                    result["description"] = extracted
+                else:
+                    # Leave empty - better than generic placeholder
+                    logger.warning("Could not generate case-specific description; leaving empty")
+                    result["description"] = ""
+        else:
+            # Ensure existing description has 3-4 lines and is case-specific
+            desc_lines = [ln.strip() for ln in result["description"].split("\n") if ln.strip()]
+            # Check if description is generic - if so, clear it (don't regenerate with sync method which also returns generic)
+            generic_phrases = ["Legal matter based", "The case involves parties", "The matter requires", "Supporting documents"]
+            is_generic = any(phrase in result["description"] for phrase in generic_phrases)
+            
+            if is_generic:
+                # Clear generic description - async path should have already tried to generate case-specific
+                # Don't use sync _generate_case_description_from_content as it also returns generic
+                logger.warning("Description is generic, clearing it (should have been replaced by async AI generation)")
+                result["description"] = ""
+                desc_lines = []
+            
+            if len(desc_lines) < 3:
+                # Pad with short generic lines only (never use raw document text)
+                while len(desc_lines) < 3:
+                    desc_lines.append("Additional details are provided in the supporting documents.")
+                result["description"] = "\n".join(desc_lines)
+            elif len(desc_lines) > 4:
+                result["description"] = "\n".join(desc_lines[:4])
+            # Ensure no line is too long (short summary only)
+            desc_lines = [ln[:120] if len(ln) > 120 else ln for ln in (result["description"].split("\n"))]
+            result["description"] = "\n".join(desc_lines)[:500]
+        # Ensure title
+        if not result.get("caseTitle"):
+            result["caseTitle"] = "Petitioner vs Respondent"
+        # Ensure title is in "vs" format
+        title = result.get("caseTitle", "")
+        if title and " vs " not in title and " v " not in title:
+            if " vs" in title or "vs " in title:
+                title = title.replace(" vs", " vs ").replace("vs ", " vs ")
+            else:
+                title = f"{title} vs Matter"
+            result["caseTitle"] = title
+        return result
+
+    async def _generate_fallback_metadata(self, combined: str, workspace_id: str) -> Dict[str, Any]:
+        """Generate fallback metadata when AI parsing fails - ensures all fields have values."""
+        try:
+            from app.ai.gemini_client import gemini_client
+            gemini_client.initialize()
+            doc_preview = combined[:400].replace("\n", " ")
+            fallback_prompt = f"""From this document content, extract ACTUAL CASE DETAILS:
+1. Two parties/names for title format "Party1 vs Party2" (or "Party vs Issue" if only one)
+2. One legal category (CRIMINAL LAW, CIVIL LAW, CYBER LAW, etc.)
+3. One relevant Indian act
+4. A SHORT CASE SUMMARY in English only (3-4 lines). Summarize in your own words; do NOT copy-paste document text. Each line one short sentence.
+
+Document: {doc_preview}
+
+Return JSON: {{"caseTitle": "Name1 vs Name2", "caseCategory": "CIVIL LAW", "subcategories": ["Act Name"], "description": "Line 1: Actual party and issue from documents\\nLine 2: Key facts/allegations from documents\\nLine 3: Relief sought from documents\\nLine 4: Additional relevant details"}}"""
+            raw = await gemini_client.generate(fallback_prompt, temperature=0.3, max_tokens=300)
+            import json
+            import re
+            start = raw.find("{")
+            if start >= 0:
+                end = raw.find("}", start) + 1
+                if end > start:
+                    try:
+                        data = json.loads(raw[start:end])
+                        title = (data.get("caseTitle") or "").strip()
+                        category = (data.get("caseCategory") or "CIVIL LAW").strip().upper()
+                        subs = data.get("subcategories") or []
+                        desc = (data.get("description") or "").strip()
+                        if not title:
+                            title = "Petitioner vs Respondent"
+                        if " vs " not in title and " v " not in title:
+                            title = f"{title} vs Matter"
+                        if not category or category == "General":
+                            category = "CIVIL LAW"
+                        if "LAW" not in category and "ACT" not in category:
+                            category = category + " LAW"
+                        if not subs:
+                            subs = ["Bharatiya Nyaya Sanhita"] if "CRIMINAL" in category else ["Indian Contract Act, 1872"]
+                        if not desc and combined and len(combined.strip()) > 50:
+                            desc = await self._generate_case_summary_from_documents(combined)
+                        if not desc:
+                            desc = self._generate_case_description_from_content(doc_preview)
+                        else:
+                            # Ensure 3-4 lines and case-specific
+                            desc_lines = [ln.strip() for ln in desc.split("\n") if ln.strip()]
+                            # Check if generic - regenerate from content if so
+                            generic_phrases = ["Legal matter based", "The case involves parties", "The matter requires", "Supporting documents"]
+                            is_generic = any(phrase in desc for phrase in generic_phrases)
+                            
+                            if is_generic and doc_preview and len(doc_preview.strip()) > 50:
+                                desc = self._generate_case_description_from_content(doc_preview)
+                                desc_lines = [ln.strip() for ln in desc.split("\n") if ln.strip()]
+                            
+                            if len(desc_lines) < 3:
+                                # Pad with case-specific content
+                                if doc_preview and len(doc_preview.strip()) > 50:
+                                    sentences = [s.strip() for s in doc_preview.split(".") if len(s.strip()) > 20]
+                                    while len(desc_lines) < 3 and sentences:
+                                        new_line = sentences.pop(0) + "."
+                                        if new_line not in desc_lines:
+                                            desc_lines.append(new_line)
+                                    while len(desc_lines) < 3:
+                                        desc_lines.append("Additional details are provided in the supporting documents.")
+                                else:
+                                    while len(desc_lines) < 3:
+                                        desc_lines.append("Additional details are provided in the supporting documents.")
+                                desc = "\n".join(desc_lines)
+                            elif len(desc_lines) > 4:
+                                desc = "\n".join(desc_lines[:4])
+                        return {"caseTitle": title, "caseCategory": category, "subcategories": subs[:3], "description": desc[:500]}
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # Ultimate fallback - use AI to generate case-specific summary from documents when available
+        desc = "Legal matter based on uploaded documents.\nThe case involves parties and issues requiring legal review.\nThe matter requires appropriate legal action.\nSupporting documents provide further context."
+        if combined and len(combined.strip()) > 50:
+            ai_desc = await self._generate_case_summary_from_documents(combined)
+            if ai_desc:
+                desc = ai_desc
+        return {"caseTitle": "Petitioner vs Respondent", "caseCategory": "CIVIL LAW", "subcategories": ["Indian Contract Act, 1872"], "description": desc}
 
     async def _get_workspace_category_and_subcategory(
         self,
@@ -575,8 +1021,9 @@ suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words eac
         user_id: str,
     ) -> Dict[str, Any]:
         """
-        Infer case title (from documents), case category, subcategories and short description from workspace documents using AI.
-        Returns {"caseTitle": str, "caseCategory": str, "subcategories": List[str], "description": str}. caseTitle is fixed once; do not overwrite on sync.
+        Infer case title (from documents), case category, subcategories and description (3-4 lines) from workspace documents using AI.
+        Returns {"caseTitle": str, "caseCategory": str, "subcategories": List[str], "description": str}. 
+        Description must be 3-4 lines (minimum 3, maximum 4). caseTitle is fixed once; do not overwrite on sync.
         """
         import json
         import re
@@ -588,9 +1035,9 @@ suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words eac
                 all_docs = await vector_store.get_all_documents(workspace_id=workspace_id)
             except Exception as e:
                 logger.warning("Could not retrieve documents for category: {}", str(e))
-                return {"caseTitle": "", "caseCategory": "General", "subcategories": [], "description": ""}
+                return {"caseTitle": "Petitioner vs Respondent", "caseCategory": "CIVIL LAW", "subcategories": ["Indian Contract Act, 1872"], "description": "Legal matter based on uploaded documents."}
             if not all_docs:
-                return {"caseTitle": "", "caseCategory": "General", "subcategories": [], "description": ""}
+                return {"caseTitle": "Petitioner vs Respondent", "caseCategory": "CIVIL LAW", "subcategories": ["Indian Contract Act, 1872"], "description": "Legal matter based on uploaded documents."}
             parts = []
             for i, doc in enumerate(all_docs, 1):
                 content = (doc.get("content") or "").strip()
@@ -598,22 +1045,25 @@ suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words eac
                     parts.append(f"--- Document {i} ---\n{content}")
             combined = "\n\n".join(parts) if parts else ""
             if not combined:
-                return {"caseTitle": "", "caseCategory": "General", "subcategories": [], "description": ""}
+                return {"caseTitle": "Petitioner vs Respondent", "caseCategory": "CIVIL LAW", "subcategories": ["Indian Contract Act, 1872"], "description": "Legal matter based on uploaded documents."}
             combined = (combined[:5000] + "...") if len(combined) > 5000 else combined
             gemini_client.initialize()
-            prompt = f"""Based on the document content below, output a JSON object with:
-- caseTitle: one short formal case title from the documents (e.g. "Umesh Malik vs Social Media Hacking Complaint" or "Complaint re Hacked Account - Shubham Malik"). Use parties/subject from the docs, not generic text.
-- caseCategory: exactly one category in UPPERCASE (e.g. CRIMINAL LAW, CYBER LAW, CIVIL LAW).
-- subcategories: array of 1-3 relevant Indian acts (e.g. "Bharatiya Nyaya Sanhita", "Information Technology Act, 2000").
-- description: a short case description in 1 or 2 lines only (e.g. "Approximate start date of the U-16 Vijay Merchant Trophy; intervention is required."). Summarize the main subject or relief sought; keep it concise.
+            prompt = f"""Based on the document content below, output a JSON object with ALL fields REQUIRED (no empty/null values):
+
+- caseTitle: MUST be in format "Petitioner vs Respondent" or "Party1 vs Party2" (e.g. "Umesh Malik vs Karnataka State Cricket Association", "Shubham Malik vs Social Media Hacking"). Extract actual party names from documents. Format: "[Petitioner/Complainant Name] vs [Respondent/Defendant Name]" or "[Party] vs [Issue/Matter]". This field is MANDATORY - always provide a title.
+- caseCategory: exactly one category in UPPERCASE (e.g. CRIMINAL LAW, CYBER LAW, CIVIL LAW, TRADE MARK LAW). MANDATORY - must be one of: CRIMINAL LAW, CIVIL LAW, CYBER LAW, CONTRACT LAW, PROPERTY LAW, LABOUR LAW, TAX LAW, or similar.
+- subcategories: array of 1-3 relevant Indian acts (e.g. ["Bharatiya Nyaya Sanhita", "Information Technology Act, 2000", "The Trade Marks Act, 1999"]). MANDATORY - must have at least 1 act.
+- description: a SHORT CASE SUMMARY in English only, exactly 3 to 4 lines (minimum 3, maximum 4). You MUST write a SPECIFIC summary for this case: name the actual parties (people or organizations) and the actual dispute. Do NOT use generic phrases like "Legal matter based on uploaded documents" or "The case involves parties and issues requiring legal review". Write in your own words; do NOT copy-paste the document. Each line one short sentence (under 120 characters). Line 1: actual parties and main issue. Line 2: key facts or allegations. Line 3: relief or action sought. Line 4 (optional): one more relevant detail. Output only the summary text, no prefixes like "Line 1:".
 
 Document content:
 {combined}
 
-Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "caseCategory": "CRIMINAL LAW", "subcategories": ["Bharatiya Nyaya Sanhita", "IT Act 2000"], "description": "Short 1-2 line case summary."}}"""
+CRITICAL: All four fields (caseTitle, caseCategory, subcategories, description) are MANDATORY. Do not leave any field empty or null.
+
+Output ONLY this JSON, no markdown: {{"caseTitle": "Petitioner Name vs Respondent Name", "caseCategory": "CRIMINAL LAW", "subcategories": ["Bharatiya Nyaya Sanhita", "IT Act 2000"], "description": "MLA Umesh Malik has filed a complaint regarding his son Shubham Malik's hacked social media account.\\nEdited videos and posts were made viral to defame the complainant and damage his political image.\\nThe complainant seeks a high-level investigation and strict action against the perpetrators.\\nThe complaint involves alleged violations under IT Act 2000 and requests preservation of digital evidence."}}"""
             raw = await gemini_client.generate(prompt, temperature=0.2, max_tokens=700)
             if not raw or "Error" in (raw[:80] or ""):
-                return {"caseTitle": "", "caseCategory": "General", "subcategories": [], "description": ""}
+                return await self._generate_fallback_metadata(combined, workspace_id)
             raw_clean = raw.strip()
             if "```" in raw_clean:
                 code = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw_clean)
@@ -631,40 +1081,132 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                             raw_clean = raw_clean[start : i + 1]
                             break
             if not raw_clean or not raw_clean.strip().startswith("{"):
-                salvaged = self._salvage_workspace_metadata_from_truncated_json(raw)
+                salvaged = self._salvage_workspace_metadata_from_truncated_json(raw, combined)
+                salvaged = self._ensure_metadata_complete(salvaged, combined)
+                if combined and len(combined.strip()) > 50:
+                    ai_desc = await self._generate_case_summary_from_documents(combined)
+                    if ai_desc:
+                        salvaged["description"] = ai_desc
                 if salvaged.get("caseCategory") != "General" or salvaged.get("subcategories") or salvaged.get("caseTitle"):
                     return salvaged
-                return {"caseTitle": "", "caseCategory": "General", "subcategories": [], "description": ""}
+                return await self._generate_fallback_metadata(combined, workspace_id)
             try:
                 data = json.loads(raw_clean)
             except json.JSONDecodeError:
-                salvaged = self._salvage_workspace_metadata_from_truncated_json(raw)
+                salvaged = self._salvage_workspace_metadata_from_truncated_json(raw, combined)
+                salvaged = self._ensure_metadata_complete(salvaged, combined)
+                if combined and len(combined.strip()) > 50:
+                    ai_desc = await self._generate_case_summary_from_documents(combined)
+                    if ai_desc:
+                        salvaged["description"] = ai_desc
                 if salvaged.get("caseCategory") != "General" or salvaged.get("subcategories") or salvaged.get("caseTitle"):
                     logger.info("Used salvaged workspace metadata from truncated response")
                     return salvaged
-                return {"caseTitle": "", "caseCategory": "General", "subcategories": [], "description": ""}
+                return await self._generate_fallback_metadata(combined, workspace_id)
             case_title = (data.get("caseTitle") or "").strip()
-            case_category = (data.get("caseCategory") or "General").strip().upper()
-            if case_category and "LAW" not in case_category and "ACT" not in case_category:
-                case_category = case_category + " LAW"
+            case_category = (data.get("caseCategory") or "").strip().upper()
             subcategories = data.get("subcategories") or data.get("subcategory") or []
             if isinstance(subcategories, str):
                 subcategories = [subcategories] if subcategories else []
             subcategories = [str(s).strip() for s in subcategories if s][:5]
             description = (data.get("description") or "").strip()
             if description:
-                lines = [ln.strip() for ln in description.split("\n") if ln.strip()][:2]
-                description = " ".join(lines)[:300]
-            logger.info(
-                "Workspace metadata: caseTitle={}, caseCategory={}, subcategories={}",
-                case_title[:50] if case_title else "",
-                case_category,
-                subcategories,
+                # Handle both actual newlines and escaped \n in JSON
+                description = description.replace("\\n", "\n")
+                # Reject if it looks like raw document paste
+                if not self._is_valid_short_summary(description):
+                    description = ""
+                else:
+                    lines = [ln.strip() for ln in description.split("\n") if ln.strip()]
+                    # Ensure 3-4 lines: pad if less than 3, truncate if more than 4
+                    if len(lines) < 3:
+                        while len(lines) < 3:
+                            lines.append("Additional details regarding the legal matter.")
+                    elif len(lines) > 4:
+                        lines = lines[:4]
+                    # Truncate any line that is too long (keep summary short)
+                    lines = [ln[:120] if len(ln) > 120 else ln for ln in lines]
+                    description = "\n".join(lines)[:500]
+            
+            # Build initial result
+            result = {"caseTitle": case_title, "caseCategory": case_category, "subcategories": subcategories, "description": description}
+            
+            # If description is missing, invalid, or generic, generate case-specific summary from documents using AI
+            generic_phrases = ["Legal matter based on uploaded documents", "The case involves parties and issues requiring legal review"]
+            need_description = (
+                not result.get("description") or
+                not self._is_valid_short_summary(result["description"]) or
+                any(p in (result.get("description") or "") for p in generic_phrases)
             )
-            return {"caseTitle": case_title, "caseCategory": case_category or "General", "subcategories": subcategories, "description": description}
+            if need_description:
+                if not combined or len(combined.strip()) < 50:
+                    logger.warning("Cannot generate case-specific description: no document content available (length: {})", len(combined) if combined else 0)
+                else:
+                    # Clear generic description before trying AI generation
+                    if result.get("description") and any(p in result["description"] for p in generic_phrases):
+                        result["description"] = ""
+                        logger.info("Cleared generic description, generating case-specific summary from documents ({} chars)", len(combined))
+                    ai_summary = await self._generate_case_summary_from_documents(combined)
+                    if ai_summary:
+                        result["description"] = ai_summary
+                        logger.info("✅ Generated case-specific description from documents (AI): {}", ai_summary[:80])
+                    elif not result.get("description"):
+                        # AI generation failed - try one more time with simpler prompt
+                        logger.warning("First AI description attempt failed, retrying with simpler prompt")
+                        ai_summary = await self._generate_case_summary_from_documents_simple(combined)
+                        if ai_summary:
+                            result["description"] = ai_summary
+                            logger.info("✅ Generated case-specific description (retry): {}", ai_summary[:80])
+                        else:
+                            logger.error("❌ Failed to generate case-specific description after retries - description will be empty")
+                            result["description"] = ""  # Leave empty rather than use generic
+            
+            # If title is missing, try to generate it from document content before fallback
+            if not result["caseTitle"]:
+                title_prompt = f"""From this document content, extract two parties or names and create a case title in format "Party1 vs Party2". If only one party, use "Party vs [Issue]".
+
+Document: {combined[:800]}
+
+Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other text."""
+                try:
+                    title_raw = await gemini_client.generate(title_prompt, temperature=0.3, max_tokens=100)
+                    if title_raw:
+                        title_raw = title_raw.strip().strip('"').strip("'")
+                        if " vs " in title_raw or " v " in title_raw:
+                            result["caseTitle"] = title_raw.split("\n")[0].split(".")[0].strip()
+                        else:
+                            result["caseTitle"] = f"{title_raw} vs Matter"
+                except Exception:
+                    pass  # _ensure_metadata_complete will set fallback
+            
+            # Ensure all fields are complete (fills any missing values)
+            result = self._ensure_metadata_complete(result, combined)
+            
+            logger.info(
+                "Workspace metadata: caseTitle={}, caseCategory={}, subcategories={}, description={}",
+                result["caseTitle"][:50] if result["caseTitle"] else "",
+                result["caseCategory"],
+                result["subcategories"],
+                result["description"][:50] if result["description"] else "",
+            )
+            return result
         except Exception as e:
             logger.warning("Workspace category/subcategory generation failed: {}", str(e))
-            return {"caseTitle": "", "caseCategory": "General", "subcategories": [], "description": ""}
+            import traceback
+            logger.debug("Traceback: {}", traceback.format_exc())
+            desc = "Legal matter based on uploaded documents.\nThe case involves parties and issues requiring legal review.\nThe matter requires appropriate legal action.\nSupporting documents provide further context."
+            if 'combined' in locals() and combined and len(combined.strip()) > 50:
+                ai_desc = await self._generate_case_summary_from_documents(combined)
+                if ai_desc:
+                    desc = ai_desc
+            fallback = {"caseTitle": "Petitioner vs Respondent", "caseCategory": "CIVIL LAW", "subcategories": ["Indian Contract Act, 1872"], "description": desc}
+            # Try to ensure metadata is complete (in case method exists)
+            try:
+                fallback = self._ensure_metadata_complete(fallback, combined if 'combined' in locals() else "")
+            except AttributeError:
+                # Method doesn't exist, use fallback as-is
+                pass
+            return fallback
 
     # ========================================================================
     # Connection Events
@@ -949,10 +1491,11 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                                         workspace_metadata_payload
                                     )
                                     logger.success(
-                                        "✅ Workspace metadata sent: title={} (from docs, fixed), category={}, subcategories={}",
+                                        "✅ Workspace metadata sent: title={} (from docs, fixed), category={}, subcategories={}, description={}",
                                         (meta.get("caseTitle") or "")[:50],
                                         meta.get("caseCategory"),
                                         meta.get("subcategories"),
+                                        (meta.get("description") or "")[:50],
                                     )
                                 except Exception as meta_err:
                                     logger.warning("Failed to emit workspace_metadata: {}", str(meta_err))
@@ -996,6 +1539,10 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                                         logger.info("📋 RECOMMENDATIONS:")
                                         for idx, rec in enumerate(strategies_result.get('recommendations', []), 1):
                                             logger.info(f"  {idx}. {rec}")
+                                        logger.info("")
+                                        logger.info("🚀 POSSIBLE NEXT STEPS:")
+                                        for idx, step in enumerate(strategies_result.get('possibleNextSteps', []), 1):
+                                            logger.info(f"  {idx}. {step}")
                                         logger.info("")
                                         logger.info("📊 ANALYSIS METADATA:")
                                         analysis = strategies_result.get('analysis', {})
@@ -1355,9 +1902,10 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                                         workspace_metadata_payload
                                     )
                                     logger.success(
-                                        "✅ Workspace metadata (sync) sent: title=unchanged, category={}, subcategories={}",
+                                        "✅ Workspace metadata (sync) sent: title=unchanged, category={}, subcategories={}, description={}",
                                         meta.get("caseCategory"),
                                         meta.get("subcategories"),
+                                        (meta.get("description") or "")[:50],
                                     )
                                 except Exception as meta_err:
                                     logger.warning("Failed to emit workspace_metadata (sync): {}", str(meta_err))
@@ -1412,6 +1960,10 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                                         logger.info("📋 RECOMMENDATIONS:")
                                         for idx, rec in enumerate(strategies_result.get('recommendations', []), 1):
                                             logger.info(f"  {idx}. {rec}")
+                                        logger.info("")
+                                        logger.info("🚀 POSSIBLE NEXT STEPS:")
+                                        for idx, step in enumerate(strategies_result.get('possibleNextSteps', []), 1):
+                                            logger.info(f"  {idx}. {step}")
                                         logger.info("")
                                         logger.info("📊 ANALYSIS METADATA:")
                                         analysis = strategies_result.get('analysis', {})

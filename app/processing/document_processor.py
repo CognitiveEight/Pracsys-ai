@@ -2,6 +2,7 @@
 Main document processor coordinating file handling, readability scoring,
 and vector storage.
 """
+import asyncio
 import json
 import re
 from typing import Dict, Any, List
@@ -395,53 +396,95 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
     
     async def _download_file(self, url: str, filename: str) -> tuple[bytes, int]:
         """
-        Download file from URL.
+        Download file from URL. Validates URL, retries on transient failures,
+        and raises with a clear error message.
         
         Returns:
             Tuple of (content, size)
         """
         if not self.http_client:
             await self.initialize()
-        
-        try:
-            # Clean URL (remove trailing quotes if present)
-            clean_url = url.rstrip('"')
-            
-            logger.debug("Downloading file from: {}", clean_url)
-            
-            response = await self.http_client.get(clean_url)
-            response.raise_for_status()
-            
-            content = response.content
-            size = len(content)
-            
-            # Check size limit
-            if size > self.max_file_size:
+
+        if not url or not isinstance(url, str):
+            msg = "Download URL is missing or invalid"
+            logger.error("{} (filename: {})", msg, filename)
+            raise FileProcessingError(msg, details={"filename": filename})
+
+        clean_url = (url or "").strip().rstrip('"')
+        if not clean_url.startswith(("http://", "https://")):
+            msg = f"Invalid download URL scheme (must be http/https): {clean_url[:80]}..."
+            logger.error("{} (filename: {})", msg, filename)
+            raise FileProcessingError(msg, details={"filename": filename, "url": clean_url[:200]})
+
+        max_attempts = 3
+        last_error = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                logger.debug("Downloading file from: {} (attempt {}/{})", clean_url[:100], attempt, max_attempts)
+                response = await self.http_client.get(clean_url)
+                response.raise_for_status()
+                content = response.content
+                size = len(content)
+
+                if size > self.max_file_size:
+                    raise FileProcessingError(
+                        f"File too large: {size / 1024 / 1024:.2f}MB (max: {self.max_file_size / 1024 / 1024}MB)",
+                        details={"filename": filename, "size": size}
+                    )
+
+                logger.debug("Downloaded file: {} ({:.2f}MB)", filename, size / 1024 / 1024)
+                return content, size
+
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                status = e.response.status_code
+                reason = (e.response.text or "")[:200]
+                err_msg = f"HTTP {status} ({e.response.reason_phrase or 'Error'})"
+                if reason:
+                    err_msg += f" — {reason}"
+                logger.error("HTTP error downloading {}: {}", filename, err_msg)
+                # Retry on server errors (5xx) and rate limit (429)
+                if attempt < max_attempts and (status >= 500 or status == 429):
+                    await asyncio.sleep(2 * attempt)
+                    continue
                 raise FileProcessingError(
-                    f"File too large: {size / 1024 / 1024:.2f}MB (max: {self.max_file_size / 1024 / 1024}MB)",
-                    details={"filename": filename, "size": size}
+                    f"Failed to download file: {err_msg}",
+                    details={"url": clean_url[:200], "filename": filename, "status_code": status}
                 )
-            
-            logger.debug(
-                "Downloaded file: {} ({:.2f}MB)",
-                filename,
-                size / 1024 / 1024
-            )
-            
-            return content, size
-            
-        except httpx.HTTPError as e:
-            logger.error("HTTP error downloading {}: {}", filename, str(e))
-            raise FileProcessingError(
-                f"Failed to download file: {str(e)}",
-                details={"url": url, "filename": filename}
-            )
-        except Exception as e:
-            logger.error("Error downloading {}: {}", filename, str(e))
-            raise FileProcessingError(
-                f"Failed to download file: {str(e)}",
-                details={"url": url, "filename": filename}
-            )
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+                last_error = e
+                err_msg = str(e) or type(e).__name__
+                logger.error("Connection/timeout error downloading {}: {}", filename, err_msg)
+                if attempt < max_attempts:
+                    await asyncio.sleep(2 * attempt)
+                    continue
+                raise FileProcessingError(
+                    f"Failed to download file: {err_msg}",
+                    details={"url": clean_url[:200], "filename": filename}
+                )
+            except httpx.HTTPError as e:
+                last_error = e
+                err_msg = str(e) or type(e).__name__
+                logger.error("HTTP error downloading {}: {}", filename, err_msg)
+                raise FileProcessingError(
+                    f"Failed to download file: {err_msg}",
+                    details={"url": clean_url[:200], "filename": filename}
+                )
+            except Exception as e:
+                last_error = e
+                err_msg = str(e) or type(e).__name__
+                logger.error("Error downloading {}: {}", filename, err_msg)
+                if attempt < max_attempts:
+                    await asyncio.sleep(2 * attempt)
+                    continue
+                raise FileProcessingError(
+                    f"Failed to download file: {err_msg}",
+                    details={"url": clean_url[:200], "filename": filename}
+                )
+
+        msg = str(last_error) if last_error else "Download failed after retries"
+        raise FileProcessingError(f"Failed to download file: {msg}", details={"filename": filename, "url": clean_url[:200]})
     
     async def _store_in_vector_db(
         self,

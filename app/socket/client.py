@@ -248,7 +248,8 @@ class SocketClient:
             logger.info("   - workspace_created")
             logger.info("   - workspace_sync")
             logger.info("   - user_message_request")
-            logger.info("📤 Ready to emit: ai_response")
+            logger.info("   - probing_prompts_request")
+            logger.info("📤 Ready to emit: ai_response, probing_prompts_response")
             self._connected = True
             await event_handler.handle("connect", None)
         
@@ -343,6 +344,15 @@ class SocketClient:
             """
             logger.info("💬 Received user_message_request event")
             await event_handler.handle("user_message_request", data)
+        
+        @self.sio.event
+        async def probing_prompts_request(data):
+            """
+            Handle probing_prompts_request (Server → AI_Maverick).
+            For STRATEGY_OBJECTIVE chatType, respond with random 4 suggestion chips as prompts.
+            """
+            logger.info("📋 Received probing_prompts_request event")
+            await event_handler.handle("probing_prompts_request", data)
         
         # ========================================================================
         # Legacy event handlers (for backward compatibility)

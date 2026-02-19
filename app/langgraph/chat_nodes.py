@@ -17,6 +17,11 @@ from app.langgraph.chat_models import (
 )
 from app.agents.role_models import RoleEnum
 from app.ai.gemini_client import gemini_client
+from app.prompts.legal_intelligence_system import (
+    get_legal_intelligence_system_instruction,
+    DOCUMENT_UPLOAD_GATE_MESSAGE,
+    ROLES,
+)
 
 
 def chat_context_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -117,13 +122,28 @@ APPLICABLE LAWS ({len(applicable_laws)} available):
 """
         context_sections.append(laws_section)
     
-    # 6. Chat History (last 3 exchanges)
+    # 5b. UPLOADED DOCUMENTS (source of truth – use these for drafts, answers, and any document-based response)
+    workspace_state = chat_context.get("workspace_state") or {}
+    uploaded_docs = workspace_state.get("uploaded_documents") or []
+    if uploaded_docs:
+        docs_section = "\nUPLOADED DOCUMENTS (use as source of truth for this workspace):\n"
+        for i, doc in enumerate(uploaded_docs, 1):
+            content = doc.get("content") or ""
+            if content:
+                docs_section += f"\n--- Document {i} ---\n{content}\n"
+        context_sections.append(docs_section)
+    
+    # 6. Chat History (last 3 exchanges; support both {user_message, response} and {role, content})
     chat_history = chat_context.get("chat_history", [])
     if chat_history:
         history_section = "RECENT CONVERSATION:\n"
-        for msg in chat_history[-3:]:
-            history_section += f"User: {msg.get('user_message', 'N/A')[:100]}\n"
-            history_section += f"Assistant: {msg.get('response', 'N/A')[:100]}\n"
+        for msg in chat_history[-6:]:  # up to 6 messages (3 exchanges)
+            if msg.get("role") and msg.get("content") is not None:
+                label = "User" if (msg.get("role") == "USER") else "Assistant"
+                history_section += f"{label}: {(msg.get('content') or '')[:200]}\n"
+            else:
+                history_section += f"User: {(msg.get('user_message') or 'N/A')[:100]}\n"
+                history_section += f"Assistant: {(msg.get('response') or 'N/A')[:100]}\n"
         context_sections.append(history_section)
     
     # Combine all sections
@@ -278,10 +298,9 @@ async def _handle_greeting(state: Dict[str, Any], user_message: str, role: str) 
     from datetime import datetime
     start_time = datetime.utcnow()
     
-    # Generate natural, contextual greeting response
+    # Generate natural, contextual greeting (still role-conditioned per legal intelligence rules)
+    system_instruction = get_legal_intelligence_system_instruction(current_role=role or "ADJUDICATOR")
     greeting_prompt = f"""
-You are a helpful AI assistant in a legal workspace system where the user's role is {role}.
-
 The user said: "{user_message}"
 
 Generate a natural, friendly response that:
@@ -291,11 +310,16 @@ Generate a natural, friendly response that:
 4. Does NOT include formal explanations, reasoning sections, or governance language
 5. Does NOT use phrases like "From judicial perspective" or overly formal language
 
-Just respond naturally as a helpful assistant would.
+Just respond naturally as a helpful assistant would, while remaining consistent with the workspace role.
 """
     
     try:
-        response = await gemini_client.generate(greeting_prompt)
+        response = await gemini_client.generate(
+            greeting_prompt,
+            system_instruction=system_instruction,
+            temperature=0.5,
+            max_tokens=300,
+        )
         processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
         
         # Clean up the response if it still has formal formatting
@@ -339,12 +363,7 @@ async def explain_why_node(state: Dict[str, Any]) -> Dict[str, Any]:
     
     Ensures explanation exists and is properly formatted.
     Attaches rationale, sources, and confidence.
-    
-    Args:
-        state: Current workflow state
-        
-    Returns:
-        Updated state with explanation
+    Enforces Document Upload Gate: first message after docs uploaded shows role confirmation.
     """
     logger.info("📝 Generating explanation...")
     
@@ -353,67 +372,95 @@ async def explain_why_node(state: Dict[str, Any]) -> Dict[str, Any]:
     intent = state.get("intent", "EXPLAIN")
     role = state.get("role")
     chat_context = state.get("chat_context", {})
+    workspace_state = chat_context.get("workspace_state") or {}
+    chat_history = chat_context.get("chat_history") or []
+    documents_count = workspace_state.get("documents_count", 0)
     
     # Special handling for GREETING intent - simple, natural responses
     if intent == "GREETING":
         logger.info("👋 Handling greeting/conversational message")
         return await _handle_greeting(state, user_message, role)
     
-    # Build reasoning prompt
+    # DOCUMENT UPLOAD GATE: First message when documents exist → show gate message and four roles only
+    if documents_count > 0 and len(chat_history) == 0:
+        gate_response = DOCUMENT_UPLOAD_GATE_MESSAGE + "\n\nSelect one role to proceed:\n\n• " + "\n• ".join(ROLES)
+        logger.info("📋 Document upload gate: returning role confirmation message (no analysis)")
+        return {
+            **state,
+            "response_text": gate_response,
+            "explanation": "Document upload gate – role confirmation required before any analysis.",
+            "sources": [],
+            "confidence": "HIGH",
+            "suggested_actions": [],
+            "processing_time_ms": 0,
+            "explanation_complete": True,
+        }
+    
+    # Role-conditioned legal intelligence system instruction
+    system_instruction = get_legal_intelligence_system_instruction(
+        current_role=role,
+        documents_uploaded=documents_count > 0,
+        role_confirmed=True,
+    )
+    
+    # Build prompt: natural intelligence-assistant response, using uploaded documents as source of truth
     reasoning_prompt = f"""
 {prompt_context}
 
-GOVERNANCE RULES:
-1. You MUST respect the role: {role}
-2. You MUST cite sources for ALL claims
-3. You MUST indicate confidence levels
-4. You MUST NOT invent facts
-5. You MUST NOT override approved facts
-6. You MUST explain your reasoning
-
-USER QUESTION: "{user_message}"
+USER MESSAGE: "{user_message}"
 
 INTENT: {intent}
 
-Generate a response that:
-1. Directly answers the question
-2. Explains WHY (reasoning)
-3. Cites specific sources (documents, facts, laws)
-4. Indicates confidence level
-5. Respects the role perspective
+Respond as an intelligence assistant. Use the UPLOADED DOCUMENTS above as the source of truth whenever the user asks for help, a draft, analysis, or anything that should be based on their case. Answer in a clear, helpful, and natural way—no need for a rigid template.
 
-Response format:
-ANSWER: <direct answer>
-EXPLANATION: <detailed reasoning>
-SOURCES: <list of sources cited>
-CONFIDENCE: <HIGH/MEDIUM/LOW/UNCERTAIN>
-SUGGESTED_ACTIONS: <optional next steps>
+- If the user asks for a drafted document (e.g. "give me the drafted document"), produce the draft based on the uploaded documents and your role.
+- If they ask for help or clarification, use the documents to give a concrete, useful response.
+- Stay in role (see system instruction) and use only the uploaded documents and any approved facts/laws above—do not invent facts.
+
+You may reply in one coherent message. If you prefer a structured format, use:
+ANSWER: <your main response>
+EXPLANATION: <brief reasoning if needed>
+SOURCES: <documents or facts cited>
+Otherwise, just write your response naturally.
 """
     
     try:
         from datetime import datetime
         start_time = datetime.utcnow()
         
-        # Generate response with Gemini
-        response = await gemini_client.generate(reasoning_prompt)
+        response = await gemini_client.generate(
+            reasoning_prompt,
+            system_instruction=system_instruction,
+            temperature=0.4,
+            max_tokens=4000,
+        )
         
         processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
         
-        # Parse response
-        lines = response.strip().split('\n')
+        # Parse response: support both structured (ANSWER:/EXPLANATION:) and natural (single message)
+        raw = response.strip()
+        lines = raw.split('\n')
         answer_line = [l for l in lines if l.startswith('ANSWER:')]
         explanation_line = [l for l in lines if l.startswith('EXPLANATION:')]
         sources_line = [l for l in lines if l.startswith('SOURCES:')]
         confidence_line = [l for l in lines if l.startswith('CONFIDENCE:')]
         actions_line = [l for l in lines if l.startswith('SUGGESTED_ACTIONS:')]
         
-        answer = answer_line[0].split(':', 1)[1].strip() if answer_line else response
-        explanation = explanation_line[0].split(':', 1)[1].strip() if explanation_line else "Explanation not provided"
-        sources_text = sources_line[0].split(':', 1)[1].strip() if sources_line else ""
-        confidence_text = confidence_line[0].split(':', 1)[1].strip() if confidence_line else "MEDIUM"
-        actions_text = actions_line[0].split(':', 1)[1].strip() if actions_line else ""
+        if answer_line:
+            answer = answer_line[0].split(':', 1)[1].strip()
+            explanation = explanation_line[0].split(':', 1)[1].strip() if explanation_line else ""
+            sources_text = sources_line[0].split(':', 1)[1].strip() if sources_line else ""
+            confidence_text = confidence_line[0].split(':', 1)[1].strip() if confidence_line else "MEDIUM"
+            actions_text = actions_line[0].split(':', 1)[1].strip() if actions_line else ""
+        else:
+            # Natural response: entire message is the answer
+            answer = raw
+            explanation = ""
+            sources_text = ""
+            confidence_text = "MEDIUM"
+            actions_text = ""
         
-        # Parse sources (simple parsing)
+        # Parse sources
         sources = []
         if sources_text:
             for source_desc in sources_text.split(','):
@@ -424,16 +471,12 @@ SUGGESTED_ACTIONS: <optional next steps>
                         source_name=source_desc.strip()[:100]
                     ))
         
-        # Parse confidence
         try:
             confidence = ConfidenceLevel[confidence_text.upper()]
         except (KeyError, AttributeError):
             confidence = ConfidenceLevel.MEDIUM
         
-        # Parse suggested actions
-        suggested_actions = []
-        if actions_text:
-            suggested_actions = [a.strip() for a in actions_text.split(',') if a.strip()]
+        suggested_actions = [a.strip() for a in actions_text.split(',') if a.strip()] if actions_text else []
         
         logger.success(f"✅ Explanation generated ({processing_time:.0f}ms)")
         logger.info(f"📊 Confidence: {confidence.value}, Sources: {len(sources)}")
@@ -539,30 +582,18 @@ def response_formatter_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Node 5: ResponseFormatterNode
     
-    Formats final response with:
-    - Role-consistent tone
-    - Module context
-    - Next possible actions
-    
-    Args:
-        state: Current workflow state
-        
-    Returns:
-        Updated state with formatted_response
+    Outputs a single clean, natural message for the user (no fixed template).
+    The model already responds in role; we avoid adding redundant labels and sections.
     """
     logger.info("🎨 Formatting response...")
     
-    role = state.get("role")
     intent = state.get("intent", "EXPLAIN")
-    response_text = state.get("response_text", "")
+    response_text = (state.get("response_text") or "").strip()
     explanation = state.get("explanation", "")
     sources = state.get("sources", [])
-    confidence = state.get("confidence", "MEDIUM")
     suggested_actions = state.get("suggested_actions", [])
-    routed_to_agent = state.get("routed_to_agent")
-    dispatch_message = state.get("dispatch_message")
     
-    # For GREETING intent, use simple formatting without formal structure
+    # Greeting or any intent: primary output is the response text as one clean message
     if intent == "GREETING":
         logger.info("👋 Using conversational formatting for greeting")
         return {
@@ -571,51 +602,26 @@ def response_formatter_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "response_complete": True
         }
     
-    # Apply role-specific tone adjustments for formal queries
-    role_prefix = ""
-    if role == "PETITIONER":
-        role_prefix = "From petitioner perspective: "
-    elif role == "RESPONDENT":
-        role_prefix = "From respondent perspective: "
-    elif role == "MEDIATOR":
-        role_prefix = "From neutral mediation perspective: "
-    elif role == "ADJUDICATOR":
-        role_prefix = "From judicial perspective: "
+    # Build one natural message: main response first, then only add extras when they add value
+    parts = [response_text] if response_text else []
     
-    # Build formatted response
-    formatted_parts = []
+    # Add reasoning only if present and meaningful (not a placeholder)
+    if explanation and explanation not in ("Explanation not provided", "Conversational response to greeting", ""):
+        parts.append(f"\n\n{explanation}")
     
-    # Main response
-    if response_text:
-        formatted_parts.append(f"{role_prefix}{response_text}")
-    
-    # Explanation
-    if explanation and explanation not in ["Explanation not provided", "Conversational response to greeting"]:
-        formatted_parts.append(f"\n**Reasoning:** {explanation}")
-    
-    # Sources
+    # Add sources only when we actually cited something
     if sources:
-        sources_text = "\n**Sources:**\n" + "\n".join([
-            f"- {s.get('source_name', 'Unknown')}" for s in sources
-        ])
-        formatted_parts.append(sources_text)
+        source_names = [s.get("source_name", "Unknown") for s in sources if s.get("source_name")]
+        if source_names:
+            parts.append("\n\nSources: " + ", ".join(source_names[:5]))
     
-    # Confidence (only for formal responses)
-    if intent not in ["GREETING"]:
-        formatted_parts.append(f"\n**Confidence:** {confidence}")
+    # Optional single line for next steps when we have concrete suggestions (no long bullet list every time)
+    if suggested_actions and len(suggested_actions) <= 3:
+        parts.append("\n\nYou could also: " + "; ".join(suggested_actions[:3]))
+    elif suggested_actions:
+        parts.append("\n\nSuggested: " + suggested_actions[0])
     
-    # Agent routing info
-    if routed_to_agent:
-        formatted_parts.append(f"\n**Action:** {dispatch_message}")
-    
-    # Suggested actions
-    if suggested_actions:
-        actions_text = "\n**Suggested Next Steps:**\n" + "\n".join([
-            f"- {action}" for action in suggested_actions
-        ])
-        formatted_parts.append(actions_text)
-    
-    formatted_response = "\n".join(formatted_parts)
+    formatted_response = "".join(parts).strip()
     
     logger.success("✅ Response formatted")
     logger.info(f"📏 Response length: {len(formatted_response)} chars")

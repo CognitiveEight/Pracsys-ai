@@ -61,6 +61,7 @@ class WorkspaceSyncPayload(BaseModel):
     Emitted to ai_service room when workspace is updated.
     When user deletes documents from Supporting Material, backend may send
     deletedDocumentIds so AI can remove them from vector store and regenerate strategy.
+    workspaceRole is sent when user changes role (e.g. Edit Workspace → Mediator).
     Optional custom instructions: structure, tone, description (same as workspace_created).
     """
     
@@ -68,6 +69,7 @@ class WorkspaceSyncPayload(BaseModel):
     userId: str
     title: Optional[str] = None
     status: Optional[str] = None
+    workspaceRole: Optional[str] = None  # PETITIONER | RESPONDENT | MEDIATOR | ADJUDICATOR (from Edit Workspace)
     evidenceFiles: Optional[List[EvidenceFilePayload]] = None
     deletedDocumentIds: Optional[List[str]] = None  # Document IDs removed from Supporting Material
     updatedAt: str  # ISO timestamp
@@ -134,6 +136,7 @@ class AIResponsePayload(BaseModel):
     """
     Schema for ai_response event (AI_Maverick → Server).
     AI service sends response back to server.
+    suggestionChips: optional follow-up prompts (clickable chips) - when user clicks, that text is sent as next message.
     """
     
     chatId: str
@@ -141,6 +144,7 @@ class AIResponsePayload(BaseModel):
     userId: str
     content: str
     metadata: Optional[AIResponseMetadata] = None
+    suggestionChips: Optional[List[str]] = None  # 3-4 contextual, role-based prompts for next turn
     
     class Config:
         populate_by_name = True

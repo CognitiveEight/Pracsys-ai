@@ -2,7 +2,7 @@
 Socket.IO event handlers with Intelligence Chat Agent integration.
 Updated to match backend Socket.IO specification.
 """
-from typing import Dict, Any, Callable, Awaitable, Optional
+from typing import Dict, Any, Callable, Awaitable, Optional, List
 from loguru import logger
 from datetime import datetime
 
@@ -42,6 +42,9 @@ class SocketEventHandler:
     def __init__(self):
         self._handlers: Dict[str, EventHandler] = {}
         self._socket_client = None  # Will be set by main service
+        self._workspace_suggestion_chips: Dict[str, List[str]] = {}  # workspace_id -> 15-16 strategy chips
+        self._workspace_chat_suggestion_chips: Dict[str, List[str]] = {}  # workspace_id -> 10-12 contextual chips (refreshed per AI reply; we return random 4 on each request)
+        self._last_workspace_id_with_chips: Optional[str] = None  # fallback when request workspace has no chips
         self._register_default_handlers()
     
     def set_socket_client(self, client):
@@ -61,6 +64,7 @@ class SocketEventHandler:
         self.register("workspace_created", self.on_workspace_created)
         self.register("workspace_sync", self.on_workspace_sync)
         self.register("user_message_request", self.on_user_message_request)
+        self.register("probing_prompts_request", self.on_probing_prompts_request)
         
         # Legacy event handlers
         self.register("workspace_updated", self.on_workspace_updated)
@@ -281,14 +285,13 @@ OUTPUT (JSON only, complete all fields):
     "Specific action 4 with strategic outcome"
   ],
   "suggestionChips": [
-    "Short actionable chip 1 (2-5 words)",
-    "Short actionable chip 2",
-    "Short actionable chip 3"
+    "Chip 1", "Chip 2", "Chip 3", "Chip 4", "Chip 5", "Chip 6", "Chip 7", "Chip 8",
+    "Chip 9", "Chip 10", "Chip 11", "Chip 12", "Chip 13", "Chip 14", "Chip 15", "Chip 16"
   ]
 }}
 ```
 
-suggestionChips: 3-5 short, actionable next-step labels (2-5 words each) specific to this case and role. Examples: "Review Title Deeds", "Map Legal Heirs", "Draft Demand Notice", "File FIR", "Preserve Digital Evidence". No full sentences."""
+suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words each) specific to this case and role. Examples: "Review Title Deeds", "Map Legal Heirs", "Draft Demand Notice", "File FIR", "Preserve Digital Evidence". No full sentences. Provide 15-16 varied chips."""
                 custom_suffix = build_custom_instruction_suffix(workspace_id)
                 if custom_suffix:
                     structured_prompt = structured_prompt.rstrip() + "\n\n" + custom_suffix
@@ -386,7 +389,7 @@ suggestionChips: 3-5 short, actionable next-step labels (2-5 words each) specifi
                         suggestion_chips = analysis_data.get("suggestionChips") or analysis_data.get("suggestion_chips") or []
                         if isinstance(suggestion_chips, str):
                             suggestion_chips = [suggestion_chips] if suggestion_chips else []
-                        suggestion_chips = [str(s).strip() for s in suggestion_chips if s][:6]
+                        suggestion_chips = [str(s).strip() for s in suggestion_chips if s][:16]
                         
                         # Validate we got meaningful content
                         if case_summary and strategic_objective and recommendations:
@@ -410,7 +413,13 @@ suggestionChips: 3-5 short, actionable next-step labels (2-5 words each) specifi
                                     "Develop detailed action plan"
                                 ][:4]  # Ensure we have at least 4
                             if not suggestion_chips:
-                                suggestion_chips = ["Review documents", "Analyze provisions", "Draft action plan"]
+                                suggestion_chips = [
+                                    "Review documents", "Analyze provisions", "Draft action plan",
+                                    "Review evidence", "File legal action", "Preserve documents",
+                                    "Map legal heirs", "Draft demand notice", "Check BNS provisions",
+                                    "Assess evidence", "Follow BNSS steps", "Organize documents",
+                                    "Consult applicable laws", "Prepare chronology", "Identify parties", "Plan next steps"
+                                ][:16]
                             logger.info("✅ Using hybrid AI + fallback content")
                             
                     except json.JSONDecodeError as json_error:
@@ -456,7 +465,13 @@ suggestionChips: 3-5 short, actionable next-step labels (2-5 words each) specifi
                                 recommendations.extend(default_recs)
                                 recommendations = recommendations[:4]  # Keep only 4
                             if not suggestion_chips:
-                                suggestion_chips = ["Review evidence", "File legal action", "Preserve documents"]
+                                suggestion_chips = [
+                                    "Review evidence", "File legal action", "Preserve documents",
+                                    "Review documents", "Analyze provisions", "Draft action plan",
+                                    "Map legal heirs", "Draft demand notice", "Check BNS provisions",
+                                    "Assess evidence", "Follow BNSS steps", "Organize documents",
+                                    "Consult applicable laws", "Prepare chronology", "Identify parties"
+                                ][:16]
                             
                             logger.success("✅ Using hybrid: AI-extracted content + fallback where needed")
                         else:
@@ -477,7 +492,12 @@ suggestionChips: 3-5 short, actionable next-step labels (2-5 words each) specifi
                     "Assess the strength of available evidence under BSA (Bharatiya Sakshya Adhiniyam)",
                     "Develop a detailed action plan with specific legal remedies and procedural steps"
                 ]
-                suggestion_chips = ["Review documents", "Analyze BNS provisions", "Assess evidence", "Draft action plan"]
+                suggestion_chips = [
+                    "Review documents", "Analyze BNS provisions", "Assess evidence", "Draft action plan",
+                    "Review evidence", "File legal action", "Preserve documents", "Map legal heirs",
+                    "Draft demand notice", "Check BNS provisions", "Follow BNSS steps", "Organize documents",
+                    "Consult applicable laws", "Prepare chronology", "Identify parties", "Plan next steps"
+                ][:16]
             
             # Format the response (use doc_count from vector store when batch_result not provided, e.g. after delete)
             strategies_payload = {
@@ -509,9 +529,9 @@ suggestionChips: 3-5 short, actionable next-step labels (2-5 words each) specifi
             return None
 
     def _salvage_workspace_metadata_from_truncated_json(self, raw: str) -> Dict[str, Any]:
-        """Extract caseTitle, caseCategory and subcategories from truncated Gemini JSON."""
+        """Extract caseTitle, caseCategory, subcategories and description from truncated Gemini JSON."""
         import re
-        result = {"caseTitle": "", "caseCategory": "General", "subcategories": []}
+        result = {"caseTitle": "", "caseCategory": "General", "subcategories": [], "description": ""}
         if not raw:
             return result
         # Salvage caseTitle: "caseTitle": "VALUE" (for document-based display title)
@@ -539,6 +559,14 @@ suggestionChips: 3-5 short, actionable next-step labels (2-5 words each) specifi
             inner = sub_match.group(1)
             subs = re.findall(r'"([^"]+)"', inner)
             result["subcategories"] = [s.strip() for s in subs if s.strip()][:5]
+        # Salvage description (short case description, 1-2 lines)
+        desc_match = re.search(r'"description"\s*:\s*"([^"]*)"', raw)
+        if not desc_match:
+            desc_match = re.search(r'"description"\s*:\s*"([^"]*)$', raw)
+        if desc_match:
+            val = desc_match.group(1).strip()
+            if val:
+                result["description"] = val[:300] if len(val) > 300 else val
         return result
 
     async def _get_workspace_category_and_subcategory(
@@ -547,8 +575,8 @@ suggestionChips: 3-5 short, actionable next-step labels (2-5 words each) specifi
         user_id: str,
     ) -> Dict[str, Any]:
         """
-        Infer case title (from documents), case category and subcategories from workspace documents using AI.
-        Returns {"caseTitle": str, "caseCategory": str, "subcategories": List[str]}. caseTitle is fixed once; do not overwrite on sync.
+        Infer case title (from documents), case category, subcategories and short description from workspace documents using AI.
+        Returns {"caseTitle": str, "caseCategory": str, "subcategories": List[str], "description": str}. caseTitle is fixed once; do not overwrite on sync.
         """
         import json
         import re
@@ -560,9 +588,9 @@ suggestionChips: 3-5 short, actionable next-step labels (2-5 words each) specifi
                 all_docs = await vector_store.get_all_documents(workspace_id=workspace_id)
             except Exception as e:
                 logger.warning("Could not retrieve documents for category: {}", str(e))
-                return {"caseTitle": "", "caseCategory": "General", "subcategories": []}
+                return {"caseTitle": "", "caseCategory": "General", "subcategories": [], "description": ""}
             if not all_docs:
-                return {"caseTitle": "", "caseCategory": "General", "subcategories": []}
+                return {"caseTitle": "", "caseCategory": "General", "subcategories": [], "description": ""}
             parts = []
             for i, doc in enumerate(all_docs, 1):
                 content = (doc.get("content") or "").strip()
@@ -570,21 +598,22 @@ suggestionChips: 3-5 short, actionable next-step labels (2-5 words each) specifi
                     parts.append(f"--- Document {i} ---\n{content}")
             combined = "\n\n".join(parts) if parts else ""
             if not combined:
-                return {"caseTitle": "", "caseCategory": "General", "subcategories": []}
+                return {"caseTitle": "", "caseCategory": "General", "subcategories": [], "description": ""}
             combined = (combined[:5000] + "...") if len(combined) > 5000 else combined
             gemini_client.initialize()
             prompt = f"""Based on the document content below, output a JSON object with:
 - caseTitle: one short formal case title from the documents (e.g. "Umesh Malik vs Social Media Hacking Complaint" or "Complaint re Hacked Account - Shubham Malik"). Use parties/subject from the docs, not generic text.
 - caseCategory: exactly one category in UPPERCASE (e.g. CRIMINAL LAW, CYBER LAW, CIVIL LAW).
 - subcategories: array of 1-3 relevant Indian acts (e.g. "Bharatiya Nyaya Sanhita", "Information Technology Act, 2000").
+- description: a short case description in 1 or 2 lines only (e.g. "Approximate start date of the U-16 Vijay Merchant Trophy; intervention is required."). Summarize the main subject or relief sought; keep it concise.
 
 Document content:
 {combined}
 
-Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "caseCategory": "CRIMINAL LAW", "subcategories": ["Bharatiya Nyaya Sanhita", "IT Act 2000"]}}"""
+Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "caseCategory": "CRIMINAL LAW", "subcategories": ["Bharatiya Nyaya Sanhita", "IT Act 2000"], "description": "Short 1-2 line case summary."}}"""
             raw = await gemini_client.generate(prompt, temperature=0.2, max_tokens=700)
             if not raw or "Error" in (raw[:80] or ""):
-                return {"caseTitle": "", "caseCategory": "General", "subcategories": []}
+                return {"caseTitle": "", "caseCategory": "General", "subcategories": [], "description": ""}
             raw_clean = raw.strip()
             if "```" in raw_clean:
                 code = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw_clean)
@@ -605,7 +634,7 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                 salvaged = self._salvage_workspace_metadata_from_truncated_json(raw)
                 if salvaged.get("caseCategory") != "General" or salvaged.get("subcategories") or salvaged.get("caseTitle"):
                     return salvaged
-                return {"caseTitle": "", "caseCategory": "General", "subcategories": []}
+                return {"caseTitle": "", "caseCategory": "General", "subcategories": [], "description": ""}
             try:
                 data = json.loads(raw_clean)
             except json.JSONDecodeError:
@@ -613,7 +642,7 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                 if salvaged.get("caseCategory") != "General" or salvaged.get("subcategories") or salvaged.get("caseTitle"):
                     logger.info("Used salvaged workspace metadata from truncated response")
                     return salvaged
-                return {"caseTitle": "", "caseCategory": "General", "subcategories": []}
+                return {"caseTitle": "", "caseCategory": "General", "subcategories": [], "description": ""}
             case_title = (data.get("caseTitle") or "").strip()
             case_category = (data.get("caseCategory") or "General").strip().upper()
             if case_category and "LAW" not in case_category and "ACT" not in case_category:
@@ -622,16 +651,20 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
             if isinstance(subcategories, str):
                 subcategories = [subcategories] if subcategories else []
             subcategories = [str(s).strip() for s in subcategories if s][:5]
+            description = (data.get("description") or "").strip()
+            if description:
+                lines = [ln.strip() for ln in description.split("\n") if ln.strip()][:2]
+                description = " ".join(lines)[:300]
             logger.info(
                 "Workspace metadata: caseTitle={}, caseCategory={}, subcategories={}",
                 case_title[:50] if case_title else "",
                 case_category,
                 subcategories,
             )
-            return {"caseTitle": case_title, "caseCategory": case_category or "General", "subcategories": subcategories}
+            return {"caseTitle": case_title, "caseCategory": case_category or "General", "subcategories": subcategories, "description": description}
         except Exception as e:
             logger.warning("Workspace category/subcategory generation failed: {}", str(e))
-            return {"caseTitle": "", "caseCategory": "General", "subcategories": []}
+            return {"caseTitle": "", "caseCategory": "General", "subcategories": [], "description": ""}
 
     # ========================================================================
     # Connection Events
@@ -737,6 +770,23 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                 workspace_role = "ADJUDICATOR"
             
             logger.info("Initializing workspace with role: {}", workspace_role)
+            
+            # Ensure workspace context exists so chat and strategy can resolve role (get_workspace)
+            from app.workspace.context import context_manager as ctx_mgr
+            from datetime import datetime as dt
+            try:
+                created_at = dt.fromisoformat(payload.createdAt.replace("Z", "+00:00")) if getattr(payload, "createdAt", None) else dt.utcnow()
+            except Exception:
+                created_at = dt.utcnow()
+            ctx_mgr.upsert_workspace(
+                payload.workspaceId,
+                payload.userId,
+                title=payload.title,
+                status="active",
+                workspace_role=workspace_role,
+                evidence_files=list(payload.evidenceFiles) if payload.evidenceFiles else [],
+                updated_at=created_at,
+            )
             
             # STEP 2: Initialize role-based agent
             try:
@@ -891,6 +941,7 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                                             "updateTitle": True,
                                             "caseCategory": meta.get("caseCategory", "General"),
                                             "subcategories": meta.get("subcategories", []),
+                                            "description": meta.get("description", ""),
                                         },
                                     }
                                     await self._socket_client.emit(
@@ -959,6 +1010,11 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                                             "document_feature_response",
                                             strategy_feature_payload
                                         )
+                                        chips = strategies_result.get("suggestionChips") or []
+                                        if chips:
+                                            self._workspace_suggestion_chips[payload.workspaceId] = list(chips)
+                                            self._last_workspace_id_with_chips = payload.workspaceId
+                                            logger.info("Stored {} suggestion chips for workspace (probing_prompts)", len(chips))
                                         logger.success("🎉 Strategy & Objectives sent to backend")
                                 except Exception as strategy_error:
                                     logger.error(f"Failed to generate strategies: {strategy_error}")
@@ -1092,17 +1148,45 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                 logger.info("🗑️ Resolved deleted document IDs (from payload + isDeleted): {}", deleted_ids)
             
             logger.info(
-                "🔄 Workspace sync: {} (User: {})",
+                "🔄 Workspace sync: {} (User: {}, Role: {})",
                 payload.workspaceId,
-                payload.userId
+                payload.userId,
+                payload.workspaceRole or "unchanged"
             )
             
-            # Update workspace metadata
+            # Create or update workspace context so chat and strategy use correct role (e.g. Mediator from Edit Workspace)
+            from app.workspace.context import context_manager
+            from datetime import datetime as dt
+            updated_at = None
+            try:
+                if payload.updatedAt:
+                    updated_at = dt.fromisoformat(payload.updatedAt.replace("Z", "+00:00"))
+            except Exception:
+                updated_at = dt.utcnow()
+            evidence_for_context = []
+            if payload.evidenceFiles:
+                for f in payload.evidenceFiles:
+                    if getattr(f, "isDeleted", False) or getattr(f, "is_deleted", False):
+                        continue
+                    evidence_for_context.append(f)
+            context_manager.upsert_workspace(
+                payload.workspaceId,
+                payload.userId,
+                title=payload.title,
+                status=payload.status,
+                workspace_role=payload.workspaceRole,
+                evidence_files=evidence_for_context,
+                updated_at=updated_at,
+            )
+            
+            # Update workspace metadata (for logging)
             updates = {}
             if payload.title:
                 updates["title"] = payload.title
             if payload.status:
                 updates["status"] = payload.status
+            if payload.workspaceRole:
+                updates["workspaceRole"] = payload.workspaceRole
             
             logger.info(f"Workspace updates: {updates}")
 
@@ -1119,11 +1203,14 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                         workspace_id=payload.workspaceId,
                         document_ids=deleted_ids,
                     )
-                    # Regenerate strategy from remaining documents
-                    workspace_role = "ADJUDICATOR"
+                    # Regenerate strategy from remaining documents (use role from payload first, e.g. Mediator)
+                    workspace_role = (payload.workspaceRole or "").strip().upper() or "ADJUDICATOR"
+                    if workspace_role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                        workspace_role = "ADJUDICATOR"
                     try:
                         ctx = workspace_manager.get_workspace(payload.workspaceId)
-                        workspace_role = (ctx.workspace_role or "ADJUDICATOR").upper()
+                        if ctx and ctx.workspace_role:
+                            workspace_role = (ctx.workspace_role or workspace_role).upper()
                     except Exception:
                         pass
                     strategies_result = await self._generate_strategies_from_documents(
@@ -1260,6 +1347,7 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                                             "updateTitle": False,
                                             "caseCategory": meta.get("caseCategory", "General"),
                                             "subcategories": meta.get("subcategories", []),
+                                            "description": meta.get("description", ""),
                                         },
                                     }
                                     await self._socket_client.emit(
@@ -1274,16 +1362,20 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                                 except Exception as meta_err:
                                     logger.warning("Failed to emit workspace_metadata (sync): {}", str(meta_err))
 
-                            # Regenerate strategies from ALL documents in workspace (including new uploads)
+                            # Regenerate strategies from ALL documents in workspace (use role from payload, e.g. Mediator)
                             if batch_result.get("successful", 0) > 0:
                                 logger.info("🎯 Regenerating strategies from all documents in workspace...")
                                 try:
-                                    workspace_role = "ADJUDICATOR"
+                                    workspace_role = (payload.workspaceRole or "").strip().upper() or "ADJUDICATOR"
+                                    if workspace_role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                                        workspace_role = "ADJUDICATOR"
                                     try:
                                         ctx = workspace_manager.get_workspace(payload.workspaceId)
-                                        workspace_role = (ctx.workspace_role or "ADJUDICATOR").upper()
+                                        if ctx and ctx.workspace_role:
+                                            workspace_role = (ctx.workspace_role or workspace_role).upper()
                                     except Exception:
                                         pass
+                                    logger.info("Using workspace role for strategies: {}", workspace_role)
                                     strategies_result = await self._generate_strategies_from_documents(
                                         workspace_id=payload.workspaceId,
                                         user_id=payload.userId,
@@ -1334,6 +1426,11 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                                             "document_feature_response",
                                             strategy_feature_payload
                                         )
+                                        chips = strategies_result.get("suggestionChips") or []
+                                        if chips:
+                                            self._workspace_suggestion_chips[payload.workspaceId] = list(chips)
+                                            self._last_workspace_id_with_chips = payload.workspaceId
+                                            logger.info("Stored {} suggestion chips for workspace (probing_prompts)", len(chips))
                                         logger.success("🎉 Updated Strategy & Objectives sent to backend")
                                 except Exception as strategy_error:
                                     logger.error(f"Failed to regenerate strategies: {strategy_error}")
@@ -1418,26 +1515,64 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
             from app.langgraph.chat_models import ChatContext
             from app.langgraph.role_agent import role_agent
             
-            # STEP 1: Get workspace context
+            # STEP 1: Get workspace context (role, documents count) from workspace manager
             workspace_id = payload.workspaceId or "unknown"
             user_id = payload.userId or "unknown"
             chat_id = payload.chatId or f"chat_{datetime.utcnow().timestamp()}"
             
-            # STEP 2: Build role context
-            # For now, use a default role context since we don't have persistent state storage
-            # TODO: Implement proper workspace state retrieval from database
             role_context = {
-                "role": "ADJUDICATOR",  # Default role
+                "role": "ADJUDICATOR",
                 "workspace_id": workspace_id,
-                "user_id": user_id
+                "user_id": user_id,
             }
+            workspace_state = {"workspace_id": workspace_id, "user_id": user_id, "documents_count": 0}
             
-            # STEP 3: Build chat context
+            try:
+                from app.workspace.manager import workspace_manager
+                ctx = workspace_manager.get_workspace(workspace_id)
+                if ctx:
+                    workspace_role = (ctx.workspace_role or "ADJUDICATOR").upper()
+                    if workspace_role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                        workspace_role = "ADJUDICATOR"
+                    role_context["role"] = workspace_role
+                    role_context_from_meta = ctx.get_metadata("role_context")
+                    if isinstance(role_context_from_meta, dict) and role_context_from_meta.get("role"):
+                        role_context.update(role_context_from_meta)
+                    docs_count = ctx.get_evidence_file_count() if hasattr(ctx, "get_evidence_file_count") else len(getattr(ctx, "evidence_files", []))
+                    workspace_state["documents_count"] = docs_count
+            except Exception as ws_err:
+                logger.warning("Could not load workspace for chat (using defaults): {}", str(ws_err))
+            
+            # Fetch uploaded document content so the model can use it (drafts, answers, etc.)
+            try:
+                from app.vectorstore.qdrant import vector_store
+                all_docs = await vector_store.get_all_documents(workspace_id=workspace_id)
+                max_chars_per_doc = 2500
+                max_total_chars = 8000
+                total = 0
+                doc_snippets = []
+                for doc in (all_docs or [])[:20]:
+                    content = (doc.get("content") or "").strip()
+                    if not content:
+                        continue
+                    snippet = content[:max_chars_per_doc] + ("..." if len(content) > max_chars_per_doc else "")
+                    if total + len(snippet) > max_total_chars:
+                        snippet = snippet[: max_total_chars - total]
+                        doc_snippets.append({"document_id": doc.get("document_id"), "content": snippet})
+                        break
+                    doc_snippets.append({"document_id": doc.get("document_id"), "content": snippet})
+                    total += len(snippet)
+                if doc_snippets:
+                    workspace_state["uploaded_documents"] = doc_snippets
+            except Exception as doc_err:
+                logger.warning("Could not load documents for chat context: {}", str(doc_err))
+            
+            # STEP 2 & 3: Build chat context with role, document count, and uploaded document content
             chat_context = ChatContext(
                 workspace_id=workspace_id,
                 user_id=user_id,
                 role_context=role_context,
-                workspace_state={"workspace_id": workspace_id, "user_id": user_id},
+                workspace_state=workspace_state,
                 chat_history=[
                     {"role": item.role, "content": item.content}
                     for item in payload.conversation_history
@@ -1457,7 +1592,26 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
             )
             processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
             
-            # STEP 5: Build AI response payload
+            # Generate 10-12 contextual chips, store for this workspace; send random 4 in response (backend polls every few sec and we return random 4 each time)
+            import random
+            suggestion_chips_for_payload = []
+            try:
+                role_for_chips = (role_context.get("role") or "ADJUDICATOR").upper()
+                generated = await self._generate_contextual_suggestion_chips(
+                    workspace_id=workspace_id,
+                    role=role_for_chips,
+                    user_message=payload.content,
+                    ai_response_text=response.response_text,
+                    max_chips=12,
+                )
+                if generated:
+                    self._workspace_chat_suggestion_chips[workspace_id] = list(generated)
+                    suggestion_chips_for_payload = random.sample(generated, min(4, len(generated)))
+                    logger.info("Stored {} contextual chips for workspace; sending random 4 in ai_response (each 4s poll will return random 4 from these {})", len(generated), len(generated))
+            except Exception as chip_err:
+                logger.warning("Suggestion chips generation failed: {}", str(chip_err))
+            
+            # STEP 5: Build AI response payload (suggestionChips = random 4 from 10-12; click sends chip as next message)
             ai_response = AIResponsePayload(
                 chatId=chat_id,
                 workspaceId=workspace_id,
@@ -1470,12 +1624,16 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                     responseTime=processing_time,
                     confidence=response.confidence.value if hasattr(response.confidence, 'value') else str(response.confidence),
                     detectedIntent=response.detected_intent
-                )
+                ),
+                suggestionChips=suggestion_chips_for_payload if suggestion_chips_for_payload else None,
             )
             
             # STEP 6: Emit ai_response back to server
             if self._socket_client:
-                await self._socket_client.emit_ai_response(ai_response.dict(by_alias=True))
+                payload_dict = ai_response.dict(by_alias=True)
+                if payload_dict.get("suggestionChips") is None:
+                    payload_dict.pop("suggestionChips", None)
+                await self._socket_client.emit_ai_response(payload_dict)
                 logger.success("✅ AI response sent successfully")
             else:
                 logger.error("❌ Socket client not available to emit response")
@@ -1521,6 +1679,226 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Party/Subject vs Issue", "ca
                     logger.info("Error response sent to user")
             except Exception as emit_error:
                 logger.error(f"Failed to emit error response: {emit_error}")
+    
+    def _fallback_chips_for_role(self, role: str, needed: int) -> List[str]:
+        """Return generic role-appropriate chips to pad when the model returns fewer than 10. Need 12+ for rotation."""
+        role_upper = (role or "ADJUDICATOR").upper()
+        pools = {
+            "ADJUDICATOR": [
+                "Summarise key issues", "Identify applicable laws", "Assess evidence strength",
+                "Outline procedural steps", "List open questions", "Suggest further inquiry",
+                "Compare parties' positions", "Note gaps in evidence", "Recommend next steps",
+                "Initiate cyber investigation", "Examine edited content", "Collect victim statements",
+                "Consult cyber forensics", "Review jurisdictional aspects", "Order preservation of evidence",
+            ],
+            "PETITIONER": [
+                "Draft relief sought", "List supporting evidence", "Cite applicable provisions",
+                "Strengthen arguments", "Address counter-arguments", "Request interim relief",
+                "Outline chronology", "Identify witnesses", "Suggest documents to file",
+                "Summarise harm suffered", "Map legal remedies", "Draft cause of action",
+            ],
+            "RESPONDENT": [
+                "Identify defence grounds", "Challenge petitioner evidence", "Cite exceptions",
+                "Propose dismissal grounds", "List procedural objections", "Suggest counter-evidence",
+                "Outline limitations", "Address each claim", "Draft reply points",
+                "Highlight inconsistencies", "Invoke limitation", "Request security for costs",
+            ],
+            "MEDIATOR": [
+                "List common ground", "Identify sticking points", "Suggest compromise options",
+                "Outline risks for each party", "Draft settlement framework", "Clarify interests",
+                "Propose confidence-building steps", "Summarise positions", "Suggest next round",
+                "Propose joint fact-finding", "Draft term sheet", "Suggest cooling-off period",
+            ],
+        }
+        generic = pools.get(role_upper, pools["ADJUDICATOR"])
+        return list(generic)[:needed]
+
+    async def _generate_contextual_suggestion_chips(
+        self,
+        workspace_id: str,
+        role: str,
+        user_message: str,
+        ai_response_text: str,
+        max_chips: int = 12,
+        conversation_summary: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Generate 10-12 short, role-based, case-related suggestion chips.
+        If the model returns fewer than 10, we pad with generic role-based chips so we have 10-12 to sample from.
+        """
+        import json
+        try:
+            from app.ai.gemini_client import gemini_client
+            gemini_client.initialize()
+            role_upper = (role or "ADJUDICATOR").upper()
+            user_preview = (user_message or "")[:300]
+            ai_preview = (ai_response_text or "")[:400]
+            prompt = f"""You are suggesting follow-up prompts for a legal workspace chat. The workspace role is: {role_upper}.
+
+Last user message: "{user_preview}"
+Last assistant reply (summary): "{ai_preview}"
+{f'Recent context: {conversation_summary[:200]}' if conversation_summary else ''}
+
+You MUST output a JSON array of exactly 10, 11, or 12 short follow-up prompts. Minimum 10 items. Not 4. Not 5. At least 10 strings in the array.
+Each prompt: 2-8 words, role-appropriate, case-related, actionable. User will click one and it gets sent as their next message.
+Vary types: draft, explain, list, risks, next steps, clarify, evidence, options.
+
+Return ONLY a JSON array, no other text. Example with 10+ items: ["Draft a settlement proposal", "List key issues for mediation", "What are the risks for each party?", "Suggest compromise options", "Summarise evidence so far", "Outline procedural next steps", "Identify gaps in the complaint", "Recommend documents to collect", "Clarify jurisdiction", "Compare both sides' positions", "Suggest interim measures"]
+"""
+            raw = await gemini_client.generate(prompt, temperature=0.7, max_tokens=600)
+            if not raw or "Error" in (raw[:80] or ""):
+                return []
+            raw = raw.strip()
+            start = raw.find("[")
+            if start < 0:
+                return []
+            depth = 0
+            end = -1
+            for i in range(start, len(raw)):
+                if raw[i] == "[":
+                    depth += 1
+                elif raw[i] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            if end <= start:
+                return []
+            arr = json.loads(raw[start:end])
+            if not isinstance(arr, list):
+                arr = []
+            chips = [str(x).strip() for x in arr if x and 2 <= len(str(x).strip()) <= 120][:max_chips]
+            from_model = len(chips)
+            # Always ensure we have 10–12 chips so every 4s we can emit a different random 4
+            target_count = 12
+            if len(chips) < target_count:
+                seen = {c.lower() for c in chips}
+                fallbacks = self._fallback_chips_for_role(role, target_count + 5)
+                for pad in fallbacks:
+                    if len(chips) >= target_count:
+                        break
+                    if pad and pad.lower() not in seen:
+                        chips.append(pad)
+                        seen.add(pad.lower())
+            result = chips[:target_count]
+            logger.info("Contextual chips: model gave {}, after padding have {} (return random 4 each poll)", from_model, len(result))
+            return result
+        except Exception as e:
+            logger.warning("Contextual suggestion chips generation failed: {}", str(e))
+            # Still return 10–12 fallback chips so rotation works
+            return self._fallback_chips_for_role(role, 12)
+    
+    async def on_probing_prompts_request(self, data: Dict[str, Any]) -> None:
+        """
+        Handle probing_prompts_request from backend.
+        - If conversation context is provided (lastUserMessage, lastAiResponse, or conversation_history),
+          generate contextual, role-based suggestion chips so they change with the chat.
+        - Otherwise return a random 4 from the stored 15-16 strategy chips (role/case-related).
+        Chips are sent as prompts[]; when user clicks one, that text goes into the chat as the user message.
+        """
+        import random
+        try:
+            workspace_id = (data.get("workspaceId") or data.get("workspace_id") or "").strip()
+            chat_type = (data.get("chatType") or "").strip()
+            if chat_type != "STRATEGY_OBJECTIVE":
+                logger.debug("probing_prompts_request: chatType is not STRATEGY_OBJECTIVE, skipping")
+                return
+            max_prompts = data.get("maxPrompts")
+            if max_prompts is None:
+                max_prompts = 4
+            try:
+                max_prompts = int(max_prompts)
+            except (TypeError, ValueError):
+                max_prompts = 4
+            
+            # 1) If we have 10-12 stored contextual chips for this workspace, return random 4 each time (so each poll shows different chips)
+            stored_chat_chips = self._workspace_chat_suggestion_chips.get(workspace_id) or []
+            if stored_chat_chips:
+                count = min(max_prompts, len(stored_chat_chips))
+                prompts = random.sample(stored_chat_chips, count) if count > 0 else []
+                logger.info("probing_prompts: returning random {} from {} stored chips (rotation)", len(prompts), len(stored_chat_chips))
+            else:
+                # 2) No stored chat chips: if we have conversation context, generate 10-12, store, return random 4
+                last_user = (data.get("lastUserMessage") or data.get("last_user_message") or "").strip()
+                last_ai = (data.get("lastAiResponse") or data.get("last_ai_response") or "").strip()
+                conv_history = data.get("conversation_history") or data.get("conversationHistory") or []
+                if conv_history and (not last_user and not last_ai):
+                    for m in reversed(conv_history):
+                        r = (m.get("role") or "").upper()
+                        c = (m.get("content") or "").strip()
+                        if not c:
+                            continue
+                        if r == "USER" and not last_user:
+                            last_user = c[:500]
+                        elif r == "AI" and not last_ai:
+                            last_ai = c[:500]
+                        if last_user and last_ai:
+                            break
+                prompts = []
+                if last_user or last_ai or (conv_history and len(conv_history) >= 2):
+                    role = "ADJUDICATOR"
+                    try:
+                        ctx = workspace_manager.get_workspace(workspace_id)
+                        if ctx and ctx.workspace_role:
+                            role = (ctx.workspace_role or "ADJUDICATOR").upper()
+                    except Exception:
+                        pass
+                    if last_user or last_ai:
+                        conv_summary = None
+                        if conv_history and len(conv_history) > 2:
+                            parts = []
+                            for m in conv_history[-4:]:
+                                r = m.get("role") or m.get("role", "")
+                                c = (m.get("content") or "")[:80]
+                                if c:
+                                    parts.append(f"{r}: {c}")
+                            conv_summary = " | ".join(parts) if parts else None
+                        generated = await self._generate_contextual_suggestion_chips(
+                            workspace_id=workspace_id,
+                            role=role,
+                            user_message=last_user,
+                            ai_response_text=last_ai,
+                            max_chips=12,
+                            conversation_summary=conv_summary,
+                        )
+                        if generated:
+                            self._workspace_chat_suggestion_chips[workspace_id] = generated
+                            count = min(max_prompts, len(generated))
+                            prompts = random.sample(generated, count) if count > 0 else []
+                            logger.info("probing_prompts: generated {} contextual chips, returning random {}", len(generated), len(prompts))
+                # 3) Fallback: strategy chips (random 4 from 15-16)
+                if not prompts:
+                    chips = self._workspace_suggestion_chips.get(workspace_id) or []
+                    if not chips and self._last_workspace_id_with_chips:
+                        chips = self._workspace_suggestion_chips.get(self._last_workspace_id_with_chips) or []
+                    if not chips:
+                        logger.warning("probing_prompts_request: no suggestion chips for workspace {}", workspace_id)
+                    count = min(max_prompts, len(chips)) if chips else 0
+                    prompts = random.sample(chips, count) if count > 0 else []
+            
+            response = {
+                "workspaceId": data.get("workspaceId"),
+                "userId": data.get("userId"),
+                "actionableId": data.get("actionableId"),
+                "chatId": data.get("chatId"),
+                "chatType": data.get("chatType"),
+                "viewType": data.get("viewType"),
+                "prompts": prompts,
+            }
+            if data.get("timestamp") is not None:
+                response["timestamp"] = data.get("timestamp")
+            if self._socket_client:
+                await self._socket_client.emit("probing_prompts_response", response)
+                logger.success(
+                    "probing_prompts_response emitted: workspaceId={}, count={}",
+                    workspace_id[:12] if workspace_id else "",
+                    len(prompts),
+                )
+            else:
+                logger.warning("No socket client to emit probing_prompts_response")
+        except Exception as e:
+            logger.exception(e)
+            logger.error("probing_prompts_request failed: {}", str(e))
     
     # ========================================================================
     # Legacy Event Handlers (for backward compatibility)

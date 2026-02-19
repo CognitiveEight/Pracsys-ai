@@ -227,6 +227,56 @@ class ContextManager:
             logger.info("Created new context for workspace: {}", data.id)
         
         return context
+
+    def upsert_workspace(
+        self,
+        workspace_id: str,
+        user_id: str,
+        *,
+        title: Optional[str] = None,
+        status: Optional[str] = None,
+        workspace_role: Optional[str] = None,
+        evidence_files: Optional[List[Any]] = None,
+        updated_at: Optional[datetime] = None,
+    ) -> WorkspaceContext:
+        """
+        Create or update workspace context from sync/update payload.
+        Used when backend sends workspace_sync (e.g. role change in Edit Workspace)
+        so that get_workspace(workspace_id) returns the correct role for chat and strategy.
+        """
+        context = self._contexts.get(workspace_id)
+        now = datetime.utcnow()
+        if context:
+            if title is not None:
+                context.title = title
+            if status is not None:
+                context.status = status
+            if workspace_role is not None:
+                context.workspace_role = (workspace_role or "ADJUDICATOR").strip().upper()
+                if context.workspace_role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                    context.workspace_role = "ADJUDICATOR"
+            if evidence_files is not None:
+                context.evidence_files = list(evidence_files)
+            if updated_at is not None:
+                context.updated_at = updated_at
+            logger.debug("Updated context for workspace: {} (role={})", workspace_id, context.workspace_role)
+            return context
+        role = (workspace_role or "ADJUDICATOR").strip().upper()
+        if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+            role = "ADJUDICATOR"
+        context = WorkspaceContext(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            title=title or "",
+            workspace_role=role,
+            status=status or "active",
+            evidence_files=list(evidence_files) if evidence_files else [],
+            created_at=now,
+            updated_at=updated_at or now,
+        )
+        self._contexts[workspace_id] = context
+        logger.info("Created context for workspace: {} (role={})", workspace_id, role)
+        return context
     
     def delete_context(self, workspace_id: str) -> bool:
         """

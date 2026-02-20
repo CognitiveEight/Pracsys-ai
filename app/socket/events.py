@@ -228,9 +228,9 @@ class SocketEventHandler:
 
 **Task**: Based on the document content above, provide:
 
-1. **Case Summary** (2-3 sentences): A clear summary of what this case is about, including key facts, parties involved, and the legal issues.
+1. **Case Summary** (5-6 sentences): A clear summary of what this case is about, including key facts, parties involved, and the legal issues.
 
-2. **Strategic Objective** (1-2 sentences): A specific, actionable objective that outlines the best course of action for someone in the {workspace_role} role.
+2. **Strategic Objective** (5-6 sentences): A specific, actionable objective that outlines the best course of action for someone in the {workspace_role} role.
 
 3. **Detailed Recommendations** (3-4 bullet points): Specific steps or considerations based on the case facts.
 
@@ -265,8 +265,8 @@ DOCUMENT CONTENT:
 YOUR ROLE: {workspace_role}
 
 TASK:
-1. Case summary (2-3 sentences with key facts and parties)
-2. Strategic objective (1-2 sentences specific to {workspace_role})
+1. Case summary (5-6 sentences with key facts and parties)
+2. Strategic objective (5-6 sentences specific to {workspace_role})
 3. Four actionable recommendations
 4. Possible next steps (3-5 immediate, concrete actions that should be taken right away)
 
@@ -707,7 +707,7 @@ Document content:
 
 Specific case summary (3-4 lines, one sentence per line):"""
 
-                raw = await gemini_client.generate(prompt, temperature=0.2 if attempt == 0 else 0.4, max_tokens=500)
+                raw = await gemini_client.generate(prompt, temperature=0.2 if attempt == 0 else 0.4, max_tokens=8000)
                 if not raw:
                     logger.warning("AI returned empty response for case summary (attempt {})", attempt + 1)
                     continue

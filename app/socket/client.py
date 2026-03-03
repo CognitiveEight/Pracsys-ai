@@ -94,16 +94,21 @@ class SocketClient:
             # Create Socket.IO client with reconnection parameters
             reconnection_attempts = settings.socket_reconnection_attempts
             reconnection_delay = settings.socket_reconnection_delay
-            
+            reconnection_delay_max = getattr(
+                settings, "socket_reconnection_delay_max", 60000
+            )
+
             # Convert delay to seconds (0 means no delay)
             delay_seconds = reconnection_delay / 1000 if reconnection_delay > 0 else 0
-            
+            delay_max_seconds = reconnection_delay_max / 1000 if reconnection_delay_max > 0 else 60.0
+
             self.sio = socketio.AsyncClient(
                 reconnection=settings.socket_reconnection,
                 reconnection_attempts=reconnection_attempts,  # 0 = infinite
                 reconnection_delay=delay_seconds,
+                reconnection_delay_max=delay_max_seconds,  # cap backoff so we don't wait too long
                 logger=False,
-                engineio_logger=False
+                engineio_logger=False,
             )
             
             # Register event handlers
@@ -129,7 +134,7 @@ class SocketClient:
                 headers=custom_headers,
                 namespaces=[settings.socket_namespace],
                 wait=True,
-                wait_timeout=10
+                wait_timeout=60
             )
             
             # Give server a moment to process connection and send any error messages
@@ -159,15 +164,15 @@ class SocketClient:
     
     async def emit(self, event: str, data: Dict[str, Any]) -> None:
         """
-        Emit an event to the server.
-        
-        Args:
-            event: Event name
-            data: Event data
+        Emit an event to the server. If socket is disconnected, logs and returns without raising
+        so long-running handlers (e.g. after analysis report generation) do not crash.
         """
         if not self.sio or not self._connected:
-            raise SocketConnectionError("Socket not connected")
-        
+            logger.warning(
+                "Socket not connected, skipping emit for event: {} (backend will not receive this payload)",
+                event,
+            )
+            return
         try:
             logger.info(f"📤 Emitting event: {event}")
             await self.sio.emit(event, data, namespace=settings.socket_namespace)
@@ -249,7 +254,8 @@ class SocketClient:
             logger.info("   - workspace_sync")
             logger.info("   - user_message_request")
             logger.info("   - probing_prompts_request")
-            logger.info("📤 Ready to emit: ai_response, probing_prompts_response")
+            logger.info("   - analysis_report_feedback")
+            logger.info("📤 Ready to emit: ai_response, probing_prompts_response, document_feature_response")
             self._connected = True
             await event_handler.handle("connect", None)
         
@@ -259,23 +265,18 @@ class SocketClient:
             self._connected = False
             logger.warning("Socket.IO disconnected")
             if reason:
-                logger.warning(f"🔴 Disconnect reason: {reason}")
-                
-                # Interpret common disconnect reasons
+                logger.warning("🔴 Disconnect reason: {}", reason)
                 if reason == "transport close":
-                    logger.error("❌ Server closed the connection (possibly authentication failure)")
+                    logger.info("Server closed the connection (check server pingTimeout if during long AI work)")
                 elif reason == "ping timeout":
-                    logger.error("❌ Connection timed out (no ping response)")
+                    logger.info("Ping timeout – backend should increase pingTimeout (e.g. 60000) for long-running AI")
                 elif reason == "transport error":
-                    logger.error("❌ Transport error (network issue)")
+                    logger.warning("Transport error (network/proxy)")
                 elif reason == "server namespace disconnect":
-                    logger.error("❌ Server forcefully disconnected (check authentication)")
-                else:
-                    logger.warning(f"Disconnect reason: {reason}")
+                    logger.warning("Server disconnected (check auth)")
             else:
                 logger.warning("🔴 Connection lost (no reason provided)")
-            
-            logger.info("Reconnection will be attempted automatically...")
+            logger.info("Reconnecting automatically (delay from config)...")
             await event_handler.handle("disconnect", {"reason": reason})
         
         @self.sio.event
@@ -353,6 +354,15 @@ class SocketClient:
             """
             logger.info("📋 Received probing_prompts_request event")
             await event_handler.handle("probing_prompts_request", data)
+
+        @self.sio.event
+        async def analysis_report_feedback(data):
+            """
+            Handle analysis_report_feedback (App → Backend → AI_Maverick).
+            User rejected an analysis report item (missingInfo or riskOrWeakness); recalc score and re-emit report.
+            """
+            logger.info("📋 Received analysis_report_feedback event")
+            await event_handler.handle("analysis_report_feedback", data)
         
         # ========================================================================
         # Legacy event handlers (for backward compatibility)

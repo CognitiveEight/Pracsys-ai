@@ -215,7 +215,7 @@ class RoleBasedAgent:
             )
             
             # Log audit event
-            await audit_logger.log_event(
+            audit_logger.log_event(
                 event_type="role_agent_invoked",
                 data={
                     "workspace_id": workspace_id,
@@ -383,7 +383,7 @@ async def enforce_role_gate(
         )
         
         # Log audit event
-        await audit_logger.log_event(
+        audit_logger.log_event(
             event_type="downstream_blocked",
             data={
                 "workspace_id": workspace_id,

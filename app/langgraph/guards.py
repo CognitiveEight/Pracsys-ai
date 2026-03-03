@@ -41,7 +41,7 @@ def require_role(operation_name: str):
                 )
                 
                 # Log audit event
-                await audit_logger.log_event(
+                audit_logger.log_event(
                     event_type="guard_blocked",
                     data={
                         "workspace_id": workspace_id,
@@ -288,7 +288,7 @@ async def log_role_access(
     workspace_id = state.get("workspace_id", "unknown")
     role = state["role_state"].get("role", "unknown")
     
-    await audit_logger.log_event(
+    audit_logger.log_event(
         event_type="role_based_access",
         data={
             "workspace_id": workspace_id,

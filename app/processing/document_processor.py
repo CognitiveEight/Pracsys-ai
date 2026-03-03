@@ -285,7 +285,7 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
             }
             
             # Log audit event
-            await audit_logger.log_event(
+            audit_logger.log_event(
                 event_type="document_processed",
                 data=result,
                 workspace_id=workspace_id,

@@ -27,7 +27,8 @@ class Settings(BaseSettings):
     socket_namespace: str = "/"
     socket_reconnection: bool = True
     socket_reconnection_attempts: int = 0  # 0 means infinite attempts
-    socket_reconnection_delay: int = 0  # 0 means immediate reconnection
+    socket_reconnection_delay: int = 2000  # ms before first reconnect (avoid tight loop)
+    socket_reconnection_delay_max: int = 60000  # ms max delay between reconnects (cap backoff)
     socket_secret_key: Optional[str] = None  # Secret key for HMAC signature (SOCKET_SECRET_KEY env var)
     
     # AI Service Authentication

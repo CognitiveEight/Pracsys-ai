@@ -70,7 +70,7 @@ class WorkspaceRoleIntegration:
             )
         
         # Log audit event
-        await audit_logger.log_event(
+        audit_logger.log_event(
             event_type="workspace_role_initialized",
             data={
                 "workspace_id": workspace_id,
@@ -175,7 +175,7 @@ class WorkspaceRoleIntegration:
         )
         
         # Log audit event
-        await audit_logger.log_event(
+        audit_logger.log_event(
             event_type="role_changed",
             data={
                 "workspace_id": workspace_id,

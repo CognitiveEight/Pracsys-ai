@@ -81,6 +81,23 @@ class WorkspaceSyncPayload(BaseModel):
         populate_by_name = True
 
 
+class AnalysisReportFeedbackPayload(BaseModel):
+    """
+    Payload for analysis_report_feedback event (App → Backend → AI service).
+    User rejects an analysis report item (missingInfo or riskOrWeakness) as not relevant.
+    """
+    workspaceId: str
+    userId: str
+    workspaceRole: str
+    section: Literal["missingInfo", "riskOrWeakness"]
+    rejectedValue: str
+    isRejected: bool = True
+    timestamp: str  # ISO timestamp
+
+    class Config:
+        populate_by_name = True
+
+
 class ConversationHistoryItem(BaseModel):
     """Schema for conversation history item."""
     

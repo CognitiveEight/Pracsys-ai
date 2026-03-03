@@ -2,6 +2,7 @@
 Socket.IO event handlers with Intelligence Chat Agent integration.
 Updated to match backend Socket.IO specification.
 """
+import asyncio
 from typing import Dict, Any, Callable, Awaitable, Optional, List
 from loguru import logger
 from datetime import datetime
@@ -39,12 +40,23 @@ class SocketEventHandler:
     - ai_response: AI response back to server
     """
     
+    # Throttle probing_prompts_response to avoid burst of emits that can trigger server disconnect
+    PROBING_THROTTLE_SECONDS = 1.0
+
     def __init__(self):
         self._handlers: Dict[str, EventHandler] = {}
         self._socket_client = None  # Will be set by main service
         self._workspace_suggestion_chips: Dict[str, List[str]] = {}  # workspace_id -> 15-16 strategy chips
         self._workspace_chat_suggestion_chips: Dict[str, List[str]] = {}  # workspace_id -> 10-12 contextual chips (refreshed per AI reply; we return random 4 on each request)
         self._last_workspace_id_with_chips: Optional[str] = None  # fallback when request workspace has no chips
+        self._last_probing_emit_time: Dict[str, float] = {}  # workspace_id -> time of last probing_prompts_response emit
+        # Cache last strategy_objective and analysis_report payloads per workspace (for re-emit on sync when no doc changes)
+        self._workspace_strategy_payload: Dict[str, Any] = {}
+        self._workspace_analysis_payload: Dict[str, Any] = {}
+        # Re-emit after reconnect when socket dropped right after analysis report (so backend gets the update)
+        self._had_disconnect: bool = False
+        self._pending_reemit_workspace_id: Optional[str] = None
+        self._pending_reemit_user_id: Optional[str] = None
         self._register_default_handlers()
     
     def set_socket_client(self, client):
@@ -65,6 +77,7 @@ class SocketEventHandler:
         self.register("workspace_sync", self.on_workspace_sync)
         self.register("user_message_request", self.on_user_message_request)
         self.register("probing_prompts_request", self.on_probing_prompts_request)
+        self.register("analysis_report_feedback", self.on_analysis_report_feedback)
         
         # Legacy event handlers
         self.register("workspace_updated", self.on_workspace_updated)
@@ -303,14 +316,16 @@ OUTPUT (JSON only, complete all fields):
 }}
 ```
 
-suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words each) specific to this case and role. Examples: "Review Title Deeds", "Map Legal Heirs", "Draft Demand Notice", "File FIR", "Preserve Digital Evidence". No full sentences. Provide 15-16 varied chips."""
+suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words each) specific to this case and role. Examples: "Review Title Deeds", "Map Legal Heirs", "Draft Demand Notice", "File FIR", "Preserve Digital Evidence". No full sentences. Provide 15-16 varied chips.
+
+CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, arrays, and the root object."""
                 custom_suffix = build_custom_instruction_suffix(workspace_id)
                 if custom_suffix:
                     structured_prompt = structured_prompt.rstrip() + "\n\n" + custom_suffix
                 ai_response = await gemini_client.generate(
                     prompt=structured_prompt,
                     temperature=0.4,  # Lower temperature for more structured output
-                    max_tokens=8000  # Increased to allow complete responses
+                    max_tokens=12000  # Allow full recommendations/nextSteps without truncation
                 )
                 
                 logger.info(f"AI generated {len(ai_response)} characters of analysis")
@@ -327,13 +342,9 @@ suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words eac
                 # Clean the response
                 ai_response = ai_response.strip()
                 
-                # Strategy 1: Look for JSON in markdown code blocks (```json ... ```)
-                json_match = re.search(r'```json\s*(\{.*?\})\s*```', ai_response, re.DOTALL)
-                if json_match:
-                    json_str = json_match.group(1)
-                    logger.info("✅ Found complete JSON in markdown code block")
-                # Strategy 2: Look for JSON starting after ```json (might be incomplete)
-                elif '```json' in ai_response:
+                # Strategy 1: Look for JSON in markdown code blocks using brace-count (handles nested {} and truncated output)
+                json_str = None
+                if '```json' in ai_response:
                     # Extract everything after ```json
                     start = ai_response.find('```json') + 7
                     remaining = ai_response[start:].strip()
@@ -361,33 +372,24 @@ suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words eac
                                 # Add closing braces
                                 open_braces = json_str.count('{') - json_str.count('}')
                                 json_str = json_str.rstrip() + '}' * open_braces
-                                logger.warning(f"⚠️ Completed truncated JSON by adding {open_braces} closing braces")
+                                logger.warning("⚠️ Completed truncated JSON by adding {} closing braces", open_braces)
                     else:
-                        json_str = None
                         logger.warning("Found ```json marker but no JSON object")
-                # Strategy 3: Look for JSON in plain code blocks
-                elif re.search(r'```\s*(\{.*?\})\s*```', ai_response, re.DOTALL):
+                if json_str is None and re.search(r'```\s*(\{.*?\})\s*```', ai_response, re.DOTALL):
                     json_match = re.search(r'```\s*(\{.*?\})\s*```', ai_response, re.DOTALL)
                     json_str = json_match.group(1)
                     logger.info("✅ Found JSON in plain code block")
-                # Strategy 4: Look for standalone JSON
-                elif ai_response.startswith('{'):
+                if json_str is None and ai_response.startswith('{'):
                     json_str = ai_response
-                    # Check if complete
-                    if json_str.count('{') == json_str.count('}'):
-                        logger.info("✅ Found complete standalone JSON")
-                    else:
-                        logger.warning("⚠️ Found incomplete standalone JSON, attempting to complete")
+                    if json_str.count('{') != json_str.count('}'):
                         open_braces = json_str.count('{') - json_str.count('}')
                         json_str = json_str.rstrip() + '}' * open_braces
-                # Strategy 5: Extract any JSON object from text
-                else:
+                if json_str is None:
                     json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', ai_response, re.DOTALL)
                     if json_match:
                         json_str = json_match.group(0)
                         logger.info("✅ Extracted JSON from text")
                     else:
-                        json_str = None
                         logger.warning("❌ No JSON found in AI response")
                 
                 if json_str:
@@ -569,6 +571,847 @@ suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words eac
             logger.error(f"Error generating strategies: {e}")
             logger.exception(e)
             return None
+
+    async def _generate_analysis_report_from_documents(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        batch_result: Optional[Dict[str, Any]] = None,
+        is_update: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Generate analysis report (quality score, missing info, strengths, risks, jurisdiction)
+        from workspace documents from the perspective of the selected role.
+
+        Returns payload suitable for document_feature_response with featureType "analysis_report":
+        missingInfo, strengths [{point, laws}], weaknesses, risks, relevantJurisdiction,
+        caseResolutionScore (0-100), qualityScoreExplanation, pendingActions, nextSteps, suggestedDrafts.
+        """
+        try:
+            from app.vectorstore.qdrant import vector_store
+            from app.ai.gemini_client import gemini_client
+            from app.agents.role_models import RoleBehaviorContract
+
+            logger.info(
+                "📊 Generating analysis report for workspace {} with role {}",
+                workspace_id,
+                workspace_role,
+            )
+
+            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                role = "ADJUDICATOR"
+
+            all_docs = []
+            try:
+                all_docs = await vector_store.get_all_documents(workspace_id=workspace_id)
+                logger.info(
+                    "Retrieved {} document(s) from vector store for analysis report",
+                    len(all_docs),
+                )
+            except Exception as vector_error:
+                logger.warning(
+                    "Could not retrieve documents from vector store: {}",
+                    vector_error,
+                )
+
+            parts = []
+            for i, doc in enumerate(all_docs, 1):
+                content = (doc.get("content") or "").strip()
+                if not content or len(content) < 20:
+                    continue
+                label = (
+                    "Document {} (most recently uploaded)".format(i)
+                    if i == len(all_docs)
+                    else "Document {}".format(i)
+                )
+                parts.append("--- {} ---\n{}".format(label, content))
+            combined_document_content = (
+                "\n\n".join(parts) if parts else "No document content available."
+            )
+
+            max_content_length = 12000
+            if parts and len(combined_document_content) > max_content_length:
+                latest_content = parts[-1]
+                earlier = "\n\n".join(parts[:-1]) if len(parts) > 1 else ""
+                if len(earlier) + len(latest_content) > max_content_length:
+                    keep_earlier = max(
+                        0, max_content_length - len(latest_content) - 200
+                    )
+                    combined_document_content = (
+                        (earlier[:keep_earlier] + "...\n\n" if keep_earlier else "")
+                        + latest_content
+                    )
+                else:
+                    combined_document_content = earlier + (
+                        "\n\n" + latest_content if earlier else latest_content
+                    )
+                logger.info(
+                    "Truncated document content for analysis report to ~{} chars",
+                    max_content_length,
+                )
+            elif len(combined_document_content) > max_content_length:
+                combined_document_content = (
+                    combined_document_content[:max_content_length] + "..."
+                )
+
+            doc_count = len(all_docs)
+            if doc_count == 0:
+                return {
+                    "missingInfo": [],
+                    "strengths": [],
+                    "weaknesses": [],
+                    "risks": [],
+                    "relevantJurisdiction": [],
+                    "caseResolutionScore": 0,
+                    "qualityScoreExplanation": "",
+                    "pendingActions": [],
+                    "nextSteps": [],
+                    "suggestedDrafts": [],
+                }
+
+            role_ctx = RoleBehaviorContract.get_context(role)
+            role_instruction = (
+                "Analyze from the perspective of {}: {}. "
+                "Framing: {}. Do not: {}.".format(
+                    role,
+                    role_ctx.reasoning_style,
+                    "; ".join(role_ctx.framing_rules[:3]),
+                    "; ".join(role_ctx.forbidden_actions[:2]),
+                )
+            )
+
+            analysis_prompt = """You are a legal analyst for Indian law. Produce an analysis report based on the uploaded documents.
+
+**Role**: {}
+**Role instruction**: {}
+
+**Document content** (documents in upload order; last is most recent):
+{}
+
+**Task**: Provide a structured analysis report from the perspective of the selected role.
+
+**Legal framework**: Use BNS (Bharatiya Nyaya Sanhita), BNSS (Bharatiya Nagarik Suraksha Sanhita), BSA (Bharatiya Sakshya Adhiniyam). Do NOT cite IPC, CrPC, or Indian Evidence Act (replaced). IT Act 2000 remains valid.
+
+**If documents appear unrelated** (different cases/matters), base analysis ONLY on the last document (labeled "most recently uploaded"). Otherwise use all documents combined.
+
+**Output ONLY a single JSON object** – no markdown, no code fences, no text before or after. Start the response with {{ and end with }}.
+{{
+  "missingInfo": ["item1", "item2"],
+  "strengths": [
+    {{ "point": "One clear strength with legal basis", "laws": ["BNS Section 318", "BNSS Section ..."] }},
+    {{ "point": "Another strength", "laws": ["..."] }}
+  ],
+  "weaknesses": ["weakness1", "weakness2"],
+  "risks": ["risk1", "risk2"],
+  "relevantJurisdiction": ["District Court, City", "High Court of State"],
+  "caseResolutionScore": 72,
+  "qualityScoreExplanation": "Detailed explanation of how the 72% score was computed...",
+  "pendingActions": ["action1"],
+  "nextSteps": ["step1", "step2"],
+  "suggestedDrafts": ["Draft 1", "Draft 2"]
+}}
+
+Rules:
+- missingInfo: 0-8 items – critical gaps (witness details, dates, evidence) that would strengthen the case from this role's perspective.
+- strengths: 2-6 items – each with "point" (one sentence) and "laws" (array of specific act/section references).
+- weaknesses: 0-6 items – factual or legal weaknesses from this role's perspective.
+- risks: 0-6 items – procedural or outcome risks (limitation, burden of proof, etc.).
+- relevantJurisdiction: 1-5 courts/fora (e.g. "District Court, Mumbai", "High Court of Bombay").
+- caseResolutionScore: integer 0-100 (overall readiness/strength of case from this role's perspective; 0 = no docs, 100 = very strong).
+- qualityScoreExplanation: string – detailed explanation of how the caseResolutionScore was computed (e.g. factors considered, impact of strengths/weaknesses/risks/missingInfo).
+- pendingActions, nextSteps, suggestedDrafts: 0-5 items each; concrete next steps and suggested draft names (e.g. "Draft BNSS Complaint").
+""".format(
+                role,
+                role_instruction,
+                combined_document_content,
+            )
+
+            custom_suffix = build_custom_instruction_suffix(workspace_id)
+            if custom_suffix:
+                analysis_prompt = analysis_prompt.rstrip() + "\n\n" + custom_suffix
+
+            ai_response = await gemini_client.generate(
+                prompt=analysis_prompt,
+                temperature=0.35,
+                max_tokens=12000,
+            )
+            logger.info(
+                "Analysis report AI response length: {} chars",
+                len(ai_response or ""),
+            )
+
+            import json
+            import re
+
+            raw = (ai_response or "").strip()
+            # Strip markdown code blocks so we can find JSON inside
+            if "```" in raw:
+                code_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
+                if code_match:
+                    raw = code_match.group(1).strip()
+                else:
+                    raw = re.sub(r"^```\w*\s*", "", raw)
+                    raw = re.sub(r"\s*```\s*$", "", raw).strip()
+            # Find first "{" and extract balanced JSON object (handles preamble text and nested JSON)
+            # Use string-aware scan so braces inside "..." don't break balance
+            json_str = None
+            start = raw.find("{")
+            if start >= 0:
+                depth = 0
+                i = start
+                in_string = False
+                escape = False
+                quote_char = None
+                while i < len(raw):
+                    c = raw[i]
+                    if in_string:
+                        if escape:
+                            escape = False
+                        elif c == "\\":
+                            escape = True
+                        elif c == quote_char:
+                            in_string = False
+                        i += 1
+                        continue
+                    if c == '"' or c == "'":
+                        in_string = True
+                        quote_char = c
+                        i += 1
+                        continue
+                    if c == "{":
+                        depth += 1
+                    elif c == "}":
+                        depth -= 1
+                        if depth == 0:
+                            json_str = raw[start : i + 1]
+                            break
+                    i += 1
+            if not json_str and raw.startswith("{"):
+                json_str = raw
+            if json_str and json_str.count("{") != json_str.count("}"):
+                open_braces = json_str.count("{") - json_str.count("}")
+                json_str = json_str.rstrip() + "}" * open_braces
+
+            if not json_str:
+                logger.warning(
+                    "No JSON found in analysis report response; using fallback. raw preview: {}",
+                    (raw or "")[:400],
+                )
+                return self._analysis_report_fallback(role)
+
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                # Try to repair truncated JSON (e.g. "Unterminated string" when Gemini hits token limit)
+                data = None
+                if "Unterminated string" in (e.msg or "") or "Unterminated" in (e.msg or ""):
+                    pos = getattr(e, "pos", None)
+                    if pos is not None and pos > 0 and pos <= len(json_str):
+                        truncated = json_str[:pos].rstrip()
+                        # Key has no value or value was cut: add empty string and close structure
+                        if truncated.endswith(':'):
+                            truncated += ' ""'
+                        elif truncated.endswith(':"') or (truncated.endswith('"') and not truncated.endswith('""')):
+                            truncated += '"'  # close the opened string as empty
+                        else:
+                            truncated += ' ""'
+                        open_brackets = truncated.count("[") - truncated.count("]")
+                        open_braces = truncated.count("{") - truncated.count("}")
+                        truncated += "]" * open_brackets + "}" * open_braces
+                        try:
+                            data = json.loads(truncated)
+                            logger.info(
+                                "Repaired analysis report JSON after truncation (pos={})",
+                                pos,
+                            )
+                        except json.JSONDecodeError:
+                            pass
+                if data is None:
+                    logger.warning("Analysis report JSON parse error: {}; using fallback", e)
+                    return self._analysis_report_fallback(role)
+
+            missing_info = data.get("missingInfo") or data.get("missing_info") or []
+            if not isinstance(missing_info, list):
+                missing_info = [missing_info] if missing_info else []
+            missing_info = [str(x).strip() for x in missing_info if x][:10]
+
+            strengths_raw = data.get("strengths") or []
+            if not isinstance(strengths_raw, list):
+                strengths_raw = []
+            strengths = []
+            for s in strengths_raw[:8]:
+                if isinstance(s, dict):
+                    point = (s.get("point") or s.get("text") or "").strip()
+                    laws = s.get("laws") or s.get("law") or []
+                    if not isinstance(laws, list):
+                        laws = [laws] if laws else []
+                    laws = [str(l).strip() for l in laws if l][:5]
+                    if point:
+                        strengths.append({"point": point, "laws": laws})
+                elif isinstance(s, str) and s.strip():
+                    strengths.append({"point": s.strip(), "laws": []})
+
+            weaknesses = data.get("weaknesses") or []
+            if not isinstance(weaknesses, list):
+                weaknesses = [weaknesses] if weaknesses else []
+            weaknesses = [str(x).strip() for x in weaknesses if x][:8]
+
+            risks = data.get("risks") or []
+            if not isinstance(risks, list):
+                risks = [risks] if risks else []
+            risks = [str(x).strip() for x in risks if x][:8]
+
+            relevant_jurisdiction = (
+                data.get("relevantJurisdiction")
+                or data.get("relevant_jurisdiction")
+                or data.get("jurisdiction")
+                or []
+            )
+            if not isinstance(relevant_jurisdiction, list):
+                relevant_jurisdiction = (
+                    [relevant_jurisdiction] if relevant_jurisdiction else []
+                )
+            relevant_jurisdiction = [
+                str(x).strip() for x in relevant_jurisdiction if x
+            ][:6]
+
+            score = data.get("caseResolutionScore") or data.get("case_resolution_score")
+            try:
+                case_resolution_score = max(
+                    0, min(100, int(score) if score is not None else 0)
+                )
+            except (TypeError, ValueError):
+                case_resolution_score = 0
+            # Cap at 95% when Missing Info / Risks / Weaknesses still have items (100% only when all empty)
+            max_allowed = self._analysis_report_max_allowed_score(
+                missing_info=missing_info, weaknesses=weaknesses, risks=risks
+            )
+            case_resolution_score = min(case_resolution_score, max_allowed)
+
+            quality_score_explanation = (
+                data.get("qualityScoreExplanation") or data.get("quality_score_explanation") or ""
+            )
+            if not isinstance(quality_score_explanation, str):
+                quality_score_explanation = str(quality_score_explanation or "").strip()
+
+            pending_actions = data.get("pendingActions") or data.get("pending_actions") or []
+            if not isinstance(pending_actions, list):
+                pending_actions = [pending_actions] if pending_actions else []
+            pending_actions = [str(x).strip() for x in pending_actions if x][:6]
+
+            next_steps = data.get("nextSteps") or data.get("next_steps") or []
+            if not isinstance(next_steps, list):
+                next_steps = [next_steps] if next_steps else []
+            next_steps = [str(x).strip() for x in next_steps if x][:6]
+
+            suggested_drafts = (
+                data.get("suggestedDrafts") or data.get("suggested_drafts") or []
+            )
+            if not isinstance(suggested_drafts, list):
+                suggested_drafts = [suggested_drafts] if suggested_drafts else []
+            suggested_drafts = [str(x).strip() for x in suggested_drafts if x][:6]
+
+            payload = {
+                "missingInfo": missing_info,
+                "strengths": strengths,
+                "weaknesses": weaknesses,
+                "risks": risks,
+                "relevantJurisdiction": relevant_jurisdiction,
+                "caseResolutionScore": case_resolution_score,
+                "qualityScoreExplanation": quality_score_explanation,
+                "pendingActions": pending_actions,
+                "nextSteps": next_steps,
+                "suggestedDrafts": suggested_drafts,
+            }
+
+            # Detailed analysis report logs for debugging
+            logger.info("=" * 80)
+            logger.info("📊 ANALYSIS REPORT PAYLOAD (AI-GENERATED)")
+            logger.info("=" * 80)
+            logger.info("📈 caseResolutionScore: {}%", case_resolution_score)
+            if quality_score_explanation:
+                logger.info(
+                    "📝 qualityScoreExplanation: {}",
+                    quality_score_explanation[:200] + ("..." if len(quality_score_explanation) > 200 else ""),
+                )
+            logger.info("")
+            logger.info("❓ MISSING INFO ({} items):", len(missing_info))
+            for idx, item in enumerate(missing_info, 1):
+                logger.info("  {}. {}", idx, item)
+            logger.info("")
+            logger.info("✅ STRENGTHS ({} items):", len(strengths))
+            for idx, s in enumerate(strengths, 1):
+                logger.info("  {}. {} | laws: {}", idx, s.get("point", ""), s.get("laws", []))
+            logger.info("")
+            logger.info("⚠️ WEAKNESSES ({} items):", len(weaknesses))
+            for idx, w in enumerate(weaknesses, 1):
+                logger.info("  {}. {}", idx, w)
+            logger.info("")
+            logger.info("🔴 RISKS ({} items):", len(risks))
+            for idx, r in enumerate(risks, 1):
+                logger.info("  {}. {}", idx, r)
+            logger.info("")
+            logger.info("📍 RELEVANT JURISDICTION ({} items):", len(relevant_jurisdiction))
+            for idx, j in enumerate(relevant_jurisdiction, 1):
+                logger.info("  {}. {}", idx, j)
+            logger.info("")
+            logger.info("📋 PENDING ACTIONS ({} items):", len(pending_actions))
+            for idx, a in enumerate(pending_actions, 1):
+                logger.info("  {}. {}", idx, a)
+            logger.info("")
+            logger.info("🚀 NEXT STEPS ({} items):", len(next_steps))
+            for idx, n in enumerate(next_steps, 1):
+                logger.info("  {}. {}", idx, n)
+            logger.info("")
+            logger.info("📄 SUGGESTED DRAFTS ({} items):", len(suggested_drafts))
+            for idx, d in enumerate(suggested_drafts, 1):
+                logger.info("  {}. {}", idx, d)
+            logger.info("=" * 80)
+
+            logger.success(
+                "✅ Analysis report generated: score={}, strengths={}, missingInfo={}",
+                case_resolution_score,
+                len(strengths),
+                len(missing_info),
+            )
+            return payload
+
+        except Exception as e:
+            logger.error("Error generating analysis report: {}", e)
+            logger.exception(e)
+            return self._analysis_report_fallback(
+                (workspace_role or "ADJUDICATOR").strip().upper()
+            )
+
+    def _analysis_report_fallback(self, role: str) -> Dict[str, Any]:
+        """Return a minimal valid analysis report when AI fails or no docs."""
+        return {
+            "missingInfo": [],
+            "strengths": [],
+            "weaknesses": [],
+            "risks": [],
+            "relevantJurisdiction": [],
+            "caseResolutionScore": 0,
+            "qualityScoreExplanation": "",
+            "pendingActions": [],
+            "nextSteps": [],
+            "suggestedDrafts": [],
+        }
+
+    def _strategy_objective_fallback(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        is_update: bool = True,
+    ) -> Dict[str, Any]:
+        """Return a minimal strategy/objective payload when there are no docs or generation fails."""
+        return {
+            "workspaceId": workspace_id,
+            "userId": user_id,
+            "role": (workspace_role or "ADJUDICATOR").strip().upper(),
+            "isUpdate": is_update,
+            "isEmpty": True,
+            "caseSummary": "",
+            "strategicObjective": "",
+            "recommendations": [],
+            "possibleNextSteps": [],
+            "suggestionChips": [],
+            "analysis": {
+                "documentCount": 0,
+                "averageReadability": 0,
+                "totalDocuments": 0,
+                "successfulDocuments": 0,
+                "basedOnAIAnalysis": False,
+            },
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    async def _emit_analysis_report(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        batch_result: Optional[Dict[str, Any]] = None,
+        is_update: bool = False,
+        log_context: str = "",
+    ) -> bool:
+        """
+        Generate analysis report (or use fallback on error), then emit to backend and cache.
+        Emit is done outside try/except so it always runs and errors propagate.
+        """
+        if not self._socket_client:
+            return False
+        try:
+            analysis_report = await self._generate_analysis_report_from_documents(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+                batch_result=batch_result,
+                is_update=is_update,
+            )
+            if not analysis_report:
+                analysis_report = self._analysis_report_fallback(
+                    (workspace_role or "ADJUDICATOR").strip().upper()
+                )
+        except Exception as e:
+            logger.warning("Analysis report generation failed{}: {}; using fallback", log_context, e)
+            analysis_report = self._analysis_report_fallback(
+                (workspace_role or "ADJUDICATOR").strip().upper()
+            )
+        # Emit outside try/except so it always runs and backend receives it
+        await self._socket_client.emit(
+            "document_feature_response",
+            {
+                "featureType": "analysis_report",
+                "workspaceId": workspace_id,
+                "userId": user_id,
+                "payload": analysis_report,
+            },
+        )
+        self._workspace_analysis_payload[workspace_id] = analysis_report
+        self._pending_reemit_workspace_id = workspace_id
+        self._pending_reemit_user_id = user_id
+        logger.success("✅ Analysis report sent to backend{}", log_context)
+        # Brief yield so the socket can flush before caller continues (reduces risk of disconnect before delivery)
+        await asyncio.sleep(0.15)
+        return True
+
+    async def _generate_and_emit_analysis_report_for_sync(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        batch_result: Optional[Dict[str, Any]],
+    ) -> None:
+        """
+        Generate analysis report and emit to backend. Used as a background task from
+        workspace_sync so the long-running Gemini call is not blocked by other socket events
+        (e.g. probing_prompts_request). Ensures analysis report is always emitted.
+        """
+        try:
+            analysis_report = await self._generate_analysis_report_from_documents(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+                batch_result=batch_result,
+                is_update=True,
+            )
+            if not analysis_report:
+                analysis_report = self._analysis_report_fallback(
+                    (workspace_role or "ADJUDICATOR").strip().upper()
+                )
+            if self._socket_client and analysis_report:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "analysis_report",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": analysis_report,
+                    },
+                )
+                self._workspace_analysis_payload[workspace_id] = analysis_report
+                logger.success("✅ Analysis report sent to backend (sync)")
+        except asyncio.CancelledError:
+            logger.warning("Analysis report (sync) task cancelled; emitting fallback")
+            raise
+        except Exception as ar_err:
+            logger.warning("Analysis report (sync) failed: {}; emitting fallback", ar_err)
+            try:
+                fallback = self._analysis_report_fallback(
+                    (workspace_role or "ADJUDICATOR").strip().upper()
+                )
+                if self._socket_client:
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "analysis_report",
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "payload": fallback,
+                        },
+                    )
+                    self._workspace_analysis_payload[workspace_id] = fallback
+                    logger.success("✅ Analysis report (fallback) sent to backend (sync)")
+            except Exception as e:
+                logger.error("Failed to emit analysis report fallback (sync): {}", e)
+
+    # Fallback score bump when AI-based delta is unavailable
+    _ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT = 4
+    # Max score when Missing Information / Risks / Weaknesses still have items (100% only when all are empty)
+    _ANALYSIS_REPORT_MAX_SCORE_WITH_PENDING_ITEMS = 95
+
+    def _analysis_report_max_allowed_score(
+        self,
+        missing_info: Optional[List[Any]] = None,
+        weaknesses: Optional[List[Any]] = None,
+        risks: Optional[List[Any]] = None,
+        report: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """
+        Return max allowed caseResolutionScore (100 only when no missing info, risks, or weaknesses).
+        If any of those sections have items, cap at 95% so 100% is not shown until user has addressed all.
+        """
+        if report is not None:
+            missing_info = report.get("missingInfo") or report.get("missing_info") or []
+            weaknesses = report.get("weaknesses") or []
+            risks = report.get("risks") or []
+        has_pending = bool(
+            (missing_info and len(missing_info) > 0)
+            or (weaknesses and len(weaknesses) > 0)
+            or (risks and len(risks) > 0)
+        )
+        return 100 if not has_pending else self._ANALYSIS_REPORT_MAX_SCORE_WITH_PENDING_ITEMS
+
+    def _match_rejected_value(self, item: Any, rejected_value: str) -> bool:
+        """Return True if item matches rejectedValue (string or dict with 'point' key)."""
+        rv = (rejected_value or "").strip()
+        if not rv:
+            return False
+        if isinstance(item, str):
+            return item.strip() == rv or rv in item.strip() or item.strip() in rv
+        if isinstance(item, dict) and "point" in item:
+            pt = (item.get("point") or "").strip()
+            return pt == rv or rv in pt or pt in rv
+        return False
+
+    async def _compute_rejection_score_delta(
+        self,
+        current_score: int,
+        section: str,
+        rejected_value: str,
+        report: Dict[str, Any],
+    ) -> tuple[int, str]:
+        """
+        Ask AI to compute score increase (0–15) and reason based on priority of the rejected item.
+        Returns (delta, reason). On failure returns (default_bump, generic reason).
+        """
+        import json
+        import re
+        try:
+            from app.ai.gemini_client import gemini_client
+            gemini_client.initialize()
+            if not gemini_client.model:
+                return (self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT, "Score adjusted to reflect user rejection.")
+            remaining_missing = len(report.get("missingInfo") or report.get("missing_info") or [])
+            remaining_weak = len(report.get("weaknesses") or [])
+            remaining_risks = len(report.get("risks") or [])
+            # Build short context: other items in the same section so the model can judge relative impact
+            section_items: List[str] = []
+            if section == "missingInfo":
+                for x in report.get("missingInfo") or report.get("missing_info") or []:
+                    t = x.get("point", x) if isinstance(x, dict) else x
+                    if isinstance(t, str) and t.strip():
+                        section_items.append(t.strip()[:120])
+            else:
+                for x in (report.get("weaknesses") or []) + (report.get("risks") or []):
+                    t = x.get("point", x) if isinstance(x, dict) else x
+                    if isinstance(t, str) and t.strip():
+                        section_items.append(t.strip()[:120])
+            section_context = (
+                "Other items in this section (for context): " + "; ".join(section_items[:8])
+                if section_items
+                else ""
+            )
+            prompt = f"""You are a legal case analyst. The user rejected ONE item from their analysis report as not relevant. Your task is to output a JSON object with "scoreIncrease" (integer 2-15) and "reason" (one short sentence).
+
+**Current case resolution score**: {current_score}%
+**Section from which item was rejected**: {section}
+**Rejected item (exact text)**: "{rejected_value[:400]}"
+**Remaining counts after this rejection**: missingInfo={remaining_missing}, weaknesses={remaining_weak}, risks={remaining_risks}
+{f'**{section_context}**' if section_context else ''}
+
+IMPACT RULES – you MUST choose scoreIncrease based on the SPECIFIC rejected item. Do NOT use the same number every time (e.g. do NOT default to 11).
+
+- **missingInfo**: Rejecting a "missing information" item means the user says that item is not needed. Impact is often LOW to MEDIUM.
+  - Low impact (minor/administrative detail, e.g. dates, addresses, minor clarifications): scoreIncrease = 0 to 1.
+  - Medium impact (useful but not critical evidence): scoreIncrease = 2 to 4.
+  - High impact (critical missing evidence that would have weakened the case): scoreIncrease = 4 to 6. Use only if the rejected item was clearly a major gap.
+
+- **riskOrWeakness**: Rejecting a risk or weakness means the user says that risk/weakness does not apply. Impact can be MEDIUM to HIGH.
+  - Low impact (minor procedural note, generic risk): scoreIncrease = 0 to 1.
+  - Medium impact (moderate risk or weakness): scoreIncrease = 2 to 4.
+  - High impact (major risk like dismissal, liability, or key weakness): scoreIncrease = 4 to 6.
+
+- If current score is 88 or above, cap scoreIncrease at 6 so the total does not overshoot 100.
+- Pick ONE integer in the chosen range (e.g. 3, 5, 7, 10) based on the wording of the rejected item. Vary your choice; do not always output 11.
+
+Output ONLY valid JSON, no markdown, no code block:
+{{"scoreIncrease": <integer 2-15>, "reason": "<one short sentence explaining why this increase for this item>"}}
+"""
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.6,
+                max_tokens=8000,
+            )
+            raw = (raw or "").strip()
+            if not raw or raw.startswith("Error") or "Error generating" in raw[:50]:
+                logger.warning("Rejection score delta: Gemini error or empty; using default. raw={}", (raw or "")[:100])
+                return (self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT, "Score adjusted to reflect user rejection.")
+            # Strip markdown code blocks if present
+            if "```" in raw:
+                match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
+                if match:
+                    raw = match.group(1).strip()
+                else:
+                    raw = re.sub(r"^```\w*\s*", "", raw)
+                    raw = re.sub(r"\s*```\s*$", "", raw)
+            obj = None
+            start = raw.find("{")
+            if start >= 0:
+                depth = 0
+                for i in range(start, len(raw)):
+                    if raw[i] == "{":
+                        depth += 1
+                    elif raw[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                obj = json.loads(raw[start : i + 1])
+                            except json.JSONDecodeError:
+                                pass
+                            break
+            if obj and isinstance(obj, dict) and "scoreIncrease" in obj:
+                delta = int(obj.get("scoreIncrease", self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT))
+                delta = max(0, min(15, delta))
+                # When score is already high, cap increase so total does not overshoot 100 and we avoid fixed large bumps
+                if current_score >= 88 and delta > 6:
+                    delta = min(delta, 6)
+                if current_score + delta > 100:
+                    delta = max(0, 100 - current_score)
+                reason = (obj.get("reason") or "Score adjusted based on rejection priority.").strip()
+                logger.info("Rejection score delta: AI delta={}, reason={}", delta, (reason or "")[:80])
+                return (delta, reason[:200])
+            # Regex fallback: extract scoreIncrease from raw text (e.g. malformed or truncated JSON)
+            num_match = re.search(
+                r'"scoreIncrease"\s*:\s*(\d+)|scoreIncrease"\s*:\s*(\d+)|\bscoreIncrease\s*:\s*(\d+)',
+                raw,
+            )
+            if num_match:
+                delta = int(num_match.group(1) or num_match.group(2) or num_match.group(3) or 0)
+                delta = max(0, min(15, delta))
+                if current_score >= 88 and delta > 6:
+                    delta = min(delta, 6)
+                if current_score + delta > 100:
+                    delta = max(0, 100 - current_score)
+                reason_match = re.search(r'"reason"\s*:\s*"([^"]*)"', raw)
+                reason = (reason_match.group(1).strip() if reason_match else "Score adjusted based on rejection priority.")[:200]
+                logger.info("Rejection score delta: parsed via regex delta={}", delta)
+                return (delta, reason)
+            logger.warning("Rejection score delta: could not parse response; using default. raw={}", raw[:200])
+        except Exception as e:
+            logger.warning("Rejection score delta failed: {}; using default bump", e)
+        return (self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT, "Score adjusted to reflect user rejection.")
+
+    async def on_analysis_report_feedback(self, data: Dict[str, Any]) -> None:
+        """
+        Handle analysis_report_feedback: user rejected an analysis item (missingInfo or riskOrWeakness).
+        Remove the item, bump caseResolutionScore, update qualityScoreExplanation, re-emit report.
+        """
+        import copy
+        payload = data if isinstance(data, dict) else {}
+        workspace_id = payload.get("workspaceId") or payload.get("workspace_id") or ""
+        user_id = payload.get("userId") or payload.get("user_id") or ""
+        workspace_role = payload.get("workspaceRole") or payload.get("workspace_role") or ""
+        section = payload.get("section") or ""
+        rejected_value = (payload.get("rejectedValue") or payload.get("rejected_value") or "").strip()
+        is_rejected = payload.get("isRejected", payload.get("is_rejected", True))
+
+        if not workspace_id or not section or not rejected_value:
+            logger.warning(
+                "analysis_report_feedback: missing workspaceId, section, or rejectedValue – ignoring"
+            )
+            return
+        if section not in ("missingInfo", "riskOrWeakness"):
+            logger.warning("analysis_report_feedback: invalid section '{}' – ignoring", section)
+            return
+        if not is_rejected:
+            logger.debug("analysis_report_feedback: isRejected=false – no score change")
+            return
+
+        current = self._workspace_analysis_payload.get(workspace_id)
+        if not current:
+            logger.warning(
+                "analysis_report_feedback: no cached analysis report for workspace {} – cannot apply rejection",
+                workspace_id,
+            )
+            return
+
+        report = copy.deepcopy(current)
+        old_score = int(report.get("caseResolutionScore") or report.get("case_resolution_score") or 0)
+        removed = False
+
+        if section == "missingInfo":
+            missing = report.get("missingInfo") or report.get("missing_info") or []
+            if isinstance(missing, list):
+                new_missing = [x for x in missing if not self._match_rejected_value(x, rejected_value)]
+                if len(new_missing) < len(missing):
+                    report["missingInfo"] = new_missing
+                    removed = True
+        else:
+            # riskOrWeakness: remove from weaknesses then risks
+            weaknesses = report.get("weaknesses") or []
+            if isinstance(weaknesses, list):
+                new_weak = [x for x in weaknesses if not self._match_rejected_value(x, rejected_value)]
+                if len(new_weak) < len(weaknesses):
+                    report["weaknesses"] = new_weak
+                    removed = True
+            risks = report.get("risks") or []
+            if isinstance(risks, list):
+                new_risks = [x for x in risks if not self._match_rejected_value(x, rejected_value)]
+                if len(new_risks) < len(risks):
+                    report["risks"] = new_risks
+                    removed = True
+
+        if not removed:
+            logger.info(
+                "analysis_report_feedback: no matching item found for rejectedValue in {} – applying score bump only",
+                section,
+            )
+
+        # Compute score increase based on priority/significance of the rejected item (AI)
+        score_delta, delta_reason = await self._compute_rejection_score_delta(
+            current_score=old_score,
+            section=section,
+            rejected_value=rejected_value,
+            report=report,
+        )
+        new_score = min(100, old_score + score_delta)
+        # Cap at 95% when Missing Info / Risks / Weaknesses still have items (100% only when all empty)
+        max_allowed = self._analysis_report_max_allowed_score(report=report)
+        new_score = min(new_score, max_allowed)
+        report["caseResolutionScore"] = new_score
+
+        explanation = (report.get("qualityScoreExplanation") or report.get("quality_score_explanation") or "").strip()
+        snippet = rejected_value[:80] + ("..." if len(rejected_value) > 80 else "")
+        feedback_note = (
+            f" User rejected 1 item from {section}: \"{snippet}\". "
+            f"Score adjusted by +{score_delta} (from {old_score}% to {new_score}%). {delta_reason}"
+        )
+        report["qualityScoreExplanation"] = (explanation + feedback_note).strip()
+
+        self._workspace_analysis_payload[workspace_id] = report
+
+        if self._socket_client:
+            await self._socket_client.emit(
+                "document_feature_response",
+                {
+                    "featureType": "analysis_report",
+                    "workspaceId": workspace_id,
+                    "userId": user_id,
+                    "payload": report,
+                },
+            )
+            logger.success(
+                "✅ analysis_report_feedback applied: score {}% → {}%, re-emitted analysis_report",
+                old_score,
+                new_score,
+            )
+        else:
+            logger.warning("analysis_report_feedback: no socket client – report updated in cache only")
 
     def _salvage_workspace_metadata_from_truncated_json(self, raw: str, combined: str = "") -> Dict[str, Any]:
         """Extract caseTitle, caseCategory, subcategories and description from truncated Gemini JSON."""
@@ -1215,7 +2058,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
     async def on_connect(self, data: Any) -> None:
         """Handle connection event."""
         logger.info("Socket connected")
-        await audit_logger.log_event(
+        audit_logger.log_event(
             "socket_connect",
             {"status": "connected"}
         )
@@ -1224,18 +2067,55 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
         """
         Handle 'connected' event from server.
         Confirms successful connection with userId and clientType.
+        If we had a disconnect right after emitting analysis report, re-emit from cache so backend gets the update.
         """
         logger.success("✅ Server confirmed connection as AI_Maverick")
         logger.info(f"Connection details: {data}")
-        await audit_logger.log_event(
+        audit_logger.log_event(
             "socket_connected_confirmed",
             {"status": "confirmed", "data": data}
         )
+        # Re-emit strategy + analysis for last synced workspace if we were disconnected right after emit
+        if self._had_disconnect and self._pending_reemit_workspace_id and self._socket_client:
+            workspace_id = self._pending_reemit_workspace_id
+            user_id = self._pending_reemit_user_id or ""
+            self._had_disconnect = False
+            self._pending_reemit_workspace_id = None
+            self._pending_reemit_user_id = None
+            try:
+                strategies_result = self._workspace_strategy_payload.get(workspace_id)
+                if strategies_result:
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "strategy_objective",
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "payload": strategies_result,
+                        },
+                    )
+                    logger.success("✅ Strategy re-emitted to backend after reconnect")
+                    await asyncio.sleep(0.2)
+                analysis_report = self._workspace_analysis_payload.get(workspace_id)
+                if analysis_report:
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "analysis_report",
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "payload": analysis_report,
+                        },
+                    )
+                    logger.success("✅ Analysis report re-emitted to backend after reconnect")
+            except Exception as e:
+                logger.warning("Failed to re-emit after reconnect: {}", e)
     
     async def on_disconnect(self, data: Any) -> None:
-        """Handle disconnection event."""
+        """Handle disconnection event. Mark that we disconnected (so on_connected can re-emit if needed)."""
+        self._had_disconnect = True
         logger.info("Socket disconnected")
-        await audit_logger.log_event(
+        audit_logger.log_event(
             "socket_disconnect",
             {"status": "disconnected"}
         )
@@ -1243,7 +2123,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
     async def on_error(self, data: Any) -> None:
         """Handle error event."""
         logger.error("Socket error received: {}", data)
-        await audit_logger.log_event(
+        audit_logger.log_event(
             "socket_error",
             {"error": str(data)}
         )
@@ -1388,10 +2268,10 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         batch_result.get("average_readability_score", 0)
                     )
                     
-                    # Send processing results back to backend
+                    # Send processing results back to backend (each section isolated so one failure doesn't block the rest — same idea as ex_event)
                     if self._socket_client:
+                        # 1) Document assessments — own try/except
                         try:
-                            # Prepare document results with readability scores, summary, and evidentiary strength
                             document_results = []
                             for result in batch_result.get("results", []):
                                 doc_result = {
@@ -1409,8 +2289,6 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 if not result.get("success"):
                                     doc_result["error"] = result.get("error", "Unknown error")
                                 document_results.append(doc_result)
-                            
-                            # Emit document_feature_response for document assessments (per backend spec)
                             document_assessment_payload = {
                                 "featureType": "document_assessments",
                                 "workspaceId": payload.workspaceId,
@@ -1425,163 +2303,123 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                     }
                                 }
                             }
-                            
-                            # Emit document_feature_response event (backend spec)
                             logger.info(f"📤 Emitting document_feature_response (document_assessments) with {len(document_results)} documents")
-                            
-                            # Log detailed document assessment information
-                            logger.info("=" * 80)
-                            logger.info("📄 DOCUMENT ASSESSMENT PAYLOAD")
-                            logger.info("=" * 80)
-                            logger.info(f"Workspace ID: {payload.workspaceId}")
-                            logger.info(f"User ID: {payload.userId}")
-                            logger.info(f"Total Files: {batch_result.get('total_files')}")
-                            logger.info(f"Successful: {batch_result.get('successful')}")
-                            logger.info(f"Failed: {batch_result.get('failed')}")
-                            logger.info(f"Average Readability: {batch_result.get('average_readability_score'):.2f}%")
-                            logger.info("-" * 80)
-                            
-                            for idx, doc in enumerate(document_results, 1):
-                                logger.info(f"")
-                                logger.info(f"Document {idx}:")
-                                logger.info(f"  ID: {doc.get('documentId')}")
-                                logger.info(f"  Filename: {doc.get('filename')}")
-                                logger.info(f"  Success: {doc.get('success')}")
-                                logger.info(f"  Readability Score: {doc.get('readabilityScore')}%")
-                                logger.info(f"  Readability Rating: {doc.get('readabilityRating')}")
-                                logger.info(f"  Summary: {(doc.get('summary') or '')[:100]}{'...' if len(doc.get('summary') or '') > 100 else ''}")
-                                logger.info(f"  Evidentiary Strength: {doc.get('evidentiaryStrength', 'N/A')}")
-                                logger.info(f"  Readable: {doc.get('readable')}")
-                                logger.info(f"  Extracted Text Length: {doc.get('extractedTextLength')} chars")
-                                logger.info(f"  Stored in Vector DB: {doc.get('storedInVectorDb')}")
-                                if not doc.get('success'):
-                                    logger.info(f"  Error: {doc.get('error')}")
-                                logger.info("-" * 80)
-                            
-                            logger.info("=" * 80)
-                            
                             await self._socket_client.emit(
                                 "document_feature_response",
                                 document_assessment_payload
                             )
                             logger.success("✅ Document assessments sent to backend")
-                            logger.info(f"📊 Sent: {batch_result.get('successful')}/{batch_result.get('total_files')} files, avg readability: {batch_result.get('average_readability_score'):.2f}%")
+                        except Exception as e:
+                            logger.error("Failed to emit document_assessments: {}", e)
 
-                            # Emit workspace_metadata: title from documents (AI case title), category, subcategories. Title is set once only.
-                            if batch_result.get("successful", 0) > 0:
-                                try:
-                                    meta = await self._get_workspace_category_and_subcategory(
-                                        workspace_id=payload.workspaceId,
-                                        user_id=payload.userId,
-                                    )
-                                    workspace_metadata_payload = {
-                                        "featureType": "workspace_metadata",
-                                        "workspaceId": payload.workspaceId,
-                                        "userId": payload.userId,
-                                        "payload": {
-                                            "workspaceTitle": meta.get("caseTitle") or "",
-                                            "updateTitle": True,
-                                            "caseCategory": meta.get("caseCategory", "General"),
-                                            "subcategories": meta.get("subcategories", []),
-                                            "description": meta.get("description", ""),
-                                        },
+                        # 2) Workspace metadata — own try/except (same as ex_event)
+                        if batch_result.get("successful", 0) > 0:
+                            try:
+                                meta = await self._get_workspace_category_and_subcategory(
+                                    workspace_id=payload.workspaceId,
+                                    user_id=payload.userId,
+                                )
+                                workspace_metadata_payload = {
+                                    "featureType": "workspace_metadata",
+                                    "workspaceId": payload.workspaceId,
+                                    "userId": payload.userId,
+                                    "payload": {
+                                        "workspaceTitle": meta.get("caseTitle") or "",
+                                        "updateTitle": True,
+                                        "caseCategory": meta.get("caseCategory", "General"),
+                                        "subcategories": meta.get("subcategories", []),
+                                        "description": meta.get("description", ""),
+                                    },
+                                }
+                                await self._socket_client.emit(
+                                    "document_feature_response",
+                                    workspace_metadata_payload
+                                )
+                                logger.success("✅ Workspace metadata sent")
+                            except Exception as meta_err:
+                                logger.warning("Failed to emit workspace_metadata: {}", str(meta_err))
+
+                        # 3) Strategy & objective — own try/except, exact same pattern as ex_event
+                        # 4) Analysis report — immediately after strategy, exact same emit pattern (so backend receives both)
+                        if batch_result.get("successful", 0) > 0:
+                            logger.info("🎯 Generating strategies and objectives from processed documents...")
+                            try:
+                                strategies_result = await self._generate_strategies_from_documents(
+                                    workspace_id=payload.workspaceId,
+                                    user_id=payload.userId,
+                                    workspace_role=workspace_role,
+                                    batch_result=batch_result
+                                )
+                                if strategies_result:
+                                    logger.success("✅ Strategies generated, emitting to backend...")
+                                    strategy_feature_payload = {
+                                        "featureType": "strategy_objective",
+                                        "workspaceId": str(payload.workspaceId),
+                                        "userId": str(payload.userId),
+                                        "payload": strategies_result
                                     }
+                                    logger.info("=" * 80)
+                                    logger.info("📋 STRATEGY & OBJECTIVE PAYLOAD (AI-GENERATED)")
+                                    logger.info("=" * 80)
+                                    logger.info(f"Workspace ID: {payload.workspaceId}")
+                                    logger.info(f"User ID: {payload.userId}")
+                                    logger.info(f"Role: {strategies_result.get('role')}")
+                                    logger.info("=" * 80)
                                     await self._socket_client.emit(
                                         "document_feature_response",
-                                        workspace_metadata_payload
+                                        strategy_feature_payload
                                     )
-                                    logger.success(
-                                        "✅ Workspace metadata sent: title={} (from docs, fixed), category={}, subcategories={}, description={}",
-                                        (meta.get("caseTitle") or "")[:50],
-                                        meta.get("caseCategory"),
-                                        meta.get("subcategories"),
-                                        (meta.get("description") or "")[:50],
-                                    )
-                                except Exception as meta_err:
-                                    logger.warning("Failed to emit workspace_metadata: {}", str(meta_err))
-
-                            # STEP 4: Generate strategies and objectives based on processed documents
-                            if batch_result.get("successful", 0) > 0:
-                                logger.info("🎯 Generating strategies and objectives from processed documents...")
+                                    self._workspace_strategy_payload[payload.workspaceId] = strategies_result
+                                    chips = strategies_result.get("suggestionChips") or []
+                                    if chips:
+                                        self._workspace_suggestion_chips[payload.workspaceId] = list(chips)
+                                        self._last_workspace_id_with_chips = payload.workspaceId
+                                    logger.success("🎉 Strategy & Objectives sent to backend")
+                            except Exception as strategy_error:
+                                logger.error(f"Failed to generate strategies: {strategy_error}")
+                                logger.exception(strategy_error)
                                 try:
-                                    strategies_result = await self._generate_strategies_from_documents(
-                                        workspace_id=payload.workspaceId,
-                                        user_id=payload.userId,
-                                        workspace_role=workspace_role,
-                                        batch_result=batch_result
-                                    )
-                                    
-                                    if strategies_result:
-                                        logger.success("✅ Strategies generated, emitting to backend...")
-                                        # Emit as document_feature_response per backend spec
-                                        strategy_feature_payload = {
+                                    await self._socket_client.emit(
+                                        "document_feature_response",
+                                        {
                                             "featureType": "strategy_objective",
-                                            "workspaceId": payload.workspaceId,
-                                            "userId": payload.userId,
-                                            "payload": strategies_result
-                                        }
-                                        
-                                        # Log detailed strategy information
-                                        logger.info("=" * 80)
-                                        logger.info("📋 STRATEGY & OBJECTIVE PAYLOAD (AI-GENERATED)")
-                                        logger.info("=" * 80)
-                                        logger.info(f"Workspace ID: {payload.workspaceId}")
-                                        logger.info(f"User ID: {payload.userId}")
-                                        logger.info(f"Role: {strategies_result.get('role')}")
-                                        logger.info(f"Is Update: {strategies_result.get('isUpdate')}")
-                                        logger.info("")
-                                        logger.info("📄 CASE SUMMARY:")
-                                        logger.info(f"{strategies_result.get('caseSummary', 'N/A')}")
-                                        logger.info("")
-                                        logger.info("🎯 STRATEGIC OBJECTIVE:")
-                                        logger.info(f"{strategies_result.get('strategicObjective', 'N/A')}")
-                                        logger.info("")
-                                        logger.info("📋 RECOMMENDATIONS:")
-                                        for idx, rec in enumerate(strategies_result.get('recommendations', []), 1):
-                                            logger.info(f"  {idx}. {rec}")
-                                        logger.info("")
-                                        logger.info("🚀 POSSIBLE NEXT STEPS:")
-                                        for idx, step in enumerate(strategies_result.get('possibleNextSteps', []), 1):
-                                            logger.info(f"  {idx}. {step}")
-                                        logger.info("")
-                                        logger.info("📊 ANALYSIS METADATA:")
-                                        analysis = strategies_result.get('analysis', {})
-                                        logger.info(f"  Document Count: {analysis.get('documentCount', 0)}")
-                                        logger.info(f"  Average Readability: {analysis.get('averageReadability', 0):.2f}%")
-                                        logger.info(f"  Total Documents: {analysis.get('totalDocuments', 0)}")
-                                        logger.info(f"  Successful: {analysis.get('successfulDocuments', 0)}")
-                                        logger.info(f"  AI Analysis: {analysis.get('basedOnAIAnalysis', False)}")
-                                        logger.info("=" * 80)
-                                        
-                                        await self._socket_client.emit(
-                                            "document_feature_response",
-                                            strategy_feature_payload
-                                        )
-                                        chips = strategies_result.get("suggestionChips") or []
-                                        if chips:
-                                            self._workspace_suggestion_chips[payload.workspaceId] = list(chips)
-                                            self._last_workspace_id_with_chips = payload.workspaceId
-                                            logger.info("Stored {} suggestion chips for workspace (probing_prompts)", len(chips))
-                                        logger.success("🎉 Strategy & Objectives sent to backend")
-                                except Exception as strategy_error:
-                                    logger.error(f"Failed to generate strategies: {strategy_error}")
-                                    logger.exception(strategy_error)
-                                    # Send error to backend
-                                    try:
-                                        error_payload = {
-                                            "featureType": "strategy_objective",
-                                            "workspaceId": payload.workspaceId,
-                                            "userId": payload.userId,
+                                            "workspaceId": str(payload.workspaceId),
+                                            "userId": str(payload.userId),
                                             "error": str(strategy_error)
                                         }
-                                        await self._socket_client.emit(
-                                            "document_feature_response",
-                                            error_payload
-                                        )
-                                    except Exception as emit_error:
-                                        logger.error(f"Failed to emit strategy error: {emit_error}")
-                        except Exception as emit_error:
-                            logger.error(f"Failed to emit processing results: {emit_error}")
+                                    )
+                                except Exception as emit_error:
+                                    logger.error(f"Failed to emit strategy error: {emit_error}")
+
+                            # Analysis report — use central helper so it always emits to backend
+                            await self._emit_analysis_report(
+                                workspace_id=payload.workspaceId,
+                                user_id=payload.userId,
+                                workspace_role=workspace_role,
+                                batch_result=batch_result,
+                                is_update=False,
+                                log_context="",
+                            )
+                        else:
+                            # When no files succeeded, still emit analysis report (fallback) so backend always receives it
+                            if self._socket_client and batch_result is not None:
+                                try:
+                                    fallback = self._analysis_report_fallback(
+                                        (workspace_role or "ADJUDICATOR").strip().upper()
+                                    )
+                                    await self._socket_client.emit(
+                                        "document_feature_response",
+                                        {
+                                            "featureType": "analysis_report",
+                                            "workspaceId": str(payload.workspaceId),
+                                            "userId": str(payload.userId),
+                                            "payload": fallback,
+                                        },
+                                    )
+                                    self._workspace_analysis_payload[payload.workspaceId] = fallback
+                                    logger.info("✅ Analysis report (fallback, 0 successful docs) sent to backend")
+                                except Exception as e:
+                                    logger.error("Failed to emit analysis report fallback (0 success): {}", e)
                     
                 except Exception as doc_error:
                     logger.error("Error processing documents: {}", str(doc_error))
@@ -1603,8 +2441,27 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         except Exception as emit_error:
                             logger.error(f"Failed to emit error notification: {emit_error}")
             
+            # When workspace has no evidence files, still emit analysis report (fallback) so backend always receives it
+            if not payload.evidenceFiles and self._socket_client:
+                try:
+                    workspace_role = (payload.workspaceRole or "ADJUDICATOR").strip().upper()
+                    fallback = self._analysis_report_fallback(workspace_role)
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "analysis_report",
+                            "workspaceId": payload.workspaceId,
+                            "userId": payload.userId,
+                            "payload": fallback,
+                        },
+                    )
+                    self._workspace_analysis_payload[payload.workspaceId] = fallback
+                    logger.info("✅ Analysis report (fallback, no docs) sent to backend")
+                except Exception as e:
+                    logger.error("Failed to emit analysis report (no docs): {}", e)
+            
             # STEP 4: Log audit event
-            await audit_logger.log_event(
+            audit_logger.log_event(
                 "workspace_created_ai",
                 {
                     "workspace_id": payload.workspaceId,
@@ -1750,7 +2607,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         workspace_id=payload.workspaceId,
                         document_ids=deleted_ids,
                     )
-                    # Regenerate strategy from remaining documents (use role from payload first, e.g. Mediator)
+                    # Regenerate strategy and analysis; emit both (always emit, use fallbacks when no docs or on error)
                     workspace_role = (payload.workspaceRole or "").strip().upper() or "ADJUDICATOR"
                     if workspace_role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
                         workspace_role = "ADJUDICATOR"
@@ -1760,24 +2617,67 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                             workspace_role = (ctx.workspace_role or workspace_role).upper()
                     except Exception:
                         pass
-                    strategies_result = await self._generate_strategies_from_documents(
-                        workspace_id=payload.workspaceId,
-                        user_id=payload.userId,
-                        workspace_role=workspace_role,
-                        batch_result=None,
-                        is_update=True
-                    )
-                    if strategies_result and self._socket_client:
+
+                    # Strategy: generate or use fallback so backend always receives strategy_objective (e.g. when all docs deleted)
+                    strategies_result = None
+                    try:
+                        strategies_result = await self._generate_strategies_from_documents(
+                            workspace_id=payload.workspaceId,
+                            user_id=payload.userId,
+                            workspace_role=workspace_role,
+                            batch_result=None,
+                            is_update=True,
+                        )
+                    except Exception as strategy_err:
+                        logger.warning("Strategy generation after delete failed: {}; using fallback", strategy_err)
+                    if not strategies_result:
+                        strategies_result = self._strategy_objective_fallback(
+                            payload.workspaceId,
+                            payload.userId,
+                            workspace_role,
+                            is_update=True,
+                        )
+                    if self._socket_client:
                         await self._socket_client.emit(
                             "document_feature_response",
                             {
                                 "featureType": "strategy_objective",
                                 "workspaceId": payload.workspaceId,
                                 "userId": payload.userId,
-                                "payload": strategies_result
-                            }
+                                "payload": strategies_result,
+                            },
                         )
-                        logger.success("🎉 Strategy & Objectives updated after document deletion")
+                        self._workspace_strategy_payload[payload.workspaceId] = strategies_result
+                        logger.success("🎉 Strategy & Objectives sent after document deletion")
+
+                    # Analysis report: always emit valid payload (never null); use fallback when no docs or on error
+                    analysis_report = None
+                    try:
+                        analysis_report = await self._generate_analysis_report_from_documents(
+                            workspace_id=payload.workspaceId,
+                            user_id=payload.userId,
+                            workspace_role=workspace_role,
+                            batch_result=None,
+                            is_update=True,
+                        )
+                    except Exception as ar_err:
+                        logger.warning("Analysis report after delete failed: {}; using fallback", ar_err)
+                    if not analysis_report or not isinstance(analysis_report, dict):
+                        analysis_report = self._analysis_report_fallback(
+                            (workspace_role or "ADJUDICATOR").strip().upper()
+                        )
+                    if self._socket_client:
+                        await self._socket_client.emit(
+                            "document_feature_response",
+                            {
+                                "featureType": "analysis_report",
+                                "workspaceId": payload.workspaceId,
+                                "userId": payload.userId,
+                                "payload": analysis_report,
+                            },
+                        )
+                        self._workspace_analysis_payload[payload.workspaceId] = analysis_report
+                        logger.success("✅ Analysis report sent after document deletion")
                 except Exception as del_err:
                     logger.error("Error handling document deletion: {}", str(del_err))
                     logger.exception(del_err)
@@ -1820,7 +2720,29 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         len(files_to_process)
                     )
 
-            if payload.evidenceFiles and files_to_process:
+            # Skip re-processing if nothing was deleted and all current files are already in the vector store
+            # (e.g. backend sent workspace_sync right after workspace_created with same files)
+            skip_reprocess = False
+            if not deleted_ids and files_to_process:
+                try:
+                    from app.vectorstore.qdrant import vector_store
+                    existing_docs = await vector_store.get_all_documents(workspace_id=payload.workspaceId)
+                    existing_ids = {str(d.get("document_id")) for d in existing_docs if d.get("document_id")}
+                    file_ids = [str(f.get("_id") or f.get("id")) or "" for f in files_to_process]
+                    if (
+                        len(file_ids) == len(files_to_process)
+                        and all(fid.strip() for fid in file_ids)
+                        and all(fid in existing_ids for fid in file_ids)
+                    ):
+                        skip_reprocess = True
+                        logger.info(
+                            "No new or changed documents (all {} file(s) already in vector store); skipping re-processing and strategy/analysis regeneration",
+                            len(files_to_process),
+                        )
+                except Exception as vec_err:
+                    logger.debug("Could not check existing documents for skip: {}", vec_err)
+
+            if payload.evidenceFiles and files_to_process and not skip_reprocess:
                 try:
                     batch_result = await document_processor.process_batch(
                         files=files_to_process,
@@ -1910,20 +2832,21 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 except Exception as meta_err:
                                     logger.warning("Failed to emit workspace_metadata (sync): {}", str(meta_err))
 
-                            # Regenerate strategies from ALL documents in workspace (use role from payload, e.g. Mediator)
+                            # Regenerate strategies and analysis; emit both (same pattern as ex_event.py)
                             if batch_result.get("successful", 0) > 0:
                                 logger.info("🎯 Regenerating strategies from all documents in workspace...")
+                                workspace_role = (payload.workspaceRole or "").strip().upper() or "ADJUDICATOR"
+                                if workspace_role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                                    workspace_role = "ADJUDICATOR"
                                 try:
-                                    workspace_role = (payload.workspaceRole or "").strip().upper() or "ADJUDICATOR"
-                                    if workspace_role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                                        workspace_role = "ADJUDICATOR"
-                                    try:
-                                        ctx = workspace_manager.get_workspace(payload.workspaceId)
-                                        if ctx and ctx.workspace_role:
-                                            workspace_role = (ctx.workspace_role or workspace_role).upper()
-                                    except Exception:
-                                        pass
-                                    logger.info("Using workspace role for strategies: {}", workspace_role)
+                                    ctx = workspace_manager.get_workspace(payload.workspaceId)
+                                    if ctx and ctx.workspace_role:
+                                        workspace_role = (ctx.workspace_role or workspace_role).upper()
+                                except Exception:
+                                    pass
+                                logger.info("Using workspace role for strategies: {}", workspace_role)
+                                # Strategy — generate then emit (per ex_event)
+                                try:
                                     strategies_result = await self._generate_strategies_from_documents(
                                         workspace_id=payload.workspaceId,
                                         user_id=payload.userId,
@@ -1931,83 +2854,201 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                         batch_result=batch_result,
                                         is_update=True
                                     )
-                                    
                                     if strategies_result:
                                         logger.success("✅ Strategies regenerated, emitting to backend...")
-                                        # Emit as document_feature_response per backend spec
                                         strategy_feature_payload = {
                                             "featureType": "strategy_objective",
                                             "workspaceId": payload.workspaceId,
                                             "userId": payload.userId,
                                             "payload": strategies_result
                                         }
-                                        
-                                        # Log detailed strategy information
                                         logger.info("=" * 80)
                                         logger.info("📋 UPDATED STRATEGY & OBJECTIVE PAYLOAD (AI-GENERATED)")
                                         logger.info("=" * 80)
-                                        logger.info(f"Workspace ID: {payload.workspaceId}")
-                                        logger.info(f"User ID: {payload.userId}")
-                                        logger.info(f"Role: {strategies_result.get('role')}")
-                                        logger.info(f"Is Update: {strategies_result.get('isUpdate')}")
-                                        logger.info("")
-                                        logger.info("📄 CASE SUMMARY:")
-                                        logger.info(f"{strategies_result.get('caseSummary', 'N/A')}")
-                                        logger.info("")
-                                        logger.info("🎯 STRATEGIC OBJECTIVE:")
-                                        logger.info(f"{strategies_result.get('strategicObjective', 'N/A')}")
-                                        logger.info("")
-                                        logger.info("📋 RECOMMENDATIONS:")
-                                        for idx, rec in enumerate(strategies_result.get('recommendations', []), 1):
-                                            logger.info(f"  {idx}. {rec}")
-                                        logger.info("")
-                                        logger.info("🚀 POSSIBLE NEXT STEPS:")
-                                        for idx, step in enumerate(strategies_result.get('possibleNextSteps', []), 1):
-                                            logger.info(f"  {idx}. {step}")
-                                        logger.info("")
-                                        logger.info("📊 ANALYSIS METADATA:")
-                                        analysis = strategies_result.get('analysis', {})
-                                        logger.info(f"  Document Count: {analysis.get('documentCount', 0)}")
-                                        logger.info(f"  Average Readability: {analysis.get('averageReadability', 0):.2f}%")
-                                        logger.info(f"  Total Documents: {analysis.get('totalDocuments', 0)}")
-                                        logger.info(f"  Successful: {analysis.get('successfulDocuments', 0)}")
-                                        logger.info(f"  AI Analysis: {analysis.get('basedOnAIAnalysis', False)}")
-                                        logger.info("=" * 80)
-                                        
                                         await self._socket_client.emit(
                                             "document_feature_response",
                                             strategy_feature_payload
                                         )
+                                        self._workspace_strategy_payload[payload.workspaceId] = strategies_result
                                         chips = strategies_result.get("suggestionChips") or []
                                         if chips:
                                             self._workspace_suggestion_chips[payload.workspaceId] = list(chips)
                                             self._last_workspace_id_with_chips = payload.workspaceId
-                                            logger.info("Stored {} suggestion chips for workspace (probing_prompts)", len(chips))
                                         logger.success("🎉 Updated Strategy & Objectives sent to backend")
                                 except Exception as strategy_error:
                                     logger.error(f"Failed to regenerate strategies: {strategy_error}")
                                     logger.exception(strategy_error)
-                                    # Send error to backend
                                     try:
-                                        error_payload = {
-                                            "featureType": "strategy_objective",
-                                            "workspaceId": payload.workspaceId,
-                                            "userId": payload.userId,
-                                            "error": str(strategy_error)
-                                        }
                                         await self._socket_client.emit(
                                             "document_feature_response",
-                                            error_payload
+                                            {
+                                                "featureType": "strategy_objective",
+                                                "workspaceId": payload.workspaceId,
+                                                "userId": payload.userId,
+                                                "error": str(strategy_error)
+                                            }
                                         )
                                     except Exception as emit_error:
                                         logger.error(f"Failed to emit strategy error: {emit_error}")
+
+                                # Analysis report — use central helper so it always emits to backend
+                                await self._emit_analysis_report(
+                                    workspace_id=payload.workspaceId,
+                                    user_id=payload.userId,
+                                    workspace_role=workspace_role,
+                                    batch_result=batch_result,
+                                    is_update=True,
+                                    log_context=" (sync)",
+                                )
+                            else:
+                                # When no files succeeded on sync, still emit analysis report (fallback)
+                                if self._socket_client:
+                                    try:
+                                        workspace_role = (payload.workspaceRole or "ADJUDICATOR").strip().upper()
+                                        if workspace_role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                                            workspace_role = "ADJUDICATOR"
+                                        fallback = self._analysis_report_fallback(workspace_role)
+                                        await self._socket_client.emit(
+                                            "document_feature_response",
+                                            {
+                                                "featureType": "analysis_report",
+                                                "workspaceId": payload.workspaceId,
+                                                "userId": payload.userId,
+                                                "payload": fallback,
+                                            },
+                                        )
+                                        self._workspace_analysis_payload[payload.workspaceId] = fallback
+                                        logger.info("✅ Analysis report (fallback, 0 successful sync) sent to backend")
+                                    except Exception as e:
+                                        logger.error("Failed to emit analysis report fallback (sync 0 success): {}", e)
                         except Exception as emit_error:
                             logger.error(f"Failed to emit sync results: {emit_error}")
                 except Exception as doc_error:
                     logger.error("Error syncing documents: {}", str(doc_error))
-            
+
+            # When we skipped re-processing (no new/changed/deleted docs), re-emit from cache only.
+            # Do NOT regenerate — only when user adds/updates/deletes documents do we regenerate (paths above).
+            elif skip_reprocess and files_to_process and self._socket_client:
+                workspace_id = payload.workspaceId
+                user_id = payload.userId
+                workspace_role = (payload.workspaceRole or "").strip().upper() or "ADJUDICATOR"
+                if workspace_role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                    workspace_role = "ADJUDICATOR"
+                try:
+                    ctx = workspace_manager.get_workspace(workspace_id)
+                    if ctx and ctx.workspace_role:
+                        workspace_role = (ctx.workspace_role or workspace_role).upper()
+                except Exception:
+                    pass
+                # Re-emit strategy from cache (no regeneration); then analysis_report. Single emit block, no try/except around emits.
+                strategies_result = self._workspace_strategy_payload.get(workspace_id)
+                if strategies_result:
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "strategy_objective",
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "payload": strategies_result,
+                        },
+                    )
+                    logger.success("✅ Strategy & Objectives re-emitted to backend (from cache)")
+                    await asyncio.sleep(0.2)  # Space out emits so backend can process each; reduces disconnect risk
+                else:
+                    try:
+                        strategies_result = await self._generate_strategies_from_documents(
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            workspace_role=workspace_role,
+                            batch_result=None,
+                            is_update=True,
+                        )
+                    except Exception as strategy_err:
+                        logger.warning("Failed to generate strategy on skip_reprocess: {}", strategy_err)
+                        strategies_result = None
+                    if strategies_result:
+                        await self._socket_client.emit(
+                            "document_feature_response",
+                            {
+                                "featureType": "strategy_objective",
+                                "workspaceId": workspace_id,
+                                "userId": user_id,
+                                "payload": strategies_result,
+                            },
+                        )
+                        self._workspace_strategy_payload[workspace_id] = strategies_result
+                        logger.success("✅ Strategy & Objectives emitted to backend (skip_reprocess, generated once)")
+
+                analysis_report = self._workspace_analysis_payload.get(workspace_id)
+                if analysis_report:
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "analysis_report",
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "payload": analysis_report,
+                        },
+                    )
+                    logger.success("✅ Analysis report re-emitted to backend (from cache)")
+                    await asyncio.sleep(0.15)  # Allow socket to flush before audit/sync complete
+                else:
+                    await self._emit_analysis_report(
+                        workspace_id,
+                        user_id,
+                        workspace_role,
+                        batch_result=None,
+                        is_update=True,
+                        log_context=" (skip_reprocess)",
+                    )
+
+            # When sync has no evidence files (e.g. user deleted all docs), emit both strategy and analysis
+            # with empty/fallback payload so backend receives both and can show empty state (not null).
+            elif not payload.evidenceFiles and self._socket_client:
+                try:
+                    workspace_id = payload.workspaceId
+                    user_id = payload.userId
+                    workspace_role = (payload.workspaceRole or "ADJUDICATOR").strip().upper()
+                    if workspace_role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                        workspace_role = "ADJUDICATOR"
+                    try:
+                        ctx = workspace_manager.get_workspace(workspace_id)
+                        if ctx and ctx.workspace_role:
+                            workspace_role = (ctx.workspace_role or workspace_role).upper()
+                    except Exception:
+                        pass
+                    strategy_fallback = self._strategy_objective_fallback(
+                        workspace_id, user_id, workspace_role, is_update=True
+                    )
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "strategy_objective",
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "payload": strategy_fallback,
+                        },
+                    )
+                    self._workspace_strategy_payload[workspace_id] = strategy_fallback
+                    analysis_fallback = self._analysis_report_fallback(workspace_role)
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "analysis_report",
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "payload": analysis_fallback,
+                        },
+                    )
+                    self._workspace_analysis_payload[workspace_id] = analysis_fallback
+                    logger.success(
+                        "✅ Strategy & Analysis report (empty) sent to backend (no documents in workspace)"
+                    )
+                except Exception as e:
+                    logger.error("Failed to emit strategy/analysis fallbacks (no docs): {}", e)
+
             # Log audit event
-            await audit_logger.log_event(
+            audit_logger.log_event(
                 "workspace_sync_ai",
                 {
                     "workspace_id": payload.workspaceId,
@@ -2018,7 +3059,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     "processed_files_count": len(files_to_process)
                 }
             )
-            
+
             logger.success("✅ Workspace sync completed: {}", payload.workspaceId)
             
         except Exception as e:
@@ -2191,7 +3232,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 logger.error("❌ Socket client not available to emit response")
             
             # STEP 7: Log audit event
-            await audit_logger.log_event(
+            audit_logger.log_event(
                 "user_message_processed",
                 {
                     "workspace_id": workspace_id,
@@ -2440,12 +3481,23 @@ Return ONLY a JSON array, no other text. Example with 10+ items: ["Draft a settl
             if data.get("timestamp") is not None:
                 response["timestamp"] = data.get("timestamp")
             if self._socket_client:
-                await self._socket_client.emit("probing_prompts_response", response)
-                logger.success(
-                    "probing_prompts_response emitted: workspaceId={}, count={}",
-                    workspace_id[:12] if workspace_id else "",
-                    len(prompts),
-                )
+                import time
+                now = time.time()
+                last = self._last_probing_emit_time.get(workspace_id) or 0
+                if now - last < self.PROBING_THROTTLE_SECONDS:
+                    logger.debug(
+                        "probing_prompts_response throttled (last emit %.1fs ago), workspaceId=%s",
+                        now - last,
+                        workspace_id[:12] if workspace_id else "",
+                    )
+                else:
+                    self._last_probing_emit_time[workspace_id] = now
+                    await self._socket_client.emit("probing_prompts_response", response)
+                    logger.success(
+                        "probing_prompts_response emitted: workspaceId={}, count={}",
+                        workspace_id[:12] if workspace_id else "",
+                        len(prompts),
+                    )
             else:
                 logger.warning("No socket client to emit probing_prompts_response")
         except Exception as e:
@@ -2463,7 +3515,7 @@ Return ONLY a JSON array, no other text. Example with 10+ items: ["Draft a settl
             workspace_id = data.get("workspace_id") or data.get("workspaceId")
             logger.info(f"Workspace updated (legacy): {workspace_id}")
             
-            await audit_logger.log_event(
+            audit_logger.log_event(
                 "workspace_updated_legacy",
                 {"workspace_id": workspace_id}
             )
@@ -2480,7 +3532,7 @@ Return ONLY a JSON array, no other text. Example with 10+ items: ["Draft a settl
             # Delete the workspace
             await workspace_manager.delete_workspace(workspace_id)
             
-            await audit_logger.log_event(
+            audit_logger.log_event(
                 "workspace_deleted",
                 {"workspace_id": workspace_id}
             )

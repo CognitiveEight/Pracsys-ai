@@ -43,7 +43,7 @@ class AuditLogger:
         
         logger.info("Audit logging configured")
     
-    async def log_event(
+    def log_event(
         self,
         event_type: str,
         data: Dict[str, Any],
@@ -52,8 +52,8 @@ class AuditLogger:
         severity: str = "INFO"
     ) -> None:
         """
-        Log an audit event.
-        
+        Log an audit event (synchronous; no I/O).
+
         Args:
             event_type: Type of event (e.g., "workspace_created")
             data: Event data
@@ -63,7 +63,7 @@ class AuditLogger:
         """
         if not self.enabled:
             return
-        
+
         audit_entry = {
             "timestamp": datetime.utcnow().isoformat(),
             "event_type": event_type,
@@ -72,10 +72,10 @@ class AuditLogger:
             "workspace_id": workspace_id,
             "data": data
         }
-        
+
         # Log with audit flag
         logger.bind(audit=True).info(json.dumps(audit_entry))
-    
+
     async def log_workspace_event(
         self,
         workspace_id: str,
@@ -92,13 +92,13 @@ class AuditLogger:
             data: Event data
             user_id: Optional user identifier
         """
-        await self.log_event(
+        self.log_event(
             event_type=event_type,
             data=data,
             user_id=user_id,
             workspace_id=workspace_id
         )
-    
+
     async def log_agent_event(
         self,
         workspace_id: str,
@@ -117,7 +117,7 @@ class AuditLogger:
             data: Event data
             user_id: Optional user identifier
         """
-        await self.log_event(
+        self.log_event(
             event_type=f"agent_{action}",
             data={
                 "agent_type": agent_type,
@@ -127,7 +127,7 @@ class AuditLogger:
             user_id=user_id,
             workspace_id=workspace_id
         )
-    
+
     async def log_security_event(
         self,
         event_type: str,
@@ -144,13 +144,13 @@ class AuditLogger:
             user_id: Optional user identifier
             severity: Event severity
         """
-        await self.log_event(
+        self.log_event(
             event_type=f"security_{event_type}",
             data=data,
             user_id=user_id,
             severity=severity
         )
-    
+
     async def log_error(
         self,
         error_type: str,
@@ -169,7 +169,7 @@ class AuditLogger:
             workspace_id: Optional workspace identifier
             user_id: Optional user identifier
         """
-        await self.log_event(
+        self.log_event(
             event_type=f"error_{error_type}",
             data={
                 "error_message": error_message,

@@ -105,12 +105,24 @@ class ConversationHistoryItem(BaseModel):
     content: str
 
 
+class ChatAttachmentPayload(BaseModel):
+    """Schema for document attached to a chat message (intelligence chat upload)."""
+    url: str
+    fileName: Optional[str] = None
+    mimeType: Optional[str] = None
+
+    class Config:
+        populate_by_name = True
+        extra = "ignore"
+
+
 class UserMessageRequestPayload(BaseModel):
     """
     Schema for user_message_request event (Server → AI_Maverick).
     User message forwarded to AI service in ai_service room.
     
     Note: Backend sends 'content' field, not 'message'.
+    When user uploads a document in chat, attachment has url, fileName, mimeType.
     """
     
     content: str  # User message content (backend sends 'content', not 'message')
@@ -120,6 +132,7 @@ class UserMessageRequestPayload(BaseModel):
     userId: Optional[str] = None
     chatId: Optional[str] = None
     timestamp: str  # ISO timestamp
+    attachment: Optional[ChatAttachmentPayload] = None  # Document uploaded with this message (e.g. ANALYSIS_REPORT chat)
     
     class Config:
         populate_by_name = True

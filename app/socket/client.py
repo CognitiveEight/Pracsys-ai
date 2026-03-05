@@ -1,5 +1,9 @@
 """
 Socket.IO client for connecting to the workspace server.
+
+Backend note: To avoid "Connection lost" during long AI processing (e.g. chat response
+taking 10–20s), the Socket.IO server should set a high pingTimeout (e.g. 60000 ms) and
+sensible pingInterval so the connection is not closed while the AI service is generating.
 """
 import asyncio
 import hmac
@@ -185,23 +189,15 @@ class SocketClient:
     async def emit_ai_response(self, data: Dict[str, Any]) -> None:
         """
         Emit AI response to the server using ai_response event.
-        
-        Per backend specification:
-        AI_Maverick → Server: ai_response event with payload:
-        {
-            chatId: str,
-            workspaceId: str,
-            userId: str,
-            content: str,
-            metadata: {...}
-        }
-        
-        Args:
-            data: AI response payload
+        If socket is disconnected, logs and returns without raising so chat handler does not crash.
+        After emit, briefly yields so the socket can flush the payload (reduces disconnect-before-delivery).
         """
         if not self.sio or not self._connected:
-            raise SocketConnectionError("Socket not connected")
-        
+            logger.warning(
+                "Socket not connected, skipping ai_response for chat: {} (user will not see this response)",
+                data.get("chatId"),
+            )
+            return
         try:
             await self.sio.emit(
                 "ai_response",
@@ -210,6 +206,7 @@ class SocketClient:
             )
             logger.success("✅ Emitted ai_response for chat: {}", data.get("chatId"))
             logger.debug("AI response data: {}", data)
+            await asyncio.sleep(0.25)
         except Exception as e:
             logger.error("Failed to emit ai_response: {}", str(e))
             raise

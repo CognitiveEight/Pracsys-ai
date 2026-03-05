@@ -57,6 +57,10 @@ class SocketEventHandler:
         self._had_disconnect: bool = False
         self._pending_reemit_workspace_id: Optional[str] = None
         self._pending_reemit_user_id: Optional[str] = None
+        # Chat attachment cache: chat_id -> list of {fileName, content} so follow-up questions in same chat see the document
+        self._chat_attachment_by_chat: Dict[str, List[Dict[str, Any]]] = {}
+        # Last ai_response payload; re-emit after reconnect when socket dropped right after emit so backend receives it
+        self._pending_ai_response: Optional[Dict[str, Any]] = None
         self._register_default_handlers()
     
     def set_socket_client(self, client):
@@ -1216,7 +1220,7 @@ Rules:
                 if section_items
                 else ""
             )
-            prompt = f"""You are a legal case analyst. The user rejected ONE item from their analysis report as not relevant. Your task is to output a JSON object with "scoreIncrease" (integer 2-15) and "reason" (one short sentence).
+            prompt = f"""You are a legal case analyst. The user rejected ONE item from their analysis report as not relevant. Your task is to output a JSON object with "scoreIncrease" (integer 1-5) and "reason" (one short sentence).
 
 **Current case resolution score**: {current_score}%
 **Section from which item was rejected**: {section}
@@ -1224,23 +1228,34 @@ Rules:
 **Remaining counts after this rejection**: missingInfo={remaining_missing}, weaknesses={remaining_weak}, risks={remaining_risks}
 {f'**{section_context}**' if section_context else ''}
 
-IMPACT RULES – you MUST choose scoreIncrease based on the SPECIFIC rejected item. Do NOT use the same number every time (e.g. do NOT default to 11).
+IMPACT RULES – you MUST choose scoreIncrease based on the SPECIFIC rejected item.
 
-- **missingInfo**: Rejecting a "missing information" item means the user says that item is not needed. Impact is often LOW to MEDIUM.
-  - Low impact (minor/administrative detail, e.g. dates, addresses, minor clarifications): scoreIncrease = 0 to 1.
-  - Medium impact (useful but not critical evidence): scoreIncrease = 2 to 4.
-  - High impact (critical missing evidence that would have weakened the case): scoreIncrease = 4 to 6. Use only if the rejected item was clearly a major gap.
+- Score increase MUST be an integer between 1 and 5 only.
+- Do NOT output numbers outside this range.
 
-- **riskOrWeakness**: Rejecting a risk or weakness means the user says that risk/weakness does not apply. Impact can be MEDIUM to HIGH.
-  - Low impact (minor procedural note, generic risk): scoreIncrease = 0 to 1.
-  - Medium impact (moderate risk or weakness): scoreIncrease = 2 to 4.
-  - High impact (major risk like dismissal, liability, or key weakness): scoreIncrease = 4 to 6.
+SECTION GUIDELINES
 
-- If current score is 88 or above, cap scoreIncrease at 6 so the total does not overshoot 100.
-- Pick ONE integer in the chosen range (e.g. 3, 5, 7, 10) based on the wording of the rejected item. Vary your choice; do not always output 11.
+missingInfo:
+Rejecting a "missing information" item means the user says that item is not needed.
+
+- Minor detail (administrative info, dates, small clarification): scoreIncrease = 1
+- Useful but not critical evidence: scoreIncrease = 2–3
+- Important missing evidence that would weaken the case: scoreIncrease = 4–5
+
+riskOrWeakness:
+Rejecting a risk or weakness means the user says that risk/weakness does not apply.
+
+- Minor procedural or generic risk: scoreIncrease = 1
+- Moderate risk or weakness: scoreIncrease = 2–3
+- Major legal risk or strong weakness: scoreIncrease = 4–5
+
+ADDITIONAL RULES
+- Choose ONE integer between 1 and 5.
+- Do NOT always output the same number.
+- Use the wording of the rejected item to decide the impact.
 
 Output ONLY valid JSON, no markdown, no code block:
-{{"scoreIncrease": <integer 2-15>, "reason": "<one short sentence explaining why this increase for this item>"}}
+{{"scoreIncrease": <integer 1-5>, "reason": "<one short sentence explaining why this increase for this item>"}}
 """
             raw = await gemini_client.generate(
                 prompt=prompt,
@@ -2110,6 +2125,20 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     logger.success("✅ Analysis report re-emitted to backend after reconnect")
             except Exception as e:
                 logger.warning("Failed to re-emit after reconnect: {}", e)
+        # Re-emit last ai_response if we disconnected right after sending (so backend receives the chat response)
+        if self._had_disconnect and self._pending_ai_response and self._socket_client:
+            try:
+                await self._socket_client.emit_ai_response(self._pending_ai_response)
+                logger.success(
+                    "✅ AI chat response re-emitted to backend after reconnect (chat: {})",
+                    self._pending_ai_response.get("chatId"),
+                )
+            except Exception as e:
+                logger.warning("Failed to re-emit ai_response after reconnect: {}", e)
+            finally:
+                self._pending_ai_response = None
+        if self._had_disconnect:
+            self._had_disconnect = False
     
     async def on_disconnect(self, data: Any) -> None:
         """Handle disconnection event. Mark that we disconnected (so on_connected can re-emit if needed)."""
@@ -3159,8 +3188,34 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     workspace_state["uploaded_documents"] = doc_snippets
             except Exception as doc_err:
                 logger.warning("Could not load documents for chat context: {}", str(doc_err))
+
+            # If user attached a document to this message, download and extract text; cache by chat_id so follow-ups see it
+            attachment = getattr(payload, "attachment", None)
+            if attachment and getattr(attachment, "url", None):
+                try:
+                    from app.processing.document_processor import document_processor
+                    filename = (getattr(attachment, "fileName", None) or "attachment").strip() or "attachment"
+                    extracted = await document_processor.download_and_extract_text(
+                        url=attachment.url,
+                        filename=filename,
+                        max_text_chars=12000,
+                    )
+                    if extracted:
+                        workspace_state["chat_attachment"] = [
+                            {"fileName": filename, "content": extracted}
+                        ]
+                        self._chat_attachment_by_chat[chat_id] = workspace_state["chat_attachment"]
+                        logger.info("Chat attachment loaded and cached for chat {}: {} ({} chars)", chat_id, filename, len(extracted))
+                except Exception as att_err:
+                    logger.warning("Could not process chat attachment: {}", att_err)
+            else:
+                # No attachment this message: use cached attachment for this chat so follow-up questions still have the document
+                cached = self._chat_attachment_by_chat.get(chat_id)
+                if cached:
+                    workspace_state["chat_attachment"] = cached
+                    logger.debug("Using cached chat attachment for follow-up (chat_id={}, {} doc(s))", chat_id, len(cached))
             
-            # STEP 2 & 3: Build chat context with role, document count, and uploaded document content
+            # STEP 2 & 3: Build chat context with role, document count, uploaded documents, and optional chat attachment
             chat_context = ChatContext(
                 workspace_id=workspace_id,
                 user_id=user_id,
@@ -3221,11 +3276,12 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 suggestionChips=suggestion_chips_for_payload if suggestion_chips_for_payload else None,
             )
             
-            # STEP 6: Emit ai_response back to server
+            # STEP 6: Emit ai_response back to server; cache for re-emit if socket disconnects right after
             if self._socket_client:
                 payload_dict = ai_response.dict(by_alias=True)
                 if payload_dict.get("suggestionChips") is None:
                     payload_dict.pop("suggestionChips", None)
+                self._pending_ai_response = payload_dict
                 await self._socket_client.emit_ai_response(payload_dict)
                 logger.success("✅ AI response sent successfully")
             else:

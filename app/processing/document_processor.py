@@ -485,6 +485,27 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
 
         msg = str(last_error) if last_error else "Download failed after retries"
         raise FileProcessingError(f"Failed to download file: {msg}", details={"filename": filename, "url": clean_url[:200]})
+
+    async def download_and_extract_text(
+        self, url: str, filename: str, max_text_chars: int = 50000
+    ) -> str:
+        """
+        Download a file from URL and extract text only (no vector store, no scoring).
+        Used for chat attachments so the user can ask questions about the uploaded document.
+        Returns extracted text, truncated to max_text_chars; empty string on failure.
+        """
+        try:
+            file_content, _ = await self._download_file(url, filename)
+            text = file_processor.process_file_by_extension(file_content, filename)
+            if not text or not isinstance(text, str):
+                return ""
+            text = text.strip()
+            if len(text) > max_text_chars:
+                text = text[:max_text_chars] + "\n\n[Content truncated for context length.]"
+            return text
+        except Exception as e:
+            logger.warning("Chat attachment download/extract failed ({}): {}", filename, e)
+            return ""
     
     async def _store_in_vector_db(
         self,

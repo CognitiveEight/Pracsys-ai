@@ -47,6 +47,7 @@ class SocketEventHandler:
         self._handlers: Dict[str, EventHandler] = {}
         self._socket_client = None  # Will be set by main service
         self._workspace_suggestion_chips: Dict[str, List[str]] = {}  # workspace_id -> 15-16 strategy chips
+        self._workspace_analysis_suggestion_chips: Dict[str, List[str]] = {}  # workspace_id -> 15-16 analysis-report chips
         self._workspace_chat_suggestion_chips: Dict[str, List[str]] = {}  # workspace_id -> 10-12 contextual chips (refreshed per AI reply; we return random 4 on each request)
         self._last_workspace_id_with_chips: Optional[str] = None  # fallback when request workspace has no chips
         self._last_probing_emit_time: Dict[str, float] = {}  # workspace_id -> time of last probing_prompts_response emit
@@ -686,7 +687,14 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
                 )
             )
 
-            analysis_prompt = """You are a legal analyst for Indian law. Produce an analysis report based on the uploaded documents.
+            analysis_prompt = (
+                """You are a legal analyst for Indian law. Produce an analysis report based on the uploaded documents.
+
+**CRITICAL – Output format (strict)**:
+- Your entire response MUST be exactly one valid JSON object. Nothing else.
+- Do NOT use markdown, do NOT use code fences (no ``` or ```json), do NOT add any text before or after the JSON.
+- The first character of your response MUST be {{ and the last character MUST be }}.
+- Escape quotes inside strings (use \\" for literal quotes). Keep qualityScoreExplanation concise (2-4 sentences) so the JSON is complete.
 
 **Role**: {}
 **Role instruction**: {}
@@ -700,7 +708,9 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
 
 **If documents appear unrelated** (different cases/matters), base analysis ONLY on the last document (labeled "most recently uploaded"). Otherwise use all documents combined.
 
-**Output ONLY a single JSON object** – no markdown, no code fences, no text before or after. Start the response with {{ and end with }}.
+**caseResolutionScore rule**: Score is 100% only when missingInfo, weaknesses, and risks are all empty (no gaps, no risks, no weaknesses). If you list any missingInfo or weaknesses or risks, the score must be less than 100 (e.g. cap at 95 when any remain). When the user later rejects/removes all such items, the score can reach 100%.
+
+**Required JSON structure** (use exactly these keys; output nothing but this object):
 {{
   "missingInfo": ["item1", "item2"],
   "strengths": [
@@ -723,10 +733,12 @@ Rules:
 - weaknesses: 0-6 items – factual or legal weaknesses from this role's perspective.
 - risks: 0-6 items – procedural or outcome risks (limitation, burden of proof, etc.).
 - relevantJurisdiction: 1-5 courts/fora (e.g. "District Court, Mumbai", "High Court of Bombay").
-- caseResolutionScore: integer 0-100 (overall readiness/strength of case from this role's perspective; 0 = no docs, 100 = very strong).
-- qualityScoreExplanation: string – detailed explanation of how the caseResolutionScore was computed (e.g. factors considered, impact of strengths/weaknesses/risks/missingInfo).
+- caseResolutionScore: integer 0-100 – MUST be based only on missingInfo, risks, and weaknesses. Rule: 100% only when there are zero missingInfo, zero weaknesses, and zero risks (all gaps/risks addressed or none identified). If any missingInfo/weaknesses/risks remain, score must be below 100 (e.g. 95 max when any remain). 0 = no docs or no analysis.
+- qualityScoreExplanation: string – detailed explanation of how the caseResolutionScore was computed (e.g. factors considered, impact of strengths/weaknesses/risks/missingInfo). Keep to 2-4 sentences so the JSON does not get truncated.
 - pendingActions, nextSteps, suggestedDrafts: 0-5 items each; concrete next steps and suggested draft names (e.g. "Draft BNSS Complaint").
-""".format(
+
+Output now: a single JSON object starting with {{ and ending with }}. No other text."""
+            ).format(
                 role,
                 role_instruction,
                 combined_document_content,
@@ -1081,6 +1093,19 @@ Rules:
         logger.success("✅ Analysis report sent to backend{}", log_context)
         # Brief yield so the socket can flush before caller continues (reduces risk of disconnect before delivery)
         await asyncio.sleep(0.15)
+        # Generate and cache 15-16 suggestion chips for Analysis Report (probing_prompts_request with chatType ANALYSIS_REPORT)
+        try:
+            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            analysis_chips = await self._generate_analysis_report_suggestion_chips(
+                workspace_id=workspace_id,
+                report=analysis_report,
+                role=role,
+            )
+            if analysis_chips:
+                self._workspace_analysis_suggestion_chips[workspace_id] = list(analysis_chips)
+                logger.info("Analysis report suggestion chips stored: {} for workspace {}", len(analysis_chips), workspace_id[:12] if workspace_id else "")
+        except Exception as chip_err:
+            logger.warning("Analysis report chips generation failed: {}", chip_err)
         return True
 
     async def _generate_and_emit_analysis_report_for_sync(
@@ -1220,39 +1245,34 @@ Rules:
                 if section_items
                 else ""
             )
-            prompt = f"""You are a legal case analyst. The user rejected ONE item from their analysis report as not relevant. Your task is to output a JSON object with "scoreIncrease" (integer 1-5) and "reason" (one short sentence).
+            # When this rejection leaves no items in any category, score can reach 100%; otherwise capped at 95%
+            can_reach_100 = (remaining_missing == 0 and remaining_weak == 0 and remaining_risks == 0)
+            prompt = f"""You are a legal case analyst. The user rejected ONE item from their analysis report as not relevant. The system will ADD your scoreIncrease to the current score. Output a JSON object with "scoreIncrease" (integer 1-5) and "reason" (one short sentence).
 
 **Current case resolution score**: {current_score}%
 **Section from which item was rejected**: {section}
 **Rejected item (exact text)**: "{rejected_value[:400]}"
 **Remaining counts after this rejection**: missingInfo={remaining_missing}, weaknesses={remaining_weak}, risks={remaining_risks}
 {f'**{section_context}**' if section_context else ''}
+**Score rule**: When missingInfo, weaknesses, and risks are all 0 (no remaining items), the score can reach 100%. When any remain, score is capped at 95%. {"This rejection leaves no items in any category – score can go to 100%." if can_reach_100 else "Items still remain – score will be capped at 95%."}
 
-IMPACT RULES – you MUST choose scoreIncrease based on the SPECIFIC rejected item.
+IMPACT RULES – choose scoreIncrease (1-5) based on the SPECIFIC rejected item. The score will increase by this amount.
 
-- Score increase MUST be an integer between 1 and 5 only.
+- scoreIncrease MUST be an integer between 1 and 5 only.
 - Do NOT output numbers outside this range.
+- When this is the last rejection (all counts 0 above), use 4 or 5 so the score can reach 100%.
 
 SECTION GUIDELINES
 
-missingInfo:
-Rejecting a "missing information" item means the user says that item is not needed.
-
-- Minor detail (administrative info, dates, small clarification): scoreIncrease = 1
+missingInfo (user says this "missing" item is not needed):
+- Minor detail (dates, small clarification): scoreIncrease = 1
 - Useful but not critical evidence: scoreIncrease = 2–3
-- Important missing evidence that would weaken the case: scoreIncrease = 4–5
+- Important missing evidence that would have weakened the case: scoreIncrease = 4–5
 
-riskOrWeakness:
-Rejecting a risk or weakness means the user says that risk/weakness does not apply.
-
+riskOrWeakness (user says this risk/weakness does not apply):
 - Minor procedural or generic risk: scoreIncrease = 1
 - Moderate risk or weakness: scoreIncrease = 2–3
 - Major legal risk or strong weakness: scoreIncrease = 4–5
-
-ADDITIONAL RULES
-- Choose ONE integer between 1 and 5.
-- Do NOT always output the same number.
-- Use the wording of the rejected item to decide the impact.
 
 Output ONLY valid JSON, no markdown, no code block:
 {{"scoreIncrease": <integer 1-5>, "reason": "<one short sentence explaining why this increase for this item>"}}
@@ -1291,10 +1311,7 @@ Output ONLY valid JSON, no markdown, no code block:
                             break
             if obj and isinstance(obj, dict) and "scoreIncrease" in obj:
                 delta = int(obj.get("scoreIncrease", self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT))
-                delta = max(0, min(15, delta))
-                # When score is already high, cap increase so total does not overshoot 100 and we avoid fixed large bumps
-                if current_score >= 88 and delta > 6:
-                    delta = min(delta, 6)
+                delta = max(1, min(5, delta))  # Rejection bump 1-5 as per prompt
                 if current_score + delta > 100:
                     delta = max(0, 100 - current_score)
                 reason = (obj.get("reason") or "Score adjusted based on rejection priority.").strip()
@@ -1307,9 +1324,7 @@ Output ONLY valid JSON, no markdown, no code block:
             )
             if num_match:
                 delta = int(num_match.group(1) or num_match.group(2) or num_match.group(3) or 0)
-                delta = max(0, min(15, delta))
-                if current_score >= 88 and delta > 6:
-                    delta = min(delta, 6)
+                delta = max(1, min(5, delta))  # Rejection bump 1-5 as per prompt
                 if current_score + delta > 100:
                     delta = max(0, 100 - current_score)
                 reason_match = re.search(r'"reason"\s*:\s*"([^"]*)"', raw)
@@ -3436,6 +3451,165 @@ Return ONLY a JSON array, no other text. Example with 10+ items: ["Draft a settl
             logger.warning("Contextual suggestion chips generation failed: {}", str(e))
             # Still return 10–12 fallback chips so rotation works
             return self._fallback_chips_for_role(role, 12)
+
+    def _fallback_chips_for_analysis_report(self, needed: int = 16) -> List[str]:
+        """Return generic analysis-report prompt chips when AI generation fails or report is empty."""
+        generic = [
+            "What is in this document",
+            "Explain key strengths",
+            "List missing information",
+            "What are the risks",
+            "Summarise weaknesses",
+            "Suggest next steps",
+            "Explain quality score",
+            "Relevant jurisdiction",
+            "Pending actions",
+            "Recommended drafts",
+            "Compare with strategy",
+            "Identify gaps",
+            "Outline procedural steps",
+            "Key evidence summary",
+            "Legal basis for strengths",
+            "Mitigation for risks",
+        ]
+        return list(generic)[:needed]
+
+    async def _generate_analysis_report_suggestion_chips(
+        self,
+        workspace_id: str,
+        report: Dict[str, Any],
+        role: str,
+    ) -> List[str]:
+        """
+        Generate 15-16 short, analysis-report-specific suggestion chips (2-5 words each).
+        Used for ANALYSIS_REPORT chatType probing_prompts; stored per workspace.
+        """
+        import json
+        try:
+            from app.ai.gemini_client import gemini_client
+            gemini_client.initialize()
+            role_upper = (role or "ADJUDICATOR").upper()
+            # Build short context from report for the prompt
+            missing = report.get("missingInfo") or report.get("missing_info") or []
+            strengths = report.get("strengths") or []
+            weak = report.get("weaknesses") or []
+            risks = report.get("risks") or []
+            next_steps = report.get("nextSteps") or report.get("next_steps") or []
+            drafts = report.get("suggestedDrafts") or report.get("suggested_drafts") or []
+            score = report.get("caseResolutionScore") or report.get("case_resolution_score")
+            if isinstance(strengths, list) and strengths and isinstance(strengths[0], dict):
+                strength_pts = [s.get("point", s.get("text", ""))[:80] for s in strengths[:3]]
+            else:
+                strength_pts = [str(s)[:80] for s in (strengths or [])[:3]]
+            context_parts = [
+                f"Score: {score}%",
+                f"Missing info ({len(missing)}): " + "; ".join(str(m)[:60] for m in missing[:2]) if missing else "None",
+                f"Strengths: " + "; ".join(strength_pts) if strength_pts else "None",
+                f"Weaknesses: " + "; ".join(str(w)[:60] for w in weak[:2]) if weak else "None",
+                f"Risks: " + "; ".join(str(r)[:60] for r in risks[:2]) if risks else "None",
+                f"Next steps: " + "; ".join(str(n)[:60] for n in next_steps[:2]) if next_steps else "None",
+                f"Suggested drafts: " + "; ".join(str(d)[:60] for d in drafts[:2]) if drafts else "None",
+            ]
+            context_str = "\n".join(context_parts)
+            prompt = f"""You are generating suggestion chips for an Analysis Report view in a legal case tool. Role: {role_upper}.
+
+Analysis report summary:
+{context_str}
+
+Output a JSON array of exactly 15 or 16 short, actionable prompt labels (2-5 words each). Each label is a question or action the user might tap to ask about the analysis. Examples: "What is in this document", "Explain key strengths", "List missing information", "What are the risks", "Summarise weaknesses", "Suggest next steps", "Explain quality score", "Relevant jurisdiction", "Pending actions", "Recommended drafts". No full sentences. Vary: missing info, strengths, weaknesses, risks, next steps, drafts, jurisdiction, score explanation.
+
+Return ONLY a JSON array of 15-16 strings, no other text."""
+            raw = await gemini_client.generate(prompt, temperature=0.5, max_tokens=8000)
+            if not raw:
+                logger.warning("Analysis report chips: empty response from Gemini; using fallback")
+                return self._fallback_chips_for_analysis_report(16)
+            raw = (raw or "").strip()
+            # Treat only leading \"Error...\" as fatal; allow 'error' words inside JSON
+            if raw.startswith("Error") or "Error generating" in (raw[:80] or ""):
+                logger.warning(
+                    "Analysis report chips: Gemini error response; using fallback. raw preview={}",
+                    raw[:120],
+                )
+                return self._fallback_chips_for_analysis_report(16)
+            start = raw.find("[")
+            if start < 0:
+                logger.warning(
+                    "Analysis report chips: no '[' found in raw response; falling back. raw preview={}",
+                    raw[:200],
+                )
+                # Salvage any double-quoted strings as a last resort before full fallback
+                import re as _re
+                quoted = _re.findall(r'"([^"]{2,100})"', raw)
+                chips = [q.strip() for q in quoted if q.strip()]
+                if chips:
+                    logger.info("Analysis report chips: salvaged {} labels from quoted strings", len(chips))
+                    chips = chips[:16]
+                else:
+                    return self._fallback_chips_for_analysis_report(16)
+            else:
+                depth = 0
+                end = -1
+                for i in range(start, len(raw)):
+                    if raw[i] == "[":
+                        depth += 1
+                    elif raw[i] == "]":
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+                if end <= start:
+                    logger.warning(
+                        "Analysis report chips: could not find matching ']' (start={}, end={}); raw preview={}",
+                        start,
+                        end,
+                        raw[:200],
+                    )
+                    # Try salvage from quoted strings
+                    import re as _re
+                    quoted = _re.findall(r'"([^"]{2,100})"', raw)
+                    chips = [q.strip() for q in quoted if q.strip()][:16]
+                    if chips:
+                        logger.info("Analysis report chips: salvaged {} labels from quoted strings after bracket mismatch", len(chips))
+                    else:
+                        return self._fallback_chips_for_analysis_report(16)
+                else:
+                    try:
+                        arr = json.loads(raw[start:end])
+                    except json.JSONDecodeError as je:
+                        logger.warning(
+                            "Analysis report chips: JSON decode failed; attempting salvage. error={}, raw segment preview={}",
+                            je,
+                            raw[start:start+200],
+                        )
+                        import re as _re
+                        quoted = _re.findall(r'"([^"]{2,100})"', raw[start:end])
+                        chips = [q.strip() for q in quoted if q.strip()][:16]
+                        if chips:
+                            logger.info("Analysis report chips: salvaged {} labels from quoted strings after JSON error", len(chips))
+                        else:
+                            return self._fallback_chips_for_analysis_report(16)
+                    else:
+                        if not isinstance(arr, list):
+                            logger.warning(
+                                "Analysis report chips: parsed JSON is not a list (type={}); using fallback",
+                                type(arr),
+                            )
+                            return self._fallback_chips_for_analysis_report(16)
+                        chips = [str(x).strip() for x in arr if x and 2 <= len(str(x).strip()) <= 100][:16]
+            if len(chips) < 15:
+                seen = {c.lower() for c in chips}
+                for pad in self._fallback_chips_for_analysis_report(20):
+                    if len(chips) >= 16:
+                        break
+                    if pad and pad.lower() not in seen:
+                        chips.append(pad)
+                        seen.add(pad.lower())
+            result = chips[:16]
+            logger.info("Analysis report chips: {} for workspace {}", len(result), workspace_id[:12] if workspace_id else "")
+            return result
+        except Exception as e:
+            logger.warning("Analysis report suggestion chips generation failed: {}", str(e))
+            return self._fallback_chips_for_analysis_report(16)
     
     async def on_probing_prompts_request(self, data: Dict[str, Any]) -> None:
         """
@@ -3448,11 +3622,8 @@ Return ONLY a JSON array, no other text. Example with 10+ items: ["Draft a settl
         import random
         try:
             workspace_id = (data.get("workspaceId") or data.get("workspace_id") or "").strip()
-            chat_type = (data.get("chatType") or "").strip()
-            if chat_type != "STRATEGY_OBJECTIVE":
-                logger.debug("probing_prompts_request: chatType is not STRATEGY_OBJECTIVE, skipping")
-                return
-            max_prompts = data.get("maxPrompts")
+            chat_type = (data.get("chatType") or data.get("chat_type") or "").strip()
+            max_prompts = data.get("maxPrompts") or data.get("max_prompts")
             if max_prompts is None:
                 max_prompts = 4
             try:
@@ -3460,70 +3631,81 @@ Return ONLY a JSON array, no other text. Example with 10+ items: ["Draft a settl
             except (TypeError, ValueError):
                 max_prompts = 4
             
-            # 1) If we have 10-12 stored contextual chips for this workspace, return random 4 each time (so each poll shows different chips)
-            stored_chat_chips = self._workspace_chat_suggestion_chips.get(workspace_id) or []
-            if stored_chat_chips:
-                count = min(max_prompts, len(stored_chat_chips))
-                prompts = random.sample(stored_chat_chips, count) if count > 0 else []
-                logger.info("probing_prompts: returning random {} from {} stored chips (rotation)", len(prompts), len(stored_chat_chips))
+            prompts = []
+            if chat_type == "ANALYSIS_REPORT":
+                # Analysis Report: return random 4 from stored 15-16 analysis-report chips (same pattern as strategy)
+                chips = self._workspace_analysis_suggestion_chips.get(workspace_id) or []
+                if not chips:
+                    chips = self._fallback_chips_for_analysis_report(16)
+                count = min(max_prompts, len(chips))
+                prompts = random.sample(chips, count) if count > 0 else []
+                logger.info("probing_prompts: ANALYSIS_REPORT, returning random {} from {} chips", len(prompts), len(chips))
             else:
-                # 2) No stored chat chips: if we have conversation context, generate 10-12, store, return random 4
-                last_user = (data.get("lastUserMessage") or data.get("last_user_message") or "").strip()
-                last_ai = (data.get("lastAiResponse") or data.get("last_ai_response") or "").strip()
-                conv_history = data.get("conversation_history") or data.get("conversationHistory") or []
-                if conv_history and (not last_user and not last_ai):
-                    for m in reversed(conv_history):
-                        r = (m.get("role") or "").upper()
-                        c = (m.get("content") or "").strip()
-                        if not c:
-                            continue
-                        if r == "USER" and not last_user:
-                            last_user = c[:500]
-                        elif r == "AI" and not last_ai:
-                            last_ai = c[:500]
-                        if last_user and last_ai:
-                            break
-                prompts = []
-                if last_user or last_ai or (conv_history and len(conv_history) >= 2):
-                    role = "ADJUDICATOR"
-                    try:
-                        ctx = workspace_manager.get_workspace(workspace_id)
-                        if ctx and ctx.workspace_role:
-                            role = (ctx.workspace_role or "ADJUDICATOR").upper()
-                    except Exception:
-                        pass
-                    if last_user or last_ai:
-                        conv_summary = None
-                        if conv_history and len(conv_history) > 2:
-                            parts = []
-                            for m in conv_history[-4:]:
-                                r = m.get("role") or m.get("role", "")
-                                c = (m.get("content") or "")[:80]
-                                if c:
-                                    parts.append(f"{r}: {c}")
-                            conv_summary = " | ".join(parts) if parts else None
-                        generated = await self._generate_contextual_suggestion_chips(
-                            workspace_id=workspace_id,
-                            role=role,
-                            user_message=last_user,
-                            ai_response_text=last_ai,
-                            max_chips=12,
-                            conversation_summary=conv_summary,
-                        )
-                        if generated:
-                            self._workspace_chat_suggestion_chips[workspace_id] = generated
-                            count = min(max_prompts, len(generated))
-                            prompts = random.sample(generated, count) if count > 0 else []
-                            logger.info("probing_prompts: generated {} contextual chips, returning random {}", len(generated), len(prompts))
-                # 3) Fallback: strategy chips (random 4 from 15-16)
-                if not prompts:
-                    chips = self._workspace_suggestion_chips.get(workspace_id) or []
-                    if not chips and self._last_workspace_id_with_chips:
-                        chips = self._workspace_suggestion_chips.get(self._last_workspace_id_with_chips) or []
-                    if not chips:
-                        logger.warning("probing_prompts_request: no suggestion chips for workspace {}", workspace_id)
-                    count = min(max_prompts, len(chips)) if chips else 0
-                    prompts = random.sample(chips, count) if count > 0 else []
+                # STRATEGY_OBJECTIVE or other: contextual chips, then strategy chips
+                # 1) If we have 10-12 stored contextual chips for this workspace, return random 4 each time (so each poll shows different chips)
+                stored_chat_chips = self._workspace_chat_suggestion_chips.get(workspace_id) or []
+                if stored_chat_chips:
+                    count = min(max_prompts, len(stored_chat_chips))
+                    prompts = random.sample(stored_chat_chips, count) if count > 0 else []
+                    logger.info("probing_prompts: returning random {} from {} stored chips (rotation)", len(prompts), len(stored_chat_chips))
+                else:
+                    # 2) No stored chat chips: if we have conversation context, generate 10-12, store, return random 4
+                    last_user = (data.get("lastUserMessage") or data.get("last_user_message") or "").strip()
+                    last_ai = (data.get("lastAiResponse") or data.get("last_ai_response") or "").strip()
+                    conv_history = data.get("conversation_history") or data.get("conversationHistory") or []
+                    if conv_history and (not last_user and not last_ai):
+                        for m in reversed(conv_history):
+                            r = (m.get("role") or "").upper()
+                            c = (m.get("content") or "").strip()
+                            if not c:
+                                continue
+                            if r == "USER" and not last_user:
+                                last_user = c[:500]
+                            elif r == "AI" and not last_ai:
+                                last_ai = c[:500]
+                            if last_user and last_ai:
+                                break
+                    prompts = []
+                    if last_user or last_ai or (conv_history and len(conv_history) >= 2):
+                        role = "ADJUDICATOR"
+                        try:
+                            ctx = workspace_manager.get_workspace(workspace_id)
+                            if ctx and ctx.workspace_role:
+                                role = (ctx.workspace_role or "ADJUDICATOR").upper()
+                        except Exception:
+                            pass
+                        if last_user or last_ai:
+                            conv_summary = None
+                            if conv_history and len(conv_history) > 2:
+                                parts = []
+                                for m in conv_history[-4:]:
+                                    r = m.get("role") or m.get("role", "")
+                                    c = (m.get("content") or "")[:80]
+                                    if c:
+                                        parts.append(f"{r}: {c}")
+                                conv_summary = " | ".join(parts) if parts else None
+                            generated = await self._generate_contextual_suggestion_chips(
+                                workspace_id=workspace_id,
+                                role=role,
+                                user_message=last_user,
+                                ai_response_text=last_ai,
+                                max_chips=12,
+                                conversation_summary=conv_summary,
+                            )
+                            if generated:
+                                self._workspace_chat_suggestion_chips[workspace_id] = generated
+                                count = min(max_prompts, len(generated))
+                                prompts = random.sample(generated, count) if count > 0 else []
+                                logger.info("probing_prompts: generated {} contextual chips, returning random {}", len(generated), len(prompts))
+                    # 3) Fallback: strategy chips (random 4 from 15-16)
+                    if not prompts:
+                        chips = self._workspace_suggestion_chips.get(workspace_id) or []
+                        if not chips and self._last_workspace_id_with_chips:
+                            chips = self._workspace_suggestion_chips.get(self._last_workspace_id_with_chips) or []
+                        if not chips:
+                            logger.warning("probing_prompts_request: no suggestion chips for workspace {}", workspace_id)
+                        count = min(max_prompts, len(chips)) if chips else 0
+                        prompts = random.sample(chips, count) if count > 0 else []
             
             response = {
                 "workspaceId": data.get("workspaceId"),

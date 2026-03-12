@@ -54,6 +54,8 @@ class SocketEventHandler:
         # Cache last strategy_objective and analysis_report payloads per workspace (for re-emit on sync when no doc changes)
         self._workspace_strategy_payload: Dict[str, Any] = {}
         self._workspace_analysis_payload: Dict[str, Any] = {}
+        # List of Dates timeline per workspace (chronological events from case documents)
+        self._workspace_list_of_dates_payload: Dict[str, List[Dict[str, Any]]] = {}
         # Re-emit after reconnect when socket dropped right after analysis report (so backend gets the update)
         self._had_disconnect: bool = False
         self._pending_reemit_workspace_id: Optional[str] = None
@@ -708,6 +710,13 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
 
 **If documents appear unrelated** (different cases/matters), base analysis ONLY on the last document (labeled "most recently uploaded"). Otherwise use all documents combined.
 
+**missingInfo – definition (strict)**:
+- List ONLY information that (1) is **NOT present** in the uploaded documents (not stated, not evidenced, not inferable from the text/images), AND (2) is **required for the case** (essential to establish facts, liability, relief, or to argue the case).
+- Do NOT list as missing anything that is already in the documents. If serial number, model number, reference number, or a date (e.g. on warranty card or letter) appears anywhere in the docs, do NOT list "serial number", "model number", "reference", or "exact date of purchase" as missing. If the retailer or party name appears, do not list "dealer details" or "seller name" as missing.
+- Do NOT list generic or nice-to-have items; only genuine gaps that a lawyer would need to prove or defend the case.
+- Before adding an item, verify: "Is this clearly absent from all documents? Is it critical for the case?" If either answer is no, omit it.
+- Typical missingInfo examples: reason for return/termination not stated in docs; basis of a "under protest" or dispute not explained; key contract terms or warranty scope not in the docs; identity/role of a signatory unclear when it matters; proof of purchase (invoice/receipt) when only a warranty card is provided; full warranty terms when only a booklet summary or URL is given; formal written confirmation from the other party when only emails or one-sided letters exist.
+
 **caseResolutionScore rule**: Score is 100% only when missingInfo, weaknesses, and risks are all empty (no gaps, no risks, no weaknesses). If you list any missingInfo or weaknesses or risks, the score must be less than 100 (e.g. cap at 95 when any remain). When the user later rejects/removes all such items, the score can reach 100%.
 
 **Required JSON structure** (use exactly these keys; output nothing but this object):
@@ -728,7 +737,7 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
 }}
 
 Rules:
-- missingInfo: 0-8 items – critical gaps (witness details, dates, evidence) that would strengthen the case from this role's perspective.
+- missingInfo: 0-8 items – ONLY information that is (a) clearly absent from the documents and (b) required for the case. Do not list anything already present or partially present in the docs.
 - strengths: 2-6 items – each with "point" (one sentence) and "laws" (array of specific act/section references).
 - weaknesses: 0-6 items – factual or legal weaknesses from this role's perspective.
 - risks: 0-6 items – procedural or outcome risks (limitation, burden of proof, etc.).
@@ -1016,6 +1025,304 @@ Output now: a single JSON object starting with {{ and ending with }}. No other t
             "suggestedDrafts": [],
         }
 
+    async def _generate_list_of_dates_from_documents(
+        self,
+        workspace_id: str,
+        user_id: str,
+        all_docs: List[Dict[str, Any]],
+        batch_result: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Extract a chronological list of important dates/events from case documents using AI.
+        Returns list of items for payload.listOfDates (date, title, description, sourceDocId, sourceDocName, etc.).
+        """
+        import json
+        import re
+        from datetime import datetime
+
+        if not all_docs:
+            return []
+
+        # Build document index and names: 1-based index -> document_id, display name
+        doc_id_by_index: Dict[int, str] = {}
+        doc_name_by_index: Dict[int, str] = {}
+        id_to_name: Dict[str, str] = {}
+        if batch_result:
+            for r in (batch_result.get("results") or []):
+                did = r.get("document_id")
+                name = r.get("filename") or r.get("originalName") or ""
+                if did:
+                    id_to_name[str(did)] = name or f"Document"
+
+        parts = []
+        for i, doc in enumerate(all_docs, 1):
+            doc_id = str(doc.get("document_id") or "")
+            content = (doc.get("content") or "").strip()
+            if not content or len(content) < 20:
+                continue
+            name = id_to_name.get(doc_id) or f"Document {i}"
+            doc_id_by_index[i] = doc_id
+            doc_name_by_index[i] = name
+            parts.append(f"--- Document {i} (id: {doc_id}, name: {name}) ---\n{content[:8000]}")
+        combined = "\n\n".join(parts) if parts else ""
+        if not combined:
+            return []
+
+        max_len = 12000
+        if len(combined) > max_len:
+            combined = combined[:max_len] + "..."
+
+        try:
+            from app.ai.gemini_client import gemini_client
+            gemini_client.initialize()
+            if not gemini_client.model:
+                return []
+
+            prompt = f"""You are a legal case analyst. From the following case documents, extract a chronological list of important dates and events (e.g. agreement signed, payment made, notice sent, reply received, court filing, hearing, deadline).
+
+**Document content** (each document is labeled Document 1, Document 2, etc. with id and name):
+{combined}
+
+**Task**: Output a JSON array of date entries. Each entry must have:
+- "date": string in YYYY-MM-DD format only
+- "title": string, short title for the event (e.g. "FIR Filed", "Notice Sent")
+- "description": string (optional), brief context
+- "sourceDocumentIndex": integer (1-based), which document (1, 2, 3...) this comes from
+- "pageNumber": integer (optional) if page is known
+- "isIncident": boolean (optional, default true)
+- "eventType": one of "Court Hearing" | "Deadline" | "Meeting" | "Filing" | "Other" (optional)
+- "relevance": one of "High" | "Medium" | "Low" (optional)
+
+Rules:
+- Output ONLY a valid JSON array. No markdown, no code fences, no text before or after.
+- The first character of your response MUST be [ and the last character MUST be ].
+- Sort by date ascending (oldest first).
+- Use only dates explicitly mentioned or clearly inferable from the text.
+- If no clear dates/events, return exactly: []
+- Escape quotes inside strings with \\". Keep title and description short so the JSON is complete and not truncated.
+
+Example shape: [{{"date":"2026-01-15","title":"Notice Sent","description":"Cease and desist","sourceDocumentIndex":1,"eventType":"Filing","relevance":"High"}}]
+"""
+            raw = await gemini_client.generate(prompt=prompt, temperature=0.3, max_tokens=8000)
+            raw = (raw or "").strip()
+            if not raw or raw.startswith("Error"):
+                logger.warning("List of dates: Gemini error or empty response")
+                return []
+
+            # Strip markdown and find JSON array
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```\s*$", "", raw)
+            start = raw.find("[")
+            if start < 0:
+                logger.warning("List of dates: no '[' found in response; raw preview={}", (raw or "")[:150])
+                return []
+            # String-aware bracket matching: do not count [ or ] inside double-quoted strings
+            depth = 0
+            end = -1
+            i = start
+            in_string = False
+            escape_next = False
+            quote_char = '"'
+            while i < len(raw):
+                c = raw[i]
+                if escape_next:
+                    escape_next = False
+                    i += 1
+                    continue
+                if c == "\\" and in_string:
+                    escape_next = True
+                    i += 1
+                    continue
+                if not in_string:
+                    if c == quote_char:
+                        in_string = True
+                    elif c == "[":
+                        depth += 1
+                    elif c == "]":
+                        depth -= 1
+                        if depth == 0:
+                            end = i
+                            break
+                else:
+                    if c == quote_char:
+                        in_string = False
+                i += 1
+
+            json_str = None
+            if end >= 0:
+                json_str = raw[start : end + 1]
+            if not json_str or end < 0:
+                # Fallback: truncated response (missing ']') – try appending ']' and balance braces
+                json_str = raw[start:].strip()
+                if json_str and not json_str.endswith("]"):
+                    # Count unclosed [ and } to try to close the array
+                    open_brackets = json_str.count("[") - json_str.count("]")
+                    open_braces = json_str.count("{") - json_str.count("}")
+                    for _ in range(open_braces):
+                        json_str += "}"
+                    for _ in range(open_brackets):
+                        json_str += "]"
+                    logger.info("List of dates: truncated response; attempted to close brackets")
+                if not json_str:
+                    logger.warning("List of dates: no matching ']' found; raw preview={}", raw[:200])
+                    return []
+
+            try:
+                arr = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                logger.warning("List of dates: JSON decode error: {}; attempting salvage", e)
+                # Salvage: look for object-like substrings with "date": and parse or regex-extract
+                salvage = []
+                search_region = raw[start:] if start >= 0 else raw
+                offset = start if start >= 0 else 0
+                for mobj in re.finditer(
+                    r'\{\s*"date"\s*:\s*"([^"]+)"\s*,\s*"title"\s*:\s*"([^"]*)"',
+                    search_region,
+                ):
+                    try:
+                        # Find the full object: from { to matching }
+                        beg = offset + mobj.start()
+                        if beg < 0:
+                            continue
+                        depth_br = 0
+                        j = beg
+                        in_str = False
+                        esc = False
+                        q = '"'
+                        while j < len(raw):
+                            ch = raw[j]
+                            if esc:
+                                esc = False
+                                j += 1
+                                continue
+                            if ch == "\\" and in_str:
+                                esc = True
+                                j += 1
+                                continue
+                            if not in_str:
+                                if ch == q:
+                                    in_str = True
+                                elif ch == "{":
+                                    depth_br += 1
+                                elif ch == "}":
+                                    depth_br -= 1
+                                    if depth_br == 0:
+                                        candidate = raw[beg : j + 1]
+                                        try:
+                                            obj = json.loads(candidate)
+                                            if isinstance(obj, dict) and obj.get("date"):
+                                                salvage.append(obj)
+                                        except json.JSONDecodeError:
+                                            pass
+                                        break
+                            else:
+                                if ch == q:
+                                    in_str = False
+                            j += 1
+                    except Exception:
+                        pass
+                if salvage:
+                    arr = salvage
+                    logger.info("List of dates: salvaged {} entries from malformed JSON", len(arr))
+                else:
+                    return []
+            if not isinstance(arr, list):
+                arr = [arr] if isinstance(arr, dict) else []
+
+            if not isinstance(arr, list):
+                return []
+
+            result = []
+            for item in arr:
+                if not isinstance(item, dict):
+                    continue
+                date_val = (item.get("date") or item.get("dateValue") or "").strip()
+                if not date_val:
+                    continue
+                # Normalize to YYYY-MM-DD
+                try:
+                    normalized = None
+                    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%B %d, %Y", "%d %B %Y"):
+                        try:
+                            dt = datetime.strptime(date_val.strip(), fmt)
+                            normalized = dt.strftime("%Y-%m-%d")
+                            break
+                        except ValueError:
+                            continue
+                    if normalized:
+                        date_val = normalized
+                    elif len(date_val) >= 10 and date_val[4] == "-" and date_val[7] == "-":
+                        date_val = date_val[:10]
+                    else:
+                        continue
+                except Exception:
+                    continue
+
+                idx = item.get("sourceDocumentIndex")
+                idx = int(idx) if idx is not None else 1
+                source_doc_id = doc_id_by_index.get(idx, "")
+                source_doc_name = doc_name_by_index.get(idx, "")
+
+                entry = {
+                    "date": date_val,
+                    "title": (item.get("title") or "").strip() or "Event",
+                    "description": (item.get("description") or "").strip(),
+                    "sourceDocId": source_doc_id or None,
+                    "sourceDocName": source_doc_name or None,
+                    "pageNumber": item.get("pageNumber") if isinstance(item.get("pageNumber"), int) else None,
+                    "isIncident": item.get("isIncident", True),
+                    "eventType": (item.get("eventType") or "").strip() or None,
+                    "relevance": (item.get("relevance") or "").strip() or None,
+                }
+                # Drop None/empty so payload is clean; keep description if present
+                entry = {k: v for k, v in entry.items() if v is not None and v != ""}
+                result.append(entry)
+
+            logger.info("List of dates: generated {} entries for workspace {}", len(result), workspace_id[:12] if workspace_id else "")
+            return result
+
+        except Exception as e:
+            logger.warning("List of dates generation failed: {}", e)
+            return []
+
+    async def _generate_and_emit_list_of_dates(
+        self,
+        workspace_id: str,
+        user_id: str,
+        batch_result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Fetch workspace documents, generate list of dates from them, emit to backend and cache.
+        Emits document_feature_response with featureType "list_of_dates" and payload.listOfDates.
+        """
+        if not self._socket_client:
+            return
+        try:
+            from app.vectorstore.qdrant import vector_store
+            all_docs = await vector_store.get_all_documents(workspace_id=workspace_id)
+        except Exception as e:
+            logger.warning("List of dates: could not fetch documents: {}", e)
+            all_docs = []
+        list_of_dates = await self._generate_list_of_dates_from_documents(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            all_docs=all_docs,
+            batch_result=batch_result,
+        )
+        payload = {"listOfDates": list_of_dates}
+        await self._socket_client.emit(
+            "document_feature_response",
+            {
+                "featureType": "list_of_dates",
+                "workspaceId": workspace_id,
+                "userId": user_id,
+                "payload": payload,
+            },
+        )
+        self._workspace_list_of_dates_payload[workspace_id] = list_of_dates
+        logger.success("✅ List of dates sent to backend ({} entries)", len(list_of_dates))
+        await asyncio.sleep(0.1)
+
     def _strategy_objective_fallback(
         self,
         workspace_id: str,
@@ -1106,6 +1413,15 @@ Output now: a single JSON object starting with {{ and ending with }}. No other t
                 logger.info("Analysis report suggestion chips stored: {} for workspace {}", len(analysis_chips), workspace_id[:12] if workspace_id else "")
         except Exception as chip_err:
             logger.warning("Analysis report chips generation failed: {}", chip_err)
+        # List of Dates: generate and emit chronological timeline after analysis report
+        try:
+            await self._generate_and_emit_list_of_dates(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                batch_result=batch_result,
+            )
+        except Exception as lod_err:
+            logger.warning("List of dates generation/emit failed: {}", lod_err)
         return True
 
     async def _generate_and_emit_analysis_report_for_sync(
@@ -1144,6 +1460,14 @@ Output now: a single JSON object starting with {{ and ending with }}. No other t
                 )
                 self._workspace_analysis_payload[workspace_id] = analysis_report
                 logger.success("✅ Analysis report sent to backend (sync)")
+            try:
+                await self._generate_and_emit_list_of_dates(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    batch_result=batch_result,
+                )
+            except Exception as lod_err:
+                logger.warning("List of dates (sync) failed: {}", lod_err)
         except asyncio.CancelledError:
             logger.warning("Analysis report (sync) task cancelled; emitting fallback")
             raise
@@ -1165,6 +1489,11 @@ Output now: a single JSON object starting with {{ and ending with }}. No other t
                     )
                     self._workspace_analysis_payload[workspace_id] = fallback
                     logger.success("✅ Analysis report (fallback) sent to backend (sync)")
+                await self._generate_and_emit_list_of_dates(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    batch_result=batch_result,
+                )
             except Exception as e:
                 logger.error("Failed to emit analysis report fallback (sync): {}", e)
 
@@ -2138,6 +2467,18 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         },
                     )
                     logger.success("✅ Analysis report re-emitted to backend after reconnect")
+                list_of_dates = self._workspace_list_of_dates_payload.get(workspace_id)
+                if list_of_dates is not None:
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "list_of_dates",
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "payload": {"listOfDates": list_of_dates},
+                        },
+                    )
+                    logger.success("✅ List of dates re-emitted to backend after reconnect")
             except Exception as e:
                 logger.warning("Failed to re-emit after reconnect: {}", e)
         # Re-emit last ai_response if we disconnected right after sending (so backend receives the chat response)
@@ -2462,6 +2803,16 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                     )
                                     self._workspace_analysis_payload[payload.workspaceId] = fallback
                                     logger.info("✅ Analysis report (fallback, 0 successful docs) sent to backend")
+                                    await self._socket_client.emit(
+                                        "document_feature_response",
+                                        {
+                                            "featureType": "list_of_dates",
+                                            "workspaceId": str(payload.workspaceId),
+                                            "userId": str(payload.userId),
+                                            "payload": {"listOfDates": []},
+                                        },
+                                    )
+                                    self._workspace_list_of_dates_payload[payload.workspaceId] = []
                                 except Exception as e:
                                     logger.error("Failed to emit analysis report fallback (0 success): {}", e)
                     
@@ -2485,7 +2836,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         except Exception as emit_error:
                             logger.error(f"Failed to emit error notification: {emit_error}")
             
-            # When workspace has no evidence files, still emit analysis report (fallback) so backend always receives it
+            # When workspace has no evidence files, still emit analysis report (fallback) and empty list of dates
             if not payload.evidenceFiles and self._socket_client:
                 try:
                     workspace_role = (payload.workspaceRole or "ADJUDICATOR").strip().upper()
@@ -2501,6 +2852,17 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     )
                     self._workspace_analysis_payload[payload.workspaceId] = fallback
                     logger.info("✅ Analysis report (fallback, no docs) sent to backend")
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "list_of_dates",
+                            "workspaceId": payload.workspaceId,
+                            "userId": payload.userId,
+                            "payload": {"listOfDates": []},
+                        },
+                    )
+                    self._workspace_list_of_dates_payload[payload.workspaceId] = []
+                    logger.info("✅ List of dates (empty, no docs) sent to backend")
                 except Exception as e:
                     logger.error("Failed to emit analysis report (no docs): {}", e)
             
@@ -2722,6 +3084,14 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         )
                         self._workspace_analysis_payload[payload.workspaceId] = analysis_report
                         logger.success("✅ Analysis report sent after document deletion")
+                    try:
+                        await self._generate_and_emit_list_of_dates(
+                            workspace_id=payload.workspaceId,
+                            user_id=payload.userId,
+                            batch_result=None,
+                        )
+                    except Exception as lod_err:
+                        logger.warning("List of dates after document deletion failed: {}", lod_err)
                 except Exception as del_err:
                     logger.error("Error handling document deletion: {}", str(del_err))
                     logger.exception(del_err)
@@ -3036,6 +3406,18 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     )
                     logger.success("✅ Analysis report re-emitted to backend (from cache)")
                     await asyncio.sleep(0.15)  # Allow socket to flush before audit/sync complete
+                    list_of_dates = self._workspace_list_of_dates_payload.get(workspace_id)
+                    if list_of_dates is not None:
+                        await self._socket_client.emit(
+                            "document_feature_response",
+                            {
+                                "featureType": "list_of_dates",
+                                "workspaceId": workspace_id,
+                                "userId": user_id,
+                                "payload": {"listOfDates": list_of_dates},
+                            },
+                        )
+                        logger.success("✅ List of dates re-emitted to backend (from cache)")
                 else:
                     await self._emit_analysis_report(
                         workspace_id,
@@ -3085,8 +3467,18 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         },
                     )
                     self._workspace_analysis_payload[workspace_id] = analysis_fallback
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "list_of_dates",
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "payload": {"listOfDates": []},
+                        },
+                    )
+                    self._workspace_list_of_dates_payload[workspace_id] = []
                     logger.success(
-                        "✅ Strategy & Analysis report (empty) sent to backend (no documents in workspace)"
+                        "✅ Strategy & Analysis report & list of dates (empty) sent to backend (no documents in workspace)"
                     )
                 except Exception as e:
                     logger.error("Failed to emit strategy/analysis fallbacks (no docs): {}", e)

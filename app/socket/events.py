@@ -623,6 +623,13 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
                     vector_error,
                 )
 
+            # Build parts with per-document cap so ALL documents are represented (no limit on number of docs)
+            # Large budget so 100+ docs each get a meaningful slice (100 docs → 1000 chars each, 200 → 500 each)
+            max_total_content = 100000  # Total character budget for all documents combined
+            num_docs = len([d for d in all_docs if (d.get("content") or "").strip() and len((d.get("content") or "").strip()) >= 20])
+            # Per-doc cap: every document included, fair share of budget (no doc count limit)
+            per_doc_cap = (max_total_content // max(1, num_docs)) if num_docs else max_total_content
+
             parts = []
             for i, doc in enumerate(all_docs, 1):
                 content = (doc.get("content") or "").strip()
@@ -633,34 +640,26 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
                     if i == len(all_docs)
                     else "Document {}".format(i)
                 )
+                if len(content) > per_doc_cap:
+                    content = content[:per_doc_cap] + "\n[... truncated for length ...]"
                 parts.append("--- {} ---\n{}".format(label, content))
             combined_document_content = (
                 "\n\n".join(parts) if parts else "No document content available."
             )
 
-            max_content_length = 12000
-            if parts and len(combined_document_content) > max_content_length:
-                latest_content = parts[-1]
-                earlier = "\n\n".join(parts[:-1]) if len(parts) > 1 else ""
-                if len(earlier) + len(latest_content) > max_content_length:
-                    keep_earlier = max(
-                        0, max_content_length - len(latest_content) - 200
-                    )
-                    combined_document_content = (
-                        (earlier[:keep_earlier] + "...\n\n" if keep_earlier else "")
-                        + latest_content
-                    )
-                else:
-                    combined_document_content = earlier + (
-                        "\n\n" + latest_content if earlier else latest_content
-                    )
+            if num_docs > 0 and len(combined_document_content) > max_total_content:
+                combined_document_content = combined_document_content[:max_total_content] + "\n[... content truncated ...]"
                 logger.info(
-                    "Truncated document content for analysis report to ~{} chars",
-                    max_content_length,
+                    "Truncated combined document content for analysis report to ~{} chars ({} docs, ~{} chars each)",
+                    max_total_content,
+                    num_docs,
+                    per_doc_cap,
                 )
-            elif len(combined_document_content) > max_content_length:
-                combined_document_content = (
-                    combined_document_content[:max_content_length] + "..."
+            elif num_docs > 1:
+                logger.info(
+                    "Analysis report using all {} documents (~{} chars per doc cap)",
+                    num_docs,
+                    per_doc_cap,
                 )
 
             doc_count = len(all_docs)
@@ -690,63 +689,177 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
             )
 
             analysis_prompt = (
-                """You are a legal analyst for Indian law. Produce an analysis report based on the uploaded documents.
+                """You are a senior legal analyst specializing in Indian law. Your task is to produce a structured legal analysis based ONLY on the uploaded documents.
 
-**CRITICAL – Output format (strict)**:
-- Your entire response MUST be exactly one valid JSON object. Nothing else.
-- Do NOT use markdown, do NOT use code fences (no ``` or ```json), do NOT add any text before or after the JSON.
-- The first character of your response MUST be {{ and the last character MUST be }}.
-- Escape quotes inside strings (use \\" for literal quotes). Keep qualityScoreExplanation concise (2-4 sentences) so the JSON is complete.
+CRITICAL OUTPUT RULES:
+- Your entire response MUST be exactly one valid JSON object.
+- Do NOT output markdown.
+- Do NOT output code blocks.
+- Do NOT output explanations outside JSON.
+- The first character MUST be {{ and the last character MUST be }}.
+- Escape quotes inside strings using \\".
 
-**Role**: {}
-**Role instruction**: {}
+ROLE: {}
+ROLE INSTRUCTION: {}
 
-**Document content** (documents in upload order; last is most recent):
+DOCUMENTS (in upload order; last document is most recent):
 {}
 
-**Task**: Provide a structured analysis report from the perspective of the selected role.
+LEGAL FRAMEWORK:
+Use only the following laws where relevant:
+- Bharatiya Nyaya Sanhita (BNS)
+- Bharatiya Nagarik Suraksha Sanhita (BNSS)
+- Bharatiya Sakshya Adhiniyam (BSA)
+- Information Technology Act 2000 (if applicable)
 
-**Legal framework**: Use BNS (Bharatiya Nyaya Sanhita), BNSS (Bharatiya Nagarik Suraksha Sanhita), BSA (Bharatiya Sakshya Adhiniyam). Do NOT cite IPC, CrPC, or Indian Evidence Act (replaced). IT Act 2000 remains valid.
+DO NOT cite:
+- IPC
+- CrPC
+- Indian Evidence Act
 
-**If documents appear unrelated** (different cases/matters), base analysis ONLY on the last document (labeled "most recently uploaded"). Otherwise use all documents combined.
+DOCUMENT RELATION RULE:
+If documents appear to belong to different cases or matters, analyze ONLY the last document.
 
-**missingInfo – definition (strict)**:
-- List ONLY information that (1) is **NOT present** in the uploaded documents (not stated, not evidenced, not inferable from the text/images), AND (2) is **required for the case** (essential to establish facts, liability, relief, or to argue the case).
-- Do NOT list as missing anything that is already in the documents. If serial number, model number, reference number, or a date (e.g. on warranty card or letter) appears anywhere in the docs, do NOT list "serial number", "model number", "reference", or "exact date of purchase" as missing. If the retailer or party name appears, do not list "dealer details" or "seller name" as missing.
-- Do NOT list generic or nice-to-have items; only genuine gaps that a lawyer would need to prove or defend the case.
-- Before adding an item, verify: "Is this clearly absent from all documents? Is it critical for the case?" If either answer is no, omit it.
-- Typical missingInfo examples: reason for return/termination not stated in docs; basis of a "under protest" or dispute not explained; key contract terms or warranty scope not in the docs; identity/role of a signatory unclear when it matters; proof of purchase (invoice/receipt) when only a warranty card is provided; full warranty terms when only a booklet summary or URL is given; formal written confirmation from the other party when only emails or one-sided letters exist.
+--------------------------------------------------
+STEP 1 — FACT EXTRACTION (internal reasoning only)
+--------------------------------------------------
 
-**caseResolutionScore rule**: Score is 100% only when missingInfo, weaknesses, and risks are all empty (no gaps, no risks, no weaknesses). If you list any missingInfo or weaknesses or risks, the score must be less than 100 (e.g. cap at 95 when any remain). When the user later rejects/removes all such items, the score can reach 100%.
+Carefully read the documents and identify key facts such as:
 
-**Required JSON structure** (use exactly these keys; output nothing but this object):
+- parties involved
+- dates
+- transactions
+- contractual obligations
+- warranty or service terms
+- communications
+- disputes raised
+- evidence provided
+
+Only treat something as "present" if it is explicitly stated in the documents.
+
+--------------------------------------------------
+STEP 2 — MISSING INFORMATION VERIFICATION
+--------------------------------------------------
+
+Before listing an item in missingInfo, verify BOTH conditions:
+
+1. The information is NOT present anywhere in the documents.
+2. The information is CRITICAL to prove the case or defend the case.
+
+If either condition fails, DO NOT include it.
+
+STRICT EXCLUSIONS:
+Do NOT list these as missing if they appear anywhere in the documents:
+
+- serial number
+- model number
+- purchase date
+- seller name
+- dealer name
+- invoice
+- receipt
+- proof of purchase
+- reference numbers
+- warranty card details
+- document dates
+
+Only include missing information that a lawyer would NEED to establish liability or relief.
+
+Examples of valid missingInfo:
+- warranty scope not defined
+- reason for termination unclear
+- identity of signatory not specified
+- contract terms not included
+- formal complaint not documented
+
+Maximum items: 8
+
+--------------------------------------------------
+STEP 3 — LEGAL ANALYSIS
+--------------------------------------------------
+
+All strengths and weaknesses MUST be based on facts from the documents.
+
+Strength rules:
+- 2–6 items
+- Each must include a clear legal point
+- Each must cite a relevant law/section
+- Must be supported by the document facts
+
+Weakness rules:
+- Only list weaknesses supported by document facts
+- Do NOT invent weaknesses
+
+Risk rules:
+- Procedural or legal risks (limitation, burden of proof, jurisdiction issues)
+
+--------------------------------------------------
+CASE RESOLUTION SCORE RULE
+--------------------------------------------------
+
+caseResolutionScore must follow STRICT logic:
+
+100 = only when:
+- missingInfo is empty
+- weaknesses is empty
+- risks is empty
+
+If ANY of those contain items → score must be < 100.
+
+Suggested scoring logic:
+- Each missingInfo item: -5
+- Each weakness: -5
+- Each risk: -3
+
+Cap score between 0 and 100.
+
+--------------------------------------------------
+OUTPUT JSON STRUCTURE
+--------------------------------------------------
+
 {{
-  "missingInfo": ["item1", "item2"],
+  "missingInfo": ["item1","item2"],
   "strengths": [
-    {{ "point": "One clear strength with legal basis", "laws": ["BNS Section 318", "BNSS Section ..."] }},
-    {{ "point": "Another strength", "laws": ["..."] }}
+    {{
+      "point": "One clear strength with legal reasoning",
+      "laws": ["BNS Section 318"]
+    }}
   ],
-  "weaknesses": ["weakness1", "weakness2"],
-  "risks": ["risk1", "risk2"],
-  "relevantJurisdiction": ["District Court, City", "High Court of State"],
+  "weaknesses": ["weakness1"],
+  "risks": ["risk1"],
+  "relevantJurisdiction": ["District Court, City"],
   "caseResolutionScore": 72,
-  "qualityScoreExplanation": "Detailed explanation of how the 72% score was computed...",
+  "qualityScoreExplanation": "Score reduced due to missing evidence and procedural risks identified in the documents.",
   "pendingActions": ["action1"],
-  "nextSteps": ["step1", "step2"],
-  "suggestedDrafts": ["Draft 1", "Draft 2"]
+  "nextSteps": ["step1","step2"],
+  "suggestedDrafts": ["Draft Legal Notice"]
 }}
 
-Rules:
-- missingInfo: 0-8 items – ONLY information that is (a) clearly absent from the documents and (b) required for the case. Do not list anything already present or partially present in the docs.
-- strengths: 2-6 items – each with "point" (one sentence) and "laws" (array of specific act/section references).
-- weaknesses: 0-6 items – factual or legal weaknesses from this role's perspective.
-- risks: 0-6 items – procedural or outcome risks (limitation, burden of proof, etc.).
-- relevantJurisdiction: 1-5 courts/fora (e.g. "District Court, Mumbai", "High Court of Bombay").
-- caseResolutionScore: integer 0-100 – MUST be based only on missingInfo, risks, and weaknesses. Rule: 100% only when there are zero missingInfo, zero weaknesses, and zero risks (all gaps/risks addressed or none identified). If any missingInfo/weaknesses/risks remain, score must be below 100 (e.g. 95 max when any remain). 0 = no docs or no analysis.
-- qualityScoreExplanation: string – detailed explanation of how the caseResolutionScore was computed (e.g. factors considered, impact of strengths/weaknesses/risks/missingInfo). Keep to 2-4 sentences so the JSON does not get truncated.
-- pendingActions, nextSteps, suggestedDrafts: 0-5 items each; concrete next steps and suggested draft names (e.g. "Draft BNSS Complaint").
+RULES:
 
-Output now: a single JSON object starting with {{ and ending with }}. No other text."""
+missingInfo:
+0–8 items
+ONLY information absent from documents and legally required.
+
+strengths:
+2–6 items with legal references.
+
+weaknesses:
+0–6 factual weaknesses.
+
+risks:
+0–6 procedural/legal risks.
+
+relevantJurisdiction:
+1–5 courts or legal forums.
+
+pendingActions / nextSteps / suggestedDrafts:
+0–5 items each.
+
+FINAL RULE:
+Output ONLY the JSON object.
+No extra text.
+"""
             ).format(
                 role,
                 role_instruction,

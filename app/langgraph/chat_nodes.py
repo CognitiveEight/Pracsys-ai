@@ -127,10 +127,12 @@ APPLICABLE LAWS ({len(applicable_laws)} available):
     uploaded_docs = workspace_state.get("uploaded_documents") or []
     if uploaded_docs:
         docs_section = "\nUPLOADED DOCUMENTS (use as source of truth for this workspace):\n"
+        docs_section += "Document numbering: Document 1 = first document, Document 2 = second, etc. "
+        docs_section += "When the user refers to \"Annexure 1\", \"Annexure 2\", \"annexure 1\", \"annexure 2\", or similar (e.g. annexure-1, Annexure I), treat these as Document 1, Document 2, Document 3, etc. respectively. Answer using the content of the corresponding Document N.\n"
         for i, doc in enumerate(uploaded_docs, 1):
             content = doc.get("content") or ""
             if content:
-                docs_section += f"\n--- Document {i} ---\n{content}\n"
+                docs_section += f"\n--- Document {i} (also referred to as Annexure {i}) ---\n{content}\n"
         context_sections.append(docs_section)
 
     # 5c. CHAT ATTACHMENT (document uploaded with this message – use to answer questions about it)

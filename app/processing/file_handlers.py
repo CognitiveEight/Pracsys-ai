@@ -32,6 +32,17 @@ except ImportError:
     logger.warning("pdf2image not available")
 
 try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    logger.warning("PIL/Pillow not available")
+
+# Max pixels per image for OCR (avoids DecompressionBomb and GCP Vision "Bad image data")
+# PIL default is ~89M; GCP Vision has size limits; keep safe for memory and API
+OCR_MAX_IMAGE_PIXELS = 20_000_000
+
+try:
     from docx import Document
     DOCX_AVAILABLE = True
 except ImportError:
@@ -143,31 +154,59 @@ class FileProcessor:
     def _extract_text_from_pdf_with_ocr(pdf_data: bytes) -> str:
         """Extract text from image-based PDF using OCR."""
         try:
-            # Convert PDF pages to images
-            images = convert_from_bytes(pdf_data)
+            resample = None
+            old_max_pixels = None
+            if PIL_AVAILABLE:
+                resample = Image.LANCZOS if hasattr(Image, "LANCZOS") else Image.BICUBIC
+                if hasattr(Image, "Resampling") and hasattr(Image.Resampling, "LANCZOS"):
+                    resample = Image.Resampling.LANCZOS
+                old_max_pixels = getattr(Image, "MAX_IMAGE_PIXELS", None)
+                if old_max_pixels is not None:
+                    Image.MAX_IMAGE_PIXELS = 200_000_000
+            try:
+                # Convert at 150 DPI to reduce size (default 200 can exceed limits)
+                images = convert_from_bytes(pdf_data, dpi=150)
+            finally:
+                if PIL_AVAILABLE and old_max_pixels is not None:
+                    Image.MAX_IMAGE_PIXELS = old_max_pixels
+
             extracted_texts = []
-            
+
             for i, image in enumerate(images):
                 logger.info(f"Processing PDF page {i+1}/{len(images)} with OCR")
-                
+
+                # Resize if image exceeds safe pixel count (avoids GCP Vision "Bad image data")
+                if PIL_AVAILABLE and resample is not None and getattr(image, "width", None) and getattr(image, "height", None):
+                    w, h = image.width, image.height
+                    pixels = w * h
+                    if pixels > OCR_MAX_IMAGE_PIXELS:
+                        ratio = (OCR_MAX_IMAGE_PIXELS / pixels) ** 0.5
+                        new_w = max(1, int(w * ratio))
+                        new_h = max(1, int(h * ratio))
+                        image = image.resize((new_w, new_h), resample)
+                        logger.warning(
+                            "PDF page %s image too large (%s pixels); resized to %sx%s for OCR",
+                            i + 1, pixels, new_w, new_h,
+                        )
+
                 # Convert PIL image to bytes
                 img_byte_arr = BytesIO()
                 image.save(img_byte_arr, format='PNG')
                 img_bytes = img_byte_arr.getvalue()
-                
+
                 # Extract text using GCP Vision API
                 page_text = FileProcessor.extract_text_from_image(img_bytes)
-                
+
                 if page_text and not page_text.startswith("[Error") and not page_text.startswith("[No text"):
                     extracted_texts.append(f"--- Page {i+1} ---\n{page_text}")
-            
+
             if extracted_texts:
                 full_text = "\n\n".join(extracted_texts)
                 logger.success(f"Extracted {len(full_text)} characters from PDF using OCR")
                 return full_text
             else:
                 return "[No text could be extracted from PDF images]"
-                
+
         except Exception as e:
             logger.error(f"Error extracting text from PDF with OCR: {str(e)}")
             return f"[Error extracting text from PDF with OCR: {str(e)}]"

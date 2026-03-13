@@ -51,7 +51,15 @@ class SocketEventHandler:
         self._workspace_chat_suggestion_chips: Dict[str, List[str]] = {}  # workspace_id -> 10-12 contextual chips (refreshed per AI reply; we return random 4 on each request)
         self._last_workspace_id_with_chips: Optional[str] = None  # fallback when request workspace has no chips
         self._last_probing_emit_time: Dict[str, float] = {}  # workspace_id -> time of last probing_prompts_response emit
-        # Cache last strategy_objective and analysis_report payloads per workspace (for re-emit on sync when no doc changes)
+        # Cache last document_feature_response payloads per workspace so we can re-emit reliably after reconnect
+        # (backend sometimes disconnects the socket during long AI work)
+        # - document_assessments: initial assessment for all documents
+        # - workspace_metadata: derived case title/category/description
+        # - strategy_objective: detailed strategy/opinion
+        # - analysis_report: score + strengths/weaknesses
+        # - list_of_dates: timeline extracted from documents
+        self._workspace_document_assessments_payload: Dict[str, Any] = {}
+        self._workspace_metadata_payload: Dict[str, Any] = {}
         self._workspace_strategy_payload: Dict[str, Any] = {}
         self._workspace_analysis_payload: Dict[str, Any] = {}
         # List of Dates timeline per workspace (chronological events from case documents)
@@ -325,7 +333,7 @@ OUTPUT (JSON only, complete all fields):
 
 suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words each) specific to this case and role. Examples: "Review Title Deeds", "Map Legal Heirs", "Draft Demand Notice", "File FIR", "Preserve Digital Evidence". No full sentences. Provide 15-16 varied chips.
 
-CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, arrays, and the root object."""
+CRITICAL: Output complete, valid JSON only. Do not truncate; close every string with \", close every array with ], and make sure the root JSON object is fully closed. Keep caseSummary and strategicObjective under 800 characters each so the full JSON fits in one response."""
                 custom_suffix = build_custom_instruction_suffix(workspace_id)
                 if custom_suffix:
                     structured_prompt = structured_prompt.rstrip() + "\n\n" + custom_suffix
@@ -373,13 +381,17 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
                             json_str = remaining[:end_pos]
                             logger.info("✅ Extracted JSON from markdown block (possibly incomplete response)")
                         else:
-                            # Incomplete JSON, try to complete it
-                            json_str = remaining
-                            if not json_str.rstrip().endswith('}'):
-                                # Add closing braces
+                            # Incomplete/truncated JSON: try to repair then parse, else fall through to partial extraction
+                            json_str = remaining.rstrip()
+                            if not json_str.endswith('}'):
+                                # Close unclosed string if we're inside a quoted value (odd number of unescaped " in tail)
+                                tail = json_str
+                                if tail.count('"') % 2 != 0:
+                                    json_str = json_str + '"'
                                 open_braces = json_str.count('{') - json_str.count('}')
-                                json_str = json_str.rstrip() + '}' * open_braces
-                                logger.warning("⚠️ Completed truncated JSON by adding {} closing braces", open_braces)
+                                open_brackets = json_str.count('[') - json_str.count(']')
+                                json_str = json_str + ']' * open_brackets + '}' * open_braces
+                                logger.warning("⚠️ Repaired truncated JSON (close quote + {} ] + {} }))", open_brackets, open_braces)
                     else:
                         logger.warning("Found ```json marker but no JSON object")
                 if json_str is None and re.search(r'```\s*(\{.*?\})\s*```', ai_response, re.DOTALL):
@@ -1212,11 +1224,11 @@ Rules:
 - Sort by date ascending (oldest first).
 - Use only dates explicitly mentioned or clearly inferable from the text.
 - If no clear dates/events, return exactly: []
-- Escape quotes inside strings with \\". Keep title and description short so the JSON is complete and not truncated.
+- Escape quotes inside strings with \\". Keep each title and description to one short phrase (under 80 chars) so the full JSON is not truncated.
 
 Example shape: [{{"date":"2026-01-15","title":"Notice Sent","description":"Cease and desist","sourceDocumentIndex":1,"eventType":"Filing","relevance":"High"}}]
 """
-            raw = await gemini_client.generate(prompt=prompt, temperature=0.3, max_tokens=8000)
+            raw = await gemini_client.generate(prompt=prompt, temperature=0.3, max_tokens=12000)
             raw = (raw or "").strip()
             if not raw or raw.startswith("Error"):
                 logger.warning("List of dates: Gemini error or empty response")
@@ -1376,6 +1388,7 @@ Example shape: [{{"date":"2026-01-15","title":"Notice Sent","description":"Cease
                 source_doc_id = doc_id_by_index.get(idx, "")
                 source_doc_name = doc_name_by_index.get(idx, "")
 
+                # Build core entry used by backend List of Dates UI
                 entry = {
                     "date": date_val,
                     "title": (item.get("title") or "").strip() or "Event",
@@ -1387,6 +1400,11 @@ Example shape: [{{"date":"2026-01-15","title":"Notice Sent","description":"Cease
                     "eventType": (item.get("eventType") or "").strip() or None,
                     "relevance": (item.get("relevance") or "").strip() or None,
                 }
+                # For frontend compatibility: many UIs expect a generic 'source'/'sourceAnswer' field.
+                # Populate these from the resolved document name so UI does not show "N/A".
+                if source_doc_name:
+                    entry["source"] = source_doc_name
+                    entry["sourceAnswer"] = source_doc_name
                 # Drop None/empty so payload is clean; keep description if present
                 entry = {k: v for k, v in entry.items() if v is not None and v != ""}
                 result.append(entry)
@@ -1422,7 +1440,14 @@ Example shape: [{{"date":"2026-01-15","title":"Notice Sent","description":"Cease
             all_docs=all_docs,
             batch_result=batch_result,
         )
-        payload = {"listOfDates": list_of_dates}
+        # Cache before emit so re-emit on reconnect has data even if emit fails (e.g. namespace disconnected)
+        self._workspace_list_of_dates_payload[workspace_id] = list_of_dates
+        # Payload matches backend spec: workspaceId, userId at root and inside payload for storage
+        payload = {
+            "workspaceId": workspace_id,
+            "userId": user_id,
+            "listOfDates": list_of_dates,
+        }
         await self._socket_client.emit(
             "document_feature_response",
             {
@@ -1432,9 +1457,8 @@ Example shape: [{{"date":"2026-01-15","title":"Notice Sent","description":"Cease
                 "payload": payload,
             },
         )
-        self._workspace_list_of_dates_payload[workspace_id] = list_of_dates
         logger.success("✅ List of dates sent to backend ({} entries)", len(list_of_dates))
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.2)  # Allow backend to process before next event
 
     def _strategy_objective_fallback(
         self,
@@ -1497,7 +1521,10 @@ Example shape: [{{"date":"2026-01-15","title":"Notice Sent","description":"Cease
             analysis_report = self._analysis_report_fallback(
                 (workspace_role or "ADJUDICATOR").strip().upper()
             )
-        # Emit outside try/except so it always runs and backend receives it
+        # Cache and set pending re-emit before emit so re-emit on reconnect has data if emit fails
+        self._workspace_analysis_payload[workspace_id] = analysis_report
+        self._pending_reemit_workspace_id = workspace_id
+        self._pending_reemit_user_id = user_id
         await self._socket_client.emit(
             "document_feature_response",
             {
@@ -1507,9 +1534,6 @@ Example shape: [{{"date":"2026-01-15","title":"Notice Sent","description":"Cease
                 "payload": analysis_report,
             },
         )
-        self._workspace_analysis_payload[workspace_id] = analysis_report
-        self._pending_reemit_workspace_id = workspace_id
-        self._pending_reemit_user_id = user_id
         logger.success("✅ Analysis report sent to backend{}", log_context)
         # Brief yield so the socket can flush before caller continues (reduces risk of disconnect before delivery)
         await asyncio.sleep(0.15)
@@ -2527,14 +2551,92 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
     # Connection Events
     # ========================================================================
     
+    async def _do_reemit_after_reconnect(self) -> None:
+        """Re-emit cached document_feature_response payloads for the pending workspace after reconnect.
+        This covers: document_assessments, workspace_metadata, strategy_objective, analysis_report, list_of_dates.
+        Clears pending state so it only runs once per disconnect/reconnect cycle."""
+        if not self._had_disconnect or not self._pending_reemit_workspace_id or not self._socket_client:
+            return
+        workspace_id = self._pending_reemit_workspace_id
+        user_id = self._pending_reemit_user_id or ""
+        self._had_disconnect = False
+        self._pending_reemit_workspace_id = None
+        self._pending_reemit_user_id = None
+        try:
+            # 1) Document assessments (if available)
+            doc_assess = self._workspace_document_assessments_payload.get(workspace_id)
+            if doc_assess:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    doc_assess,
+                )
+                logger.success("✅ Document assessments re-emitted to backend after reconnect")
+                await asyncio.sleep(0.1)
+            # 2) Workspace metadata (if available)
+            metadata = self._workspace_metadata_payload.get(workspace_id)
+            if metadata:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    metadata,
+                )
+                logger.success("✅ Workspace metadata re-emitted to backend after reconnect")
+                await asyncio.sleep(0.1)
+            # 3) Strategy & objectives
+            strategies_result = self._workspace_strategy_payload.get(workspace_id)
+            if strategies_result:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "strategy_objective",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": strategies_result,
+                    },
+                )
+                logger.success("✅ Strategy re-emitted to backend after reconnect")
+                await asyncio.sleep(0.2)
+            # 4) Analysis report
+            analysis_report = self._workspace_analysis_payload.get(workspace_id)
+            if analysis_report:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "analysis_report",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": analysis_report,
+                    },
+                )
+                logger.success("✅ Analysis report re-emitted to backend after reconnect")
+            # 5) List of dates timeline
+            list_of_dates = self._workspace_list_of_dates_payload.get(workspace_id)
+            if list_of_dates is not None:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "list_of_dates",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": {
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "listOfDates": list_of_dates,
+                        },
+                    },
+                )
+                logger.success("✅ List of dates re-emitted to backend after reconnect")
+        except Exception as e:
+            logger.warning("Failed to re-emit after reconnect: {}", e)
+
     async def on_connect(self, data: Any) -> None:
-        """Handle connection event."""
+        """Handle connection event. Re-emit pending document_feature_response if we had disconnected during workspace init."""
         logger.info("Socket connected")
         audit_logger.log_event(
             "socket_connect",
             {"status": "connected"}
         )
-    
+        await self._do_reemit_after_reconnect()
+
     async def on_connected(self, data: Any) -> None:
         """
         Handle 'connected' event from server.
@@ -2547,53 +2649,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
             "socket_connected_confirmed",
             {"status": "confirmed", "data": data}
         )
-        # Re-emit strategy + analysis for last synced workspace if we were disconnected right after emit
-        if self._had_disconnect and self._pending_reemit_workspace_id and self._socket_client:
-            workspace_id = self._pending_reemit_workspace_id
-            user_id = self._pending_reemit_user_id or ""
-            self._had_disconnect = False
-            self._pending_reemit_workspace_id = None
-            self._pending_reemit_user_id = None
-            try:
-                strategies_result = self._workspace_strategy_payload.get(workspace_id)
-                if strategies_result:
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "strategy_objective",
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "payload": strategies_result,
-                        },
-                    )
-                    logger.success("✅ Strategy re-emitted to backend after reconnect")
-                    await asyncio.sleep(0.2)
-                analysis_report = self._workspace_analysis_payload.get(workspace_id)
-                if analysis_report:
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "analysis_report",
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "payload": analysis_report,
-                        },
-                    )
-                    logger.success("✅ Analysis report re-emitted to backend after reconnect")
-                list_of_dates = self._workspace_list_of_dates_payload.get(workspace_id)
-                if list_of_dates is not None:
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "list_of_dates",
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "payload": {"listOfDates": list_of_dates},
-                        },
-                    )
-                    logger.success("✅ List of dates re-emitted to backend after reconnect")
-            except Exception as e:
-                logger.warning("Failed to re-emit after reconnect: {}", e)
+        await self._do_reemit_after_reconnect()
         # Re-emit last ai_response if we disconnected right after sending (so backend receives the chat response)
         if self._had_disconnect and self._pending_ai_response and self._socket_client:
             try:
@@ -2679,6 +2735,9 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 payload.userId,
                 payload.workspaceRole
             )
+            # Set early so re-emit on reconnect works even if socket drops during document_assessments/metadata/strategy/analysis/list_of_dates
+            self._pending_reemit_workspace_id = str(payload.workspaceId)
+            self._pending_reemit_user_id = str(payload.userId)
             
             # STEP 1: Validate role (convert to uppercase for validation)
             workspace_role = payload.workspaceRole.upper() if payload.workspaceRole else "ADJUDICATOR"
@@ -2806,7 +2865,9 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 "document_feature_response",
                                 document_assessment_payload
                             )
-                            logger.success("✅ Document assessments sent to backend")
+                            # Cache for reliable re-emit after reconnect when socket drops mid-workspace_created
+                            self._workspace_document_assessments_payload[payload.workspaceId] = document_assessment_payload
+                            logger.success("✅ Document assessments sent (or cached for re-emit) to backend")
                         except Exception as e:
                             logger.error("Failed to emit document_assessments: {}", e)
 
@@ -2833,7 +2894,9 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                     "document_feature_response",
                                     workspace_metadata_payload
                                 )
-                                logger.success("✅ Workspace metadata sent")
+                                # Cache for reliable re-emit alongside other workspace payloads
+                                self._workspace_metadata_payload[payload.workspaceId] = workspace_metadata_payload
+                                logger.success("✅ Workspace metadata sent (or cached for re-emit)")
                             except Exception as meta_err:
                                 logger.warning("Failed to emit workspace_metadata: {}", str(meta_err))
 
@@ -2863,11 +2926,12 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                     logger.info(f"User ID: {payload.userId}")
                                     logger.info(f"Role: {strategies_result.get('role')}")
                                     logger.info("=" * 80)
+                                    # Cache before emit so re-emit on reconnect has data if emit fails
+                                    self._workspace_strategy_payload[payload.workspaceId] = strategies_result
                                     await self._socket_client.emit(
                                         "document_feature_response",
                                         strategy_feature_payload
                                     )
-                                    self._workspace_strategy_payload[payload.workspaceId] = strategies_result
                                     chips = strategies_result.get("suggestionChips") or []
                                     if chips:
                                         self._workspace_suggestion_chips[payload.workspaceId] = list(chips)
@@ -2922,7 +2986,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                             "featureType": "list_of_dates",
                                             "workspaceId": str(payload.workspaceId),
                                             "userId": str(payload.userId),
-                                            "payload": {"listOfDates": []},
+                                            "payload": {
+                                                "workspaceId": str(payload.workspaceId),
+                                                "userId": str(payload.userId),
+                                                "listOfDates": [],
+                                            },
                                         },
                                     )
                                     self._workspace_list_of_dates_payload[payload.workspaceId] = []
@@ -2971,7 +3039,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                             "featureType": "list_of_dates",
                             "workspaceId": payload.workspaceId,
                             "userId": payload.userId,
-                            "payload": {"listOfDates": []},
+                            "payload": {
+                                "workspaceId": payload.workspaceId,
+                                "userId": payload.userId,
+                                "listOfDates": [],
+                            },
                         },
                     )
                     self._workspace_list_of_dates_payload[payload.workspaceId] = []
@@ -3527,7 +3599,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 "featureType": "list_of_dates",
                                 "workspaceId": workspace_id,
                                 "userId": user_id,
-                                "payload": {"listOfDates": list_of_dates},
+                                "payload": {
+                                    "workspaceId": workspace_id,
+                                    "userId": user_id,
+                                    "listOfDates": list_of_dates,
+                                },
                             },
                         )
                         logger.success("✅ List of dates re-emitted to backend (from cache)")
@@ -3586,7 +3662,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                             "featureType": "list_of_dates",
                             "workspaceId": workspace_id,
                             "userId": user_id,
-                            "payload": {"listOfDates": []},
+                            "payload": {
+                                "workspaceId": workspace_id,
+                                "userId": user_id,
+                                "listOfDates": [],
+                            },
                         },
                     )
                     self._workspace_list_of_dates_payload[workspace_id] = []
@@ -4211,6 +4291,16 @@ Return ONLY a JSON array of 15-16 strings, no other text."""
                             logger.warning("probing_prompts_request: no suggestion chips for workspace {}", workspace_id)
                         count = min(max_prompts, len(chips)) if chips else 0
                         prompts = random.sample(chips, count) if count > 0 else []
+                    # 4) Always return at least generic prompts so UI never gets count=0
+                    if not prompts:
+                        generic = [
+                            "Summarize key points from the documents",
+                            "Explain the main strengths",
+                            "What are the risks or gaps?",
+                            "Suggest next steps",
+                        ]
+                        prompts = generic[:max_prompts]
+                        logger.info("probing_prompts_request: using generic fallback prompts (count={})", len(prompts))
             
             response = {
                 "workspaceId": data.get("workspaceId"),

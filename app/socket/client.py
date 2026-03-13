@@ -168,8 +168,9 @@ class SocketClient:
     
     async def emit(self, event: str, data: Dict[str, Any]) -> None:
         """
-        Emit an event to the server. If socket is disconnected, logs and returns without raising
-        so long-running handlers (e.g. after analysis report generation) do not crash.
+        Emit an event to the server. If socket is disconnected or emit fails (e.g. namespace
+        closed), logs and returns without raising so long-running handlers can cache and re-emit
+        after reconnect.
         """
         if not self.sio or not self._connected:
             logger.warning(
@@ -183,8 +184,17 @@ class SocketClient:
             logger.success(f"✅ Event emitted successfully: {event}")
             logger.debug("Event data: {}", data)
         except Exception as e:
-            logger.error("Failed to emit event {}: {}", event, str(e))
-            raise
+            err_msg = str(e)
+            logger.error("Failed to emit event {}: {}", event, err_msg)
+            # Treat namespace/connection errors as disconnected so callers don't burst-retry
+            if "not a connected namespace" in err_msg or "connection" in err_msg.lower():
+                self._connected = False
+                # So re-emit runs after reconnect even if disconnect event was not fired
+                try:
+                    event_handler._had_disconnect = True
+                except Exception:
+                    pass
+            # Do not raise: allow caller to cache payload and re-emit after reconnect
     
     async def emit_ai_response(self, data: Dict[str, Any]) -> None:
         """

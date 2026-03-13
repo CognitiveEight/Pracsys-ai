@@ -5,6 +5,7 @@ and vector storage.
 import asyncio
 import json
 import re
+import socket
 from typing import Dict, Any, List
 from pathlib import Path
 import httpx
@@ -136,7 +137,7 @@ Document excerpt:
 
 Output only the JSON object, no markdown, no code block, no other text. Example:
 {{"summary": "This document is a complaint letter to the police regarding a hacked social media account.", "evidentiaryStrength": "High"}}"""
-            raw = await gemini_client.generate(prompt, temperature=0.2, max_tokens=600)
+            raw = await gemini_client.generate(prompt, temperature=0.2, max_tokens=800)
             if not raw or "Error" in (raw[:80] or ""):
                 english_fallback = await self._get_english_summary_fallback(extracted_text)
                 return {"summary": english_fallback, "evidentiary_strength": "Medium"}
@@ -178,7 +179,21 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
                 str(e),
                 (raw[:400] if raw else "")
             )
-            # Try to salvage partial summary from truncated JSON (e.g. "Unterminated string")
+            # Try to repair truncated JSON (Unterminated string: close the value string and object)
+            if raw and "Unterminated string" in str(e):
+                try:
+                    # Append closing quote for the summary value and the rest of the object
+                    repaired = raw.rstrip() + "\", \"evidentiaryStrength\": \"Medium\"}"
+                    data = json.loads(repaired)
+                    summary = (data.get("summary") or "").strip()
+                    if summary and len(summary) >= 10:
+                        strength = (data.get("evidentiaryStrength") or "Medium").strip()
+                        if strength not in ("Low", "Medium", "High"):
+                            strength = "Medium"
+                        return {"summary": summary, "evidentiary_strength": strength}
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            # Try to salvage partial summary from truncated JSON
             salvaged = self._salvage_summary_from_truncated_json(raw)
             if salvaged and len(salvaged) >= 25:
                 return {"summary": salvaged, "evidentiary_strength": "Medium"}
@@ -416,7 +431,7 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
             logger.error("{} (filename: {})", msg, filename)
             raise FileProcessingError(msg, details={"filename": filename, "url": clean_url[:200]})
 
-        max_attempts = 3
+        max_attempts = 5  # Extra attempts for transient DNS/network failures (e.g. Errno -3)
         last_error = None
 
         for attempt in range(1, max_attempts + 1):
@@ -452,15 +467,39 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
                     f"Failed to download file: {err_msg}",
                     details={"url": clean_url[:200], "filename": filename, "status_code": status}
                 )
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout, OSError, socket.gaierror) as e:
                 last_error = e
                 err_msg = str(e) or type(e).__name__
-                logger.error("Connection/timeout error downloading {}: {}", filename, err_msg)
-                if attempt < max_attempts:
-                    await asyncio.sleep(2 * attempt)
+                is_dns_temp = (
+                    "name resolution" in err_msg
+                    or "Errno -3" in err_msg
+                    or "Temporary failure" in err_msg
+                    or isinstance(e, socket.gaierror)
+                )
+                # For transient DNS/network issues during intermediate attempts, log as WARNING not ERROR
+                if is_dns_temp and attempt < max_attempts:
+                    logger.warning(
+                        "DNS/network temporary failure downloading {} (attempt {}/{}): {}",
+                        filename,
+                        attempt,
+                        max_attempts,
+                        err_msg,
+                    )
+                else:
+                    logger.error("Connection/timeout error downloading {}: {}", filename, err_msg)
+                if is_dns_temp and attempt < max_attempts:
+                    # Longer backoff for DNS/connection errors (3, 6, 9, 12 sec)
+                    delay = 3 * attempt
+                    await asyncio.sleep(delay)
                     continue
+                if attempt < max_attempts:
+                    # Non-DNS connection issue, still retry with shorter backoff
+                    delay = 2 * attempt
+                    await asyncio.sleep(delay)
+                    continue
+                # Out of retries – raise a clear error
                 raise FileProcessingError(
-                    f"Failed to download file: {err_msg}",
+                    f"Failed to download file due to network/DNS error: {err_msg}",
                     details={"url": clean_url[:200], "filename": filename}
                 )
             except httpx.HTTPError as e:
@@ -474,9 +513,25 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
             except Exception as e:
                 last_error = e
                 err_msg = str(e) or type(e).__name__
-                logger.error("Error downloading {}: {}", filename, err_msg)
+                is_dns_temp = (
+                    "name resolution" in err_msg
+                    or "Errno -3" in err_msg
+                    or "Temporary failure" in err_msg
+                    or isinstance(e, socket.gaierror)
+                )
+                if is_dns_temp and attempt < max_attempts:
+                    logger.warning(
+                        "DNS/network temporary failure (generic) downloading {} (attempt {}/{}): {}",
+                        filename,
+                        attempt,
+                        max_attempts,
+                        err_msg,
+                    )
+                else:
+                    logger.error("Error downloading {}: {}", filename, err_msg)
                 if attempt < max_attempts:
-                    await asyncio.sleep(2 * attempt)
+                    delay = 3 * attempt if is_dns_temp else 2 * attempt
+                    await asyncio.sleep(delay)
                     continue
                 raise FileProcessingError(
                     f"Failed to download file: {err_msg}",

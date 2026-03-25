@@ -25,6 +25,8 @@ class SocketClient:
         self.sio: Optional[socketio.AsyncClient] = None
         self._connected = False
         self._reconnect_task: Optional[asyncio.Task] = None
+        # Used to coordinate short waits during transient disconnects.
+        self._connected_event: asyncio.Event = asyncio.Event()
     
     def _generate_signature(self) -> Optional[str]:
         """
@@ -172,11 +174,34 @@ class SocketClient:
         closed), logs and returns without raising so long-running handlers can cache and re-emit
         after reconnect.
         """
-        if not self.sio or not self._connected:
+        if not self.sio:
             logger.warning(
-                "Socket not connected, skipping emit for event: {} (backend will not receive this payload)",
+                "Socket client not initialized; skipping emit for event: {}",
                 event,
             )
+            return
+
+        # If temporarily disconnected, wait briefly for reconnection.
+        if not self._connected:
+            wait_timeout = getattr(settings, "socket_emit_wait_timeout_seconds", 15.0) or 15.0
+            logger.warning(
+                "Socket not connected; waiting up to {:.1f}s before skipping event: {}",
+                wait_timeout,
+                event,
+            )
+            try:
+                await asyncio.wait_for(self._connected_event.wait(), timeout=wait_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Socket still not connected after {:.1f}s; skipping emit for event: {}",
+                    wait_timeout,
+                    event,
+                )
+                return
+
+        # Now we consider ourselves connected for emitting.
+        if not self._connected:
+            logger.warning("Socket connection state not ready; skipping emit for event: {}", event)
             return
         try:
             logger.info(f"📤 Emitting event: {event}")
@@ -202,11 +227,32 @@ class SocketClient:
         If socket is disconnected, logs and returns without raising so chat handler does not crash.
         After emit, briefly yields so the socket can flush the payload (reduces disconnect-before-delivery).
         """
-        if not self.sio or not self._connected:
+        if not self.sio:
             logger.warning(
-                "Socket not connected, skipping ai_response for chat: {} (user will not see this response)",
+                "Socket client not initialized; skipping ai_response for chat: {}",
                 data.get("chatId"),
             )
+            return
+
+        if not self._connected:
+            wait_timeout = getattr(settings, "socket_emit_wait_timeout_seconds", 15.0) or 15.0
+            logger.warning(
+                "Socket not connected; waiting up to {:.1f}s before skipping ai_response for chat: {}",
+                wait_timeout,
+                data.get("chatId"),
+            )
+            try:
+                await asyncio.wait_for(self._connected_event.wait(), timeout=wait_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Socket still not connected after {:.1f}s; skipping ai_response for chat: {}",
+                    wait_timeout,
+                    data.get("chatId"),
+                )
+                return
+
+        if not self._connected:
+            # Safety check
             return
         try:
             await self.sio.emit(
@@ -264,12 +310,14 @@ class SocketClient:
             logger.info("   - analysis_report_feedback")
             logger.info("📤 Ready to emit: ai_response, probing_prompts_response, document_feature_response")
             self._connected = True
+            self._connected_event.set()
             await event_handler.handle("connect", None)
         
         @self.sio.event
         async def disconnect(reason=None):
             """Handle disconnection event with reason."""
             self._connected = False
+            self._connected_event.clear()
             logger.warning("Socket.IO disconnected")
             if reason:
                 logger.warning("🔴 Disconnect reason: {}", reason)

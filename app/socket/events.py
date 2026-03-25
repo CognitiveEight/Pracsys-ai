@@ -1202,32 +1202,53 @@ No extra text.
             if not gemini_client.model:
                 return []
 
-            prompt = f"""You are a legal case analyst. From the following case documents, extract a chronological list of important dates and events (e.g. agreement signed, payment made, notice sent, reply received, court filing, hearing, deadline).
+            prompt = f"""You are a legal case analyst. From the following case documents, extract a comprehensive chronological list of important dates and events (e.g. agreement signed, payment made, notice sent, reply received, court filing, hearing, deadline).
 
 **Document content** (each document is labeled Document 1, Document 2, etc. with id and name):
 {combined}
 
-**Task**: Output a JSON array of date entries. Each entry must have:
+**Task**:
+1) Build an inventory across ALL provided documents (Document 1..N).
+2) Extract every date-like expression you can find and attach it to the nearest meaningful event/action described near that date.
+3) Output a JSON array of date entries.
+
+Each entry MUST have:
 - "date": string in YYYY-MM-DD format only
-- "title": string, short title for the event (e.g. "FIR Filed", "Notice Sent")
-- "description": string (optional), brief context
-- "sourceDocumentIndex": integer (1-based), which document (1, 2, 3...) this comes from
+- "title": string, short title for the event (e.g. "FIR Filed", "Notice Sent", "Affidavit Filed", "Hearing Date")
+- "description": string (optional), brief context tied to the event/date
+- "sourceDocumentIndex": integer (1-based), which document (1, 2, 3...) the event comes from
 - "pageNumber": integer (optional) if page is known
 - "isIncident": boolean (optional, default true)
 - "eventType": one of "Court Hearing" | "Deadline" | "Meeting" | "Filing" | "Other" (optional)
 - "relevance": one of "High" | "Medium" | "Low" (optional)
 
-Rules:
-- Output ONLY a valid JSON array. No markdown, no code fences, no text before or after.
+Rules (CRITICAL for consistency):
+- Output ONLY a single valid JSON array. No markdown, no code fences, no other text.
 - The first character of your response MUST be [ and the last character MUST be ].
-- Sort by date ascending (oldest first).
-- Use only dates explicitly mentioned or clearly inferable from the text.
-- If no clear dates/events, return exactly: []
+- Inventory completeness: if the documents contain ANY date-like expressions, you MUST NOT return []. You must return the full list of all extractable date-events.
+- Date normalization: output each "date" as YYYY-MM-DD only (convert common formats to YYYY-MM-DD).
+  - If you cannot determine the year, omit only that single entry.
+- Sorting: sort by date ascending (oldest first). For the same date, tie-break by "sourceDocumentIndex" ascending, then by "title" alphabetically.
+- De-duplication: remove exact duplicates only (same date + same title + same sourceDocumentIndex). Otherwise keep distinct events.
+- Return the full array; do not truncate the list of events.
 - Escape quotes inside strings with \\". Keep each title and description to one short phrase (under 80 chars) so the full JSON is not truncated.
 
-Example shape: [{{"date":"2026-01-15","title":"Notice Sent","description":"Cease and desist","sourceDocumentIndex":1,"eventType":"Filing","relevance":"High"}}]
+CASE-SPECIFIC MATERIALITY FILTER (MANDATORY):
+- Include ONLY events that are materially relevant to THIS dispute/case between the parties in the uploaded documents.
+- Focus on the litigation/claim timeline (e.g., purchase, defect discovery, service/repair steps, notices, emails, legal notices, replies, filings, hearings, deadlines, receipt under protest).
+- EXCLUDE generic historical/background chronology that does not affect the current dispute outcome.
+- EXCLUDE company history, founder history, old brand milestones, awards, and other encyclopedic timeline entries unless directly tied to the parties' present claim/defense.
+- If a document is a general article/reference (e.g., encyclopedia/company history), use it only when a date directly supports a pleaded case issue. Otherwise ignore those dates.
+
+WHEN BOTH TYPES EXIST:
+- Prioritize dispute-specific events over background events.
+- If dispute-specific events are present, do NOT include unrelated background/history events in the final output.
+
+Example shape:
+[{{"date":"2026-01-15","title":"Notice Sent","description":"Cease and desist","sourceDocumentIndex":1,"pageNumber":3,"isIncident":true,"eventType":"Filing","relevance":"High"}}]
 """
-            raw = await gemini_client.generate(prompt=prompt, temperature=0.3, max_tokens=12000)
+            # Keep deterministic JSON extraction for timeline completeness.
+            raw = await gemini_client.generate(prompt=prompt, temperature=0.0, max_tokens=12000)
             raw = (raw or "").strip()
             if not raw or raw.startswith("Error"):
                 logger.warning("List of dates: Gemini error or empty response")
@@ -1671,6 +1692,237 @@ Example shape: [{{"date":"2026-01-15","title":"Notice Sent","description":"Cease
             pt = (item.get("point") or "").strip()
             return pt == rv or rv in pt or pt in rv
         return False
+
+    def _parse_bullets_from_block(self, block: str) -> List[str]:
+        """Parse a text block into a list of bullet items."""
+        import re
+
+        if not block:
+            return []
+
+        b = block.strip()
+        # Remove leading label separators sometimes included in copied text
+        b = re.sub(r"^\s*[:\-–]\s*", "", b)
+
+        lines = [ln.strip() for ln in b.splitlines() if ln.strip()]
+        if not lines:
+            return []
+
+        items: List[str] = []
+        for ln in lines:
+            # Remove common bullet/number prefixes
+            ln = re.sub(r"^(?:[-*•]\s+)", "", ln)
+            ln = re.sub(r"^\d+\s*[.)]\s+", "", ln)
+            ln = ln.strip()
+            if not ln:
+                continue
+            # Stop if the next section header accidentally got included
+            if re.match(r"^(?:RESOLVED_MISSING_INFO|REMOVED_WEAKNESSES|REMOVED_RISKS|STRATEGIC_OBJECTIVE_UPDATE)\b", ln, flags=re.I):
+                continue
+            items.append(ln)
+
+        # If the block seems to be comma/semicolon separated (no clear bullet lines), split again.
+        if len(items) <= 1 and ("," in b or ";" in b) and "\n" not in b:
+            parts = [p.strip() for p in re.split(r"[;,]", b) if p.strip()]
+            items = parts
+
+        # De-duplicate while preserving order
+        seen = set()
+        out: List[str] = []
+        for it in items:
+            key = it.lower().strip()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(it)
+        return out
+
+    def _extract_intelligence_chat_panel_updates(
+        self,
+        combined_text: str,
+    ) -> Dict[str, Any]:
+        """
+        Extract user-requested panel mutations from chat text.
+
+        Supported explicit markers:
+        - STRATEGIC_OBJECTIVE_UPDATE:
+        - RESOLVED_MISSING_INFO:
+        - REMOVED_WEAKNESSES:
+        - REMOVED_RISKS:
+        """
+        import re
+
+        text = combined_text or ""
+        if not text.strip():
+            return {}
+
+        # Use case-insensitive, dotall captures. Stop at the next known marker.
+        def _capture(pattern: str) -> Optional[str]:
+            m = re.search(pattern, text, flags=re.I | re.S)
+            return m.group(1).strip() if (m and m.group(1)) else None
+
+        objective_block = _capture(
+            r"(?:STRATEGIC_OBJECTIVE_UPDATE\s*[:=\-]|strategic\s*objective\s*(?:update|change|edit)?\s*(?:to|[:=\-]))\s*(.*?)\s*(?=(?:RESOLVED_MISSING_INFO|REMOVED_WEAKNESSES|REMOVED_RISKS)\b|$)"
+        )
+        missing_block = _capture(
+            r"(?:RESOLVED_MISSING_INFO\s*[:=\-]|missing\s*information\s*[:=\-]|missing\s*info\s*[:=\-])\s*(.*?)\s*(?=(?:REMOVED_WEAKNESSES|REMOVED_RISKS|STRATEGIC_OBJECTIVE_UPDATE|$))"
+        )
+        weaknesses_block = _capture(
+            r"(?:REMOVED_WEAKNESSES\s*[:=\-]|weaknesses?\s*[:=\-])\s*(.*?)\s*(?=(?:REMOVED_RISKS|RESOLVED_MISSING_INFO|STRATEGIC_OBJECTIVE_UPDATE|$))"
+        )
+        risks_block = _capture(
+            r"(?:REMOVED_RISKS\s*[:=\-]|risks?\s*[:=\-])\s*(.*?)\s*(?=(?:REMOVED_WEAKNESSES|RESOLVED_MISSING_INFO|STRATEGIC_OBJECTIVE_UPDATE|$))"
+        )
+
+        updates: Dict[str, Any] = {}
+        if objective_block:
+            updates["strategicObjective"] = objective_block.strip()
+        if missing_block:
+            updates["missingInfo"] = self._parse_bullets_from_block(missing_block)
+        if weaknesses_block:
+            updates["weaknesses"] = self._parse_bullets_from_block(weaknesses_block)
+        if risks_block:
+            updates["risks"] = self._parse_bullets_from_block(risks_block)
+
+        # Require at least one meaningful field to treat as an update request.
+        if not updates:
+            return {}
+
+        # Remove empty lists
+        for k in ("missingInfo", "weaknesses", "risks"):
+            if k in updates and isinstance(updates[k], list) and len(updates[k]) == 0:
+                updates.pop(k, None)
+
+        return updates
+
+    async def _try_apply_intelligence_chat_panel_updates(
+        self,
+        workspace_id: str,
+        user_id: str,
+        combined_text: str,
+    ) -> Dict[str, Any]:
+        """
+        If the chat message includes user panel update markers, apply them to:
+        - strategy_objective.strategicObjective
+        - analysis_report.missingInfo / weaknesses / risks
+        and re-emit updated panels to backend.
+        """
+        if not self._socket_client:
+            return {"applied": False}
+
+        updates = self._extract_intelligence_chat_panel_updates(combined_text)
+        if not updates:
+            return {"applied": False}
+
+        applied_any = False
+        response_parts: List[str] = []
+
+        # 1) Strategy objective update
+        objective_text = updates.get("strategicObjective")
+        if objective_text:
+            current_strategy = self._workspace_strategy_payload.get(workspace_id)
+            if isinstance(current_strategy, dict):
+                current_strategy["strategicObjective"] = objective_text
+                self._workspace_strategy_payload[workspace_id] = current_strategy
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "strategy_objective",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": current_strategy,
+                    },
+                )
+                applied_any = True
+                response_parts.append("Strategic objective updated")
+
+        # 2) Analysis report updates
+        missing_items = updates.get("missingInfo") or []
+        weakness_items = updates.get("weaknesses") or []
+        risk_items = updates.get("risks") or []
+
+        if missing_items or weakness_items or risk_items:
+            current_report = self._workspace_analysis_payload.get(workspace_id)
+            if isinstance(current_report, dict):
+                removed_missing = 0
+                removed_weak = 0
+                removed_risk = 0
+
+                # missingInfo
+                missing_list_key = "missingInfo" if "missingInfo" in current_report else "missing_info"
+                current_missing = current_report.get(missing_list_key) or []
+                if isinstance(current_missing, list):
+                    new_missing = [
+                        x
+                        for x in current_missing
+                        if not any(self._match_rejected_value(x, v) for v in missing_items)
+                    ]
+                    removed_missing = len(current_missing) - len(new_missing)
+                    current_report[missing_list_key] = new_missing
+
+                # weaknesses
+                current_weak = current_report.get("weaknesses") or []
+                if isinstance(current_weak, list):
+                    new_weak = [
+                        x
+                        for x in current_weak
+                        if not any(self._match_rejected_value(x, v) for v in weakness_items)
+                    ]
+                    removed_weak = len(current_weak) - len(new_weak)
+                    current_report["weaknesses"] = new_weak
+
+                # risks
+                current_risk = current_report.get("risks") or []
+                if isinstance(current_risk, list):
+                    new_risk = [
+                        x
+                        for x in current_risk
+                        if not any(self._match_rejected_value(x, v) for v in risk_items)
+                    ]
+                    removed_risk = len(current_risk) - len(new_risk)
+                    current_report["risks"] = new_risk
+
+                removed_any = (removed_missing + removed_weak + removed_risk) > 0
+
+                if removed_any:
+                    old_score = int(current_report.get("caseResolutionScore") or current_report.get("case_resolution_score") or 0)
+                    delta = min(5, max(0, removed_missing * 2 + removed_weak + removed_risk))
+                    if delta < 1:
+                        delta = 1
+
+                    # Cap based on pending items
+                    new_max_allowed = self._analysis_report_max_allowed_score(report=current_report)
+                    new_score = min(new_max_allowed, old_score + delta)
+                    current_report["caseResolutionScore"] = new_score
+
+                    explanation = (current_report.get("qualityScoreExplanation") or current_report.get("quality_score_explanation") or "").strip()
+                    note = (
+                        f" User provided panel updates; removed {removed_missing} missingInfo, "
+                        f"{removed_weak} weaknesses, and {removed_risk} risks from the analysis."
+                    )
+                    current_report["qualityScoreExplanation"] = (explanation + note).strip()
+
+                self._workspace_analysis_payload[workspace_id] = current_report
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "analysis_report",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": current_report,
+                    },
+                )
+                applied_any = True
+                response_parts.append("Analysis report updated")
+
+        return {
+            "applied": applied_any,
+            "response_text": (
+                "; ".join(response_parts)
+                + "." if response_parts
+                else "Workspace updated."
+            ),
+        }
 
     async def _compute_rejection_score_delta(
         self,
@@ -3813,6 +4065,32 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 if cached:
                     workspace_state["chat_attachment"] = cached
                     logger.debug("Using cached chat attachment for follow-up (chat_id={}, {} doc(s))", chat_id, len(cached))
+
+            # -------------------------------------------------------------
+            # INTELLIGENCE CHAT PANEL MUTATIONS (USER-DRIVEN)
+            # If the lawyer sends update markers, apply them immediately
+            # to the cached Strategy/Objectives + Analysis Report and re-emit
+            # updated panels to the backend.
+            # -------------------------------------------------------------
+            update_result = {"applied": False}
+            try:
+                combined_text_for_updates = payload.content or ""
+                # Include attachment text if present (so updates can be pasted into a file)
+                chat_attachment = workspace_state.get("chat_attachment") or []
+                if isinstance(chat_attachment, list) and chat_attachment:
+                    for att in chat_attachment:
+                        if isinstance(att, dict):
+                            combined_text_for_updates += "\n\n" + (att.get("content") or "")
+
+                update_result = await self._try_apply_intelligence_chat_panel_updates(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    combined_text=combined_text_for_updates,
+                )
+                if update_result.get("applied"):
+                    logger.success("✅ Panel updates applied from chat message")
+            except Exception as upd_err:
+                logger.warning("Panel update attempt failed; continuing with generic chat. err={}", str(upd_err))
             
             # STEP 2 & 3: Build chat context with role, document count, uploaded documents, and optional chat attachment
             chat_context = ChatContext(
@@ -3836,6 +4114,12 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 message_id=chat_id,
                 user_message=payload.content,
                 chat_context=chat_context
+            )
+            # If we applied deterministic panel updates, override the chat text
+            response_text_to_emit = (
+                update_result.get("response_text")
+                if isinstance(update_result, dict) and update_result.get("applied")
+                else response.response_text
             )
             processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
             
@@ -3863,7 +4147,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 chatId=chat_id,
                 workspaceId=workspace_id,
                 userId=user_id,
-                content=response.response_text,
+                content=response_text_to_emit,
                 metadata=AIResponseMetadata(
                     messageId=response.message_id,
                     aiModel=settings.gemini_model,
@@ -3894,7 +4178,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     "user_id": user_id,
                     "chat_id": chat_id,
                     "message_length": len(payload.content),
-                    "response_length": len(response.response_text),
+                    "response_length": len(response_text_to_emit),
                     "processing_time_ms": processing_time,
                     "intent": response.detected_intent
                 }

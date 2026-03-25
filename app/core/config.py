@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     socket_reconnection_delay: int = 2000  # ms before first reconnect (avoid tight loop)
     socket_reconnection_delay_max: int = 60000  # ms max delay between reconnects (cap backoff)
     socket_secret_key: Optional[str] = None  # Secret key for HMAC signature (SOCKET_SECRET_KEY env var)
+    # When emitting events, if the socket is temporarily disconnected, wait briefly
+    # for reconnection instead of skipping payloads.
+    socket_emit_wait_timeout_seconds: float = 15.0
     
     # AI Service Authentication
     # Payload for HMAC signature - JSON string of AI user object

@@ -200,6 +200,25 @@ For any user question:
 5) If information is insufficient, say so explicitly
 
 ############################################
+## 6b. INTELLIGENCE CHAT UPDATES (USER-DRIVEN)
+############################################
+If the lawyer wants to MODIFY the Intelligence Panel content using chat (and not just ask a question),
+send the message using the explicit update format below.
+
+This prevents the assistant from treating the content as generic discussion.
+
+Update format (any subset is allowed):
+- `STRATEGIC_OBJECTIVE_UPDATE: <new strategic objective text>`
+- `RESOLVED_MISSING_INFO: <one item or a bullet list>`
+- `REMOVED_WEAKNESSES: <one item or a bullet list>`
+- `REMOVED_RISKS: <one item or a bullet list>`
+
+Guidelines:
+- For bullet lists, use one item per line with `-` or `*` or numbering like `1. ...`
+- Use the exact wording shown in the Intelligence Panel where possible.
+- If you do NOT use these markers, the message will be treated as a generic chat request (no panel mutation).
+
+############################################
 ## 7. ROLE CHANGE
 ############################################
 

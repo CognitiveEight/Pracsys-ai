@@ -49,11 +49,16 @@ class ReadabilityScorer:
                 "readable": False
             }
         
-        # Calculate component scores
-        extraction_score = self._score_extraction(extracted_text, metadata, original_size)
-        content_score = self._score_content(extracted_text)
-        structure_score = self._score_structure(extracted_text, metadata)
-        quality_score = self._score_quality(extracted_text)
+        # Normalize text for scoring only.
+        # OCR/PDF text can include common mojibake sequences like "youâre" which
+        # should not penalize readability.
+        normalized_text = self._normalize_text_for_scoring(extracted_text)
+
+        # Calculate component scores (on normalized text)
+        extraction_score = self._score_extraction(normalized_text, metadata, original_size)
+        content_score = self._score_content(normalized_text)
+        structure_score = self._score_structure(normalized_text, metadata)
+        quality_score = self._score_quality(normalized_text)
         
         # Weighted total score
         total_score = (
@@ -62,6 +67,15 @@ class ReadabilityScorer:
             structure_score * 0.20 +
             quality_score * 0.10
         )
+
+        # Calibration: if the text is clearly usable (long enough, good encoding),
+        # OCR often lacks perfect paragraphing. In that case, we should reflect
+        # the real-world usability with a higher score.
+        if extraction_score >= 70 and content_score >= 65 and quality_score >= 70:
+            if structure_score >= 40:
+                total_score = max(total_score, 90.0)
+            elif structure_score >= 25:
+                total_score = max(total_score, 85.0)
         
         result = {
             "total_score": round(total_score, 2),
@@ -72,9 +86,9 @@ class ReadabilityScorer:
             "readable": total_score >= 50,
             "rating": self._get_rating(total_score),
             "details": {
-                "character_count": len(extracted_text),
-                "word_count": len(extracted_text.split()),
-                "line_count": len(extracted_text.split('\n')),
+                "character_count": len(normalized_text),
+                "word_count": len(normalized_text.split()),
+                "line_count": len(normalized_text.split('\n')),
                 "format": metadata.get("format", "unknown")
             }
         }
@@ -124,6 +138,26 @@ class ReadabilityScorer:
         
         return min(score, 100.0)
     
+    def _normalize_text_for_scoring(self, text: str) -> str:
+        """Normalize extracted text for *scoring* heuristics."""
+        if not text:
+            return ""
+
+        t = text.replace("\r\n", "\n").replace("\r", "\n")
+
+        # Fix common UTF-8 mojibake patterns coming from PDF/OCR.
+        # Example: "youâre" -> "you're"
+        t = t.replace("â", "'").replace("â€™", "'").replace("â€˜", "'")
+        t = t.replace("â€œ", '"').replace("â€�", '"').replace("â€", '"')
+        t = t.replace("â€”", "-").replace("â€“", "-")
+
+        # Collapse excessive whitespace but keep newlines for structure scoring.
+        # Avoid changing content too aggressively; only trim line-level spaces.
+        t = "\n".join(line.strip() for line in t.split("\n"))
+        t = re.sub(r"[ \t]+", " ", t)
+        t = re.sub(r"\n{3,}", "\n\n", t)
+        return t.strip()
+
     def _score_content(self, text: str) -> float:
         """
         Score content quality (0-100).
@@ -179,8 +213,11 @@ class ReadabilityScorer:
         
         score = 0.0
         
-        # Paragraph breaks
-        paragraphs = [p for p in text.split('\n\n') if p.strip()]
+        # Paragraph breaks (support OCR where paragraphs are separated by
+        # multiple newlines, whitespace-only lines, or just a few blank lines).
+        paragraphs = [p for p in re.split(r'\n\s*\n+', text) if p.strip()]
+        line_count = len(text.splitlines())
+
         if len(paragraphs) > 5:
             score += 40
         elif len(paragraphs) > 2:
@@ -188,6 +225,15 @@ class ReadabilityScorer:
         elif len(paragraphs) > 1:
             score += 20
         else:
+            score += 10
+
+        # If OCR kept text on many lines (even without blank line paragraphs),
+        # treat that as a sign of structure/legibility.
+        if line_count >= 40:
+            score += 25
+        elif line_count >= 20:
+            score += 18
+        elif line_count >= 10:
             score += 10
         
         # Headers (markdown style or numbered)

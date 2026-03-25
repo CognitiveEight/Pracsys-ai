@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     # Google Cloud Platform
     google_application_credentials: Optional[str] = None
     gcp_project_id: Optional[str] = None
+    # Optional: use an API key for Vision OCR instead of service-account credentials.
+    # Environment variable supported: GOOGLE_CLOUD_VISION_API_KEY
+    google_cloud_vision_api_key: Optional[str] = None
     google_cse_id: Optional[str] = None
     
     # Vector Store (Qdrant)

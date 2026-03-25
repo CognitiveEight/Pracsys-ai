@@ -204,6 +204,21 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
             english_fallback = await self._get_english_summary_fallback(extracted_text)
             return {"summary": english_fallback, "evidentiary_strength": "Medium"}
     
+    def _infer_format_from_filename(self, filename: str) -> str:
+        """Infer a coarse format type used by readability scoring."""
+        suffix = Path(filename or "").suffix.lower().lstrip(".")
+        if not suffix:
+            return "unknown"
+        if suffix in {"jpg", "jpeg", "png", "gif", "bmp", "webp"}:
+            return "image"
+        if suffix in {"pdf"}:
+            return "pdf"
+        if suffix in {"doc", "docx", "rtf"}:
+            return "doc"
+        if suffix in {"txt", "md"}:
+            return "text"
+        return suffix
+    
     @tracer.trace("process_document")
     async def process_document(
         self,
@@ -246,7 +261,11 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
             extraction_metadata = {
                 "extraction_method": "gcp_vision" if any(ext in filename.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp']) else "direct",
                 "has_errors": extracted_text.startswith("[Error") or extracted_text.startswith("["),
-                "text_length": len(extracted_text)
+                "text_length": len(extracted_text),
+                # Readability scorer expects these fields (it uses them for extraction_score).
+                "character_count": len(extracted_text),
+                "word_count": len(extracted_text.split()),
+                "format": self._infer_format_from_filename(filename)
             }
             
             # Calculate readability score

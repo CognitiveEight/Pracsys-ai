@@ -256,13 +256,13 @@ class SocketEventHandler:
 
 **Task**: Based on the document content above, provide:
 
-1. **Case Summary** (5-6 sentences): A clear summary of what this case is about, including key facts, parties involved, and the legal issues.
+1. **Case Summary** (5-6 sentences): Start EXACTLY with the phrase: **"This case is about..."**. Include the parties (as named in documents), core legal issues, and 2-4 case-specific facts (dates/events/agreements/communications). Keep it scannable for a lawyer.
 
-2. **Strategic Objective** (5-6 sentences): A specific, actionable objective that outlines the best course of action for someone in the {workspace_role} role.
+2. **Strategic Objective** (5-6 sentences): Write a role-tailored strategic objective for the **{workspace_role}** perspective. It must reference: (a) the strongest facts from the documents, (b) the legal issues, (c) practical priority order (what to do first), and (d) how evidence/timeline supports or limits the objective.
 
-3. **Detailed Recommendations** (3-4 bullet points): Specific steps or considerations based on the case facts.
+3. **Detailed Recommendations** (3-5 bullet points): Distinct strategic outcomes or legal courses of action tied to the documents and legal issues. Each bullet should be concrete and include a legal basis reference using Indian statutes (BNS/BNSS/BSA/IT Act, etc.). Avoid generic advice.
 
-4. **Possible Next Steps** (3-5 bullet points): Immediate, actionable next steps that should be taken right away. These should be concrete, specific actions that can be executed immediately (e.g., "File FIR at local police station", "Preserve digital evidence", "Contact legal counsel", "Gather witness statements"). Focus on immediate actions rather than long-term strategy.
+4. **Possible Next Steps** (3-5 bullet points): Immediate, executable actions for right away. Keep them concrete (who/what to do). Prefer steps that preserve evidence, clarify missing facts, and move the case forward procedurally for the selected role.
 
 **Format your response as JSON**:
 {{
@@ -273,14 +273,14 @@ class SocketEventHandler:
 }}
 
 **Important**: 
-- Be specific to the case facts in the documents
-- Use Indian legal terminology appropriately
-- Reference BNS (Bharatiya Nyaya Sanhita) sections, NOT IPC (Indian Penal Code is replaced)
-- Reference BNSS (Bharatiya Nagarik Suraksha Sanhita) for procedural matters, NOT CrPC
-- Reference BSA (Bharatiya Sakshya Adhiniyam) for evidence matters, NOT Indian Evidence Act
-- For IT Act, continue using Information Technology Act, 2000 sections as it's still in force
-- Make recommendations actionable and role-specific
-- If documents don't contain enough information, acknowledge that and provide general guidance
+- Be specific to the case facts in the documents. Do NOT invent facts.
+- Use Indian legal terminology appropriately.
+- Reference BNS (Bharatiya Nyaya Sanhita) sections, NOT IPC (Indian Penal Code is replaced).
+- Reference BNSS (Bharatiya Nagarik Suraksha Sanhita) for procedural matters, NOT CrPC.
+- Reference BSA (Bharatiya Sakshya Adhiniyam) for evidence matters, NOT Indian Evidence Act.
+- For IT Act, continue using Information Technology Act, 2000 sections as it's still in force.
+- Make recommendations and next steps actionable and role-specific.
+- If documents do not contain enough information, explicitly state the limitation in caseSummary/strategicObjective (do not guess).
 - **If the documents appear unrelated** (different cases, different matters, or no clear connection), base your analysis ONLY on **Document N (the most recently uploaded)** and ignore the others. Otherwise base your analysis on all documents combined."""
 
             try:
@@ -293,9 +293,9 @@ DOCUMENT CONTENT:
 YOUR ROLE: {workspace_role}
 
 TASK:
-1. Case summary (5-6 sentences with key facts and parties)
-2. Strategic objective (5-6 sentences specific to {workspace_role})
-3. Four actionable recommendations
+1. Case summary (5-6 sentences ; MUST start with "This case is about...")
+2. Strategic objective (5-6 sentences ; role-specific for {workspace_role})
+3. 3-5 recommendations (distinct strategic outcomes / courses of action, each tied to legal basis)
 4. Possible next steps (3-5 immediate, concrete actions that should be taken right away)
 
 LEGAL FRAMEWORK (CRITICAL):
@@ -309,13 +309,12 @@ UNRELATED DOCUMENTS: If the documents appear to be from different cases or unrel
 OUTPUT (JSON only, complete all fields):
 ```json
 {{
-  "caseSummary": "Concise summary with facts, parties, and key issues",
-  "strategicObjective": "Clear objective tailored for {workspace_role} role",
+  "caseSummary": "This case is about... (facts, parties, core legal issues)",
+  "strategicObjective": "Role-tailored strategic objective for {workspace_role} (facts, priorities, evidence support/limits)",
   "recommendations": [
-    "Specific action 1 citing BNS/BNSS sections",
-    "Specific action 2 with legal basis",
-    "Specific action 3 with procedural steps",
-    "Specific action 4 with strategic outcome"
+    "Distinct strategic outcome 1 tied to facts + legal basis (BNS/BNSS/BSA/IT Act etc.)",
+    "Distinct strategic outcome 2 tied to facts + legal basis (BNS/BNSS/BSA/IT Act etc.)",
+    "Distinct strategic outcome 3 tied to facts + legal basis (BNS/BNSS/BSA/IT Act etc.)"
   ],
   "possibleNextSteps": [
     "Immediate action 1 (e.g., File FIR, Preserve evidence)",
@@ -333,7 +332,7 @@ OUTPUT (JSON only, complete all fields):
 
 suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words each) specific to this case and role. Examples: "Review Title Deeds", "Map Legal Heirs", "Draft Demand Notice", "File FIR", "Preserve Digital Evidence". No full sentences. Provide 15-16 varied chips.
 
-CRITICAL: Output complete, valid JSON only. Do not truncate; close every string with \", close every array with ], and make sure the root JSON object is fully closed. Keep caseSummary and strategicObjective under 800 characters each so the full JSON fits in one response."""
+CRITICAL: Output complete, valid JSON only. Do not truncate; close every string with \", close every array with ], and make sure the root JSON object is fully closed. Keep caseSummary and strategicObjective under 1200 characters each so the full JSON fits in one response. Ensure caseSummary starts exactly with "This case is about..."."""
                 custom_suffix = build_custom_instruction_suffix(workspace_id)
                 if custom_suffix:
                     structured_prompt = structured_prompt.rstrip() + "\n\n" + custom_suffix

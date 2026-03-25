@@ -78,43 +78,43 @@ class FileProcessor:
             return "[Image content - GCP Vision API not available]"
         
         try:
-            # Set up authentication if credentials path is provided
             from app.core.config import settings
             import os
-            
-            if settings.google_application_credentials and os.path.exists(settings.google_application_credentials):
-                os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = settings.google_application_credentials
-                logger.debug(f"Set GOOGLE_APPLICATION_CREDENTIALS: {settings.google_application_credentials}")
-            
-            # Initialize the GCP Vision client
-            client = vision.ImageAnnotatorClient()
-            
-            # Create image object from bytes
+            from google.auth.api_key import Credentials as ApiKeyCredentials
+
+            # Vision OCR uses API key only (no service-account credentials).
+            api_key_value = (
+                (getattr(settings, "google_cloud_vision_api_key", None) or "")
+                or os.getenv("GOOGLE_CLOUD_VISION_API_KEY")
+                or ""
+            ).strip()
+            if not api_key_value:
+                logger.error("Google Vision API key not configured. Set GOOGLE_CLOUD_VISION_API_KEY.")
+                return "[Error: Vision API key not configured (set GOOGLE_CLOUD_VISION_API_KEY)]"
+
+            api_credentials = ApiKeyCredentials(api_key_value)
+            client = vision.ImageAnnotatorClient(credentials=api_credentials)
+
             image = vision.Image(content=image_data)
-            
-            # Perform text detection
             response = client.text_detection(image=image)
-            texts = response.text_annotations
-            
             if response.error.message:
-                raise Exception(f'GCP Vision API error: {response.error.message}')
-            
-            # Extract the full text (first annotation contains all detected text)
+                raise Exception(f"GCP Vision API error: {response.error.message}")
+
+            texts = response.text_annotations
             if texts:
                 extracted_text = texts[0].description
-                logger.success(f"Extracted {len(extracted_text)} characters from image")
+                logger.success(f"Extracted {len(extracted_text)} characters from image using API key")
                 return extracted_text.strip()
-            else:
-                logger.warning("No text detected in image")
-                return "[No text detected in image]"
-                
-        except DefaultCredentialsError as e:
-            logger.error(f"GCP authentication error: {str(e)}")
-            return "[Error: GCP credentials not configured. Please set GOOGLE_APPLICATION_CREDENTIALS environment variable]"
+
+            logger.warning("No text detected in image")
+            return "[No text detected in image]"
+
         except Exception as e:
             logger.error(f"Error extracting text from image: {str(e)}")
             return f"[Error extracting text from image: {str(e)}]"
-    
+
+    # Service-account OCR auth helpers removed (API key only).
+
     @staticmethod
     def extract_text_from_pdf(pdf_data: bytes) -> str:
         """Extract text from PDF file using text extraction and OCR for image-based PDFs."""

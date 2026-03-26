@@ -3,6 +3,7 @@ Socket.IO event handlers with Intelligence Chat Agent integration.
 Updated to match backend Socket.IO specification.
 """
 import asyncio
+import time
 from typing import Dict, Any, Callable, Awaitable, Optional, List
 from loguru import logger
 from datetime import datetime
@@ -72,6 +73,9 @@ class SocketEventHandler:
         self._chat_attachment_by_chat: Dict[str, List[Dict[str, Any]]] = {}
         # Last ai_response payload; re-emit after reconnect when socket dropped right after emit so backend receives it
         self._pending_ai_response: Optional[Dict[str, Any]] = None
+        # De-dup guard for replayed workspace_sync events (e.g., reconnect replay).
+        # workspace_id -> {"fingerprint": str, "ts": float}
+        self._last_workspace_sync_fingerprint: Dict[str, Dict[str, Any]] = {}
         self._register_default_handlers()
     
     def set_socket_client(self, client):
@@ -3362,6 +3366,55 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
 
             # Validate and parse payload
             payload = WorkspaceSyncPayload(**data)
+
+            # -----------------------------------------------------------------
+            # Idempotency guard: skip duplicate/replayed workspace_sync payloads.
+            # This prevents duplicate strategy/analysis/list generation when
+            # the same sync event is replayed around reconnect.
+            # -----------------------------------------------------------------
+            try:
+                import json
+                workspace_id_for_fp = str(payload.workspaceId)
+                file_facts = []
+                for f in (payload.evidenceFiles or []):
+                    fid = str(getattr(f, "id", "") or "")
+                    file_facts.append(
+                        {
+                            "id": fid,
+                            "isDeleted": bool(getattr(f, "isDeleted", False) or getattr(f, "is_deleted", False)),
+                            "uploadedAt": str(getattr(f, "uploadedAt", "") or ""),
+                        }
+                    )
+                file_facts.sort(key=lambda x: (x.get("id") or "", x.get("uploadedAt") or ""))
+                fp_obj = {
+                    "workspaceId": workspace_id_for_fp,
+                    "updatedAt": str(payload.updatedAt or ""),
+                    "deletedDocumentIds": sorted([str(x) for x in (payload.deletedDocumentIds or [])]),
+                    "files": file_facts,
+                    "workspaceRole": str(payload.workspaceRole or ""),
+                    "title": str(payload.title or ""),
+                    "status": str(payload.status or ""),
+                }
+                fingerprint = json.dumps(fp_obj, sort_keys=True, default=str)
+                now_ts = time.time()
+                last = self._last_workspace_sync_fingerprint.get(workspace_id_for_fp)
+                # 180s window to avoid replay duplicates while still allowing real updates.
+                if (
+                    last
+                    and last.get("fingerprint") == fingerprint
+                    and (now_ts - float(last.get("ts") or 0.0)) < 180.0
+                ):
+                    logger.info(
+                        "Skipping duplicate/replayed workspace_sync for workspace {} (fingerprint matched within 180s)",
+                        workspace_id_for_fp,
+                    )
+                    return
+                self._last_workspace_sync_fingerprint[workspace_id_for_fp] = {
+                    "fingerprint": fingerprint,
+                    "ts": now_ts,
+                }
+            except Exception as fp_err:
+                logger.debug("workspace_sync idempotency guard skipped due to fingerprint error: {}", fp_err)
 
             # Update custom instructions if provided (structure, tone, description)
             custom = (data or {}).get("customInstructions") or {}

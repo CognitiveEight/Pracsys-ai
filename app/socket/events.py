@@ -3562,6 +3562,39 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     if file_id:
                         file_dict["_id"] = file_id
                     files_to_process.append(file_dict)
+
+                # Prevent duplicate processing on delete syncs/reconnect:
+                # keep only files that are NOT already present in vector store.
+                # (If a file already exists and wasn't changed, processing it again causes
+                # duplicate strategy/analysis/list-of-dates regeneration.)
+                try:
+                    from app.vectorstore.qdrant import vector_store
+                    existing_docs_after_sync = await vector_store.get_all_documents(
+                        workspace_id=payload.workspaceId
+                    )
+                    existing_ids_after_sync = {
+                        str(d.get("document_id"))
+                        for d in (existing_docs_after_sync or [])
+                        if d.get("document_id")
+                    }
+                    original_count = len(files_to_process)
+                    filtered_files = []
+                    for f in files_to_process:
+                        fid = str(f.get("_id") or f.get("id") or "").strip()
+                        # If file id is known and already in vector store, skip re-processing.
+                        if fid and fid in existing_ids_after_sync:
+                            continue
+                        filtered_files.append(f)
+                    files_to_process = filtered_files
+                    if original_count != len(files_to_process):
+                        logger.info(
+                            "Filtered {} already-indexed file(s) from sync batch; remaining to process: {}",
+                            original_count - len(files_to_process),
+                            len(files_to_process),
+                        )
+                except Exception as dedupe_err:
+                    logger.debug("Could not de-duplicate sync files against vector store: {}", dedupe_err)
+
                 if not files_to_process:
                     logger.info("No new/updated evidence files to process (all skipped or empty list)")
                 else:

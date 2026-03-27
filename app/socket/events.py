@@ -946,6 +946,27 @@ No extra text.
                             )
                         except json.JSONDecodeError:
                             pass
+                if data is None and getattr(e, "pos", None):
+                    # Fallback salvage: trim to last complete token boundary and close containers.
+                    partial = json_str[: e.pos].rstrip()
+                    while partial and partial[-1] not in [",", "}", "]"]:
+                        partial = partial[:-1].rstrip()
+                    partial = partial.rstrip(",")
+                    if partial:
+                        open_brackets = partial.count("[") - partial.count("]")
+                        open_braces = partial.count("{") - partial.count("}")
+                        if open_brackets > 0:
+                            partial += "]" * open_brackets
+                        if open_braces > 0:
+                            partial += "}" * open_braces
+                        try:
+                            data = json.loads(partial)
+                            logger.info(
+                                "Salvaged analysis report JSON from partial response (pos={})",
+                                e.pos,
+                            )
+                        except json.JSONDecodeError:
+                            pass
                 if data is None:
                     logger.warning("Analysis report JSON parse error: {}; using fallback", e)
                     return self._analysis_report_fallback(role)

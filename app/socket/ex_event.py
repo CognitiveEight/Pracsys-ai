@@ -16,6 +16,7 @@ from app.socket.schemas import (
 )
 from app.workspace.manager import workspace_manager
 from app.workspace.custom_instructions import set_custom_instructions, build_custom_instruction_suffix
+from app.prompts.legal_intelligence_system import get_legal_intelligence_system_instruction
 from app.observability.audit import audit_logger
 from app.utils.exceptions import SocketEventError
 from app.langgraph.integration import workspace_role_integration
@@ -68,6 +69,14 @@ class SocketEventHandler:
         """Set the socket client for emitting responses."""
         self._socket_client = client
         logger.debug("Socket client registered with event handler")
+
+    def _get_generation_system_instruction(self, workspace_role: Optional[str]) -> str:
+        """Use one consistent legal system instruction across intelligence generations."""
+        return get_legal_intelligence_system_instruction(
+            current_role=(workspace_role or "").strip().upper() or None,
+            documents_uploaded=True,
+            role_confirmed=True,
+        )
     
     def _register_default_handlers(self) -> None:
         """Register default event handlers."""
@@ -140,7 +149,8 @@ class SocketEventHandler:
         """
         Generate detailed, document-specific strategies and objectives using AI analysis.
         Uses ALL documents currently in the workspace (from vector store), in upload order.
-        When documents are unrelated, AI is instructed to base strategy on the latest document only.
+        If documents include multiple matters, the model is instructed to call out ambiguity
+        and prioritize the dominant evidence-backed dispute.
 
         Args:
             workspace_id: Workspace identifier
@@ -179,9 +189,14 @@ class SocketEventHandler:
             except Exception as vector_error:
                 logger.warning(f"Could not retrieve documents from vector store: {vector_error}")
 
-            # Build combined content: label documents by order so AI can use "latest" when unrelated
+            # Build combined content with a fair per-document cap so all documents are represented.
             parts = []
-            document_labels = []
+            valid_docs = [
+                d for d in all_docs
+                if (d.get("content") or "").strip() and len((d.get("content") or "").strip()) >= 20
+            ]
+            max_total_content = 100000
+            per_doc_cap = (max_total_content // max(1, len(valid_docs))) if valid_docs else max_total_content
             if not all_docs:
                 combined_document_content = "No document content available."
             else:
@@ -190,24 +205,18 @@ class SocketEventHandler:
                     if not content or len(content) < 20:
                         continue
                     label = f"Document {i} (most recently uploaded)" if i == len(all_docs) else f"Document {i}"
-                    document_labels.append(label)
+                    if len(content) > per_doc_cap:
+                        content = content[:per_doc_cap] + "\n[... truncated for length ...]"
                     parts.append(f"--- {label} ---\n{content}")
                 combined_document_content = "\n\n".join(parts) if parts else "No document content available."
-
-            # Truncate if too long (Gemini has token limits), keep last document if multiple
-            max_content_length = 12000
-            if parts and len(combined_document_content) > max_content_length:
-                latest_content = parts[-1]
-                earlier = "\n\n".join(parts[:-1]) if len(parts) > 1 else ""
-                if len(earlier) + len(latest_content) > max_content_length:
-                    keep_earlier = max(0, max_content_length - len(latest_content) - 200)
-                    combined_document_content = (earlier[:keep_earlier] + "...\n\n" if keep_earlier else "") + latest_content
-                else:
-                    combined_document_content = earlier + ("\n\n" + latest_content if earlier else latest_content)
-                logger.info(f"Truncated combined content to ~{max_content_length} characters (keeping latest document)")
-            elif len(combined_document_content) > max_content_length:
-                combined_document_content = combined_document_content[:max_content_length] + "..."
-                logger.info(f"Truncated document content to {max_content_length} characters")
+            if len(combined_document_content) > max_total_content:
+                combined_document_content = combined_document_content[:max_total_content] + "\n[... content truncated ...]"
+                logger.info(
+                    "Strategy generation content truncated to ~{} chars ({} docs, ~{} chars each)",
+                    max_total_content,
+                    len(valid_docs),
+                    per_doc_cap,
+                )
 
             # When no documents (e.g. all deleted), return fallback so backend can clear strategy / show empty state
             doc_count = len(all_docs)
@@ -220,7 +229,6 @@ class SocketEventHandler:
                     "isEmpty": True,
                     "caseSummary": "",
                     "strategicObjective": "",
-                    "recommendations": [],
                     "possibleNextSteps": [],
                     "suggestionChips": [],
                     "analysis": {
@@ -250,15 +258,12 @@ class SocketEventHandler:
 
 2. **Strategic Objective** (5-6 sentences): A specific, actionable objective that outlines the best course of action for someone in the {workspace_role} role.
 
-3. **Detailed Recommendations** (3-4 bullet points): Specific steps or considerations based on the case facts.
-
-4. **Possible Next Steps** (3-5 bullet points): Immediate, actionable next steps that should be taken right away. These should be concrete, specific actions that can be executed immediately (e.g., "File FIR at local police station", "Preserve digital evidence", "Contact legal counsel", "Gather witness statements"). Focus on immediate actions rather than long-term strategy.
+3. **Possible Next Steps** (3-5 bullet points): Immediate, actionable next steps that should be taken right away. These should be concrete, specific actions that can be executed immediately (e.g., "File FIR at local police station", "Preserve digital evidence", "Contact legal counsel", "Gather witness statements"). Focus on immediate actions rather than long-term strategy.
 
 **Format your response as JSON**:
 {{
   "caseSummary": "...",
   "strategicObjective": "...",
-  "recommendations": ["...", "...", "..."],
   "possibleNextSteps": ["...", "...", "...", "..."]
 }}
 
@@ -269,9 +274,9 @@ class SocketEventHandler:
 - Reference BNSS (Bharatiya Nagarik Suraksha Sanhita) for procedural matters, NOT CrPC
 - Reference BSA (Bharatiya Sakshya Adhiniyam) for evidence matters, NOT Indian Evidence Act
 - For IT Act, continue using Information Technology Act, 2000 sections as it's still in force
-- Make recommendations actionable and role-specific
+- Make next steps actionable and role-specific
 - If documents don't contain enough information, acknowledge that and provide general guidance
-- **If the documents appear unrelated** (different cases, different matters, or no clear connection), base your analysis ONLY on **Document N (the most recently uploaded)** and ignore the others. Otherwise base your analysis on all documents combined."""
+- If documents seem to include multiple matters, explicitly call out the split and focus your output on the dominant dispute supported by strongest evidence."""
 
             try:
                 # Improved prompt for better JSON generation
@@ -285,8 +290,7 @@ YOUR ROLE: {workspace_role}
 TASK:
 1. Case summary (5-6 sentences with key facts and parties)
 2. Strategic objective (5-6 sentences specific to {workspace_role})
-3. Four actionable recommendations
-4. Possible next steps (3-5 immediate, concrete actions that should be taken right away)
+3. Possible next steps (3-5 immediate, concrete actions that should be taken right away)
 
 LEGAL FRAMEWORK (CRITICAL):
 - Use BNS (Bharatiya Nyaya Sanhita) - NOT IPC
@@ -294,19 +298,13 @@ LEGAL FRAMEWORK (CRITICAL):
 - Use BSA (Bharatiya Sakshya Adhiniyam) - NOT Evidence Act
 - IT Act 2000 remains valid
 
-UNRELATED DOCUMENTS: If the documents appear to be from different cases or unrelated matters, base your analysis ONLY on the last document (labeled "most recently uploaded"). Otherwise use all documents combined.
+MULTIPLE MATTERS: If documents appear to include multiple matters, explicitly mention ambiguity and focus your output on the dominant dispute supported by strongest evidence.
 
 OUTPUT (JSON only, complete all fields):
 ```json
 {{
   "caseSummary": "Concise summary with facts, parties, and key issues",
   "strategicObjective": "Clear objective tailored for {workspace_role} role",
-  "recommendations": [
-    "Specific action 1 citing BNS/BNSS sections",
-    "Specific action 2 with legal basis",
-    "Specific action 3 with procedural steps",
-    "Specific action 4 with strategic outcome"
-  ],
   "possibleNextSteps": [
     "Immediate action 1 (e.g., File FIR, Preserve evidence)",
     "Immediate action 2 (e.g., Contact relevant authority)",
@@ -329,8 +327,9 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
                     structured_prompt = structured_prompt.rstrip() + "\n\n" + custom_suffix
                 ai_response = await gemini_client.generate(
                     prompt=structured_prompt,
+                    system_instruction=self._get_generation_system_instruction(workspace_role),
                     temperature=0.4,  # Lower temperature for more structured output
-                    max_tokens=12000  # Allow full recommendations/nextSteps without truncation
+                    max_tokens=12000  # Allow full nextSteps without truncation
                 )
                 
                 logger.info(f"AI generated {len(ai_response)} characters of analysis")
@@ -404,7 +403,6 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
                         
                         case_summary = analysis_data.get("caseSummary", "")
                         strategic_objective = analysis_data.get("strategicObjective", "")
-                        recommendations = analysis_data.get("recommendations", [])
                         possible_next_steps = analysis_data.get("possibleNextSteps") or analysis_data.get("possible_next_steps") or []
                         if isinstance(possible_next_steps, str):
                             possible_next_steps = [possible_next_steps] if possible_next_steps else []
@@ -415,11 +413,10 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
                         suggestion_chips = [str(s).strip() for s in suggestion_chips if s][:16]
                         
                         # Validate we got meaningful content
-                        if case_summary and strategic_objective and recommendations:
+                        if case_summary and strategic_objective:
                             logger.success("✅ AI analysis completed successfully")
                             logger.info(f"   - Case Summary: {len(case_summary)} chars")
                             logger.info(f"   - Strategic Objective: {len(strategic_objective)} chars")
-                            logger.info(f"   - Recommendations: {len(recommendations)} items")
                             logger.info(f"   - Possible Next Steps: {len(possible_next_steps)} items")
                             logger.info(f"   - Suggestion chips: {len(suggestion_chips)} items")
                         else:
@@ -429,13 +426,6 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
                                 case_summary = f"Legal matter for {workspace_role} role based on {doc_count} document(s). The documents have been analyzed and contain important case information."
                             if not strategic_objective:
                                 strategic_objective = "Conduct a comprehensive legal review to determine the optimal course of action based on the available evidence and applicable BNS provisions."
-                            if not recommendations or len(recommendations) < 3:
-                                recommendations = recommendations + [
-                                    "Review all documentary evidence thoroughly",
-                                    "Analyze applicable BNS and BNSS provisions",
-                                    "Assess evidence strength under BSA",
-                                    "Develop detailed action plan"
-                                ][:4]  # Ensure we have at least 4
                             if not possible_next_steps or len(possible_next_steps) < 3:
                                 possible_next_steps = possible_next_steps + [
                                     "Review all uploaded documents immediately",
@@ -462,49 +452,29 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
                         # Handle cases where string values are incomplete (no closing quote)
                         case_summary_match = re.search(r'"caseSummary"\s*:\s*"([^"]*)', json_str)
                         objective_match = re.search(r'"strategicObjective"\s*:\s*"([^"]*)', json_str)
-                        recommendations_match = re.findall(r'"([^"]+)"\s*(?:,|\])', json_str)
-                        
                         if case_summary_match or objective_match:
                             logger.info("✅ Extracted partial data from malformed JSON")
                             case_summary = case_summary_match.group(1) if case_summary_match else ""
                             strategic_objective = objective_match.group(1) if objective_match else ""
                             
-                            # Extract recommendations and possible next steps from the partial JSON
-                            recommendations = []
+                            # Extract possible next steps from the partial JSON
                             possible_next_steps = []
                             suggestion_chips = []
-                            if recommendations_match and len(recommendations_match) > 2:
-                                # Filter out field names, keep only actual recommendations
-                                potential_recs = [r for r in recommendations_match 
-                                                if r not in ['caseSummary', 'strategicObjective', 'recommendations', 'possibleNextSteps', 'possible_next_steps']
-                                                and len(r) > 20]  # Recommendations should be substantial
-                                recommendations = potential_recs[:4]  # Take up to 4
-                                # Try to extract possible next steps if present
-                                possible_next_steps_match = re.search(r'"possibleNextSteps"\s*:\s*\[(.*?)\]', json_str, re.DOTALL)
-                                if not possible_next_steps_match:
-                                    possible_next_steps_match = re.search(r'"possible_next_steps"\s*:\s*\[(.*?)\]', json_str, re.DOTALL)
-                                if possible_next_steps_match:
-                                    next_steps_inner = possible_next_steps_match.group(1)
-                                    next_steps = re.findall(r'"([^"]+)"', next_steps_inner)
-                                    possible_next_steps = [s.strip() for s in next_steps if s.strip()][:5]
+                            possible_next_steps_match = re.search(r'"possibleNextSteps"\s*:\s*\[(.*?)\]', json_str, re.DOTALL)
+                            if not possible_next_steps_match:
+                                possible_next_steps_match = re.search(r'"possible_next_steps"\s*:\s*\[(.*?)\]', json_str, re.DOTALL)
+                            if possible_next_steps_match:
+                                next_steps_inner = possible_next_steps_match.group(1)
+                                next_steps = re.findall(r'"([^"]+)"', next_steps_inner)
+                                possible_next_steps = [s.strip() for s in next_steps if s.strip()][:5]
                             
-                            logger.info(f"   Extracted: Summary={bool(case_summary)}, Objective={bool(strategic_objective)}, Recs={len(recommendations)}")
+                            logger.info(f"   Extracted: Summary={bool(case_summary)}, Objective={bool(strategic_objective)}, NextSteps={len(possible_next_steps)}")
                             
                             # Fill in missing pieces
                             if not case_summary:
                                 raise  # Can't salvage without case summary, use full fallback
                             if not strategic_objective:
                                 strategic_objective = "Conduct a comprehensive legal review based on the case facts to determine the optimal course of action under BNS."
-                            if not recommendations or len(recommendations) < 3:
-                                # Add fallback recommendations
-                                default_recs = [
-                                    "File appropriate legal action under relevant BNS provisions",
-                                    "Preserve and organize all evidence following BSA guidelines",
-                                    "Follow BNSS procedural requirements for the case",
-                                    "Develop comprehensive strategy based on case specifics"
-                                ]
-                                recommendations.extend(default_recs)
-                                recommendations = recommendations[:4]  # Keep only 4
                             if not suggestion_chips:
                                 suggestion_chips = [
                                     "Review evidence", "File legal action", "Preserve documents",
@@ -527,12 +497,6 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
                 # Fallback to generic analysis
                 case_summary = f"Analysis of {doc_count} document(s) for {workspace_role} role. The documents have been processed and are ready for detailed review under Indian legal framework (BNS, BNSS, BSA)."
                 strategic_objective = "Conduct a comprehensive legal review to determine the optimal course of action based on the available evidence and applicable provisions under Bharatiya Nyaya Sanhita (BNS) and other relevant laws."
-                recommendations = [
-                    "Review all uploaded documents thoroughly to identify key facts",
-                    "Analyze applicable provisions under BNS (Bharatiya Nyaya Sanhita) and BNSS (Bharatiya Nagarik Suraksha Sanhita)",
-                    "Assess the strength of available evidence under BSA (Bharatiya Sakshya Adhiniyam)",
-                    "Develop a detailed action plan with specific legal remedies and procedural steps"
-                ]
                 possible_next_steps = [
                     "Review all uploaded documents immediately",
                     "Preserve and secure all evidence",
@@ -555,7 +519,6 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
                 "isUpdate": is_update,
                 "caseSummary": case_summary,
                 "strategicObjective": strategic_objective,
-                "recommendations": recommendations,
                 "possibleNextSteps": possible_next_steps if possible_next_steps else [],
                 "suggestionChips": suggestion_chips if suggestion_chips else [],
                 "analysis": {
@@ -621,6 +584,10 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
                     vector_error,
                 )
 
+            # Build parts with per-document cap so ALL documents are represented (no limit on number of docs)
+            max_total_content = 100000
+            num_docs = len([d for d in all_docs if (d.get("content") or "").strip() and len((d.get("content") or "").strip()) >= 20])
+            per_doc_cap = (max_total_content // max(1, num_docs)) if num_docs else max_total_content
             parts = []
             for i, doc in enumerate(all_docs, 1):
                 content = (doc.get("content") or "").strip()
@@ -631,34 +598,26 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
                     if i == len(all_docs)
                     else "Document {}".format(i)
                 )
+                if len(content) > per_doc_cap:
+                    content = content[:per_doc_cap] + "\n[... truncated for length ...]"
                 parts.append("--- {} ---\n{}".format(label, content))
             combined_document_content = (
                 "\n\n".join(parts) if parts else "No document content available."
             )
 
-            max_content_length = 12000
-            if parts and len(combined_document_content) > max_content_length:
-                latest_content = parts[-1]
-                earlier = "\n\n".join(parts[:-1]) if len(parts) > 1 else ""
-                if len(earlier) + len(latest_content) > max_content_length:
-                    keep_earlier = max(
-                        0, max_content_length - len(latest_content) - 200
-                    )
-                    combined_document_content = (
-                        (earlier[:keep_earlier] + "...\n\n" if keep_earlier else "")
-                        + latest_content
-                    )
-                else:
-                    combined_document_content = earlier + (
-                        "\n\n" + latest_content if earlier else latest_content
-                    )
+            if num_docs > 0 and len(combined_document_content) > max_total_content:
+                combined_document_content = combined_document_content[:max_total_content] + "\n[... content truncated ...]"
                 logger.info(
-                    "Truncated document content for analysis report to ~{} chars",
-                    max_content_length,
+                    "Truncated combined document content for analysis report to ~{} chars ({} docs, ~{} chars each)",
+                    max_total_content,
+                    num_docs,
+                    per_doc_cap,
                 )
-            elif len(combined_document_content) > max_content_length:
-                combined_document_content = (
-                    combined_document_content[:max_content_length] + "..."
+            elif num_docs > 1:
+                logger.info(
+                    "Analysis report using all {} documents (~{} chars per doc cap)",
+                    num_docs,
+                    per_doc_cap,
                 )
 
             doc_count = len(all_docs)
@@ -706,7 +665,7 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close all strings, 
 
 **Legal framework**: Use BNS (Bharatiya Nyaya Sanhita), BNSS (Bharatiya Nagarik Suraksha Sanhita), BSA (Bharatiya Sakshya Adhiniyam). Do NOT cite IPC, CrPC, or Indian Evidence Act (replaced). IT Act 2000 remains valid.
 
-**If documents appear unrelated** (different cases/matters), base analysis ONLY on the last document (labeled "most recently uploaded"). Otherwise use all documents combined.
+If documents appear to include multiple matters, mention that ambiguity and prioritize the dispute best supported by evidence.
 
 **Required JSON structure** (use exactly these keys; output nothing but this object):
 {{
@@ -748,6 +707,7 @@ Output now: a single JSON object starting with {{ and ending with }}. No other t
 
             ai_response = await gemini_client.generate(
                 prompt=analysis_prompt,
+                system_instruction=self._get_generation_system_instruction(workspace_role),
                 temperature=0.35,
                 max_tokens=12000,
             )
@@ -1030,7 +990,6 @@ Output now: a single JSON object starting with {{ and ending with }}. No other t
             "isEmpty": True,
             "caseSummary": "",
             "strategicObjective": "",
-            "recommendations": [],
             "possibleNextSteps": [],
             "suggestionChips": [],
             "analysis": {

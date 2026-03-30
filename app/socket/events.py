@@ -975,6 +975,11 @@ No extra text.
             if not isinstance(missing_info, list):
                 missing_info = [missing_info] if missing_info else []
             missing_info = [str(x).strip() for x in missing_info if x][:10]
+            # Product language requirement: refer to uploaded files as annexures in analysis text.
+            missing_info = [
+                re.sub(r"\bdocuments\b", "annexures", re.sub(r"\bdocument\b", "annexure", x, flags=re.IGNORECASE), flags=re.IGNORECASE)
+                for x in missing_info
+            ]
 
             strengths_raw = data.get("strengths") or []
             if not isinstance(strengths_raw, list):
@@ -988,19 +993,30 @@ No extra text.
                         laws = [laws] if laws else []
                     laws = [str(l).strip() for l in laws if l][:5]
                     if point:
+                        point = re.sub(r"\bdocuments\b", "annexures", re.sub(r"\bdocument\b", "annexure", point, flags=re.IGNORECASE), flags=re.IGNORECASE)
                         strengths.append({"point": point, "laws": laws})
                 elif isinstance(s, str) and s.strip():
-                    strengths.append({"point": s.strip(), "laws": []})
+                    point = s.strip()
+                    point = re.sub(r"\bdocuments\b", "annexures", re.sub(r"\bdocument\b", "annexure", point, flags=re.IGNORECASE), flags=re.IGNORECASE)
+                    strengths.append({"point": point, "laws": []})
 
             weaknesses = data.get("weaknesses") or []
             if not isinstance(weaknesses, list):
                 weaknesses = [weaknesses] if weaknesses else []
             weaknesses = [str(x).strip() for x in weaknesses if x][:8]
+            weaknesses = [
+                re.sub(r"\bdocuments\b", "annexures", re.sub(r"\bdocument\b", "annexure", x, flags=re.IGNORECASE), flags=re.IGNORECASE)
+                for x in weaknesses
+            ]
 
             risks = data.get("risks") or []
             if not isinstance(risks, list):
                 risks = [risks] if risks else []
             risks = [str(x).strip() for x in risks if x][:8]
+            risks = [
+                re.sub(r"\bdocuments\b", "annexures", re.sub(r"\bdocument\b", "annexure", x, flags=re.IGNORECASE), flags=re.IGNORECASE)
+                for x in risks
+            ]
 
             relevant_jurisdiction = (
                 data.get("relevantJurisdiction")
@@ -1034,6 +1050,12 @@ No extra text.
             )
             if not isinstance(quality_score_explanation, str):
                 quality_score_explanation = str(quality_score_explanation or "").strip()
+            quality_score_explanation = re.sub(
+                r"\bdocuments\b",
+                "annexures",
+                re.sub(r"\bdocument\b", "annexure", quality_score_explanation, flags=re.IGNORECASE),
+                flags=re.IGNORECASE,
+            )
 
             pending_actions = data.get("pendingActions") or data.get("pending_actions") or []
             if not isinstance(pending_actions, list):
@@ -1167,7 +1189,7 @@ No extra text.
                 did = r.get("document_id")
                 name = r.get("filename") or r.get("originalName") or ""
                 if did:
-                    id_to_name[str(did)] = name or f"Document"
+                    id_to_name[str(did)] = name or f"Annexure"
 
         valid_docs = [
             d for d in all_docs
@@ -1181,12 +1203,12 @@ No extra text.
             content = (doc.get("content") or "").strip()
             if not content or len(content) < 20:
                 continue
-            name = id_to_name.get(doc_id) or f"Document {i}"
+            name = id_to_name.get(doc_id) or f"Annexure {i}"
             doc_id_by_index[i] = doc_id
             doc_name_by_index[i] = name
             if len(content) > per_doc_cap:
                 content = content[:per_doc_cap] + "\n[... truncated for length ...]"
-            parts.append(f"--- Document {i} (id: {doc_id}, name: {name}) ---\n{content}")
+            parts.append(f"--- Annexure {i} (id: {doc_id}, name: {name}) ---\n{content}")
         combined = "\n\n".join(parts) if parts else ""
         if not combined:
             return []
@@ -1200,13 +1222,13 @@ No extra text.
             if not gemini_client.model:
                 return []
 
-            prompt = f"""You are a legal case analyst. From the following case documents, extract a comprehensive chronological list of important dates and events (e.g. agreement signed, payment made, notice sent, reply received, court filing, hearing, deadline).
+            prompt = f"""You are a legal case analyst. From the following annexures, extract a comprehensive chronological list of important dates and events (e.g. agreement signed, payment made, notice sent, reply received, court filing, hearing, deadline).
 
-**Document content** (each document is labeled Document 1, Document 2, etc. with id and name):
+**Annexure content** (each file is labeled Annexure 1, Annexure 2, etc. with id and name):
 {combined}
 
 **Task**:
-1) Build an inventory across ALL provided documents (Document 1..N).
+1) Build an inventory across ALL provided annexures (Annexure 1..N).
 2) Extract every date-like expression you can find and attach it to the nearest meaningful event/action described near that date.
 3) Output a JSON array of date entries.
 
@@ -1231,16 +1253,12 @@ Rules (CRITICAL for consistency):
 - Return the full array; do not truncate the list of events.
 - Escape quotes inside strings with \\". Keep each title and description to one short phrase (under 80 chars) so the full JSON is not truncated.
 
-CASE-SPECIFIC MATERIALITY FILTER (MANDATORY):
-- Include ONLY events that are materially relevant to THIS dispute/case between the parties in the uploaded documents.
-- Focus on the litigation/claim timeline (e.g., purchase, defect discovery, service/repair steps, notices, emails, legal notices, replies, filings, hearings, deadlines, receipt under protest).
-- EXCLUDE generic historical/background chronology that does not affect the current dispute outcome.
-- EXCLUDE company history, founder history, old brand milestones, awards, and other encyclopedic timeline entries unless directly tied to the parties' present claim/defense.
-- If a document is a general article/reference (e.g., encyclopedia/company history), use it only when a date directly supports a pleaded case issue. Otherwise ignore those dates.
-
-WHEN BOTH TYPES EXIST:
-- Prioritize dispute-specific events over background events.
-- If dispute-specific events are present, do NOT include unrelated background/history events in the final output.
+CASE MATERIALITY + COVERAGE RULE (MANDATORY):
+- Include all date-events that are materially connected to this case/dispute across ALL annexures.
+- Include procedural events, factual incidents, communications, notices, filings, service/repair steps, contractual and payment milestones, and deadlines.
+- EXCLUDE background-only chronology that is not tied to the parties' present dispute (e.g., founder biographies, company origin history, awards, old brand milestones, industrial history).
+- If an annexure is a reference/background article, keep only dates that directly support a pleaded issue in this case.
+- Keep deduplication rule: remove only exact duplicates (same date + title + sourceDocumentIndex).
 
 Example shape:
 [{{"date":"2026-01-15","title":"Notice Sent","description":"Cease and desist","sourceDocumentIndex":1,"pageNumber":3,"isIncident":true,"eventType":"Filing","relevance":"High"}}]
@@ -1381,6 +1399,14 @@ Example shape:
                 return []
 
             result = []
+            background_timeline_pattern = re.compile(
+                r"\b(founder|born|birth|founded|established|industrialization|hydroelectric|milestone|"
+                r"brand history|company history|legacy history|origin story|corporate history)\b",
+                flags=re.IGNORECASE,
+            )
+            def _is_background_timeline_entry(title: str, description: str, source_name: str) -> bool:
+                text = f"{title} {description} {source_name}".strip()
+                return bool(background_timeline_pattern.search(text))
             for item in arr:
                 if not isinstance(item, dict):
                     continue
@@ -1428,6 +1454,14 @@ Example shape:
                 if source_doc_name:
                     entry["source"] = source_doc_name
                     entry["sourceAnswer"] = source_doc_name
+                # Guardrail: suppress purely historical/corporate background chronology
+                # that can leak from supporting/reference annexures.
+                if _is_background_timeline_entry(
+                    str(entry.get("title") or ""),
+                    str(entry.get("description") or ""),
+                    str(entry.get("sourceDocName") or ""),
+                ):
+                    continue
                 # Drop None/empty so payload is clean; keep description if present
                 entry = {k: v for k, v in entry.items() if v is not None and v != ""}
                 result.append(entry)

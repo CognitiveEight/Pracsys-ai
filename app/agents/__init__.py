@@ -1,15 +1,10 @@
 """Agents module."""
 
-from app.agents.base import BaseAgent, AgentConfig, AgentResponse
-from app.agents.router import agent_router, AgentType
+from app.agents.base import AgentConfig, AgentResponse, BaseAgent
 from app.agents.chat_agent import ChatAgent, create_chat_agent
-from app.agents.role_models import (
-    Role,
-    RoleEnum,
-    RoleContext,
-    RoleBehaviorContract,
-    RoleSelectionError
-)
+from app.agents.role_models import (Role, RoleBehaviorContract, RoleContext,
+                                    RoleEnum, RoleSelectionError)
+from app.agents.router import AgentType, agent_router
 
 __all__ = [
     "BaseAgent",
@@ -23,6 +18,5 @@ __all__ = [
     "RoleEnum",
     "RoleContext",
     "RoleBehaviorContract",
-    "RoleSelectionError"
+    "RoleSelectionError",
 ]
-

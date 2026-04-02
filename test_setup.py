@@ -1,8 +1,9 @@
 """
 Test script to verify SimplerToday setup and configuration.
 """
-import sys
+
 import importlib.util
+import sys
 from pathlib import Path
 from typing import List, Tuple
 
@@ -29,7 +30,7 @@ def test_imports() -> List[Tuple[bool, str]]:
         "httpx",
         "aiofiles",
     ]
-    
+
     results = []
     for package in packages:
         try:
@@ -38,14 +39,14 @@ def test_imports() -> List[Tuple[bool, str]]:
             results.append((True, f"✅ {package}"))
         except ImportError:
             results.append((False, f"❌ {package} (not installed)"))
-    
+
     return results
 
 
 def test_project_structure() -> List[Tuple[bool, str]]:
     """Test if all required files and directories exist."""
     base_path = Path(__file__).parent
-    
+
     required_items = [
         ("app/", "directory"),
         ("app/main.py", "file"),
@@ -58,7 +59,7 @@ def test_project_structure() -> List[Tuple[bool, str]]:
         ("requirements.txt", "file"),
         ("env.example", "file"),
     ]
-    
+
     results = []
     for item, item_type in required_items:
         path = base_path / item
@@ -66,12 +67,12 @@ def test_project_structure() -> List[Tuple[bool, str]]:
             exists = path.is_dir()
         else:
             exists = path.is_file()
-        
+
         if exists:
             results.append((True, f"✅ {item}"))
         else:
             results.append((False, f"❌ {item} (missing)"))
-    
+
     return results
 
 
@@ -85,7 +86,7 @@ def test_app_imports() -> List[Tuple[bool, str]]:
         "app.vectorstore.qdrant",
         "app.observability.logger",
     ]
-    
+
     results = []
     for module in modules:
         try:
@@ -93,7 +94,7 @@ def test_app_imports() -> List[Tuple[bool, str]]:
             results.append((True, f"✅ {module}"))
         except Exception as e:
             results.append((False, f"❌ {module} ({str(e)[:50]})"))
-    
+
     return results
 
 
@@ -110,51 +111,51 @@ def main():
     print("=" * 60)
     print("SimplerToday Setup Test")
     print("=" * 60)
-    
+
     # Test Python version
     print("\n📦 Python Version:")
     success, msg = test_python_version()
     print(f"  {msg}")
-    
+
     # Test package imports
     print("\n📦 Required Packages:")
     import_results = test_imports()
     for success, msg in import_results:
         print(f"  {msg}")
-    
+
     # Test project structure
     print("\n📁 Project Structure:")
     structure_results = test_project_structure()
     for success, msg in structure_results:
         print(f"  {msg}")
-    
+
     # Test .env file
     print("\n⚙️  Configuration:")
     success, msg = test_env_file()
     print(f"  {msg}")
-    
+
     # Test app imports
     print("\n🐍 Application Modules:")
     app_import_results = test_app_imports()
     for success, msg in app_import_results:
         print(f"  {msg}")
-    
+
     # Summary
     print("\n" + "=" * 60)
     all_results = (
-        [test_python_version()] +
-        import_results +
-        structure_results +
-        [test_env_file()] +
-        app_import_results
+        [test_python_version()]
+        + import_results
+        + structure_results
+        + [test_env_file()]
+        + app_import_results
     )
-    
+
     total = len(all_results)
     passed = sum(1 for success, _ in all_results if success)
     failed = total - passed
-    
+
     print(f"Results: {passed}/{total} passed")
-    
+
     if failed > 0:
         print(f"⚠️  {failed} tests failed. Please fix the issues above.")
         return 1
@@ -169,4 +170,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

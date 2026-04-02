@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     # Environment variable supported: GOOGLE_CLOUD_VISION_API_KEY
     google_cloud_vision_api_key: Optional[str] = None
     google_cse_id: Optional[str] = None
+    google_cse_base_url: str = "https://www.googleapis.com/customsearch/v1"
     
     # Vector Store (Qdrant)
     qdrant_url: str = "http://localhost:6333"

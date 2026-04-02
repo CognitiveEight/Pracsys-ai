@@ -4,7 +4,12 @@ Updated to match backend Socket.IO specification.
 """
 import asyncio
 import time
+import json
+import re
 from typing import Dict, Any, Callable, Awaitable, Optional, List
+from html import unescape
+from urllib.parse import quote_plus
+import httpx
 from loguru import logger
 from datetime import datetime
 
@@ -66,6 +71,8 @@ class SocketEventHandler:
         self._workspace_analysis_payload: Dict[str, Any] = {}
         # List of Dates timeline per workspace (chronological events from case documents)
         self._workspace_list_of_dates_payload: Dict[str, List[Dict[str, Any]]] = {}
+        # Applicable laws payload per workspace (acts/sections inferred from docs + case law search)
+        self._workspace_applicable_laws_payload: Dict[str, Dict[str, Any]] = {}
         # Re-emit after reconnect when socket dropped right after analysis report (so backend gets the update)
         self._had_disconnect: bool = False
         self._pending_reemit_workspace_id: Optional[str] = None
@@ -796,7 +803,12 @@ Cap score between 0 and 100.
 OUTPUT JSON STRUCTURE
 --------------------------------------------------
 
+Output keys in this exact order (score and explanation FIRST so they are not truncated):
+- caseResolutionScore and qualityScoreExplanation MUST appear immediately after the opening "{{".
+
 {{
+  "caseResolutionScore": 72,
+  "qualityScoreExplanation": "Required: 2-4 sentences explaining how this score follows from missing info, weaknesses, risks, and strengths. Non-empty. Example: Score reflects gaps in annexures and procedural risks.",
   "missingInfo": ["item1","item2"],
   "strengths": [
     {{
@@ -807,8 +819,6 @@ OUTPUT JSON STRUCTURE
   "weaknesses": ["weakness1"],
   "risks": ["risk1"],
   "relevantJurisdiction": ["District Court, City"],
-  "caseResolutionScore": 72,
-  "qualityScoreExplanation": "Score reduced due to missing evidence and procedural risks identified in the documents.",
   "pendingActions": ["action1"],
   "nextSteps": ["step1","step2"],
   "suggestedDrafts": ["Draft Legal Notice"]
@@ -834,6 +844,9 @@ relevantJurisdiction:
 
 pendingActions / nextSteps / suggestedDrafts:
 0–5 items each.
+
+qualityScoreExplanation RULE:
+- MANDATORY non-empty string. If the score is below 100, say why (missing info / weaknesses / risks). If 100, say that no gaps, weaknesses, or risks were flagged.
 
 FINAL RULE:
 Output ONLY the JSON object.
@@ -1050,6 +1063,15 @@ No extra text.
             )
             if not isinstance(quality_score_explanation, str):
                 quality_score_explanation = str(quality_score_explanation or "").strip()
+            quality_score_explanation = await self._ensure_quality_score_explanation(
+                workspace_role=workspace_role,
+                case_resolution_score=case_resolution_score,
+                missing_info=missing_info,
+                weaknesses=weaknesses,
+                risks=risks,
+                strengths=strengths,
+                existing=quality_score_explanation,
+            )
             quality_score_explanation = re.sub(
                 r"\bdocuments\b",
                 "annexures",
@@ -1519,6 +1541,392 @@ Example shape:
         logger.success("✅ List of dates sent to backend ({} entries)", len(list_of_dates))
         await asyncio.sleep(0.2)  # Allow backend to process before next event
 
+    def _normalize_applicable_laws_payload(self, raw: Any) -> Dict[str, Any]:
+        """Normalize model/search output into strict applicable_laws payload schema."""
+        laws_raw = []
+        if isinstance(raw, dict):
+            laws_raw = raw.get("laws") or []
+        elif isinstance(raw, list):
+            laws_raw = raw
+        if not isinstance(laws_raw, list):
+            laws_raw = []
+
+        normalized: List[Dict[str, str]] = []
+        relevance_allowed = {"high": "High", "medium": "Medium", "low": "Low"}
+        for idx, item in enumerate(laws_raw, start=1):
+            if not isinstance(item, dict):
+                continue
+            act = str(item.get("act") or "").strip()
+            section = str(item.get("section") or "").strip()
+            description = str(item.get("description") or "").strip()
+            # Guardrail: user explicitly asked to not show IPC items in output.
+            act_l = act.lower()
+            desc_l = description.lower()
+            if re.search(r"\bindian\s*penal\s*code\b", act_l) or re.search(r"\bipc\b", act_l) or re.search(r"\bipc\b", desc_l):
+                continue
+            relevance_in = str(item.get("relevance") or "").strip().lower()
+            relevance = relevance_allowed.get(relevance_in, "Medium")
+            if not act or not section or not description:
+                continue
+            normalized.append(
+                {
+                    "id": f"law_{idx}",
+                    "act": act,
+                    "section": section,
+                    "description": description,
+                    "relevance": relevance,
+                }
+            )
+            if len(normalized) >= 12:
+                break
+        return {"laws": normalized}
+
+    def _heuristic_applicable_laws_fallback(self, evidence_snippet: str) -> Dict[str, Any]:
+        """Best-effort law mapping from keywords when model JSON fails or returns empty."""
+        txt = (evidence_snippet or "").lower()
+        candidates: List[Dict[str, str]] = []
+
+        def add(act: str, section: str, description: str, relevance: str = "Medium") -> None:
+            candidates.append(
+                {
+                    "id": "",
+                    "act": act,
+                    "section": section,
+                    "description": description,
+                    "relevance": relevance,
+                }
+            )
+
+        if re.search(r"\b(hack|hacked|phish|otp|password|account|cyber|digital)\b", txt):
+            add(
+                "Information Technology Act, 2000",
+                "Section 66C",
+                "Potential identity/credential misuse through digital systems.",
+                "High",
+            )
+            add(
+                "Information Technology Act, 2000",
+                "Section 66D",
+                "Potential cheating by personation using computer resources.",
+                "High",
+            )
+        if re.search(r"\b(theft|stolen|stole|robbery|vehicle|car|bike)\b", txt):
+            add(
+                "Bharatiya Nyaya Sanhita, 2023",
+                "Section 303",
+                "Potential theft of movable property based on allegations.",
+                "High",
+            )
+        if re.search(r"\b(threat|intimidat|blackmail|extort)\b", txt):
+            add(
+                "Bharatiya Nyaya Sanhita, 2023",
+                "Section 351",
+                "Potential criminal intimidation-related conduct.",
+                "Medium",
+            )
+        if re.search(r"\b(company|director|shareholder|board|mismanagement)\b", txt):
+            add(
+                "Companies Act, 2013",
+                "Section 241",
+                "Possible oppression and mismanagement concerns requiring review.",
+                "Medium",
+            )
+        if re.search(r"\b(gst|invoice|input tax|itc|tax credit)\b", txt):
+            add(
+                "Central Goods and Services Tax Act, 2017",
+                "Section 16",
+                "Input tax credit eligibility may be relevant to the dispute.",
+                "Medium",
+            )
+
+        # Keep output non-empty only when there is at least one signal.
+        return self._normalize_applicable_laws_payload({"laws": candidates})
+
+    async def _extract_case_signals_from_documents(
+        self,
+        workspace_id: str,
+        user_id: str,
+    ) -> Dict[str, Any]:
+        """Extract search-friendly title, keywords and evidence snippets from workspace docs."""
+        del user_id  # Not needed for extraction, kept for future traceability.
+        workspace_title = ""
+        try:
+            ctx = workspace_manager.get_workspace(workspace_id)
+            if ctx:
+                workspace_title = str(getattr(ctx, "title", "") or "").strip()
+        except Exception:
+            workspace_title = ""
+
+        snippets: List[str] = []
+        try:
+            from app.vectorstore.qdrant import vector_store
+            all_docs = await vector_store.get_all_documents(workspace_id=workspace_id)
+        except Exception as e:
+            logger.warning("Applicable laws: failed to fetch documents for signal extraction: {}", e)
+            all_docs = []
+
+        for doc in all_docs[:5]:
+            content = str(doc.get("content") or "").strip()
+            if not content:
+                continue
+            snippets.append(content[:1200])
+
+        joined = " ".join(snippets)
+        tokens = re.findall(r"[A-Za-z][A-Za-z0-9]{3,}", joined)
+        stop = {
+            "this", "that", "with", "from", "were", "have", "been", "their", "there",
+            "which", "shall", "under", "about", "against", "where", "claim", "case",
+            "court", "petitioner", "respondent", "document", "documents", "matter",
+            "hereby", "thereof", "plaintiff", "defendant",
+        }
+        freq: Dict[str, int] = {}
+        for token in tokens:
+            t = token.lower()
+            if t in stop:
+                continue
+            freq[t] = freq.get(t, 0) + 1
+        ranked = sorted(freq.items(), key=lambda x: x[1], reverse=True)
+        keywords = [k for k, _v in ranked[:8]]
+
+        query_parts = [p for p in [workspace_title, " ".join(keywords)] if p]
+        query = " ".join(query_parts).strip()
+        if not query:
+            query = "Indian legal case applicable sections"
+        return {
+            "workspaceTitle": workspace_title,
+            "query": query,
+            "keywords": keywords,
+            "evidenceSnippet": joined[:5000],
+        }
+
+    async def _search_indiankanoon(self, query: str) -> List[Dict[str, str]]:
+        """Search Indian Kanoon directly and return top lightweight results."""
+        if not query.strip():
+            return []
+        search_url = f"https://indiankanoon.org/search/?formInput={quote_plus(query)}"
+        logger.info("Applicable laws: Indian Kanoon query={}", query[:180])
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                res = await client.get(search_url, headers={"User-Agent": "Mozilla/5.0"})
+                if res.status_code >= 400:
+                    logger.warning("Applicable laws: Indian Kanoon search status {}", res.status_code)
+                    return []
+                html = res.text or ""
+        except Exception as e:
+            logger.warning("Applicable laws: Indian Kanoon search failed: {}", e)
+            return []
+
+        pattern = re.compile(
+            r'<a[^>]+href="(?P<href>/doc/\d+/?)"[^>]*>(?P<title>.*?)</a>',
+            flags=re.I | re.S,
+        )
+        results: List[Dict[str, str]] = []
+        seen = set()
+        for m in pattern.finditer(html):
+            href = m.group("href") or ""
+            title = re.sub(r"<.*?>", " ", m.group("title") or "")
+            title = unescape(re.sub(r"\s+", " ", title)).strip()
+            if not title:
+                continue
+            url = f"https://indiankanoon.org{href}"
+            if url in seen:
+                continue
+            seen.add(url)
+            results.append({"title": title, "url": url, "snippet": ""})
+            if len(results) >= 8:
+                break
+        if results:
+            preview = [
+                {"title": r.get("title", "")[:120], "url": r.get("url", "")}
+                for r in results[:5]
+            ]
+            logger.info("Applicable laws: Indian Kanoon results preview={}", preview)
+        else:
+            logger.info("Applicable laws: Indian Kanoon returned no results")
+        return results
+
+    async def _search_google_cse_for_indiankanoon(self, query: str) -> List[Dict[str, str]]:
+        """Fallback search via Google CSE, constrained to Indian Kanoon domain."""
+        if not query.strip() or not settings.google_api_key or not settings.google_cse_id:
+            return []
+        endpoint = getattr(settings, "google_cse_base_url", "https://www.googleapis.com/customsearch/v1")
+        params = {
+            "key": settings.google_api_key,
+            "cx": settings.google_cse_id,
+            "q": f"site:indiankanoon.org {query}",
+            "num": 8,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.get(endpoint, params=params)
+                res.raise_for_status()
+                data = res.json() if res.text else {}
+        except Exception as e:
+            logger.warning("Applicable laws: Google CSE fallback failed: {}", e)
+            return []
+
+        out: List[Dict[str, str]] = []
+        for item in data.get("items", []) or []:
+            link = str(item.get("link") or "").strip()
+            if "indiankanoon.org" not in link:
+                continue
+            out.append(
+                {
+                    "title": str(item.get("title") or "").strip(),
+                    "url": link,
+                    "snippet": str(item.get("snippet") or "").strip(),
+                }
+            )
+            if len(out) >= 8:
+                break
+        if out:
+            preview = [
+                {"title": r.get("title", "")[:120], "url": r.get("url", "")}
+                for r in out[:5]
+            ]
+            logger.info("Applicable laws: Google CSE results preview={}", preview)
+        else:
+            logger.info("Applicable laws: Google CSE returned no results")
+        return out
+
+    async def _generate_applicable_laws_from_sources(
+        self,
+        workspace_id: str,
+        workspace_role: str,
+        signals: Dict[str, Any],
+        search_results: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """Generate final laws list JSON from case signals + search context."""
+        from app.ai.gemini_client import gemini_client
+
+        sources_text = []
+        for idx, row in enumerate(search_results[:8], start=1):
+            sources_text.append(
+                f"{idx}. title={row.get('title','')} | url={row.get('url','')} | snippet={row.get('snippet','')}"
+            )
+        source_blob = "\n".join(sources_text) if sources_text else "No external case snippets available."
+        prompt = f"""
+You are an Indian legal research assistant.
+Return ONLY one valid JSON object with this exact shape:
+{{
+  "laws": [
+    {{
+      "id": "law_1",
+      "act": "Act name",
+      "section": "Section X",
+      "description": "Why this section is potentially applicable to this case.",
+      "relevance": "High"
+    }}
+  ]
+}}
+
+Rules:
+- Focus on likely applicable Indian laws/sections from the case facts.
+- Do NOT restrict to only predefined acts; any Indian law can be used.
+- Do NOT cite IPC (Indian Penal Code). If a section is IPC-linked, prefer the corresponding BNS section where applicable.
+- You may include common examples like BNS, IT Act, GST, Companies Act, RTI, SC/ST PoA where relevant.
+- Relevance must be one of: High, Medium, Low.
+- Keep description concise and case-specific.
+- If evidence is insufficient, return {{"laws":[]}}.
+
+Workspace role: {workspace_role}
+Workspace title: {signals.get("workspaceTitle","")}
+Search query: {signals.get("query","")}
+Case keywords: {", ".join(signals.get("keywords", []))}
+Document evidence snippet:
+{signals.get("evidenceSnippet","")}
+
+Indian Kanoon / case-law search results:
+{source_blob}
+"""
+        raw = await gemini_client.generate(
+            prompt=prompt,
+            system_instruction=self._get_generation_system_instruction(workspace_role),
+            temperature=0.2,
+            max_tokens=8000,
+        )
+        logger.info("Applicable laws: raw LLM response preview={}", (raw or "")[:500])
+        text = (raw or "").strip()
+        if "```" in text:
+            m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.I)
+            if m:
+                text = m.group(1).strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            text = text[start : end + 1]
+        parsed: Dict[str, Any] = {"laws": []}
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            # Try salvage by balancing braces if model returned truncated JSON.
+            try:
+                open_braces = text.count("{") - text.count("}")
+                open_brackets = text.count("[") - text.count("]")
+                salvaged = text + ("]" * max(0, open_brackets)) + ("}" * max(0, open_braces))
+                parsed = json.loads(salvaged)
+                logger.info("Applicable laws: salvaged malformed Gemini JSON")
+            except Exception:
+                logger.warning("Applicable laws: failed to parse Gemini JSON; using heuristic fallback")
+                parsed = {"laws": []}
+
+        normalized = self._normalize_applicable_laws_payload(parsed)
+        logger.info(
+            "Applicable laws: final normalized payload from LLM count={} payload={}",
+            len(normalized.get("laws", [])),
+            normalized,
+        )
+        if not normalized.get("laws"):
+            heuristic = self._heuristic_applicable_laws_fallback(signals.get("evidenceSnippet", ""))
+            if heuristic.get("laws"):
+                logger.info("Applicable laws: heuristic fallback generated {} law(s)", len(heuristic.get("laws", [])))
+                logger.info("Applicable laws: final payload from heuristic={}", heuristic)
+                return heuristic
+        return normalized
+
+    async def _generate_and_emit_applicable_laws(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: Optional[str] = None,
+    ) -> None:
+        """Generate and emit document_feature_response with featureType applicable_laws."""
+        role = (workspace_role or "ADJUDICATOR").strip().upper()
+        logger.info("Applicable laws: generation started for workspace {}", workspace_id[:12] if workspace_id else "")
+        signals = await self._extract_case_signals_from_documents(workspace_id, user_id)
+        search_results = await self._search_indiankanoon(signals.get("query", ""))
+        if not search_results:
+            search_results = await self._search_google_cse_for_indiankanoon(signals.get("query", ""))
+        logger.info(
+            "Applicable laws: gathered {} search result(s) for workspace {}",
+            len(search_results),
+            workspace_id[:12] if workspace_id else "",
+        )
+
+        payload = await self._generate_applicable_laws_from_sources(
+            workspace_id=workspace_id,
+            workspace_role=role,
+            signals=signals,
+            search_results=search_results,
+        )
+        self._workspace_applicable_laws_payload[workspace_id] = payload
+        if not self._socket_client:
+            return
+        await self._socket_client.emit(
+            "document_feature_response",
+            {
+                "featureType": "applicable_laws",
+                "workspaceId": workspace_id,
+                "userId": user_id,
+                "payload": payload,
+            },
+        )
+        logger.success(
+            "✅ Applicable laws sent to backend ({} laws)",
+            len(payload.get("laws", [])),
+        )
+        await asyncio.sleep(0.1)
+
     def _strategy_objective_fallback(
         self,
         workspace_id: str,
@@ -1618,6 +2026,15 @@ Example shape:
             )
         except Exception as lod_err:
             logger.warning("List of dates generation/emit failed: {}", lod_err)
+        try:
+            logger.info("Applicable laws: invoking after list_of_dates for workspace {}", workspace_id[:12] if workspace_id else "")
+            await self._generate_and_emit_applicable_laws(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+            )
+        except Exception as laws_err:
+            logger.warning("Applicable laws generation/emit failed: {}", laws_err)
         return True
 
     async def _generate_and_emit_analysis_report_for_sync(
@@ -1665,6 +2082,15 @@ Example shape:
                 )
             except Exception as lod_err:
                 logger.warning("List of dates (sync) failed: {}", lod_err)
+            try:
+                logger.info("Applicable laws: invoking in sync flow for workspace {}", workspace_id[:12] if workspace_id else "")
+                await self._generate_and_emit_applicable_laws(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=workspace_role,
+                )
+            except Exception as laws_err:
+                logger.warning("Applicable laws (sync) failed: {}", laws_err)
         except asyncio.CancelledError:
             logger.warning("Analysis report (sync) task cancelled; emitting fallback")
             raise
@@ -1692,6 +2118,15 @@ Example shape:
                     workspace_role=workspace_role,
                     batch_result=batch_result,
                 )
+                try:
+                    logger.info("Applicable laws: invoking in sync fallback flow for workspace {}", workspace_id[:12] if workspace_id else "")
+                    await self._generate_and_emit_applicable_laws(
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        workspace_role=workspace_role,
+                    )
+                except Exception as laws_err:
+                    logger.warning("Applicable laws (sync fallback) failed: {}", laws_err)
             except Exception as e:
                 logger.error("Failed to emit analysis report fallback (sync): {}", e)
 
@@ -1721,6 +2156,103 @@ Example shape:
             or (risks and len(risks) > 0)
         )
         return 100 if not has_pending else self._ANALYSIS_REPORT_MAX_SCORE_WITH_PENDING_ITEMS
+
+    def _derive_quality_score_explanation(
+        self,
+        case_resolution_score: int,
+        missing_info: List[Any],
+        weaknesses: List[Any],
+        risks: List[Any],
+        strengths: List[Any],
+    ) -> str:
+        """Deterministic explanation when the model omits qualityScoreExplanation or output was truncated."""
+        nm = len(missing_info or [])
+        nw = len(weaknesses or [])
+        nr = len(risks or [])
+        ns = len(strengths or [])
+        lead = f"The current case resolution score is {case_resolution_score}%."
+        if nm == 0 and nw == 0 and nr == 0:
+            return (
+                f"{lead} No missing critical information, factual weaknesses, or procedural risks were flagged "
+                "in the annexures for this pass."
+            )
+        clauses = []
+        if nm:
+            clauses.append(f"{nm} critical information gap(s) noted in the annexures")
+        if nw:
+            clauses.append(f"{nw} factual weakness(es)")
+        if nr:
+            clauses.append(f"{nr} procedural or legal risk(s)")
+        if len(clauses) == 1:
+            why = clauses[0]
+        else:
+            why = ", ".join(clauses[:-1]) + f", and {clauses[-1]}"
+        second = f"The score reflects {why}, which reduces readiness relative to a fully complete case file."
+        third = (
+            f"The analysis still identifies {ns} strength(s) that support the file."
+            if ns
+            else ""
+        )
+        return " ".join(s for s in (lead, second, third) if s).strip()
+
+    async def _ensure_quality_score_explanation(
+        self,
+        workspace_role: str,
+        case_resolution_score: int,
+        missing_info: List[Any],
+        weaknesses: List[Any],
+        risks: List[Any],
+        strengths: List[Any],
+        existing: str,
+    ) -> str:
+        """Fill qualityScoreExplanation via model output, short LLM pass, or deterministic text."""
+        if (existing or "").strip():
+            return (existing or "").strip()
+        try:
+            from app.ai.gemini_client import gemini_client
+            import json as _json
+
+            strength_pts = []
+            for s in (strengths or [])[:6]:
+                if isinstance(s, dict):
+                    strength_pts.append((s.get("point") or s.get("text") or "")[:200])
+                elif s:
+                    strength_pts.append(str(s)[:200])
+            summary = _json.dumps(
+                {
+                    "caseResolutionScore": case_resolution_score,
+                    "missingInfo": [str(x)[:200] for x in (missing_info or [])[:8]],
+                    "weaknesses": [str(x)[:200] for x in (weaknesses or [])[:8]],
+                    "risks": [str(x)[:200] for x in (risks or [])[:8]],
+                    "strengthPoints": [x for x in strength_pts if x],
+                },
+                ensure_ascii=False,
+            )
+            prompt = (
+                f"You are a senior legal analyst. Given this case analysis summary (JSON only), "
+                f"write exactly 2-3 short sentences for an Indian-law workspace. "
+                f'Start with "The current score is {case_resolution_score}% because". '
+                "Explain the score using only the listed gaps, weaknesses, risks, and strengths—do not invent facts.\n\n"
+                f"{summary}"
+            )
+            txt = await gemini_client.generate(
+                prompt=prompt,
+                system_instruction=self._get_generation_system_instruction(workspace_role),
+                temperature=0.35,
+                max_tokens=500,
+            )
+            txt = (txt or "").strip()
+            if len(txt) >= 40:
+                return txt
+        except Exception as e:
+            logger.warning("Quality score explanation (LLM fallback) failed: {}", e)
+        return self._derive_quality_score_explanation(
+            case_resolution_score,
+            missing_info,
+            weaknesses,
+            risks,
+            strengths,
+        )
 
     def _match_rejected_value(self, item: Any, rejected_value: str) -> bool:
         """Return True if item matches rejectedValue (string or dict with 'point' key)."""
@@ -2917,6 +3449,19 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     },
                 )
                 logger.success("✅ List of dates re-emitted to backend after reconnect")
+            # 6) Applicable laws
+            applicable_laws = self._workspace_applicable_laws_payload.get(workspace_id)
+            if applicable_laws is not None:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "applicable_laws",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": applicable_laws,
+                    },
+                )
+                logger.success("✅ Applicable laws re-emitted to backend after reconnect")
         except Exception as e:
             logger.warning("Failed to re-emit after reconnect: {}", e)
 
@@ -3286,6 +3831,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                         },
                                     )
                                     self._workspace_list_of_dates_payload[payload.workspaceId] = []
+                                    await self._generate_and_emit_applicable_laws(
+                                        workspace_id=str(payload.workspaceId),
+                                        user_id=str(payload.userId),
+                                        workspace_role=workspace_role,
+                                    )
                                 except Exception as e:
                                     logger.error("Failed to emit analysis report fallback (0 success): {}", e)
                     
@@ -3340,6 +3890,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     )
                     self._workspace_list_of_dates_payload[payload.workspaceId] = []
                     logger.info("✅ List of dates (empty, no docs) sent to backend")
+                    await self._generate_and_emit_applicable_laws(
+                        workspace_id=str(payload.workspaceId),
+                        user_id=str(payload.userId),
+                        workspace_role=workspace_role,
+                    )
                 except Exception as e:
                     logger.error("Failed to emit analysis report (no docs): {}", e)
             
@@ -3480,9 +4035,57 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         file_id = getattr(file, "id", None) or (getattr(file, "_id", None) if hasattr(file, "_id") else None)
                         if file_id and str(file_id) not in deleted_ids:
                             deleted_ids.append(str(file_id))
+
+            # Backend often sends only the remaining evidenceFiles after a delete (the removed file is omitted)
+            # without deletedDocumentIds or isDeleted. Those IDs would stay in the vector store and skip logic below
+            # would leave strategy/analysis/list-of-dates/applicable-laws stale (files_to_process becomes empty).
+            if payload.evidenceFiles is not None:
+                try:
+                    non_deleted_evidence = [
+                        f
+                        for f in payload.evidenceFiles
+                        if not (
+                            getattr(f, "isDeleted", False)
+                            or getattr(f, "is_deleted", False)
+                        )
+                    ]
+                    id_from_file = []
+                    for f in non_deleted_evidence:
+                        fid = getattr(f, "id", None) or getattr(f, "_id", None)
+                        if fid:
+                            id_from_file.append(str(fid).strip())
+                    # Only infer when every remaining file has an id (avoid false orphan deletion).
+                    if non_deleted_evidence and len(id_from_file) == len(non_deleted_evidence):
+                        from app.vectorstore.qdrant import vector_store
+
+                        current_id_set = set(id_from_file)
+                        existing_docs = await vector_store.get_all_documents(
+                            workspace_id=payload.workspaceId
+                        )
+                        existing_id_set = {
+                            str(d.get("document_id"))
+                            for d in (existing_docs or [])
+                            if d.get("document_id")
+                        }
+                        orphan_ids = [i for i in existing_id_set if i not in current_id_set]
+                        for oid in orphan_ids:
+                            if oid not in deleted_ids:
+                                deleted_ids.append(oid)
+                        if orphan_ids:
+                            logger.info(
+                                "🗑️ Inferred {} removed document(s) (in vector store but not in evidenceFiles): {}",
+                                len(orphan_ids),
+                                orphan_ids,
+                            )
+                except Exception as orphan_err:
+                    logger.warning(
+                        "Vector vs evidenceFiles orphan detection failed: {}",
+                        orphan_err,
+                    )
+
             if deleted_ids:
-                logger.info("🗑️ Resolved deleted document IDs (from payload + isDeleted): {}", deleted_ids)
-            
+                logger.info("🗑️ Document IDs to remove from vector store (explicit + inferred): {}", deleted_ids)
+
             logger.info(
                 "🔄 Workspace sync: {} (User: {}, Role: {})",
                 payload.workspaceId,
@@ -3534,12 +4137,18 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     len(deleted_ids),
                     deleted_ids
                 )
+                delete_ok = False
                 try:
                     await vector_store.delete_documents(
                         workspace_id=payload.workspaceId,
                         document_ids=deleted_ids,
                     )
-                    # Regenerate strategy and analysis; emit both (always emit, use fallbacks when no docs or on error)
+                    delete_ok = True
+                except Exception as del_err:
+                    logger.error("Vector store delete failed: {}", str(del_err))
+                    logger.exception(del_err)
+                if delete_ok:
+                    # Resolve role once; list_of_dates + applicable_laws must run after delete even if strategy emit fails.
                     workspace_role = (payload.workspaceRole or "").strip().upper() or "ADJUDICATOR"
                     if workspace_role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
                         workspace_role = "ADJUDICATOR"
@@ -3569,18 +4178,21 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                             workspace_role,
                             is_update=True,
                         )
-                    if self._socket_client:
-                        await self._socket_client.emit(
-                            "document_feature_response",
-                            {
-                                "featureType": "strategy_objective",
-                                "workspaceId": payload.workspaceId,
-                                "userId": payload.userId,
-                                "payload": strategies_result,
-                            },
-                        )
-                        self._workspace_strategy_payload[payload.workspaceId] = strategies_result
-                        logger.success("🎉 Strategy & Objectives sent after document deletion")
+                    try:
+                        if self._socket_client:
+                            await self._socket_client.emit(
+                                "document_feature_response",
+                                {
+                                    "featureType": "strategy_objective",
+                                    "workspaceId": payload.workspaceId,
+                                    "userId": payload.userId,
+                                    "payload": strategies_result,
+                                },
+                            )
+                            self._workspace_strategy_payload[payload.workspaceId] = strategies_result
+                            logger.success("🎉 Strategy & Objectives sent after document deletion")
+                    except Exception as strat_emit_err:
+                        logger.warning("Strategy emit after delete failed: {}", strat_emit_err)
 
                     # Analysis report: always emit valid payload (never null); use fallback when no docs or on error
                     analysis_report = None
@@ -3598,18 +4210,22 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         analysis_report = self._analysis_report_fallback(
                             (workspace_role or "ADJUDICATOR").strip().upper()
                         )
-                    if self._socket_client:
-                        await self._socket_client.emit(
-                            "document_feature_response",
-                            {
-                                "featureType": "analysis_report",
-                                "workspaceId": payload.workspaceId,
-                                "userId": payload.userId,
-                                "payload": analysis_report,
-                            },
-                        )
-                        self._workspace_analysis_payload[payload.workspaceId] = analysis_report
-                        logger.success("✅ Analysis report sent after document deletion")
+                    try:
+                        if self._socket_client:
+                            await self._socket_client.emit(
+                                "document_feature_response",
+                                {
+                                    "featureType": "analysis_report",
+                                    "workspaceId": payload.workspaceId,
+                                    "userId": payload.userId,
+                                    "payload": analysis_report,
+                                },
+                            )
+                            self._workspace_analysis_payload[payload.workspaceId] = analysis_report
+                            logger.success("✅ Analysis report sent after document deletion")
+                    except Exception as ar_emit_err:
+                        logger.warning("Analysis report emit after delete failed: {}", ar_emit_err)
+
                     try:
                         await self._generate_and_emit_list_of_dates(
                             workspace_id=payload.workspaceId,
@@ -3619,9 +4235,14 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         )
                     except Exception as lod_err:
                         logger.warning("List of dates after document deletion failed: {}", lod_err)
-                except Exception as del_err:
-                    logger.error("Error handling document deletion: {}", str(del_err))
-                    logger.exception(del_err)
+                    try:
+                        await self._generate_and_emit_applicable_laws(
+                            workspace_id=payload.workspaceId,
+                            user_id=payload.userId,
+                            workspace_role=workspace_role,
+                        )
+                    except Exception as laws_err:
+                        logger.warning("Applicable laws after document deletion failed: {}", laws_err)
 
             # Process new evidence files if any (skip files that are deleted: isDeleted true or in deleted_ids)
             files_to_process = []
@@ -3893,6 +4514,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                         )
                                         self._workspace_analysis_payload[payload.workspaceId] = fallback
                                         logger.info("✅ Analysis report (fallback, 0 successful sync) sent to backend")
+                                        await self._generate_and_emit_applicable_laws(
+                                            workspace_id=payload.workspaceId,
+                                            user_id=payload.userId,
+                                            workspace_role=workspace_role,
+                                        )
                                     except Exception as e:
                                         logger.error("Failed to emit analysis report fallback (sync 0 success): {}", e)
                         except Exception as emit_error:
@@ -3982,6 +4608,18 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                             },
                         )
                         logger.success("✅ List of dates re-emitted to backend (from cache)")
+                    applicable_laws = self._workspace_applicable_laws_payload.get(workspace_id)
+                    if applicable_laws is not None:
+                        await self._socket_client.emit(
+                            "document_feature_response",
+                            {
+                                "featureType": "applicable_laws",
+                                "workspaceId": workspace_id,
+                                "userId": user_id,
+                                "payload": applicable_laws,
+                            },
+                        )
+                        logger.success("✅ Applicable laws re-emitted to backend (from cache)")
                 else:
                     await self._emit_analysis_report(
                         workspace_id,
@@ -3998,6 +4636,22 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 try:
                     workspace_id = payload.workspaceId
                     user_id = payload.userId
+                    # Explicit [] means "no documents in workspace" — wipe vector DB so re-uploads are clean.
+                    # evidenceFiles omitted (None) may be a partial sync; do not delete vectors in that case.
+                    if payload.evidenceFiles is not None and len(payload.evidenceFiles) == 0:
+                        try:
+                            from app.vectorstore.qdrant import vector_store
+
+                            await vector_store.delete_workspace(workspace_id=workspace_id)
+                            logger.info(
+                                "🗑️ Cleared all vectors for workspace {} (evidenceFiles is empty list)",
+                                workspace_id,
+                            )
+                        except Exception as clear_err:
+                            logger.warning(
+                                "Could not clear vector store for empty evidence list: {}",
+                                clear_err,
+                            )
                     workspace_role = (payload.workspaceRole or "ADJUDICATOR").strip().upper()
                     if workspace_role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
                         workspace_role = "ADJUDICATOR"
@@ -4045,6 +4699,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         },
                     )
                     self._workspace_list_of_dates_payload[workspace_id] = []
+                    await self._generate_and_emit_applicable_laws(
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        workspace_role=workspace_role,
+                    )
                     logger.success(
                         "✅ Strategy & Analysis report & list of dates (empty) sent to backend (no documents in workspace)"
                     )
@@ -4215,6 +4874,21 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     logger.success("✅ Panel updates applied from chat message")
             except Exception as upd_err:
                 logger.warning("Panel update attempt failed; continuing with generic chat. err={}", str(upd_err))
+
+            chat_type_upper = (payload.chat_type or "").strip().upper()
+            chat_type_to_module = {
+                "ANALYSIS_REPORT": "analysis_report",
+                "STRATEGY_OBJECTIVE": "strategy_objective",
+                "APPLICABLE_LAWS": "applicable_laws",
+                "DRAFTING_ASSISTANT": "drafting_assistant",
+                "TEMPLATES_CASE_LAWS": "case_laws",
+            }
+            active_module = chat_type_to_module.get(chat_type_upper)
+            cached_analysis = self._workspace_analysis_payload.get(workspace_id)
+            if cached_analysis and isinstance(cached_analysis, dict):
+                workspace_state["analysis_report"] = dict(cached_analysis)
+
+            custom_chat_suffix = build_custom_instruction_suffix(workspace_id) or None
             
             # STEP 2 & 3: Build chat context with role, document count, uploaded documents, and optional chat attachment
             chat_context = ChatContext(
@@ -4222,6 +4896,8 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 user_id=user_id,
                 role_context=role_context,
                 workspace_state=workspace_state,
+                active_module=active_module,
+                custom_instruction_suffix=custom_chat_suffix,
                 chat_history=[
                     {"role": item.role, "content": item.content}
                     for item in payload.conversation_history

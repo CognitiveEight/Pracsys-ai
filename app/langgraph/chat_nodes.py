@@ -122,8 +122,49 @@ APPLICABLE LAWS ({len(applicable_laws)} available):
 """
         context_sections.append(laws_section)
     
-    # 5b. UPLOADED DOCUMENTS (source of truth – use these for drafts, answers, and any document-based response)
+    # 5a. ANALYSIS REPORT (cached panel snapshot – use for Analysis Report chat, score explanation, strengths/risks)
     workspace_state = chat_context.get("workspace_state") or {}
+    analysis_report = workspace_state.get("analysis_report")
+    if isinstance(analysis_report, dict) and analysis_report:
+        score = analysis_report.get("caseResolutionScore")
+        if score is None:
+            score = analysis_report.get("case_resolution_score")
+        expl = (analysis_report.get("qualityScoreExplanation") or analysis_report.get("quality_score_explanation") or "").strip()
+        missing = analysis_report.get("missingInfo") or analysis_report.get("missing_info") or []
+        strengths_ar = analysis_report.get("strengths") or []
+        weak_ar = analysis_report.get("weaknesses") or []
+        risks_ar = analysis_report.get("risks") or []
+        juris = analysis_report.get("relevantJurisdiction") or analysis_report.get("relevant_jurisdiction") or []
+        pending = analysis_report.get("pendingActions") or analysis_report.get("pending_actions") or []
+        next_st = analysis_report.get("nextSteps") or analysis_report.get("next_steps") or []
+        drafts_ar = analysis_report.get("suggestedDrafts") or analysis_report.get("suggested_drafts") or []
+        st_lines = []
+        for s in strengths_ar[:5]:
+            if isinstance(s, dict):
+                pt = (s.get("point") or s.get("text") or "").strip()
+                laws = s.get("laws") or s.get("law") or []
+                if not isinstance(laws, list):
+                    laws = [laws] if laws else []
+                law_s = ", ".join(str(l) for l in laws[:3] if l)
+                st_lines.append(f"- {pt[:300]}" + (f" ({law_s})" if law_s else ""))
+            elif s:
+                st_lines.append(f"- {str(s)[:300]}")
+        ar_section = f"""
+CACHED ANALYSIS REPORT (same data as the Analysis Report panel; use for questions about score, gaps, risks):
+- Case resolution score: {score}%
+- Quality score explanation: {expl if expl else "(see counts below — user may ask you to explain the score in your own words)"}
+- Missing information ({len(missing) if isinstance(missing, list) else 0}): {chr(10).join(f"  - {str(x)[:200]}" for x in (missing[:6] if isinstance(missing, list) else [])) or "  (none)"}
+- Strengths: {chr(10).join(st_lines) if st_lines else "  (none)"}
+- Weaknesses ({len(weak_ar) if isinstance(weak_ar, list) else 0}): {chr(10).join(f"  - {str(x)[:200]}" for x in (weak_ar[:6] if isinstance(weak_ar, list) else [])) or "  (none)"}
+- Risks ({len(risks_ar) if isinstance(risks_ar, list) else 0}): {chr(10).join(f"  - {str(x)[:200]}" for x in (risks_ar[:6] if isinstance(risks_ar, list) else [])) or "  (none)"}
+- Relevant jurisdiction: {", ".join(str(x) for x in (juris[:5] if isinstance(juris, list) else [])) or "(none)"}
+- Pending actions: {", ".join(str(x) for x in (pending[:5] if isinstance(pending, list) else [])) or "(none)"}
+- Next steps: {", ".join(str(x) for x in (next_st[:5] if isinstance(next_st, list) else [])) or "(none)"}
+- Suggested drafts: {", ".join(str(x) for x in (drafts_ar[:5] if isinstance(drafts_ar, list) else [])) or "(none)"}
+"""
+        context_sections.append(ar_section)
+
+    # 5b. UPLOADED DOCUMENTS (source of truth – use these for drafts, answers, and any document-based response)
     uploaded_docs = workspace_state.get("uploaded_documents") or []
     if uploaded_docs:
         docs_section = "\nUPLOADED DOCUMENTS (use as source of truth for this workspace):\n"

@@ -4,7 +4,7 @@ Updated to match backend Socket.IO specification.
 """
 from typing import Optional, List, Any, Dict, Literal
 from datetime import datetime
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, ConfigDict, AliasChoices
 
 
 # ============================================================================
@@ -125,17 +125,16 @@ class UserMessageRequestPayload(BaseModel):
     When user uploads a document in chat, attachment has url, fileName, mimeType.
     """
     
+    model_config = ConfigDict(populate_by_name=True)
+
     content: str  # User message content (backend sends 'content', not 'message')
-    chat_type: str  # ChatType from backend
+    chat_type: str = Field(validation_alias=AliasChoices("chat_type", "chatType"))
     conversation_history: List[ConversationHistoryItem] = []
     workspaceId: Optional[str] = None
     userId: Optional[str] = None
     chatId: Optional[str] = None
     timestamp: str  # ISO timestamp
     attachment: Optional[ChatAttachmentPayload] = None  # Document uploaded with this message (e.g. ANALYSIS_REPORT chat)
-    
-    class Config:
-        populate_by_name = True
 
 
 # ============================================================================

@@ -5,7 +5,7 @@ Implements governed, role-aware chat reasoning.
 
 import re
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
@@ -54,6 +54,89 @@ _EXPLANATION_SUPPRESSED_IN_UI = frozenset(
         "Default greeting response",
     }
 )
+
+# Short replies that continue the prior assistant offer/question (must not be GREETING)
+_AFFIRMATION_CONTINUE_PHRASES = frozenset(
+    {
+        "yes",
+        "yeah",
+        "yep",
+        "yup",
+        "sure",
+        "ok",
+        "okay",
+        "please",
+        "pls",
+        "plz",
+        "please do",
+        "go ahead",
+        "do it",
+        "proceed",
+        "continue",
+        "absolutely",
+        "of course",
+        "sounds good",
+        "that would be great",
+    }
+)
+
+
+def _normalize_short_user_reply(msg: str) -> str:
+    return re.sub(r"\s+", " ", (msg or "").strip().lower()).strip(" \t.!?,")
+
+
+def is_user_affirmation_to_continue(msg: str) -> bool:
+    """
+    True when the user is likely answering 'yes' / 'ok' to the assistant's
+    prior question (e.g. 'Would you like a detailed analysis?').
+    """
+    n = _normalize_short_user_reply(msg)
+    if not n:
+        return False
+    if n in _AFFIRMATION_CONTINUE_PHRASES:
+        return True
+    if (
+        len(n) < 48
+        and n.split()[0] in {"yes", "yeah", "yep", "yup", "ok", "okay", "sure"}
+    ):
+        return True
+    return False
+
+
+def _last_ai_message_from_history(chat_history: List[Dict[str, Any]]) -> str:
+    for msg in reversed(chat_history or []):
+        if (msg.get("role") or "").upper() == "AI":
+            return (msg.get("content") or "").strip()
+    return ""
+
+
+def merge_intelligence_chat_history(
+    conversation_items: Optional[List[Any]],
+    *,
+    current_user_content: str,
+    cached_last_ai: Optional[str],
+) -> List[Dict[str, Any]]:
+    """
+    Build chat_history for the graph. If the client omits the last assistant
+    turn but the user sends a short affirmation, append cached_last AI text
+    so the model can resolve 'yes' / 'ok' correctly.
+    """
+    hist: List[Dict[str, Any]] = []
+    for item in conversation_items or []:
+        role = getattr(item, "role", None)
+        content = getattr(item, "content", None)
+        if isinstance(item, dict):
+            role = item.get("role")
+            content = item.get("content")
+        hist.append({"role": role, "content": content or ""})
+    cached = (cached_last_ai or "").strip()
+    if (
+        cached
+        and is_user_affirmation_to_continue(current_user_content)
+        and (not hist or (hist[-1].get("role") or "").upper() != "AI")
+    ):
+        hist = list(hist) + [{"role": "AI", "content": cached}]
+    return hist
 
 
 def chat_context_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -239,6 +322,10 @@ CACHED ANALYSIS REPORT (same data as the Analysis Report panel; use for question
             "For high-level questions (e.g. case goal, what the dispute is about), prefer ACTIVE STRATEGY and "
             "CACHED ANALYSIS REPORT in this prompt if present; read annexures for detail only when needed.\n"
         )
+        docs_section += (
+            "NUMERIC INTEGRITY: Transcribe purchase price, invoice totals, and other figures exactly as in the "
+            "excerpts below; if a figure does not appear here, do not invent it — say it is not in the supplied excerpt.\n"
+        )
         for i, doc in enumerate(uploaded_docs, 1):
             content = doc.get("content") or ""
             if content:
@@ -265,14 +352,16 @@ CACHED ANALYSIS REPORT (same data as the Analysis Report panel; use for question
                 attach_section += f"\n--- {name} ---\n{content}\n"
         context_sections.append(attach_section)
 
-    # 6. Chat History (last 3 exchanges; support both {user_message, response} and {role, content})
+    # 6. Chat History (last several turns; support both {user_message, response} and {role, content})
     chat_history = chat_context.get("chat_history", [])
     if chat_history:
         history_section = "RECENT CONVERSATION:\n"
-        for msg in chat_history[-6:]:  # up to 6 messages (3 exchanges)
+        for msg in chat_history[-12:]:  # enough context for "yes" following a prior offer
             if msg.get("role") and msg.get("content") is not None:
                 label = "User" if (msg.get("role") == "USER") else "Assistant"
-                history_section += f"{label}: {(msg.get('content') or '')[:200]}\n"
+                content = (msg.get("content") or "").strip()
+                lim = 1200 if (msg.get("role") == "AI") else 600
+                history_section += f"{label}: {content[:lim]}\n"
             else:
                 history_section += f"User: {(msg.get('user_message') or 'N/A')[:100]}\n"
                 history_section += (
@@ -326,14 +415,35 @@ async def intent_classifier_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "error_message": "No message provided",
         }
 
+    chat_ctx = state.get("chat_context") or {}
+    hist = chat_ctx.get("chat_history") or []
+    last_ai_in_thread = _last_ai_message_from_history(hist)
+    if last_ai_in_thread and is_user_affirmation_to_continue(user_message):
+        # Critical: "yes"/"ok" after the assistant offered detail must not be GREETING
+        bypass = IntentClassificationResult(
+            intent="CLARIFY",
+            confidence=0.97,
+            reasoning="Short affirmation continuing the assistant's prior message or offer.",
+            requires_agent=False,
+            target_agent=None,
+            is_supported=True,
+            rejection_reason=None,
+        )
+        return {
+            **state,
+            "intent_classification": bypass.to_dict(),
+            "intent": "CLARIFY",
+            "intent_classified": True,
+        }
+
     # Intent classification prompt
     classification_prompt = f"""
 Classify the following user message into ONE of these intents:
 
 INTENTS:
-- GREETING: Simple greetings, casual conversation, or social interactions (hi, hello, how are you, thanks, etc.)
+- GREETING: Only standalone social openers (hi, hello, hey, good morning, how are you, bye) or thanks with NO prior assistant question being answered. NEVER GREETING for "yes", "yeah", "ok", "sure", "please", "go ahead" answering something the assistant just asked or offered.
 - EXPLAIN: User wants explanation of existing intelligence or workspace content
-- CLARIFY: User asking follow-up or clarification questions about specific topics
+- CLARIFY: Follow-up, clarification, OR short affirmations ("yes", "ok", "sure", "please do") agreeing to the assistant's last suggestion or question
 - VALIDATE: User wants to validate facts or information
 - DRAFT: User wants to create or draft pleadings, filings, or formal text
 - STRATEGY_CHANGE: User wants to change strategy
@@ -346,10 +456,10 @@ USER MESSAGE: "{user_message}"
 ROLE: {role}
 
 IMPORTANT: 
-- Simple greetings like "hi", "hello", "hey", "thanks", "good morning" should be classified as GREETING
-- Only use EXPLAIN when user is asking about workspace intelligence or specific information
-- Use CLARIFY when user is following up on previous conversation
-- Most conversational/social messages should be GREETING
+- "yes", "yep", "ok", "sure", "please", "go ahead", "absolutely" → CLARIFY (user continuing the thread), NOT GREETING
+- "hi", "hello", "thanks" as a pure greeting → GREETING
+- Use EXPLAIN for substantive new questions about the workspace or case
+- Use CLARIFY for follow-ups and for short replies that refer to the immediately previous assistant turn
 
 Respond in format:
 INTENT: <intent_name>
@@ -534,6 +644,10 @@ async def explain_why_node(state: Dict[str, Any]) -> Dict[str, Any]:
     workspace_state = chat_context.get("workspace_state") or {}
     chat_history = chat_context.get("chat_history") or []
     documents_count = workspace_state.get("documents_count", 0)
+    last_ai_turn = _last_ai_message_from_history(chat_history)
+    followup_affirmation = bool(
+        last_ai_turn and is_user_affirmation_to_continue(user_message)
+    )
 
     # Special handling for GREETING intent - simple, natural responses
     if intent == "GREETING":
@@ -589,6 +703,24 @@ Formatting:
 - Do not use many "###" markdown headings for simple short questions.
 
 Stay in role. If case-specific facts are missing, say what is missing instead of inventing them.
+
+Accuracy (non-negotiable for court-style answers):
+- State rupee amounts, invoice totals, dates, and other hard numbers ONLY if they appear in the annexures or panel context in this prompt; never invent or substitute a “plausible” figure.
+- Consumer / private-party product or service disputes: lead with Consumer Protection Act, 2019 (defect / deficiency as appropriate); do not claim Article 14 “applies to” private companies in the same way as State action — use CPA, contract, and measured fairness language unless facts show State / Article 12 or writ-appropriate public function.
+- Do not center Bharatiya Sakshya Adhiniyam unless the issue is genuinely evidentiary admissibility; describe admissions and records in plain terms when it is a consumer dispute.
+- Compensation: realistic, proportionate framing for Indian consumer fora; avoid routine very large “mental agony” promises. No US slang such as “lemon” or “lemon law”.
+"""
+    if followup_affirmation:
+        tail = last_ai_turn[:6000] if last_ai_turn else ""
+        reasoning_prompt += f"""
+
+CRITICAL — USER CONTINUATION (their message is only: "{user_message}"):
+The user's reply affirms or accepts what the assistant proposed in the message below. Fulfill that proposal now in full (legal analysis, remedies under the Indian litigation framework, forum, grounds — as applicable). Do NOT respond with a generic greeting, "Great!", or ask again whether they want the analysis — deliver the substance immediately.
+
+PREVIOUS ASSISTANT MESSAGE:
+---
+{tail}
+---
 """
 
     try:
@@ -596,11 +728,15 @@ Stay in role. If case-specific facts are missing, say what is missing instead of
 
         start_time = datetime.utcnow()
 
+        max_tok = _max_tokens_for_chat_intent(intent or "EXPLAIN")
+        if followup_affirmation:
+            max_tok = max(max_tok, 3600)
+
         response = await gemini_client.generate(
             reasoning_prompt,
             system_instruction=system_instruction,
             temperature=0.35,
-            max_tokens=_max_tokens_for_chat_intent(intent or "EXPLAIN"),
+            max_tokens=max_tok,
         )
 
         processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000

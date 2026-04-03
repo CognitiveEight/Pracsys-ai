@@ -20,8 +20,11 @@ from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
 from app.processing.document_processor import document_processor
-from app.prompts.legal_intelligence_system import \
-    get_legal_intelligence_system_instruction
+from app.prompts.legal_intelligence_system import (
+    ANNEXURE_UPLOAD_GATE_MESSAGE,
+    get_legal_intelligence_system_instruction,
+)
+from app.langgraph.chat_nodes import merge_intelligence_chat_history
 from app.socket.schemas import (AIResponseMetadata, AIResponsePayload,
                                 UserMessageRequestPayload,
                                 WorkspaceCreatedPayload, WorkspaceSyncPayload)
@@ -88,6 +91,8 @@ class SocketEventHandler:
         self._pending_reemit_user_id: Optional[str] = None
         # Chat attachment cache: chat_id -> list of {fileName, content} so follow-up questions in same chat see the document
         self._chat_attachment_by_chat: Dict[str, List[Dict[str, Any]]] = {}
+        # Intelligence chat: last assistant text per chat_id (client may omit conversation_history)
+        self._intelligence_last_ai_by_chat: Dict[str, str] = {}
         # Last ai_response payload; re-emit after reconnect when socket dropped right after emit so backend receives it
         self._pending_ai_response: Optional[Dict[str, Any]] = None
         # De-dup guard for replayed workspace_sync events (e.g., reconnect replay).
@@ -5884,8 +5889,9 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         disp = (getattr(ef, "filename", None) or "").strip()
                         if disp:
                             id_to_annexure_name[str(fid)] = disp
-                max_chars_per_doc = 2500
-                max_total_chars = 8000
+                # Larger excerpts so invoice amounts and key clauses are less often truncated
+                max_chars_per_doc = 4500
+                max_total_chars = 12000
                 total = 0
                 doc_snippets = []
                 for doc in (all_docs or [])[:20]:
@@ -6010,7 +6016,12 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
 
             custom_chat_suffix = build_custom_instruction_suffix(workspace_id) or None
 
-            # STEP 2 & 3: Build chat context with role, document count, uploaded documents, and optional chat attachment
+            # STEP 2 & 3: Build chat context (merge server-side last AI turn when client omits it)
+            chat_history_resolved = merge_intelligence_chat_history(
+                payload.conversation_history,
+                current_user_content=payload.content or "",
+                cached_last_ai=self._intelligence_last_ai_by_chat.get(chat_id),
+            )
             chat_context = ChatContext(
                 workspace_id=workspace_id,
                 user_id=user_id,
@@ -6018,10 +6029,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 workspace_state=workspace_state,
                 active_module=active_module,
                 custom_instruction_suffix=custom_chat_suffix,
-                chat_history=[
-                    {"role": item.role, "content": item.content}
-                    for item in payload.conversation_history
-                ],
+                chat_history=chat_history_resolved,
             )
 
             # STEP 4: Process with Intelligence Chat Agent
@@ -6104,6 +6112,15 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 self._pending_ai_response = payload_dict
                 await self._socket_client.emit_ai_response(payload_dict)
                 logger.success("✅ AI response sent successfully")
+                # Cache assistant text for follow-ups like "yes" when conversation_history is incomplete
+                _rt = (response_text_to_emit or "").strip()
+                if (
+                    _rt
+                    and "Select one role to proceed" not in _rt
+                    and not _rt.startswith(ANNEXURE_UPLOAD_GATE_MESSAGE[:40])
+                    and not _rt.lower().startswith("i apologize")
+                ):
+                    self._intelligence_last_ai_by_chat[chat_id] = _rt
             else:
                 logger.error("❌ Socket client not available to emit response")
 

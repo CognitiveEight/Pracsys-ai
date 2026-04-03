@@ -2,9 +2,12 @@
 
 from app.prompts.legal_intelligence_system import (
     LEGAL_INTELLIGENCE_SYSTEM_PROMPT,
-    get_legal_intelligence_system_instruction)
+    get_legal_intelligence_system_instruction,
+    get_structured_document_feature_system_instruction,
+)
 
 __all__ = [
     "LEGAL_INTELLIGENCE_SYSTEM_PROMPT",
     "get_legal_intelligence_system_instruction",
+    "get_structured_document_feature_system_instruction",
 ]

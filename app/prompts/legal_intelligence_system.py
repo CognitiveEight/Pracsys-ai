@@ -688,6 +688,25 @@ def _litigation_framework_role_suffix(role_upper: str) -> str:
     )
 
 
+def get_structured_document_feature_system_instruction(
+    current_role: Optional[str] = None,
+) -> str:
+    """
+    System instruction for document-derived JSON features (strategy & objective, analysis
+    report, list of dates, applicable laws). Intentionally excludes LEGAL_INTELLIGENCE_SYSTEM_PROMPT,
+    whose mandatory annexure gate ("do not analyze; show role picker only") overrides user
+    JSON instructions and produces generic fallbacks.
+    """
+    role_upper = (current_role or "").strip().upper() or "ADJUDICATOR"
+    return (
+        "You are a backend structured-output module for Indian legal workspaces. "
+        f"The workspace role is already selected: {role_upper}. "
+        "Never ask the user to choose a role. Never output annexure-upload gate messages, "
+        "onboarding text, or conversational preambles. "
+        "Output only valid JSON exactly as specified in the user message (no markdown code fences)."
+    )
+
+
 def get_legal_intelligence_system_instruction(
     current_role: Optional[str] = None,
     annexures_uploaded: bool = False,

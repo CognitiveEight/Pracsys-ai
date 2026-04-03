@@ -23,6 +23,7 @@ from app.processing.document_processor import document_processor
 from app.prompts.legal_intelligence_system import (
     ANNEXURE_UPLOAD_GATE_MESSAGE,
     get_legal_intelligence_system_instruction,
+    get_structured_document_feature_system_instruction,
 )
 from app.langgraph.chat_nodes import merge_intelligence_chat_history
 from app.socket.schemas import (AIResponseMetadata, AIResponsePayload,
@@ -397,11 +398,12 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                     )
                 ai_response = await gemini_client.generate(
                     prompt=structured_prompt,
-                    system_instruction=self._get_generation_system_instruction(
+                    system_instruction=get_structured_document_feature_system_instruction(
                         workspace_role
                     ),
-                    temperature=0.4,  # Lower temperature for more structured output
-                    max_tokens=12000,  # Allow full nextSteps without truncation
+                    temperature=0.2,
+                    max_tokens=12000,
+                    response_mime_type="application/json",
                 )
 
                 logger.info(f"AI generated {len(ai_response)} characters of analysis")
@@ -418,9 +420,17 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                 # Clean the response
                 ai_response = ai_response.strip()
 
-                # Strategy 1: Look for JSON in markdown code blocks using brace-count (handles nested {} and truncated output)
+                # Prefer whole-response JSON when Gemini honors response_mime_type=application/json
                 json_str = None
-                if "```json" in ai_response:
+                if ai_response.startswith("{"):
+                    try:
+                        json.loads(ai_response)
+                        json_str = ai_response
+                    except json.JSONDecodeError:
+                        pass
+
+                # Strategy 1: Look for JSON in markdown code blocks using brace-count (handles nested {} and truncated output)
+                if json_str is None and "```json" in ai_response:
                     # Extract everything after ```json
                     start = ai_response.find("```json") + 7
                     remaining = ai_response[start:].strip()
@@ -1045,11 +1055,12 @@ No extra text.
 
             ai_response = await gemini_client.generate(
                 prompt=analysis_prompt,
-                system_instruction=self._get_generation_system_instruction(
+                system_instruction=get_structured_document_feature_system_instruction(
                     workspace_role
                 ),
-                temperature=0.35,
+                temperature=0.2,
                 max_tokens=12000,
+                response_mime_type="application/json",
             )
             logger.info(
                 "Analysis report AI response length: {} chars",
@@ -1527,149 +1538,164 @@ Example shape:
             # Keep deterministic JSON extraction for timeline completeness.
             raw = await gemini_client.generate(
                 prompt=prompt,
-                system_instruction=self._get_generation_system_instruction(
+                system_instruction=get_structured_document_feature_system_instruction(
                     workspace_role
                 ),
                 temperature=0.0,
                 max_tokens=12000,
+                response_mime_type="application/json",
             )
             raw = (raw or "").strip()
             if not raw or raw.startswith("Error"):
                 logger.warning("List of dates: Gemini error or empty response")
                 return []
 
-            # Strip markdown and find JSON array
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```\s*$", "", raw)
-            start = raw.find("[")
-            if start < 0:
-                logger.warning(
-                    "List of dates: no '[' found in response; raw preview={}",
-                    (raw or "")[:150],
-                )
-                return []
-            # String-aware bracket matching: do not count [ or ] inside double-quoted strings
-            depth = 0
-            end = -1
-            i = start
-            in_string = False
-            escape_next = False
-            quote_char = '"'
-            while i < len(raw):
-                c = raw[i]
-                if escape_next:
-                    escape_next = False
-                    i += 1
-                    continue
-                if c == "\\" and in_string:
-                    escape_next = True
-                    i += 1
-                    continue
-                if not in_string:
-                    if c == quote_char:
-                        in_string = True
-                    elif c == "[":
-                        depth += 1
-                    elif c == "]":
-                        depth -= 1
-                        if depth == 0:
-                            end = i
-                            break
-                else:
-                    if c == quote_char:
-                        in_string = False
-                i += 1
+            # Whole-response JSON array when MIME type is honored (skip fence stripping / bracket scan)
+            if raw.startswith("["):
+                try:
+                    _direct_arr = json.loads(raw)
+                    if isinstance(_direct_arr, list):
+                        arr = _direct_arr
+                    else:
+                        arr = None
+                except json.JSONDecodeError:
+                    arr = None
+            else:
+                arr = None
 
-            json_str = None
-            if end >= 0:
-                json_str = raw[start : end + 1]
-            if not json_str or end < 0:
-                # Fallback: truncated response (missing ']') – try appending ']' and balance braces
-                json_str = raw[start:].strip()
-                if json_str and not json_str.endswith("]"):
-                    # Count unclosed [ and } to try to close the array
-                    open_brackets = json_str.count("[") - json_str.count("]")
-                    open_braces = json_str.count("{") - json_str.count("}")
-                    for _ in range(open_braces):
-                        json_str += "}"
-                    for _ in range(open_brackets):
-                        json_str += "]"
-                    logger.info(
-                        "List of dates: truncated response; attempted to close brackets"
-                    )
-                if not json_str:
+            if arr is None:
+                # Strip markdown and find JSON array
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```\s*$", "", raw)
+                start = raw.find("[")
+                if start < 0:
                     logger.warning(
-                        "List of dates: no matching ']' found; raw preview={}",
-                        raw[:200],
+                        "List of dates: no '[' found in response; raw preview={}",
+                        (raw or "")[:150],
                     )
                     return []
+                # String-aware bracket matching: do not count [ or ] inside double-quoted strings
+                depth = 0
+                end = -1
+                i = start
+                in_string = False
+                escape_next = False
+                quote_char = '"'
+                while i < len(raw):
+                    c = raw[i]
+                    if escape_next:
+                        escape_next = False
+                        i += 1
+                        continue
+                    if c == "\\" and in_string:
+                        escape_next = True
+                        i += 1
+                        continue
+                    if not in_string:
+                        if c == quote_char:
+                            in_string = True
+                        elif c == "[":
+                            depth += 1
+                        elif c == "]":
+                            depth -= 1
+                            if depth == 0:
+                                end = i
+                                break
+                    else:
+                        if c == quote_char:
+                            in_string = False
+                    i += 1
 
-            try:
-                arr = json.loads(json_str)
-            except json.JSONDecodeError as e:
-                logger.warning(
-                    "List of dates: JSON decode error: {}; attempting salvage", e
-                )
-                # Salvage: look for object-like substrings with "date": and parse or regex-extract
-                salvage = []
-                search_region = raw[start:] if start >= 0 else raw
-                offset = start if start >= 0 else 0
-                for mobj in re.finditer(
-                    r'\{\s*"date"\s*:\s*"([^"]+)"\s*,\s*"title"\s*:\s*"([^"]*)"',
-                    search_region,
-                ):
-                    try:
-                        # Find the full object: from { to matching }
-                        beg = offset + mobj.start()
-                        if beg < 0:
-                            continue
-                        depth_br = 0
-                        j = beg
-                        in_str = False
-                        esc = False
-                        q = '"'
-                        while j < len(raw):
-                            ch = raw[j]
-                            if esc:
-                                esc = False
-                                j += 1
-                                continue
-                            if ch == "\\" and in_str:
-                                esc = True
-                                j += 1
-                                continue
-                            if not in_str:
-                                if ch == q:
-                                    in_str = True
-                                elif ch == "{":
-                                    depth_br += 1
-                                elif ch == "}":
-                                    depth_br -= 1
-                                    if depth_br == 0:
-                                        candidate = raw[beg : j + 1]
-                                        try:
-                                            obj = json.loads(candidate)
-                                            if isinstance(obj, dict) and obj.get(
-                                                "date"
-                                            ):
-                                                salvage.append(obj)
-                                        except json.JSONDecodeError:
-                                            pass
-                                        break
-                            else:
-                                if ch == q:
-                                    in_str = False
-                            j += 1
-                    except Exception:
-                        pass
-                if salvage:
-                    arr = salvage
-                    logger.info(
-                        "List of dates: salvaged {} entries from malformed JSON",
-                        len(arr),
+                json_str = None
+                if end >= 0:
+                    json_str = raw[start : end + 1]
+                if not json_str or end < 0:
+                    # Fallback: truncated response (missing ']') – try appending ']' and balance braces
+                    json_str = raw[start:].strip()
+                    if json_str and not json_str.endswith("]"):
+                        # Count unclosed [ and } to try to close the array
+                        open_brackets = json_str.count("[") - json_str.count("]")
+                        open_braces = json_str.count("{") - json_str.count("}")
+                        for _ in range(open_braces):
+                            json_str += "}"
+                        for _ in range(open_brackets):
+                            json_str += "]"
+                        logger.info(
+                            "List of dates: truncated response; attempted to close brackets"
+                        )
+                    if not json_str:
+                        logger.warning(
+                            "List of dates: no matching ']' found; raw preview={}",
+                            raw[:200],
+                        )
+                        return []
+
+                try:
+                    arr = json.loads(json_str)
+                except json.JSONDecodeError as e:
+                    logger.warning(
+                        "List of dates: JSON decode error: {}; attempting salvage", e
                     )
-                else:
-                    return []
+                    # Salvage: look for object-like substrings with "date": and parse or regex-extract
+                    salvage = []
+                    search_region = raw[start:] if start >= 0 else raw
+                    offset = start if start >= 0 else 0
+                    for mobj in re.finditer(
+                        r'\{\s*"date"\s*:\s*"([^"]+)"\s*,\s*"title"\s*:\s*"([^"]*)"',
+                        search_region,
+                    ):
+                        try:
+                            # Find the full object: from { to matching }
+                            beg = offset + mobj.start()
+                            if beg < 0:
+                                continue
+                            depth_br = 0
+                            j = beg
+                            in_str = False
+                            esc = False
+                            q = '"'
+                            while j < len(raw):
+                                ch = raw[j]
+                                if esc:
+                                    esc = False
+                                    j += 1
+                                    continue
+                                if ch == "\\" and in_str:
+                                    esc = True
+                                    j += 1
+                                    continue
+                                if not in_str:
+                                    if ch == q:
+                                        in_str = True
+                                    elif ch == "{":
+                                        depth_br += 1
+                                    elif ch == "}":
+                                        depth_br -= 1
+                                        if depth_br == 0:
+                                            candidate = raw[beg : j + 1]
+                                            try:
+                                                obj = json.loads(candidate)
+                                                if isinstance(obj, dict) and obj.get(
+                                                    "date"
+                                                ):
+                                                    salvage.append(obj)
+                                            except json.JSONDecodeError:
+                                                pass
+                                            break
+                                else:
+                                    if ch == q:
+                                        in_str = False
+                                j += 1
+                        except Exception:
+                            pass
+                    if salvage:
+                        arr = salvage
+                        logger.info(
+                            "List of dates: salvaged {} entries from malformed JSON",
+                            len(arr),
+                        )
+                    else:
+                        return []
             if not isinstance(arr, list):
                 arr = [arr] if isinstance(arr, dict) else []
 
@@ -2179,9 +2205,12 @@ Indian Kanoon / case-law search results:
 """
         raw = await gemini_client.generate(
             prompt=prompt,
-            system_instruction=self._get_generation_system_instruction(workspace_role),
+            system_instruction=get_structured_document_feature_system_instruction(
+                workspace_role
+            ),
             temperature=0.2,
             max_tokens=8000,
+            response_mime_type="application/json",
         )
         logger.info("Applicable laws: raw LLM response preview={}", (raw or "")[:500])
         text = (raw or "").strip()
@@ -2786,7 +2815,7 @@ Indian Kanoon / case-law search results:
             )
             txt = await gemini_client.generate(
                 prompt=prompt,
-                system_instruction=self._get_generation_system_instruction(
+                system_instruction=get_structured_document_feature_system_instruction(
                     workspace_role
                 ),
                 temperature=0.35,
@@ -3154,8 +3183,12 @@ Output ONLY valid JSON, no markdown, no code block:
 """
             raw = await gemini_client.generate(
                 prompt=prompt,
-                temperature=0.6,
+                system_instruction=get_structured_document_feature_system_instruction(
+                    None
+                ),
+                temperature=0.3,
                 max_tokens=8000,
+                response_mime_type="application/json",
             )
             raw = (raw or "").strip()
             if not raw or raw.startswith("Error") or "Error generating" in raw[:50]:

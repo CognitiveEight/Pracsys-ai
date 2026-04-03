@@ -10,14 +10,30 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import time
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import socketio
 from loguru import logger
 
+from app import __version__ as app_version
 from app.core.config import settings
+from app.socket.backend_events import AI_HEARTBEAT_PING, AI_HEARTBEAT_PONG
 from app.socket.events import event_handler
 from app.utils.exceptions import SocketConnectionError
+
+_AI_PROCESS_START_MONO = time.monotonic()
+
+
+def _utc_iso_ms_z() -> str:
+    """UTC ISO-8601 with millisecond precision and Z suffix."""
+    now = datetime.now(timezone.utc)
+    return (
+        now.strftime("%Y-%m-%dT%H:%M:%S.")
+        + f"{now.microsecond // 1000:03d}"
+        + "Z"
+    )
 
 
 class SocketClient:
@@ -312,6 +328,35 @@ class SocketClient:
         await self.emit("unsubscribe", {"workspace_id": workspace_id})
         logger.info("Unsubscribed from workspace: {}", workspace_id)
 
+    def _heartbeat_pong_payload(
+        self, payload_in: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Build pong body; echoes requestId/serverSentAt from Node when present."""
+        return {
+            "requestId": payload_in.get("requestId"),
+            "serverSentAt": payload_in.get("serverSentAt"),
+            "aiTimestamp": _utc_iso_ms_z(),
+            "status": "ok",
+            "version": app_version,
+            "uptimeMs": int((time.monotonic() - _AI_PROCESS_START_MONO) * 1000),
+        }
+
+    async def _emit_heartbeat_pong(self, payload: Dict[str, Any]) -> None:
+        """
+        Emit pong on every backend ping. Does not use emit-wait logic.
+        Always attempts if the client exists so idle sockets keep application-level traffic.
+        """
+        if not self.sio:
+            return
+        try:
+            await self.sio.emit(
+                AI_HEARTBEAT_PONG,
+                payload,
+                namespace=settings.socket_namespace,
+            )
+        except Exception as e:
+            logger.warning("Heartbeat pong emit failed: {}", e)
+
     def _register_handlers(self) -> None:
         """
         Register Socket.IO event handlers.
@@ -333,8 +378,9 @@ class SocketClient:
             logger.info("   - user_message_request")
             logger.info("   - probing_prompts_request")
             logger.info("   - analysis_report_feedback")
+            logger.info("   - ai_heartbeat_ping")
             logger.info(
-                "📤 Ready to emit: ai_response, probing_prompts_response, document_feature_response"
+                "📤 Ready to emit: ai_response, probing_prompts_response, document_feature_response, ai_heartbeat_pong"
             )
             self._connected = True
             self._connected_event.set()
@@ -455,6 +501,24 @@ class SocketClient:
             """
             logger.info("📋 Received analysis_report_feedback event")
             await event_handler.handle("analysis_report_feedback", data)
+
+        @self.sio.on(AI_HEARTBEAT_PING)
+        async def ai_heartbeat_ping(data):
+            """
+            Node backend → AI: reply with ai_heartbeat_pong on every ping so the link stays active.
+            """
+            payload_in = data if isinstance(data, dict) else {}
+            try:
+                out = self._heartbeat_pong_payload(payload_in)
+            except Exception as e:
+                logger.warning("heartbeat ping payload build failed, sending minimal pong: {}", e)
+                out = {
+                    "aiTimestamp": _utc_iso_ms_z(),
+                    "status": "ok",
+                    "version": app_version,
+                    "uptimeMs": int((time.monotonic() - _AI_PROCESS_START_MONO) * 1000),
+                }
+            await self._emit_heartbeat_pong(out)
 
         # ========================================================================
         # Legacy event handlers (for backward compatibility)

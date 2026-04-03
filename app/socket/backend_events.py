@@ -251,6 +251,35 @@ class AIResponsePayload(BaseModel):
 
 
 # ============================================================================
+# Heartbeat (Backend → AI ping, AI → Backend pong)
+# ============================================================================
+
+AI_HEARTBEAT_PING = "ai_heartbeat_ping"
+AI_HEARTBEAT_PONG = "ai_heartbeat_pong"
+
+
+class AIHeartbeatPingPayload(BaseModel):
+    """
+    Backend → AI_Maverick. Emitted periodically or from healthCheck().
+    """
+
+    requestId: Optional[str] = None
+    serverSentAt: Optional[str] = None
+    source: Optional[str] = None  # "backend" | "health_check"
+
+
+class AIHeartbeatPongPayload(BaseModel):
+    """AI_Maverick → Backend. Echoes ping correlation fields when present."""
+
+    requestId: Optional[str] = None
+    serverSentAt: Optional[str] = None
+    aiTimestamp: str
+    status: Literal["ok"] = "ok"
+    version: str
+    uptimeMs: int
+
+
+# ============================================================================
 # Additional Events (Not in official docs but used internally)
 # ============================================================================
 

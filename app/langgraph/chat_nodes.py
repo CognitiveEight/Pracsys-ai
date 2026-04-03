@@ -36,12 +36,12 @@ def _strip_trailing_sources_block(text: str) -> str:
 def _max_tokens_for_chat_intent(intent: str) -> int:
     """Cap length for routine Q&A; leave headroom for drafting and heavy intents."""
     return {
-        "DRAFT": 4000,
-        "STRATEGY_CHANGE": 3200,
-        "NEXT_STEPS": 2800,
-        "VALIDATE": 2200,
-        "REMOVE_INSIGHT": 2200,
-    }.get(intent, 1400)
+        "DRAFT": 8000,
+        "STRATEGY_CHANGE": 8000,
+        "NEXT_STEPS": 8000,
+        "VALIDATE": 8000,
+        "REMOVE_INSIGHT": 8000,
+    }.get(intent, 8000)
 
 
 # Explanations kept for governance/metadata only — never append to user-visible chat text

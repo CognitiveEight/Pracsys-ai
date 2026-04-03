@@ -81,6 +81,7 @@ class AISocketService:
             logger.info("   - workspace_created: New workspace created")
             logger.info("   - workspace_sync: Workspace updated")
             logger.info("   - user_message_request: User chat message")
+            logger.info("   - ai_heartbeat_ping: Backend keepalive (replies with ai_heartbeat_pong)")
             logger.info("📤 Ready to emit:")
             logger.info("   - ai_response: AI chat response")
 

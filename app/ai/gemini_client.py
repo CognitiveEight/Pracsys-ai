@@ -3,6 +3,7 @@ Google Gemini AI client for SimplerToday.
 Handles all interactions with Gemini 2.0 Flash model.
 """
 
+import asyncio
 from typing import Any, Dict, List, Optional
 
 import google.generativeai as genai
@@ -98,10 +99,14 @@ class GeminiClient:
             else:
                 full_prompt = prompt
 
-            # Generate
-            response = self.model.generate_content(
-                full_prompt, generation_config=generation_config
-            )
+            # Run sync SDK in a thread so long strategy/analysis calls do not block
+            # the asyncio loop (intelligence chat must stay responsive).
+            def _sync_generate():
+                return self.model.generate_content(
+                    full_prompt, generation_config=generation_config
+                )
+
+            response = await asyncio.to_thread(_sync_generate)
 
             result = response.text
 
@@ -142,15 +147,10 @@ class GeminiClient:
             return "Error: Gemini model not available"
 
         try:
-            # Start chat session
-            chat = self.model.start_chat(history=[])
-
-            # Configure generation
             generation_config = genai.types.GenerationConfig(
                 temperature=temperature, max_output_tokens=max_tokens, **kwargs
             )
 
-            # Build conversation
             conversation_text = ""
 
             if system_instruction:
@@ -169,10 +169,13 @@ class GeminiClient:
 
             conversation_text += "Assistant:"
 
-            # Generate response
-            response = chat.send_message(
-                conversation_text, generation_config=generation_config
-            )
+            def _sync_chat():
+                chat = self.model.start_chat(history=[])
+                return chat.send_message(
+                    conversation_text, generation_config=generation_config
+                )
+
+            response = await asyncio.to_thread(_sync_chat)
 
             result = response.text
 
@@ -198,12 +201,15 @@ class GeminiClient:
             self.initialize()
 
         try:
-            # Use Google's embedding API
-            result = genai.embed_content(
-                model=self.embedding_model_name,
-                content=text,
-                task_type="retrieval_document",
-            )
+
+            def _sync_embed():
+                return genai.embed_content(
+                    model=self.embedding_model_name,
+                    content=text,
+                    task_type="retrieval_document",
+                )
+
+            result = await asyncio.to_thread(_sync_embed)
 
             embedding = result["embedding"]
 

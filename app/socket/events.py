@@ -2309,6 +2309,212 @@ Indian Kanoon / case-law search results:
             "timestamp": datetime.utcnow().isoformat(),
         }
 
+    def _schedule_list_of_dates_and_applicable_laws(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        batch_result: Optional[Dict[str, Any]],
+        *,
+        log_context: str = "",
+    ) -> None:
+        """
+        Run list_of_dates then applicable_laws without blocking the active socket handler,
+        so user_message_request (intelligence chat) can be processed while these emit.
+        """
+        ctx = log_context or ""
+
+        async def _runner() -> None:
+            try:
+                await self._generate_and_emit_list_of_dates(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=workspace_role,
+                    batch_result=batch_result,
+                )
+            except Exception as lod_err:
+                logger.warning(
+                    "List of dates (background{}) failed: {}",
+                    ctx,
+                    lod_err,
+                )
+            try:
+                logger.info(
+                    "Applicable laws: invoking (background{}) for workspace {}",
+                    ctx,
+                    workspace_id[:12] if workspace_id else "",
+                )
+                await self._generate_and_emit_applicable_laws(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=workspace_role,
+                )
+            except Exception as laws_err:
+                logger.warning(
+                    "Applicable laws (background{}) failed: {}",
+                    ctx,
+                    laws_err,
+                )
+
+        try:
+            asyncio.create_task(_runner())
+            logger.debug(
+                "Scheduled list_of_dates + applicable_laws{} for workspace {}",
+                ctx,
+                workspace_id[:12] if workspace_id else "",
+            )
+        except RuntimeError as rt_err:
+            logger.error(
+                "Could not schedule timeline/laws task{}: {}",
+                ctx,
+                rt_err,
+            )
+
+    def _schedule_applicable_laws_only(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        *,
+        log_context: str = "",
+    ) -> None:
+        ctx = log_context or ""
+
+        async def _runner() -> None:
+            try:
+                await self._generate_and_emit_applicable_laws(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=workspace_role,
+                )
+            except Exception as laws_err:
+                logger.warning(
+                    "Applicable laws only (background{}) failed: {}",
+                    ctx,
+                    laws_err,
+                )
+
+        try:
+            asyncio.create_task(_runner())
+        except RuntimeError as rt_err:
+            logger.error(
+                "Could not schedule applicable_laws task{}: {}",
+                ctx,
+                rt_err,
+            )
+
+    async def _run_strategy_analysis_timeline_pipeline(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        batch_result: Dict[str, Any],
+        *,
+        is_update: bool,
+        analysis_log_context: str,
+    ) -> None:
+        """
+        Strategy → analysis report → scheduled list_of_dates + applicable_laws.
+        Runs inside asyncio.create_task so workspace_sync / workspace_created return quickly.
+        """
+        role = (workspace_role or "ADJUDICATOR").strip().upper()
+        if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+            role = "ADJUDICATOR"
+        try:
+            ctx = workspace_manager.get_workspace(workspace_id)
+            if ctx and ctx.workspace_role:
+                role = (ctx.workspace_role or role).upper()
+        except Exception:
+            pass
+
+        logger.info("Using workspace role for background AI pipeline: {}", role)
+        try:
+            strategies_result = await self._generate_strategies_from_documents(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=role,
+                batch_result=batch_result,
+                is_update=is_update,
+            )
+            if strategies_result and self._socket_client:
+                logger.success("✅ Strategies generated (background), emitting...")
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "strategy_objective",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": strategies_result,
+                    },
+                )
+                self._workspace_strategy_payload[workspace_id] = strategies_result
+                chips = strategies_result.get("suggestionChips") or []
+                if chips:
+                    self._workspace_suggestion_chips[workspace_id] = list(chips)
+                    self._last_workspace_id_with_chips = workspace_id
+                logger.success("🎉 Strategy & Objectives sent to backend (background)")
+        except Exception as strategy_error:
+            logger.error("Background strategy generation failed: {}", strategy_error)
+            logger.exception(strategy_error)
+            if self._socket_client:
+                try:
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "strategy_objective",
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "error": str(strategy_error),
+                        },
+                    )
+                except Exception as emit_error:
+                    logger.error("Failed to emit strategy error (bg): {}", emit_error)
+
+        await self._emit_analysis_report(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            workspace_role=role,
+            batch_result=batch_result,
+            is_update=is_update,
+            log_context=analysis_log_context,
+        )
+
+    def _schedule_strategy_analysis_pipeline(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        batch_result: Dict[str, Any],
+        *,
+        is_update: bool,
+        analysis_log_context: str,
+    ) -> None:
+        async def _runner() -> None:
+            try:
+                await self._run_strategy_analysis_timeline_pipeline(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=workspace_role,
+                    batch_result=batch_result,
+                    is_update=is_update,
+                    analysis_log_context=analysis_log_context,
+                )
+            except Exception as e:
+                logger.exception(
+                    "Background strategy/analysis pipeline failed for workspace {}: {}",
+                    workspace_id[:12] if workspace_id else "",
+                    e,
+                )
+
+        try:
+            asyncio.create_task(_runner())
+            logger.info(
+                "Scheduled background strategy + analysis + timeline/laws for workspace {}",
+                workspace_id[:12] if workspace_id else "",
+            )
+        except RuntimeError as e:
+            logger.error("Could not schedule strategy/analysis pipeline: {}", e)
+
     async def _emit_analysis_report(
         self,
         workspace_id: str,
@@ -2380,28 +2586,14 @@ Indian Kanoon / case-law search results:
                 )
         except Exception as chip_err:
             logger.warning("Analysis report chips generation failed: {}", chip_err)
-        # List of Dates: generate and emit chronological timeline after analysis report
-        try:
-            await self._generate_and_emit_list_of_dates(
-                workspace_id=workspace_id,
-                user_id=user_id,
-                workspace_role=workspace_role,
-                batch_result=batch_result,
-            )
-        except Exception as lod_err:
-            logger.warning("List of dates generation/emit failed: {}", lod_err)
-        try:
-            logger.info(
-                "Applicable laws: invoking after list_of_dates for workspace {}",
-                workspace_id[:12] if workspace_id else "",
-            )
-            await self._generate_and_emit_applicable_laws(
-                workspace_id=workspace_id,
-                user_id=user_id,
-                workspace_role=workspace_role,
-            )
-        except Exception as laws_err:
-            logger.warning("Applicable laws generation/emit failed: {}", laws_err)
+        # List of Dates + Applicable laws: background so intelligence chat can proceed
+        self._schedule_list_of_dates_and_applicable_laws(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            workspace_role=workspace_role,
+            batch_result=batch_result,
+            log_context=log_context or " (after analysis)",
+        )
         return True
 
     async def _generate_and_emit_analysis_report_for_sync(
@@ -2440,27 +2632,13 @@ Indian Kanoon / case-law search results:
                 )
                 self._workspace_analysis_payload[workspace_id] = analysis_report
                 logger.success("✅ Analysis report sent to backend (sync)")
-            try:
-                await self._generate_and_emit_list_of_dates(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    workspace_role=workspace_role,
-                    batch_result=batch_result,
-                )
-            except Exception as lod_err:
-                logger.warning("List of dates (sync) failed: {}", lod_err)
-            try:
-                logger.info(
-                    "Applicable laws: invoking in sync flow for workspace {}",
-                    workspace_id[:12] if workspace_id else "",
-                )
-                await self._generate_and_emit_applicable_laws(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    workspace_role=workspace_role,
-                )
-            except Exception as laws_err:
-                logger.warning("Applicable laws (sync) failed: {}", laws_err)
+            self._schedule_list_of_dates_and_applicable_laws(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+                batch_result=batch_result,
+                log_context=" (sync helper)",
+            )
         except asyncio.CancelledError:
             logger.warning("Analysis report (sync) task cancelled; emitting fallback")
             raise
@@ -2486,26 +2664,13 @@ Indian Kanoon / case-law search results:
                     logger.success(
                         "✅ Analysis report (fallback) sent to backend (sync)"
                     )
-                await self._generate_and_emit_list_of_dates(
+                self._schedule_list_of_dates_and_applicable_laws(
                     workspace_id=workspace_id,
                     user_id=user_id,
                     workspace_role=workspace_role,
                     batch_result=batch_result,
+                    log_context=" (sync fallback)",
                 )
-                try:
-                    logger.info(
-                        "Applicable laws: invoking in sync fallback flow for workspace {}",
-                        workspace_id[:12] if workspace_id else "",
-                    )
-                    await self._generate_and_emit_applicable_laws(
-                        workspace_id=workspace_id,
-                        user_id=user_id,
-                        workspace_role=workspace_role,
-                    )
-                except Exception as laws_err:
-                    logger.warning(
-                        "Applicable laws (sync fallback) failed: {}", laws_err
-                    )
             except Exception as e:
                 logger.error("Failed to emit analysis report fallback (sync): {}", e)
 
@@ -4512,91 +4677,18 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                     str(meta_err),
                                 )
 
-                        # 3) Strategy & objective — own try/except, exact same pattern as ex_event
-                        # 4) Analysis report — immediately after strategy, exact same emit pattern (so backend receives both)
+                        # 3–4) Strategy, analysis, list_of_dates, applicable_laws: background so chat events are not blocked
                         if batch_result.get("successful", 0) > 0:
                             logger.info(
-                                "🎯 Generating strategies and objectives from processed documents..."
+                                "🎯 Scheduling strategy + analysis + timeline/laws (background)…"
                             )
-                            try:
-                                strategies_result = (
-                                    await self._generate_strategies_from_documents(
-                                        workspace_id=payload.workspaceId,
-                                        user_id=payload.userId,
-                                        workspace_role=workspace_role,
-                                        batch_result=batch_result,
-                                    )
-                                )
-                                if strategies_result:
-                                    logger.success(
-                                        "✅ Strategies generated, emitting to backend..."
-                                    )
-                                    strategy_feature_payload = {
-                                        "featureType": "strategy_objective",
-                                        "workspaceId": str(payload.workspaceId),
-                                        "userId": str(payload.userId),
-                                        "payload": strategies_result,
-                                    }
-                                    logger.info("=" * 80)
-                                    logger.info(
-                                        "📋 STRATEGY & OBJECTIVE PAYLOAD (AI-GENERATED)"
-                                    )
-                                    logger.info("=" * 80)
-                                    logger.info(f"Workspace ID: {payload.workspaceId}")
-                                    logger.info(f"User ID: {payload.userId}")
-                                    logger.info(
-                                        f"Role: {strategies_result.get('role')}"
-                                    )
-                                    logger.info("=" * 80)
-                                    # Cache before emit so re-emit on reconnect has data if emit fails
-                                    self._workspace_strategy_payload[
-                                        payload.workspaceId
-                                    ] = strategies_result
-                                    await self._socket_client.emit(
-                                        "document_feature_response",
-                                        strategy_feature_payload,
-                                    )
-                                    chips = (
-                                        strategies_result.get("suggestionChips") or []
-                                    )
-                                    if chips:
-                                        self._workspace_suggestion_chips[
-                                            payload.workspaceId
-                                        ] = list(chips)
-                                        self._last_workspace_id_with_chips = (
-                                            payload.workspaceId
-                                        )
-                                    logger.success(
-                                        "🎉 Strategy & Objectives sent to backend"
-                                    )
-                            except Exception as strategy_error:
-                                logger.error(
-                                    f"Failed to generate strategies: {strategy_error}"
-                                )
-                                logger.exception(strategy_error)
-                                try:
-                                    await self._socket_client.emit(
-                                        "document_feature_response",
-                                        {
-                                            "featureType": "strategy_objective",
-                                            "workspaceId": str(payload.workspaceId),
-                                            "userId": str(payload.userId),
-                                            "error": str(strategy_error),
-                                        },
-                                    )
-                                except Exception as emit_error:
-                                    logger.error(
-                                        f"Failed to emit strategy error: {emit_error}"
-                                    )
-
-                            # Analysis report — use central helper so it always emits to backend
-                            await self._emit_analysis_report(
-                                workspace_id=payload.workspaceId,
-                                user_id=payload.userId,
+                            self._schedule_strategy_analysis_pipeline(
+                                workspace_id=str(payload.workspaceId),
+                                user_id=str(payload.userId),
                                 workspace_role=workspace_role,
                                 batch_result=batch_result,
                                 is_update=False,
-                                log_context="",
+                                analysis_log_context="",
                             )
                         else:
                             # When no files succeeded, still emit analysis report (fallback) so backend always receives it
@@ -4638,10 +4730,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                     self._workspace_list_of_dates_payload[
                                         payload.workspaceId
                                     ] = []
-                                    await self._generate_and_emit_applicable_laws(
+                                    self._schedule_applicable_laws_only(
                                         workspace_id=str(payload.workspaceId),
                                         user_id=str(payload.userId),
                                         workspace_role=workspace_role,
+                                        log_context=" (created, 0 docs success)",
                                     )
                                 except Exception as e:
                                     logger.error(
@@ -4705,10 +4798,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     )
                     self._workspace_list_of_dates_payload[payload.workspaceId] = []
                     logger.info("✅ List of dates (empty, no docs) sent to backend")
-                    await self._generate_and_emit_applicable_laws(
+                    self._schedule_applicable_laws_only(
                         workspace_id=str(payload.workspaceId),
                         user_id=str(payload.userId),
                         workspace_role=workspace_role,
+                        log_context=" (created, no docs)",
                     )
                 except Exception as e:
                     logger.error("Failed to emit analysis report (no docs): {}", e)
@@ -5114,28 +5208,13 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                             "Analysis report emit after delete failed: {}", ar_emit_err
                         )
 
-                    try:
-                        await self._generate_and_emit_list_of_dates(
-                            workspace_id=payload.workspaceId,
-                            user_id=payload.userId,
-                            workspace_role=workspace_role,
-                            batch_result=None,
-                        )
-                    except Exception as lod_err:
-                        logger.warning(
-                            "List of dates after document deletion failed: {}", lod_err
-                        )
-                    try:
-                        await self._generate_and_emit_applicable_laws(
-                            workspace_id=payload.workspaceId,
-                            user_id=payload.userId,
-                            workspace_role=workspace_role,
-                        )
-                    except Exception as laws_err:
-                        logger.warning(
-                            "Applicable laws after document deletion failed: {}",
-                            laws_err,
-                        )
+                    self._schedule_list_of_dates_and_applicable_laws(
+                        workspace_id=str(payload.workspaceId),
+                        user_id=str(payload.userId),
+                        workspace_role=workspace_role,
+                        batch_result=None,
+                        log_context=" (after document deletion)",
+                    )
 
             # Process new evidence files if any (skip files that are deleted: isDeleted true or in deleted_ids)
             files_to_process = []
@@ -5376,11 +5455,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                         str(meta_err),
                                     )
 
-                            # Regenerate strategies and analysis; emit both (same pattern as ex_event.py)
                             if batch_result.get("successful", 0) > 0:
-                                logger.info(
-                                    "🎯 Regenerating strategies from all documents in workspace..."
-                                )
                                 workspace_role = (
                                     payload.workspaceRole or ""
                                 ).strip().upper() or "ADJUDICATOR"
@@ -5402,84 +5477,19 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 except Exception:
                                     pass
                                 logger.info(
-                                    "Using workspace role for strategies: {}",
+                                    "Using workspace role for strategies (sync): {}",
                                     workspace_role,
                                 )
-                                # Strategy — generate then emit (per ex_event)
-                                try:
-                                    strategies_result = (
-                                        await self._generate_strategies_from_documents(
-                                            workspace_id=payload.workspaceId,
-                                            user_id=payload.userId,
-                                            workspace_role=workspace_role,
-                                            batch_result=batch_result,
-                                            is_update=True,
-                                        )
-                                    )
-                                    if strategies_result:
-                                        logger.success(
-                                            "✅ Strategies regenerated, emitting to backend..."
-                                        )
-                                        strategy_feature_payload = {
-                                            "featureType": "strategy_objective",
-                                            "workspaceId": payload.workspaceId,
-                                            "userId": payload.userId,
-                                            "payload": strategies_result,
-                                        }
-                                        logger.info("=" * 80)
-                                        logger.info(
-                                            "📋 UPDATED STRATEGY & OBJECTIVE PAYLOAD (AI-GENERATED)"
-                                        )
-                                        logger.info("=" * 80)
-                                        await self._socket_client.emit(
-                                            "document_feature_response",
-                                            strategy_feature_payload,
-                                        )
-                                        self._workspace_strategy_payload[
-                                            payload.workspaceId
-                                        ] = strategies_result
-                                        chips = (
-                                            strategies_result.get("suggestionChips")
-                                            or []
-                                        )
-                                        if chips:
-                                            self._workspace_suggestion_chips[
-                                                payload.workspaceId
-                                            ] = list(chips)
-                                            self._last_workspace_id_with_chips = (
-                                                payload.workspaceId
-                                            )
-                                        logger.success(
-                                            "🎉 Updated Strategy & Objectives sent to backend"
-                                        )
-                                except Exception as strategy_error:
-                                    logger.error(
-                                        f"Failed to regenerate strategies: {strategy_error}"
-                                    )
-                                    logger.exception(strategy_error)
-                                    try:
-                                        await self._socket_client.emit(
-                                            "document_feature_response",
-                                            {
-                                                "featureType": "strategy_objective",
-                                                "workspaceId": payload.workspaceId,
-                                                "userId": payload.userId,
-                                                "error": str(strategy_error),
-                                            },
-                                        )
-                                    except Exception as emit_error:
-                                        logger.error(
-                                            f"Failed to emit strategy error: {emit_error}"
-                                        )
-
-                                # Analysis report — use central helper so it always emits to backend
-                                await self._emit_analysis_report(
-                                    workspace_id=payload.workspaceId,
-                                    user_id=payload.userId,
+                                logger.info(
+                                    "🎯 Scheduling strategy + analysis + timeline/laws on sync (background)…"
+                                )
+                                self._schedule_strategy_analysis_pipeline(
+                                    workspace_id=str(payload.workspaceId),
+                                    user_id=str(payload.userId),
                                     workspace_role=workspace_role,
                                     batch_result=batch_result,
                                     is_update=True,
-                                    log_context=" (sync)",
+                                    analysis_log_context=" (sync)",
                                 )
                             else:
                                 # When no files succeeded on sync, still emit analysis report (fallback)
@@ -5515,10 +5525,27 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                         logger.info(
                                             "✅ Analysis report (fallback, 0 successful sync) sent to backend"
                                         )
-                                        await self._generate_and_emit_applicable_laws(
-                                            workspace_id=payload.workspaceId,
-                                            user_id=payload.userId,
+                                        await self._socket_client.emit(
+                                            "document_feature_response",
+                                            {
+                                                "featureType": "list_of_dates",
+                                                "workspaceId": payload.workspaceId,
+                                                "userId": payload.userId,
+                                                "payload": {
+                                                    "workspaceId": payload.workspaceId,
+                                                    "userId": payload.userId,
+                                                    "listOfDates": [],
+                                                },
+                                            },
+                                        )
+                                        self._workspace_list_of_dates_payload[
+                                            payload.workspaceId
+                                        ] = []
+                                        self._schedule_applicable_laws_only(
+                                            workspace_id=str(payload.workspaceId),
+                                            user_id=str(payload.userId),
                                             workspace_role=workspace_role,
+                                            log_context=" (sync, 0 docs success)",
                                         )
                                     except Exception as e:
                                         logger.error(
@@ -5749,13 +5776,14 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         },
                     )
                     self._workspace_list_of_dates_payload[workspace_id] = []
-                    await self._generate_and_emit_applicable_laws(
+                    self._schedule_applicable_laws_only(
                         workspace_id=workspace_id,
                         user_id=user_id,
                         workspace_role=workspace_role,
+                        log_context=" (sync, no documents)",
                     )
                     logger.success(
-                        "✅ Strategy & Analysis report & list of dates (empty) sent to backend (no documents in workspace)"
+                        "✅ Strategy & Analysis report & list of dates (empty) sent to backend (no documents); applicable laws scheduled"
                     )
                 except Exception as e:
                     logger.error(

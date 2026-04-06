@@ -192,13 +192,12 @@ def chat_context_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # Build context sections
     context_sections = []
 
-    # 1. Role Context
+    # 1. Workspace context — chat answers are role-neutral for accuracy; panel may be role-conditioned
     role_section = f"""
-ROLE CONTEXT:
-You are operating as: {role}
-Reasoning Style: {role_context.get('reasoning_style', 'N/A')}
-Allowed Bias: {role_context.get('allowed_bias', 'none')}
-Forbidden Actions: {', '.join(role_context.get('forbidden_actions', []))}
+WORKSPACE CONTEXT (intelligence chat = impartial analyst):
+- Workspace / panel role: {role} (how Strategy & Objective text was generated — not a mandate to slant chat).
+- Do **not** adopt party "Reasoning Style" or "Allowed Bias" from role metadata unless the user explicitly asks for one party's perspective.
+- Default: balanced, accurate, both-side issue-spotting like a senior lawyer advising on merits, not advocating.
 """
     context_sections.append(role_section)
 
@@ -442,7 +441,7 @@ Classify the following user message into ONE of these intents:
 
 INTENTS:
 - GREETING: Only standalone social openers (hi, hello, hey, good morning, how are you, bye) or thanks with NO prior assistant question being answered. NEVER GREETING for "yes", "yeah", "ok", "sure", "please", "go ahead" answering something the assistant just asked or offered.
-- EXPLAIN: User wants explanation of existing intelligence or workspace content
+- EXPLAIN: User wants explanation of existing intelligence **or** broader legal reasoning: analogies, hypotheticals ("what if…"), comparisons, doctrine, procedure, "how would a court view…", brainstorming, risks, weaknesses, "play devil's advocate", or any substantive question that is not purely a drafting/strategy-panel mutation — even if it goes **beyond** text in the panel
 - CLARIFY: Follow-up, clarification, OR short affirmations ("yes", "ok", "sure", "please do") agreeing to the assistant's last suggestion or question
 - VALIDATE: User wants to validate facts or information
 - DRAFT: User wants to create or draft pleadings, filings, or formal text
@@ -458,8 +457,9 @@ ROLE: {role}
 IMPORTANT: 
 - "yes", "yep", "ok", "sure", "please", "go ahead", "absolutely" → CLARIFY (user continuing the thread), NOT GREETING
 - "hi", "hello", "thanks" as a pure greeting → GREETING
-- Use EXPLAIN for substantive new questions about the workspace or case
+- Use EXPLAIN for almost all substantive legal questions (workspace **and** open-ended legal thinking). Prefer EXPLAIN over UNKNOWN when unsure.
 - Use CLARIFY for follow-ups and for short replies that refer to the immediately previous assistant turn
+- NEVER output an intent name not in the list above; if torn between categories, choose EXPLAIN
 
 Respond in format:
 INTENT: <intent_name>
@@ -503,20 +503,22 @@ TARGET_AGENT: <agent_name or none>
         if target_agent and target_agent.lower() == "none":
             target_agent = None
 
-        # Validate intent
-        is_supported = intent in [e.value for e in ChatIntentEnum]
-        rejection_reason = (
-            None if is_supported else f"Intent '{intent}' is not supported"
-        )
-
+        # Validate intent — off-enum labels stop the graph; coerce to EXPLAIN
+        allowed_intents = {e.value for e in ChatIntentEnum}
+        if intent not in allowed_intents:
+            logger.warning(
+                "⚠️ Classifier returned non-enum intent {!r}; coercing to EXPLAIN",
+                intent,
+            )
+            intent = "EXPLAIN"
         classification_result = IntentClassificationResult(
             intent=intent,
             confidence=confidence,
             reasoning=reasoning,
             requires_agent=requires_agent,
             target_agent=target_agent,
-            is_supported=is_supported,
-            rejection_reason=rejection_reason,
+            is_supported=True,
+            rejection_reason=None,
         )
 
         logger.success(f"✅ Intent classified: {intent} (confidence: {confidence:.2f})")
@@ -533,13 +535,15 @@ TARGET_AGENT: <agent_name or none>
         logger.error(f"❌ Intent classification failed: {e}")
         return {
             **state,
-            "intent": "UNKNOWN",
+            "intent": "EXPLAIN",
             "intent_classification": {
-                "intent": "UNKNOWN",
-                "confidence": 0.0,
-                "reasoning": f"Classification error: {str(e)}",
-                "is_supported": False,
-                "rejection_reason": "Classification failed",
+                "intent": "EXPLAIN",
+                "confidence": 0.55,
+                "reasoning": f"Classification error (defaulting to explain): {str(e)}",
+                "requires_agent": False,
+                "target_agent": None,
+                "is_supported": True,
+                "rejection_reason": None,
             },
         }
 
@@ -565,7 +569,8 @@ async def _handle_greeting(
 
     # Generate natural, contextual greeting (still role-conditioned per legal intelligence rules)
     system_instruction = get_legal_intelligence_system_instruction(
-        current_role=role or "ADJUDICATOR"
+        current_role=role or "ADJUDICATOR",
+        role_neutral_chat=True,
     )
     greeting_prompt = f"""
 The user said: "{user_message}"
@@ -577,7 +582,7 @@ Generate a natural, friendly response that:
 4. Does NOT include formal explanations, reasoning sections, or governance language
 5. Does NOT use phrases like "From judicial perspective" or overly formal language
 
-Just respond naturally as a helpful assistant would, while remaining consistent with the workspace role.
+Just respond naturally as a helpful impartial legal assistant (no party slant unless they ask).
 """
 
     try:
@@ -680,6 +685,7 @@ async def explain_why_node(state: Dict[str, Any]) -> Dict[str, Any]:
         current_role=role,
         annexures_uploaded=documents_count > 0,
         role_confirmed=True,
+        role_neutral_chat=True,
     )
 
     # Build prompt: reason-first, proportionate length; avoid memo-style dumps for simple questions
@@ -695,14 +701,14 @@ You are an intelligence assistant. Calibrate response length to the question:
 - Short or single-focus questions (e.g. case goal, objective, "what is this about", parties, relief): give a direct, concise answer first—usually one short paragraph or a few bullets. Start from ACTIVE STRATEGY and CACHED ANALYSIS REPORT if present; only then tighten with annexures if needed. Do NOT turn this into a multi-section legal memo unless the user asks for detail.
 - Questions that explicitly ask for detailed analysis, full breakdown, outline of all arguments, or comparison of evidence: you may use clear sections or headings.
 - Drafting, line-by-line annexure interpretation, or "what does Annexure X say": ground answers in the relevant annexures; cite briefly inline when useful.
-- General legal/process questions: reasoning-led; cite annexures only when they add value.
+- General legal/process questions, hypotheticals, "what if", devil's advocate, or "what else should I consider": **engage fully** — use disciplined step-by-step reasoning, general Indian legal doctrine and practice where appropriate, and clearly label what is **on the file** vs **general background**. Do not limit yourself to paraphrasing the strategy panel when the user is clearly asking for broader judgment.
 - If annexures conflict, flag it; do not invent case facts.
 
 Formatting:
 - Routine chat: plain prose only. Do NOT add "SOURCES:" lists or "ANSWER:/EXPLANATION:" labels unless the user asked for a formal structured deliverable.
 - Do not use many "###" markdown headings for simple short questions.
 
-Stay in role. If case-specific facts are missing, say what is missing instead of inventing them.
+Stay **impartial** in analysis (workspace role only informs how the panel was written). If case-specific facts are missing, say what is missing instead of inventing them.
 
 Accuracy (non-negotiable for court-style answers):
 - State rupee amounts, invoice totals, dates, and other hard numbers ONLY if they appear in the annexures or panel context in this prompt; never invent or substitute a “plausible” figure.
@@ -735,7 +741,7 @@ PREVIOUS ASSISTANT MESSAGE:
         response = await gemini_client.generate(
             reasoning_prompt,
             system_instruction=system_instruction,
-            temperature=0.35,
+            temperature=0.45,
             max_tokens=max_tok,
         )
 

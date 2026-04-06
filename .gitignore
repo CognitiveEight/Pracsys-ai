@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Data
+data/
+*.db
+*.sqlite
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Distribution / packaging
+*.whl
+
+# Temporary files
+*.tmp
+tmp/
+temp/
+
+# GCP Credentials (SENSITIVE - DO NOT COMMIT)
+*.json
+*-service-account*.json
+bns-ai-*.json
+
+# Auto-generated Documentation
+*.md
+!README.md
+
+diagnose_socket.py
+example_ai_socket_usage.py
+example_socket_usage.py
+STRUCTURE.txt
+test_backend_payload.py
+test_socket_ai_service.py
+test_socket_signature.py
+test_strategy_generation.py
+# Keep only README.md for repo documentation
+

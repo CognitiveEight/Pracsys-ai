@@ -2,13 +2,9 @@
 
 from app.socket.client import SocketClient
 from app.socket.events import event_handler
-from app.socket.schemas import (
-    SocketResponse,
-    WorkspaceData,
-    EvidenceFile,
-    ChatMessage,
-    AgentResponse as SocketAgentResponse
-)
+from app.socket.schemas import AgentResponse as SocketAgentResponse
+from app.socket.schemas import (ChatMessage, EvidenceFile, SocketResponse,
+                                WorkspaceData)
 
 __all__ = [
     "SocketClient",
@@ -17,6 +13,5 @@ __all__ = [
     "WorkspaceData",
     "EvidenceFile",
     "ChatMessage",
-    "SocketAgentResponse"
+    "SocketAgentResponse",
 ]
-

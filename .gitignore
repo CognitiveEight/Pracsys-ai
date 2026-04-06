@@ -86,3 +86,4 @@ google-application-credentials.json
 # Auto-generated Documentation
 *.md
 !README.md
+!SYSTEM_ARCHITECTURE.md

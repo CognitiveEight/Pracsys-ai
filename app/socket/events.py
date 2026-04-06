@@ -26,9 +26,14 @@ from app.prompts.legal_intelligence_system import (
     get_structured_document_feature_system_instruction,
 )
 from app.langgraph.chat_nodes import merge_intelligence_chat_history
-from app.socket.schemas import (AIResponseMetadata, AIResponsePayload,
-                                UserMessageRequestPayload,
-                                WorkspaceCreatedPayload, WorkspaceSyncPayload)
+from app.socket.schemas import (
+    AIResponseMetadata,
+    AIResponsePayload,
+    ApplicableLawRelevanceRequestPayload,
+    UserMessageRequestPayload,
+    WorkspaceCreatedPayload,
+    WorkspaceSyncPayload,
+)
 from app.utils.exceptions import SocketEventError
 from app.workspace.custom_instructions import (build_custom_instruction_suffix,
                                                set_custom_instructions)
@@ -128,6 +133,10 @@ class SocketEventHandler:
         self.register("user_message_request", self.on_user_message_request)
         self.register("probing_prompts_request", self.on_probing_prompts_request)
         self.register("analysis_report_feedback", self.on_analysis_report_feedback)
+        self.register(
+            "applicable_law_relevance_request",
+            self.on_applicable_law_relevance_request,
+        )
 
         # Legacy event handlers
         self.register("workspace_updated", self.on_workspace_updated)
@@ -3405,6 +3414,272 @@ Output ONLY valid JSON, no markdown, no code block:
             logger.warning(
                 "analysis_report_feedback: no socket client – report updated in cache only"
             )
+
+    def _normalize_manual_law_relevance(self, raw: Optional[str]) -> str:
+        """Map model output to High, Medium, Low, or not relevant."""
+        if not raw:
+            return "not relevant"
+        s = str(raw).strip().lower()
+        if s in ("high", "h"):
+            return "High"
+        if s in ("medium", "med", "m"):
+            return "Medium"
+        if s in ("low", "l"):
+            return "Low"
+        if any(
+            x in s
+            for x in (
+                "not relevant",
+                "not applicable",
+                "irrelevant",
+                "none",
+                "no relevance",
+                "n/a",
+            )
+        ):
+            return "not relevant"
+        # Title-case unknown strings for optional freeform per spec
+        return str(raw).strip() or "not relevant"
+
+    async def _document_snippet_for_law_relevance(
+        self, workspace_id: str, max_chars: int = 12000
+    ) -> str:
+        """Concatenate recent document text for relevance assessment."""
+        try:
+            from app.vectorstore.qdrant import vector_store
+
+            all_docs = await vector_store.get_all_documents(workspace_id=workspace_id)
+        except Exception as e:
+            logger.warning("applicable_law_relevance: vector store read failed: {}", e)
+            all_docs = []
+        parts: List[str] = []
+        for doc in all_docs[:8]:
+            content = str(doc.get("content") or "").strip()
+            if len(content) < 20:
+                continue
+            parts.append(content[:2500])
+        joined = "\n\n---\n\n".join(parts)
+        if len(joined) > max_chars:
+            joined = joined[:max_chars] + "\n[... truncated ...]"
+        return joined or "No document text available for this workspace."
+
+    def _applicable_law_relevance_law_dict(
+        self,
+        *,
+        law_id: Optional[str],
+        act: str,
+        section: str,
+        title: Optional[str],
+        description: Optional[str],
+        relevance: str,
+    ) -> Dict[str, Any]:
+        """Build law object for applicable-law relevance responses (omit empty optionals)."""
+        out: Dict[str, Any] = {
+            "act": act,
+            "section": section,
+            "relevance": relevance,
+        }
+        if law_id:
+            out["id"] = law_id
+        if title:
+            out["title"] = title
+        if description:
+            out["description"] = description
+        return out
+
+    async def _emit_applicable_law_relevance_to_backend(
+        self,
+        workspace_id: str,
+        user_id: str,
+        request_id: Optional[str],
+        law_dict: Dict[str, Any],
+    ) -> None:
+        """
+        Backend integration: many gateways only persist AI output on document_feature_response.
+        Emit that first (featureType applicable_law_relevance), then the standalone event for spec parity.
+        """
+        if not self._socket_client:
+            logger.warning("applicable_law_relevance: no socket client; cannot emit")
+            return
+
+        payload_inner: Dict[str, Any] = {
+            "workspaceId": workspace_id,
+            "userId": user_id,
+            "law": law_dict,
+        }
+        if request_id:
+            payload_inner["requestId"] = request_id
+
+        doc_feature_body: Dict[str, Any] = {
+            "featureType": "applicable_law_relevance",
+            "workspaceId": workspace_id,
+            "userId": user_id,
+            "payload": payload_inner,
+        }
+        try:
+            doc_log = json.dumps(doc_feature_body, default=str)
+        except Exception:
+            doc_log = str(doc_feature_body)
+        logger.info(
+            "applicable_law_relevance → backend document_feature_response (preview): {}",
+            doc_log[:2000] + ("..." if len(doc_log) > 2000 else ""),
+        )
+        await self._socket_client.emit("document_feature_response", doc_feature_body)
+        await asyncio.sleep(0.1)
+
+        standalone: Dict[str, Any] = {
+            "workspaceId": workspace_id,
+            "userId": user_id,
+            "law": law_dict,
+        }
+        if request_id:
+            standalone["requestId"] = request_id
+        try:
+            solo_log = json.dumps(standalone, default=str)
+        except Exception:
+            solo_log = str(standalone)
+        logger.info(
+            "applicable_law_relevance → backend applicable_law_relevance_response (preview): {}",
+            solo_log[:2000] + ("..." if len(solo_log) > 2000 else ""),
+        )
+        await self._socket_client.emit("applicable_law_relevance_response", standalone)
+        logger.success(
+            "✅ applicable law relevance delivered to backend (document_feature_response + applicable_law_relevance_response) requestId={} relevance={}",
+            request_id,
+            law_dict.get("relevance"),
+        )
+
+    async def on_applicable_law_relevance_request(self, data: Dict[str, Any]) -> None:
+        """
+        Server asks whether a lawyer-selected act/section is relevant to the case documents.
+        Emits document_feature_response (featureType applicable_law_relevance) and
+        applicable_law_relevance_response with relevance: High | Medium | Low | not relevant.
+        """
+        from app.ai.gemini_client import gemini_client
+
+        payload_in = data if isinstance(data, dict) else {}
+        logger.info(
+            "applicable_law_relevance_request ← backend (received): keys={}",
+            list(payload_in.keys()) if isinstance(payload_in, dict) else type(payload_in),
+        )
+        try:
+            req = ApplicableLawRelevanceRequestPayload(**payload_in)
+        except Exception as e:
+            logger.warning("applicable_law_relevance_request: invalid payload {}: {}", e, payload_in)
+            workspace_id = str(payload_in.get("workspaceId") or payload_in.get("workspace_id") or "")
+            user_id = str(payload_in.get("userId") or payload_in.get("user_id") or "")
+            request_id_raw = payload_in.get("requestId") or payload_in.get("request_id")
+            request_id = str(request_id_raw) if request_id_raw else None
+            law_raw = payload_in.get("law") if isinstance(payload_in.get("law"), dict) else {}
+            if self._socket_client and workspace_id and user_id:
+                law_dict = self._applicable_law_relevance_law_dict(
+                    law_id=str(law_raw.get("id")) if law_raw.get("id") else None,
+                    act=str(law_raw.get("act") or ""),
+                    section=str(law_raw.get("section") or ""),
+                    title=str(law_raw.get("title") or "").strip() or None,
+                    description=str(law_raw.get("description") or "").strip() or None,
+                    relevance="not relevant",
+                )
+                await self._emit_applicable_law_relevance_to_backend(
+                    workspace_id, user_id, request_id, law_dict
+                )
+            else:
+                logger.warning(
+                    "applicable_law_relevance_request: cannot respond — missing socket or workspaceId/userId"
+                )
+            return
+
+        workspace_id = req.workspaceId
+        user_id = req.userId
+        request_id = req.requestId
+        law = req.law
+        act = (law.act or "").strip()
+        section = (law.section or "").strip()
+
+        logger.info(
+            "applicable_law_relevance_request ← backend (parsed): workspaceId={} userId={} requestId={} act={} section={}",
+            workspace_id[:24] if workspace_id else "",
+            user_id[:24] if user_id else "",
+            request_id,
+            act[:80] if act else "",
+            section[:80] if section else "",
+        )
+
+        async def _emit_response(relevance: str) -> None:
+            law_dict = self._applicable_law_relevance_law_dict(
+                law_id=law.id,
+                act=act,
+                section=section,
+                title=(law.title or "").strip() or None,
+                description=(law.description or "").strip() or None,
+                relevance=relevance,
+            )
+            await self._emit_applicable_law_relevance_to_backend(
+                workspace_id, user_id, request_id, law_dict
+            )
+
+        if not act or not section:
+            await _emit_response("not relevant")
+            return
+
+        doc_context = await self._document_snippet_for_law_relevance(workspace_id)
+        role = "ADJUDICATOR"
+        try:
+            ctx = workspace_manager.get_workspace(workspace_id)
+            if ctx and getattr(ctx, "workspace_role", None):
+                role = str(ctx.workspace_role).strip().upper() or role
+        except Exception:
+            pass
+
+        ud = (law.userDescription or "").strip()
+        title = (law.title or "").strip()
+        desc = (law.description or "").strip()
+        prompt = f"""You assess whether a specific statute provision is relevant to a case given ONLY the document excerpt below.
+
+Return ONLY valid JSON (no markdown):
+{{"relevance":"High"}} or {{"relevance":"Medium"}} or {{"relevance":"Low"}} or {{"relevance":"not relevant"}}
+
+Rules:
+- High: facts strongly support applying this act/section.
+- Medium: plausibly applicable but uncertain or partial fit.
+- Low: weak tangential link only.
+- not relevant: provision does not meaningfully apply to these facts, or documents lack basis.
+- Use IPC only if the lawyer selected IPC; prefer reasoning under Indian law generally.
+- If documents are empty or unhelpful, use "not relevant".
+
+Selected law:
+- Act: {act}
+- Section: {section}
+{f"- Title: {title}" if title else ""}
+{f"- Description: {desc}" if desc else ""}
+{f"- Lawyer note: {ud}" if ud else ""}
+
+Case documents (excerpt):
+{doc_context}
+"""
+        raw = await gemini_client.generate(
+            prompt=prompt,
+            system_instruction=self._get_generation_system_instruction(role),
+            temperature=0.2,
+            max_tokens=8000,
+        )
+        text = (raw or "").strip()
+        if "```" in text:
+            m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.I)
+            if m:
+                text = m.group(1).strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        rel = "not relevant"
+        if start >= 0 and end > start:
+            try:
+                obj = json.loads(text[start : end + 1])
+                rel = self._normalize_manual_law_relevance(obj.get("relevance"))
+            except Exception:
+                m = re.search(r'"relevance"\s*:\s*"([^"]+)"', text)
+                if m:
+                    rel = self._normalize_manual_law_relevance(m.group(1))
+        await _emit_response(rel)
 
     def _salvage_workspace_metadata_from_truncated_json(
         self, raw: str, combined: str = ""

@@ -1,0 +1,184 @@
+SimplerToday Project Structure
+================================
+
+NOTE: For tables, setup steps, and current feature list, see README.md.
+      This file is an ASCII tree for quick reference in any editor.
+
+simplertoday/
+│
+├── app/                                    # Main application package
+│   ├── __init__.py                         # Package initialization
+│   ├── main.py                             # Application entry point
+│   │
+│   ├── agents/                             # AI Agent System
+│   │   ├── __init__.py                     # Agent exports
+│   │   ├── base.py                         # Base agent class & interfaces
+│   │   ├── router.py                       # Agent routing logic
+│   │   └── chat_agent.py                   # Chat agent implementation
+│   │
+│   ├── ai/                                 # Gemini client (generation, embed)
+│   ├── langgraph/                          # Strategy + intelligence chat graphs
+│   ├── prompts/                            # Legal intelligence system prompts
+│   ├── processing/                         # Document extraction & batch processing
+│   │
+│   ├── core/                               # Core Application Layer
+│   │   ├── __init__.py                     # Core exports
+│   │   ├── config.py                       # Configuration management (Pydantic)
+│   │   ├── lifecycle.py                    # Application startup/shutdown
+│   │   └── security.py                     # Security utilities (JWT, hashing)
+│   │
+│   ├── observability/                      # Monitoring & Logging
+│   │   ├── __init__.py                     # Observability exports
+│   │   ├── logger.py                       # Logging configuration (Loguru)
+│   │   ├── audit.py                        # Audit trail logging
+│   │   └── trace.py                        # Distributed tracing
+│   │
+│   ├── socket/                             # Socket.IO Client
+│   │   ├── __init__.py                     # Socket exports
+│   │   ├── ai_service.py                   # AI service bootstrap
+│   │   ├── client.py                       # Socket client with reconnection
+│   │   ├── events.py                       # Event handlers
+│   │   ├── schemas.py                      # Pydantic data schemas
+│   │   └── backend_events.py               # Backend event helpers
+│   │
+│   ├── utils/                              # Utility Functions
+│   │   ├── __init__.py                     # Utils exports
+│   │   └── exceptions.py                   # Custom exception classes
+│   │
+│   ├── vectorstore/                        # Vector Database Layer
+│   │   ├── __init__.py                     # Vector store exports
+│   │   ├── qdrant.py                       # Qdrant integration
+│   │   └── memory.py                       # Conversation memory
+│   │
+│   └── workspace/                          # Workspace Management
+│       ├── __init__.py                     # Workspace exports
+│       ├── context.py                      # Workspace context & state
+│       └── manager.py                      # Workspace CRUD operations
+│
+├── logs/                                   # Log files (auto-generated)
+│   ├── app.log                             # All application logs
+│   ├── errors.log                          # Error logs only
+│   ├── structured.log                      # JSON structured logs
+│   └── audit/                              # Audit logs
+│       └── audit.log                       # Audit trail
+│
+├── data/                                   # Data storage (auto-generated)
+│   └── workspaces/                         # Workspace files
+│       └── {workspace_id}/                 # Per-workspace directory
+│           └── evidence_files/             # Downloaded files
+│
+├── .dockerignore                           # Docker ignore rules
+├── .gitignore                              # Git ignore rules
+├── ARCHITECTURE.md                         # Architecture documentation
+├── docker-compose.yml                      # Services (Qdrant, Redis)
+├── Dockerfile                              # Docker container image
+├── env.example                             # Environment variables template
+├── Makefile                                # Development commands
+├── PROJECT_SUMMARY.md                      # Project summary
+├── QUICKSTART.md                           # Quick start guide
+├── README.md                               # Main documentation
+├── requirements.txt                        # Python dependencies
+├── run.sh                                  # Startup script (executable)
+├── STRUCTURE.txt                           # This file
+└── test_setup.py                           # Setup verification script
+
+
+File Count Summary:
+-------------------
+Python Files: 26
+Documentation: 5
+Configuration: 7
+Total Files: 38+
+
+
+Key Directories:
+----------------
+app/agents/         - Agent implementations and routing
+app/ai/             - Gemini client
+app/langgraph/      - Strategy & intelligence chat workflows
+app/prompts/        - Legal intelligence prompts
+app/processing/     - Document processing
+app/core/           - Core application infrastructure
+app/observability/  - Logging, audit, tracing
+app/socket/         - Socket.IO client and events
+app/utils/          - Utilities and exceptions
+app/vectorstore/    - Vector store and memory
+app/workspace/      - Workspace management
+
+
+External Dependencies:
+----------------------
+- Qdrant (Vector Store)
+- Redis (Caching - optional)
+- Socket.IO Server (Required)
+- Google Gemini (LLM - primary; see GOOGLE_API_KEY)
+
+
+Auto-Generated Directories:
+---------------------------
+logs/               - Created on first run
+logs/audit/         - Created on first run
+data/workspaces/    - Created on first run
+
+
+Entry Points:
+-------------
+python -m app.main              - Direct execution
+./run.sh                        - Using startup script
+make run                        - Using Makefile
+docker build && docker run      - Using Docker
+
+
+Configuration:
+--------------
+Environment: .env file (copy from env.example)
+Settings: app/core/config.py
+Validation: Pydantic Settings
+
+
+Key Features:
+-------------
+✓ Socket.IO client with auto-reconnection
+✓ Workspace lifecycle management
+✓ Document embedding and semantic search
+✓ AI agent framework with routing
+✓ Comprehensive logging and audit trails
+✓ Distributed tracing
+✓ Security utilities (JWT, encryption)
+✓ Type-safe with Pydantic
+✓ Async/await throughout
+✓ Production-ready error handling
+
+
+Ready for Integration:
+----------------------
+- LLM providers (OpenAI, Anthropic)
+- Custom agents
+- Additional event handlers
+- REST API endpoints
+- WebSocket server
+- Custom storage backends
+
+
+Development Tools:
+------------------
+make setup          - Complete setup
+make test           - Run tests
+make run            - Start application
+make docker-up      - Start services
+make clean          - Clean temp files
+
+
+Documentation:
+--------------
+README.md           - Comprehensive guide
+QUICKSTART.md       - 5-minute setup
+ARCHITECTURE.md     - System design
+PROJECT_SUMMARY.md  - Project overview
+STRUCTURE.txt       - This file (structure)
+
+
+Status: ✅ COMPLETE & READY
+Version: 0.1.0
+Created: January 2026
+

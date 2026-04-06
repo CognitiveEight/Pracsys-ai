@@ -16,71 +16,73 @@ parts/
 sdist/
 var/
 wheels/
+pip-wheel-metadata/
+share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
 
-# Virtual Environment
+# Virtual environments
 venv/
 env/
 ENV/
-.venv
+.venv/
 
-# Environment Variables
+# Environment and secrets (never commit real values)
 .env
 .env.local
 .env.*.local
+!.env.example
 
-# IDEs
+# IDE / editor
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 .DS_Store
+.cursor/
 
-# Logs
+# Type checkers / linters (local caches)
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyright/
+
+# Logs and local data
 logs/
 *.log
-
-# Data
 data/
 *.db
 *.sqlite
 
-# Test
+# Tests / coverage
 .pytest_cache/
 .coverage
 htmlcov/
 .tox/
+.hypothesis/
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# Jupyter
+.ipynb_checkpoints/
 
-# Distribution / packaging
+# Packaging
 *.whl
 
-# Temporary files
+# Temporary
 *.tmp
 tmp/
 temp/
 
-# GCP Credentials (SENSITIVE - DO NOT COMMIT)
-*.json
+# -----------------------------------------------------------------------------
+# Cloud credentials & key material (narrow patterns — do not use blanket *.json)
+# -----------------------------------------------------------------------------
 *-service-account*.json
+*-serviceaccount*.json
 bns-ai-*.json
-
+gcp-vision.json
+google-application-credentials.json
 # Auto-generated Documentation
 *.md
 !README.md
-
-diagnose_socket.py
-example_ai_socket_usage.py
-example_socket_usage.py
-STRUCTURE.txt
-test_backend_payload.py
-test_socket_ai_service.py
-test_socket_signature.py
-test_strategy_generation.py
-# Keep only README.md for repo documentation
-

@@ -1,0 +1,53 @@
+# Core Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic>=2.5.3
+pydantic-settings>=2.1.0
+
+# Socket.IO Client
+python-socketio==5.11.1
+python-engineio==4.9.1
+aiohttp==3.9.5
+
+# AI/ML - Google Gemini
+google-generativeai>=0.4.0
+google-ai-generativelanguage>=0.4.0
+
+# Google Cloud (for Vision API OCR)
+google-cloud-vision>=3.4.0
+
+# LangChain with Google (compatible versions)
+langchain>=0.1.6
+langchain-google-genai>=0.0.11
+langchain-core>=0.1.52
+
+# LangGraph (compatible with langchain-core>=0.1.25)
+langgraph>=0.0.62
+
+# Vector Store
+qdrant-client==1.7.3
+
+# Database & Caching
+redis==5.0.1
+
+# Observability & Monitoring
+loguru==0.7.2
+prometheus-client==0.19.0
+
+# Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.6
+
+# Utilities
+python-dotenv==1.0.0
+httpx==0.26.0
+tenacity==8.2.3
+aiofiles==23.2.1
+
+# Document Processing
+PyPDF2==3.0.1
+python-docx==1.1.0
+pdf2image>=1.16.0
+docx2txt>=0.8
+

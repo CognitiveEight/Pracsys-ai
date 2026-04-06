@@ -147,6 +147,39 @@ context_builder → intent_classifier → explain_why → action_dispatcher → 
 
 ---
 
+### 3.4 Applicable Laws Generation
+
+**Location:** `app/socket/events.py` — `_generate_and_emit_applicable_laws`, `_generate_applicable_laws_from_sources`, `_extract_case_signals_from_documents`, `_search_indiankanoon`, `_search_google_cse_for_indiankanoon`, helpers `_normalize_applicable_laws_payload`, `_heuristic_applicable_laws_fallback`.
+
+**Role:** Populate the **Applicable Laws** panel with a structured list of **potentially relevant Indian statutes and sections**, grounded in workspace documents and external search snippets. Outputs support **research and drafting direction**, not definitive legal advice.
+
+**Flow:**
+
+1. **Case signals** (`_extract_case_signals_from_documents`): Read up to the first five documents from the **vector store**; build `workspaceTitle`, a **search query** (title + frequent keywords from text), `keywords`, and a **document evidence snippet** (concatenated excerpts).
+2. **Search (Indian Kanoon–oriented)**:
+   - **Primary:** HTTP GET to `indiankanoon.org` search HTML; parse result links/titles (`_search_indiankanoon`).
+   - **Fallback:** **Google Custom Search API** with `site:indiankanoon.org` (`_search_google_cse_for_indiankanoon`) when `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` are set; otherwise skip.
+3. **Synthesis** (`_generate_applicable_laws_from_sources`): Single **Gemini** call (`application/json`) with case signals + search result titles/snippets. System instruction uses `get_structured_document_feature_system_instruction` so output stays structured (no chat gate text). Model returns JSON: `laws[]` entries with `act`, `section`, `description`, `relevance` (`High` / `Medium` / `Low`). Prompt rules: Indian law focus, **no IPC** in output (prefer BNS where relevant), concise case-tied descriptions.
+4. **Normalize** (`_normalize_applicable_laws_payload`): Validates fields, maps relevance, **drops IPC-labelled rows**, caps list at **12** items, assigns stable `id` fields (`law_1`, …).
+5. **Heuristic fallback** (`_heuristic_applicable_laws_fallback`): If the model returns no laws, optional keyword-based stubs (e.g. IT Act, BNS, Companies Act, GST) from the evidence snippet.
+
+**Outbound payload:**
+
+- Socket event: `document_feature_response`
+- `featureType`: `"applicable_laws"`
+- `payload`: `{ "laws": [ { "id", "act", "section", "description", "relevance" }, ... ] }`
+
+**Caching and scheduling:**
+
+- In-memory cache: `_workspace_applicable_laws_payload[workspace_id]` for **reconnect / re-emit** (same pattern as analysis and list of dates).
+- **Order in pipeline:** Usually runs **after** `list_of_dates` inside `_schedule_list_of_dates_and_applicable_laws`, or alone via `_schedule_applicable_laws_only` (e.g. zero-document fallbacks). Work is **`asyncio.create_task`**-scheduled from `_emit_analysis_report` and sync/create paths so **long Gemini + HTTP work does not block** concurrent **`user_message_request`** handling.
+
+**Intelligence Chat:**
+
+- When the workspace stores `applicable_laws` in metadata, **`ChatContext`** can include that list; **`chat_context_builder_node`** surfaces titles into the prompt so answers can align with the panel (`app/langgraph/chat_nodes.py`, `app/langgraph/chat_integration.py`).
+
+---
+
 ## 4. End-to-End Data Flows
 
 ### 4.1 workspace_created
@@ -166,8 +199,9 @@ Backend emits workspace_created (workspaceId, userId, evidenceFiles, role, ...)
     → _emit_analysis_report(...) / _generate_and_emit_analysis_report_for_sync(...)
         → _generate_analysis_report_from_documents(...)   [Gemini]
         → emit document_feature_response (analysis_report)
-    → Optional: list_of_dates → emit document_feature_response (list_of_dates)
-    → Optional: applicable_laws (Indian Kanoon search + CSE fallback + Gemini normalization)
+        → schedule background: list_of_dates then applicable_laws (see §3.4)
+    → list_of_dates (scheduled) → emit document_feature_response (list_of_dates)
+    → applicable_laws (scheduled): signals from vector store → Kanoon / CSE → Gemini JSON → normalize / heuristic
         → emit document_feature_response (applicable_laws)
 ```
 
@@ -207,7 +241,8 @@ Backend emits user_message_request (chatId, workspaceId, userId, content, conver
 | **Intelligence Chat Agent** | `app/langgraph/intelligence_chat_agent.py` — LangGraph: context_builder → intent_classifier → explain_why (Gemini) → action_dispatcher → response_formatter → governance_validator. Used for every `user_message_request`. |
 | **Document processing** | `app/processing/document_processor.py` — Batch download and text extraction; stores content in vector store (Qdrant). |
 | **Vector store** | `app/vectorstore/qdrant.py` — Stores document content by workspace; used by strategy generation and chat context. |
-| **Gemini client** | `app/ai/gemini_client.py` — Used for strategy prompt, chat “explain_why”, and analysis report generation. |
+| **Gemini client** | `app/ai/gemini_client.py` — Used for strategy prompt, chat “explain_why”, analysis report generation, and applicable-laws JSON synthesis. |
+| **Applicable laws (socket)** | `app/socket/events.py` — `_generate_and_emit_applicable_laws` and helpers: vector-store signals, Indian Kanoon + optional Google CSE search, Gemini normalization, heuristic fallback; see **§3.4**. |
 | **Integration** | `app/langgraph/integration.py` — `WorkspaceRoleIntegration`: init workspace with role, sync role to workspace context, handle role change, process user message through role agent. |
 | **Chat integration** | `app/langgraph/chat_integration.py` — `process_workspace_chat()` builds `ChatContext` from workspace and calls `intelligence_chat_agent.process_message()`. |
 | **Observability** | `app/observability/` — Audit and tracing for role gate, role agent, strategy, and chat. |
@@ -219,6 +254,7 @@ Backend emits user_message_request (chatId, workspaceId, userId, content, conver
 - **WorkspaceState (LangGraph):** `workspace_id`, `user_id`, `role_state` (role, role_context, role_selected_at, role_history, role_validated), `messages`, `user_input`, `agent_output`, `metadata`, `error`, `next`. Used by Role-Based Agent.
 - **ChatContext (input to Chat Agent):** `workspace_id`, `user_id`, `role_context`, `workspace_state`, `active_strategy`, `approved_facts`, `applicable_laws`, `active_module`, `chat_history`, `custom_instruction_suffix`, and for socket path: `uploaded_documents`, `chat_attachment`. Built in socket handler and optionally via `chat_integration.create_chat_context_from_state()`.
 - **Strategy payload (output):** `caseSummary`, `strategicObjective`, `recommendations`, `possibleNextSteps`, `suggestionChips`, `role`, `isUpdate`, `analysis`, `timestamp`. Sent as `document_feature_response` with `featureType: "strategy_objective"`.
+- **Applicable laws payload (cached / emitted):** `{ "laws": [ { "id", "act", "section", "description", "relevance" }, ... ] }` with `featureType: "applicable_laws"`. See **§3.4**.
 
 ---
 

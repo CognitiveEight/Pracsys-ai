@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: simplertoday-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+    restart: unless-stopped
+    networks:
+      - simplertoday-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: simplertoday-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    networks:
+      - simplertoday-network
+
+volumes:
+  qdrant_storage:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  simplertoday-network:
+    driver: bridge
+

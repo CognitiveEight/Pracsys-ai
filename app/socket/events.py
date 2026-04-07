@@ -7,6 +7,7 @@ import asyncio
 import json
 import re
 import time
+from datetime import date as date_type
 from datetime import datetime
 from html import unescape
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -41,9 +42,9 @@ from app.workspace.manager import workspace_manager
 
 EventHandler = Callable[[Dict[str, Any]], Awaitable[None]]
 
-# Workspace role labels — must not appear in reportCaseSummary (neutral / report-facing text).
+# Labels to strip from reportCaseSummary / derived report text (neutral / report-facing).
 _STRATEGY_ROLE_LABELS_RE = re.compile(
-    r"\b(?:adjudicator|petitioner|respondent|mediator)s?\b",
+    r"\b(?:adjudicator|petitioner|respondent|mediator|client|clients)\b",
     re.I,
 )
 
@@ -54,7 +55,15 @@ def _derive_report_case_summary(case_summary: str) -> str:
         return ""
     t = case_summary.strip()
     t = re.sub(
-        r"\bfor\s+(?:the\s+)?(?:adjudicator|petitioner|respondent|mediator)s?\s+role\b",
+        r"^This\s+case\s+is\s+about\b",
+        "This matter is about",
+        t,
+        count=1,
+        flags=re.I,
+    )
+    t = re.sub(r"\bCase\b", "matter", t)
+    t = re.sub(
+        r"\bfor\s+(?:the\s+)?(?:adjudicator|petitioner|respondent|mediator|client|clients)\s+role\b",
         "based on the available materials",
         t,
         flags=re.I,
@@ -63,6 +72,133 @@ def _derive_report_case_summary(case_summary: str) -> str:
     t = re.sub(r"\s{2,}", " ", t)
     t = re.sub(r"\s+([.,;:])", r"\1", t)
     return t.strip()
+
+
+def _strip_strength_point_statute_boilerplate(text: str) -> str:
+    """
+    Remove trailing citation boilerplate from analysis strength points (statutes belong in `laws`, not prose).
+    Strips phrases like 'which is a relevant fact under …' and 'admissible under …'.
+    """
+    if not (text or "").strip():
+        return ""
+    t = text.strip()
+    for _ in range(5):
+        prev = t
+        t = re.sub(
+            r"\s*,?\s*which\s+is\s+a\s+relevant\s+fact\s+under[^.]*\.",
+            "",
+            t,
+            flags=re.IGNORECASE,
+        )
+        t = re.sub(
+            r"\s*,?\s*admissible\s+under[^.]*\.",
+            "",
+            t,
+            flags=re.IGNORECASE,
+        )
+        t = re.sub(
+            r"\s*,?\s*which\s+is\s+a\s+relevant\s+fact\s+under[^.]*$",
+            "",
+            t,
+            flags=re.IGNORECASE,
+        )
+        t = re.sub(
+            r"\s*,?\s*admissible\s+under[^.]*$",
+            "",
+            t,
+            flags=re.IGNORECASE,
+        )
+        if t == prev:
+            break
+    t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\s*,\s*$", "", t)
+    return t.strip()
+
+
+def _annexure_wording_for_next_steps(text: str) -> str:
+    """
+    Product wording for strategy possibleNextSteps: refer to uploads as Annexure N, not Document N;
+    replace standalone document/documents with annexure/annexures.
+    """
+    if not (text or "").strip():
+        return ""
+    t = text.strip()
+    t = re.sub(r"\b[Dd]ocuments\s+(\d+)\b", r"Annexures \1", t)
+    t = re.sub(r"\b[Dd]ocument\s+(\d+)\b", r"Annexure \1", t)
+    t = re.sub(
+        r"\bdocuments\b",
+        "annexures",
+        re.sub(r"\bdocument\b", "annexure", t, flags=re.IGNORECASE),
+        flags=re.IGNORECASE,
+    )
+    return t
+
+
+_OVERVIEW_CONTACTED_DATE_RE = re.compile(
+    r"Contacted\s+SimplerToday(?:\.ai)?\s+on:\s*"
+    r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})",
+    re.I,
+)
+_OVERVIEW_TO_PHONE_RE = re.compile(
+    r"To:\s*(\+?91[\s\-]*\d[\d\s\-]{8,18})",
+    re.I,
+)
+
+
+def _normalize_report_mobile_from_overview(raw: str) -> Optional[str]:
+    """Format mobile from Overview 'To:' line as '+91 XXXXX XXXXX'. Returns None if invalid."""
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) >= 12 and digits.startswith("91"):
+        national = digits[2:12]
+    elif len(digits) == 11 and digits.startswith("0"):
+        national = digits[1:11]
+    elif len(digits) == 10:
+        national = digits
+    else:
+        return None
+    if len(national) != 10 or national[0] not in "6789":
+        return None
+    return f"+91 {national[:5]} {national[5:]}"
+
+
+def _overview_conversation_date_to_iso(day: str, month: str, year: str) -> Optional[str]:
+    """DD/MM/YYYY (or DD-MM-YYYY) from Overview header → YYYY-MM-DD."""
+    try:
+        d, m, y = int(day), int(month), int(year)
+        date_type(y, m, d)
+        return f"{y:04d}-{m:02d}-{d:02d}"
+    except ValueError:
+        return None
+
+
+def extract_overview_conversation_report_contact_meta(
+    all_docs: List[Dict[str, Any]],
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Lawyers may upload 'Overview of the Conversation' PDFs with a fixed top block:
+      To: +91 ...
+      Contacted SimplerToday.ai on: DD/MM/YYYY
+    Values are taken only from that template in indexed text — never invented.
+    Missing pieces → None (JSON null). First matching document wins (upload order).
+    """
+    for doc in all_docs or []:
+        content = (doc.get("content") or "").strip()
+        if len(content) < 20:
+            continue
+        m_date = _OVERVIEW_CONTACTED_DATE_RE.search(content)
+        if not m_date:
+            continue
+        iso_date = _overview_conversation_date_to_iso(
+            m_date.group(1), m_date.group(2), m_date.group(3)
+        )
+        m_phone = _OVERVIEW_TO_PHONE_RE.search(content)
+        mobile = (
+            _normalize_report_mobile_from_overview(m_phone.group(1))
+            if m_phone
+            else None
+        )
+        return mobile, iso_date
+    return None, None
 
 
 class SocketEventHandler:
@@ -317,6 +453,9 @@ class SocketEventHandler:
 
             # When no documents (e.g. all deleted), return fallback so backend can clear strategy / show empty state
             doc_count = len(all_docs)
+            report_mobile, report_contact_date = (
+                extract_overview_conversation_report_contact_meta(all_docs)
+            )
             if doc_count == 0:
                 fallback_payload = {
                     "workspaceId": workspace_id,
@@ -329,6 +468,8 @@ class SocketEventHandler:
                     "strategicObjective": "",
                     "possibleNextSteps": [],
                     "suggestionChips": [],
+                    "reportMobileNumber": None,
+                    "reportContactedDate": None,
                     "analysis": {
                         "documentCount": 0,
                         "averageReadability": 0,
@@ -358,11 +499,11 @@ class SocketEventHandler:
 
 1. **Case Summary** (5-6 sentences): Start EXACTLY with the phrase: **"This case is about..."**. Include the parties (as named in documents), core legal issues, and 2-4 case-specific facts (dates/events/agreements/communications). Keep it scannable for a lawyer.
 
-2. **Report Case Summary** (5-6 sentences): Same factual breadth as the case summary, also starting EXACTLY with **"This case is about..."**, but written for **neutral reports** (court filings, memos, shared summaries). **Do not** use the words *Adjudicator*, *Petitioner*, *Respondent*, or *Mediator* (any casing), and **do not** frame the matter from the workspace role’s perspective—describe parties by name/title from the documents only.
+2. **Report Case Summary** (5-6 sentences): MUST start EXACTLY with **"This matter is about..."**. Mirror the same facts, structure, and coverage as the case summary but as a neutral, expanded, polished narrative for formal reports and filings. **Strictly do not** use: Petitioner, Respondent, Client, Case, Adjudicator, Mediator, or role-style labels; describe parties only by names, designations, or factual identifiers from the documents.
 
 3. **Strategic Objective** (5-6 sentences): Write a role-tailored strategic objective for the **{workspace_role}** perspective. It must reference: (a) the strongest facts from the documents, (b) the legal issues, (c) practical priority order (what to do first), and (d) how evidence/timeline supports or limits the objective.
 
-4. **Possible Next Steps** (3-5 bullet points): Immediate, executable actions for right away. Keep them concrete (who/what to do). Prefer steps that preserve evidence, clarify missing facts, and move the case forward procedurally for the selected role.
+4. **Possible Next Steps** (3-5 bullet points): Immediate, executable actions for right away. Keep them concrete (who/what to do). Prefer steps that preserve evidence, clarify missing facts, and move the case forward procedurally for the selected role. When citing an uploaded file by its order in the bundle, write **Annexure N** (same order as above); **never** write "Document N" or "document" for an upload—use **annexure / annexures** only.
 
 **Format your response as JSON**:
 {{
@@ -394,30 +535,47 @@ YOUR ROLE: {workspace_role}
 
 TASK:
 1. Case summary (5-6 sentences ; MUST start with "This case is about...")
-2. Report case summary (5-6 sentences ; MUST start with "This case is about..." ; neutral report text: NEVER use the words Adjudicator, Petitioner, Respondent, or Mediator ; no workspace-role lens—only names/roles from documents)
+2. Report case summary (5-6 sentences ; MUST start EXACTLY with "This matter is about..." ; MUST mirror the same facts, structure, and coverage as the case summary BUT rewritten as a neutral, expanded, and polished narrative suitable for formal reports and filings ; STRICTLY DO NOT use the words: Petitioner, Respondent, Client, Case, Adjudicator, Mediator, or any role-based labels ; avoid even generic role references ; describe parties only by their names, designations, or factual identifiers from the documents ; maintain an advanced, professional tone while keeping it clear and easy to read)
 3. Strategic objective (5-6 sentences ; role-specific for {workspace_role})
-4. Possible next steps (3-5 immediate, concrete actions that should be taken right away)
+4. Possible next steps (3-5 immediate, concrete actions that should be taken right away). When referring to an uploaded file by index, use **Annexure 1**, **Annexure 2**, etc. (upload order). Never use the word **Document** or **document** for an upload—use **annexure** / **annexures** only.
 
-LEGAL FRAMEWORK (CRITICAL):
-- Use BNS (Bharatiya Nyaya Sanhita) - NOT IPC
-- Use BNSS (Bharatiya Nagarik Suraksha Sanhita) - NOT CrPC  
-- Use BSA (Bharatiya Sakshya Adhiniyam) - NOT Evidence Act
-- IT Act 2000 remains valid
+LEGAL FRAMEWORK (CRITICAL - USE CORRECT INDIAN LAWS):
+- Always reference applicable and **most relevant Indian statutes/sections based on the case facts**, including but not limited to:
+  • Bharatiya Nyaya Sanhita (BNS), 2023
+  • Bharatiya Nagarik Suraksha Sanhita (BNSS), 2023
+  • Bharatiya Sakshya Adhiniyam (BSA), 2023
+  • Information Technology Act, 2000
+  • Companies Act, 2013
+  • Goods and Services Tax (GST) Acts
+  • Right to Information Act, 2005
+  • SC/ST (Prevention of Atrocities) Act, 1989
+  • Indian Contract Act, 1872
+  • Transfer of Property Act, 1882
+  • Consumer Protection Act, 2019
+  • Any other applicable central or state law
 
-MULTIPLE MATTERS: If documents appear to include multiple matters, explicitly mention ambiguity and focus your output on the dominant dispute supported by strongest evidence.
+- Do NOT restrict analysis to only one statute—identify and apply **all relevant laws**.
+- Prefer **latest applicable laws** (e.g., BNS/BNSS/BSA instead of IPC/CrPC/Evidence Act where applicable).
+- If multiple legal domains are involved (civil, criminal, corporate, tax, cyber), reflect all relevant frameworks.
+
+MULTIPLE MATTERS:
+If documents appear to include multiple matters, explicitly mention ambiguity and focus your output on the dominant dispute supported by strongest evidence.
+
+INSUFFICIENT DATA:
+If documents do not contain enough information, explicitly state the limitation in caseSummary, reportCaseSummary, and strategicObjective. Do NOT guess facts.
 
 OUTPUT (JSON only, complete all fields):
 ```json
 {{
   "caseSummary": "This case is about... (facts, parties, core legal issues)",
-  "reportCaseSummary": "This case is about... (same facts/issues; neutral; no Adjudicator/Petitioner/Respondent/Mediator labels)",
+  "reportCaseSummary": "This matter is about... (same facts/coverage as caseSummary; neutral expanded narrative; no Petitioner/Respondent/Client/Case/Adjudicator/Mediator labels)",
   "strategicObjective": "Role-tailored strategic objective for {workspace_role} (facts, priorities, evidence support/limits)",
   "possibleNextSteps": [
-    "Immediate action 1 (e.g., File FIR, Preserve evidence)",
-    "Immediate action 2 (e.g., Contact relevant authority)",
-    "Immediate action 3 (e.g., Gather documents)",
-    "Immediate action 4 (e.g., Consult legal counsel)",
-    "Immediate action 5 (e.g., Secure witness statements)"
+    "Immediate action 1",
+    "Immediate action 2",
+    "Immediate action 3",
+    "Immediate action 4",
+    "Immediate action 5"
   ],
   "suggestionChips": [
     "Chip 1", "Chip 2", "Chip 3", "Chip 4", "Chip 5", "Chip 6", "Chip 7", "Chip 8",
@@ -428,7 +586,7 @@ OUTPUT (JSON only, complete all fields):
 
 suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words each) specific to this case and role. Examples: "Review Title Deeds", "Map Legal Heirs", "Draft Demand Notice", "File FIR", "Preserve Digital Evidence". No full sentences. Provide 15-16 varied chips.
 
-CRITICAL: Output complete, valid JSON only. Do not truncate; close every string with \", close every array with ], and make sure the root JSON object is fully closed. Keep caseSummary, reportCaseSummary, and strategicObjective under 1200 characters each so the full JSON fits in one response. Ensure caseSummary and reportCaseSummary each start exactly with "This case is about..."."""
+CRITICAL: Output complete, valid JSON only. Do not truncate; close every string with \", close every array with ], and make sure the root JSON object is fully closed. Keep caseSummary, reportCaseSummary, and strategicObjective under 1200 characters each so the full JSON fits in one response. Ensure caseSummary starts exactly with "This case is about..." and reportCaseSummary starts exactly with "This matter is about...". In possibleNextSteps strings, never use "Document" or "document" to mean an uploaded file—use Annexure N or annexure/annexures."""
                 custom_suffix = build_custom_instruction_suffix(workspace_id)
                 if custom_suffix:
                     structured_prompt = (
@@ -774,6 +932,13 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                     "Plan next steps",
                 ][:16]
 
+            _raw_next_steps = list(possible_next_steps or [])
+            possible_next_steps = []
+            for s in _raw_next_steps:
+                t = _annexure_wording_for_next_steps(str(s).strip())
+                if t:
+                    possible_next_steps.append(t)
+
             # Format the response (use doc_count from vector store when batch_result not provided, e.g. after delete)
             strategies_payload = {
                 "workspaceId": workspace_id,
@@ -785,6 +950,8 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                 "strategicObjective": strategic_objective,
                 "possibleNextSteps": possible_next_steps if possible_next_steps else [],
                 "suggestionChips": suggestion_chips if suggestion_chips else [],
+                "reportMobileNumber": report_mobile,
+                "reportContactedDate": report_contact_date,
                 "analysis": {
                     "documentCount": doc_count,
                     "averageReadability": (batch_result or {}).get(
@@ -804,6 +971,12 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
             logger.success(
                 f"✅ Generated detailed strategy analysis for workspace {workspace_id}"
             )
+            if report_mobile or report_contact_date:
+                logger.info(
+                    "Overview conversation report fields: mobile={}, contactedDate={}",
+                    report_mobile,
+                    report_contact_date,
+                )
 
             return strategies_payload
 
@@ -1035,9 +1208,10 @@ All strengths and weaknesses MUST be based on facts from the documents.
 
 Strength rules:
 - 2–6 items
-- Each must include a clear legal point
-- Each must cite a relevant law/section
-- Must be supported by the document facts
+- Each `point` must state the factual and legal reasoning in plain prose (clear, specific to the annexures)
+- Put **statutes and sections only** in the `laws` array (e.g. "BSA", "BNS Section 318", "IT Act 2000")
+- **Forbidden in `point` text:** do not end (or pad) a strength with boilerplate such as "which is a relevant fact under [Act]" or "admissible under [Act(s)]" — no trailing "under the Bharatiya Sakshya Adhiniyam" / "under the IT Act" restatements; the `laws` field carries citations
+- Must be supported by the annexure facts
 
 Weakness rules:
 - Only list weaknesses supported by document facts
@@ -1080,8 +1254,8 @@ Output keys in this exact order (score and explanations FIRST so they are not tr
   "missingInfo": ["item1","item2"],
   "strengths": [
     {{
-      "point": "One clear strength with legal reasoning",
-      "laws": ["BNS Section 318"]
+      "point": "Factual strength stated clearly without repeating statute boilerplate in the sentence",
+      "laws": ["BNS Section 318", "BSA"]
     }}
   ],
   "weaknesses": ["weakness1"],
@@ -1099,7 +1273,7 @@ missingInfo:
 ONLY information absent from documents and legally required.
 
 strengths:
-2–6 items with legal references.
+2–6 items; each has factual `point` prose plus `laws` for citations — **no** "relevant fact under …" / "admissible under …" sentences in `point`.
 
 weaknesses:
 0–6 factual weaknesses.
@@ -1300,6 +1474,9 @@ No extra text.
                             ),
                             flags=re.IGNORECASE,
                         )
+                        point = _strip_strength_point_statute_boilerplate(point)
+                        if not point:
+                            continue
                         strengths.append({"point": point, "laws": laws})
                 elif isinstance(s, str) and s.strip():
                     point = s.strip()
@@ -1309,6 +1486,9 @@ No extra text.
                         re.sub(r"\bdocument\b", "annexure", point, flags=re.IGNORECASE),
                         flags=re.IGNORECASE,
                     )
+                    point = _strip_strength_point_statute_boilerplate(point)
+                    if not point:
+                        continue
                     strengths.append({"point": point, "laws": []})
 
             weaknesses = data.get("weaknesses") or []
@@ -2467,6 +2647,8 @@ Indian Kanoon / case-law search results:
             "strategicObjective": "",
             "possibleNextSteps": [],
             "suggestionChips": [],
+            "reportMobileNumber": None,
+            "reportContactedDate": None,
             "analysis": {
                 "documentCount": 0,
                 "averageReadability": 0,

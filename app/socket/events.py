@@ -609,90 +609,16 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                 logger.info(ai_response)
                 logger.info("=" * 80)
 
-                # Try to parse JSON response with multiple strategies
+                # Try to parse JSON response with shared repair logic
                 import json
                 import re
 
-                # Clean the response
                 ai_response = ai_response.strip()
-
-                # Prefer whole-response JSON when Gemini honors response_mime_type=application/json
-                json_str = None
-                if ai_response.startswith("{"):
-                    try:
-                        json.loads(ai_response)
-                        json_str = ai_response
-                    except json.JSONDecodeError:
-                        pass
-
-                # Strategy 1: Look for JSON in markdown code blocks using brace-count (handles nested {} and truncated output)
-                if json_str is None and "```json" in ai_response:
-                    # Extract everything after ```json
-                    start = ai_response.find("```json") + 7
-                    remaining = ai_response[start:].strip()
-                    # Try to find the closing brace
-                    if remaining.startswith("{"):
-                        # Count braces to find matching close
-                        brace_count = 0
-                        end_pos = 0
-                        for i, char in enumerate(remaining):
-                            if char == "{":
-                                brace_count += 1
-                            elif char == "}":
-                                brace_count -= 1
-                                if brace_count == 0:
-                                    end_pos = i + 1
-                                    break
-
-                        if end_pos > 0:
-                            json_str = remaining[:end_pos]
-                            logger.info(
-                                "✅ Extracted JSON from markdown block (possibly incomplete response)"
-                            )
-                        else:
-                            # Incomplete/truncated JSON: try to repair then parse, else fall through to partial extraction
-                            json_str = remaining.rstrip()
-                            if not json_str.endswith("}"):
-                                # Close unclosed string if we're inside a quoted value (odd number of unescaped " in tail)
-                                tail = json_str
-                                if tail.count('"') % 2 != 0:
-                                    json_str = json_str + '"'
-                                open_braces = json_str.count("{") - json_str.count("}")
-                                open_brackets = json_str.count("[") - json_str.count(
-                                    "]"
-                                )
-                                json_str = (
-                                    json_str + "]" * open_brackets + "}" * open_braces
-                                )
-                                logger.warning(
-                                    "⚠️ Repaired truncated JSON (close quote + {} ] + {} }))",
-                                    open_brackets,
-                                    open_braces,
-                                )
-                    else:
-                        logger.warning("Found ```json marker but no JSON object")
-                if json_str is None and re.search(
-                    r"```\s*(\{.*?\})\s*```", ai_response, re.DOTALL
-                ):
-                    json_match = re.search(
-                        r"```\s*(\{.*?\})\s*```", ai_response, re.DOTALL
-                    )
-                    json_str = json_match.group(1)
-                    logger.info("✅ Found JSON in plain code block")
-                if json_str is None and ai_response.startswith("{"):
-                    json_str = ai_response
-                    if json_str.count("{") != json_str.count("}"):
-                        open_braces = json_str.count("{") - json_str.count("}")
-                        json_str = json_str.rstrip() + "}" * open_braces
-                if json_str is None:
-                    json_match = re.search(
-                        r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", ai_response, re.DOTALL
-                    )
-                    if json_match:
-                        json_str = json_match.group(0)
-                        logger.info("✅ Extracted JSON from text")
-                    else:
-                        logger.warning("❌ No JSON found in AI response")
+                json_str = self._prepare_json_candidate(ai_response, prefer="object")
+                if json_str:
+                    logger.info("✅ Extracted JSON candidate for strategy analysis")
+                else:
+                    logger.warning("❌ No JSON found in AI response")
 
                 if json_str:
                     # Try to parse JSON
@@ -1866,152 +1792,93 @@ Example shape:
                 logger.warning("List of dates: Gemini error or empty response")
                 return []
 
-            # Whole-response JSON array when MIME type is honored (skip fence stripping / bracket scan)
-            if raw.startswith("["):
+            arr = None
+            json_str = self._prepare_json_candidate(raw, prefer="array")
+            if json_str:
                 try:
-                    _direct_arr = json.loads(raw)
-                    if isinstance(_direct_arr, list):
-                        arr = _direct_arr
-                    else:
-                        arr = None
-                except json.JSONDecodeError:
-                    arr = None
-            else:
-                arr = None
-
-            if arr is None:
-                # Strip markdown and find JSON array
-                raw = re.sub(r"^```(?:json)?\s*", "", raw)
-                raw = re.sub(r"\s*```\s*$", "", raw)
-                start = raw.find("[")
-                if start < 0:
-                    logger.warning(
-                        "List of dates: no '[' found in response; raw preview={}",
-                        (raw or "")[:150],
-                    )
-                    return []
-                # String-aware bracket matching: do not count [ or ] inside double-quoted strings
-                depth = 0
-                end = -1
-                i = start
-                in_string = False
-                escape_next = False
-                quote_char = '"'
-                while i < len(raw):
-                    c = raw[i]
-                    if escape_next:
-                        escape_next = False
-                        i += 1
-                        continue
-                    if c == "\\" and in_string:
-                        escape_next = True
-                        i += 1
-                        continue
-                    if not in_string:
-                        if c == quote_char:
-                            in_string = True
-                        elif c == "[":
-                            depth += 1
-                        elif c == "]":
-                            depth -= 1
-                            if depth == 0:
-                                end = i
-                                break
-                    else:
-                        if c == quote_char:
-                            in_string = False
-                    i += 1
-
-                json_str = None
-                if end >= 0:
-                    json_str = raw[start : end + 1]
-                if not json_str or end < 0:
-                    # Fallback: truncated response (missing ']') – try appending ']' and balance braces
-                    json_str = raw[start:].strip()
-                    if json_str and not json_str.endswith("]"):
-                        # Count unclosed [ and } to try to close the array
-                        open_brackets = json_str.count("[") - json_str.count("]")
-                        open_braces = json_str.count("{") - json_str.count("}")
-                        for _ in range(open_braces):
-                            json_str += "}"
-                        for _ in range(open_brackets):
-                            json_str += "]"
-                        logger.info(
-                            "List of dates: truncated response; attempted to close brackets"
+                    parsed = json.loads(json_str)
+                    if isinstance(parsed, list):
+                        arr = parsed
+                    elif isinstance(parsed, dict):
+                        arr = (
+                            parsed.get("listOfDates")
+                            or parsed.get("dates")
+                            or parsed.get("items")
+                            or []
                         )
-                    if not json_str:
-                        logger.warning(
-                            "List of dates: no matching ']' found; raw preview={}",
-                            raw[:200],
-                        )
-                        return []
-
-                try:
-                    arr = json.loads(json_str)
                 except json.JSONDecodeError as e:
                     logger.warning(
-                        "List of dates: JSON decode error: {}; attempting salvage", e
+                        "List of dates: JSON decode error after repair: {}; attempting salvage",
+                        e,
                     )
-                    # Salvage: look for object-like substrings with "date": and parse or regex-extract
-                    salvage = []
-                    search_region = raw[start:] if start >= 0 else raw
-                    offset = start if start >= 0 else 0
-                    for mobj in re.finditer(
-                        r'\{\s*"date"\s*:\s*"([^"]+)"\s*,\s*"title"\s*:\s*"([^"]*)"',
-                        search_region,
-                    ):
-                        try:
-                            # Find the full object: from { to matching }
-                            beg = offset + mobj.start()
-                            if beg < 0:
-                                continue
-                            depth_br = 0
-                            j = beg
-                            in_str = False
-                            esc = False
-                            q = '"'
-                            while j < len(raw):
-                                ch = raw[j]
-                                if esc:
-                                    esc = False
-                                    j += 1
-                                    continue
-                                if ch == "\\" and in_str:
-                                    esc = True
-                                    j += 1
-                                    continue
-                                if not in_str:
-                                    if ch == q:
-                                        in_str = True
-                                    elif ch == "{":
-                                        depth_br += 1
-                                    elif ch == "}":
-                                        depth_br -= 1
-                                        if depth_br == 0:
-                                            candidate = raw[beg : j + 1]
-                                            try:
-                                                obj = json.loads(candidate)
-                                                if isinstance(obj, dict) and obj.get(
-                                                    "date"
-                                                ):
-                                                    salvage.append(obj)
-                                            except json.JSONDecodeError:
-                                                pass
-                                            break
-                                else:
-                                    if ch == q:
-                                        in_str = False
+
+            if arr is None:
+                search_region = self._strip_markdown_json_fences(raw)
+                start = search_region.find("[")
+                if start < 0 and search_region.find("{") < 0:
+                    logger.warning(
+                        "List of dates: no JSON markers found in response; raw preview={}",
+                        (search_region or "")[:150],
+                    )
+                    return []
+                salvage = []
+                offset = 0
+                for mobj in re.finditer(
+                    r'\{\s*"date"\s*:\s*"([^"]+)"\s*,\s*"title"\s*:\s*"([^"]*)"',
+                    search_region,
+                ):
+                    try:
+                        # Find the full object: from { to matching }
+                        beg = offset + mobj.start()
+                        if beg < 0:
+                            continue
+                        depth_br = 0
+                        j = beg
+                        in_str = False
+                        esc = False
+                        q = '"'
+                        while j < len(search_region):
+                            ch = search_region[j]
+                            if esc:
+                                esc = False
                                 j += 1
-                        except Exception:
-                            pass
-                    if salvage:
-                        arr = salvage
-                        logger.info(
-                            "List of dates: salvaged {} entries from malformed JSON",
-                            len(arr),
-                        )
-                    else:
-                        return []
+                                continue
+                            if ch == "\\" and in_str:
+                                esc = True
+                                j += 1
+                                continue
+                            if not in_str:
+                                if ch == q:
+                                    in_str = True
+                                elif ch == "{":
+                                    depth_br += 1
+                                elif ch == "}":
+                                    depth_br -= 1
+                                    if depth_br == 0:
+                                        candidate = search_region[beg : j + 1]
+                                        try:
+                                            obj = json.loads(candidate)
+                                            if isinstance(obj, dict) and obj.get(
+                                                "date"
+                                            ):
+                                                salvage.append(obj)
+                                        except json.JSONDecodeError:
+                                            pass
+                                        break
+                            else:
+                                if ch == q:
+                                    in_str = False
+                            j += 1
+                    except Exception:
+                        pass
+                if salvage:
+                    arr = salvage
+                    logger.info(
+                        "List of dates: salvaged {} entries from malformed JSON",
+                        len(arr),
+                    )
+                else:
+                    return []
             if not isinstance(arr, list):
                 arr = [arr] if isinstance(arr, dict) else []
 
@@ -2164,6 +2031,84 @@ Example shape:
             "✅ List of dates sent to backend ({} entries)", len(list_of_dates)
         )
         await asyncio.sleep(0.2)  # Allow backend to process before next event
+
+    def _strip_markdown_json_fences(self, text: str) -> str:
+        cleaned = (text or "").strip()
+        if "```" not in cleaned:
+            return cleaned
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", cleaned, flags=re.I)
+        if m:
+            return (m.group(1) or "").strip()
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+        return cleaned.strip()
+
+    def _extract_balanced_json_fragment(
+        self, text: str, open_char: str
+    ) -> Optional[str]:
+        if not text:
+            return None
+        close_char = "}" if open_char == "{" else "]"
+        start = text.find(open_char)
+        if start < 0:
+            return None
+        depth = 0
+        i = start
+        in_string = False
+        escape = False
+        quote = '"'
+        while i < len(text):
+            c = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif c == "\\":
+                    escape = True
+                elif c == quote:
+                    in_string = False
+                i += 1
+                continue
+            if c == '"' or c == "'":
+                in_string = True
+                quote = c
+                i += 1
+                continue
+            if c == open_char:
+                depth += 1
+            elif c == close_char:
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+            i += 1
+        return text[start:].strip() if start >= 0 else None
+
+    def _prepare_json_candidate(
+        self, raw_text: str, prefer: str = "object"
+    ) -> Optional[str]:
+        text = self._strip_markdown_json_fences(raw_text)
+        if not text:
+            return None
+
+        open_char = "{" if prefer == "object" else "["
+        candidate = self._extract_balanced_json_fragment(text, open_char)
+        if not candidate:
+            fallback_char = "[" if open_char == "{" else "{"
+            candidate = self._extract_balanced_json_fragment(text, fallback_char)
+        if not candidate:
+            return None
+
+        # Repair common truncation by balancing quotes/brackets/braces.
+        unescaped_quotes = len(re.findall(r'(?<!\\)"', candidate))
+        if unescaped_quotes % 2 != 0:
+            candidate += '"'
+        open_brackets = candidate.count("[") - candidate.count("]")
+        open_braces = candidate.count("{") - candidate.count("}")
+        if open_brackets > 0:
+            candidate += "]" * open_brackets
+        if open_braces > 0:
+            candidate += "}" * open_braces
+        candidate = re.sub(r",\s*([\]}])", r"\1", candidate)
+        return candidate.strip()
 
     def _normalize_applicable_laws_payload(self, raw: Any) -> Dict[str, Any]:
         """Normalize model/search output into strict applicable_laws payload schema."""
@@ -2531,28 +2476,17 @@ Indian Kanoon / case-law search results:
             response_mime_type="application/json",
         )
         logger.info("Applicable laws: raw LLM response preview={}", (raw or "")[:500])
-        text = (raw or "").strip()
-        if "```" in text:
-            m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.I)
-            if m:
-                text = m.group(1).strip()
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            text = text[start : end + 1]
+        text = self._prepare_json_candidate(raw or "", prefer="object") or ""
         parsed: Dict[str, Any] = {"laws": []}
         try:
             parsed = json.loads(text)
         except Exception:
-            # Try salvage by balancing braces if model returned truncated JSON.
             try:
-                open_braces = text.count("{") - text.count("}")
-                open_brackets = text.count("[") - text.count("]")
-                salvaged = (
-                    text + ("]" * max(0, open_brackets)) + ("}" * max(0, open_braces))
-                )
-                parsed = json.loads(salvaged)
-                logger.info("Applicable laws: salvaged malformed Gemini JSON")
+                arr_candidate = self._prepare_json_candidate(raw or "", prefer="array")
+                parsed_arr = json.loads(arr_candidate) if arr_candidate else []
+                parsed = {"laws": parsed_arr} if isinstance(parsed_arr, list) else {"laws": []}
+                if parsed.get("laws"):
+                    logger.info("Applicable laws: salvaged laws array from malformed JSON")
             except Exception:
                 logger.warning(
                     "Applicable laws: failed to parse Gemini JSON; using heuristic fallback"

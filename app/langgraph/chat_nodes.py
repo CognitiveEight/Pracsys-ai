@@ -655,6 +655,7 @@ async def explain_why_node(state: Dict[str, Any]) -> Dict[str, Any]:
     workspace_state = chat_context.get("workspace_state") or {}
     chat_history = chat_context.get("chat_history") or []
     documents_count = workspace_state.get("documents_count", 0)
+    role_selected = bool(workspace_state.get("role_selected"))
     last_ai_turn = _last_ai_message_from_history(chat_history)
     followup_affirmation = bool(
         last_ai_turn and is_user_affirmation_to_continue(user_message)
@@ -666,7 +667,7 @@ async def explain_why_node(state: Dict[str, Any]) -> Dict[str, Any]:
         return await _handle_greeting(state, user_message, role)
 
     # Annexure upload gate: first message when annexures exist → show gate message and four roles only
-    if documents_count > 0 and len(chat_history) == 0:
+    if documents_count > 0 and len(chat_history) == 0 and not role_selected:
         gate_response = (
             ANNEXURE_UPLOAD_GATE_MESSAGE
             + "\n\nSelect one role to proceed:\n\n• "

@@ -3220,6 +3220,19 @@ Indian Kanoon / case-law search results:
 
         return updates
 
+    def _strip_panel_update_markers_from_text(self, text: str) -> str:
+        """Remove control-marker blocks from assistant text before user-facing emit."""
+        s = (text or "").strip()
+        if not s:
+            return s
+        s = re.sub(
+            r"(?is)\b(?:RESOLVED_MISSING_INFO|REMOVED_WEAKNESSES|REMOVED_RISKS|STRATEGIC_OBJECTIVE_UPDATE)\s*[:=\-].*?(?=\n\s*\n|$)",
+            "",
+            s,
+        )
+        s = re.sub(r"\n{3,}", "\n\n", s).strip()
+        return s
+
     async def _try_apply_intelligence_chat_panel_updates(
         self,
         workspace_id: str,
@@ -3334,30 +3347,31 @@ Indian Kanoon / case-law search results:
                     new_score = min(new_max_allowed, old_score + delta)
                     current_report["caseResolutionScore"] = new_score
 
-                    explanation = (
-                        current_report.get("qualityScoreExplanation")
-                        or current_report.get("quality_score_explanation")
-                        or ""
-                    ).strip()
-                    report_explanation = (
-                        current_report.get("reportQualityScoreExplanation")
-                        or current_report.get("report_quality_score_explanation")
-                        or ""
-                    ).strip()
-                    if not report_explanation:
-                        report_explanation = (
-                            self._sanitize_report_quality_score_explanation(explanation)
-                        )
+                    missing_now = (
+                        current_report.get("missingInfo")
+                        or current_report.get("missing_info")
+                        or []
+                    )
+                    weak_now = current_report.get("weaknesses") or []
+                    risk_now = current_report.get("risks") or []
+                    strengths_now = current_report.get("strengths") or []
+                    base_explanation = self._derive_quality_score_explanation(
+                        case_resolution_score=new_score,
+                        missing_info=missing_now if isinstance(missing_now, list) else [],
+                        weaknesses=weak_now if isinstance(weak_now, list) else [],
+                        risks=risk_now if isinstance(risk_now, list) else [],
+                        strengths=strengths_now if isinstance(strengths_now, list) else [],
+                    )
                     note = (
-                        f" User provided panel updates; removed {removed_missing} missingInfo, "
-                        f"{removed_weak} weaknesses, and {removed_risk} risks from the analysis."
+                        f" Lawyer-provided updates resolved {removed_missing} missing information item(s), "
+                        f"{removed_weak} weakness(es), and {removed_risk} risk(s)."
                     )
                     current_report["qualityScoreExplanation"] = (
-                        explanation + note
-                    ).strip()
+                        f"{base_explanation} {note}".strip()
+                    )
                     current_report["reportQualityScoreExplanation"] = (
                         self._sanitize_report_quality_score_explanation(
-                            report_explanation + note
+                            f"{base_explanation} {note}".strip()
                         )
                     ).strip()
 
@@ -6659,6 +6673,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 "workspace_id": workspace_id,
                 "user_id": user_id,
                 "documents_count": 0,
+                "role_selected": False,
             }
             ctx = None
             try:
@@ -6675,6 +6690,9 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     ):
                         workspace_role = "ADJUDICATOR"
                     role_context["role"] = workspace_role
+                    workspace_state["role_selected"] = bool(
+                        (ctx.workspace_role or "").strip()
+                    )
                     role_context_from_meta = ctx.get_metadata("role_context")
                     if isinstance(
                         role_context_from_meta, dict
@@ -6862,12 +6880,35 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 user_message=payload.content,
                 chat_context=chat_context,
             )
+            # If assistant produced panel-update markers, apply them as well.
+            ai_update_result = {"applied": False}
+            try:
+                ai_update_result = await self._try_apply_intelligence_chat_panel_updates(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    combined_text=response.response_text or "",
+                )
+                if ai_update_result.get("applied"):
+                    logger.success("✅ Panel updates applied from AI response markers")
+            except Exception as ai_upd_err:
+                logger.warning(
+                    "AI response panel update attempt failed; continuing. err={}",
+                    str(ai_upd_err),
+                )
             # If we applied deterministic panel updates, override the chat text
-            response_text_to_emit = (
-                update_result.get("response_text")
-                if isinstance(update_result, dict) and update_result.get("applied")
-                else response.response_text
-            )
+            if isinstance(update_result, dict) and update_result.get("applied"):
+                response_text_to_emit = update_result.get("response_text")
+            elif isinstance(ai_update_result, dict) and ai_update_result.get("applied"):
+                cleaned = self._strip_panel_update_markers_from_text(
+                    response.response_text or ""
+                )
+                response_text_to_emit = (
+                    cleaned
+                    if cleaned
+                    else ai_update_result.get("response_text") or response.response_text
+                )
+            else:
+                response_text_to_emit = response.response_text
             processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
 
             # Generate 10-12 contextual chips, store for this workspace; send random 4 in response (backend polls every few sec and we return random 4 each time)

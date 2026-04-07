@@ -9,7 +9,7 @@ import re
 import time
 from datetime import datetime
 from html import unescape
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
 import httpx
@@ -40,6 +40,29 @@ from app.workspace.custom_instructions import (build_custom_instruction_suffix,
 from app.workspace.manager import workspace_manager
 
 EventHandler = Callable[[Dict[str, Any]], Awaitable[None]]
+
+# Workspace role labels — must not appear in reportCaseSummary (neutral / report-facing text).
+_STRATEGY_ROLE_LABELS_RE = re.compile(
+    r"\b(?:adjudicator|petitioner|respondent|mediator)s?\b",
+    re.I,
+)
+
+
+def _derive_report_case_summary(case_summary: str) -> str:
+    """Best-effort neutral summary when the model omits reportCaseSummary."""
+    if not (case_summary or "").strip():
+        return ""
+    t = case_summary.strip()
+    t = re.sub(
+        r"\bfor\s+(?:the\s+)?(?:adjudicator|petitioner|respondent|mediator)s?\s+role\b",
+        "based on the available materials",
+        t,
+        flags=re.I,
+    )
+    t = _STRATEGY_ROLE_LABELS_RE.sub("", t)
+    t = re.sub(r"\s{2,}", " ", t)
+    t = re.sub(r"\s+([.,;:])", r"\1", t)
+    return t.strip()
 
 
 class SocketEventHandler:
@@ -302,6 +325,7 @@ class SocketEventHandler:
                     "isUpdate": is_update,
                     "isEmpty": True,
                     "caseSummary": "",
+                    "reportCaseSummary": "",
                     "strategicObjective": "",
                     "possibleNextSteps": [],
                     "suggestionChips": [],
@@ -334,13 +358,16 @@ class SocketEventHandler:
 
 1. **Case Summary** (5-6 sentences): Start EXACTLY with the phrase: **"This case is about..."**. Include the parties (as named in documents), core legal issues, and 2-4 case-specific facts (dates/events/agreements/communications). Keep it scannable for a lawyer.
 
-2. **Strategic Objective** (5-6 sentences): Write a role-tailored strategic objective for the **{workspace_role}** perspective. It must reference: (a) the strongest facts from the documents, (b) the legal issues, (c) practical priority order (what to do first), and (d) how evidence/timeline supports or limits the objective.
+2. **Report Case Summary** (5-6 sentences): Same factual breadth as the case summary, also starting EXACTLY with **"This case is about..."**, but written for **neutral reports** (court filings, memos, shared summaries). **Do not** use the words *Adjudicator*, *Petitioner*, *Respondent*, or *Mediator* (any casing), and **do not** frame the matter from the workspace role’s perspective—describe parties by name/title from the documents only.
 
-3. **Possible Next Steps** (3-5 bullet points): Immediate, executable actions for right away. Keep them concrete (who/what to do). Prefer steps that preserve evidence, clarify missing facts, and move the case forward procedurally for the selected role.
+3. **Strategic Objective** (5-6 sentences): Write a role-tailored strategic objective for the **{workspace_role}** perspective. It must reference: (a) the strongest facts from the documents, (b) the legal issues, (c) practical priority order (what to do first), and (d) how evidence/timeline supports or limits the objective.
+
+4. **Possible Next Steps** (3-5 bullet points): Immediate, executable actions for right away. Keep them concrete (who/what to do). Prefer steps that preserve evidence, clarify missing facts, and move the case forward procedurally for the selected role.
 
 **Format your response as JSON**:
 {{
   "caseSummary": "...",
+  "reportCaseSummary": "...",
   "strategicObjective": "...",
   "possibleNextSteps": ["...", "...", "...", "..."]
 }}
@@ -353,7 +380,7 @@ class SocketEventHandler:
 - Reference BSA (Bharatiya Sakshya Adhiniyam) for evidence matters, NOT Indian Evidence Act.
 - For IT Act, continue using Information Technology Act, 2000 sections as it's still in force.
 - Make next steps actionable and role-specific.
-- If documents do not contain enough information, explicitly state the limitation in caseSummary/strategicObjective (do not guess).
+- If documents do not contain enough information, explicitly state the limitation in caseSummary/reportCaseSummary/strategicObjective (do not guess).
 - If documents seem to include multiple matters, explicitly call out the split and focus your output on the dominant dispute supported by strongest evidence."""
 
             try:
@@ -367,8 +394,9 @@ YOUR ROLE: {workspace_role}
 
 TASK:
 1. Case summary (5-6 sentences ; MUST start with "This case is about...")
-2. Strategic objective (5-6 sentences ; role-specific for {workspace_role})
-3. Possible next steps (3-5 immediate, concrete actions that should be taken right away)
+2. Report case summary (5-6 sentences ; MUST start with "This case is about..." ; neutral report text: NEVER use the words Adjudicator, Petitioner, Respondent, or Mediator ; no workspace-role lens—only names/roles from documents)
+3. Strategic objective (5-6 sentences ; role-specific for {workspace_role})
+4. Possible next steps (3-5 immediate, concrete actions that should be taken right away)
 
 LEGAL FRAMEWORK (CRITICAL):
 - Use BNS (Bharatiya Nyaya Sanhita) - NOT IPC
@@ -382,6 +410,7 @@ OUTPUT (JSON only, complete all fields):
 ```json
 {{
   "caseSummary": "This case is about... (facts, parties, core legal issues)",
+  "reportCaseSummary": "This case is about... (same facts/issues; neutral; no Adjudicator/Petitioner/Respondent/Mediator labels)",
   "strategicObjective": "Role-tailored strategic objective for {workspace_role} (facts, priorities, evidence support/limits)",
   "possibleNextSteps": [
     "Immediate action 1 (e.g., File FIR, Preserve evidence)",
@@ -399,7 +428,7 @@ OUTPUT (JSON only, complete all fields):
 
 suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words each) specific to this case and role. Examples: "Review Title Deeds", "Map Legal Heirs", "Draft Demand Notice", "File FIR", "Preserve Digital Evidence". No full sentences. Provide 15-16 varied chips.
 
-CRITICAL: Output complete, valid JSON only. Do not truncate; close every string with \", close every array with ], and make sure the root JSON object is fully closed. Keep caseSummary and strategicObjective under 1200 characters each so the full JSON fits in one response. Ensure caseSummary starts exactly with "This case is about..."."""
+CRITICAL: Output complete, valid JSON only. Do not truncate; close every string with \", close every array with ], and make sure the root JSON object is fully closed. Keep caseSummary, reportCaseSummary, and strategicObjective under 1200 characters each so the full JSON fits in one response. Ensure caseSummary and reportCaseSummary each start exactly with "This case is about..."."""
                 custom_suffix = build_custom_instruction_suffix(workspace_id)
                 if custom_suffix:
                     structured_prompt = (
@@ -541,10 +570,23 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                             str(s).strip() for s in suggestion_chips if s
                         ][:16]
 
+                        report_raw = analysis_data.get(
+                            "reportCaseSummary"
+                        ) or analysis_data.get("report_case_summary")
+                        if isinstance(report_raw, str):
+                            report_case_summary = report_raw.strip()
+                        elif report_raw is None:
+                            report_case_summary = ""
+                        else:
+                            report_case_summary = str(report_raw).strip()
+
                         # Validate we got meaningful content
                         if case_summary and strategic_objective:
                             logger.success("✅ AI analysis completed successfully")
                             logger.info(f"   - Case Summary: {len(case_summary)} chars")
+                            logger.info(
+                                f"   - Report case summary: {len(report_case_summary)} chars"
+                            )
                             logger.info(
                                 f"   - Strategic Objective: {len(strategic_objective)} chars"
                             )
@@ -595,6 +637,11 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                                 ][:16]
                             logger.info("✅ Using hybrid AI + fallback content")
 
+                        if not report_case_summary:
+                            report_case_summary = _derive_report_case_summary(
+                                case_summary
+                            )
+
                     except json.JSONDecodeError as json_error:
                         logger.error(f"❌ JSON parsing failed: {json_error}")
                         logger.info(
@@ -609,6 +656,9 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                         objective_match = re.search(
                             r'"strategicObjective"\s*:\s*"([^"]*)', json_str
                         )
+                        report_summary_match = re.search(
+                            r'"reportCaseSummary"\s*:\s*"([^"]*)', json_str
+                        )
                         if case_summary_match or objective_match:
                             logger.info("✅ Extracted partial data from malformed JSON")
                             case_summary = (
@@ -618,6 +668,11 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                             )
                             strategic_objective = (
                                 objective_match.group(1) if objective_match else ""
+                            )
+                            report_case_summary = (
+                                report_summary_match.group(1).strip()
+                                if report_summary_match
+                                else ""
                             )
 
                             # Extract possible next steps from the partial JSON
@@ -669,6 +724,11 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                                     "Identify parties",
                                 ][:16]
 
+                            if not report_case_summary:
+                                report_case_summary = _derive_report_case_summary(
+                                    case_summary
+                                )
+
                             logger.success(
                                 "✅ Using hybrid: AI-extracted content + fallback where needed"
                             )
@@ -683,6 +743,10 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                 logger.warning("Using fallback generic analysis")
                 # Fallback to generic analysis
                 case_summary = f"Analysis of {doc_count} document(s) for {workspace_role} role. The documents have been processed and are ready for detailed review under Indian legal framework (BNS, BNSS, BSA)."
+                report_case_summary = (
+                    f"Analysis of {doc_count} document(s). The documents have been processed "
+                    "and are ready for detailed review under Indian legal framework (BNS, BNSS, BSA)."
+                )
                 strategic_objective = "Conduct a comprehensive legal review to determine the optimal course of action based on the available evidence and applicable provisions under Bharatiya Nyaya Sanhita (BNS) and other relevant laws."
                 possible_next_steps = [
                     "Review all uploaded documents immediately",
@@ -717,6 +781,7 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                 "role": workspace_role,
                 "isUpdate": is_update,
                 "caseSummary": case_summary,
+                "reportCaseSummary": report_case_summary,
                 "strategicObjective": strategic_objective,
                 "possibleNextSteps": possible_next_steps if possible_next_steps else [],
                 "suggestionChips": suggestion_chips if suggestion_chips else [],
@@ -761,7 +826,8 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
 
         Returns payload suitable for document_feature_response with featureType "analysis_report":
         missingInfo, strengths [{point, laws}], weaknesses, risks, relevantJurisdiction,
-        caseResolutionScore (0-100), qualityScoreExplanation, pendingActions, nextSteps, suggestedDrafts.
+        caseResolutionScore (0-100), qualityScoreExplanation, reportQualityScoreExplanation,
+        pendingActions, nextSteps, suggestedDrafts.
         """
         try:
             from app.agents.role_models import RoleBehaviorContract
@@ -858,6 +924,7 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                     "relevantJurisdiction": [],
                     "caseResolutionScore": 0,
                     "qualityScoreExplanation": "",
+                    "reportQualityScoreExplanation": "",
                     "pendingActions": [],
                     "nextSteps": [],
                     "suggestedDrafts": [],
@@ -1003,12 +1070,13 @@ Cap score between 0 and 100.
 OUTPUT JSON STRUCTURE
 --------------------------------------------------
 
-Output keys in this exact order (score and explanation FIRST so they are not truncated):
-- caseResolutionScore and qualityScoreExplanation MUST appear immediately after the opening "{{".
+Output keys in this exact order (score and explanations FIRST so they are not truncated):
+- caseResolutionScore, qualityScoreExplanation, and reportQualityScoreExplanation MUST appear immediately after the opening "{{".
 
 {{
   "caseResolutionScore": 72,
   "qualityScoreExplanation": "Required: 2-4 sentences explaining how this score follows from missing info, weaknesses, risks, and strengths. Non-empty. Example: Score reflects gaps in annexures and procedural risks.",
+  "reportQualityScoreExplanation": "Required: 2-4 sentences with the same scoring logic as qualityScoreExplanation, written for external or report-facing use. Do not use the words legal or respondent (any casing). Use neutral wording (e.g. procedural risk, parties, case file). Non-empty.",
   "missingInfo": ["item1","item2"],
   "strengths": [
     {{
@@ -1047,6 +1115,10 @@ pendingActions / nextSteps / suggestedDrafts:
 
 qualityScoreExplanation RULE:
 - MANDATORY non-empty string. If the score is below 100, say why (missing info / weaknesses / risks). If 100, say that no gaps, weaknesses, or risks were flagged.
+
+reportQualityScoreExplanation RULE:
+- MANDATORY non-empty string. Same substance as qualityScoreExplanation (tie the score to missing info, weaknesses, risks, and strengths).
+- MUST NOT contain the words "legal" or "respondent" in any form—including compounds where they appear as standalone words (rewrite to neutral alternatives: e.g. procedural risk, parties, opposing side, case file, annexures).
 
 FINAL RULE:
 Output ONLY the JSON object.
@@ -1322,6 +1394,49 @@ No extra text.
                 flags=re.IGNORECASE,
             )
 
+            report_quality_raw = (
+                data.get("reportQualityScoreExplanation")
+                or data.get("report_quality_score_explanation")
+                or ""
+            )
+            if not isinstance(report_quality_raw, str):
+                report_quality_raw = str(report_quality_raw or "").strip()
+            else:
+                report_quality_raw = report_quality_raw.strip()
+
+            report_quality_score_explanation = (
+                self._sanitize_report_quality_score_explanation(report_quality_raw)
+            )
+            report_quality_score_explanation = re.sub(
+                r"\bdocuments\b",
+                "annexures",
+                re.sub(
+                    r"\bdocument\b",
+                    "annexure",
+                    report_quality_score_explanation,
+                    flags=re.IGNORECASE,
+                ),
+                flags=re.IGNORECASE,
+            )
+            if not report_quality_score_explanation:
+                report_quality_score_explanation = (
+                    self._sanitize_report_quality_score_explanation(
+                        quality_score_explanation
+                    )
+                )
+            if not report_quality_score_explanation:
+                report_quality_score_explanation = (
+                    self._sanitize_report_quality_score_explanation(
+                        self._derive_quality_score_explanation(
+                            case_resolution_score,
+                            missing_info,
+                            weaknesses,
+                            risks,
+                            strengths,
+                        )
+                    )
+                )
+
             pending_actions = (
                 data.get("pendingActions") or data.get("pending_actions") or []
             )
@@ -1349,6 +1464,7 @@ No extra text.
                 "relevantJurisdiction": relevant_jurisdiction,
                 "caseResolutionScore": case_resolution_score,
                 "qualityScoreExplanation": quality_score_explanation,
+                "reportQualityScoreExplanation": report_quality_score_explanation,
                 "pendingActions": pending_actions,
                 "nextSteps": next_steps,
                 "suggestedDrafts": suggested_drafts,
@@ -1364,6 +1480,16 @@ No extra text.
                     "📝 qualityScoreExplanation: {}",
                     quality_score_explanation[:200]
                     + ("..." if len(quality_score_explanation) > 200 else ""),
+                )
+            if report_quality_score_explanation:
+                logger.info(
+                    "📝 reportQualityScoreExplanation: {}",
+                    report_quality_score_explanation[:200]
+                    + (
+                        "..."
+                        if len(report_quality_score_explanation) > 200
+                        else ""
+                    ),
                 )
             logger.info("")
             logger.info("❓ MISSING INFO ({} items):", len(missing_info))
@@ -1428,6 +1554,7 @@ No extra text.
             "relevantJurisdiction": [],
             "caseResolutionScore": 0,
             "qualityScoreExplanation": "",
+            "reportQualityScoreExplanation": "",
             "pendingActions": [],
             "nextSteps": [],
             "suggestedDrafts": [],
@@ -2197,7 +2324,9 @@ Rules:
 - Focus on likely applicable Indian laws/sections from the case facts.
 - Do NOT restrict to only predefined acts; any Indian law can be used.
 - Do NOT cite IPC (Indian Penal Code). If a section is IPC-linked, prefer the corresponding BNS section where applicable.
-- You may include common examples like BNS, IT Act, GST, Companies Act, RTI, SC/ST PoA where relevant.
+- **Grounding (any type of matter):** Every row must be justified only from (a) the document excerpt below and/or (b) the numbered Indian Kanoon search lines. Do **not** invent or guess Act/Section numbers; the statutory label you output must match the **legal wrong or remedy** actually discussed in those sources.
+- **Coherence:** The offence, liability, or remedy described in your `description` must match what that Act and Section actually govern. If you cannot tie the fact pattern to the section with the sources in hand, **omit that row** rather than stretching unrelated provisions.
+- In each `description`, briefly show the link (e.g. a concrete fact from the documents, or "Search line N …" referring to one of the numbered results).
 - Relevance must be one of: High, Medium, Low.
 - Keep description concise and case-specific.
 - If evidence is insufficient, return {{"laws":[]}}.
@@ -2334,6 +2463,7 @@ Indian Kanoon / case-law search results:
             "isUpdate": is_update,
             "isEmpty": True,
             "caseSummary": "",
+            "reportCaseSummary": "",
             "strategicObjective": "",
             "possibleNextSteps": [],
             "suggestionChips": [],
@@ -2781,6 +2911,19 @@ Indian Kanoon / case-law search results:
         )
         return " ".join(s for s in (lead, second, third) if s).strip()
 
+    def _sanitize_report_quality_score_explanation(self, text: str) -> str:
+        """Report-facing score explanation: remove disallowed words (legal, respondent) per product rules."""
+        if not (text or "").strip():
+            return ""
+        t = (text or "").strip()
+        t = re.sub(r"\brespondents?\b", "parties", t, flags=re.I)
+        t = re.sub(r"\s+or\s+legal\s+", " or ", t, flags=re.I)
+        t = re.sub(r"\s+and\s+legal\s+", " and ", t, flags=re.I)
+        t = re.sub(r"\blegal\b", "", t, flags=re.I)
+        t = re.sub(r"\s{2,}", " ", t)
+        t = re.sub(r"\s+([.,;:])", r"\1", t)
+        return t.strip()
+
     async def _ensure_quality_score_explanation(
         self,
         workspace_role: str,
@@ -3080,12 +3223,26 @@ Indian Kanoon / case-law search results:
                         or current_report.get("quality_score_explanation")
                         or ""
                     ).strip()
+                    report_explanation = (
+                        current_report.get("reportQualityScoreExplanation")
+                        or current_report.get("report_quality_score_explanation")
+                        or ""
+                    ).strip()
+                    if not report_explanation:
+                        report_explanation = (
+                            self._sanitize_report_quality_score_explanation(explanation)
+                        )
                     note = (
                         f" User provided panel updates; removed {removed_missing} missingInfo, "
                         f"{removed_weak} weaknesses, and {removed_risk} risks from the analysis."
                     )
                     current_report["qualityScoreExplanation"] = (
                         explanation + note
+                    ).strip()
+                    current_report["reportQualityScoreExplanation"] = (
+                        self._sanitize_report_quality_score_explanation(
+                            report_explanation + note
+                        )
                     ).strip()
 
                 self._workspace_analysis_payload[workspace_id] = current_report
@@ -3282,7 +3439,8 @@ Output ONLY valid JSON, no markdown, no code block:
     async def on_analysis_report_feedback(self, data: Dict[str, Any]) -> None:
         """
         Handle analysis_report_feedback: user rejected an analysis item (missingInfo or riskOrWeakness).
-        Remove the item, bump caseResolutionScore, update qualityScoreExplanation, re-emit report.
+        Remove the item, bump caseResolutionScore, update qualityScoreExplanation and
+        reportQualityScoreExplanation, re-emit report.
         """
         import copy
 
@@ -3386,12 +3544,22 @@ Output ONLY valid JSON, no markdown, no code block:
             or report.get("quality_score_explanation")
             or ""
         ).strip()
+        report_explanation = (
+            report.get("reportQualityScoreExplanation")
+            or report.get("report_quality_score_explanation")
+            or ""
+        ).strip()
         snippet = rejected_value[:80] + ("..." if len(rejected_value) > 80 else "")
         feedback_note = (
             f' User rejected 1 item from {section}: "{snippet}". '
             f"Score adjusted by +{score_delta} (from {old_score}% to {new_score}%). {delta_reason}"
         )
         report["qualityScoreExplanation"] = (explanation + feedback_note).strip()
+        report["reportQualityScoreExplanation"] = (
+            self._sanitize_report_quality_score_explanation(
+                report_explanation + feedback_note
+            )
+        ).strip()
 
         self._workspace_analysis_payload[workspace_id] = report
 
@@ -3462,6 +3630,237 @@ Output ONLY valid JSON, no markdown, no code block:
         if len(joined) > max_chars:
             joined = joined[:max_chars] + "\n[... truncated ...]"
         return joined or "No document text available for this workspace."
+
+    async def _search_kanoon_for_law_relevance(
+        self,
+        act: str,
+        section: str,
+        signals: Dict[str, Any],
+    ) -> List[Dict[str, str]]:
+        """
+        Same discovery path as applicable_laws: Indian Kanoon first, then Google CSE to site:indiankanoon.org.
+        Queries combine the selected act/section with case keywords from the workspace.
+        """
+        kw = " ".join((signals.get("keywords") or [])[:6])
+        title_hint = (signals.get("workspaceTitle") or "")[:80]
+        sec_plain = re.sub(r"^section\s*", "", (section or "").strip(), flags=re.I)
+        queries = [
+            " ".join(p for p in (act, section, kw) if p).strip(),
+            " ".join(p for p in (act, f"Section {sec_plain}", kw) if p).strip(),
+            " ".join(p for p in (act, section, title_hint) if p).strip(),
+        ]
+        seen_urls: set = set()
+        merged: List[Dict[str, str]] = []
+        for q in queries:
+            if not q or len(q.strip()) < 5:
+                continue
+            logger.info("law_relevance: Indian Kanoon query={}", q[:200])
+            batch = await self._search_indiankanoon(q)
+            for row in batch:
+                u = row.get("url") or ""
+                if u and u not in seen_urls:
+                    seen_urls.add(u)
+                    merged.append(row)
+                    if len(merged) >= 10:
+                        return merged
+            if merged:
+                return merged
+        fallback_q = queries[0] if queries and queries[0] else f"{act} {section}"
+        cse = await self._search_google_cse_for_indiankanoon(fallback_q)
+        for row in cse:
+            u = row.get("url") or ""
+            if u and u not in seen_urls:
+                seen_urls.add(u)
+                merged.append(row)
+                if len(merged) >= 10:
+                    break
+        logger.info(
+            "law_relevance: total search rows after Kanoon/CSE={}",
+            len(merged),
+        )
+        return merged
+
+    def _merge_law_relevance_description(
+        self,
+        lawyer_desc: Optional[str],
+        rationale: str,
+        max_len: int = 1600,
+    ) -> Optional[str]:
+        """Attach evidence-style rationale from documents + Kanoon to optional lawyer description."""
+        r = (rationale or "").strip()
+        l = (lawyer_desc or "").strip()
+        if r and l:
+            out = (
+                f"{l}\n\nAssessment (case documents and Indian Kanoon search): {r}"
+            )
+        elif r:
+            out = f"Assessment (case documents and Indian Kanoon search): {r}"
+        else:
+            out = l
+        if len(out) > max_len:
+            out = out[: max_len - 3] + "..."
+        return out or None
+
+    def _apply_law_relevance_consistency_guards(
+        self,
+        relevance: str,
+        rationale: str,
+        search_results: List[Dict[str, str]],
+        doc_context: str,
+    ) -> Tuple[str, str]:
+        """
+        High/Medium should rest on substance; Low must still reflect something in the case file.
+        """
+        r = (rationale or "").strip()
+        dc = (doc_context or "").strip()
+        has_docs = bool(dc) and "No document text available" not in dc
+        has_search = len(search_results) > 0
+        weak_rationale = len(r) < 55
+
+        if relevance in ("High", "Medium") and weak_rationale:
+            relevance = "Low" if has_docs else "not relevant"
+            if not r:
+                r = (
+                    "Insufficient explicit reasoning; downgraded pending clearer case and search tie-in."
+                )
+        if relevance == "High":
+            if not has_search and not (has_docs and len(dc) > 400):
+                relevance = "Medium"
+                extra = (
+                    " Adjusted to Medium: High confidence needs stronger document detail "
+                    "and/or Indian Kanoon support."
+                )
+                r = (r + extra).strip() if r else extra.strip()
+        if relevance == "Low":
+            if not has_docs:
+                relevance = "not relevant"
+                r = "No usable case documents to tie this provision to the matter."
+            elif len(r) < 35:
+                relevance = "not relevant"
+                r = (
+                    "Low relevance requires at least one concrete fact from the file; "
+                    "none was identified."
+                )
+        return relevance, r.strip()
+
+    async def _assess_law_relevance_with_kanoon_and_llm(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        act: str,
+        section: str,
+        title: str,
+        desc: str,
+        user_note: str,
+        doc_context: str,
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Run Indian Kanoon/CSE search like applicable_laws, then score relevance with grounded rationale.
+        Returns (relevance label, description text including rationale).
+        """
+        from app.ai.gemini_client import gemini_client
+
+        signals = await self._extract_case_signals_from_documents(
+            workspace_id, user_id
+        )
+        search_results = await self._search_kanoon_for_law_relevance(
+            act, section, signals
+        )
+
+        sources_text = []
+        for idx, row in enumerate(search_results[:8], start=1):
+            sources_text.append(
+                f"{idx}. title={row.get('title','')} | url={row.get('url','')} | snippet={row.get('snippet','')}"
+            )
+        source_blob = (
+            "\n".join(sources_text)
+            if sources_text
+            else "No Indian Kanoon / search snippets retrieved (rely on documents only)."
+        )
+
+        prompt = f"""You are a senior Indian lawyer. The user selected ONE statute provision; decide if it fits THIS case.
+
+You MUST use BOTH:
+(A) the case document excerpt, and
+(B) the Indian Kanoon / case-law search lines (titles/snippets/URLs) when present.
+
+Return exactly one JSON object (no markdown), shape:
+{{
+  "relevance": "High" | "Medium" | "Low" | "not relevant",
+  "rationale": "string, 2–5 short sentences"
+}}
+
+SCORING (strict):
+- **High**: Document facts clearly engage this act+section, AND search results show this provision or very similar charges/relief in comparable fact patterns (name the pattern briefly). Rationale must name at least one **specific document fact** and one **search-line theme** (or state search was empty but document fit is overwhelming—only if documents are very strong).
+- **Medium**: Document facts plausibly engage this provision; search supports or is neutral; some uncertainty. Rationale must cite at least one **concrete document fact** and explain the fit.
+- **Low**: Only if the **documents** still contain at least one concrete fact that could trigger this provision, but the fit is weak or peripheral. Do **not** pick Low from search alone. Rationale must quote the weak fact you rely on.
+- **not relevant**: Provision does not meaningfully apply, or documents lack any hook, or search+documents show mismatch.
+
+Rules:
+- Do NOT fabricate facts not present in the document excerpt.
+- Do NOT cite IPC unless the selected act is IPC; prefer BNS framing if overlapping.
+- If search block is empty, you may still assign Medium or Low only with strong/slight document hooks respectively; **High** requires either search support or unusually clear statutory fit spelled out in the documents.
+
+Selected law:
+- Act: {act}
+- Section: {section}
+{f"- Title: {title}" if title else ""}
+{f"- Prior description: {desc}" if desc else ""}
+{f"- Lawyer note: {user_note}" if user_note else ""}
+
+Workspace title / keywords (hint): {signals.get("workspaceTitle","")} | {", ".join(signals.get("keywords") or [])}
+
+Case documents (excerpt):
+{doc_context}
+
+Indian Kanoon / search results (titles and snippets):
+{source_blob}
+"""
+        raw = await gemini_client.generate(
+            prompt=prompt,
+            system_instruction=get_structured_document_feature_system_instruction(
+                workspace_role
+            ),
+            temperature=0.15,
+            max_tokens=2048,
+            response_mime_type="application/json",
+        )
+        text = (raw or "").strip()
+        if text.startswith("Error generating"):
+            return "not relevant", "Assessment failed (model error)."
+        if "```" in text:
+            m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.I)
+            if m:
+                text = m.group(1).strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        rel = "not relevant"
+        rationale = ""
+        if start >= 0 and end > start:
+            try:
+                obj = json.loads(text[start : end + 1])
+                rel = self._normalize_manual_law_relevance(obj.get("relevance"))
+                rationale = str(obj.get("rationale") or "").strip()
+            except Exception:
+                try:
+                    open_braces = text.count("{") - text.count("}")
+                    open_brackets = text.count("[") - text.count("]")
+                    salvaged = text[start : end + 1] + (
+                        "]" * max(0, open_brackets)
+                    ) + ("}" * max(0, open_braces))
+                    obj = json.loads(salvaged)
+                    rel = self._normalize_manual_law_relevance(obj.get("relevance"))
+                    rationale = str(obj.get("rationale") or "").strip()
+                except Exception:
+                    m = re.search(r'"relevance"\s*:\s*"([^"]+)"', text)
+                    if m:
+                        rel = self._normalize_manual_law_relevance(m.group(1))
+        rel, rationale = self._apply_law_relevance_consistency_guards(
+            rel, rationale, search_results, doc_context
+        )
+        merged = self._merge_law_relevance_description(desc, rationale)
+        return rel, merged
 
     def _applicable_law_relevance_law_dict(
         self,
@@ -3555,8 +3954,6 @@ Output ONLY valid JSON, no markdown, no code block:
         Emits document_feature_response (featureType applicable_law_relevance) and
         applicable_law_relevance_response with relevance: High | Medium | Low | not relevant.
         """
-        from app.ai.gemini_client import gemini_client
-
         payload_in = data if isinstance(data, dict) else {}
         logger.info(
             "applicable_law_relevance_request ← backend (received): keys={}",
@@ -3605,13 +4002,17 @@ Output ONLY valid JSON, no markdown, no code block:
             section[:80] if section else "",
         )
 
-        async def _emit_response(relevance: str) -> None:
+        async def _emit_response(
+            relevance: str, description: Optional[str] = None
+        ) -> None:
+            base_law_desc = (law.description or "").strip() or None
+            final_desc = description if description else base_law_desc
             law_dict = self._applicable_law_relevance_law_dict(
                 law_id=law.id,
                 act=act,
                 section=section,
                 title=(law.title or "").strip() or None,
-                description=(law.description or "").strip() or None,
+                description=final_desc,
                 relevance=relevance,
             )
             await self._emit_applicable_law_relevance_to_backend(
@@ -3634,52 +4035,18 @@ Output ONLY valid JSON, no markdown, no code block:
         ud = (law.userDescription or "").strip()
         title = (law.title or "").strip()
         desc = (law.description or "").strip()
-        prompt = f"""You assess whether a specific statute provision is relevant to a case given ONLY the document excerpt below.
-
-Return ONLY valid JSON (no markdown):
-{{"relevance":"High"}} or {{"relevance":"Medium"}} or {{"relevance":"Low"}} or {{"relevance":"not relevant"}}
-
-Rules:
-- High: facts strongly support applying this act/section.
-- Medium: plausibly applicable but uncertain or partial fit.
-- Low: weak tangential link only.
-- not relevant: provision does not meaningfully apply to these facts, or documents lack basis.
-- Use IPC only if the lawyer selected IPC; prefer reasoning under Indian law generally.
-- If documents are empty or unhelpful, use "not relevant".
-
-Selected law:
-- Act: {act}
-- Section: {section}
-{f"- Title: {title}" if title else ""}
-{f"- Description: {desc}" if desc else ""}
-{f"- Lawyer note: {ud}" if ud else ""}
-
-Case documents (excerpt):
-{doc_context}
-"""
-        raw = await gemini_client.generate(
-            prompt=prompt,
-            system_instruction=self._get_generation_system_instruction(role),
-            temperature=0.2,
-            max_tokens=8000,
+        rel, merged_desc = await self._assess_law_relevance_with_kanoon_and_llm(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            workspace_role=role,
+            act=act,
+            section=section,
+            title=title,
+            desc=desc,
+            user_note=ud,
+            doc_context=doc_context,
         )
-        text = (raw or "").strip()
-        if "```" in text:
-            m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.I)
-            if m:
-                text = m.group(1).strip()
-        start = text.find("{")
-        end = text.rfind("}")
-        rel = "not relevant"
-        if start >= 0 and end > start:
-            try:
-                obj = json.loads(text[start : end + 1])
-                rel = self._normalize_manual_law_relevance(obj.get("relevance"))
-            except Exception:
-                m = re.search(r'"relevance"\s*:\s*"([^"]+)"', text)
-                if m:
-                    rel = self._normalize_manual_law_relevance(m.group(1))
-        await _emit_response(rel)
+        await _emit_response(rel, merged_desc)
 
     def _salvage_workspace_metadata_from_truncated_json(
         self, raw: str, combined: str = ""

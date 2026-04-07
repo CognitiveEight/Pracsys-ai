@@ -252,6 +252,11 @@ APPLICABLE LAWS ({len(applicable_laws)} available):
             or analysis_report.get("quality_score_explanation")
             or ""
         ).strip()
+        report_expl = (
+            analysis_report.get("reportQualityScoreExplanation")
+            or analysis_report.get("report_quality_score_explanation")
+            or ""
+        ).strip()
         missing = (
             analysis_report.get("missingInfo")
             or analysis_report.get("missing_info")
@@ -293,6 +298,7 @@ APPLICABLE LAWS ({len(applicable_laws)} available):
 CACHED ANALYSIS REPORT (same data as the Analysis Report panel; use for questions about score, gaps, risks):
 - Case resolution score: {score}%
 - Quality score explanation: {expl if expl else "(see counts below — user may ask you to explain the score in your own words)"}
+- Report quality score explanation (neutral wording; omit words legal/respondent): {report_expl if report_expl else "(same as above if absent)"}
 - Missing information ({len(missing) if isinstance(missing, list) else 0}): {chr(10).join(f"  - {str(x)[:200]}" for x in (missing[:6] if isinstance(missing, list) else [])) or "  (none)"}
 - Strengths: {chr(10).join(st_lines) if st_lines else "  (none)"}
 - Weaknesses ({len(weak_ar) if isinstance(weak_ar, list) else 0}): {chr(10).join(f"  - {str(x)[:200]}" for x in (weak_ar[:6] if isinstance(weak_ar, list) else [])) or "  (none)"}

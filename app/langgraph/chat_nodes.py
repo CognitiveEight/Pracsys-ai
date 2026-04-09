@@ -598,7 +598,7 @@ Just respond naturally as a helpful impartial legal assistant (no party slant un
             greeting_prompt,
             system_instruction=system_instruction,
             temperature=0.5,
-            max_tokens=300,
+            max_tokens=12000,
         )
         processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
 

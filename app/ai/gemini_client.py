@@ -4,6 +4,8 @@ Handles all interactions with Gemini 2.0 Flash model.
 """
 
 import asyncio
+import json
+import re
 from typing import Any, Dict, List, Optional
 
 import google.generativeai as genai
@@ -56,6 +58,68 @@ class GeminiClient:
             logger.error("Failed to initialize Gemini client: {}", str(e))
             raise
 
+    @staticmethod
+    def _extract_balanced_json_fragment(text: str) -> Optional[str]:
+        if not text:
+            return None
+        start_obj = text.find("{")
+        start_arr = text.find("[")
+        starts = [x for x in (start_obj, start_arr) if x >= 0]
+        if not starts:
+            return None
+        start = min(starts)
+        open_char = text[start]
+        close_char = "}" if open_char == "{" else "]"
+        depth = 0
+        in_string = False
+        escape = False
+        quote = '"'
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == quote:
+                    in_string = False
+                i += 1
+                continue
+            if ch in ('"', "'"):
+                in_string = True
+                quote = ch
+                i += 1
+                continue
+            if ch == open_char:
+                depth += 1
+            elif ch == close_char:
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1].strip()
+            i += 1
+        return text[start:].strip()
+
+    @staticmethod
+    def _coerce_valid_json_text(raw: str) -> Optional[str]:
+        text = (raw or "").strip()
+        if not text:
+            return None
+        if "```" in text:
+            match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.I)
+            if match:
+                text = match.group(1).strip()
+            else:
+                text = re.sub(r"^```\w*\s*", "", text)
+                text = re.sub(r"\s*```\s*$", "", text).strip()
+        candidate = GeminiClient._extract_balanced_json_fragment(text) or text
+        candidate = re.sub(r",\s*([\]}])", r"\1", candidate)
+        try:
+            json.loads(candidate)
+            return candidate
+        except Exception:
+            return None
+
     @tracer.trace("gemini_generate")
     async def generate(
         self,
@@ -107,8 +171,49 @@ class GeminiClient:
                 )
 
             response = await asyncio.to_thread(_sync_generate)
-
             result = response.text
+
+            # Global guardrail: when caller requests JSON mode, ensure we return valid JSON.
+            # If first pass is malformed, ask Gemini to repair the payload only.
+            is_json_mode = kwargs.get("response_mime_type") == "application/json"
+            if is_json_mode:
+                valid = self._coerce_valid_json_text(result)
+                if valid is None:
+                    original_preview = (result or "")[:1800]
+                    for attempt in range(2):
+                        repair_prompt = (
+                            "Return ONLY valid JSON with no markdown and no extra text.\n"
+                            "Repair the JSON below while preserving meaning.\n\n"
+                            f"{original_preview}"
+                        )
+
+                        repair_config = genai.types.GenerationConfig(
+                            temperature=0.0,
+                            max_output_tokens=max_tokens,
+                            response_mime_type="application/json",
+                        )
+
+                        def _sync_repair():
+                            return self.model.generate_content(
+                                repair_prompt, generation_config=repair_config
+                            )
+
+                        repair_response = await asyncio.to_thread(_sync_repair)
+                        repaired_text = repair_response.text
+                        valid = self._coerce_valid_json_text(repaired_text)
+                        if valid is not None:
+                            logger.info(
+                                "Gemini JSON repair succeeded on attempt {}",
+                                attempt + 1,
+                            )
+                            result = valid
+                            break
+                    if valid is None:
+                        logger.warning(
+                            "Gemini JSON remained malformed after repair attempts"
+                        )
+                else:
+                    result = valid
 
             logger.success("✅ Generated {} characters with Gemini", len(result))
             return result

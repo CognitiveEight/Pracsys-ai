@@ -81,6 +81,7 @@ class AISocketService:
             logger.info("   - workspace_created: New workspace created")
             logger.info("   - workspace_sync: Workspace updated")
             logger.info("   - user_message_request: User chat message")
+            logger.info("   - analysis_docx_generate_request: Analysis DOCX text processing")
             logger.info("   - ai_heartbeat_ping: Backend keepalive (replies with ai_heartbeat_pong)")
             logger.info("📤 Ready to emit:")
             logger.info("   - ai_response: AI chat response")
@@ -173,6 +174,7 @@ class AISocketService:
                 "workspace_created",
                 "workspace_sync",
                 "user_message_request",
+                "analysis_docx_generate_request",
             ],
             "events_emitting": ["ai_response"],
         }

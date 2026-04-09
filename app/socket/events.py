@@ -30,6 +30,7 @@ from app.langgraph.chat_nodes import merge_intelligence_chat_history
 from app.socket.schemas import (
     AIResponseMetadata,
     AIResponsePayload,
+    AnalysisDocxGenerateRequestPayload,
     ApplicableLawRelevanceRequestPayload,
     UserMessageRequestPayload,
     WorkspaceCreatedPayload,
@@ -39,6 +40,7 @@ from app.utils.exceptions import SocketEventError
 from app.workspace.custom_instructions import (build_custom_instruction_suffix,
                                                set_custom_instructions)
 from app.workspace.manager import workspace_manager
+from agent import process_analysis_docx_request
 
 EventHandler = Callable[[Dict[str, Any]], Awaitable[None]]
 
@@ -263,6 +265,9 @@ class SocketEventHandler:
         # De-dup guard for replayed workspace_sync events (e.g., reconnect replay).
         # workspace_id -> {"fingerprint": str, "ts": float}
         self._last_workspace_sync_fingerprint: Dict[str, Dict[str, Any]] = {}
+        # During objective-change regeneration, suppress stale background analysis_report emits
+        # from older pipelines so FE receives only the fresh objective-aligned report.
+        self._suppress_analysis_emit_until_ts: Dict[str, float] = {}
         self._register_default_handlers()
 
     def set_socket_client(self, client):
@@ -295,6 +300,10 @@ class SocketEventHandler:
         self.register(
             "applicable_law_relevance_request",
             self.on_applicable_law_relevance_request,
+        )
+        self.register(
+            "analysis_docx_generate_request",
+            self.on_analysis_docx_generate_request,
         )
 
         # Legacy event handlers
@@ -653,6 +662,96 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                         suggestion_chips = [
                             str(s).strip() for s in suggestion_chips if s
                         ][:16]
+
+                        # If tail arrays are missing due partial/truncated JSON, recover them.
+                        if len(possible_next_steps) < 3 or len(suggestion_chips) < 10:
+                            try:
+                                recovery_prompt = f"""Return ONLY one valid JSON object with:
+{{
+  "possibleNextSteps": ["..."],
+  "suggestionChips": ["..."]
+}}
+
+Context:
+- Role: {workspace_role}
+- Case summary: {case_summary}
+- Strategic objective: {strategic_objective}
+
+Documents:
+{combined_document_content}
+
+Rules:
+- possibleNextSteps: exactly 3-5 immediate, practical actions.
+- suggestionChips: exactly 15-16 short labels (2-5 words each), actionable and case-specific.
+- Use Annexure wording for uploads (never Document N).
+- No invented facts.
+- JSON only; no markdown.
+"""
+                                recovery_raw = await gemini_client.generate(
+                                    prompt=recovery_prompt,
+                                    system_instruction=get_structured_document_feature_system_instruction(
+                                        workspace_role
+                                    ),
+                                    temperature=0.1,
+                                    max_tokens=2500,
+                                    response_mime_type="application/json",
+                                )
+                                recovery_json = self._prepare_json_candidate(
+                                    (recovery_raw or "").strip(), prefer="object"
+                                )
+                                recovered_data = (
+                                    json.loads(recovery_json)
+                                    if recovery_json
+                                    else json.loads((recovery_raw or "").strip())
+                                )
+                                if isinstance(recovered_data, dict):
+                                    recovered_next_steps = (
+                                        recovered_data.get("possibleNextSteps")
+                                        or recovered_data.get("possible_next_steps")
+                                        or []
+                                    )
+                                    if isinstance(recovered_next_steps, str):
+                                        recovered_next_steps = (
+                                            [recovered_next_steps]
+                                            if recovered_next_steps
+                                            else []
+                                        )
+                                    recovered_next_steps = [
+                                        str(s).strip()
+                                        for s in recovered_next_steps
+                                        if str(s).strip()
+                                    ][:5]
+
+                                    recovered_chips = (
+                                        recovered_data.get("suggestionChips")
+                                        or recovered_data.get("suggestion_chips")
+                                        or []
+                                    )
+                                    if isinstance(recovered_chips, str):
+                                        recovered_chips = (
+                                            [recovered_chips] if recovered_chips else []
+                                        )
+                                    recovered_chips = [
+                                        str(s).strip()
+                                        for s in recovered_chips
+                                        if str(s).strip()
+                                    ][:16]
+
+                                    if len(possible_next_steps) < 3 and recovered_next_steps:
+                                        possible_next_steps = recovered_next_steps
+                                    if len(suggestion_chips) < 10 and recovered_chips:
+                                        suggestion_chips = recovered_chips
+
+                                    logger.info(
+                                        "Recovered strategy tail fields: nextSteps={}, chips={}",
+                                        len(possible_next_steps),
+                                        len(suggestion_chips),
+                                    )
+                            except Exception as recovery_err:
+                                logger.warning(
+                                    "Could not recover strategy nextSteps/chips: {}",
+                                    recovery_err,
+                                )
 
                         report_raw = analysis_data.get(
                             "reportCaseSummary"
@@ -1039,6 +1138,19 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                     "; ".join(role_ctx.forbidden_actions[:2]),
                 )
             )
+            # Anchor analysis to the latest strategy/objective so regenerated reports
+            # reflect lawyer edits from intelligence chat.
+            strategy_payload = self._workspace_strategy_payload.get(workspace_id) or {}
+            if not isinstance(strategy_payload, dict):
+                strategy_payload = {}
+            current_case_summary = str(strategy_payload.get("caseSummary") or "").strip()
+            current_strategic_objective = str(
+                strategy_payload.get("strategicObjective") or ""
+            ).strip()
+            if not current_case_summary:
+                current_case_summary = "(not provided)"
+            if not current_strategic_objective:
+                current_strategic_objective = "(not provided)"
 
             analysis_prompt = (
                 """You are a senior legal analyst specializing in Indian law. Your task is to produce a structured legal analysis based ONLY on the uploaded documents.
@@ -1053,9 +1165,31 @@ CRITICAL OUTPUT RULES:
 
 ROLE: {}
 ROLE INSTRUCTION: {}
+CURRENT CASE SUMMARY (from strategy panel):
+{}
+CURRENT STRATEGIC OBJECTIVE (from strategy panel):
+{}
 
 DOCUMENTS (in upload order; last document is most recent):
 {}
+
+OBJECTIVE-ALIGNMENT RULES (MANDATORY):
+- If CURRENT STRATEGIC OBJECTIVE is provided, align analysis to it while staying faithful to annexure facts.
+- Evaluate objective feasibility using annexure evidence: strengths/weaknesses/risks must explicitly reflect what helps or blocks that objective.
+- missingInfo should prioritize gaps that are critical to execute that objective.
+- pendingActions and nextSteps must be practical actions that move the matter toward that objective in priority order.
+- relevantJurisdiction must reflect objective-linked forum cues in annexures or objective text (for example, if the objective says filing in Patna, assess whether Patna forum support appears in annexure facts and list appropriate jurisdiction/forum entries).
+- Never fabricate facts to force alignment; when objective and evidence conflict, state the conflict as weakness/risk.
+
+RELEVANT JURISDICTION FORMAT (STRICT):
+- Output must be COURT/FORUM-centric by location (High Court / Supreme Court / District Court / Family Court / Magistrate Court / Commission etc.).
+- Return ONLY jurisdiction/forum names (no reasons, no legal basis text, no explanatory suffix).
+- Do NOT output location-only permissibility lines like "Patna, Bihar: Permissible under ...".
+- Good examples:
+  - "High Court of Delhi"
+  - "District & Sessions Court, Patna"
+  - "Metropolitan Magistrate Court, Delhi"
+  - "Supreme Court of India"
 
 LEGAL FRAMEWORK:
 Use only the following laws where relevant:
@@ -1227,6 +1361,8 @@ No extra text.
             ).format(
                 role,
                 role_instruction,
+                current_case_summary,
+                current_strategic_objective,
                 combined_document_content,
             )
 
@@ -1309,9 +1445,11 @@ No extra text.
 
             try:
                 data = json.loads(json_str)
+                parsed_from_partial = False
             except json.JSONDecodeError as e:
                 # Try to repair truncated JSON (e.g. "Unterminated string" when Gemini hits token limit)
                 data = None
+                parsed_from_partial = False
                 if "Unterminated string" in (e.msg or "") or "Unterminated" in (
                     e.msg or ""
                 ):
@@ -1332,6 +1470,7 @@ No extra text.
                         truncated += "]" * open_brackets + "}" * open_braces
                         try:
                             data = json.loads(truncated)
+                            parsed_from_partial = True
                             logger.info(
                                 "Repaired analysis report JSON after truncation (pos={})",
                                 pos,
@@ -1353,6 +1492,7 @@ No extra text.
                             partial += "}" * open_braces
                         try:
                             data = json.loads(partial)
+                            parsed_from_partial = True
                             logger.info(
                                 "Salvaged analysis report JSON from partial response (pos={})",
                                 e.pos,
@@ -1364,6 +1504,76 @@ No extra text.
                         "Analysis report JSON parse error: {}; using fallback", e
                     )
                     return self._analysis_report_fallback(role)
+
+            # Tail recovery: Gemini may return valid JSON with missing/empty tail arrays.
+            # Recover those sections via a compact follow-up call and merge.
+            tail_keys = [
+                "weaknesses",
+                "risks",
+                "relevantJurisdiction",
+                "pendingActions",
+                "nextSteps",
+                "suggestedDrafts",
+            ]
+            missing_tail_keys = []
+            for k in tail_keys:
+                v = data.get(k)
+                if k not in data or v is None:
+                    missing_tail_keys.append(k)
+                    continue
+                if isinstance(v, list) and len(v) == 0:
+                    missing_tail_keys.append(k)
+            if missing_tail_keys:
+                try:
+                    recovery_prompt = (
+                        """Return ONLY one valid JSON object with these keys:
+weaknesses, risks, relevantJurisdiction, pendingActions, nextSteps, suggestedDrafts
+
+Context:
+- Role: {}
+- Case summary: {}
+- Strategic objective: {}
+
+Documents:
+{}
+
+Rules:
+- Base strictly on annexure facts; do not invent.
+- Each key must be a JSON array.
+- For weaknesses, risks, and relevantJurisdiction: provide at least 1 item each whenever documents contain case facts. Use [] only when truly impossible.
+- Keep concise and practical.
+- Output JSON only.
+"""
+                    ).format(
+                        role,
+                        current_case_summary,
+                        current_strategic_objective,
+                        combined_document_content,
+                    )
+                    recovery_raw = await gemini_client.generate(
+                        prompt=recovery_prompt,
+                        system_instruction=get_structured_document_feature_system_instruction(
+                            workspace_role
+                        ),
+                        temperature=0.1,
+                        max_tokens=2500,
+                        response_mime_type="application/json",
+                    )
+                    recovered = json.loads((recovery_raw or "").strip())
+                    if isinstance(recovered, dict):
+                        for k in missing_tail_keys:
+                            v = recovered.get(k)
+                            if isinstance(v, list):
+                                data[k] = v
+                    logger.info(
+                        "Recovered analysis report tail keys (missing/empty): {}",
+                        ", ".join(missing_tail_keys),
+                    )
+                except Exception as recovery_err:
+                    logger.warning(
+                        "Could not recover missing/empty tail keys: {}",
+                        recovery_err,
+                    )
 
             missing_info = data.get("missingInfo") or data.get("missing_info") or []
             if not isinstance(missing_info, list):
@@ -1458,6 +1668,104 @@ No extra text.
             relevant_jurisdiction = [
                 str(x).strip() for x in relevant_jurisdiction if x
             ][:6]
+            relevant_jurisdiction = await self._ensure_structured_relevant_jurisdiction(
+                relevant_jurisdiction,
+                workspace_role=workspace_role,
+                case_summary=current_case_summary,
+                strategic_objective=current_strategic_objective,
+                document_excerpt=combined_document_content,
+            )
+
+            # Final guardrail for repeatedly-empty critical sections:
+            # force a focused regeneration and, if still empty, apply deterministic defaults.
+            must_fill = []
+            if len(weaknesses) == 0:
+                must_fill.append("weaknesses")
+            if len(risks) == 0:
+                must_fill.append("risks")
+            if len(relevant_jurisdiction) == 0:
+                must_fill.append("relevantJurisdiction")
+            if must_fill:
+                try:
+                    force_tail_prompt = (
+                        """Return ONLY one valid JSON object with keys:
+weaknesses, risks, relevantJurisdiction
+
+Context:
+- Role: {}
+- Case summary: {}
+- Strategic objective: {}
+
+Documents:
+{}
+
+Rules:
+- Use only annexure facts; do not invent.
+- weaknesses: provide 1-3 specific vulnerability points.
+- risks: provide 1-3 concrete procedural/legal risks.
+- relevantJurisdiction: provide 1-3 likely forums/courts/authorities.
+- If evidence is weak, still provide best-effort concise entries from available facts (do not return empty arrays).
+- Output JSON only.
+"""
+                    ).format(
+                        role,
+                        current_case_summary,
+                        current_strategic_objective,
+                        combined_document_content,
+                    )
+                    force_raw = await gemini_client.generate(
+                        prompt=force_tail_prompt,
+                        system_instruction=get_structured_document_feature_system_instruction(
+                            workspace_role
+                        ),
+                        temperature=0.0,
+                        max_tokens=2200,
+                        response_mime_type="application/json",
+                    )
+                    force_obj = json.loads((force_raw or "").strip())
+                    if isinstance(force_obj, dict):
+                        if not weaknesses and isinstance(force_obj.get("weaknesses"), list):
+                            weaknesses = [
+                                str(x).strip()
+                                for x in (force_obj.get("weaknesses") or [])
+                                if str(x).strip()
+                            ][:8]
+                        if not risks and isinstance(force_obj.get("risks"), list):
+                            risks = [
+                                str(x).strip()
+                                for x in (force_obj.get("risks") or [])
+                                if str(x).strip()
+                            ][:8]
+                        if (not relevant_jurisdiction) and isinstance(
+                            force_obj.get("relevantJurisdiction"), list
+                        ):
+                            relevant_jurisdiction = [
+                                str(x).strip()
+                                for x in (force_obj.get("relevantJurisdiction") or [])
+                                if str(x).strip()
+                            ][:6]
+                    logger.info(
+                        "Forced analysis tail regeneration attempted for: {}",
+                        ", ".join(must_fill),
+                    )
+                except Exception as force_tail_err:
+                    logger.warning(
+                        "Forced tail regeneration failed: {}",
+                        force_tail_err,
+                    )
+
+            if not weaknesses:
+                weaknesses = [
+                    "Current annexures do not yet establish complete evidence support for every pleaded point."
+                ]
+            if not risks:
+                risks = [
+                    "On current annexures, adverse inference risk may arise if supporting records remain unfiled."
+                ]
+            if not relevant_jurisdiction:
+                relevant_jurisdiction = [
+                    "Appropriate forum to be confirmed from territorial and subject-matter nexus in annexures."
+                ]
 
             score = data.get("caseResolutionScore") or data.get("case_resolution_score")
             try:
@@ -1649,6 +1957,97 @@ No extra text.
             return self._analysis_report_fallback(
                 (workspace_role or "ADJUDICATOR").strip().upper()
             )
+
+    async def _ensure_structured_relevant_jurisdiction(
+        self,
+        entries: List[str],
+        *,
+        workspace_role: str,
+        case_summary: str,
+        strategic_objective: str,
+        document_excerpt: str,
+    ) -> List[str]:
+        """
+        Ensure jurisdiction items are court/forum names only (no reasons).
+        Target format examples:
+        - "High Court of Delhi"
+        - "District & Sessions Court, Patna"
+        - "Supreme Court of India"
+        """
+        cleaned = [str(x).strip() for x in (entries or []) if str(x).strip()]
+        if not cleaned:
+            return []
+
+        def _is_structured(v: str) -> bool:
+            s = (v or "").strip()
+            if not s:
+                return False
+            forum_re = re.compile(
+                r"\b(supreme\s+court|high\s+court|district(?:\s*&\s*sessions)?\s+court|sessions\s+court|family\s+court|magistrate|tribunal|commission|consumer\s+commission|forum)\b",
+                re.I,
+            )
+            return bool(forum_re.search(s))
+
+        def _strip_reason(v: str) -> str:
+            s = (v or "").strip()
+            if not s:
+                return s
+            # Remove trailing parenthetical / dash / colon explanations if present.
+            s = re.sub(r"\s*\([^)]*\)\s*$", "", s).strip()
+            s = re.sub(r"\s*[-:]\s*.*$", "", s).strip()
+            return s
+
+        cleaned = [_strip_reason(v) for v in cleaned]
+        cleaned = [v for v in cleaned if _is_structured(v)]
+        if cleaned:
+            return cleaned[:6]
+
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            prompt = f"""Rewrite/produce relevantJurisdiction entries in STRICT structured form.
+
+Current entries:
+{json.dumps(cleaned, ensure_ascii=False)}
+
+Case summary:
+{case_summary}
+
+Strategic objective:
+{strategic_objective}
+
+Document excerpt:
+{(document_excerpt or "")[:12000]}
+
+Rules:
+- Output ONLY JSON object: {{"relevantJurisdiction": ["..."]}}
+- 1 to 5 items only
+- Entries MUST be COURT/FORUM names only (no reasons/legal basis text).
+- Do NOT output explanations in parentheses, after hyphen, or after colon.
+- Do NOT output location-only lines.
+- Good: "Metropolitan Magistrate Court, Delhi"
+- Good: "High Court of Delhi"
+- Do NOT output lines like "Patna, Bihar: Permissible under ...".
+- Prefer case-specific nearby forums from facts.
+- Include High Court/Supreme Court only when plausibly relevant to the case posture.
+"""
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.1,
+                max_tokens=1200,
+                response_mime_type="application/json",
+            )
+            candidate = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            parsed = json.loads(candidate) if candidate else json.loads((raw or "").strip())
+            arr = parsed.get("relevantJurisdiction") if isinstance(parsed, dict) else []
+            if not isinstance(arr, list):
+                return cleaned[:6]
+            out = [_strip_reason(str(x).strip()) for x in arr if str(x).strip()]
+            out = [x for x in out if _is_structured(x)]
+            return out[:6] if out else cleaned[:6]
+        except Exception as e:
+            logger.warning("Jurisdiction structure enforcement failed: {}", e)
+            return cleaned[:6]
 
     def _analysis_report_fallback(self, role: str) -> Dict[str, Any]:
         """Return a minimal valid analysis report when AI fails or no docs."""
@@ -2687,6 +3086,554 @@ Indian Kanoon / case-law search results:
                 rt_err,
             )
 
+    async def _emit_workspace_refresh(
+        self,
+        workspace_id: str,
+        user_id: Optional[str] = None,
+        *,
+        reason: str = "ai_update_started",
+        feature_types: Optional[List[str]] = None,
+    ) -> None:
+        """
+        Emit FE loader hint before heavy AI refresh/regeneration starts.
+        """
+        if not self._socket_client or not workspace_id:
+            return
+        features = feature_types or [
+            "strategy_objective",
+            "analysis_report",
+            "list_of_dates",
+            "applicable_laws",
+        ]
+        payload: Dict[str, Any] = {
+            "workspaceId": workspace_id,
+            "featureTypes": features,
+            "reason": reason,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+        if user_id:
+            payload["userId"] = user_id
+        try:
+            await self._socket_client.emit("workspace:refresh", payload)
+            logger.info(
+                "workspace:refresh emitted (reason={}, features={}) for workspace {}",
+                reason,
+                len(features),
+                workspace_id[:12] if workspace_id else "",
+            )
+        except Exception as e:
+            logger.warning("workspace:refresh emit failed: {}", e)
+
+    @staticmethod
+    def _canonical_text_key(text: Any) -> str:
+        s = str(text or "").strip().lower()
+        s = re.sub(r"[^a-z0-9\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    @staticmethod
+    def _merge_unique_string_lists(old_list: Any, new_list: Any, limit: int = 12) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for src in (old_list or [], new_list or []):
+            if not isinstance(src, list):
+                continue
+            for item in src:
+                text = str(item or "").strip()
+                if not text:
+                    continue
+                key = SocketEventHandler._canonical_text_key(text)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(text)
+                if len(out) >= limit:
+                    return out
+        return out
+
+    def _merge_analysis_report_for_objective_change(
+        self, old_report: Dict[str, Any], new_report: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        old_report = old_report or {}
+        new_report = new_report or {}
+        merged = dict(old_report)
+
+        for key, limit in (
+            ("missingInfo", 10),
+            ("weaknesses", 8),
+            ("risks", 8),
+            ("relevantJurisdiction", 6),
+            ("pendingActions", 6),
+            ("nextSteps", 6),
+            ("suggestedDrafts", 6),
+        ):
+            merged[key] = self._merge_unique_string_lists(
+                old_report.get(key), new_report.get(key), limit=limit
+            )
+
+        old_strengths = old_report.get("strengths") or []
+        new_strengths = new_report.get("strengths") or []
+        strengths_map: Dict[str, Dict[str, Any]] = {}
+        for s in (old_strengths + new_strengths):
+            if not isinstance(s, dict):
+                continue
+            point = str(s.get("point") or "").strip()
+            if not point:
+                continue
+            key = self._canonical_text_key(point)
+            laws = s.get("laws") if isinstance(s.get("laws"), list) else []
+            prev = strengths_map.get(key)
+            if prev:
+                prev["laws"] = self._merge_unique_string_lists(
+                    prev.get("laws"), laws, limit=6
+                )
+            else:
+                strengths_map[key] = {
+                    "point": point,
+                    "laws": self._merge_unique_string_lists([], laws, limit=6),
+                }
+        merged["strengths"] = list(strengths_map.values())[:8]
+
+        merged["caseResolutionScore"] = int(
+            new_report.get("caseResolutionScore")
+            if new_report.get("caseResolutionScore") is not None
+            else old_report.get("caseResolutionScore") or 0
+        )
+        merged["qualityScoreExplanation"] = (
+            str(new_report.get("qualityScoreExplanation") or "").strip()
+            or str(old_report.get("qualityScoreExplanation") or "").strip()
+        )
+        merged["reportQualityScoreExplanation"] = (
+            str(new_report.get("reportQualityScoreExplanation") or "").strip()
+            or str(old_report.get("reportQualityScoreExplanation") or "").strip()
+        )
+        return merged
+
+    def _merge_applicable_laws_for_objective_change(
+        self, old_payload: Dict[str, Any], new_payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        def _law_key(law: Dict[str, Any]) -> str:
+            act = self._canonical_text_key(law.get("act") or "")
+            sec_raw = str(law.get("section") or "").strip().lower()
+            sec_raw = re.sub(r"\b(section|sec\.?)\b", " ", sec_raw)
+            sec_raw = re.sub(r"[^a-z0-9]", " ", sec_raw)
+            sec = re.sub(r"\s+", " ", sec_raw).strip()
+            return f"{act}::{sec}"
+
+        old_laws = (old_payload or {}).get("laws") or []
+        new_laws = (new_payload or {}).get("laws") or []
+        merged_by_key: Dict[str, Dict[str, Any]] = {}
+
+        for law in old_laws:
+            if not isinstance(law, dict):
+                continue
+            act = str(law.get("act") or "").strip()
+            sec = str(law.get("section") or "").strip()
+            if not act or not sec:
+                continue
+            merged_by_key[_law_key(law)] = dict(law)
+
+        for law in new_laws:
+            if not isinstance(law, dict):
+                continue
+            act = str(law.get("act") or "").strip()
+            sec = str(law.get("section") or "").strip()
+            if not act or not sec:
+                continue
+            k = _law_key(law)
+            if k in merged_by_key:
+                old = merged_by_key[k]
+                merged_by_key[k] = {
+                    **old,
+                    **law,
+                    "description": str(law.get("description") or old.get("description") or "").strip(),
+                    "relevance": str(law.get("relevance") or old.get("relevance") or "Medium").strip(),
+                }
+            else:
+                merged_by_key[k] = dict(law)
+
+        merged_laws = list(merged_by_key.values())[:12]
+        return {"laws": merged_laws}
+
+    def _merge_list_of_dates_for_objective_change(
+        self, old_dates: List[Dict[str, Any]], new_dates: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        seen = set()
+        for item in (old_dates or []) + (new_dates or []):
+            if not isinstance(item, dict):
+                continue
+            date_v = str(item.get("date") or "").strip()
+            title_v = self._canonical_text_key(item.get("title") or "")
+            if not (date_v or title_v):
+                continue
+            # Dedupe by date + normalized title (ignore source doc IDs to avoid repeats across refreshes)
+            key = f"{date_v}::{title_v}"
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+        return merged[:200]
+
+    async def _llm_semantic_keep_indexes(
+        self,
+        items: List[str],
+        *,
+        item_type: str,
+        max_keep: int,
+    ) -> Optional[List[int]]:
+        if not items:
+            return []
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            numbered = "\n".join(f"{i+1}. {v}" for i, v in enumerate(items))
+            prompt = f"""You are a strict semantic deduplicator.
+Given the numbered {item_type} list below, remove duplicates by MEANING (not wording).
+If two or more items mean the same thing, keep only the best, most specific one.
+Preserve distinct items even if related.
+
+Return ONLY JSON:
+{{"keepIndexes":[1,2,5]}}
+
+Rules:
+- keepIndexes must be 1-based indexes from the list.
+- No duplicates in keepIndexes.
+- Keep original order.
+- Keep at most {max_keep} items.
+
+{item_type.upper()}:
+{numbered}
+"""
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=1200,
+                response_mime_type="application/json",
+            )
+            candidate = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            parsed = json.loads(candidate) if candidate else json.loads((raw or "").strip())
+            keep = parsed.get("keepIndexes") if isinstance(parsed, dict) else None
+            if not isinstance(keep, list):
+                return None
+            cleaned: List[int] = []
+            seen = set()
+            for idx in keep:
+                try:
+                    n = int(idx)
+                except Exception:
+                    continue
+                if n < 1 or n > len(items) or n in seen:
+                    continue
+                seen.add(n)
+                cleaned.append(n)
+                if len(cleaned) >= max_keep:
+                    break
+            return cleaned or None
+        except Exception as e:
+            logger.warning("LLM semantic dedupe failed for {}: {}", item_type, e)
+            return None
+
+    async def _llm_semantic_dedupe_strings(
+        self, items: List[str], *, item_type: str, max_keep: int
+    ) -> List[str]:
+        if not items:
+            return []
+        keep = await self._llm_semantic_keep_indexes(
+            items, item_type=item_type, max_keep=max_keep
+        )
+        if not keep:
+            return items[:max_keep]
+        out = [items[i - 1] for i in keep if 1 <= i <= len(items)]
+        return out[:max_keep]
+
+    async def _llm_semantic_dedupe_strengths(
+        self, strengths: List[Dict[str, Any]], *, max_keep: int = 8
+    ) -> List[Dict[str, Any]]:
+        if not strengths:
+            return []
+        lines = []
+        valid_strengths: List[Dict[str, Any]] = []
+        for s in strengths:
+            if not isinstance(s, dict):
+                continue
+            point = str(s.get("point") or "").strip()
+            if not point:
+                continue
+            laws = s.get("laws") if isinstance(s.get("laws"), list) else []
+            laws_s = ", ".join(str(x).strip() for x in laws if str(x).strip())
+            lines.append(point if not laws_s else f"{point} | laws: {laws_s}")
+            valid_strengths.append(s)
+        if not valid_strengths:
+            return []
+        keep = await self._llm_semantic_keep_indexes(
+            lines, item_type="analysis strengths", max_keep=max_keep
+        )
+        if not keep:
+            return valid_strengths[:max_keep]
+        return [valid_strengths[i - 1] for i in keep if 1 <= i <= len(valid_strengths)][
+            :max_keep
+        ]
+
+    async def _run_objective_change_incremental_refresh(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        *,
+        log_context: str = "",
+    ) -> None:
+        ctx = log_context or " (objective change)"
+
+        # 1) Analysis report: regenerate and emit only the fresh payload
+        # (do not merge with previous analysis report for objective-change flow).
+        new_analysis = await self._generate_analysis_report_from_documents(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            workspace_role=workspace_role,
+            batch_result=None,
+            is_update=True,
+        )
+        merged_analysis = (
+            dict(new_analysis)
+            if isinstance(new_analysis, dict) and new_analysis
+            else self._analysis_report_fallback(
+                (workspace_role or "ADJUDICATOR").strip().upper()
+            )
+        )
+        # Semantic dedupe by meaning (LLM-based), not only exact text.
+        merged_analysis["missingInfo"] = await self._llm_semantic_dedupe_strings(
+            merged_analysis.get("missingInfo") or [],
+            item_type="missing information items",
+            max_keep=10,
+        )
+        merged_analysis["weaknesses"] = await self._llm_semantic_dedupe_strings(
+            merged_analysis.get("weaknesses") or [],
+            item_type="weaknesses",
+            max_keep=8,
+        )
+        merged_analysis["risks"] = await self._llm_semantic_dedupe_strings(
+            merged_analysis.get("risks") or [],
+            item_type="risks",
+            max_keep=8,
+        )
+        merged_analysis["pendingActions"] = await self._llm_semantic_dedupe_strings(
+            merged_analysis.get("pendingActions") or [],
+            item_type="pending actions",
+            max_keep=6,
+        )
+        merged_analysis["nextSteps"] = await self._llm_semantic_dedupe_strings(
+            merged_analysis.get("nextSteps") or [],
+            item_type="next steps",
+            max_keep=6,
+        )
+        merged_analysis["suggestedDrafts"] = await self._llm_semantic_dedupe_strings(
+            merged_analysis.get("suggestedDrafts") or [],
+            item_type="suggested drafts",
+            max_keep=6,
+        )
+        merged_analysis["relevantJurisdiction"] = await self._llm_semantic_dedupe_strings(
+            merged_analysis.get("relevantJurisdiction") or [],
+            item_type="relevant jurisdiction entries",
+            max_keep=6,
+        )
+        merged_analysis["strengths"] = await self._llm_semantic_dedupe_strengths(
+            merged_analysis.get("strengths") or [], max_keep=8
+        )
+        self._workspace_analysis_payload[workspace_id] = merged_analysis
+        if self._socket_client:
+            await self._socket_client.emit(
+                "document_feature_response",
+                {
+                    "featureType": "analysis_report",
+                    "workspaceId": workspace_id,
+                    "userId": user_id,
+                    "payload": merged_analysis,
+                },
+            )
+            logger.success(
+                "✅ Objective-change incremental analysis update emitted{}",
+                ctx,
+            )
+            # Fresh objective-aligned report is emitted; lift suppression so future emits are allowed.
+            self._suppress_analysis_emit_until_ts.pop(workspace_id, None)
+
+        # 2) List of dates: regenerate, then merge with existing chronology
+        try:
+            from app.vectorstore.qdrant import vector_store
+
+            all_docs = await vector_store.get_all_documents(workspace_id=workspace_id)
+        except Exception as e:
+            logger.warning("List of dates (objective change) fetch failed: {}", e)
+            all_docs = []
+        new_dates = await self._generate_list_of_dates_from_documents(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            all_docs=all_docs,
+            workspace_role=workspace_role,
+            batch_result=None,
+        )
+        old_dates = self._workspace_list_of_dates_payload.get(workspace_id) or []
+        merged_dates = self._merge_list_of_dates_for_objective_change(
+            old_dates if isinstance(old_dates, list) else [],
+            new_dates if isinstance(new_dates, list) else [],
+        )
+        if merged_dates:
+            date_lines = []
+            for d in merged_dates:
+                if not isinstance(d, dict):
+                    continue
+                date_lines.append(
+                    "{} | {} | {}".format(
+                        str(d.get("date") or "").strip(),
+                        str(d.get("title") or "").strip(),
+                        str(d.get("description") or "").strip(),
+                    ).strip()
+                )
+            keep_dates = await self._llm_semantic_keep_indexes(
+                date_lines, item_type="list of dates events", max_keep=200
+            )
+            if keep_dates:
+                merged_dates = [
+                    merged_dates[i - 1]
+                    for i in keep_dates
+                    if 1 <= i <= len(merged_dates)
+                ]
+        self._workspace_list_of_dates_payload[workspace_id] = merged_dates
+        if self._socket_client:
+            await self._socket_client.emit(
+                "document_feature_response",
+                {
+                    "featureType": "list_of_dates",
+                    "workspaceId": workspace_id,
+                    "userId": user_id,
+                    "payload": {
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "listOfDates": merged_dates,
+                    },
+                },
+            )
+            logger.success(
+                "✅ Objective-change incremental list_of_dates update emitted{}",
+                ctx,
+            )
+
+        # 3) Applicable laws: regenerate, then merge (keep prior + add/refresh new)
+        signals = await self._extract_case_signals_from_documents(workspace_id, user_id)
+        search_results = await self._search_indiankanoon(signals.get("query", ""))
+        if not search_results:
+            search_results = await self._search_google_cse_for_indiankanoon(
+                signals.get("query", "")
+            )
+        new_laws = await self._generate_applicable_laws_from_sources(
+            workspace_id=workspace_id,
+            workspace_role=workspace_role,
+            signals=signals,
+            search_results=search_results,
+        )
+        old_laws = self._workspace_applicable_laws_payload.get(workspace_id) or {}
+        merged_laws = self._merge_applicable_laws_for_objective_change(
+            old_laws if isinstance(old_laws, dict) else {},
+            new_laws if isinstance(new_laws, dict) else {},
+        )
+        laws_arr = merged_laws.get("laws") or []
+        if isinstance(laws_arr, list) and laws_arr:
+            law_lines = []
+            for lw in laws_arr:
+                if not isinstance(lw, dict):
+                    law_lines.append(str(lw))
+                    continue
+                law_lines.append(
+                    "{} | {} | {}".format(
+                        str(lw.get("act") or "").strip(),
+                        str(lw.get("section") or "").strip(),
+                        str(lw.get("description") or "").strip(),
+                    )
+                )
+            keep_laws = await self._llm_semantic_keep_indexes(
+                law_lines, item_type="applicable laws entries", max_keep=12
+            )
+            if keep_laws:
+                merged_laws["laws"] = [
+                    laws_arr[i - 1] for i in keep_laws if 1 <= i <= len(laws_arr)
+                ]
+        self._workspace_applicable_laws_payload[workspace_id] = merged_laws
+        if self._socket_client:
+            await self._socket_client.emit(
+                "document_feature_response",
+                {
+                    "featureType": "applicable_laws",
+                    "workspaceId": workspace_id,
+                    "userId": user_id,
+                    "payload": merged_laws,
+                },
+            )
+            logger.success(
+                "✅ Objective-change incremental applicable_laws update emitted{}",
+                ctx,
+            )
+
+    def _schedule_objective_change_reanalysis(
+        self,
+        workspace_id: str,
+        user_id: str,
+        *,
+        log_context: str = "",
+    ) -> None:
+        """
+        On strategic objective changes from intelligence chat, run incremental
+        refresh (merge old + new) for analysis_report, list_of_dates, and applicable_laws.
+        """
+        ctx = log_context or " (objective change)"
+
+        # Resolve role with safe fallbacks so regeneration is always attempted.
+        role = "ADJUDICATOR"
+        try:
+            strategy_payload = self._workspace_strategy_payload.get(workspace_id) or {}
+            candidate_role = (strategy_payload.get("role") or "").strip().upper()
+            if candidate_role in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                role = candidate_role
+        except Exception:
+            pass
+        try:
+            ws_ctx = workspace_manager.get_workspace(workspace_id)
+            if ws_ctx and ws_ctx.workspace_role:
+                ctx_role = (ws_ctx.workspace_role or "").strip().upper()
+                if ctx_role in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                    role = ctx_role
+        except Exception:
+            pass
+
+        async def _runner() -> None:
+            try:
+                await self._run_objective_change_incremental_refresh(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=role,
+                    log_context=ctx,
+                )
+            except Exception as rean_err:
+                logger.warning(
+                    "Objective-change incremental refresh{} failed: {}",
+                    ctx,
+                    rean_err,
+                )
+
+        try:
+            asyncio.create_task(_runner())
+            logger.info(
+                "Scheduled objective-change reanalysis{} for workspace {}",
+                ctx,
+                workspace_id[:12] if workspace_id else "",
+            )
+        except RuntimeError as rt_err:
+            logger.error(
+                "Could not schedule objective-change reanalysis{}: {}",
+                ctx,
+                rt_err,
+            )
+
     async def _run_strategy_analysis_timeline_pipeline(
         self,
         workspace_id: str,
@@ -2835,6 +3782,17 @@ Indian Kanoon / case-law search results:
             analysis_report = self._analysis_report_fallback(
                 (workspace_role or "ADJUDICATOR").strip().upper()
             )
+        # Guard: if objective-change refresh is active, skip stale background emits
+        # so workspace sees only objective-aligned analysis report.
+        suppress_until = self._suppress_analysis_emit_until_ts.get(workspace_id, 0.0)
+        if suppress_until and time.time() < suppress_until:
+            logger.info(
+                "Skipping stale analysis_report emit for workspace {} (suppressed for {:.1f}s more){}",
+                workspace_id[:12] if workspace_id else "",
+                max(0.0, suppress_until - time.time()),
+                log_context,
+            )
+            return False
         # Cache and set pending re-emit before emit so re-emit on reconnect has data if emit fails
         self._workspace_analysis_payload[workspace_id] = analysis_report
         self._pending_reemit_workspace_id = workspace_id
@@ -3253,6 +4211,7 @@ Indian Kanoon / case-law search results:
             return {"applied": False}
 
         applied_any = False
+        objective_changed = False
         response_parts: List[str] = []
 
         # 1) Strategy objective update
@@ -3262,17 +4221,10 @@ Indian Kanoon / case-law search results:
             if isinstance(current_strategy, dict):
                 current_strategy["strategicObjective"] = objective_text
                 self._workspace_strategy_payload[workspace_id] = current_strategy
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "strategy_objective",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": current_strategy,
-                    },
-                )
                 applied_any = True
-                response_parts.append("Strategic objective updated")
+                objective_changed = True
+                # Keep objective update internal for downstream regeneration;
+                # do not re-emit strategy_objective panel from intelligence chat.
 
         # 2) Analysis report updates
         missing_items = updates.get("missingInfo") or []
@@ -3376,17 +4328,49 @@ Indian Kanoon / case-law search results:
                     ).strip()
 
                 self._workspace_analysis_payload[workspace_id] = current_report
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "analysis_report",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": current_report,
-                    },
+                # If objective changed in the same turn, do not emit this interim/cached report.
+                # Objective-refresh pipeline will emit only the freshly regenerated analysis report.
+                suppress_until = self._suppress_analysis_emit_until_ts.get(
+                    workspace_id, 0.0
                 )
+                suppress_active = bool(suppress_until and time.time() < suppress_until)
+                if not objective_changed and not suppress_active:
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "analysis_report",
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "payload": current_report,
+                        },
+                    )
                 applied_any = True
-                response_parts.append("Analysis report updated")
+                if not objective_changed and not suppress_active:
+                    response_parts.append("Analysis report updated")
+
+        if objective_changed:
+            # Block any stale/background analysis emits briefly; objective refresh will emit fresh report.
+            self._suppress_analysis_emit_until_ts[workspace_id] = time.time() + 120.0
+            await self._emit_workspace_refresh(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                reason="objective_change_regeneration_started",
+                feature_types=[
+                    "strategy_objective",
+                    "analysis_report",
+                    "list_of_dates",
+                    "applicable_laws",
+                ],
+            )
+            # Objective change should re-run analysis and laws discovery so panels stay aligned.
+            self._schedule_objective_change_reanalysis(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                log_context=" (from intelligence chat objective update)",
+            )
+            response_parts.append(
+                "Regeneration started for analysis report and applicable laws"
+            )
 
         return {
             "applied": applied_any,
@@ -4177,6 +5161,45 @@ Indian Kanoon / search results (titles and snippets):
             doc_context=doc_context,
         )
         await _emit_response(rel, merged_desc)
+
+    async def on_analysis_docx_generate_request(self, data: Dict[str, Any]) -> None:
+        """
+        Handle analysis_docx_generate_request (Server -> AI_Maverick).
+        Performs deterministic text processing and emits analysis_docx_generate_response.
+        """
+        payload_in = data if isinstance(data, dict) else {}
+        logger.info(
+            "analysis_docx_generate_request <- backend (received): keys={}",
+            list(payload_in.keys()) if isinstance(payload_in, dict) else type(payload_in),
+        )
+
+        if not self._socket_client:
+            logger.warning(
+                "analysis_docx_generate_request: socket client unavailable, cannot emit response"
+            )
+            return
+
+        try:
+            req = AnalysisDocxGenerateRequestPayload(**payload_in)
+            normalized_request = req.model_dump(exclude_none=True)
+        except Exception as e:
+            logger.warning("analysis_docx_generate_request: invalid payload: {}", e)
+            normalized_request = payload_in
+
+        response_body = process_analysis_docx_request(normalized_request)
+        try:
+            preview = json.dumps(response_body, default=str)
+        except Exception:
+            preview = str(response_body)
+        logger.info(
+            "analysis_docx_generate_response -> backend (preview): {}",
+            preview[:2000] + ("..." if len(preview) > 2000 else ""),
+        )
+        await self._socket_client.emit("analysis_docx_generate_response", response_body)
+        logger.success(
+            "✅ analysis_docx_generate_response emitted for requestId={}",
+            response_body.get("requestId"),
+        )
 
     def _salvage_workspace_metadata_from_truncated_json(
         self, raw: str, combined: str = ""
@@ -5487,6 +6510,17 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                             logger.info(
                                 "🎯 Scheduling strategy + analysis + timeline/laws (background)…"
                             )
+                            await self._emit_workspace_refresh(
+                                workspace_id=str(payload.workspaceId),
+                                user_id=str(payload.userId),
+                                reason="ai_update_started",
+                                feature_types=[
+                                    "strategy_objective",
+                                    "analysis_report",
+                                    "list_of_dates",
+                                    "applicable_laws",
+                                ],
+                            )
                             self._schedule_strategy_analysis_pipeline(
                                 workspace_id=str(payload.workspaceId),
                                 user_id=str(payload.userId),
@@ -5924,6 +6958,18 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     except Exception:
                         pass
 
+                    await self._emit_workspace_refresh(
+                        workspace_id=str(payload.workspaceId),
+                        user_id=str(payload.userId),
+                        reason="ai_update_started",
+                        feature_types=[
+                            "strategy_objective",
+                            "analysis_report",
+                            "list_of_dates",
+                            "applicable_laws",
+                        ],
+                    )
+
                     # Strategy: generate or use fallback so backend always receives strategy_objective (e.g. when all docs deleted)
                     strategies_result = None
                     try:
@@ -6287,6 +7333,17 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 )
                                 logger.info(
                                     "🎯 Scheduling strategy + analysis + timeline/laws on sync (background)…"
+                                )
+                                await self._emit_workspace_refresh(
+                                    workspace_id=str(payload.workspaceId),
+                                    user_id=str(payload.userId),
+                                    reason="ai_update_started",
+                                    feature_types=[
+                                        "strategy_objective",
+                                        "analysis_report",
+                                        "list_of_dates",
+                                        "applicable_laws",
+                                    ],
                                 )
                                 self._schedule_strategy_analysis_pipeline(
                                     workspace_id=str(payload.workspaceId),
@@ -6690,10 +7747,16 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     ):
                         workspace_role = "ADJUDICATOR"
                     role_context["role"] = workspace_role
-                    workspace_state["role_selected"] = bool(
-                        (ctx.workspace_role or "").strip()
-                    )
                     role_context_from_meta = ctx.get_metadata("role_context")
+                    role_from_meta = ""
+                    if isinstance(role_context_from_meta, dict):
+                        role_from_meta = str(
+                            role_context_from_meta.get("role") or ""
+                        ).strip()
+                    # Treat role as selected if either workspace_role is set or role metadata exists.
+                    workspace_state["role_selected"] = bool(
+                        (ctx.workspace_role or "").strip() or role_from_meta
+                    )
                     if isinstance(
                         role_context_from_meta, dict
                     ) and role_context_from_meta.get("role"):

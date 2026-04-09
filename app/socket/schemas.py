@@ -150,6 +150,23 @@ class ApplicableLawRelevanceRequestPayload(BaseModel):
     law: ApplicableLawItemInRequest
 
 
+class AnalysisDocxGenerateRequestPayload(BaseModel):
+    """
+    Payload for analysis_docx_generate_request (Server -> AI).
+    AI performs text normalization and returns analysis_docx_generate_response.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    requestId: str
+    workspaceId: str
+    userId: Optional[str] = None
+    trigger: Optional[str] = None
+    contentHash: Optional[str] = None
+    documentSource: Dict[str, Any]
+    timestamp: Optional[str] = None
+
+
 class ConversationHistoryItem(BaseModel):
     """Schema for conversation history item."""
 

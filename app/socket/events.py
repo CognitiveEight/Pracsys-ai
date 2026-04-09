@@ -4232,6 +4232,13 @@ Rules:
         risk_items = updates.get("risks") or []
 
         if missing_items or weakness_items or risk_items:
+            # Analysis-only refresh hint so FE can show loader specifically for Analysis Report.
+            await self._emit_workspace_refresh(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                reason="analysis_report_update_started",
+                feature_types=["analysis_report"],
+            )
             current_report = self._workspace_analysis_payload.get(workspace_id)
             if isinstance(current_report, dict):
                 removed_missing = 0
@@ -4330,11 +4337,7 @@ Rules:
                 self._workspace_analysis_payload[workspace_id] = current_report
                 # If objective changed in the same turn, do not emit this interim/cached report.
                 # Objective-refresh pipeline will emit only the freshly regenerated analysis report.
-                suppress_until = self._suppress_analysis_emit_until_ts.get(
-                    workspace_id, 0.0
-                )
-                suppress_active = bool(suppress_until and time.time() < suppress_until)
-                if not objective_changed and not suppress_active:
+                if not objective_changed:
                     await self._socket_client.emit(
                         "document_feature_response",
                         {
@@ -4345,8 +4348,20 @@ Rules:
                         },
                     )
                 applied_any = True
-                if not objective_changed and not suppress_active:
-                    response_parts.append("Analysis report updated")
+                if not objective_changed:
+                    response_parts.append(
+                        "Analysis report updated with revised quality score"
+                    )
+                if (
+                    removed_missing == 0
+                    and removed_weak == 0
+                    and removed_risk == 0
+                    and not objective_changed
+                ):
+                    logger.info(
+                        "Analysis update markers found, but no matching items removed (workspace={})",
+                        workspace_id[:12] if workspace_id else "",
+                    )
 
         if objective_changed:
             # Block any stale/background analysis emits briefly; objective refresh will emit fresh report.

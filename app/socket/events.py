@@ -260,6 +260,11 @@ class SocketEventHandler:
         self._chat_attachment_by_chat: Dict[str, List[Dict[str, Any]]] = {}
         # Intelligence chat: last assistant text per chat_id (client may omit conversation_history)
         self._intelligence_last_ai_by_chat: Dict[str, str] = {}
+        # Persistent role cache keys:
+        # - per chat: f"{workspace_id}:{user_id}:{chat_id}" -> role
+        # - per user/workspace: f"{workspace_id}:{user_id}" -> role
+        self._role_cache_by_chat: Dict[str, str] = {}
+        self._role_cache_by_user_workspace: Dict[str, str] = {}
         # Last ai_response payload; re-emit after reconnect when socket dropped right after emit so backend receives it
         self._pending_ai_response: Optional[Dict[str, Any]] = None
         # De-dup guard for replayed workspace_sync events (e.g., reconnect replay).
@@ -269,6 +274,75 @@ class SocketEventHandler:
         # from older pipelines so FE receives only the fresh objective-aligned report.
         self._suppress_analysis_emit_until_ts: Dict[str, float] = {}
         self._register_default_handlers()
+
+    async def _remember_workspace_role(
+        self,
+        workspace_id: str,
+        user_id: str,
+        role: str,
+        *,
+        chat_id: Optional[str] = None,
+    ) -> None:
+        role_upper = (role or "").strip().upper()
+        if role_upper not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+            return
+        ws_user_key = f"{workspace_id}:{user_id}"
+        self._role_cache_by_user_workspace[ws_user_key] = role_upper
+        if chat_id:
+            self._role_cache_by_chat[f"{workspace_id}:{user_id}:{chat_id}"] = role_upper
+        try:
+            from app.vectorstore.qdrant import vector_store
+
+            await vector_store.upsert_workspace_role(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                role=role_upper,
+                chat_id=chat_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to persist role cache in vector DB (workspace={}, user={}): {}",
+                workspace_id,
+                user_id,
+                e,
+            )
+
+    async def _restore_workspace_role(
+        self,
+        workspace_id: str,
+        user_id: str,
+        *,
+        chat_id: Optional[str] = None,
+    ) -> Optional[str]:
+        if chat_id:
+            in_mem_chat = self._role_cache_by_chat.get(f"{workspace_id}:{user_id}:{chat_id}")
+            if in_mem_chat:
+                return in_mem_chat
+        in_mem_user = self._role_cache_by_user_workspace.get(f"{workspace_id}:{user_id}")
+        if in_mem_user:
+            return in_mem_user
+        try:
+            from app.vectorstore.qdrant import vector_store
+
+            from_vector_db = await vector_store.get_workspace_role(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                chat_id=chat_id,
+            )
+            role_upper = str(from_vector_db or "").strip().upper()
+            if role_upper in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                self._role_cache_by_user_workspace[f"{workspace_id}:{user_id}"] = role_upper
+                if chat_id:
+                    self._role_cache_by_chat[f"{workspace_id}:{user_id}:{chat_id}"] = role_upper
+                return role_upper
+        except Exception as e:
+            logger.warning(
+                "Failed to restore role cache from vector DB (workspace={}, user={}): {}",
+                workspace_id,
+                user_id,
+                e,
+            )
+        return None
 
     def set_socket_client(self, client):
         """Set the socket client for emitting responses."""
@@ -6325,6 +6399,9 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     payload.workspaceRole,
                 )
                 workspace_role = "ADJUDICATOR"
+            await self._remember_workspace_role(
+                str(payload.workspaceId), str(payload.userId), workspace_role
+            )
 
             logger.info("Initializing workspace with role: {}", workspace_role)
 
@@ -6921,6 +6998,12 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 evidence_files=evidence_for_context,
                 updated_at=updated_at,
             )
+            if payload.workspaceRole:
+                await self._remember_workspace_role(
+                    str(payload.workspaceId),
+                    str(payload.userId),
+                    str(payload.workspaceRole),
+                )
 
             # Update workspace metadata (for logging)
             updates = {}
@@ -7741,6 +7824,15 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 "workspace_id": workspace_id,
                 "user_id": user_id,
             }
+            role_aliases = {
+                "ADJUDICATOR": "ADJUDICATOR",
+                "PETITIONER": "PETITIONER",
+                "RESPONDENT": "RESPONDENT",
+                "MEDIATOR": "MEDIATOR",
+            }
+            raw_user_text = (payload.content or "").strip()
+            cleaned_for_role = re.sub(r"[^A-Za-z]", "", raw_user_text).upper()
+            explicit_role_selection = role_aliases.get(cleaned_for_role)
             workspace_state = {
                 "workspace_id": workspace_id,
                 "user_id": user_id,
@@ -7762,6 +7854,9 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     ):
                         workspace_role = "ADJUDICATOR"
                     role_context["role"] = workspace_role
+                    await self._remember_workspace_role(
+                        workspace_id, user_id, workspace_role, chat_id=chat_id
+                    )
                     role_context_from_meta = ctx.get_metadata("role_context")
                     role_from_meta = ""
                     if isinstance(role_context_from_meta, dict):
@@ -7787,6 +7882,108 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     "Could not load workspace for chat (using defaults): {}",
                     str(ws_err),
                 )
+
+            # Restore role from persistent cache (workspace+user and optional chat) when context was cold/reloaded.
+            cached_role = await self._restore_workspace_role(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                chat_id=chat_id,
+            )
+            if cached_role:
+                role_context["role"] = cached_role
+                workspace_state["role_selected"] = True
+                if not ctx:
+                    try:
+                        from app.workspace.context import context_manager
+
+                        ctx = context_manager.upsert_workspace(
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            workspace_role=cached_role,
+                        )
+                    except Exception:
+                        ctx = None
+                if ctx:
+                    ctx.workspace_role = cached_role
+                    role_ctx_meta = ctx.get_metadata("role_context", {})
+                    if not isinstance(role_ctx_meta, dict):
+                        role_ctx_meta = {}
+                    role_ctx_meta = {**role_ctx_meta, "role": cached_role}
+                    ctx.set_metadata("role", cached_role)
+                    ctx.set_metadata("role_context", role_ctx_meta)
+                    role_context.update(role_ctx_meta)
+
+            # If the user explicitly sends a role name in chat, persist it on workspace context.
+            if explicit_role_selection:
+                try:
+                    if not ctx:
+                        from app.workspace.context import context_manager
+
+                        ctx = context_manager.upsert_workspace(
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            workspace_role=explicit_role_selection,
+                        )
+                    ctx.workspace_role = explicit_role_selection
+                    role_ctx_meta = ctx.get_metadata("role_context", {})
+                    if not isinstance(role_ctx_meta, dict):
+                        role_ctx_meta = {}
+                    role_ctx_meta = {**role_ctx_meta, "role": explicit_role_selection}
+                    ctx.set_metadata("role", explicit_role_selection)
+                    ctx.set_metadata("role_context", role_ctx_meta)
+                    ctx.set_metadata("role_selected_at", datetime.utcnow().isoformat())
+                    role_context.update(role_ctx_meta)
+                    role_context["role"] = explicit_role_selection
+                    workspace_state["role_selected"] = True
+                    await self._remember_workspace_role(
+                        workspace_id,
+                        user_id,
+                        explicit_role_selection,
+                        chat_id=chat_id,
+                    )
+                    logger.info(
+                        "Role selected from chat and stored on workspace context: {}",
+                        explicit_role_selection,
+                    )
+
+                    # If user message is only the role selection word, acknowledge and return immediately.
+                    if cleaned_for_role in role_aliases:
+                        if self._socket_client:
+                            ai_response = AIResponsePayload(
+                                chatId=chat_id,
+                                workspaceId=workspace_id,
+                                userId=user_id,
+                                content=(
+                                    f"Role confirmed as {explicit_role_selection.title()}. "
+                                    "I will keep this role for this workspace. "
+                                    "You can now ask your legal question."
+                                ),
+                                metadata=AIResponseMetadata(
+                                    messageId=chat_id,
+                                    aiModel=settings.gemini_model,
+                                ),
+                            )
+                            payload_dict = ai_response.dict(by_alias=True)
+                            await self._socket_client.emit_ai_response(payload_dict)
+                            self._pending_ai_response = payload_dict
+                            self._intelligence_last_ai_by_chat[chat_id] = (
+                                ai_response.content
+                            )
+                        audit_logger.log_event(
+                            "workspace_role_selected_from_chat",
+                            {
+                                "workspace_id": workspace_id,
+                                "user_id": user_id,
+                                "chat_id": chat_id,
+                                "role": explicit_role_selection,
+                            },
+                        )
+                        return
+                except Exception as role_sel_err:
+                    logger.warning(
+                        "Failed to persist role selection from chat: {}",
+                        str(role_sel_err),
+                    )
 
             # Fetch annexure text from vector store for chat (drafts, answers, etc.)
             try:
@@ -8050,6 +8247,12 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 self._pending_ai_response = payload_dict
                 await self._socket_client.emit_ai_response(payload_dict)
                 logger.success("✅ AI response sent successfully")
+                await self._remember_workspace_role(
+                    workspace_id,
+                    user_id,
+                    (role_context.get("role") or "ADJUDICATOR"),
+                    chat_id=chat_id,
+                )
                 # Cache assistant text for follow-ups like "yes" when conversation_history is incomplete
                 _rt = (response_text_to_emit or "").strip()
                 if (

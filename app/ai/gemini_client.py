@@ -126,7 +126,7 @@ class GeminiClient:
         prompt: str,
         system_instruction: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 2000,
+        max_tokens: int = 12000,
         **kwargs,
     ) -> str:
         """
@@ -228,7 +228,7 @@ class GeminiClient:
         messages: List[Dict[str, str]],
         system_instruction: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 2000,
+        max_tokens: int = 12000,
         **kwargs,
     ) -> str:
         """

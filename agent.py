@@ -334,6 +334,11 @@ def process_analysis_docx_request(payload: Dict[str, Any]) -> Dict[str, Any]:
         report_quality = source.get("qualityScoreExplanation", "")
     document_payload["reportQualityScoreExplanation"] = filter_structure(str(report_quality))
 
+    # Ensure new backend key is always present for DOCX consumers.
+    if "risks" not in document_payload:
+        document_payload["risks"] = []
+    document_payload["risks"] = filter_structure(document_payload.get("risks") or [])
+
     return {
         "requestId": request_id,
         "workspaceId": workspace_id,

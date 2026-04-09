@@ -767,7 +767,7 @@ Rules:
                                         workspace_role
                                     ),
                                     temperature=0.1,
-                                    max_tokens=2500,
+                                    max_tokens=12000,
                                     response_mime_type="application/json",
                                 )
                                 recovery_json = self._prepare_json_candidate(
@@ -1630,7 +1630,7 @@ Rules:
                             workspace_role
                         ),
                         temperature=0.1,
-                        max_tokens=2500,
+                        max_tokens=12000,
                         response_mime_type="application/json",
                     )
                     recovered = json.loads((recovery_raw or "").strip())
@@ -1793,7 +1793,7 @@ Rules:
                             workspace_role
                         ),
                         temperature=0.0,
-                        max_tokens=2200,
+                        max_tokens=12000,
                         response_mime_type="application/json",
                     )
                     force_obj = json.loads((force_raw or "").strip())
@@ -2108,7 +2108,7 @@ Rules:
             raw = await gemini_client.generate(
                 prompt=prompt,
                 temperature=0.1,
-                max_tokens=1200,
+                max_tokens=12000,
                 response_mime_type="application/json",
             )
             candidate = self._prepare_json_candidate((raw or "").strip(), prefer="object")
@@ -2945,7 +2945,7 @@ Indian Kanoon / case-law search results:
                 workspace_role
             ),
             temperature=0.2,
-            max_tokens=8000,
+            max_tokens=12000,
             response_mime_type="application/json",
         )
         logger.info("Applicable laws: raw LLM response preview={}", (raw or "")[:500])
@@ -3382,7 +3382,7 @@ Rules:
             raw = await gemini_client.generate(
                 prompt=prompt,
                 temperature=0.0,
-                max_tokens=1200,
+                max_tokens=12000,
                 response_mime_type="application/json",
             )
             candidate = self._prepare_json_candidate((raw or "").strip(), prefer="object")
@@ -4119,7 +4119,7 @@ Rules:
                     workspace_role
                 ),
                 temperature=0.35,
-                max_tokens=500,
+                max_tokens=12000,
             )
             txt = (txt or "").strip()
             if len(txt) >= 40:
@@ -4556,7 +4556,7 @@ Output ONLY valid JSON, no markdown, no code block:
                     None
                 ),
                 temperature=0.3,
-                max_tokens=8000,
+                max_tokens=12000,
                 response_mime_type="application/json",
             )
             raw = (raw or "").strip()
@@ -5026,7 +5026,7 @@ Indian Kanoon / search results (titles and snippets):
                 workspace_role
             ),
             temperature=0.15,
-            max_tokens=2048,
+            max_tokens=12000,
             response_mime_type="application/json",
         )
         text = (raw or "").strip()
@@ -5453,7 +5453,7 @@ Document content:
 Specific case summary (3-4 lines, one sentence per line):"""
 
                 raw = await gemini_client.generate(
-                    prompt, temperature=0.2 if attempt == 0 else 0.4, max_tokens=8000
+                    prompt, temperature=0.2 if attempt == 0 else 0.4, max_tokens=12000
                 )
                 if not raw:
                     logger.warning(
@@ -5590,7 +5590,7 @@ Specific case summary (3-4 lines, one sentence per line):"""
 {doc_content}
 
 Summary (3-4 lines, one sentence per line):"""
-            raw = await gemini_client.generate(prompt, temperature=0.5, max_tokens=400)
+            raw = await gemini_client.generate(prompt, temperature=0.5, max_tokens=12000)
             if not raw:
                 return ""
             lines = [ln.strip() for ln in raw.strip().split("\n") if ln.strip()][:4]
@@ -5779,7 +5779,7 @@ Document: {doc_preview}
 
 Return JSON: {{"caseTitle": "Name1 vs Name2", "caseCategory": "CIVIL LAW", "subcategories": ["Act Name"], "description": "Line 1: Actual party and issue from documents\\nLine 2: Key facts/allegations from documents\\nLine 3: Relief sought from documents\\nLine 4: Additional relevant details"}}"""
             raw = await gemini_client.generate(
-                fallback_prompt, temperature=0.3, max_tokens=300
+                fallback_prompt, temperature=0.3, max_tokens=12000
             )
             import json
             import re
@@ -5958,7 +5958,7 @@ Document content:
 CRITICAL: All four fields (caseTitle, caseCategory, subcategories, description) are MANDATORY. Do not leave any field empty or null.
 
 Output ONLY this JSON, no markdown: {{"caseTitle": "Petitioner Name vs Respondent Name", "caseCategory": "CRIMINAL LAW", "subcategories": ["Bharatiya Nyaya Sanhita", "IT Act 2000"], "description": "MLA Umesh Malik has filed a complaint regarding his son Shubham Malik's hacked social media account.\\nEdited videos and posts were made viral to defame the complainant and damage his political image.\\nThe complainant seeks a high-level investigation and strict action against the perpetrators.\\nThe complaint involves alleged violations under IT Act 2000 and requests preservation of digital evidence."}}"""
-            raw = await gemini_client.generate(prompt, temperature=0.2, max_tokens=700)
+            raw = await gemini_client.generate(prompt, temperature=0.2, max_tokens=12000)
             if not raw or "Error" in (raw[:80] or ""):
                 return await self._generate_fallback_metadata(combined, workspace_id)
             raw_clean = raw.strip()
@@ -6117,7 +6117,7 @@ Document: {combined[:800]}
 Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other text."""
                 try:
                     title_raw = await gemini_client.generate(
-                        title_prompt, temperature=0.3, max_tokens=100
+                        title_prompt, temperature=0.3, max_tokens=12000
                     )
                     if title_raw:
                         title_raw = title_raw.strip().strip('"').strip("'")
@@ -8425,7 +8425,7 @@ Vary types: draft, explain, list, risks, next steps, clarify, evidence, options.
 
 Return ONLY a JSON array, no other text. Example with 10+ items: ["Draft a settlement proposal", "List key issues for mediation", "What are the risks for each party?", "Suggest compromise options", "Summarise evidence so far", "Outline procedural next steps", "Identify gaps in the complaint", "Recommend documents to collect", "Clarify jurisdiction", "Compare both sides' positions", "Suggest interim measures"]
 """
-            raw = await gemini_client.generate(prompt, temperature=0.7, max_tokens=600)
+            raw = await gemini_client.generate(prompt, temperature=0.7, max_tokens=12000)
             if not raw or "Error" in (raw[:80] or ""):
                 return []
             raw = raw.strip()
@@ -8574,7 +8574,7 @@ Analysis report summary:
 Output a JSON array of exactly 15 or 16 short, actionable prompt labels (2-5 words each). Each label is a question or action the user might tap to ask about the analysis. Examples: "What is in this document", "Explain key strengths", "List missing information", "What are the risks", "Summarise weaknesses", "Suggest next steps", "Explain quality score", "Relevant jurisdiction", "Pending actions", "Recommended drafts". No full sentences. Vary: missing info, strengths, weaknesses, risks, next steps, drafts, jurisdiction, score explanation.
 
 Return ONLY a JSON array of 15-16 strings, no other text."""
-            raw = await gemini_client.generate(prompt, temperature=0.5, max_tokens=8000)
+            raw = await gemini_client.generate(prompt, temperature=0.5, max_tokens=12000)
             if not raw:
                 logger.warning(
                     "Analysis report chips: empty response from Gemini; using fallback"

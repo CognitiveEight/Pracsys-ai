@@ -144,7 +144,11 @@ def node_text_filter(state: TextFilterState) -> dict[str, str]:
         llm = ChatGoogleGenerativeAI(**kwargs)
         msg = llm.invoke([SystemMessage(content=SYSTEM), HumanMessage(content=text)])
         out = _ai_output_text(msg)
-        return {"output": out if isinstance(out, str) and out else _direct_filter(text)}
+        if not isinstance(out, str) or not out:
+            return {"output": _direct_filter(text)}
+        # Hard safety: enforce deterministic forbidden-word replacement
+        # even when Gemini output drifts from instruction.
+        return {"output": _direct_filter(out)}
     except Exception:
         return {"output": _direct_filter(text)}
 
@@ -316,31 +320,19 @@ def process_analysis_docx_request(payload: Dict[str, Any]) -> Dict[str, Any]:
             "timestamp": _now_iso(),
         }
 
+    # Process the full source so every provided key is normalized consistently.
+    document_payload = filter_structure(source)
+
+    # Normalize summary keys expected by DOCX pipeline.
     report_case_summary = source.get("reportCaseSummary")
     if report_case_summary is None:
         report_case_summary = source.get("caseSummary", "")
+    document_payload["reportCaseSummary"] = filter_structure(str(report_case_summary))
 
     report_quality = source.get("reportQualityScoreExplanation")
     if report_quality is None:
         report_quality = source.get("qualityScoreExplanation", "")
-
-    document_payload = {
-        "reportCaseSummary": filter_structure(str(report_case_summary)),
-        "reportQualityScoreExplanation": filter_structure(str(report_quality)),
-        "missingInfo": filter_structure(source.get("missingInfo", [])),
-        "strengths": filter_structure(source.get("strengths", [])),
-        "weaknesses": filter_structure(source.get("weaknesses", [])),
-    }
-
-    # Keep additional analysis blocks when backend sends them for DOCX export.
-    if "laws" in source:
-        document_payload["laws"] = filter_structure(source.get("laws", []))
-    if "listOfDates" in source:
-        document_payload["listOfDates"] = filter_structure(source.get("listOfDates", []))
-    if "possibleNextSteps" in source:
-        document_payload["possibleNextSteps"] = filter_structure(
-            source.get("possibleNextSteps", [])
-        )
+    document_payload["reportQualityScoreExplanation"] = filter_structure(str(report_quality))
 
     return {
         "requestId": request_id,

@@ -7913,6 +7913,21 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     ctx.set_metadata("role_context", role_ctx_meta)
                     role_context.update(role_ctx_meta)
 
+            # Safety: if documents exist but role flag is still false (cache miss/race),
+            # don't block the user with role picker again; continue in neutral mode.
+            if workspace_state.get("documents_count", 0) > 0 and not workspace_state.get(
+                "role_selected"
+            ):
+                workspace_state["role_selected"] = True
+                role_context["role"] = (
+                    (role_context.get("role") or "ADJUDICATOR").strip().upper()
+                )
+                logger.warning(
+                    "Role not found for workspace {} with existing documents; bypassing gate with role={}",
+                    workspace_id[:12] if workspace_id else "",
+                    role_context["role"],
+                )
+
             # If the user explicitly sends a role name in chat, persist it on workspace context.
             if explicit_role_selection:
                 try:

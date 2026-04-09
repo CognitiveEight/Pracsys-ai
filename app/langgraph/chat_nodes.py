@@ -573,10 +573,12 @@ async def _handle_greeting(
 
     start_time = datetime.utcnow()
 
-    # Generate natural, contextual greeting (still role-conditioned per legal intelligence rules)
-    system_instruction = get_legal_intelligence_system_instruction(
-        current_role=role or "ADJUDICATOR",
-        role_neutral_chat=True,
+    # Important: use a lightweight greeting system instruction.
+    # Using the full legal system prompt here can leak annexure gate text.
+    system_instruction = (
+        "You are a friendly legal AI assistant in a workspace chat. "
+        "For greetings/thanks, reply briefly and naturally (1-2 short sentences). "
+        "Do not ask for role selection. Do not mention annexure gate or onboarding text."
     )
     greeting_prompt = f"""
 The user said: "{user_message}"
@@ -607,6 +609,19 @@ Just respond naturally as a helpful impartial legal assistant (no party slant un
         for prefix in ["ANSWER:", "RESPONSE:", "**Response:**", "**Answer:**"]:
             if response_text.startswith(prefix):
                 response_text = response_text[len(prefix) :].strip()
+
+        # Guardrail: never allow greeting path to emit role-selection gate text.
+        lower_text = response_text.lower()
+        if (
+            "select one role to proceed" in lower_text
+            or "please confirm your objective" in lower_text
+            or "supporting materials" in lower_text
+            or response_text.startswith(ANNEXURE_UPLOAD_GATE_MESSAGE[:40])
+        ):
+            response_text = (
+                "Hello! I am here and ready to help. "
+                "You can ask any question about your case."
+            )
 
         logger.success(
             f"✅ Generated natural greeting response ({processing_time:.0f}ms)"
@@ -666,8 +681,20 @@ async def explain_why_node(state: Dict[str, Any]) -> Dict[str, Any]:
         logger.info("👋 Handling greeting/conversational message")
         return await _handle_greeting(state, user_message, role)
 
-    # Annexure upload gate: first message when annexures exist → show gate message and four roles only
-    if documents_count > 0 and len(chat_history) == 0 and not role_selected:
+    # Annexure upload gate: first message only when workspace has docs but no established
+    # panel/context state yet. If analysis/strategy already exists, do not re-gate.
+    has_existing_panel_state = bool(
+        workspace_state.get("analysis_report")
+        or workspace_state.get("active_strategy")
+        or workspace_state.get("approved_facts")
+        or workspace_state.get("applicable_laws")
+    )
+    if (
+        documents_count > 0
+        and len(chat_history) == 0
+        and not role_selected
+        and not has_existing_panel_state
+    ):
         gate_response = (
             ANNEXURE_UPLOAD_GATE_MESSAGE
             + "\n\nSelect one role to proceed:\n\n• "

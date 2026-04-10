@@ -26,7 +26,11 @@ from app.prompts.legal_intelligence_system import (
     get_legal_intelligence_system_instruction,
     get_structured_document_feature_system_instruction,
 )
-from app.langgraph.chat_nodes import merge_intelligence_chat_history
+from app.langgraph.chat_nodes import (
+    _last_ai_message_from_history,
+    is_user_affirmation_to_continue,
+    merge_intelligence_chat_history,
+)
 from app.socket.schemas import (
     AIResponseMetadata,
     AIResponsePayload,
@@ -48,6 +52,12 @@ EventHandler = Callable[[Dict[str, Any]], Awaitable[None]]
 _STRATEGY_ROLE_LABELS_RE = re.compile(
     r"\b(?:adjudicator|petitioner|respondent|mediator|client|clients)\b",
     re.I,
+)
+
+# Appended to Strategy & Objective replies when the user discusses a new priority informally.
+OBJECTIVE_UPDATE_OFFER_QUESTION = (
+    "Do you want me to update the whole workspace based on this new objective "
+    "that you have defined?"
 )
 
 
@@ -1083,6 +1093,443 @@ Rules:
             logger.error(f"Error generating strategies: {e}")
             logger.exception(e)
             return None
+
+    def _extract_direct_objective_update_instruction(self, text: str) -> Optional[str]:
+        """
+        Return instruction only when user explicitly asks to update/change objective.
+        This powers direct auto-update (no confirmation question).
+        """
+        raw = (text or "").strip()
+        if not raw or len(raw) > 2000:
+            return None
+        tl = raw.lower()
+        q_prefixes = (
+            "what ",
+            "how ",
+            "why ",
+            "when ",
+            "where ",
+            "explain ",
+            "can you ",
+            "could you ",
+            "should i ",
+            "is there ",
+            "are there ",
+            "define ",
+            "list ",
+            "summarize ",
+            "summarise ",
+            "tell me ",
+            "describe ",
+            "outline ",
+        )
+        if any(tl.startswith(p) for p in q_prefixes):
+            return None
+        if tl.rstrip().endswith("?") and len(raw) < 800:
+            return None
+        explicit_pairs = (
+            ("update", "objective"),
+            ("change", "objective"),
+            ("revise", "objective"),
+            ("modify", "objective"),
+            ("replace", "objective"),
+            ("regenerate", "objective"),
+            ("refresh", "objective"),
+            ("update", "strategy"),
+            ("change", "strategy"),
+            ("regenerate", "strategy"),
+        )
+        explicit_hit = any(a in tl and b in tl for (a, b) in explicit_pairs)
+        if not explicit_hit:
+            # Also treat declarative objective definitions as direct objective updates,
+            # e.g. "client objective is to file in Patna only".
+            declarative_objective = (
+                ("objective" in tl)
+                and (
+                    "objective is" in tl
+                    or "objective is to" in tl
+                    or "client objective" in tl
+                    or "main objective" in tl
+                )
+                and (
+                    "want to file" in tl
+                    or "file the case" in tl
+                    or "only in" in tl
+                    or "jurisdiction" in tl
+                    or "priority is" in tl
+                )
+                and not tl.endswith("?")
+            )
+            if not declarative_objective:
+                return None
+        return raw
+
+    def _extract_implicit_objective_shift_instruction(self, text: str) -> Optional[str]:
+        """
+        Detect likely strategic-shift intent in informal language.
+        Used to append confirmation question (not direct auto-update).
+        """
+        raw = (text or "").strip()
+        if not raw or len(raw) > 2000:
+            return None
+        tl = raw.lower()
+        if is_user_affirmation_to_continue(raw):
+            return None
+        if tl.rstrip().endswith("?") and len(raw) < 900:
+            return None
+        signals = (
+            "want to file",
+            "file the case",
+            "jurisdiction",
+            "strategic priority",
+            "client want",
+            "we want",
+            "we need to",
+            "priority is",
+            "should file",
+            "must file",
+            "only in",
+            "only at",
+            "approach",
+            "focus on",
+            "main objective",
+            "mitigate",
+            "strategy",
+            "prioritize",
+            "ensure",
+            "target",
+            "to mitigate",
+        )
+        heuristic_declarative_strategy = (
+            len(raw) >= 35
+            and not tl.endswith("?")
+            and (
+                tl.startswith("to ")
+                or " strategy " in f" {tl} "
+                or " objective " in f" {tl} "
+                or " mitigate " in f" {tl} "
+            )
+        )
+        if not any(s in tl for s in signals) and not heuristic_declarative_strategy:
+            return None
+        if self._extract_direct_objective_update_instruction(raw):
+            return None
+        return raw
+
+    async def _regenerate_strategy_objective_preserving_case_summary(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        user_objective_instruction: str,
+        current_strategy: Dict[str, Any],
+    ) -> bool:
+        """
+        Regenerate strategicObjective, possibleNextSteps, and suggestionChips from the user's new
+        objective instruction. Keeps caseSummary and reportCaseSummary unchanged; emits strategy_objective.
+        """
+        try:
+            from app.ai.gemini_client import gemini_client
+            from app.vectorstore.qdrant import vector_store
+
+            case_summary = (current_strategy.get("caseSummary") or "").strip()
+            report_case_summary = (current_strategy.get("reportCaseSummary") or "").strip()
+            if not case_summary:
+                return False
+
+            all_docs = []
+            try:
+                all_docs = await vector_store.get_all_documents(
+                    workspace_id=workspace_id
+                )
+            except Exception as e:
+                logger.warning(
+                    "Objective regen: could not load documents: {}", e
+                )
+            parts = []
+            valid_docs = [
+                d
+                for d in all_docs
+                if (d.get("content") or "").strip()
+                and len((d.get("content") or "").strip()) >= 20
+            ]
+            max_total_content = 100000
+            per_doc_cap = (
+                (max_total_content // max(1, len(valid_docs)))
+                if valid_docs
+                else max_total_content
+            )
+            if not all_docs:
+                combined_document_content = "No document content available."
+            else:
+                for i, doc in enumerate(all_docs, 1):
+                    content = (doc.get("content") or "").strip()
+                    if not content or len(content) < 20:
+                        continue
+                    label = (
+                        f"Document {i} (most recently uploaded)"
+                        if i == len(all_docs)
+                        else f"Document {i}"
+                    )
+                    if len(content) > per_doc_cap:
+                        content = (
+                            content[:per_doc_cap] + "\n[... truncated for length ...]"
+                        )
+                    parts.append(f"--- {label} ---\n{content}")
+                combined_document_content = (
+                    "\n\n".join(parts) if parts else "No document content available."
+                )
+            if len(combined_document_content) > max_total_content:
+                combined_document_content = (
+                    combined_document_content[:max_total_content]
+                    + "\n[... content truncated ...]"
+                )
+
+            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                role = "ADJUDICATOR"
+
+            prompt = f"""You are a legal strategy analyst for Indian law.
+
+The following case summaries are FIXED. Do NOT change, paraphrase, or contradict them.
+
+LOCKED caseSummary (verbatim context):
+{case_summary}
+
+LOCKED reportCaseSummary (verbatim context):
+{report_case_summary or "(same facts as case summary; neutral report narrative)"}
+
+**User's new strategic priority / instruction** (follow this as the primary constraint):
+{user_objective_instruction.strip()}
+
+Current strategic objective (to replace):
+{(current_strategy.get("strategicObjective") or "").strip()}
+
+Current possible next steps (to replace):
+{json.dumps(current_strategy.get("possibleNextSteps") or [], ensure_ascii=True)}
+
+**Role**: {role}
+
+**Document content** (for fact consistency only; do not rewrite the case summaries):
+{combined_document_content}
+
+Return JSON ONLY with these keys:
+{{
+  "strategicObjective": "5-6 sentences, role-tailored for {role}, aligned with the user's instruction and the case facts",
+  "possibleNextSteps": ["3-5 concrete immediate actions; use Annexure N for uploads, never Document N"],
+  "suggestionChips": ["15-16 short labels, 2-5 words each, actionable"]
+}}
+
+Rules:
+- Do not restate or replace caseSummary/reportCaseSummary in the output.
+- The new strategicObjective and possibleNextSteps MUST reflect the new user instruction and MUST NOT just repeat the current objective/steps.
+- BNS/BNSS/BSA naming (not IPC/CrPC/IEA where replaced).
+- No invented facts; if the instruction conflicts with documents, note the tension in strategicObjective.
+- JSON only; complete strings and arrays."""
+
+            custom_suffix = build_custom_instruction_suffix(workspace_id)
+            if custom_suffix:
+                prompt = prompt.rstrip() + "\n\n" + custom_suffix
+
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                system_instruction=get_structured_document_feature_system_instruction(
+                    role
+                ),
+                temperature=0.25,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            if not json_str:
+                return False
+            data = json.loads(json_str)
+            if not isinstance(data, dict):
+                return False
+
+            strategic_objective = (data.get("strategicObjective") or "").strip()
+            possible_next_steps = (
+                data.get("possibleNextSteps") or data.get("possible_next_steps") or []
+            )
+            if isinstance(possible_next_steps, str):
+                possible_next_steps = [possible_next_steps] if possible_next_steps else []
+            possible_next_steps = [
+                _annexure_wording_for_next_steps(str(s).strip())
+                for s in possible_next_steps
+                if s
+            ][:5]
+            suggestion_chips = (
+                data.get("suggestionChips") or data.get("suggestion_chips") or []
+            )
+            if isinstance(suggestion_chips, str):
+                suggestion_chips = [suggestion_chips] if suggestion_chips else []
+            suggestion_chips = [str(s).strip() for s in suggestion_chips if s][:16]
+
+            if not strategic_objective:
+                return False
+            if len(possible_next_steps) < 2:
+                possible_next_steps = (
+                    possible_next_steps
+                    + [
+                        "Map jurisdiction and venue requirements against the instruction",
+                        "Preserve and index key annexures referenced in strategy",
+                    ]
+                )[:5]
+
+            merged = dict(current_strategy)
+            merged["caseSummary"] = current_strategy.get("caseSummary", case_summary)
+            merged["reportCaseSummary"] = current_strategy.get(
+                "reportCaseSummary", report_case_summary
+            )
+            merged["strategicObjective"] = strategic_objective
+            merged["possibleNextSteps"] = possible_next_steps
+            merged["suggestionChips"] = suggestion_chips
+            merged["isUpdate"] = True
+            merged["role"] = role
+            merged["workspaceId"] = workspace_id
+            merged["userId"] = user_id
+            merged["timestamp"] = datetime.utcnow().isoformat()
+
+            self._workspace_strategy_payload[workspace_id] = merged
+            if suggestion_chips:
+                self._workspace_suggestion_chips[workspace_id] = list(suggestion_chips)
+                self._last_workspace_id_with_chips = workspace_id
+
+            if self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "strategy_objective",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": merged,
+                    },
+                )
+                logger.success(
+                    "✅ Strategy objective regen emitted (case summary preserved) workspace={}",
+                    workspace_id[:12] if workspace_id else "",
+                )
+            return True
+        except Exception as e:
+            logger.warning("Strategy objective regen failed: {}", e)
+            return False
+
+    def _last_ai_offered_objective_update(self, ai_text: str) -> bool:
+        """True if the assistant previously appended the objective-update offer question."""
+        t = (ai_text or "").lower()
+        return (
+            "update the strategic objective" in t
+            or "update the whole workspace based on this new objective" in t
+        )
+
+    def _format_thread_for_objective_extraction(
+        self,
+        chat_history: List[Dict[str, Any]],
+        current_user_message: str,
+        *,
+        max_messages: int = 14,
+    ) -> str:
+        """Build a compact thread for summarizing the desired new objective after 'yes'."""
+        lines: List[str] = []
+        hist = chat_history or []
+        tail = hist[-max_messages:] if len(hist) > max_messages else hist
+        for m in tail:
+            role = (m.get("role") or "").upper()
+            c = (m.get("content") or "").strip()
+            if not c:
+                continue
+            prefix = "User" if role == "USER" else "Assistant"
+            lines.append(f"{prefix}: {c}")
+        lines.append(f"User (confirmation): {(current_user_message or '').strip()}")
+        return "\n".join(lines)
+
+    async def _summarize_objective_instruction_from_thread(
+        self,
+        thread: str,
+        workspace_role: str,
+    ) -> Optional[str]:
+        """Extract the new strategic priority from an informal discussion thread."""
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            prompt = f"""The lawyer chatted in informal language about how they want to steer the case. They then confirmed they want the strategy panels updated.
+
+Summarize the NEW strategic objective / priority they want (venue, relief, procedural focus, or emphasis), in 2-8 sentences. Use ONLY what appears in the thread; do not invent facts. If the thread does not support a concrete objective, use an empty string.
+
+Workspace role: {role}
+
+Thread:
+{thread}
+
+Reply JSON only: {{"objectiveText": "..."}}"""
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.1,
+                max_tokens=2000,
+                response_mime_type="application/json",
+            )
+            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            if not json_str:
+                return None
+            data = json.loads(json_str)
+            if not isinstance(data, dict):
+                return None
+            txt = (data.get("objectiveText") or data.get("objective_text") or "").strip()
+            return txt or None
+        except Exception as e:
+            logger.warning("Objective instruction summarization failed: {}", e)
+            return None
+
+    async def _should_offer_objective_update_after_discussion(
+        self,
+        user_message: str,
+        assistant_reply: str,
+    ) -> bool:
+        """
+        True when the user is exploring a new strategic direction in informal language
+        without explicitly asking to update the strategy panel — offer to update at end of reply.
+        """
+        um = (user_message or "").strip()
+        ar = (assistant_reply or "").strip()
+        if len(um) < 12:
+            return False
+        if is_user_affirmation_to_continue(um):
+            return False
+        if OBJECTIVE_UPDATE_OFFER_QUESTION.lower() in ar.lower():
+            return False
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            prompt = f"""Classify whether the USER message suggests a possible NEW strategic priority or direction for their legal case (e.g. different court/venue, focus on one remedy, shift emphasis, change timing), in informal or indirect wording — even if they do NOT ask to "update the objective" or "change strategy".
+
+Return JSON only: {{"offer": true or false}}
+
+Rules:
+- offer=true: user is discussing or leaning toward a different strategic emphasis that could change the formal strategic objective; includes informal / "lemon language".
+- offer=false: pure legal information question, greeting, document request, or no strategic repositioning.
+
+User message:
+{um[:4000]}
+
+Assistant reply (for context, first 1200 chars):
+{ar[:1200]}"""
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=120,
+                response_mime_type="application/json",
+            )
+            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            if not json_str:
+                return False
+            data = json.loads(json_str)
+            if not isinstance(data, dict):
+                return False
+            return bool(data.get("offer") is True)
+        except Exception as e:
+            logger.warning("Objective-offer classifier failed: {}", e)
+            return False
 
     async def _generate_analysis_report_from_documents(
         self,
@@ -2593,13 +3040,28 @@ Example shape:
         if not isinstance(laws_raw, list):
             laws_raw = []
 
+        def normalize_section_label(value: str) -> str:
+            """Normalize noisy section labels and return raw section token."""
+            text = re.sub(r"\s+", " ", str(value or "")).strip()
+            if not text:
+                return ""
+
+            # Remove any repeated/single "Section"/"Sec" prefix variants.
+            core = re.sub(
+                r"^(?:(?:section|sec)\s*[:.-]?\s*)+",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            ).strip(" :.-")
+            return core or text
+
         normalized: List[Dict[str, str]] = []
         relevance_allowed = {"high": "High", "medium": "Medium", "low": "Low"}
         for idx, item in enumerate(laws_raw, start=1):
             if not isinstance(item, dict):
                 continue
             act = str(item.get("act") or "").strip()
-            section = str(item.get("section") or "").strip()
+            section = normalize_section_label(item.get("section"))
             description = str(item.get("description") or "").strip()
             # Guardrail: user explicitly asked to not show IPC items in output.
             act_l = act.lower()
@@ -4270,10 +4732,12 @@ Rules:
         workspace_id: str,
         user_id: str,
         combined_text: str,
+        *,
+        ignore_strategic_objective: bool = False,
     ) -> Dict[str, Any]:
         """
         If the chat message includes user panel update markers, apply them to:
-        - strategy_objective.strategicObjective
+        - strategy_objective (only if not already handled by objective regeneration in STRATEGY_OBJECTIVE chat)
         - analysis_report.missingInfo / weaknesses / risks
         and re-emit updated panels to backend.
         """
@@ -4281,24 +4745,34 @@ Rules:
             return {"applied": False}
 
         updates = self._extract_intelligence_chat_panel_updates(combined_text)
+        if ignore_strategic_objective:
+            updates.pop("strategicObjective", None)
         if not updates:
             return {"applied": False}
 
         applied_any = False
-        objective_changed = False
         response_parts: List[str] = []
 
-        # 1) Strategy objective update
+        # 1) Strategy objective: raw text update + emit when regen did not run (e.g. no case summary yet)
         objective_text = updates.get("strategicObjective")
-        if objective_text:
+        if objective_text and not ignore_strategic_objective:
             current_strategy = self._workspace_strategy_payload.get(workspace_id)
             if isinstance(current_strategy, dict):
+                current_strategy = dict(current_strategy)
                 current_strategy["strategicObjective"] = objective_text
+                current_strategy["timestamp"] = datetime.utcnow().isoformat()
                 self._workspace_strategy_payload[workspace_id] = current_strategy
                 applied_any = True
-                objective_changed = True
-                # Keep objective update internal for downstream regeneration;
-                # do not re-emit strategy_objective panel from intelligence chat.
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "strategy_objective",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": current_strategy,
+                    },
+                )
+                response_parts.append("Strategy objective text updated")
 
         # 2) Analysis report updates
         missing_items = updates.get("missingInfo") or []
@@ -4409,57 +4883,24 @@ Rules:
                     ).strip()
 
                 self._workspace_analysis_payload[workspace_id] = current_report
-                # If objective changed in the same turn, do not emit this interim/cached report.
-                # Objective-refresh pipeline will emit only the freshly regenerated analysis report.
-                if not objective_changed:
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "analysis_report",
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "payload": current_report,
-                        },
-                    )
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "analysis_report",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": current_report,
+                    },
+                )
                 applied_any = True
-                if not objective_changed:
-                    response_parts.append(
-                        "Analysis report updated with revised quality score"
-                    )
-                if (
-                    removed_missing == 0
-                    and removed_weak == 0
-                    and removed_risk == 0
-                    and not objective_changed
-                ):
+                response_parts.append(
+                    "Analysis report updated with revised quality score"
+                )
+                if removed_missing == 0 and removed_weak == 0 and removed_risk == 0:
                     logger.info(
                         "Analysis update markers found, but no matching items removed (workspace={})",
                         workspace_id[:12] if workspace_id else "",
                     )
-
-        if objective_changed:
-            # Block any stale/background analysis emits briefly; objective refresh will emit fresh report.
-            self._suppress_analysis_emit_until_ts[workspace_id] = time.time() + 120.0
-            await self._emit_workspace_refresh(
-                workspace_id=workspace_id,
-                user_id=user_id,
-                reason="objective_change_regeneration_started",
-                feature_types=[
-                    "strategy_objective",
-                    "analysis_report",
-                    "list_of_dates",
-                    "applicable_laws",
-                ],
-            )
-            # Objective change should re-run analysis and laws discovery so panels stay aligned.
-            self._schedule_objective_change_reanalysis(
-                workspace_id=workspace_id,
-                user_id=user_id,
-                log_context=" (from intelligence chat objective update)",
-            )
-            response_parts.append(
-                "Regeneration started for analysis report and applicable laws"
-            )
 
         return {
             "applied": applied_any,
@@ -6602,17 +7043,6 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                             logger.info(
                                 "🎯 Scheduling strategy + analysis + timeline/laws (background)…"
                             )
-                            await self._emit_workspace_refresh(
-                                workspace_id=str(payload.workspaceId),
-                                user_id=str(payload.userId),
-                                reason="ai_update_started",
-                                feature_types=[
-                                    "strategy_objective",
-                                    "analysis_report",
-                                    "list_of_dates",
-                                    "applicable_laws",
-                                ],
-                            )
                             self._schedule_strategy_analysis_pipeline(
                                 workspace_id=str(payload.workspaceId),
                                 user_id=str(payload.userId),
@@ -7432,17 +7862,24 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 logger.info(
                                     "🎯 Scheduling strategy + analysis + timeline/laws on sync (background)…"
                                 )
-                                await self._emit_workspace_refresh(
-                                    workspace_id=str(payload.workspaceId),
-                                    user_id=str(payload.userId),
-                                    reason="ai_update_started",
-                                    feature_types=[
-                                        "strategy_objective",
-                                        "analysis_report",
-                                        "list_of_dates",
-                                        "applicable_laws",
-                                    ],
+                                has_prior_panels = bool(
+                                    self._workspace_strategy_payload.get(payload.workspaceId)
+                                    or self._workspace_analysis_payload.get(payload.workspaceId)
+                                    or self._workspace_list_of_dates_payload.get(payload.workspaceId)
+                                    or self._workspace_applicable_laws_payload.get(payload.workspaceId)
                                 )
+                                if has_prior_panels:
+                                    await self._emit_workspace_refresh(
+                                        workspace_id=str(payload.workspaceId),
+                                        user_id=str(payload.userId),
+                                        reason="ai_update_started",
+                                        feature_types=[
+                                            "strategy_objective",
+                                            "analysis_report",
+                                            "list_of_dates",
+                                            "applicable_laws",
+                                        ],
+                                    )
                                 self._schedule_strategy_analysis_pipeline(
                                     workspace_id=str(payload.workspaceId),
                                     user_id=str(payload.userId),
@@ -8102,8 +8539,20 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
             # If the lawyer sends update markers, apply them immediately
             # to the cached Strategy/Objectives + Analysis Report and re-emit
             # updated panels to the backend.
+            # STRATEGY_OBJECTIVE: new objective text → regenerate objective + next steps + chips;
+            # case summary unchanged; emit strategy_objective (skip long chat memo).
+            # Informal discussion → full answer may append an offer; user "yes" → regen + analysis refresh.
             # -------------------------------------------------------------
+            chat_type_upper = (payload.chat_type or "").strip().upper()
+            chat_history_resolved = merge_intelligence_chat_history(
+                payload.conversation_history,
+                current_user_content=payload.content or "",
+                cached_last_ai=self._intelligence_last_ai_by_chat.get(chat_id),
+            )
             update_result = {"applied": False}
+            objective_regen_ok = False
+            objective_ack_kind: Optional[str] = None
+            implicit_objective_shift_text: Optional[str] = None
             try:
                 combined_text_for_updates = payload.content or ""
                 # Include attachment text if present (so updates can be pasted into a file)
@@ -8115,10 +8564,133 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 att.get("content") or ""
                             )
 
+                um_early = (payload.content or "").strip()
+                # User said yes after we asked whether to update the objective (informal discussion flow)
+                if (
+                    chat_type_upper == "STRATEGY_OBJECTIVE"
+                    and is_user_affirmation_to_continue(um_early)
+                ):
+                    last_ai_for_offer = _last_ai_message_from_history(
+                        chat_history_resolved
+                    )
+                    if not last_ai_for_offer:
+                        last_ai_for_offer = (
+                            self._intelligence_last_ai_by_chat.get(chat_id) or ""
+                        )
+                    if self._last_ai_offered_objective_update(last_ai_for_offer):
+                        thread_txt = self._format_thread_for_objective_extraction(
+                            chat_history_resolved, um_early
+                        )
+                        instr = await self._summarize_objective_instruction_from_thread(
+                            thread_txt,
+                            (role_context.get("role") or "ADJUDICATOR"),
+                        )
+                        cur_strat = self._workspace_strategy_payload.get(workspace_id)
+                        if (
+                            instr
+                            and len(instr.strip()) >= 15
+                            and isinstance(cur_strat, dict)
+                            and (cur_strat.get("caseSummary") or "").strip()
+                        ):
+                            await self._emit_workspace_refresh(
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                reason="objective_change_regeneration_started",
+                                feature_types=[
+                                    "strategy_objective",
+                                    "analysis_report",
+                                    "list_of_dates",
+                                    "applicable_laws",
+                                ],
+                            )
+                            regen_ok = (
+                                await self._regenerate_strategy_objective_preserving_case_summary(
+                                    workspace_id=workspace_id,
+                                    user_id=user_id,
+                                    workspace_role=(
+                                        role_context.get("role") or "ADJUDICATOR"
+                                    ),
+                                    user_objective_instruction=instr,
+                                    current_strategy=cur_strat,
+                                )
+                            )
+                            if regen_ok:
+                                objective_regen_ok = True
+                                objective_ack_kind = "followup_ok"
+                                self._schedule_objective_change_reanalysis(
+                                    workspace_id=workspace_id,
+                                    user_id=user_id,
+                                    log_context=(
+                                        " (after user confirmed objective update from discussion)"
+                                    ),
+                                )
+                            else:
+                                objective_regen_ok = True
+                                objective_ack_kind = "followup_clarify"
+                        else:
+                            objective_regen_ok = True
+                            objective_ack_kind = "followup_clarify"
+
+                objective_instruction: Optional[str] = None
+                if not objective_regen_ok and chat_type_upper == "STRATEGY_OBJECTIVE":
+                    prep = self._extract_intelligence_chat_panel_updates(
+                        combined_text_for_updates
+                    )
+                    objective_instruction = prep.get("strategicObjective")
+                    if not objective_instruction:
+                        objective_instruction = self._extract_direct_objective_update_instruction(
+                            combined_text_for_updates
+                        )
+                    if not objective_instruction:
+                        implicit_objective_shift_text = (
+                            self._extract_implicit_objective_shift_instruction(
+                                combined_text_for_updates
+                            )
+                        )
+                if (
+                    not objective_regen_ok
+                    and objective_instruction
+                    and chat_type_upper == "STRATEGY_OBJECTIVE"
+                ):
+                    cur_strat = self._workspace_strategy_payload.get(workspace_id)
+                    if isinstance(cur_strat, dict) and (
+                        cur_strat.get("caseSummary") or ""
+                    ).strip():
+                        await self._emit_workspace_refresh(
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            reason="objective_change_regeneration_started",
+                            feature_types=[
+                                "strategy_objective",
+                                "analysis_report",
+                                "list_of_dates",
+                                "applicable_laws",
+                            ],
+                        )
+                        objective_regen_ok = (
+                            await self._regenerate_strategy_objective_preserving_case_summary(
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                workspace_role=(
+                                    role_context.get("role") or "ADJUDICATOR"
+                                ),
+                                user_objective_instruction=objective_instruction,
+                                current_strategy=cur_strat,
+                            )
+                        )
+                        if objective_regen_ok:
+                            objective_ack_kind = "direct"
+                            self._schedule_objective_change_reanalysis(
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                log_context=" (from direct objective instruction)",
+                            )
+
                 update_result = await self._try_apply_intelligence_chat_panel_updates(
                     workspace_id=workspace_id,
                     user_id=user_id,
                     combined_text=combined_text_for_updates,
+                    ignore_strategic_objective=bool(objective_regen_ok),
                 )
                 if update_result.get("applied"):
                     logger.success("✅ Panel updates applied from chat message")
@@ -8128,7 +8700,6 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     str(upd_err),
                 )
 
-            chat_type_upper = (payload.chat_type or "").strip().upper()
             chat_type_to_module = {
                 "ANALYSIS_REPORT": "analysis_report",
                 "STRATEGY_OBJECTIVE": "strategy_objective",
@@ -8143,12 +8714,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
 
             custom_chat_suffix = build_custom_instruction_suffix(workspace_id) or None
 
-            # STEP 2 & 3: Build chat context (merge server-side last AI turn when client omits it)
-            chat_history_resolved = merge_intelligence_chat_history(
-                payload.conversation_history,
-                current_user_content=payload.content or "",
-                cached_last_ai=self._intelligence_last_ai_by_chat.get(chat_id),
-            )
+            # STEP 2 & 3: Build chat context (history merged above for objective follow-up + graph)
             chat_context = ChatContext(
                 workspace_id=workspace_id,
                 user_id=user_id,
@@ -8159,75 +8725,153 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 chat_history=chat_history_resolved,
             )
 
-            # STEP 4: Process with Intelligence Chat Agent
-            logger.info("🤖 Processing message with Intelligence Chat Agent...")
-
-            start_time = datetime.utcnow()
-            response = await intelligence_chat_agent.process_message(
-                workspace_id=workspace_id,
-                user_id=user_id,
-                message_id=chat_id,
-                user_message=payload.content,
-                chat_context=chat_context,
-            )
-            # If assistant produced panel-update markers, apply them as well.
-            ai_update_result = {"applied": False}
-            try:
-                ai_update_result = await self._try_apply_intelligence_chat_panel_updates(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    combined_text=response.response_text or "",
-                )
-                if ai_update_result.get("applied"):
-                    logger.success("✅ Panel updates applied from AI response markers")
-            except Exception as ai_upd_err:
-                logger.warning(
-                    "AI response panel update attempt failed; continuing. err={}",
-                    str(ai_upd_err),
-                )
-            # If we applied deterministic panel updates, override the chat text
-            if isinstance(update_result, dict) and update_result.get("applied"):
-                response_text_to_emit = update_result.get("response_text")
-            elif isinstance(ai_update_result, dict) and ai_update_result.get("applied"):
-                cleaned = self._strip_panel_update_markers_from_text(
-                    response.response_text or ""
-                )
-                response_text_to_emit = (
-                    cleaned
-                    if cleaned
-                    else ai_update_result.get("response_text") or response.response_text
-                )
-            else:
-                response_text_to_emit = response.response_text
-            processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
-
-            # Generate 10-12 contextual chips, store for this workspace; send random 4 in response (backend polls every few sec and we return random 4 each time)
+            # STEP 4: Process with Intelligence Chat Agent (skip when objective-only regen ran)
+            skip_intelligence_llm = bool(objective_regen_ok)
             import random
 
-            suggestion_chips_for_payload = []
-            try:
-                role_for_chips = (role_context.get("role") or "ADJUDICATOR").upper()
-                generated = await self._generate_contextual_suggestion_chips(
-                    workspace_id=workspace_id,
-                    role=role_for_chips,
-                    user_message=payload.content,
-                    ai_response_text=response.response_text,
-                    max_chips=12,
+            ai_update_result: Dict[str, Any] = {"applied": False}
+            start_time = datetime.utcnow()
+            if skip_intelligence_llm:
+                logger.info(
+                    "Skipping intelligence chat LLM (strategy objective regen emitted)"
                 )
-                if generated:
-                    self._workspace_chat_suggestion_chips[workspace_id] = list(
-                        generated
+                ack_parts: List[str] = []
+                if objective_ack_kind == "followup_clarify":
+                    ack_parts.append(
+                        "I could not infer a clear new strategic objective from our discussion. "
+                        "Please briefly state the priority you want (for example venue, relief, or focus), "
+                        "and I will update the strategy and analysis panels."
                     )
-                    suggestion_chips_for_payload = random.sample(
-                        generated, min(4, len(generated))
+                elif objective_ack_kind == "followup_ok":
+                    ack_parts.append(
+                        "I have updated the strategic objective and possible next steps. "
+                        "I am refreshing the analysis report, list of dates, and applicable laws "
+                        "to align with this objective based on our discussion."
                     )
-                    logger.info(
-                        "Stored {} contextual chips for workspace; sending random 4 in ai_response (each 4s poll will return random 4 from these {})",
-                        len(generated),
-                        len(generated),
+                elif objective_ack_kind == "direct" or objective_regen_ok:
+                    # Keep chat response short to avoid duplicating strategy panel payload
+                    # that is already emitted via document_feature_response.
+                    ack_parts.append("Objective update applied. Panels are refreshing.")
+                if isinstance(update_result, dict) and update_result.get("applied"):
+                    extra = (update_result.get("response_text") or "").strip()
+                    if extra:
+                        ack_parts.append(extra)
+                response_text_to_emit = " ".join(ack_parts).strip() or "Panel updated."
+                from types import SimpleNamespace
+
+                response = SimpleNamespace(
+                    response_text=response_text_to_emit,
+                    message_id=chat_id,
+                    tokens_used=0,
+                    confidence=SimpleNamespace(value="high"),
+                    detected_intent="strategy_objective_refresh",
+                )
+                processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+                suggestion_chips_for_payload = []
+                try:
+                    ws_chips = self._workspace_suggestion_chips.get(workspace_id) or []
+                    if ws_chips:
+                        suggestion_chips_for_payload = random.sample(
+                            ws_chips, min(4, len(ws_chips))
+                        )
+                except Exception:
+                    pass
+            else:
+                logger.info("🤖 Processing message with Intelligence Chat Agent...")
+                response = await intelligence_chat_agent.process_message(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    message_id=chat_id,
+                    user_message=payload.content,
+                    chat_context=chat_context,
+                )
+                # If assistant produced panel-update markers, apply them as well.
+                try:
+                    ai_update_result = await self._try_apply_intelligence_chat_panel_updates(
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        combined_text=response.response_text or "",
                     )
-            except Exception as chip_err:
-                logger.warning("Suggestion chips generation failed: {}", str(chip_err))
+                    if ai_update_result.get("applied"):
+                        logger.success(
+                            "✅ Panel updates applied from AI response markers"
+                        )
+                except Exception as ai_upd_err:
+                    logger.warning(
+                        "AI response panel update attempt failed; continuing. err={}",
+                        str(ai_upd_err),
+                    )
+                # If we applied deterministic panel updates, override the chat text
+                if isinstance(update_result, dict) and update_result.get("applied"):
+                    response_text_to_emit = update_result.get("response_text")
+                elif isinstance(ai_update_result, dict) and ai_update_result.get(
+                    "applied"
+                ):
+                    cleaned = self._strip_panel_update_markers_from_text(
+                        response.response_text or ""
+                    )
+                    response_text_to_emit = (
+                        cleaned
+                        if cleaned
+                        else ai_update_result.get("response_text")
+                        or response.response_text
+                    )
+                else:
+                    response_text_to_emit = response.response_text
+                # Informal strategic discussion: offer to update panels (user can reply yes next turn)
+                if (
+                    chat_type_upper == "STRATEGY_OBJECTIVE"
+                    and OBJECTIVE_UPDATE_OFFER_QUESTION.lower()
+                    not in (response_text_to_emit or "").lower()
+                ):
+                    try:
+                        should_append_offer = bool(
+                            implicit_objective_shift_text
+                        ) or await self._should_offer_objective_update_after_discussion(
+                            payload.content or "",
+                            response_text_to_emit or "",
+                        )
+                        if should_append_offer:
+                            response_text_to_emit = (
+                                (response_text_to_emit or "").rstrip()
+                                + "\n\n"
+                                + OBJECTIVE_UPDATE_OFFER_QUESTION
+                            )
+                    except Exception as offer_err:
+                        logger.warning(
+                            "Objective update offer append failed: {}", offer_err
+                        )
+                processing_time = (
+                    datetime.utcnow() - start_time
+                ).total_seconds() * 1000
+
+                # Generate 10-12 contextual chips, store for this workspace; send random 4 in response (backend polls every few sec and we return random 4 each time)
+                suggestion_chips_for_payload = []
+                try:
+                    role_for_chips = (role_context.get("role") or "ADJUDICATOR").upper()
+                    generated = await self._generate_contextual_suggestion_chips(
+                        workspace_id=workspace_id,
+                        role=role_for_chips,
+                        user_message=payload.content,
+                        ai_response_text=response_text_to_emit,
+                        max_chips=12,
+                    )
+                    if generated:
+                        self._workspace_chat_suggestion_chips[workspace_id] = list(
+                            generated
+                        )
+                        suggestion_chips_for_payload = random.sample(
+                            generated, min(4, len(generated))
+                        )
+                        logger.info(
+                            "Stored {} contextual chips for workspace; sending random 4 in ai_response (each 4s poll will return random 4 from these {})",
+                            len(generated),
+                            len(generated),
+                        )
+                except Exception as chip_err:
+                    logger.warning(
+                        "Suggestion chips generation failed: {}", str(chip_err)
+                    )
 
             # STEP 5: Build AI response payload (suggestionChips = random 4 from 10-12; click sends chip as next message)
             ai_response = AIResponsePayload(

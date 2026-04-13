@@ -77,6 +77,8 @@ _FORBIDDEN_RE = re.compile(
 _DIRECT_REPLACEMENTS = {
     "Petitioner": "Individual",
     "petitioner": "individual",
+    "Petitoner": "Individual",
+    "petitoner": "individual",
     "Respondent": "Individual",
     "respondent": "individual",
     "Case's": "Matter's",
@@ -117,13 +119,56 @@ def _ai_output_text(msg) -> str:
 
 
 def _direct_filter(text: str) -> str:
-    """Deterministic fallback when GEMINI_MODEL is unavailable."""
+    """Deterministic fallback with sentence-safe casing/spacing fixes."""
+    marker = "__LEGAL_SENTENCE_START__"
+
+    def _is_sentence_start(s: str, idx: int) -> bool:
+        j = idx - 1
+        while j >= 0 and s[j].isspace():
+            j -= 1
+        if j < 0:
+            return True
+        return s[j] in ".!?\n"
+
+    def _previous_word(s: str, idx: int) -> str:
+        prefix = s[:idx]
+        m = re.search(r"([A-Za-z]+)\s*$", prefix)
+        return m.group(1) if m else ""
+
+    def _replace(m: re.Match) -> str:
+        tok = m.group(0)
+        rep = _DIRECT_REPLACEMENTS.get(tok, tok)
+        if rep:
+            prev = _previous_word(text, m.start())
+            # Natural article+noun style: "The Petitioner" -> "The individual".
+            if prev.lower() == "the" and rep in ("Individual", "Matter", "Matter's"):
+                rep = rep[0].lower() + rep[1:]
+            # Keep normal grammar when lowercase token starts a sentence.
+            if rep and rep[0].islower() and _is_sentence_start(text, m.start()):
+                rep = rep[0].upper() + rep[1:]
+            return rep
+
+        # Removing Legal/legal: if it starts a sentence, keep natural opener.
+        if _is_sentence_start(text, m.start()):
+            return marker
+        return ""
+
     pattern = re.compile(
         r"\b(?:"
         + "|".join(re.escape(k) for k in sorted(_DIRECT_REPLACEMENTS, key=len, reverse=True))
         + r")\b"
     )
-    return pattern.sub(lambda m: _DIRECT_REPLACEMENTS.get(m.group(0), m.group(0)), text)
+    out = pattern.sub(_replace, text)
+
+    # "Legal issues ..." -> "The issues ..."
+    out = re.sub(rf"{marker}\s+([A-Za-z])", r"The \1", out)
+    out = out.replace(marker, "")
+
+    # Spacing cleanup around removals.
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r" +([,.;:!?])", r"\1", out)
+    out = re.sub(r"\n +", "\n", out)
+    return out
 
 
 def node_text_filter(state: TextFilterState) -> dict[str, str]:

@@ -4,12 +4,13 @@ from __future__ import annotations
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 from typing import Any, Dict, TypedDict
 
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
+import google.generativeai as genai
 from langgraph.graph import END, START, StateGraph
+from app.ai.gemini_client import gemini_client
 from app.core.config import settings
 
 # Must match SYSTEM "Forbidden words" list (case-sensitive fast path = LLM path).
@@ -88,6 +89,9 @@ _DIRECT_REPLACEMENTS = {
     "legal": "",
 }
 
+_LLM_FILTER_DISABLED = False
+_LLM_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+
 
 class TextFilterState(TypedDict):
     text: str
@@ -123,32 +127,52 @@ def _direct_filter(text: str) -> str:
 
 
 def node_text_filter(state: TextFilterState) -> dict[str, str]:
+    global _LLM_FILTER_DISABLED
     text = state["text"]
     if not has_forbidden(text):
         return {"output": text}
 
-    model = os.environ.get("GEMINI_MODEL") or settings.gemini_model
-    if not model:
+    if _LLM_FILTER_DISABLED:
         return {"output": _direct_filter(text)}
 
-    m = model.lower()
-    kwargs: dict = {"model": model, "timeout": 120}
-    if "gemini-3" in m:
-        kwargs["thinking_level"] = "minimal"
-        kwargs["temperature"] = 1.0
-    else:
-        kwargs["temperature"] = 0
-
     try:
-        llm = ChatGoogleGenerativeAI(**kwargs)
-        msg = llm.invoke([SystemMessage(content=SYSTEM), HumanMessage(content=text)])
-        out = _ai_output_text(msg)
+        # Use same Gemini wiring as app/ai/gemini_client.py
+        gemini_client.initialize()
+        if not gemini_client.model:
+            return {"output": _direct_filter(text)}
+
+        model_name = os.environ.get("GEMINI_MODEL") or settings.gemini_model
+        if model_name and model_name != gemini_client.model_name:
+            gemini_client.model_name = model_name
+            gemini_client.model = genai.GenerativeModel(model_name)
+
+        full_prompt = f"{SYSTEM}\n\n{text}"
+        future = _LLM_EXECUTOR.submit(
+            lambda: gemini_client.model.generate_content(
+                full_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.0, max_output_tokens=8000
+                ),
+            )
+        )
+        try:
+            response = future.result(timeout=6)
+        except FuturesTimeoutError:
+            _LLM_FILTER_DISABLED = True
+            return {"output": _direct_filter(text)}
+        out = getattr(response, "text", "") or ""
         if not isinstance(out, str) or not out:
             return {"output": _direct_filter(text)}
         # Hard safety: enforce deterministic forbidden-word replacement
         # even when Gemini output drifts from instruction.
         return {"output": _direct_filter(out)}
-    except Exception:
+    except Exception as e:
+        # Staging/prod often uses ADC tokens without GenAI scopes.
+        # Disable LLM path for this process after first scope/auth failure
+        # to avoid repeated retry noise and latency on every string.
+        emsg = str(e)
+        if "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in emsg or "PermissionDenied" in emsg:
+            _LLM_FILTER_DISABLED = True
         return {"output": _direct_filter(text)}
 
 

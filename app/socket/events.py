@@ -10,7 +10,7 @@ import time
 from datetime import date as date_type
 from datetime import datetime
 from html import unescape
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote_plus
 
 import httpx
@@ -280,6 +280,8 @@ class SocketEventHandler:
         # De-dup guard for replayed workspace_sync events (e.g., reconnect replay).
         # workspace_id -> {"fingerprint": str, "ts": float}
         self._last_workspace_sync_fingerprint: Dict[str, Dict[str, Any]] = {}
+        # Guard against overlapping analysis-report refresh tasks from chat marker misses.
+        self._analysis_refresh_inflight: Set[str] = set()
         # During objective-change regeneration, suppress stale background analysis_report emits
         # from older pipelines so FE receives only the fresh objective-aligned report.
         self._suppress_analysis_emit_until_ts: Dict[str, float] = {}
@@ -1160,7 +1162,25 @@ Rules:
                 )
                 and not tl.endswith("?")
             )
-            if not declarative_objective:
+            # Also treat clear client-goal declarations as direct updates even if the
+            # user does not literally type the word "objective".
+            declarative_goal = (
+                not tl.endswith("?")
+                and (
+                    "client wants to" in tl
+                    or "client want to" in tl
+                    or "our client wants to" in tl
+                    or "we want to file" in tl
+                    or "i want to file" in tl
+                    or "wants to file a case in" in tl
+                    or "wants to file the case in" in tl
+                    or "file a case in" in tl
+                    or "file the case in" in tl
+                    or "only in delhi" in tl
+                    or "only in patna" in tl
+                )
+            )
+            if not declarative_objective and not declarative_goal:
                 return None
         return raw
 
@@ -1364,6 +1384,21 @@ Rules:
             if isinstance(suggestion_chips, str):
                 suggestion_chips = [suggestion_chips] if suggestion_chips else []
             suggestion_chips = [str(s).strip() for s in suggestion_chips if s][:16]
+            if len(suggestion_chips) < 10:
+                prior = current_strategy.get("suggestionChips") or []
+                if isinstance(prior, list):
+                    for p in prior:
+                        t = str(p).strip()
+                        if t and t.lower() not in {x.lower() for x in suggestion_chips}:
+                            suggestion_chips.append(t)
+                        if len(suggestion_chips) >= 16:
+                            break
+            if len(suggestion_chips) < 10:
+                for pad in self._fallback_chips_for_role(role, 16):
+                    if pad and pad.lower() not in {x.lower() for x in suggestion_chips}:
+                        suggestion_chips.append(pad)
+                    if len(suggestion_chips) >= 16:
+                        break
 
             if not strategic_objective:
                 return False
@@ -1391,9 +1426,8 @@ Rules:
             merged["timestamp"] = datetime.utcnow().isoformat()
 
             self._workspace_strategy_payload[workspace_id] = merged
-            if suggestion_chips:
-                self._workspace_suggestion_chips[workspace_id] = list(suggestion_chips)
-                self._last_workspace_id_with_chips = workspace_id
+            self._workspace_suggestion_chips[workspace_id] = list(suggestion_chips)
+            self._last_workspace_id_with_chips = workspace_id
 
             if self._socket_client:
                 await self._socket_client.emit(
@@ -1530,6 +1564,216 @@ Assistant reply (for context, first 1200 chars):
         except Exception as e:
             logger.warning("Objective-offer classifier failed: {}", e)
             return False
+
+    async def _llm_classify_objective_change_intent(
+        self,
+        user_message: str,
+        *,
+        chat_type_upper: str,
+    ) -> Dict[str, Any]:
+        """
+        LLM-only classifier for NL objective-change detection.
+        Returns:
+          {"mode": "direct_update" | "ask_confirmation" | "none", "objectiveText": "...", "isQuestionLike": bool, "updateRequestedNow": bool}
+        """
+        msg = (user_message or "").strip()
+        if not msg or chat_type_upper != "STRATEGY_OBJECTIVE":
+            return {"mode": "none", "objectiveText": "", "isQuestionLike": False}
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            prompt = f"""You are a STRICT intent classifier for a legal strategic-objective workflow.
+
+Your job is to determine whether the user is:
+1. DEFINING or CHANGING a strategy/objective (actionable intent), OR
+2. EXPLORING / ASKING / ANALYZING (non-actionable intent)
+
+--------------------------------
+OUTPUT FORMAT (JSON ONLY)
+--------------------------------
+{{
+  "mode": "direct_update" | "ask_confirmation" | "none",
+  "objectiveText": "normalized objective text or empty",
+  "isQuestionLike": true or false,
+  "updateRequestedNow": true or false
+}}
+
+--------------------------------
+CORE PRINCIPLE
+--------------------------------
+"direct_update" is ONLY allowed when the user clearly intends an IMMEDIATE strategy/objective update.
+
+If immediate intent is missing -> DO NOT use direct_update.
+
+--------------------------------
+STEP-BY-STEP DECISION LOGIC
+--------------------------------
+
+STEP 1: QUESTION DETECTION (HIGHEST PRIORITY)
+If the user is asking anything (what/how/why/which/can you/explain/list/analyze/suggest):
+
+-> isQuestionLike = true
+-> updateRequestedNow = false
+-> mode = "none"
+
+IMPORTANT:
+- Even if strategy/objective words appear, DO NOT treat as update
+- Questions NEVER trigger direct_update
+
+--------------------------------
+
+STEP 2: EXPLORATION / TENTATIVE INTENT
+If the user is suggesting, brainstorming, or unsure:
+
+Examples:
+- "should we focus on..."
+- "maybe we can..."
+- "what if we..."
+- "we could consider..."
+
+-> mode = "ask_confirmation"
+-> updateRequestedNow = false
+-> isQuestionLike = true or false (based on phrasing)
+
+--------------------------------
+
+STEP 3: DIRECT STRATEGY / OBJECTIVE UPDATE (STRICT)
+Classify as "direct_update" ONLY if ALL conditions are satisfied:
+
+A. The statement is DECLARATIVE (not a question)
+B. The intent is FINAL (not exploratory)
+C. The user is clearly choosing a direction
+D. The user expects this change to be APPLIED NOW
+
+--------------------------------
+STRATEGY CHANGE RULE (CRITICAL)
+--------------------------------
+
+A strategy shift MUST be treated as "direct_update" if it is decisive and immediate,
+even if the user does NOT explicitly say "update objective".
+
+This includes statements like:
+- "Focus on X instead of Y"
+- "Drop X and pursue Y"
+- "We will proceed with X"
+- "Shift strategy to X"
+- "Prioritize X over Y"
+
+If the above statements are:
+- Declarative
+- Final (not tentative)
+- Actionable immediately
+
+-> mode = "direct_update"
+-> updateRequestedNow = true
+-> isQuestionLike = false
+
+--------------------------------
+HARD CONSTRAINTS (MANDATORY)
+--------------------------------
+
+1. NEVER set mode = "direct_update" if updateRequestedNow = false
+
+2. If isQuestionLike = true:
+   -> mode MUST be "none"
+
+3. Analytical or informational requests ALWAYS -> mode = "none"
+
+Examples:
+- "identify risks"
+- "explain strategy"
+- "list options"
+- "summarize"
+- "compare approaches"
+- "what should we do?"
+
+4. If the intent is unclear -> default to "none"
+
+--------------------------------
+OBJECTIVE TEXT RULE
+--------------------------------
+
+- Extract ONLY when mode != "none"
+- Keep it SHORT, CLEAR, and ACTION-ORIENTED
+- Do NOT add new information
+- Do NOT hallucinate or expand meaning
+
+Examples:
+Input: "Focus on breach of contract instead of negligence"
+Output: "Focus on breach of contract over negligence"
+
+--------------------------------
+FINAL INSTRUCTION
+--------------------------------
+
+Return ONLY valid JSON.
+No explanation.
+No extra text.
+
+--------------------------------
+USER MESSAGE
+--------------------------------
+{msg[:5000]}
+"""
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=500,
+                response_mime_type="application/json",
+            )
+            candidate = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            if not candidate:
+                return {"mode": "none", "objectiveText": "", "isQuestionLike": False}
+            parsed = json.loads(candidate)
+            if not isinstance(parsed, dict):
+                return {"mode": "none", "objectiveText": "", "isQuestionLike": False}
+            mode = str(parsed.get("mode") or "").strip().lower()
+            if mode not in {"direct_update", "ask_confirmation", "none"}:
+                mode = "none"
+            obj_text = str(parsed.get("objectiveText") or "").strip()
+            is_question_like = bool(parsed.get("isQuestionLike") is True)
+            update_requested_now = bool(parsed.get("updateRequestedNow") is True)
+            if is_question_like and not update_requested_now:
+                mode = "none"
+            # LLM-output-only promotion: if classifier extracted a clear objective text,
+            # says it's not a question, and did not mark immediate update explicitly,
+            # treat as direct update for strategy/objective parity.
+            if (
+                mode in {"none", "ask_confirmation"}
+                and obj_text
+                and len(obj_text) >= 20
+                and not is_question_like
+            ):
+                mode = "direct_update"
+                update_requested_now = True
+            # Guardrail: if model marks ask_confirmation but the user message is declarative
+            # and objective text is clear, treat as direct update (strategy/objective parity).
+            if (
+                mode == "ask_confirmation"
+                and obj_text
+                and len(obj_text) >= 20
+                and not is_question_like
+                and update_requested_now
+            ):
+                mode = "direct_update"
+            if mode == "direct_update" and not update_requested_now:
+                mode = "none"
+            if mode == "none":
+                obj_text = ""
+            return {
+                "mode": mode,
+                "objectiveText": obj_text,
+                "isQuestionLike": is_question_like,
+                "updateRequestedNow": update_requested_now,
+            }
+        except Exception as e:
+            logger.warning("Objective intent classifier failed: {}", e)
+            return {
+                "mode": "none",
+                "objectiveText": "",
+                "isQuestionLike": False,
+                "updateRequestedNow": False,
+            }
 
     async def _generate_analysis_report_from_documents(
         self,
@@ -2608,6 +2852,7 @@ Rules:
         # Build document index and names: 1-based index -> document_id, display name
         doc_id_by_index: Dict[int, str] = {}
         doc_name_by_index: Dict[int, str] = {}
+        doc_content_by_index: Dict[int, str] = {}
         id_to_name: Dict[str, str] = {}
         if batch_result:
             for r in batch_result.get("results") or []:
@@ -2637,6 +2882,7 @@ Rules:
             name = id_to_name.get(doc_id) or f"Annexure {i}"
             doc_id_by_index[i] = doc_id
             doc_name_by_index[i] = name
+            doc_content_by_index[i] = content
             if len(content) > per_doc_cap:
                 content = content[:per_doc_cap] + "\n[... truncated for length ...]"
             parts.append(
@@ -2671,7 +2917,7 @@ Each entry MUST have:
 - "title": string, short title for the event (e.g. "FIR Filed", "Notice Sent", "Affidavit Filed", "Hearing Date")
 - "description": string (optional), brief context tied to the event/date
 - "sourceDocumentIndex": integer (1-based), which document (1, 2, 3...) the event comes from
-- "pageNumber": integer (optional) if page is known
+- "pageNumber": integer (mandatory)
 - "isIncident": boolean (optional, default true)
 - "eventType": one of "Court Hearing" | "Deadline" | "Meeting" | "Filing" | "Other" (optional)
 - "relevance": one of "High" | "Medium" | "Low" (optional)
@@ -2682,6 +2928,7 @@ Rules (CRITICAL for consistency):
 - Inventory completeness: if the documents contain ANY date-like expressions, you MUST NOT return []. You must return the full list of all extractable date-events.
 - Date normalization: output each "date" as YYYY-MM-DD only (convert common formats to YYYY-MM-DD).
   - If you cannot determine the year, omit only that single entry.
+- pageNumber rule: always return an integer >= 1. If exact page is unclear (common in DOCX/TXT), set pageNumber to 1.
 - Sorting: sort by date ascending (oldest first). For the same date, tie-break by "sourceDocumentIndex" ascending, then by "title" alphabetically.
 - De-duplication: remove exact duplicates only (same date + same title + same sourceDocumentIndex). Otherwise keep distinct events.
 - Return the full array; do not truncate the list of events.
@@ -2818,6 +3065,59 @@ Example shape:
                 text = f"{title} {description} {source_name}".strip()
                 return bool(background_timeline_pattern.search(text))
 
+            def _resolve_page_number(
+                item_payload: Dict[str, Any], source_content: str
+            ) -> int:
+                """
+                Ensure pageNumber is always an integer.
+                Uses model value when valid, then tries PDF page markers, then defaults to 1.
+                """
+                raw_page = item_payload.get("pageNumber")
+                if isinstance(raw_page, int) and raw_page > 0:
+                    return raw_page
+                if isinstance(raw_page, str):
+                    raw_page = raw_page.strip()
+                    if raw_page.isdigit() and int(raw_page) > 0:
+                        return int(raw_page)
+
+                if source_content:
+                    page_markers = list(
+                        re.finditer(r"---\s*Page\s+(\d+)\s*---", source_content, re.I)
+                    )
+                    if page_markers:
+                        # Try to anchor by date/title/description and map to nearest prior page marker.
+                        anchors = [
+                            str(item_payload.get("date") or "").strip(),
+                            str(item_payload.get("title") or "").strip(),
+                            str(item_payload.get("description") or "").strip(),
+                        ]
+                        haystack = source_content.lower()
+                        pos = -1
+                        for anchor in anchors:
+                            if len(anchor) < 4:
+                                continue
+                            pos = haystack.find(anchor.lower())
+                            if pos >= 0:
+                                break
+                        if pos >= 0:
+                            nearest = 1
+                            for marker in page_markers:
+                                if marker.start() <= pos:
+                                    try:
+                                        nearest = int(marker.group(1))
+                                    except Exception:
+                                        nearest = 1
+                                else:
+                                    break
+                            return nearest if nearest > 0 else 1
+                        # Page markers exist but anchor was not found; default to first marker page.
+                        try:
+                            first_page = int(page_markers[0].group(1))
+                            return first_page if first_page > 0 else 1
+                        except Exception:
+                            return 1
+                return 1
+
             for item in arr:
                 if not isinstance(item, dict):
                     continue
@@ -2858,6 +3158,8 @@ Example shape:
                 idx = int(idx) if idx is not None else 1
                 source_doc_id = doc_id_by_index.get(idx, "")
                 source_doc_name = doc_name_by_index.get(idx, "")
+                source_content = doc_content_by_index.get(idx, "")
+                page_number = _resolve_page_number(item, source_content)
 
                 # Build core entry used by backend List of Dates UI
                 entry = {
@@ -2866,11 +3168,7 @@ Example shape:
                     "description": (item.get("description") or "").strip(),
                     "sourceDocId": source_doc_id or None,
                     "sourceDocName": source_doc_name or None,
-                    "pageNumber": (
-                        item.get("pageNumber")
-                        if isinstance(item.get("pageNumber"), int)
-                        else None
-                    ),
+                    "pageNumber": page_number,
                     "isIncident": item.get("isIncident", True),
                     "eventType": (item.get("eventType") or "").strip() or None,
                     "relevance": (item.get("relevance") or "").strip() or None,
@@ -2950,7 +3248,43 @@ Example shape:
         logger.success(
             "✅ List of dates sent to backend ({} entries)", len(list_of_dates)
         )
+        self._log_list_of_dates_outbound(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            list_of_dates=list_of_dates,
+            context="generated",
+        )
         await asyncio.sleep(0.2)  # Allow backend to process before next event
+
+    def _log_list_of_dates_outbound(
+        self,
+        workspace_id: str,
+        user_id: str,
+        list_of_dates: List[Dict[str, Any]],
+        context: str,
+    ) -> None:
+        """
+        Record outbound list_of_dates responses with generation timestamp for tracing.
+        """
+        generated_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        outbound = {
+            "featureType": "list_of_dates",
+            "workspaceId": workspace_id,
+            "userId": user_id,
+            "payload": {
+                "workspaceId": workspace_id,
+                "userId": user_id,
+                "listOfDates": list_of_dates,
+            },
+            "generatedAt": generated_at,
+            "context": context,
+        }
+        logger.info(
+            "📤 list_of_dates outbound at {} [{}]: {}",
+            generated_at,
+            context,
+            json.dumps(outbound, ensure_ascii=False),
+        )
 
     def _strip_markdown_json_fences(self, text: str) -> str:
         cleaned = (text or "").strip()
@@ -4054,6 +4388,12 @@ Rules:
                 "✅ Objective-change incremental list_of_dates update emitted{}",
                 ctx,
             )
+            self._log_list_of_dates_outbound(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                list_of_dates=merged_dates,
+                context="objective-change-incremental",
+            )
 
         # 3) Applicable laws: regenerate, then merge (keep prior + add/refresh new)
         signals = await self._extract_case_signals_from_documents(workspace_id, user_id)
@@ -4597,15 +4937,97 @@ Rules:
         )
 
     def _match_rejected_value(self, item: Any, rejected_value: str) -> bool:
-        """Return True if item matches rejectedValue (string or dict with 'point' key)."""
+        """Return True if item matches/addresses rejectedValue using robust text overlap."""
         rv = (rejected_value or "").strip()
         if not rv:
             return False
+
+        item_text = ""
         if isinstance(item, str):
-            return item.strip() == rv or rv in item.strip() or item.strip() in rv
-        if isinstance(item, dict) and "point" in item:
-            pt = (item.get("point") or "").strip()
-            return pt == rv or rv in pt or pt in rv
+            item_text = item.strip()
+        elif isinstance(item, dict) and "point" in item:
+            item_text = (item.get("point") or "").strip()
+        if not item_text:
+            return False
+
+        # Fast-path exact/containment checks.
+        if item_text == rv or rv in item_text or item_text in rv:
+            return True
+
+        def _norm(s: str) -> str:
+            s = s.lower().strip()
+            s = re.sub(r"[^a-z0-9\s]", " ", s)
+            s = re.sub(r"\s+", " ", s).strip()
+            return s
+
+        stop_words = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "for",
+            "of",
+            "to",
+            "in",
+            "on",
+            "with",
+            "by",
+            "from",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "that",
+            "this",
+            "these",
+            "those",
+            "it",
+            "its",
+            "their",
+            "his",
+            "her",
+            "our",
+            "your",
+            "at",
+            "as",
+            "can",
+            "could",
+            "should",
+            "would",
+            "about",
+            "into",
+            "also",
+            "than",
+            "then",
+            "over",
+            "under",
+        }
+
+        def _tokens(s: str) -> Set[str]:
+            out: Set[str] = set()
+            for tok in _norm(s).split():
+                if len(tok) <= 2 or tok in stop_words:
+                    continue
+                out.add(tok)
+            return out
+
+        item_tokens = _tokens(item_text)
+        rv_tokens = _tokens(rv)
+        if not item_tokens or not rv_tokens:
+            return False
+
+        overlap = item_tokens.intersection(rv_tokens)
+        if not overlap:
+            return False
+
+        # Strong match: at least 2 shared informative tokens, or most of item intent covered.
+        if len(overlap) >= 2:
+            return True
+        return len(overlap) / max(1, len(item_tokens)) >= 0.6
         return False
 
     def _parse_bullets_from_block(self, block: str) -> List[str]:
@@ -4680,17 +5102,18 @@ Rules:
             m = re.search(pattern, text, flags=re.I | re.S)
             return m.group(1).strip() if (m and m.group(1)) else None
 
+        # Strict marker-only parsing to avoid false positives from normal draft/chat text.
         objective_block = _capture(
-            r"(?:STRATEGIC_OBJECTIVE_UPDATE\s*[:=\-]|strategic\s*objective\s*(?:update|change|edit)?\s*(?:to|[:=\-]))\s*(.*?)\s*(?=(?:RESOLVED_MISSING_INFO|REMOVED_WEAKNESSES|REMOVED_RISKS)\b|$)"
+            r"(?:STRATEGIC_OBJECTIVE_UPDATE\s*[:=\-])\s*(.*?)\s*(?=(?:RESOLVED_MISSING_INFO|REMOVED_WEAKNESSES|REMOVED_RISKS)\b|$)"
         )
         missing_block = _capture(
-            r"(?:RESOLVED_MISSING_INFO\s*[:=\-]|missing\s*information\s*[:=\-]|missing\s*info\s*[:=\-])\s*(.*?)\s*(?=(?:REMOVED_WEAKNESSES|REMOVED_RISKS|STRATEGIC_OBJECTIVE_UPDATE|$))"
+            r"(?:RESOLVED_MISSING_INFO\s*[:=\-])\s*(.*?)\s*(?=(?:REMOVED_WEAKNESSES|REMOVED_RISKS|STRATEGIC_OBJECTIVE_UPDATE|$))"
         )
         weaknesses_block = _capture(
-            r"(?:REMOVED_WEAKNESSES\s*[:=\-]|weaknesses?\s*[:=\-])\s*(.*?)\s*(?=(?:REMOVED_RISKS|RESOLVED_MISSING_INFO|STRATEGIC_OBJECTIVE_UPDATE|$))"
+            r"(?:REMOVED_WEAKNESSES\s*[:=\-])\s*(.*?)\s*(?=(?:REMOVED_RISKS|RESOLVED_MISSING_INFO|STRATEGIC_OBJECTIVE_UPDATE|$))"
         )
         risks_block = _capture(
-            r"(?:REMOVED_RISKS\s*[:=\-]|risks?\s*[:=\-])\s*(.*?)\s*(?=(?:REMOVED_WEAKNESSES|RESOLVED_MISSING_INFO|STRATEGIC_OBJECTIVE_UPDATE|$))"
+            r"(?:REMOVED_RISKS\s*[:=\-])\s*(.*?)\s*(?=(?:REMOVED_WEAKNESSES|RESOLVED_MISSING_INFO|STRATEGIC_OBJECTIVE_UPDATE|$))"
         )
 
         updates: Dict[str, Any] = {}
@@ -4726,6 +5149,113 @@ Rules:
         )
         s = re.sub(r"\n{3,}", "\n\n", s).strip()
         return s
+
+    def _schedule_analysis_report_refresh_after_marker_miss(
+        self,
+        workspace_id: str,
+        user_id: str,
+        *,
+        log_context: str = "",
+    ) -> None:
+        """Regenerate analysis report when marker-based item matching found no removals."""
+        if not workspace_id or not user_id:
+            return
+        if workspace_id in self._analysis_refresh_inflight:
+            logger.info(
+                "Analysis refresh already inflight after marker miss (workspace={})",
+                workspace_id[:12],
+            )
+            return
+        self._analysis_refresh_inflight.add(workspace_id)
+
+        async def _runner() -> None:
+            try:
+                role = await self._restore_workspace_role(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                )
+                try:
+                    emitted = await asyncio.wait_for(
+                        self._emit_analysis_report(
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            workspace_role=(role or "ADJUDICATOR"),
+                            batch_result=None,
+                            is_update=True,
+                            log_context=log_context or " (marker miss refresh)",
+                        ),
+                        timeout=35.0,
+                    )
+                    if not emitted:
+                        logger.warning(
+                            "Analysis refresh completed without emit (workspace={}); sending cached analysis payload",
+                            workspace_id[:12],
+                        )
+                        cached_report = self._workspace_analysis_payload.get(workspace_id)
+                        if self._socket_client and isinstance(cached_report, dict):
+                            fallback_payload = dict(cached_report)
+                            fallback_payload["timestamp"] = (
+                                datetime.utcnow().isoformat() + "Z"
+                            )
+                            await self._socket_client.emit(
+                                "document_feature_response",
+                                {
+                                    "featureType": "analysis_report",
+                                    "workspaceId": workspace_id,
+                                    "userId": user_id,
+                                    "payload": fallback_payload,
+                                },
+                            )
+                            logger.info(
+                                "Cached analysis report emitted after no-emit refresh (workspace={})",
+                                workspace_id[:12],
+                            )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Analysis refresh timed out after marker miss (workspace={}); emitting cached analysis payload to clear loader",
+                        workspace_id[:12],
+                    )
+                    cached_report = self._workspace_analysis_payload.get(workspace_id)
+                    if self._socket_client and isinstance(cached_report, dict):
+                        fallback_payload = dict(cached_report)
+                        fallback_payload["timestamp"] = (
+                            datetime.utcnow().isoformat() + "Z"
+                        )
+                        await self._socket_client.emit(
+                            "document_feature_response",
+                            {
+                                "featureType": "analysis_report",
+                                "workspaceId": workspace_id,
+                                "userId": user_id,
+                                "payload": fallback_payload,
+                            },
+                        )
+                        logger.info(
+                            "Cached analysis report emitted after timeout (workspace={})",
+                            workspace_id[:12],
+                        )
+            except Exception as err:
+                logger.warning(
+                    "Analysis refresh after marker miss failed (workspace={}): {}",
+                    workspace_id[:12],
+                    err,
+                )
+            finally:
+                self._analysis_refresh_inflight.discard(workspace_id)
+
+        try:
+            asyncio.create_task(_runner())
+            logger.info(
+                "Scheduled analysis report refresh after marker miss (workspace={})",
+                workspace_id[:12],
+            )
+        except RuntimeError as err:
+            self._analysis_refresh_inflight.discard(workspace_id)
+            logger.warning(
+                "Could not schedule marker-miss analysis refresh (workspace={}): {}",
+                workspace_id[:12],
+                err,
+            )
 
     async def _try_apply_intelligence_chat_panel_updates(
         self,
@@ -4881,6 +5411,9 @@ Rules:
                             f"{base_explanation} {note}".strip()
                         )
                     ).strip()
+                # Always update timestamp so frontend receives a fresh analysis payload
+                # even when marker text does not match and list contents remain unchanged.
+                current_report["timestamp"] = datetime.utcnow().isoformat() + "Z"
 
                 self._workspace_analysis_payload[workspace_id] = current_report
                 await self._socket_client.emit(
@@ -4900,6 +5433,14 @@ Rules:
                     logger.info(
                         "Analysis update markers found, but no matching items removed (workspace={})",
                         workspace_id[:12] if workspace_id else "",
+                    )
+                    self._schedule_analysis_report_refresh_after_marker_miss(
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        log_context=" (after missing-info marker miss)",
+                    )
+                    response_parts.append(
+                        "Refreshing analysis report using your newly provided details"
                     )
 
         return {
@@ -6698,6 +7239,12 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     },
                 )
                 logger.success("✅ List of dates re-emitted to backend after reconnect")
+                self._log_list_of_dates_outbound(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    list_of_dates=list_of_dates,
+                    context="reconnect-reemit",
+                )
             # 6) Applicable laws
             applicable_laws = self._workspace_applicable_laws_payload.get(workspace_id)
             if applicable_laws is not None:
@@ -8638,15 +9185,28 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     )
                     objective_instruction = prep.get("strategicObjective")
                     if not objective_instruction:
-                        objective_instruction = self._extract_direct_objective_update_instruction(
-                            combined_text_for_updates
+                        intent_cls = await self._llm_classify_objective_change_intent(
+                            combined_text_for_updates,
+                            chat_type_upper=chat_type_upper,
                         )
-                    if not objective_instruction:
-                        implicit_objective_shift_text = (
-                            self._extract_implicit_objective_shift_instruction(
-                                combined_text_for_updates
+                        mode = str(intent_cls.get("mode") or "none")
+                        norm_obj = str(intent_cls.get("objectiveText") or "").strip()
+                        is_question_like = bool(
+                            intent_cls.get("isQuestionLike") is True
+                        )
+                        logger.info(
+                            "Objective intent classifier: mode={}, isQuestionLike={}, updateRequestedNow={}, objectiveTextLen={}",
+                            mode,
+                            is_question_like,
+                            bool(intent_cls.get("updateRequestedNow") is True),
+                            len(norm_obj),
+                        )
+                        if mode == "direct_update" and not is_question_like:
+                            objective_instruction = norm_obj or combined_text_for_updates
+                        elif mode == "ask_confirmation" and not is_question_like:
+                            implicit_objective_shift_text = (
+                                norm_obj or combined_text_for_updates
                             )
-                        )
                 if (
                     not objective_regen_ok
                     and objective_instruction
@@ -8751,7 +9311,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 elif objective_ack_kind == "direct" or objective_regen_ok:
                     # Keep chat response short to avoid duplicating strategy panel payload
                     # that is already emitted via document_feature_response.
-                    ack_parts.append("Objective update applied. Panels are refreshing.")
+                    ack_parts.append(
+                        "I have updated the strategic objective and possible next steps. "
+                        "I am refreshing the analysis report, list of dates, and applicable laws "
+                        "to align with this objective based on our discussion."
+                    )
                 if isinstance(update_result, dict) and update_result.get("applied"):
                     extra = (update_result.get("response_text") or "").strip()
                     if extra:
@@ -8785,24 +9349,105 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     user_message=payload.content,
                     chat_context=chat_context,
                 )
-                # If assistant produced panel-update markers, apply them as well.
-                try:
-                    ai_update_result = await self._try_apply_intelligence_chat_panel_updates(
-                        workspace_id=workspace_id,
-                        user_id=user_id,
-                        combined_text=response.response_text or "",
-                    )
-                    if ai_update_result.get("applied"):
-                        logger.success(
-                            "✅ Panel updates applied from AI response markers"
+                # If downstream chat intent says STRATEGY_CHANGE in Strategy & Objective chat,
+                # force the same direct objective-refresh pipeline (refresh -> strategy regen -> reanalysis).
+                detected_intent_upper = str(
+                    getattr(response, "detected_intent", "") or ""
+                ).upper()
+                if (
+                    chat_type_upper == "STRATEGY_OBJECTIVE"
+                    and detected_intent_upper == "STRATEGY_CHANGE"
+                ):
+                    cur_strat = self._workspace_strategy_payload.get(workspace_id)
+                    if isinstance(cur_strat, dict) and (
+                        cur_strat.get("caseSummary") or ""
+                    ).strip():
+                        await self._emit_workspace_refresh(
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            reason="objective_change_regeneration_started",
+                            feature_types=[
+                                "strategy_objective",
+                                "analysis_report",
+                                "list_of_dates",
+                                "applicable_laws",
+                            ],
                         )
-                except Exception as ai_upd_err:
-                    logger.warning(
-                        "AI response panel update attempt failed; continuing. err={}",
-                        str(ai_upd_err),
+                        regen_ok = (
+                            await self._regenerate_strategy_objective_preserving_case_summary(
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                workspace_role=(
+                                    role_context.get("role") or "ADJUDICATOR"
+                                ),
+                                user_objective_instruction=(payload.content or "").strip(),
+                                current_strategy=cur_strat,
+                            )
+                        )
+                        if regen_ok:
+                            self._schedule_objective_change_reanalysis(
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                log_context=" (promoted from strategy_change intent)",
+                            )
+                            objective_regen_ok = True
+                            objective_ack_kind = "direct"
+                            response_text_to_emit = (
+                                "I have updated the strategic objective and possible next steps. "
+                                "I am refreshing the analysis report, list of dates, and applicable laws "
+                                "to align with this objective based on our discussion."
+                            )
+                            from types import SimpleNamespace
+
+                            response = SimpleNamespace(
+                                response_text=response_text_to_emit,
+                                message_id=chat_id,
+                                tokens_used=0,
+                                confidence=SimpleNamespace(value="high"),
+                                detected_intent="strategy_objective_refresh",
+                            )
+                            processing_time = (
+                                datetime.utcnow() - start_time
+                            ).total_seconds() * 1000
+                            suggestion_chips_for_payload = []
+                            try:
+                                ws_chips = (
+                                    self._workspace_suggestion_chips.get(workspace_id)
+                                    or []
+                                )
+                                if ws_chips:
+                                    suggestion_chips_for_payload = random.sample(
+                                        ws_chips, min(4, len(ws_chips))
+                                    )
+                            except Exception:
+                                pass
+                # If assistant produced panel-update markers, apply them as well.
+                if objective_regen_ok:
+                    ai_update_result = {"applied": False}
+                elif chat_type_upper != "STRATEGY_OBJECTIVE":
+                    try:
+                        ai_update_result = await self._try_apply_intelligence_chat_panel_updates(
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            combined_text=response.response_text or "",
+                        )
+                        if ai_update_result.get("applied"):
+                            logger.success(
+                                "✅ Panel updates applied from AI response markers"
+                            )
+                    except Exception as ai_upd_err:
+                        logger.warning(
+                            "AI response panel update attempt failed; continuing. err={}",
+                            str(ai_upd_err),
+                        )
+                else:
+                    logger.debug(
+                        "Skipping AI response marker application for STRATEGY_OBJECTIVE chat to avoid duplicate objective refresh flows"
                     )
                 # If we applied deterministic panel updates, override the chat text
-                if isinstance(update_result, dict) and update_result.get("applied"):
+                if objective_regen_ok:
+                    pass
+                elif isinstance(update_result, dict) and update_result.get("applied"):
                     response_text_to_emit = update_result.get("response_text")
                 elif isinstance(ai_update_result, dict) and ai_update_result.get(
                     "applied"
@@ -8820,6 +9465,8 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     response_text_to_emit = response.response_text
                 # Informal strategic discussion: offer to update panels (user can reply yes next turn)
                 if (
+                    not objective_regen_ok
+                    and
                     chat_type_upper == "STRATEGY_OBJECTIVE"
                     and OBJECTIVE_UPDATE_OFFER_QUESTION.lower()
                     not in (response_text_to_emit or "").lower()
@@ -8841,37 +9488,38 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         logger.warning(
                             "Objective update offer append failed: {}", offer_err
                         )
-                processing_time = (
-                    datetime.utcnow() - start_time
-                ).total_seconds() * 1000
+                if not objective_regen_ok:
+                    processing_time = (
+                        datetime.utcnow() - start_time
+                    ).total_seconds() * 1000
 
-                # Generate 10-12 contextual chips, store for this workspace; send random 4 in response (backend polls every few sec and we return random 4 each time)
-                suggestion_chips_for_payload = []
-                try:
-                    role_for_chips = (role_context.get("role") or "ADJUDICATOR").upper()
-                    generated = await self._generate_contextual_suggestion_chips(
-                        workspace_id=workspace_id,
-                        role=role_for_chips,
-                        user_message=payload.content,
-                        ai_response_text=response_text_to_emit,
-                        max_chips=12,
-                    )
-                    if generated:
-                        self._workspace_chat_suggestion_chips[workspace_id] = list(
-                            generated
+                    # Generate 10-12 contextual chips, store for this workspace; send random 4 in response (backend polls every few sec and we return random 4 each time)
+                    suggestion_chips_for_payload = []
+                    try:
+                        role_for_chips = (role_context.get("role") or "ADJUDICATOR").upper()
+                        generated = await self._generate_contextual_suggestion_chips(
+                            workspace_id=workspace_id,
+                            role=role_for_chips,
+                            user_message=payload.content,
+                            ai_response_text=response_text_to_emit,
+                            max_chips=12,
                         )
-                        suggestion_chips_for_payload = random.sample(
-                            generated, min(4, len(generated))
+                        if generated:
+                            self._workspace_chat_suggestion_chips[workspace_id] = list(
+                                generated
+                            )
+                            suggestion_chips_for_payload = random.sample(
+                                generated, min(4, len(generated))
+                            )
+                            logger.info(
+                                "Stored {} contextual chips for workspace; sending random 4 in ai_response (each 4s poll will return random 4 from these {})",
+                                len(generated),
+                                len(generated),
+                            )
+                    except Exception as chip_err:
+                        logger.warning(
+                            "Suggestion chips generation failed: {}", str(chip_err)
                         )
-                        logger.info(
-                            "Stored {} contextual chips for workspace; sending random 4 in ai_response (each 4s poll will return random 4 from these {})",
-                            len(generated),
-                            len(generated),
-                        )
-                except Exception as chip_err:
-                    logger.warning(
-                        "Suggestion chips generation failed: {}", str(chip_err)
-                    )
 
             # STEP 5: Build AI response payload (suggestionChips = random 4 from 10-12; click sends chip as next message)
             ai_response = AIResponsePayload(
@@ -9464,6 +10112,18 @@ Return ONLY a JSON array of 15-16 strings, no other text."""
                     # 3) Fallback: strategy chips (random 4 from 15-16)
                     if not prompts:
                         chips = self._workspace_suggestion_chips.get(workspace_id) or []
+                        if not chips:
+                            strategy_payload = (
+                                self._workspace_strategy_payload.get(workspace_id) or {}
+                            )
+                            arr = strategy_payload.get("suggestionChips") or []
+                            if isinstance(arr, list):
+                                chips = [str(x).strip() for x in arr if str(x).strip()]
+                                if chips:
+                                    self._workspace_suggestion_chips[workspace_id] = list(
+                                        chips
+                                    )
+                                    self._last_workspace_id_with_chips = workspace_id
                         if not chips and self._last_workspace_id_with_chips:
                             chips = (
                                 self._workspace_suggestion_chips.get(
@@ -9471,6 +10131,17 @@ Return ONLY a JSON array of 15-16 strings, no other text."""
                                 )
                                 or []
                             )
+                        if not chips:
+                            role = "ADJUDICATOR"
+                            try:
+                                ctx = workspace_manager.get_workspace(workspace_id)
+                                if ctx and ctx.workspace_role:
+                                    role = (ctx.workspace_role or "ADJUDICATOR").upper()
+                            except Exception:
+                                pass
+                            chips = self._fallback_chips_for_role(role, 16)
+                            self._workspace_suggestion_chips[workspace_id] = list(chips)
+                            self._last_workspace_id_with_chips = workspace_id
                         if not chips:
                             logger.warning(
                                 "probing_prompts_request: no suggestion chips for workspace {}",

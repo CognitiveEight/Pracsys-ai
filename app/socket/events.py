@@ -31,6 +31,7 @@ from app.langgraph.chat_nodes import (
     is_user_affirmation_to_continue,
     merge_intelligence_chat_history,
 )
+from app.langgraph.list_of_dates_agent import list_of_dates_temporal_agent
 from app.socket.schemas import (
     AIResponseMetadata,
     AIResponsePayload,
@@ -2853,6 +2854,9 @@ Rules:
         doc_id_by_index: Dict[int, str] = {}
         doc_name_by_index: Dict[int, str] = {}
         doc_content_by_index: Dict[int, str] = {}
+        doc_explicit_dates_by_index: Dict[int, set[str]] = {}
+        doc_explicit_years_by_index: Dict[int, set[int]] = {}
+        doc_anchor_year_by_index: Dict[int, Optional[int]] = {}
         id_to_name: Dict[str, str] = {}
         if batch_result:
             for r in batch_result.get("results") or []:
@@ -3065,6 +3069,29 @@ Example shape:
                 text = f"{title} {description} {source_name}".strip()
                 return bool(background_timeline_pattern.search(text))
 
+            def _extract_page_markers(source_content: str) -> List[Tuple[int, int]]:
+                """
+                Extract page markers and their positions from OCR/plain text dumps.
+                Supports markers like:
+                - --- Page 3 ---
+                - -- 3 of 15 --
+                """
+                markers: List[Tuple[int, int]] = []
+                if not source_content:
+                    return markers
+                for m in re.finditer(r"---\s*Page\s+(\d+)\s*---", source_content, re.I):
+                    try:
+                        markers.append((m.start(), int(m.group(1))))
+                    except Exception:
+                        continue
+                for m in re.finditer(r"--\s*(\d+)\s+of\s+\d+\s*--", source_content, re.I):
+                    try:
+                        markers.append((m.start(), int(m.group(1))))
+                    except Exception:
+                        continue
+                markers.sort(key=lambda x: x[0])
+                return markers
+
             def _resolve_page_number(
                 item_payload: Dict[str, Any], source_content: str
             ) -> int:
@@ -3081,9 +3108,7 @@ Example shape:
                         return int(raw_page)
 
                 if source_content:
-                    page_markers = list(
-                        re.finditer(r"---\s*Page\s+(\d+)\s*---", source_content, re.I)
-                    )
+                    page_markers = _extract_page_markers(source_content)
                     if page_markers:
                         # Try to anchor by date/title/description and map to nearest prior page marker.
                         anchors = [
@@ -3101,10 +3126,10 @@ Example shape:
                                 break
                         if pos >= 0:
                             nearest = 1
-                            for marker in page_markers:
-                                if marker.start() <= pos:
+                            for marker_pos, marker_page in page_markers:
+                                if marker_pos <= pos:
                                     try:
-                                        nearest = int(marker.group(1))
+                                        nearest = int(marker_page)
                                     except Exception:
                                         nearest = 1
                                 else:
@@ -3112,11 +3137,190 @@ Example shape:
                             return nearest if nearest > 0 else 1
                         # Page markers exist but anchor was not found; default to first marker page.
                         try:
-                            first_page = int(page_markers[0].group(1))
+                            first_page = int(page_markers[0][1])
                             return first_page if first_page > 0 else 1
                         except Exception:
                             return 1
                 return 1
+
+            def _extract_explicit_dates(source_content: str) -> set[str]:
+                """Extract explicit full dates from source text as YYYY-MM-DD."""
+                out: set[str] = set()
+                if not source_content:
+                    return out
+                patterns = [
+                    (r"\b\d{4}-\d{2}-\d{2}\b", "%Y-%m-%d"),
+                    (r"\b\d{2}/\d{2}/\d{4}\b", "%d/%m/%Y"),
+                    (r"\b\d{2}-\d{2}-\d{4}\b", "%d-%m-%Y"),
+                    (r"\b\d{4}/\d{2}/\d{2}\b", "%Y/%m/%d"),
+                    (
+                        r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b",
+                        "%B %d, %Y",
+                    ),
+                    (
+                        r"\b\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b",
+                        "%d %B %Y",
+                    ),
+                ]
+                for patt, fmt in patterns:
+                    for m in re.finditer(patt, source_content, flags=re.I):
+                        try:
+                            dt = datetime.strptime(m.group(0), fmt)
+                            out.add(dt.strftime("%Y-%m-%d"))
+                        except Exception:
+                            continue
+                return out
+
+            def _extract_explicit_date_mentions(
+                source_content: str,
+            ) -> List[Tuple[str, int]]:
+                """
+                Extract explicit date mentions with character positions.
+                Returns list of (YYYY-MM-DD, start_pos).
+                """
+                out: List[Tuple[str, int]] = []
+                if not source_content:
+                    return out
+                patterns = [
+                    (r"\b\d{4}-\d{2}-\d{2}\b", "%Y-%m-%d"),
+                    (r"\b\d{2}/\d{2}/\d{4}\b", "%d/%m/%Y"),
+                    (r"\b\d{2}-\d{2}-\d{4}\b", "%d-%m-%Y"),
+                    (r"\b\d{4}/\d{2}/\d{2}\b", "%Y/%m/%d"),
+                    (
+                        r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b",
+                        "%B %d, %Y",
+                    ),
+                    (
+                        r"\b\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b",
+                        "%d %B %Y",
+                    ),
+                ]
+                for patt, fmt in patterns:
+                    for m in re.finditer(patt, source_content, flags=re.I):
+                        try:
+                            dt = datetime.strptime(m.group(0), fmt)
+                            out.append((dt.strftime("%Y-%m-%d"), m.start()))
+                        except Exception:
+                            continue
+                # Deterministic ordering by occurrence position
+                out.sort(key=lambda x: x[1])
+                return out
+
+            def _extract_explicit_years(source_content: str) -> set[int]:
+                """Extract explicit 4-digit years written in source text."""
+                years = set()
+                if not source_content:
+                    return years
+                for m in re.finditer(r"\b(19|20)\d{2}\b", source_content):
+                    try:
+                        years.add(int(m.group(0)))
+                    except Exception:
+                        continue
+                return years
+
+            def _resolve_anchor_year(source_content: str, explicit_dates: set[str]) -> Optional[int]:
+                """
+                Resolve a reference year for relative expressions like "past 10 years".
+                Prefer latest explicit full date; else latest explicit year.
+                """
+                years = []
+                for d in explicit_dates:
+                    try:
+                        years.append(int(d[:4]))
+                    except Exception:
+                        continue
+                if years:
+                    return max(years)
+                years_only = _extract_explicit_years(source_content)
+                return max(years_only) if years_only else None
+
+            def _is_duration_derived_date_allowed(
+                normalized_date: str,
+                item_payload: Dict[str, Any],
+                source_content: str,
+                anchor_year: Optional[int],
+            ) -> bool:
+                """
+                Allow inferred year-only dates only when grounded by relative duration
+                phrases in the same source and an explicit anchor year.
+                """
+                if not normalized_date or len(normalized_date) < 10:
+                    return False
+                if normalized_date[5:] != "01-01":
+                    return False
+                if anchor_year is None:
+                    return False
+                try:
+                    target_year = int(normalized_date[:4])
+                except Exception:
+                    return False
+
+                corpus = " ".join(
+                    [
+                        source_content or "",
+                        str(item_payload.get("title") or ""),
+                        str(item_payload.get("description") or ""),
+                    ]
+                ).lower()
+                if not corpus:
+                    return False
+
+                word_to_num = {
+                    "one": 1,
+                    "two": 2,
+                    "three": 3,
+                    "four": 4,
+                    "five": 5,
+                    "six": 6,
+                    "seven": 7,
+                    "eight": 8,
+                    "nine": 9,
+                    "ten": 10,
+                    "eleven": 11,
+                    "twelve": 12,
+                    "thirteen": 13,
+                    "fourteen": 14,
+                    "fifteen": 15,
+                    "sixteen": 16,
+                    "seventeen": 17,
+                    "eighteen": 18,
+                    "nineteen": 19,
+                    "twenty": 20,
+                }
+
+                def _to_year_count(raw: str) -> Optional[int]:
+                    token = (raw or "").strip().lower()
+                    if not token:
+                        return None
+                    if token.isdigit():
+                        val = int(token)
+                        return val if 0 < val <= 50 else None
+                    return word_to_num.get(token)
+
+                # Examples matched:
+                # - "10 years", "past 5 years", "4-5 years", "4 to 5 years"
+                # - "ten years", "past four years", "four to five years"
+                pattern = (
+                    r"\b(?:past\s+)?"
+                    r"(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|"
+                    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+                    r"eighteen|nineteen|twenty)"
+                    r"(?:\s*(?:-|to)\s*"
+                    r"(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|"
+                    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+                    r"eighteen|nineteen|twenty))?"
+                    r"\s+years?\b"
+                )
+                for m in re.finditer(pattern, corpus):
+                    n1 = _to_year_count(m.group(1))
+                    n2 = _to_year_count(m.group(2)) if m.group(2) else n1
+                    if n1 is None or n2 is None:
+                        continue
+                    low, high = sorted((n1, n2))
+                    allowed_years = {anchor_year - n for n in range(low, high + 1)}
+                    if target_year in allowed_years:
+                        return True
+                return False
 
             for item in arr:
                 if not isinstance(item, dict):
@@ -3159,6 +3363,40 @@ Example shape:
                 source_doc_id = doc_id_by_index.get(idx, "")
                 source_doc_name = doc_name_by_index.get(idx, "")
                 source_content = doc_content_by_index.get(idx, "")
+                if idx not in doc_explicit_dates_by_index:
+                    explicit_dates = _extract_explicit_dates(source_content)
+                    doc_explicit_dates_by_index[idx] = explicit_dates
+                    explicit_years = _extract_explicit_years(source_content)
+                    doc_explicit_years_by_index[idx] = explicit_years
+                    doc_anchor_year_by_index[idx] = _resolve_anchor_year(
+                        source_content, explicit_dates
+                    )
+                explicit_dates = doc_explicit_dates_by_index.get(idx, set())
+                explicit_years = doc_explicit_years_by_index.get(idx, set())
+                anchor_year = doc_anchor_year_by_index.get(idx)
+
+                # Keep only grounded dates:
+                # 1) exact explicit date appears in source, OR
+                # 2) explicit year appears in source with YYYY-01-01 normalization, OR
+                # 3) derived from relative "X years" phrase anchored to explicit year in same source.
+                year_val = int(date_val[:4]) if len(date_val) >= 4 and date_val[:4].isdigit() else None
+                is_explicit_full_date = date_val in explicit_dates
+                is_explicit_year_only = (
+                    date_val.endswith("-01-01")
+                    and year_val is not None
+                    and year_val in explicit_years
+                )
+                is_allowed_relative = _is_duration_derived_date_allowed(
+                    date_val, item, source_content, anchor_year
+                )
+                if not (is_explicit_full_date or is_explicit_year_only or is_allowed_relative):
+                    logger.debug(
+                        "List of dates: dropping ungrounded date={} title='{}' doc='{}'",
+                        date_val,
+                        (item.get("title") or "").strip(),
+                        source_doc_name or source_doc_id or str(idx),
+                    )
+                    continue
                 page_number = _resolve_page_number(item, source_content)
 
                 # Build core entry used by backend List of Dates UI
@@ -3189,6 +3427,134 @@ Example shape:
                 # Drop None/empty so payload is clean; keep description if present
                 entry = {k: v for k, v in entry.items() if v is not None and v != ""}
                 result.append(entry)
+
+            # Deterministic backfill: ensure explicit dates present in source docs are not missed
+            # by model output on long/noisy documents.
+            existing_doc_date_pairs = {
+                (str(e.get("sourceDocId") or ""), str(e.get("date") or ""))
+                for e in result
+            }
+            for idx, source_content in doc_content_by_index.items():
+                source_doc_id = doc_id_by_index.get(idx, "")
+                source_doc_name = doc_name_by_index.get(idx, "")
+                mentions = _extract_explicit_date_mentions(source_content)
+                if not mentions:
+                    continue
+
+                page_markers = _extract_page_markers(source_content)
+
+                for normalized_date, pos in mentions:
+                    pair = (str(source_doc_id or ""), normalized_date)
+                    if pair in existing_doc_date_pairs:
+                        continue
+
+                    page_number = 1
+                    if page_markers:
+                        for marker_pos, marker_page in page_markers:
+                            if marker_pos <= pos:
+                                try:
+                                    page_number = int(marker_page)
+                                except Exception:
+                                    page_number = 1
+                            else:
+                                break
+
+                    snippet_start = max(0, pos - 70)
+                    snippet_end = min(len(source_content), pos + 130)
+                    snippet = re.sub(
+                        r"\s+",
+                        " ",
+                        source_content[snippet_start:snippet_end].strip(),
+                    )
+                    if len(snippet) > 180:
+                        snippet = snippet[:177].rstrip() + "..."
+
+                    supplemental = {
+                        "date": normalized_date,
+                        "title": "Date Mentioned in Document",
+                        "description": snippet or "Date explicitly mentioned in source document.",
+                        "sourceDocId": source_doc_id or None,
+                        "sourceDocName": source_doc_name or None,
+                        "pageNumber": page_number if page_number > 0 else 1,
+                        "isIncident": False,
+                        "eventType": "Other",
+                        "relevance": "Medium",
+                    }
+                    if source_doc_name:
+                        supplemental["source"] = source_doc_name
+                        supplemental["sourceAnswer"] = source_doc_name
+                    supplemental = {
+                        k: v
+                        for k, v in supplemental.items()
+                        if v is not None and v != ""
+                    }
+                    result.append(supplemental)
+                    existing_doc_date_pairs.add(pair)
+
+            # LLM temporal-inference backfill via LangGraph:
+            # captures relative/chained timeline statements grounded in document text.
+            existing_keys = {
+                (
+                    str(e.get("sourceDocId") or "").strip(),
+                    str(e.get("date") or "").strip(),
+                )
+                for e in result
+            }
+            for idx, source_content in doc_content_by_index.items():
+                source_doc_id = doc_id_by_index.get(idx, "")
+                source_doc_name = doc_name_by_index.get(idx, "")
+                anchor_year = doc_anchor_year_by_index.get(idx)
+                rel_events: List[Dict[str, Any]] = []
+                try:
+                    rel_events = await list_of_dates_temporal_agent.infer_temporal_events(
+                        document_text=source_content,
+                        source_doc_id=source_doc_id,
+                        source_doc_name=source_doc_name,
+                        anchor_year=anchor_year,
+                    )
+                except Exception as temporal_err:
+                    logger.debug(
+                        "List of dates temporal agent failed for doc {}: {}",
+                        source_doc_id or idx,
+                        temporal_err,
+                    )
+                    rel_events = []
+                for e in rel_events:
+                    # Resolve best-effort page for inferred temporal events too.
+                    e["pageNumber"] = _resolve_page_number(e, source_content)
+                    key = (
+                        str(e.get("sourceDocId") or "").strip(),
+                        str(e.get("date") or "").strip(),
+                    )
+                    if key in existing_keys:
+                        continue
+                    result.append(e)
+                    existing_keys.add(key)
+
+            # Stable ordering for UI: chronological first, then title/doc.
+            result.sort(
+                key=lambda x: (
+                    str(x.get("date") or ""),
+                    str(x.get("title") or ""),
+                    str(x.get("sourceDocName") or ""),
+                )
+            )
+
+            # Final deterministic dedupe: same sourceDocId + date + title should appear once,
+            # even if descriptions differ across model/backfill passes.
+            deduped: List[Dict[str, Any]] = []
+            seen_keys: set[Tuple[str, str, str]] = set()
+            for entry in result:
+                key = (
+                    str(entry.get("sourceDocId") or "").strip(),
+                    str(entry.get("date") or "").strip(),
+                    str(entry.get("title") or "").strip().lower(),
+                )
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                deduped.append(entry)
+            result = deduped
 
             logger.info(
                 "List of dates: generated {} entries for workspace {}",
@@ -3221,15 +3587,58 @@ Example shape:
         except Exception as e:
             logger.warning("List of dates: could not fetch documents: {}", e)
             all_docs = []
+        processed_doc_ids: set[str] = set()
+        if isinstance(batch_result, dict):
+            for r in batch_result.get("results") or []:
+                did = str(r.get("document_id") or "").strip()
+                if did:
+                    processed_doc_ids.add(did)
+
+        target_docs = all_docs
+        if processed_doc_ids:
+            # Incremental upload sync: build timeline only from newly processed docs.
+            target_docs = [
+                d
+                for d in (all_docs or [])
+                if str(d.get("document_id") or "").strip() in processed_doc_ids
+            ]
+            logger.info(
+                "List of dates incremental mode: {} processed doc(s), {} matched in vector store",
+                len(processed_doc_ids),
+                len(target_docs),
+            )
+
         list_of_dates = await self._generate_list_of_dates_from_documents(
             workspace_id=workspace_id,
             user_id=user_id,
-            all_docs=all_docs,
+            all_docs=target_docs,
             workspace_role=workspace_role,
             batch_result=batch_result,
         )
-        # Cache before emit so re-emit on reconnect has data even if emit fails (e.g. namespace disconnected)
-        self._workspace_list_of_dates_payload[workspace_id] = list_of_dates
+        if processed_doc_ids:
+            # Replace only the updated docs' timeline entries; preserve other docs unchanged.
+            prior = self._workspace_list_of_dates_payload.get(workspace_id) or []
+            if not isinstance(prior, list):
+                prior = []
+            retained = [
+                e
+                for e in prior
+                if str(e.get("sourceDocId") or "").strip() not in processed_doc_ids
+            ]
+            merged = retained + (list_of_dates or [])
+            merged.sort(
+                key=lambda x: (
+                    str(x.get("date") or ""),
+                    str(x.get("title") or ""),
+                    str(x.get("sourceDocName") or ""),
+                )
+            )
+            # Cache before emit so re-emit on reconnect has data even if emit fails.
+            self._workspace_list_of_dates_payload[workspace_id] = merged
+            list_of_dates = merged
+        else:
+            # Full refresh mode (workspace created/delete flows): replace complete payload.
+            self._workspace_list_of_dates_payload[workspace_id] = list_of_dates
         # Payload matches backend spec: workspaceId, userId at root and inside payload for storage
         payload = {
             "workspaceId": workspace_id,
@@ -4328,48 +4737,12 @@ Rules:
             # Fresh objective-aligned report is emitted; lift suppression so future emits are allowed.
             self._suppress_analysis_emit_until_ts.pop(workspace_id, None)
 
-        # 2) List of dates: regenerate, then merge with existing chronology
-        try:
-            from app.vectorstore.qdrant import vector_store
-
-            all_docs = await vector_store.get_all_documents(workspace_id=workspace_id)
-        except Exception as e:
-            logger.warning("List of dates (objective change) fetch failed: {}", e)
-            all_docs = []
-        new_dates = await self._generate_list_of_dates_from_documents(
-            workspace_id=workspace_id,
-            user_id=user_id,
-            all_docs=all_docs,
-            workspace_role=workspace_role,
-            batch_result=None,
-        )
-        old_dates = self._workspace_list_of_dates_payload.get(workspace_id) or []
-        merged_dates = self._merge_list_of_dates_for_objective_change(
-            old_dates if isinstance(old_dates, list) else [],
-            new_dates if isinstance(new_dates, list) else [],
-        )
-        if merged_dates:
-            date_lines = []
-            for d in merged_dates:
-                if not isinstance(d, dict):
-                    continue
-                date_lines.append(
-                    "{} | {} | {}".format(
-                        str(d.get("date") or "").strip(),
-                        str(d.get("title") or "").strip(),
-                        str(d.get("description") or "").strip(),
-                    ).strip()
-                )
-            keep_dates = await self._llm_semantic_keep_indexes(
-                date_lines, item_type="list of dates events", max_keep=200
-            )
-            if keep_dates:
-                merged_dates = [
-                    merged_dates[i - 1]
-                    for i in keep_dates
-                    if 1 <= i <= len(merged_dates)
-                ]
-        self._workspace_list_of_dates_payload[workspace_id] = merged_dates
+        # 2) List of dates: preserve existing payload on objective change.
+        # Only regenerate dates when documents are uploaded/deleted.
+        preserved_dates = self._workspace_list_of_dates_payload.get(workspace_id) or []
+        if not isinstance(preserved_dates, list):
+            preserved_dates = []
+        self._workspace_list_of_dates_payload[workspace_id] = preserved_dates
         if self._socket_client:
             await self._socket_client.emit(
                 "document_feature_response",
@@ -4380,61 +4753,27 @@ Rules:
                     "payload": {
                         "workspaceId": workspace_id,
                         "userId": user_id,
-                        "listOfDates": merged_dates,
+                        "listOfDates": preserved_dates,
                     },
                 },
             )
             logger.success(
-                "✅ Objective-change incremental list_of_dates update emitted{}",
+                "✅ Objective-change preserved list_of_dates re-emitted{}",
                 ctx,
             )
             self._log_list_of_dates_outbound(
                 workspace_id=workspace_id,
                 user_id=user_id,
-                list_of_dates=merged_dates,
-                context="objective-change-incremental",
+                list_of_dates=preserved_dates,
+                context="objective-change-preserved",
             )
 
-        # 3) Applicable laws: regenerate, then merge (keep prior + add/refresh new)
-        signals = await self._extract_case_signals_from_documents(workspace_id, user_id)
-        search_results = await self._search_indiankanoon(signals.get("query", ""))
-        if not search_results:
-            search_results = await self._search_google_cse_for_indiankanoon(
-                signals.get("query", "")
-            )
-        new_laws = await self._generate_applicable_laws_from_sources(
-            workspace_id=workspace_id,
-            workspace_role=workspace_role,
-            signals=signals,
-            search_results=search_results,
-        )
-        old_laws = self._workspace_applicable_laws_payload.get(workspace_id) or {}
-        merged_laws = self._merge_applicable_laws_for_objective_change(
-            old_laws if isinstance(old_laws, dict) else {},
-            new_laws if isinstance(new_laws, dict) else {},
-        )
-        laws_arr = merged_laws.get("laws") or []
-        if isinstance(laws_arr, list) and laws_arr:
-            law_lines = []
-            for lw in laws_arr:
-                if not isinstance(lw, dict):
-                    law_lines.append(str(lw))
-                    continue
-                law_lines.append(
-                    "{} | {} | {}".format(
-                        str(lw.get("act") or "").strip(),
-                        str(lw.get("section") or "").strip(),
-                        str(lw.get("description") or "").strip(),
-                    )
-                )
-            keep_laws = await self._llm_semantic_keep_indexes(
-                law_lines, item_type="applicable laws entries", max_keep=12
-            )
-            if keep_laws:
-                merged_laws["laws"] = [
-                    laws_arr[i - 1] for i in keep_laws if 1 <= i <= len(laws_arr)
-                ]
-        self._workspace_applicable_laws_payload[workspace_id] = merged_laws
+        # 3) Applicable laws: preserve existing payload on objective change.
+        # Only regenerate laws when documents are uploaded/deleted.
+        preserved_laws = self._workspace_applicable_laws_payload.get(workspace_id) or {}
+        if not isinstance(preserved_laws, dict):
+            preserved_laws = {}
+        self._workspace_applicable_laws_payload[workspace_id] = preserved_laws
         if self._socket_client:
             await self._socket_client.emit(
                 "document_feature_response",
@@ -4442,11 +4781,11 @@ Rules:
                     "featureType": "applicable_laws",
                     "workspaceId": workspace_id,
                     "userId": user_id,
-                    "payload": merged_laws,
+                    "payload": preserved_laws,
                 },
             )
             logger.success(
-                "✅ Objective-change incremental applicable_laws update emitted{}",
+                "✅ Objective-change preserved applicable_laws re-emitted{}",
                 ctx,
             )
 
@@ -4458,8 +4797,10 @@ Rules:
         log_context: str = "",
     ) -> None:
         """
-        On strategic objective changes from intelligence chat, run incremental
-        refresh (merge old + new) for analysis_report, list_of_dates, and applicable_laws.
+        On strategic objective changes from intelligence chat:
+        - regenerate analysis_report
+        - preserve/re-emit current list_of_dates and applicable_laws
+        (dates/laws regenerate only on document upload/delete flows).
         """
         ctx = log_context or " (objective change)"
 

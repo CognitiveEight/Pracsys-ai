@@ -357,6 +357,60 @@ class SocketEventHandler:
             )
         return None
 
+    async def _resolve_workspace_role(
+        self,
+        workspace_id: str,
+        user_id: str,
+        *,
+        preferred_role: Optional[str] = None,
+        chat_id: Optional[str] = None,
+    ) -> str:
+        """
+        Resolve the effective workspace role before generation.
+
+        Priority:
+        1) Explicit role from current payload
+        2) In-memory workspace context
+        3) Persisted role cache (Qdrant-backed)
+        4) ADJUDICATOR fallback
+        """
+        valid_roles = {"ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"}
+        normalized_preferred = (preferred_role or "").strip().upper()
+        if normalized_preferred in valid_roles:
+            return normalized_preferred
+
+        try:
+            from app.workspace.context import context_manager
+
+            ctx = context_manager.get_context(workspace_id)
+            if ctx and ctx.workspace_role:
+                ctx_role = (ctx.workspace_role or "").strip().upper()
+                if ctx_role in valid_roles:
+                    return ctx_role
+        except Exception:
+            pass
+
+        restored_role = await self._restore_workspace_role(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+        if restored_role in valid_roles:
+            # Keep in-memory context aligned after process restarts/reconnects.
+            try:
+                from app.workspace.context import context_manager
+
+                context_manager.upsert_workspace(
+                    workspace_id,
+                    user_id,
+                    workspace_role=restored_role,
+                )
+            except Exception:
+                pass
+            return restored_role
+
+        return "ADJUDICATOR"
+
     def set_socket_client(self, client):
         """Set the socket client for emitting responses."""
         self._socket_client = client
@@ -4865,15 +4919,11 @@ Rules:
         Strategy → analysis report → scheduled list_of_dates + applicable_laws.
         Runs inside asyncio.create_task so workspace_sync / workspace_created return quickly.
         """
-        role = (workspace_role or "ADJUDICATOR").strip().upper()
-        if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-            role = "ADJUDICATOR"
-        try:
-            ctx = workspace_manager.get_workspace(workspace_id)
-            if ctx and ctx.workspace_role:
-                role = (ctx.workspace_role or role).upper()
-        except Exception:
-            pass
+        role = await self._resolve_workspace_role(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            preferred_role=workspace_role,
+        )
 
         logger.info("Using workspace role for background AI pipeline: {}", role)
         try:
@@ -8322,6 +8372,15 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     str(payload.userId),
                     str(payload.workspaceRole),
                 )
+            resolved_workspace_role = await self._resolve_workspace_role(
+                workspace_id=str(payload.workspaceId),
+                user_id=str(payload.userId),
+                preferred_role=payload.workspaceRole,
+            )
+            logger.info(
+                "Resolved workspace role for sync generation: {}",
+                resolved_workspace_role,
+            )
 
             # Update workspace metadata (for logging)
             updates = {}
@@ -8355,24 +8414,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     logger.exception(del_err)
                 if delete_ok:
                     # Resolve role once; list_of_dates + applicable_laws must run after delete even if strategy emit fails.
-                    workspace_role = (
-                        payload.workspaceRole or ""
-                    ).strip().upper() or "ADJUDICATOR"
-                    if workspace_role not in (
-                        "ADJUDICATOR",
-                        "PETITIONER",
-                        "RESPONDENT",
-                        "MEDIATOR",
-                    ):
-                        workspace_role = "ADJUDICATOR"
-                    try:
-                        ctx = workspace_manager.get_workspace(payload.workspaceId)
-                        if ctx and ctx.workspace_role:
-                            workspace_role = (
-                                ctx.workspace_role or workspace_role
-                            ).upper()
-                    except Exception:
-                        pass
+                    workspace_role = resolved_workspace_role
 
                     await self._emit_workspace_refresh(
                         workspace_id=str(payload.workspaceId),
@@ -8723,26 +8765,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                     )
 
                             if batch_result.get("successful", 0) > 0:
-                                workspace_role = (
-                                    payload.workspaceRole or ""
-                                ).strip().upper() or "ADJUDICATOR"
-                                if workspace_role not in (
-                                    "ADJUDICATOR",
-                                    "PETITIONER",
-                                    "RESPONDENT",
-                                    "MEDIATOR",
-                                ):
-                                    workspace_role = "ADJUDICATOR"
-                                try:
-                                    ctx = workspace_manager.get_workspace(
-                                        payload.workspaceId
-                                    )
-                                    if ctx and ctx.workspace_role:
-                                        workspace_role = (
-                                            ctx.workspace_role or workspace_role
-                                        ).upper()
-                                except Exception:
-                                    pass
+                                workspace_role = resolved_workspace_role
                                 logger.info(
                                     "Using workspace role for strategies (sync): {}",
                                     workspace_role,
@@ -8780,18 +8803,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 # When no files succeeded on sync, still emit analysis report (fallback)
                                 if self._socket_client:
                                     try:
-                                        workspace_role = (
-                                            (payload.workspaceRole or "ADJUDICATOR")
-                                            .strip()
-                                            .upper()
-                                        )
-                                        if workspace_role not in (
-                                            "ADJUDICATOR",
-                                            "PETITIONER",
-                                            "RESPONDENT",
-                                            "MEDIATOR",
-                                        ):
-                                            workspace_role = "ADJUDICATOR"
+                                        workspace_role = resolved_workspace_role
                                         fallback = self._analysis_report_fallback(
                                             workspace_role
                                         )
@@ -8847,22 +8859,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
             elif skip_reprocess and files_to_process and self._socket_client:
                 workspace_id = payload.workspaceId
                 user_id = payload.userId
-                workspace_role = (
-                    payload.workspaceRole or ""
-                ).strip().upper() or "ADJUDICATOR"
-                if workspace_role not in (
-                    "ADJUDICATOR",
-                    "PETITIONER",
-                    "RESPONDENT",
-                    "MEDIATOR",
-                ):
-                    workspace_role = "ADJUDICATOR"
-                try:
-                    ctx = workspace_manager.get_workspace(workspace_id)
-                    if ctx and ctx.workspace_role:
-                        workspace_role = (ctx.workspace_role or workspace_role).upper()
-                except Exception:
-                    pass
+                workspace_role = resolved_workspace_role
                 # Re-emit strategy from cache (no regeneration); then analysis_report. Single emit block, no try/except around emits.
                 strategies_result = self._workspace_strategy_payload.get(workspace_id)
                 if strategies_result:
@@ -9006,23 +9003,8 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 clear_err,
                             )
                     workspace_role = (
-                        (payload.workspaceRole or "ADJUDICATOR").strip().upper()
+                        resolved_workspace_role
                     )
-                    if workspace_role not in (
-                        "ADJUDICATOR",
-                        "PETITIONER",
-                        "RESPONDENT",
-                        "MEDIATOR",
-                    ):
-                        workspace_role = "ADJUDICATOR"
-                    try:
-                        ctx = workspace_manager.get_workspace(workspace_id)
-                        if ctx and ctx.workspace_role:
-                            workspace_role = (
-                                ctx.workspace_role or workspace_role
-                            ).upper()
-                    except Exception:
-                        pass
                     strategy_fallback = self._strategy_objective_fallback(
                         workspace_id, user_id, workspace_role, is_update=True
                     )

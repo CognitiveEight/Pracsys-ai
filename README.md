@@ -1,308 +1,197 @@
-# SimplerToday
+# SimplerToday AI Service
 
-An intelligent workspace management system with Socket.IO integration, vector store capabilities, and AI-powered agents.
+SimplerToday is the **AI engine** that connects to your application backend over **Socket.IO**. It reads case documents, builds a **legal intelligence workspace**, and answers lawyer questions in natural language.
 
-## 🚀 Features
+---
 
-- **Socket.IO Client**: Real-time connection to workspace server with automatic reconnection
-- **Workspace Management**: Comprehensive workspace lifecycle management with file processing
-- **Vector Store Integration**: Qdrant-based document storage and semantic search
-- **AI Agents**: Extensible agent framework for intelligent interactions
-- **Observability**: Built-in logging, audit trails, and distributed tracing
-- **Security**: JWT-based authentication and authorization
-- **Async/Await**: Fully asynchronous architecture for high performance
+## In plain language: what does it do?
 
-## 📁 Project Structure
+| Capability | What it means for users |
+|------------|-------------------------|
+| **Document intelligence** | Uploaded case files are read, assessed for quality, and stored for search so the AI can refer to what is actually in the record. |
+| **Strategy & objectives** | The system can draft a **case summary**, **strategic objective**, and **possible next steps** from the documents, aligned to the workspace role (e.g. petitioner, respondent). |
+| **Analysis report** | A structured view of **strengths**, **risks**, **missing information**, **score context**, and pointers for improvement. |
+| **Document generation** | AI outputs can be transformed into **structured DOCX/report drafts** for legal review and downstream editing workflows. |
+| **Important dates** | A **timeline / list of dates** derived from the materials where applicable. |
+| **Applicable laws** | Suggestions for **relevant legal frameworks** tied to the matter (for research direction, not as final legal advice). |
+| **Intelligence chat** | A **chat** where lawyers ask follow‑ups (explain a risk, compare options, procedural questions, hypotheticals). Replies aim to be **balanced and accurate**; workspace role mainly affects **panel** drafts, not an automatic advocacy slant in chat. |
+| **Responsive during generation** | Long jobs (strategy, analysis, dates, laws) run in the background when possible so **chat can still answer** while other outputs are being prepared. |
+
+Nothing here replaces a qualified lawyer or predicts court outcomes. Outputs support **professional judgment**, not **decisions**.
+
+---
+
+## Who should read this?
+
+- **Lawyers, product, and programme managers** — read *In plain language* and *Trust and limitations* below.
+- **Engineers and DevOps** — read *Technical overview*, *Configuration*, and *Running the service*. Deeper behaviour is described in [`SYSTEM_ARCHITECTURE.md`](SYSTEM_ARCHITECTURE.md).
+
+---
+
+## Trust and limitations
+
+- The AI **must not invent** facts, amounts, dates, or citations that are not grounded in supplied materials or clearly labelled general legal background.
+- **Workspace role** (petitioner, respondent, etc.) mainly shapes how **panel outputs** (e.g. strategy blocks) are **generated**. **Intelligence chat** is configured for **neutral, accuracy‑first** analysis unless the user explicitly asks for a one‑sided view.
+- Use generated content as **drafting and thinking support**, subject to review by qualified counsel and local rules.
+
+---
+
+## Technical overview
+
+- **Runtime:** Python 3.11+, asyncio.
+- **AI model:** Google **Gemini** (configurable).
+- **Vectors:** **Qdrant** for embeddings and workspace‑scoped search.
+- **Transport:** **Socket.IO client** — listens for workspace and chat events from your backend and emits structured payloads and chat replies.
+
+### Main Socket.IO events (summary)
+
+**Inbound (backend → AI)**
+
+- `workspace_created` — new workspace and evidence files.
+- `workspace_sync` — workspace updates (files added, changed, or removed).
+- `user_message_request` — user message for **intelligence chat**.
+- `probing_prompts_request`, `analysis_report_feedback`, heartbeat events as per your backend contract.
+
+**Outbound (AI → backend)**
+
+- `document_feature_response` — payloads such as `document_assessments`, `strategy_objective`, `analysis_report`, `list_of_dates`, `applicable_laws`, `workspace_metadata`, etc.
+- `ai_response` — natural language chat reply.
+
+Exact payload shapes are defined in code (`app/socket/schemas.py`) and integration notes under `docs/` where present.
+
+---
+
+## Repository layout
+
+This section matches the idea of [`STRUCTURE.txt`](STRUCTURE.txt) (printable ASCII tree) but is **updated** for the current legal-AI codebase. Use either this README or `STRUCTURE.txt` to find your way around; for deep behaviour, see [`SYSTEM_ARCHITECTURE.md`](SYSTEM_ARCHITECTURE.md).
+
+### Top of the repository
 
 ```
 simplertoday/
-├── app/
-│   ├── main.py                 # Application entry point
-│   ├── socket/                 # Socket.IO client
-│   │   ├── client.py           # Socket client implementation
-│   │   ├── events.py           # Event handlers
-│   │   └── schemas.py          # Pydantic schemas
-│   ├── agents/                 # AI Agents
-│   │   ├── base.py             # Base agent class
-│   │   ├── router.py           # Agent routing logic
-│   │   └── chat_agent.py       # Chat agent implementation
-│   ├── workspace/              # Workspace management
-│   │   ├── context.py          # Workspace context
-│   │   └── manager.py          # Workspace manager
-│   ├── vectorstore/            # Vector database
-│   │   ├── qdrant.py           # Qdrant integration
-│   │   └── memory.py           # Conversation memory
-│   ├── observability/          # Monitoring & logging
-│   │   ├── logger.py           # Logging configuration
-│   │   ├── audit.py            # Audit logging
-│   │   └── trace.py            # Distributed tracing
-│   ├── core/                   # Core functionality
-│   │   ├── config.py           # Configuration management
-│   │   ├── lifecycle.py        # Application lifecycle
-│   │   └── security.py         # Security utilities
-│   └── utils/                  # Utilities
-│       └── exceptions.py       # Custom exceptions
-├── requirements.txt            # Python dependencies
-├── .env.example               # Environment variables template
-└── README.md                  # This file
+├── app/                          # All Python application code (table below)
+├── docs/                         # Integration notes (when present)
+├── logs/                         # Created when the app runs (gitignored)
+├── data/                         # Local/cache data (gitignored)
+├── env.example                   # Template → copy to .env
+├── requirements.txt
+├── docker-compose.yml            # Optional: Qdrant, Redis, etc.
+├── Dockerfile                    # Optional container image
+├── Makefile                      # make setup | run | docker-up | …
+├── run.sh                        # Optional: shell helper to start the service
+├── STRUCTURE.txt                 # Detailed folder tree (companion doc)
+├── README.md                     # This file
+└── SYSTEM_ARCHITECTURE.md       # Event flow & multi-agent design
 ```
 
-## 🛠️ Installation
+### Inside `app/` — what each folder is for
 
-### Prerequisites
+| Path | In plain terms |
+|------|----------------|
+| `main.py` | Starts the program and handles graceful shutdown. |
+| `socket/` | Socket.IO **client**: connect to your backend, handle events, emit AI results. |
+| `langgraph/` | **Strategy generation** and **intelligence chat** workflows (step-by-step AI). |
+| `prompts/` | Legal system prompts (chat behaviour, guardrails, role context). |
+| `ai/` | **Google Gemini** client: text generation, chat, embeddings. |
+| `processing/` | Document download, text extraction, batch processing, readability. |
+| `vectorstore/` | **Qdrant**: embeddings and semantic search **per workspace**. |
+| `workspace/` | Workspace state and manager (open matter context). |
+| `agents/` | Agent types, routing, shared chat helpers. |
+| `core/` | Configuration (`config.py`), app lifecycle, security utilities. |
+| `observability/` | Logging, audit trail, tracing. |
+| `utils/` | Shared exceptions and small helpers. |
 
-- Python 3.11 or higher
-- Qdrant (for vector store)
-- Redis (optional, for caching)
+### Folders created automatically
 
-### Setup
+| Location | Purpose |
+|----------|---------|
+| `logs/` | App logs (including `logs/audit/` when enabled). |
+| `data/workspaces/` | Per-workspace file cache / downloads when that path is used. |
 
-1. **Clone the repository**:
+Do not rely on these being in Git — they appear after the first runs.
+
+### Dependencies (external systems)
+
+| System | Role |
+|--------|------|
+| **Socket.IO server** | Your app backend; **required** for production use. |
+| **Google Gemini** | Primary LLM (`GOOGLE_API_KEY`); see `env.example`. |
+| **Qdrant** | Vector database for document search; often run via Docker. |
+| **Redis** | Optional caching (see `docker-compose.yml` / `config.py`). |
+| **GCP / Vision** | Optional OCR or vision keys if you enable those features. |
+
+### Quick commands
+
+| Goal | Command |
+|------|---------|
+| Install deps only | `make install` |
+| First-time setup (venv, deps, `.env` from template, folders) | `make setup` |
+| Run the AI service | `make run` or `python -m app.main` |
+| Smoke test | `make test` *(currently expects `test_setup.py`; add tests before relying on this target)* |
+| Start Docker services (e.g. Qdrant) | `make docker-up` |
+| Stop Docker services | `make docker-down` |
+
+---
+
+## Configuration
+
+1. Copy the environment template to a local `.env` file (settings load from `.env`):
+
    ```bash
-   cd /media/abhishek/Data1/simplertoday
+   cp env.example .env
    ```
 
-2. **Create virtual environment**:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
+2. Set at least:
 
-3. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+   - **Socket:** `SOCKET_URL`, `SOCKET_SECRET_KEY`, `SOCKET_AI_PAYLOAD` (per your backend).
+   - **AI:** `GOOGLE_API_KEY` for Gemini; optional GCP fields for OCR or other Google services.
+   - **Vectors:** `QDRANT_URL` (and API key if used).
 
-4. **Configure environment variables**:
-   ```bash
-   cp .env.example .env
-   # Edit .env with your configuration
-   ```
+See `env.example` for all variables and comments.
 
-5. **Required Environment Variables**:
-   - `SOCKET_URL`: Your Socket.IO server URL
-   - `SECRET_KEY`: Secret key for JWT tokens
-   - `OPENAI_API_KEY`: OpenAI API key (optional, for LLM integration)
-   - `QDRANT_URL`: Qdrant server URL (default: http://localhost:6333)
+---
 
-## 🚦 Running the Application
+## Running the service
 
-### Start Qdrant (if running locally)
+**Qdrant** (if local):
 
 ```bash
 docker run -p 6333:6333 qdrant/qdrant
 ```
 
-### Run the application
+**Install and run:**
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 python -m app.main
 ```
 
-Or with uvicorn (if using FastAPI endpoint in future):
+---
 
-```bash
-uvicorn app.main:app --reload
-```
+## Observability
 
-## 📡 Socket.IO Integration
-
-The application connects to a Socket.IO server and subscribes to workspace events:
-
-### Supported Events
-
-- `workspace_created`: When a new workspace is created
-- `workspace_updated`: When workspace data is updated
-- `workspace_deleted`: When a workspace is deleted
-- `chat_message`: When a chat message is received
-
-### Example Socket Data
-
-```json
-{
-  "status": true,
-  "statusCode": 201,
-  "message": "created successfully",
-  "data": {
-    "_id": "6968e67ef2fd67764c19f57f",
-    "userId": "69566190ed0063e78c4df274",
-    "title": "Hack",
-    "workspaceRole": "PETITIONER",
-    "status": "ACTIVE",
-    "evidenceFiles": [
-      {
-        "filename": "Legal_Draft.txt",
-        "url": "https://example.com/file.txt",
-        "uploadedAt": "2026-01-15T13:07:10.543Z"
-      }
-    ]
-  }
-}
-```
-
-## 🤖 Agent System
-
-The application includes an extensible agent framework:
-
-### Current Agents
-
-- **ChatAgent**: General conversation and query handling
-
-### Adding New Agents
-
-1. Create agent class extending `BaseAgent`
-2. Implement `process()` method
-3. Register in `AgentRouter`
-4. Add to `AgentType` enum
-
-Example:
-
-```python
-from app.agents.base import BaseAgent, AgentConfig, AgentResponse
-
-class CustomAgent(BaseAgent):
-    def __init__(self):
-        config = AgentConfig(
-            name="custom_agent",
-            model="gpt-4",
-            system_prompt="Your prompt here"
-        )
-        super().__init__(config)
-    
-    async def process(self, workspace_context, message, **kwargs):
-        # Your implementation
-        pass
-```
-
-## 🗄️ Vector Store
-
-Documents are automatically processed and stored in Qdrant for semantic search:
-
-- Text files are embedded and indexed
-- Semantic search retrieves relevant context
-- Workspace-scoped searches ensure data isolation
-
-## 📊 Observability
-
-### Logging
-
-Logs are written to:
-- Console (with colors)
-- `logs/app.log` (all logs)
-- `logs/errors.log` (errors only)
-- `logs/structured.log` (JSON format)
-
-### Audit Logging
-
-Audit events are logged to:
-- `logs/audit/audit.log`
-
-Tracks:
-- Workspace operations
-- Agent interactions
-- Security events
-- System events
-
-### Tracing
-
-Use the `@tracer.trace()` decorator for performance monitoring:
-
-```python
-from app.observability.trace import tracer
-
-@tracer.trace("my_operation")
-async def my_function():
-    # Your code
-    pass
-```
-
-## 🔒 Security
-
-- JWT-based authentication
-- Password hashing with bcrypt
-- Input sanitization
-- Workspace access control
-- Audit logging for compliance
-
-## 🧪 Development
-
-### Code Structure
-
-- **Async/Await**: All I/O operations are asynchronous
-- **Type Hints**: Full type annotations for better IDE support
-- **Pydantic**: Schema validation for all data structures
-- **Loguru**: Beautiful and powerful logging
-- **Modular Design**: Clear separation of concerns
-
-### Best Practices
-
-1. Use type hints for all functions
-2. Log important events with appropriate levels
-3. Handle exceptions gracefully
-4. Document complex logic
-5. Use async/await consistently
-
-## 📝 Configuration
-
-All configuration is managed through environment variables and `app/core/config.py`:
-
-```python
-from app.core.config import settings
-
-# Access configuration
-socket_url = settings.socket_url
-debug_mode = settings.debug
-```
-
-## 🔄 Lifecycle Management
-
-The application handles graceful startup and shutdown:
-
-- Initializes all components
-- Connects to external services
-- Handles shutdown signals (SIGTERM, SIGINT)
-- Cleans up resources properly
-
-## 📚 Next Steps
-
-1. **LLM Integration**: Connect chat agent to OpenAI/Anthropic
-2. **Additional Agents**: Implement document analysis, legal research agents
-3. **REST API**: Add FastAPI endpoints for HTTP access
-4. **WebSocket Server**: Add WebSocket support for direct client connections
-5. **Testing**: Add unit and integration tests
-6. **Deployment**: Containerize with Docker
-
-## 🐛 Troubleshooting
-
-### Socket Connection Issues
-
-- Verify `SOCKET_URL` is correct
-- Check network connectivity
-- Ensure Socket.IO server is running
-
-### Vector Store Issues
-
-- Ensure Qdrant is running
-- Verify `QDRANT_URL` configuration
-- Check Qdrant logs for errors
-
-### Import Errors
-
-- Activate virtual environment
-- Reinstall dependencies: `pip install -r requirements.txt`
-
-## 📄 License
-
-[Your License Here]
-
-## 👥 Contributors
-
-[Your Team Information]
-
-## 📧 Support
-
-For issues and questions, please create an issue on GitHub or contact the development team.
+- Console logging (Loguru).
+- Log files under `logs/` when configured (see `app/observability/logger.py`).
+- Audit and trace helpers under `app/observability/`.
 
 ---
 
-**Built with ❤️ for intelligent workspace management**
+## Security notes
+
+- Do **not** commit `.env`, API keys, or Google **service account** JSON; use `env.example` as a template only.
+- Socket authentication follows your backend’s **HMAC / secret** contract.
+
+---
+
+## Contributing and support
+
+- **Architecture and event flow:** [`SYSTEM_ARCHITECTURE.md`](SYSTEM_ARCHITECTURE.md)
+- **Additional docs:** see `docs/` and topic‑specific `*.md` files at the repo root where maintained.
+
+---
+
+## License
+
+MIT

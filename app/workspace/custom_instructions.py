@@ -2,7 +2,8 @@
 Per-workspace custom instructions (structure, tone, description).
 Used to append user preferences to AI prompts when set; otherwise default prompt only.
 """
-from typing import Dict, Any, Optional
+
+from typing import Any, Dict, Optional
 
 # workspace_id -> { "structure": str, "tone": str, "description": str }
 _custom_instructions: Dict[str, Dict[str, str]] = {}

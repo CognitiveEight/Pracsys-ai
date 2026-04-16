@@ -111,6 +111,62 @@ class AnalysisReportFeedbackPayload(BaseModel):
         populate_by_name = True
 
 
+class ApplicableLawItemInRequest(BaseModel):
+    """Law object inside applicable_law_relevance_request (Server → AI)."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: Optional[str] = None
+    act: str = Field(..., validation_alias=AliasChoices("act", "Act"))
+    section: str = Field(..., validation_alias=AliasChoices("section", "Section"))
+    title: Optional[str] = Field(
+        None, validation_alias=AliasChoices("title", "Title")
+    )
+    description: Optional[str] = Field(
+        None, validation_alias=AliasChoices("description", "Description")
+    )
+    userDescription: Optional[str] = Field(
+        None,
+        validation_alias=AliasChoices("userDescription", "user_description"),
+    )
+
+
+class ApplicableLawRelevanceRequestPayload(BaseModel):
+    """
+    Payload for applicable_law_relevance_request (Server → AI).
+    Lawyer-selected law; AI returns applicability via applicable_law_relevance_response.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    workspaceId: str = Field(
+        ..., validation_alias=AliasChoices("workspaceId", "workspace_id")
+    )
+    userId: str = Field(..., validation_alias=AliasChoices("userId", "user_id"))
+    requestId: Optional[str] = Field(
+        None, validation_alias=AliasChoices("requestId", "request_id")
+    )
+    timestamp: Optional[str] = None
+    law: ApplicableLawItemInRequest
+
+
+class AnalysisDocxGenerateRequestPayload(BaseModel):
+    """
+    Payload for analysis_docx_generate_request (Server -> AI).
+    AI performs text normalization and returns analysis_docx_generate_response.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    requestId: str
+    workspaceId: str
+    userId: Optional[str] = None
+    trigger: Optional[str] = None
+    contentHash: Optional[str] = None
+    documentSource: Dict[str, Any]
+    timestamp: Optional[str] = None
+
+
 class ConversationHistoryItem(BaseModel):
     """Schema for conversation history item."""
 

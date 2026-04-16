@@ -9,6 +9,7 @@ sensible pingInterval so the connection is not closed while the AI service is ge
 import asyncio
 import base64
 import hashlib
+import json
 import hmac
 import time
 from datetime import datetime, timezone
@@ -378,9 +379,11 @@ class SocketClient:
             logger.info("   - user_message_request")
             logger.info("   - probing_prompts_request")
             logger.info("   - analysis_report_feedback")
+            logger.info("   - applicable_law_relevance_request")
+            logger.info("   - analysis_docx_generate_request")
             logger.info("   - ai_heartbeat_ping")
             logger.info(
-                "📤 Ready to emit: ai_response, probing_prompts_response, document_feature_response, ai_heartbeat_pong"
+                "📤 Ready to emit: ai_response, probing_prompts_response, document_feature_response, applicable_law_relevance_response, analysis_docx_generate_response, ai_heartbeat_pong"
             )
             self._connected = True
             self._connected_event.set()
@@ -501,6 +504,40 @@ class SocketClient:
             """
             logger.info("📋 Received analysis_report_feedback event")
             await event_handler.handle("analysis_report_feedback", data)
+
+        @self.sio.event
+        async def applicable_law_relevance_request(data):
+            """
+            Handle applicable_law_relevance_request (Server → AI_Maverick).
+            Lawyer-selected law; AI returns applicability as applicable_law_relevance_response.
+            """
+            logger.info("⚖️ applicable_law_relevance_request ← backend (socket received)")
+            try:
+                raw = json.dumps(data, default=str) if data is not None else "null"
+                logger.info(
+                    "applicable_law_relevance_request payload (preview): {}",
+                    raw[:1800] + ("..." if len(raw) > 1800 else ""),
+                )
+            except Exception:
+                logger.info("applicable_law_relevance_request payload (repr): {}", repr(data))
+            await event_handler.handle("applicable_law_relevance_request", data)
+
+        @self.sio.event
+        async def analysis_docx_generate_request(data):
+            """
+            Handle analysis_docx_generate_request (Server -> AI_Maverick).
+            AI returns processed document text via analysis_docx_generate_response.
+            """
+            logger.info("📝 analysis_docx_generate_request <- backend (socket received)")
+            try:
+                raw = json.dumps(data, default=str) if data is not None else "null"
+                logger.info(
+                    "analysis_docx_generate_request payload (preview): {}",
+                    raw[:1800] + ("..." if len(raw) > 1800 else ""),
+                )
+            except Exception:
+                logger.info("analysis_docx_generate_request payload (repr): {}", repr(data))
+            await event_handler.handle("analysis_docx_generate_request", data)
 
         @self.sio.on(AI_HEARTBEAT_PING)
         async def ai_heartbeat_ping(data):

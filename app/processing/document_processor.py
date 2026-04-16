@@ -115,7 +115,7 @@ class DocumentProcessor:
 
 Document excerpt:
 {snippet}"""
-            out = await gemini_client.generate(prompt, temperature=0.2, max_tokens=150)
+            out = await gemini_client.generate(prompt, temperature=0.2, max_tokens=12000)
             out = (out or "").strip()
             if out and "Error" not in out[:50] and len(out) >= 15:
                 return out
@@ -152,7 +152,7 @@ Document excerpt:
 
 Output only the JSON object, no markdown, no code block, no other text. Example:
 {{"summary": "This document is a complaint letter to the police regarding a hacked social media account.", "evidentiaryStrength": "High"}}"""
-            raw = await gemini_client.generate(prompt, temperature=0.2, max_tokens=800)
+            raw = await gemini_client.generate(prompt, temperature=0.2, max_tokens=12000)
             if not raw or "Error" in (raw[:80] or ""):
                 english_fallback = await self._get_english_summary_fallback(
                     extracted_text

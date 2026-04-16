@@ -7,8 +7,9 @@ is not dropped during init/timeouts.
 """
 
 import asyncio
+from datetime import datetime
 from typing import Any, Dict, List, Optional
-from uuid import uuid4
+from uuid import NAMESPACE_DNS, uuid4, uuid5
 
 from loguru import logger
 from qdrant_client import QdrantClient
@@ -456,6 +457,139 @@ class QdrantStore:
             # Qdrant client doesn't require explicit close
             self.client = None
             logger.info("Qdrant client closed")
+
+    async def upsert_workspace_role(
+        self,
+        workspace_id: str,
+        user_id: str,
+        role: str,
+        *,
+        chat_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Persist workspace-role selection in Qdrant so it survives process restarts.
+
+        Writes:
+        - user/workspace default role point
+        - optional chat-specific role point
+        """
+        if self.client is None:
+            await self.initialize()
+        role_upper = (role or "").strip().upper()
+        if role_upper not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+            return False
+
+        def _point_id(scope: str) -> str:
+            return str(uuid5(NAMESPACE_DNS, f"role-cache:{workspace_id}:{user_id}:{scope}"))
+
+        now_iso = datetime.utcnow().isoformat()
+        points: List[PointStruct] = []
+
+        user_payload = {
+            "workspace_id": workspace_id,
+            "document_id": "__workspace_role_cache__",
+            "original_document_id": "__workspace_role_cache__",
+            "content": "",
+            "uploaded_at": now_iso,
+            "cache_kind": "workspace_role_cache",
+            "cache_scope": "user_workspace",
+            "cache_user_id": str(user_id),
+            "cache_chat_id": "__default__",
+            "cache_role": role_upper,
+            "metadata": {
+                "kind": "workspace_role_cache",
+                "scope": "user_workspace",
+                "user_id": str(user_id),
+                "chat_id": "__default__",
+                "role": role_upper,
+                "updated_at": now_iso,
+            },
+        }
+        points.append(
+            PointStruct(id=_point_id("__default__"), vector=[0.0] * self.vector_size, payload=user_payload)
+        )
+
+        if chat_id:
+            chat_payload = {
+                **user_payload,
+                "cache_scope": "chat",
+                "cache_chat_id": str(chat_id),
+                "metadata": {
+                    **user_payload["metadata"],
+                    "scope": "chat",
+                    "chat_id": str(chat_id),
+                },
+            }
+            points.append(
+                PointStruct(
+                    id=_point_id(str(chat_id)),
+                    vector=[0.0] * self.vector_size,
+                    payload=chat_payload,
+                )
+            )
+
+        try:
+            await asyncio.to_thread(
+                self.client.upsert,
+                collection_name=self.collection_name,
+                points=points,
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "Failed to upsert workspace role cache (workspace={}, user={}): {}",
+                workspace_id,
+                user_id,
+                e,
+            )
+            return False
+
+    async def get_workspace_role(
+        self,
+        workspace_id: str,
+        user_id: str,
+        *,
+        chat_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Read workspace role from Qdrant cache (chat-specific first, then user/workspace).
+        """
+        if self.client is None:
+            await self.initialize()
+
+        async def _read(scope_chat_id: str) -> Optional[str]:
+            filt = Filter(
+                must=[
+                    FieldCondition(key="workspace_id", match=MatchValue(value=workspace_id)),
+                    FieldCondition(key="cache_kind", match=MatchValue(value="workspace_role_cache")),
+                    FieldCondition(key="cache_user_id", match=MatchValue(value=str(user_id))),
+                    FieldCondition(key="cache_chat_id", match=MatchValue(value=scope_chat_id)),
+                ]
+            )
+            try:
+                result, _next = await asyncio.to_thread(
+                    self.client.scroll,
+                    collection_name=self.collection_name,
+                    scroll_filter=filt,
+                    limit=1,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            except Exception:
+                return None
+            if not result:
+                return None
+            payload = result[0].payload or {}
+            role = str(payload.get("cache_role") or "").strip().upper()
+            if role in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                return role
+            return None
+
+        if chat_id:
+            role = await _read(str(chat_id))
+            if role:
+                return role
+        return await _read("__default__")
 
 
 # Global vector store instance

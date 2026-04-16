@@ -21,7 +21,7 @@ class ChatAgent(BaseAgent):
             name="chat_agent",
             model="gpt-4",
             temperature=0.7,
-            max_tokens=2000,
+            max_tokens=12000,
             system_prompt="""You are a helpful AI assistant for a legal workspace management system.
             
 Your role is to:

@@ -1,8 +1,10 @@
 """
 Centralized logging configuration using Loguru.
 """
+
 import sys
 from pathlib import Path
+
 from loguru import logger
 
 from app.core.config import settings
@@ -14,7 +16,7 @@ def setup_logging() -> None:
     """
     # Remove default handler
     logger.remove()
-    
+
     # Console handler with color
     logger.add(
         sys.stderr,
@@ -22,13 +24,13 @@ def setup_logging() -> None:
         level=settings.log_level,
         colorize=True,
         backtrace=True,
-        diagnose=True
+        diagnose=True,
     )
-    
+
     # Create logs directory
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    
+
     # File handler for all logs
     logger.add(
         log_dir / "app.log",
@@ -38,9 +40,9 @@ def setup_logging() -> None:
         retention="30 days",
         compression="zip",
         backtrace=True,
-        diagnose=True
+        diagnose=True,
     )
-    
+
     # File handler for errors only
     logger.add(
         log_dir / "errors.log",
@@ -50,9 +52,9 @@ def setup_logging() -> None:
         retention="90 days",
         compression="zip",
         backtrace=True,
-        diagnose=True
+        diagnose=True,
     )
-    
+
     # File handler for JSON structured logs
     logger.add(
         log_dir / "structured.log",
@@ -60,9 +62,9 @@ def setup_logging() -> None:
         level="INFO",
         rotation="100 MB",
         retention="30 days",
-        serialize=True  # Output as JSON
+        serialize=True,  # Output as JSON
     )
-    
+
     logger.info("Logging configured successfully")
     logger.debug("Debug logging enabled")
 
@@ -70,10 +72,10 @@ def setup_logging() -> None:
 def get_logger(name: str):
     """
     Get a logger instance with a specific name.
-    
+
     Args:
         name: Logger name (usually __name__)
-        
+
     Returns:
         Logger instance
     """
@@ -82,4 +84,3 @@ def get_logger(name: str):
 
 # Setup logging on module import
 setup_logging()
-

@@ -5,21 +5,17 @@ Note: Qdrant Python client is synchronous (blocking HTTP). We run initialization
 in a thread pool so the event loop stays responsive and the socket connection
 is not dropped during init/timeouts.
 """
+
 import asyncio
-from typing import List, Dict, Any, Optional
-from uuid import uuid4
-from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    Distance,
-    VectorParams,
-    PointStruct,
-    Filter,
-    FieldCondition,
-    MatchValue,
-    MatchAny,
-)
-from qdrant_client.http import models
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+from uuid import NAMESPACE_DNS, uuid4, uuid5
+
 from loguru import logger
+from qdrant_client import QdrantClient
+from qdrant_client.http import models
+from qdrant_client.models import (Distance, FieldCondition, Filter, MatchAny,
+                                  MatchValue, PointStruct, VectorParams)
 
 from app.core.config import settings
 from app.utils.exceptions import VectorStoreError
@@ -29,12 +25,12 @@ class QdrantStore:
     """
     Qdrant vector store wrapper for managing document embeddings.
     """
-    
+
     def __init__(self):
         self.client: Optional[QdrantClient] = None
         self.collection_name = settings.qdrant_collection_name
         self.vector_size = 768  # Google Gemini embedding size (text-embedding-004)
-    
+
     def _initialize_sync(self) -> None:
         """
         Synchronous init: create client and ensure collection.
@@ -58,9 +54,8 @@ class QdrantStore:
             self.client.create_collection(
                 collection_name=self.collection_name,
                 vectors_config=VectorParams(
-                    size=self.vector_size,
-                    distance=Distance.COSINE
-                )
+                    size=self.vector_size, distance=Distance.COSINE
+                ),
             )
             logger.success("Collection created: {}", self.collection_name)
         else:
@@ -78,58 +73,56 @@ class QdrantStore:
         except Exception as e:
             logger.error("Failed to initialize Qdrant: {}", str(e))
             raise VectorStoreError(
-                "Failed to initialize Qdrant",
-                details={"error": str(e)}
+                "Failed to initialize Qdrant", details={"error": str(e)}
             )
-    
+
     async def _ensure_collection_exists(self) -> None:
         """Create collection if it doesn't exist. Used when client already exists (e.g. after lazy init)."""
         try:
             collections = self.client.get_collections().collections
             collection_names = [col.name for col in collections]
-            
+
             if self.collection_name not in collection_names:
                 logger.info("Creating collection: {}", self.collection_name)
-                
+
                 self.client.create_collection(
                     collection_name=self.collection_name,
                     vectors_config=VectorParams(
-                        size=self.vector_size,
-                        distance=Distance.COSINE
-                    )
+                        size=self.vector_size, distance=Distance.COSINE
+                    ),
                 )
-                
+
                 logger.success("Collection created: {}", self.collection_name)
             else:
                 logger.debug("Collection already exists: {}", self.collection_name)
-                
+
         except Exception as e:
             logger.error("Failed to ensure collection exists: {}", str(e))
             raise
-    
+
     async def add_document(
         self,
         workspace_id: str,
         document_id: str,
         content: str,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Add a document to the vector store.
-        
+
         Args:
             workspace_id: Workspace identifier
             document_id: Document identifier
             content: Document content
             metadata: Optional metadata
-            
+
         Returns:
             Point ID in vector store
         """
         try:
             # Generate embedding (placeholder - will implement with actual embedding model)
             embedding = await self._generate_embedding(content)
-            
+
             # Create point (original_document_id for filtering: chunks use same doc id)
             point_id = str(uuid4())
             meta = metadata or {}
@@ -141,28 +134,24 @@ class QdrantStore:
                 "original_document_id": meta.get("original_document_id", document_id),
                 "uploaded_at": meta.get("uploaded_at"),
             }
-            
-            point = PointStruct(
-                id=point_id,
-                vector=embedding,
-                payload=payload
-            )
-            
+
+            point = PointStruct(id=point_id, vector=embedding, payload=payload)
+
             # Upsert point (run in thread so event loop is not blocked)
             await asyncio.to_thread(
                 self.client.upsert,
                 collection_name=self.collection_name,
                 points=[point],
             )
-            
+
             logger.debug(
                 "Added document to vector store: {} (workspace: {})",
                 document_id,
-                workspace_id
+                workspace_id,
             )
-            
+
             return point_id
-            
+
         except Exception as e:
             logger.error("Failed to add document: {}", str(e))
             raise VectorStoreError(
@@ -170,41 +159,37 @@ class QdrantStore:
                 details={
                     "workspace_id": workspace_id,
                     "document_id": document_id,
-                    "error": str(e)
-                }
+                    "error": str(e),
+                },
             )
-    
+
     async def search(
-        self,
-        workspace_id: str,
-        query: str,
-        limit: int = 5
+        self, workspace_id: str, query: str, limit: int = 5
     ) -> List[Dict[str, Any]]:
         """
         Search for similar documents in a workspace.
-        
+
         Args:
             workspace_id: Workspace identifier
             query: Search query
             limit: Maximum number of results
-            
+
         Returns:
             List of search results
         """
         try:
             # Generate query embedding
             query_embedding = await self._generate_embedding(query)
-            
+
             # Create filter for workspace
             workspace_filter = Filter(
                 must=[
                     FieldCondition(
-                        key="workspace_id",
-                        match=MatchValue(value=workspace_id)
+                        key="workspace_id", match=MatchValue(value=workspace_id)
                     )
                 ]
             )
-            
+
             # Search (run in thread so event loop is not blocked)
             results = await asyncio.to_thread(
                 self.client.search,
@@ -213,33 +198,34 @@ class QdrantStore:
                 query_filter=workspace_filter,
                 limit=limit,
             )
-            
+
             # Format results
             formatted_results = []
             for result in results:
-                formatted_results.append({
-                    "id": result.id,
-                    "score": result.score,
-                    "content": result.payload.get("content"),
-                    "metadata": result.payload.get("metadata", {}),
-                    "document_id": result.payload.get("document_id")
-                })
-            
+                formatted_results.append(
+                    {
+                        "id": result.id,
+                        "score": result.score,
+                        "content": result.payload.get("content"),
+                        "metadata": result.payload.get("metadata", {}),
+                        "document_id": result.payload.get("document_id"),
+                    }
+                )
+
             logger.debug(
                 "Found {} results for query in workspace {}",
                 len(formatted_results),
-                workspace_id
+                workspace_id,
             )
-            
+
             return formatted_results
-            
+
         except Exception as e:
             logger.error("Search failed: {}", str(e))
             raise VectorStoreError(
-                "Search failed",
-                details={"workspace_id": workspace_id, "error": str(e)}
+                "Search failed", details={"workspace_id": workspace_id, "error": str(e)}
             )
-    
+
     def _get_all_documents_sync(
         self,
         workspace_id: str,
@@ -248,10 +234,7 @@ class QdrantStore:
         """Sync scroll + combine; run via to_thread to avoid blocking the event loop."""
         workspace_filter = Filter(
             must=[
-                FieldCondition(
-                    key="workspace_id",
-                    match=MatchValue(value=workspace_id)
-                )
+                FieldCondition(key="workspace_id", match=MatchValue(value=workspace_id))
             ]
         )
         seen_point_ids = set()
@@ -274,11 +257,15 @@ class QdrantStore:
                 content = (payload.get("content") or "").strip()
                 if not content or len(content) < 20:
                     continue
-                orig_id = payload.get("original_document_id") or payload.get("document_id")
+                orig_id = payload.get("original_document_id") or payload.get(
+                    "document_id"
+                )
                 uploaded_at = payload.get("uploaded_at") or ""
                 meta = payload.get("metadata") or {}
                 if not orig_id:
-                    orig_id = meta.get("original_document_id") or payload.get("document_id")
+                    orig_id = meta.get("original_document_id") or payload.get(
+                        "document_id"
+                    )
                 if orig_id not in doc_chunks:
                     doc_chunks[orig_id] = []
                 doc_chunks[orig_id].append((uploaded_at, content))
@@ -290,11 +277,13 @@ class QdrantStore:
             chunks_sorted = sorted(chunks, key=lambda x: (x[0] or "", x[1]))
             combined = " ".join(c for _, c in chunks_sorted)
             uploaded_at = chunks_sorted[0][0] if chunks_sorted else ""
-            out.append({
-                "document_id": doc_id,
-                "content": combined,
-                "uploaded_at": uploaded_at,
-            })
+            out.append(
+                {
+                    "document_id": doc_id,
+                    "content": combined,
+                    "uploaded_at": uploaded_at,
+                }
+            )
         out.sort(key=lambda x: (x["uploaded_at"] or "", x["document_id"]))
         return out
 
@@ -332,7 +321,7 @@ class QdrantStore:
             logger.error("get_all_documents failed: {}", str(e))
             raise VectorStoreError(
                 "get_all_documents failed",
-                details={"workspace_id": workspace_id, "error": str(e)}
+                details={"workspace_id": workspace_id, "error": str(e)},
             )
 
     async def delete_documents(
@@ -358,12 +347,10 @@ class QdrantStore:
             delete_filter = Filter(
                 must=[
                     FieldCondition(
-                        key="workspace_id",
-                        match=MatchValue(value=workspace_id)
+                        key="workspace_id", match=MatchValue(value=workspace_id)
                     ),
                     FieldCondition(
-                        key="original_document_id",
-                        match=MatchAny(any=document_ids)
+                        key="original_document_id", match=MatchAny(any=document_ids)
                     ),
                 ]
             )
@@ -382,16 +369,20 @@ class QdrantStore:
             logger.error("Failed to delete documents: {}", str(e))
             raise VectorStoreError(
                 "Failed to delete documents",
-                details={"workspace_id": workspace_id, "document_ids": document_ids, "error": str(e)}
+                details={
+                    "workspace_id": workspace_id,
+                    "document_ids": document_ids,
+                    "error": str(e),
+                },
             )
 
     async def delete_workspace(self, workspace_id: str) -> bool:
         """
         Delete all documents for a workspace.
-        
+
         Args:
             workspace_id: Workspace identifier
-            
+
         Returns:
             True if successful
         """
@@ -400,51 +391,48 @@ class QdrantStore:
             workspace_filter = Filter(
                 must=[
                     FieldCondition(
-                        key="workspace_id",
-                        match=MatchValue(value=workspace_id)
+                        key="workspace_id", match=MatchValue(value=workspace_id)
                     )
                 ]
             )
-            
+
             # Delete points (run in thread so event loop is not blocked)
             await asyncio.to_thread(
                 self.client.delete,
                 collection_name=self.collection_name,
-                points_selector=models.FilterSelector(
-                    filter=workspace_filter
-                ),
+                points_selector=models.FilterSelector(filter=workspace_filter),
             )
-            
+
             logger.info("Deleted all documents for workspace: {}", workspace_id)
             return True
-            
+
         except Exception as e:
             logger.error("Failed to delete workspace documents: {}", str(e))
             raise VectorStoreError(
                 "Failed to delete workspace documents",
-                details={"workspace_id": workspace_id, "error": str(e)}
+                details={"workspace_id": workspace_id, "error": str(e)},
             )
-    
+
     async def _generate_embedding(self, text: str) -> List[float]:
         """
         Generate embedding for text using Google Gemini.
-        
+
         Args:
             text: Text to embed
-            
+
         Returns:
             Embedding vector (768 dimensions for Google embeddings)
         """
         try:
             from app.ai.gemini_client import gemini_client
-            
+
             # Initialize if needed
             if not gemini_client.is_available():
                 gemini_client.initialize()
-            
+
             # Generate embedding with Gemini
             embedding = await gemini_client.embed_text(text)
-            
+
             # Google embeddings are 768 dimensions
             # Pad or truncate to match vector_size if needed
             if len(embedding) < self.vector_size:
@@ -452,17 +440,17 @@ class QdrantStore:
                 embedding.extend([0.0] * (self.vector_size - len(embedding)))
             elif len(embedding) > self.vector_size:
                 # Truncate
-                embedding = embedding[:self.vector_size]
-            
+                embedding = embedding[: self.vector_size]
+
             return embedding
-            
+
         except Exception as e:
             logger.error("Error generating embedding with Gemini: {}", str(e))
-            
+
             # Fallback: Return zero vector
             logger.warning("Using fallback zero vector for embedding")
             return [0.0] * self.vector_size
-    
+
     async def close(self) -> None:
         """Close Qdrant client connection."""
         if self.client:
@@ -470,7 +458,139 @@ class QdrantStore:
             self.client = None
             logger.info("Qdrant client closed")
 
+    async def upsert_workspace_role(
+        self,
+        workspace_id: str,
+        user_id: str,
+        role: str,
+        *,
+        chat_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Persist workspace-role selection in Qdrant so it survives process restarts.
+
+        Writes:
+        - user/workspace default role point
+        - optional chat-specific role point
+        """
+        if self.client is None:
+            await self.initialize()
+        role_upper = (role or "").strip().upper()
+        if role_upper not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+            return False
+
+        def _point_id(scope: str) -> str:
+            return str(uuid5(NAMESPACE_DNS, f"role-cache:{workspace_id}:{user_id}:{scope}"))
+
+        now_iso = datetime.utcnow().isoformat()
+        points: List[PointStruct] = []
+
+        user_payload = {
+            "workspace_id": workspace_id,
+            "document_id": "__workspace_role_cache__",
+            "original_document_id": "__workspace_role_cache__",
+            "content": "",
+            "uploaded_at": now_iso,
+            "cache_kind": "workspace_role_cache",
+            "cache_scope": "user_workspace",
+            "cache_user_id": str(user_id),
+            "cache_chat_id": "__default__",
+            "cache_role": role_upper,
+            "metadata": {
+                "kind": "workspace_role_cache",
+                "scope": "user_workspace",
+                "user_id": str(user_id),
+                "chat_id": "__default__",
+                "role": role_upper,
+                "updated_at": now_iso,
+            },
+        }
+        points.append(
+            PointStruct(id=_point_id("__default__"), vector=[0.0] * self.vector_size, payload=user_payload)
+        )
+
+        if chat_id:
+            chat_payload = {
+                **user_payload,
+                "cache_scope": "chat",
+                "cache_chat_id": str(chat_id),
+                "metadata": {
+                    **user_payload["metadata"],
+                    "scope": "chat",
+                    "chat_id": str(chat_id),
+                },
+            }
+            points.append(
+                PointStruct(
+                    id=_point_id(str(chat_id)),
+                    vector=[0.0] * self.vector_size,
+                    payload=chat_payload,
+                )
+            )
+
+        try:
+            await asyncio.to_thread(
+                self.client.upsert,
+                collection_name=self.collection_name,
+                points=points,
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "Failed to upsert workspace role cache (workspace={}, user={}): {}",
+                workspace_id,
+                user_id,
+                e,
+            )
+            return False
+
+    async def get_workspace_role(
+        self,
+        workspace_id: str,
+        user_id: str,
+        *,
+        chat_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Read workspace role from Qdrant cache (chat-specific first, then user/workspace).
+        """
+        if self.client is None:
+            await self.initialize()
+
+        async def _read(scope_chat_id: str) -> Optional[str]:
+            filt = Filter(
+                must=[
+                    FieldCondition(key="workspace_id", match=MatchValue(value=workspace_id)),
+                    FieldCondition(key="cache_kind", match=MatchValue(value="workspace_role_cache")),
+                    FieldCondition(key="cache_user_id", match=MatchValue(value=str(user_id))),
+                    FieldCondition(key="cache_chat_id", match=MatchValue(value=scope_chat_id)),
+                ]
+            )
+            try:
+                result, _next = await asyncio.to_thread(
+                    self.client.scroll,
+                    collection_name=self.collection_name,
+                    scroll_filter=filt,
+                    limit=1,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            except Exception:
+                return None
+            if not result:
+                return None
+            payload = result[0].payload or {}
+            role = str(payload.get("cache_role") or "").strip().upper()
+            if role in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                return role
+            return None
+
+        if chat_id:
+            role = await _read(str(chat_id))
+            if role:
+                return role
+        return await _read("__default__")
+
 
 # Global vector store instance
 vector_store = QdrantStore()
-

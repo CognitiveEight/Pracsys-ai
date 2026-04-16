@@ -2,41 +2,40 @@
 Readability scoring for documents.
 Calculates how readable and well-structured a document is (0-100%).
 """
-from typing import Dict, Any
+
 import re
+from typing import Any, Dict
+
 from loguru import logger
 
 
 class ReadabilityScorer:
     """
     Calculate readability score for documents.
-    
+
     Score factors:
     - Text extraction success (40%)
     - Content quality (30%)
     - Structure and formatting (20%)
     - Character/encoding quality (10%)
     """
-    
+
     def calculate_score(
-        self,
-        extracted_text: str,
-        metadata: Dict[str, Any],
-        original_size: int
+        self, extracted_text: str, metadata: Dict[str, Any], original_size: int
     ) -> Dict[str, Any]:
         """
         Calculate comprehensive readability score.
-        
+
         Args:
             extracted_text: Extracted text content
             metadata: File metadata
             original_size: Original file size in bytes
-            
+
         Returns:
             Dictionary with score and breakdown
         """
         logger.debug("Calculating readability score...")
-        
+
         # If extraction failed
         if metadata.get("error"):
             return {
@@ -46,26 +45,28 @@ class ReadabilityScorer:
                 "structure_score": 0,
                 "quality_score": 0,
                 "error": metadata["error"],
-                "readable": False
+                "readable": False,
             }
-        
+
         # Normalize text for scoring only.
         # OCR/PDF text can include common mojibake sequences like "youâre" which
         # should not penalize readability.
         normalized_text = self._normalize_text_for_scoring(extracted_text)
 
         # Calculate component scores (on normalized text)
-        extraction_score = self._score_extraction(normalized_text, metadata, original_size)
+        extraction_score = self._score_extraction(
+            normalized_text, metadata, original_size
+        )
         content_score = self._score_content(normalized_text)
         structure_score = self._score_structure(normalized_text, metadata)
         quality_score = self._score_quality(normalized_text)
-        
+
         # Weighted total score
         total_score = (
-            extraction_score * 0.40 +
-            content_score * 0.30 +
-            structure_score * 0.20 +
-            quality_score * 0.10
+            extraction_score * 0.40
+            + content_score * 0.30
+            + structure_score * 0.20
+            + quality_score * 0.10
         )
 
         # Calibration: if the text is clearly usable (long enough, good encoding),
@@ -76,7 +77,7 @@ class ReadabilityScorer:
                 total_score = max(total_score, 90.0)
             elif structure_score >= 25:
                 total_score = max(total_score, 85.0)
-        
+
         result = {
             "total_score": round(total_score, 2),
             "extraction_score": round(extraction_score, 2),
@@ -88,28 +89,23 @@ class ReadabilityScorer:
             "details": {
                 "character_count": len(normalized_text),
                 "word_count": len(normalized_text.split()),
-                "line_count": len(normalized_text.split('\n')),
-                "format": metadata.get("format", "unknown")
-            }
+                "line_count": len(normalized_text.split("\n")),
+                "format": metadata.get("format", "unknown"),
+            },
         }
-        
+
         logger.success(
-            "Readability score: {:.2f}% ({})",
-            result["total_score"],
-            result["rating"]
+            "Readability score: {:.2f}% ({})", result["total_score"], result["rating"]
         )
-        
+
         return result
-    
+
     def _score_extraction(
-        self,
-        text: str,
-        metadata: Dict[str, Any],
-        original_size: int
+        self, text: str, metadata: Dict[str, Any], original_size: int
     ) -> float:
         """
         Score text extraction success (0-100).
-        
+
         Factors:
         - Text was extracted (base 50)
         - Text length vs file size ratio (up to 30)
@@ -117,9 +113,9 @@ class ReadabilityScorer:
         """
         if not text:
             return 0.0
-        
+
         score = 50.0  # Base score for successful extraction
-        
+
         # Text length ratio
         if original_size > 0:
             text_ratio = len(text) / original_size
@@ -130,14 +126,14 @@ class ReadabilityScorer:
                 score += 15
             elif text_ratio > 2.0:
                 score += 20
-        
+
         # Metadata completeness
         important_fields = ["character_count", "word_count", "format"]
         present_fields = sum(1 for field in important_fields if field in metadata)
         score += (present_fields / len(important_fields)) * 20
-        
+
         return min(score, 100.0)
-    
+
     def _normalize_text_for_scoring(self, text: str) -> str:
         """Normalize extracted text for *scoring* heuristics."""
         if not text:
@@ -161,7 +157,7 @@ class ReadabilityScorer:
     def _score_content(self, text: str) -> float:
         """
         Score content quality (0-100).
-        
+
         Factors:
         - Adequate length (up to 40)
         - Sentence structure (up to 30)
@@ -169,11 +165,11 @@ class ReadabilityScorer:
         """
         if not text:
             return 0.0
-        
+
         score = 0.0
         words = text.split()
         word_count = len(words)
-        
+
         # Length scoring
         if word_count >= 100:
             score += 40
@@ -183,26 +179,26 @@ class ReadabilityScorer:
             score += 20
         elif word_count >= 10:
             score += 10
-        
+
         # Sentence structure (presence of punctuation)
-        sentences = re.split(r'[.!?]+', text)
+        sentences = re.split(r"[.!?]+", text)
         if len(sentences) > 1:
             score += 30
         elif len(sentences) > 0 and len(text) > 50:
             score += 15
-        
+
         # Vocabulary diversity (unique words ratio)
         if word_count > 0:
             unique_words = len(set(words))
             diversity_ratio = unique_words / word_count
             score += diversity_ratio * 30
-        
+
         return min(score, 100.0)
-    
+
     def _score_structure(self, text: str, metadata: Dict[str, Any]) -> float:
         """
         Score document structure (0-100).
-        
+
         Factors:
         - Paragraph breaks (up to 40)
         - Headers/sections (up to 30)
@@ -210,12 +206,12 @@ class ReadabilityScorer:
         """
         if not text:
             return 0.0
-        
+
         score = 0.0
-        
+
         # Paragraph breaks (support OCR where paragraphs are separated by
         # multiple newlines, whitespace-only lines, or just a few blank lines).
-        paragraphs = [p for p in re.split(r'\n\s*\n+', text) if p.strip()]
+        paragraphs = [p for p in re.split(r"\n\s*\n+", text) if p.strip()]
         line_count = len(text.splitlines())
 
         if len(paragraphs) > 5:
@@ -235,31 +231,33 @@ class ReadabilityScorer:
             score += 18
         elif line_count >= 10:
             score += 10
-        
+
         # Headers (markdown style or numbered)
-        headers = re.findall(r'^#+\s+.+$|^\d+\.\s+.+$', text, re.MULTILINE)
+        headers = re.findall(r"^#+\s+.+$|^\d+\.\s+.+$", text, re.MULTILINE)
         if len(headers) > 5:
             score += 30
         elif len(headers) > 2:
             score += 20
         elif len(headers) > 0:
             score += 10
-        
+
         # Lists and tables
-        has_lists = bool(re.search(r'^\s*[-*•]\s+', text, re.MULTILINE))
-        has_tables = metadata.get("table_count", 0) > 0 or bool(re.search(r'\|.+\|', text))
-        
+        has_lists = bool(re.search(r"^\s*[-*•]\s+", text, re.MULTILINE))
+        has_tables = metadata.get("table_count", 0) > 0 or bool(
+            re.search(r"\|.+\|", text)
+        )
+
         if has_lists and has_tables:
             score += 30
         elif has_lists or has_tables:
             score += 15
-        
+
         return min(score, 100.0)
-    
+
     def _score_quality(self, text: str) -> float:
         """
         Score character and encoding quality (0-100).
-        
+
         Factors:
         - No encoding errors (40)
         - Reasonable special character ratio (30)
@@ -267,16 +265,16 @@ class ReadabilityScorer:
         """
         if not text:
             return 0.0
-        
+
         score = 0.0
-        
+
         # Encoding quality (no replacement characters)
-        if '�' not in text and '\ufffd' not in text:
+        if "�" not in text and "\ufffd" not in text:
             score += 40
         else:
-            replacement_ratio = (text.count('�') + text.count('\ufffd')) / len(text)
+            replacement_ratio = (text.count("�") + text.count("\ufffd")) / len(text)
             score += 40 * (1 - replacement_ratio)
-        
+
         # Special character ratio
         special_chars = re.findall(r'[^\w\s.,!?;:()\-\'"@#$%&*+=\[\]{}|\\/<>~`]', text)
         if len(text) > 0:
@@ -287,9 +285,9 @@ class ReadabilityScorer:
                 score += 20
             elif special_ratio < 0.20:
                 score += 10
-        
+
         # Whitespace quality (not excessive)
-        lines = text.split('\n')
+        lines = text.split("\n")
         empty_lines = sum(1 for line in lines if not line.strip())
         if len(lines) > 0:
             empty_ratio = empty_lines / len(lines)
@@ -299,9 +297,9 @@ class ReadabilityScorer:
                 score += 20
             elif empty_ratio < 0.7:
                 score += 10
-        
+
         return min(score, 100.0)
-    
+
     def _get_rating(self, score: float) -> str:
         """Get text rating based on score."""
         if score >= 90:
@@ -318,4 +316,3 @@ class ReadabilityScorer:
 
 # Global scorer instance
 readability_scorer = ReadabilityScorer()
-

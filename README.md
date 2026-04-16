@@ -11,6 +11,7 @@ SimplerToday is the **AI engine** that connects to your application backend over
 | **Document intelligence** | Uploaded case files are read, assessed for quality, and stored for search so the AI can refer to what is actually in the record. |
 | **Strategy & objectives** | The system can draft a **case summary**, **strategic objective**, and **possible next steps** from the documents, aligned to the workspace role (e.g. petitioner, respondent). |
 | **Analysis report** | A structured view of **strengths**, **risks**, **missing information**, **score context**, and pointers for improvement. |
+| **Document generation** | AI outputs can be transformed into **structured DOCX/report drafts** for legal review and downstream editing workflows. |
 | **Important dates** | A **timeline / list of dates** derived from the materials where applicable. |
 | **Applicable laws** | Suggestions for **relevant legal frameworks** tied to the matter (for research direction, not as final legal advice). |
 | **Intelligence chat** | A **chat** where lawyers ask follow‑ups (explain a risk, compare options, procedural questions, hypotheticals). Replies aim to be **balanced and accurate**; workspace role mainly affects **panel** drafts, not an automatic advocacy slant in chat. |
@@ -126,7 +127,7 @@ Do not rely on these being in Git — they appear after the first runs.
 | Install deps only | `make install` |
 | First-time setup (venv, deps, `.env` from template, folders) | `make setup` |
 | Run the AI service | `make run` or `python -m app.main` |
-| Smoke test | `make test` |
+| Smoke test | `make test` *(currently expects `test_setup.py`; add tests before relying on this target)* |
 | Start Docker services (e.g. Qdrant) | `make docker-up` |
 | Stop Docker services | `make docker-down` |
 

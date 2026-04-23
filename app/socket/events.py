@@ -5371,6 +5371,30 @@ Rules:
                 max_tokens=12000,
             )
             txt = (txt or "").strip()
+            # Unwrap if the model returned JSON instead of plain text
+            # e.g. {"analysis": "..."} or {"explanation": "..."} or {"qualityScoreExplanation": "..."}
+            if txt.startswith("{"):
+                try:
+                    parsed = _json.loads(txt)
+                    if isinstance(parsed, dict):
+                        txt = (
+                            parsed.get("analysis")
+                            or parsed.get("explanation")
+                            or parsed.get("qualityScoreExplanation")
+                            or parsed.get("quality_score_explanation")
+                            or parsed.get("text")
+                            or next(
+                                (v for v in parsed.values() if isinstance(v, str) and len(v) >= 40),
+                                "",
+                            )
+                        ).strip()
+                except (_json.JSONDecodeError, Exception):
+                    pass
+            # Strip markdown code fences if present
+            if "```" in txt:
+                _fence_match = re.search(r"```(?:\w+)?\s*([\s\S]*?)```", txt)
+                if _fence_match:
+                    txt = _fence_match.group(1).strip()
             if len(txt) >= 40:
                 return txt
         except Exception as e:
@@ -6171,26 +6195,26 @@ Output ONLY valid JSON, no markdown, no code block:
         new_score = min(new_score, max_allowed)
         report["caseResolutionScore"] = new_score
 
-        explanation = (
-            report.get("qualityScoreExplanation")
-            or report.get("quality_score_explanation")
-            or ""
-        ).strip()
-        report_explanation = (
-            report.get("reportQualityScoreExplanation")
-            or report.get("report_quality_score_explanation")
-            or ""
-        ).strip()
-        snippet = rejected_value[:80] + ("..." if len(rejected_value) > 80 else "")
-        feedback_note = (
-            f' User rejected 1 item from {section}: "{snippet}". '
-            f"Score adjusted by +{score_delta} (from {old_score}% to {new_score}%). {delta_reason}"
+        # Regenerate a clean, generic explanation based on the updated report state.
+        # Do NOT mention the rejection, score delta, or any change tracking — lawyers
+        # share this explanation directly with clients.
+        updated_missing = report.get("missingInfo") or report.get("missing_info") or []
+        updated_weaknesses = report.get("weaknesses") or []
+        updated_risks = report.get("risks") or []
+        updated_strengths = report.get("strengths") or []
+
+        fresh_explanation = await self._ensure_quality_score_explanation(
+            workspace_role=workspace_role,
+            case_resolution_score=new_score,
+            missing_info=updated_missing,
+            weaknesses=updated_weaknesses,
+            risks=updated_risks,
+            strengths=updated_strengths,
+            existing="",  # force regeneration so the explanation reflects current state
         )
-        report["qualityScoreExplanation"] = (explanation + feedback_note).strip()
+        report["qualityScoreExplanation"] = fresh_explanation
         report["reportQualityScoreExplanation"] = (
-            self._sanitize_report_quality_score_explanation(
-                report_explanation + feedback_note
-            )
+            self._sanitize_report_quality_score_explanation(fresh_explanation)
         ).strip()
 
         self._workspace_analysis_payload[workspace_id] = report

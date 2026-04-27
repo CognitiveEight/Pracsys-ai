@@ -117,6 +117,60 @@ class GeminiClient:
         return text[start:].strip()
 
     @staticmethod
+    def _safe_extract_text(response: Any) -> str:
+        """Extract text from a Gemini response without ever raising.
+
+        `response.text` raises when the candidate has no Part (e.g. when
+        `finish_reason` is MAX_TOKENS=2, RECITATION=3, SAFETY=4, BLOCKLIST=5).
+        Treat all such "no usable text" cases as an empty string so callers
+        can detect them via `bool(result)` instead of trying to parse an
+        error message that just happens to start with "Error".
+        """
+        if response is None:
+            return ""
+        # Try the fast path; if it raises (no Parts), fall back to candidate scan.
+        try:
+            text = response.text
+            return text or ""
+        except Exception:
+            pass
+
+        try:
+            candidates = list(getattr(response, "candidates", None) or [])
+        except Exception:
+            candidates = []
+
+        # Inspect the first finished candidate for any inline text Parts.
+        chunks: List[str] = []
+        finish_reason: Any = None
+        for cand in candidates:
+            if finish_reason is None:
+                finish_reason = getattr(cand, "finish_reason", None)
+            content = getattr(cand, "content", None)
+            parts = getattr(content, "parts", None) if content is not None else None
+            for part in parts or []:
+                piece = getattr(part, "text", None)
+                if piece:
+                    chunks.append(str(piece))
+            if chunks:
+                break
+
+        if chunks:
+            return "".join(chunks)
+
+        # No text recovered. Log finish reason at debug level so prod logs do
+        # not get spammed with the same "finish_reason is 2" stack trace, but
+        # operators can still inspect what happened when needed.
+        try:
+            fr_repr = getattr(finish_reason, "name", None) or str(finish_reason)
+        except Exception:
+            fr_repr = "unknown"
+        logger.debug(
+            "Gemini returned no usable text (finish_reason={})", fr_repr
+        )
+        return ""
+
+    @staticmethod
     def _coerce_valid_json_text(raw: str) -> Optional[str]:
         text = (raw or "").strip()
         if not text:
@@ -189,7 +243,7 @@ class GeminiClient:
                 )
 
             response = await asyncio.to_thread(_sync_generate)
-            result = response.text
+            result = self._safe_extract_text(response)
 
             # Global guardrail: when caller requests JSON mode, ensure we return valid JSON.
             # If first pass is malformed, ask Gemini to repair the payload only.
@@ -219,7 +273,7 @@ class GeminiClient:
                             )
 
                         repair_response = await asyncio.to_thread(_sync_repair)
-                        repaired_text = repair_response.text
+                        repaired_text = self._safe_extract_text(repair_response)
                         valid = self._coerce_valid_json_text(repaired_text)
                         if valid is not None:
                             logger.info(
@@ -304,7 +358,7 @@ class GeminiClient:
 
             response = await asyncio.to_thread(_sync_chat)
 
-            result = response.text
+            result = self._safe_extract_text(response)
 
             logger.success("✅ Chat response: {} characters", len(result))
             return result

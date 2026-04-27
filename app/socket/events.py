@@ -47,8 +47,12 @@ from app.socket.schemas import (
 )
 from app.utils.exceptions import SocketEventError
 from app.workspace.custom_instructions import (build_custom_instruction_suffix,
+                                               hydrate_custom_instructions_from_cache,
                                                set_custom_instructions)
 from app.workspace.manager import workspace_manager
+from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
+                                       hydrate_workspace_state, persist_state,
+                                       restore_state)
 from agent import process_analysis_docx_request
 
 EventHandler = Callable[[Dict[str, Any]], Awaitable[None]]
@@ -237,14 +241,18 @@ class SocketEventHandler:
     def __init__(self):
         self._handlers: Dict[str, EventHandler] = {}
         self._socket_client = None  # Will be set by main service
+        # NOTE: every per-workspace cache below is a PersistentWorkspaceDict so
+        # that writes (`self._workspace_X[workspace_id] = ...`) are mirrored to
+        # Qdrant in the background. After an AI service restart we hydrate the
+        # cache by reading these same kinds back via `restore_state`.
         self._workspace_suggestion_chips: Dict[str, List[str]] = (
-            {}
+            PersistentWorkspaceDict("strategy_suggestion_chips")
         )  # workspace_id -> 15-16 strategy chips
         self._workspace_analysis_suggestion_chips: Dict[str, List[str]] = (
-            {}
+            PersistentWorkspaceDict("analysis_suggestion_chips")
         )  # workspace_id -> 15-16 analysis-report chips
         self._workspace_chat_suggestion_chips: Dict[str, List[str]] = (
-            {}
+            PersistentWorkspaceDict("chat_suggestion_chips")
         )  # workspace_id -> 10-12 contextual chips (refreshed per AI reply; we return random 4 on each request)
         self._last_workspace_id_with_chips: Optional[str] = (
             None  # fallback when request workspace has no chips
@@ -259,16 +267,30 @@ class SocketEventHandler:
         # - strategy_objective: detailed strategy/opinion
         # - analysis_report: score + strengths/weaknesses
         # - list_of_dates: timeline extracted from documents
-        self._workspace_document_assessments_payload: Dict[str, Any] = {}
-        self._workspace_metadata_payload: Dict[str, Any] = {}
-        self._workspace_strategy_payload: Dict[str, Any] = {}
-        self._workspace_analysis_payload: Dict[str, Any] = {}
+        self._workspace_document_assessments_payload: Dict[str, Any] = (
+            PersistentWorkspaceDict(CacheKinds.DOCUMENT_ASSESSMENTS)
+        )
+        self._workspace_metadata_payload: Dict[str, Any] = PersistentWorkspaceDict(
+            CacheKinds.WORKSPACE_METADATA_PAYLOAD
+        )
+        self._workspace_strategy_payload: Dict[str, Any] = PersistentWorkspaceDict(
+            CacheKinds.STRATEGY_PAYLOAD
+        )
+        self._workspace_analysis_payload: Dict[str, Any] = PersistentWorkspaceDict(
+            CacheKinds.ANALYSIS_REPORT
+        )
         # List of Dates timeline per workspace (chronological events from case documents)
-        self._workspace_list_of_dates_payload: Dict[str, List[Dict[str, Any]]] = {}
+        self._workspace_list_of_dates_payload: Dict[str, List[Dict[str, Any]]] = (
+            PersistentWorkspaceDict(CacheKinds.LIST_OF_DATES)
+        )
         # Applicable laws payload per workspace (acts/sections inferred from docs + case law search)
-        self._workspace_applicable_laws_payload: Dict[str, Dict[str, Any]] = {}
+        self._workspace_applicable_laws_payload: Dict[str, Dict[str, Any]] = (
+            PersistentWorkspaceDict(CacheKinds.APPLICABLE_LAWS)
+        )
         # Procedural timeline payload per workspace (upcoming filing/hearing/compliance/evidence/adjournment dates)
-        self._workspace_procedural_timeline_payload: Dict[str, List[Dict[str, Any]]] = {}
+        self._workspace_procedural_timeline_payload: Dict[
+            str, List[Dict[str, Any]]
+        ] = PersistentWorkspaceDict(CacheKinds.PROCEDURAL_TIMELINE)
         # Re-emit after reconnect when socket dropped right after analysis report (so backend gets the update)
         self._had_disconnect: bool = False
         self._pending_reemit_workspace_id: Optional[str] = None
@@ -293,6 +315,119 @@ class SocketEventHandler:
         # from older pipelines so FE receives only the fresh objective-aligned report.
         self._suppress_analysis_emit_until_ts: Dict[str, float] = {}
         self._register_default_handlers()
+
+    async def _hydrate_workspace_caches(
+        self,
+        workspace_id: str,
+        *,
+        user_id: Optional[str] = None,
+    ) -> None:
+        """Repopulate in-memory per-workspace caches from Qdrant.
+
+        Runs at the start of chat and document-feature handlers so that an AI
+        service restart does not silently degrade chat with empty annexures,
+        missing analysis report and missing applicable laws. No-ops when the
+        in-memory cache already has data for this workspace (the live process
+        is the source of truth).
+        """
+        if not workspace_id:
+            return
+        try:
+            # Workspace context (title, status, role, evidence files, metadata)
+            from app.workspace.context import context_manager
+
+            existing_ctx = context_manager.get_context(workspace_id)
+            need_meta_hydration = (
+                existing_ctx is None
+                or not (existing_ctx.evidence_files or [])
+                or not existing_ctx.metadata
+            )
+        except Exception:
+            existing_ctx = None
+            need_meta_hydration = True
+
+        # Skip work entirely when every cache we care about is already warm.
+        all_warm = (
+            not need_meta_hydration
+            and bool(self._workspace_analysis_payload.get(workspace_id))
+            and bool(self._workspace_applicable_laws_payload.get(workspace_id))
+            and bool(self._workspace_procedural_timeline_payload.get(workspace_id))
+        )
+        if all_warm:
+            return
+
+        try:
+            cached_kinds = await hydrate_workspace_state(workspace_id)
+        except Exception as e:  # pragma: no cover - best-effort
+            logger.debug(
+                "Workspace cache hydration failed (workspace={}): {}",
+                workspace_id,
+                e,
+            )
+            cached_kinds = {}
+
+        if not cached_kinds:
+            return
+
+        meta_payload = cached_kinds.get(CacheKinds.WORKSPACE_META)
+        if isinstance(meta_payload, dict):
+            try:
+                from app.workspace.context import context_manager
+
+                if existing_ctx is not None:
+                    existing_ctx.apply_cache_dict(meta_payload)
+                else:
+                    await context_manager.hydrate_context_from_cache(
+                        workspace_id=workspace_id, user_id=user_id
+                    )
+            except Exception as e:
+                logger.debug(
+                    "Workspace context hydration failed (workspace={}): {}",
+                    workspace_id,
+                    e,
+                )
+
+        # Hydrate per-kind in-memory dicts only when nothing is in memory yet.
+        kind_to_dict = {
+            CacheKinds.ANALYSIS_REPORT: self._workspace_analysis_payload,
+            CacheKinds.APPLICABLE_LAWS: self._workspace_applicable_laws_payload,
+            CacheKinds.PROCEDURAL_TIMELINE: self._workspace_procedural_timeline_payload,
+            CacheKinds.LIST_OF_DATES: self._workspace_list_of_dates_payload,
+            CacheKinds.WORKSPACE_METADATA_PAYLOAD: self._workspace_metadata_payload,
+            CacheKinds.DOCUMENT_ASSESSMENTS: self._workspace_document_assessments_payload,
+            CacheKinds.STRATEGY_PAYLOAD: self._workspace_strategy_payload,
+        }
+        for kind, target in kind_to_dict.items():
+            payload = cached_kinds.get(kind)
+            if payload is None:
+                continue
+            if target.get(workspace_id):
+                continue
+            try:
+                if isinstance(target, PersistentWorkspaceDict):
+                    target.hydrate_from_cache(workspace_id, payload)
+                else:
+                    target[workspace_id] = payload
+            except Exception as e:
+                logger.debug(
+                    "Cache rehydration skipped (kind={}, workspace={}): {}",
+                    kind,
+                    workspace_id,
+                    e,
+                )
+
+        ci_payload = cached_kinds.get(CacheKinds.CUSTOM_INSTRUCTIONS)
+        if isinstance(ci_payload, dict):
+            try:
+                hydrate_custom_instructions_from_cache(workspace_id, ci_payload)
+            except Exception:
+                pass
+
+        logger.info(
+            "Hydrated workspace caches from Qdrant: {} (kinds={})",
+            workspace_id,
+            sorted(cached_kinds.keys()),
+        )
 
     async def _remember_workspace_role(
         self,
@@ -1642,13 +1777,26 @@ User message:
 
 Assistant reply (for context, first 1200 chars):
 {ar[:1200]}"""
+            # max_tokens is generous because gemini-3-flash-preview counts
+            # internal "thinking" tokens against the same budget; 120 was too
+            # small and the response was returning with finish_reason=MAX_TOKENS
+            # (no Part), which produced a non-JSON error string for callers.
             raw = await gemini_client.generate(
                 prompt=prompt,
                 temperature=0.0,
-                max_tokens=120,
+                max_tokens=512,
                 response_mime_type="application/json",
             )
-            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            raw_text = (raw or "").strip()
+            # gemini_client now returns "" when the candidate had no Part and
+            # the legacy code returned an "Error generating response: …" string.
+            # Treat both as "no offer" without spamming WARN logs.
+            if not raw_text or raw_text.lower().startswith("error generating"):
+                logger.debug(
+                    "Objective-offer classifier got empty/error response; treating as no-offer"
+                )
+                return False
+            json_str = self._prepare_json_candidate(raw_text, prefer="object")
             if not json_str:
                 return False
             data = json.loads(json_str)
@@ -9650,6 +9798,12 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
             workspace_id = payload.workspaceId or "unknown"
             user_id = payload.userId or "unknown"
             chat_id = payload.chatId or f"chat_{datetime.utcnow().timestamp()}"
+
+            # Repopulate in-memory caches from Qdrant when the AI service was
+            # restarted between the original workspace_sync and this message.
+            # No-op if the cache is already warm or workspace_id is missing.
+            if workspace_id and workspace_id != "unknown":
+                await self._hydrate_workspace_caches(workspace_id, user_id=user_id)
 
             role_context = {
                 "role": "ADJUDICATOR",

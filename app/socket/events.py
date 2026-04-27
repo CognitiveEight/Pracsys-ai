@@ -580,6 +580,10 @@ class SocketEventHandler:
         self.register("probing_prompts_request", self.on_probing_prompts_request)
         self.register("analysis_report_feedback", self.on_analysis_report_feedback)
         self.register(
+            "added_missing_information",
+            self.on_added_missing_information,
+        )
+        self.register(
             "applicable_law_relevance_request",
             self.on_applicable_law_relevance_request,
         )
@@ -5995,6 +5999,8 @@ Rules:
 
     # Fallback score bump when AI-based delta is unavailable
     _ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT = 4
+    # Fallback score drop when AI-based delta is unavailable for added_missing_information
+    _ADDED_MISSING_INFO_SCORE_DROP_DEFAULT = 3
     # Max score when Missing Information / Risks / Weaknesses still have items (100% only when all are empty)
     _ANALYSIS_REPORT_MAX_SCORE_WITH_PENDING_ITEMS = 95
 
@@ -7004,6 +7010,336 @@ Output ONLY valid JSON, no markdown, no code block:
         else:
             logger.warning(
                 "analysis_report_feedback: no socket client – report updated in cache only"
+            )
+
+    async def _compute_added_missing_info_score_delta(
+        self,
+        current_score: int,
+        title: str,
+        description: str,
+        report: Dict[str, Any],
+    ) -> Tuple[bool, int, str]:
+        """
+        Ask AI to (a) decide if user-supplied title+description is RELATED to the case
+        and (b) compute a score DECREASE (1-5) when related. The system will SUBTRACT
+        the returned delta from the current case resolution score.
+
+        Returns (is_related, decrease, reason). On failure returns
+        (False, 0, "") so the caller can no-op safely.
+        """
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            gemini_client.initialize()
+            if not gemini_client.model:
+                logger.warning(
+                    "added_missing_information: Gemini unavailable; assuming not related"
+                )
+                return (False, 0, "")
+
+            case_summary = (
+                report.get("caseSummary") or report.get("case_summary") or ""
+            ).strip()
+            report_summary = (
+                report.get("reportCaseSummary")
+                or report.get("report_case_summary")
+                or ""
+            ).strip()
+            strategic_objective = (
+                report.get("strategicObjective")
+                or report.get("strategic_objective")
+                or ""
+            ).strip()
+
+            def _flatten(items: Any, limit: int = 6) -> List[str]:
+                out: List[str] = []
+                if not isinstance(items, list):
+                    return out
+                for x in items[:limit]:
+                    if isinstance(x, dict):
+                        t = x.get("point") or x.get("text") or ""
+                    else:
+                        t = x
+                    if isinstance(t, str) and t.strip():
+                        out.append(t.strip()[:200])
+                return out
+
+            missing_items = _flatten(
+                report.get("missingInfo") or report.get("missing_info") or [],
+                limit=8,
+            )
+            weakness_items = _flatten(report.get("weaknesses") or [], limit=6)
+            risk_items = _flatten(report.get("risks") or [], limit=6)
+
+            missing_block = (
+                "\n".join(f"- {x}" for x in missing_items) if missing_items else "- (none)"
+            )
+            weakness_block = (
+                "\n".join(f"- {x}" for x in weakness_items)
+                if weakness_items
+                else "- (none)"
+            )
+            risk_block = (
+                "\n".join(f"- {x}" for x in risk_items) if risk_items else "- (none)"
+            )
+
+            safe_title = (title or "").strip()[:300]
+            safe_description = (description or "").strip()[:1500]
+
+            prompt = f"""You are a legal case analyst. The user manually supplied additional information to address previously-flagged "missing information" items in their analysis report. Two decisions are required:
+
+1) Is the user-supplied text RELATED to this specific case? Use the case summary, missing info, weaknesses, and risks below as ground truth. Generic, off-topic, gibberish, or unrelated text → isRelated=false.
+2) If RELATED, choose an integer scoreDecrease between 1 and 5. The system will SUBTRACT this from the current score because the user has just confirmed a real gap existed and the new context may surface additional risks/weaknesses.
+
+**Current case resolution score**: {current_score}%
+
+**Case summary**: {case_summary[:800] or "(not available)"}
+**Report-facing summary**: {report_summary[:600] or "(not available)"}
+**Strategic objective**: {strategic_objective[:400] or "(not available)"}
+
+**Existing missingInfo items**:
+{missing_block}
+
+**Existing weaknesses**:
+{weakness_block}
+
+**Existing risks**:
+{risk_block}
+
+**User-supplied title**: "{safe_title}"
+**User-supplied description**: "{safe_description}"
+
+IMPACT RULES (only when isRelated=true):
+- Minor / vague clarification that lightly touches one missing item: scoreDecrease = 1
+- Moderate, on-topic information that addresses one missing item but introduces small new uncertainty: scoreDecrease = 2-3
+- Highly relevant information that exposes additional gaps, factual weaknesses, or procedural risks: scoreDecrease = 4-5
+
+When isRelated=false set scoreDecrease=0 and reason explains briefly why it is off-topic.
+
+Output ONLY valid JSON, no markdown, no code block:
+{{"isRelated": <true|false>, "scoreDecrease": <integer 0-5>, "reason": "<one short sentence>"}}
+"""
+
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                system_instruction=get_structured_document_feature_system_instruction(
+                    None
+                ),
+                temperature=0.3,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+            raw = (raw or "").strip()
+            if not raw or raw.startswith("Error") or "Error generating" in raw[:50]:
+                logger.warning(
+                    "added_missing_information score delta: empty/error response; treating as not related. raw={}",
+                    (raw or "")[:120],
+                )
+                return (False, 0, "")
+
+            if "```" in raw:
+                fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
+                if fence_match:
+                    raw = fence_match.group(1).strip()
+                else:
+                    raw = re.sub(r"^```\w*\s*", "", raw)
+                    raw = re.sub(r"\s*```\s*$", "", raw)
+
+            obj: Optional[Dict[str, Any]] = None
+            start = raw.find("{")
+            if start >= 0:
+                depth = 0
+                for i in range(start, len(raw)):
+                    if raw[i] == "{":
+                        depth += 1
+                    elif raw[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                obj = json.loads(raw[start : i + 1])
+                            except json.JSONDecodeError:
+                                obj = None
+                            break
+
+            if not (obj and isinstance(obj, dict)):
+                logger.warning(
+                    "added_missing_information score delta: could not parse JSON; treating as not related. raw={}",
+                    raw[:200],
+                )
+                return (False, 0, "")
+
+            is_related_raw = obj.get("isRelated")
+            if isinstance(is_related_raw, str):
+                is_related = is_related_raw.strip().lower() in ("true", "yes", "1")
+            else:
+                is_related = bool(is_related_raw)
+
+            try:
+                delta = int(
+                    obj.get("scoreDecrease") or obj.get("score_decrease") or 0
+                )
+            except (TypeError, ValueError):
+                delta = 0
+            delta = max(0, min(5, delta))
+            reason = (obj.get("reason") or "").strip()[:200]
+
+            if not is_related:
+                logger.info(
+                    "added_missing_information: AI judged not related (reason={})",
+                    reason or "(no reason)",
+                )
+                return (False, 0, reason)
+
+            if delta < 1:
+                # Related but no magnitude provided → fall back to default drop so the score actually moves.
+                delta = self._ADDED_MISSING_INFO_SCORE_DROP_DEFAULT
+
+            logger.info(
+                "added_missing_information score delta: AI delta=-{}, reason={}",
+                delta,
+                reason or "(no reason)",
+            )
+            return (True, delta, reason or "Score adjusted to reflect newly disclosed information.")
+        except Exception as e:
+            logger.warning(
+                "added_missing_information score delta failed: {}; treating as not related",
+                e,
+            )
+            return (False, 0, "")
+
+    async def on_added_missing_information(self, data: Dict[str, Any]) -> None:
+        """
+        Handle added_missing_information: user manually supplies title+description
+        to address previously-flagged missing information.
+
+        - If the user-supplied text is RELATED to the case (per AI judgement), the
+          caseResolutionScore is DECREASED, qualityScoreExplanation is freshly
+          regenerated, and the analysis report is re-emitted.
+        - If the text is NOT related, no changes are made and nothing is re-emitted.
+        - The missingInfo list is never modified by this event (the user is
+          providing context, not curating items).
+        """
+        import copy
+
+        payload = data if isinstance(data, dict) else {}
+        workspace_id = (
+            payload.get("workspaceId") or payload.get("workspace_id") or ""
+        ).strip()
+        user_id = (payload.get("userId") or payload.get("user_id") or "").strip()
+        workspace_role = (
+            payload.get("workspaceRole") or payload.get("workspace_role") or ""
+        )
+        title = (payload.get("title") or "").strip()
+        description = (payload.get("description") or "").strip()
+
+        if not workspace_id:
+            logger.warning(
+                "added_missing_information: missing workspaceId – ignoring"
+            )
+            return
+        if not title and not description:
+            logger.warning(
+                "added_missing_information: both title and description are empty – ignoring (workspace={})",
+                workspace_id,
+            )
+            return
+
+        # Repopulate in-memory caches from Qdrant when AI service was restarted
+        # between the original analysis_report emit and this event.
+        try:
+            await self._hydrate_workspace_caches(workspace_id, user_id=user_id)
+        except Exception as e:  # pragma: no cover - best-effort hydration
+            logger.debug(
+                "added_missing_information: hydration failed for workspace {}: {}",
+                workspace_id,
+                e,
+            )
+
+        current = self._workspace_analysis_payload.get(workspace_id)
+        if not current:
+            logger.warning(
+                "added_missing_information: no cached analysis report for workspace {} – cannot apply update",
+                workspace_id,
+            )
+            return
+
+        report = copy.deepcopy(current)
+        old_score = int(
+            report.get("caseResolutionScore")
+            or report.get("case_resolution_score")
+            or 0
+        )
+
+        is_related, score_delta, _delta_reason = (
+            await self._compute_added_missing_info_score_delta(
+                current_score=old_score,
+                title=title,
+                description=description,
+                report=report,
+            )
+        )
+
+        if not is_related:
+            logger.info(
+                "added_missing_information: input is not related to the case – "
+                "no score change, no re-emit (workspace={})",
+                workspace_id,
+            )
+            return
+
+        # Apply score decrease (clamped at 0). Pending-item cap (95%) is unchanged
+        # because we are not modifying the missing/weakness/risk lists here.
+        new_score = max(0, old_score - score_delta)
+        max_allowed = self._analysis_report_max_allowed_score(report=report)
+        new_score = min(new_score, max_allowed)
+        report["caseResolutionScore"] = new_score
+
+        # Regenerate a clean, generic explanation that reflects the updated state.
+        # Lawyers share this with clients, so do NOT mention deltas or that the
+        # user manually added information.
+        updated_missing = (
+            report.get("missingInfo") or report.get("missing_info") or []
+        )
+        updated_weaknesses = report.get("weaknesses") or []
+        updated_risks = report.get("risks") or []
+        updated_strengths = report.get("strengths") or []
+
+        fresh_explanation = await self._ensure_quality_score_explanation(
+            workspace_role=workspace_role,
+            case_resolution_score=new_score,
+            missing_info=updated_missing,
+            weaknesses=updated_weaknesses,
+            risks=updated_risks,
+            strengths=updated_strengths,
+            existing="",  # force regeneration so the explanation reflects current state
+        )
+        report["qualityScoreExplanation"] = fresh_explanation
+        report["reportQualityScoreExplanation"] = (
+            self._sanitize_report_quality_score_explanation(fresh_explanation)
+        ).strip()
+        report["timestamp"] = datetime.utcnow().isoformat() + "Z"
+
+        self._workspace_analysis_payload[workspace_id] = report
+
+        if self._socket_client:
+            await self._socket_client.emit(
+                "document_feature_response",
+                {
+                    "featureType": "analysis_report",
+                    "workspaceId": workspace_id,
+                    "userId": user_id,
+                    "payload": report,
+                },
+            )
+            logger.success(
+                "✅ added_missing_information applied: score {}% → {}% (-{}), re-emitted analysis_report",
+                old_score,
+                new_score,
+                score_delta,
+            )
+        else:
+            logger.warning(
+                "added_missing_information: no socket client – report updated in cache only"
             )
 
     def _normalize_manual_law_relevance(self, raw: Optional[str]) -> str:

@@ -1,3 +1,26 @@
+# Release v2.0.1 - 2026-04-23
+
+This is a hotfix release (`v2.0.1`) on top of `v2.0.0`, addressing two targeted bugs reported after the `v2.0.0` rollout: incorrect quality score explanation rendering and noisy/invalid entries in the list-of-dates extraction flow.
+
+## Highlights
+
+- Quality score explanation no longer leaks internal rejection tracking notes to clients — the explanation is now fully regenerated from current workspace state on each score update.
+- List-of-dates extraction is significantly more precise: garbage UI-scraped content, placeholder dates, and irrelevant citation years are now filtered out before results are emitted.
+
+## Bug Fixes
+
+- Fixed quality score explanation returning raw JSON or markdown code fences from the AI model instead of plain readable text.
+- Fixed quality score explanation incorrectly appending internal rejection/score-delta notes that were visible to end clients; explanation is now cleanly regenerated on item rejection.
+- Fixed list-of-dates agent emitting entries with placeholder or invalid dates (e.g. `1111-11-11`, `9999-99-99`) and UI-scraped garbage content (e.g. "View PDF", "Feedback", "Copyright Policy").
+- Fixed list-of-dates prompt to exclude listing-history table rows, statute citation years, and background biographical dates unrelated to the case.
+- Improved list-of-dates evidence snippet quality — raw document fragments and PDF link lists are no longer accepted as evidence snippets.
+
+## Compatibility Notes
+
+- Drop-in replacement for `v2.0.0`. No schema or contract changes; only behavioral fixes in quality score explanation generation and list-of-dates filtering.
+
+---
+
 # Release v2.0.0 - 2026-04-16
 
 This release upgrades the Law Firm SimplerToday AI service in `v2.0.0` with more stable document analysis, document generation support, stronger workspace synchronization, and safer applicable-laws handling.

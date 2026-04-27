@@ -184,14 +184,14 @@ UNDER SECTION ...", "you are called upon to ...", "within N days from receipt
 of this notice" — you MUST output BOTH of these entries, no matter what else
 you find:
 
-  A. ISSUANCE OF LEGAL NOTICE (type="notice")
+  A. ISSUANCE OF LEGAL NOTICE (type="Other")
      → date = the notice issue date.
      → If the document body has a BLANK placeholder (e.g. "Date: __ March 2026",
        "Date: ____") OR the date field is ambiguous, USE the FILENAME DATE HINT
        above. Indian legal-notice filenames conventionally start with a YY-MM-DD,
        YY MM DD, or YY.MM.DD prefix.
 
-  B. LEGAL NOTICE RESPONSE DEADLINE (type="filing")
+  B. LEGAL NOTICE RESPONSE DEADLINE (type="Deadline")
      → Extract the EXPLICIT deadline date if one is stated (e.g. "close of
        business on 08 April 2026" → 2026-04-08). This is the preferred source.
      → Otherwise compute: deadline = notice_date + response_period (e.g. +15 days).
@@ -201,7 +201,7 @@ you find:
 INCLUDE — dates that belong on the procedural timeline
 ========================================================================
 
-1. PRE-LITIGATION LEGAL MILESTONES (type="milestone"):
+1. PRE-LITIGATION LEGAL MILESTONES (type="Other"):
    Only events that are LEGALLY-SIGNIFICANT TURNING POINTS — not every documented
    interaction. Pick at most 1-2 milestones per event-category.
    Qualifying examples:
@@ -215,27 +215,33 @@ INCLUDE — dates that belong on the procedural timeline
      • Intermediate service records, repair progress updates, diagnosis reports
      • Follow-up emails that merely repeat an earlier grievance
 
-2. NOTICE ISSUANCE (type="notice"):
+2. NOTICE ISSUANCE (type="Other"):
    • Date a legal notice / demand notice / statutory notice was SENT by any party.
    • Title example: "Issuance of Legal Notice".
 
-3. RESPONSE / FILING DEADLINE (type="filing"):
+3. RESPONSE / FILING DEADLINE (type="Deadline"):
    • Compute: response_deadline = notice_date + response_period (e.g. 30 days).
      Example: notice dated 13-03-2026 + 26 days → 2026-04-08.
    • Any court-directed filing deadline (written statement, reply, affidavit).
    • Any "complaint will be filed within X days" window end date.
 
-4. COURT HEARING DATES (type="hearing"):
+4. COURT HEARING DATES (type="Court Hearing"):
    • Any date the matter is listed before a court, tribunal, forum, or authority.
+   • Also use this type for ADJOURNMENT / NEXT DATE entries (next date set when
+     a matter is adjourned).
 
-5. EVIDENCE DEADLINES (type="evidence"):
+5. EVIDENCE DEADLINES (type="Deadline"):
    • Any deadline for submitting documents, witness lists, affidavits of evidence.
 
-6. COMPLIANCE DATES (type="compliance"):
+6. COMPLIANCE DATES (type="Deadline"):
    • Any date by which a party must comply with a court/tribunal order.
 
-7. ADJOURNMENT / NEXT DATE (type="adjournment"):
-   • Any next date set when a matter is adjourned.
+7. ACTUAL COURT FILINGS (type="Filing"):
+   • Past dates on which a petition, complaint, written statement, or reply
+     was actually filed in a court / tribunal / forum.
+
+8. CLIENT MEETINGS / CONSULTATIONS (type="Meeting"):
+   • Scheduled meetings, mediation sessions, or consultations.
 
 ========================================================================
 STRICTLY EXCLUDE — do NOT output any of the following
@@ -280,9 +286,16 @@ Return ONLY a JSON array. Each entry must have exactly these fields:
                         "Next Hearing — Arguments")
   "date"        : YYYY-MM-DD (computed if relative)
   "description" : one sentence ≤ 20 words describing the event/obligation
-  "type"        : exactly one of
-                  "milestone" | "notice" | "filing" | "hearing" |
-                  "evidence" | "compliance" | "adjournment"
+  "type"        : EXACTLY one of these five values (case-sensitive):
+                    "Court Hearing" — court / tribunal hearings, adjournments, next dates
+                    "Deadline"      — any obligation deadline (response, filing, evidence,
+                                       compliance, statutory response window)
+                    "Filing"        — an ACTUAL past filing event in a court / tribunal
+                                       (petition filed, written statement filed, reply filed)
+                    "Meeting"       — scheduled meetings, mediations, consultations
+                    "Other"         — pre-litigation milestones, legal-notice issuance,
+                                       service registrations, formal grievances, anything
+                                       that does not clearly fit the other four buckets
 
 If no qualifying entries exist in this document, return [].
 Output ONLY the JSON array — no markdown fences, no commentary."""
@@ -522,24 +535,27 @@ TASK — produce the CLEAN legal timeline by:
        • intermediate repair/diagnosis updates
        • warranty/delivery/purchase events
   3. PRESERVING every unique legal-journey event:
-       • First service registration / first formal complaint
-       • First formal grievance / demand letter
-       • Legal notice issuance (type="notice")
-       • Response / filing deadlines (type="filing")
-       • Court hearings, evidence deadlines, compliance, adjournments
-  4. **MANDATORY** — if ANY raw entry is type="notice" or any source-doc name starts
-     with a legal-notice filename prefix (e.g. "YY MM DD Legal Notice..."), the final
-     timeline MUST contain BOTH:
-       (a) an "Issuance of Legal Notice" entry (type="notice") on the notice date.
+       • First service registration / first formal complaint  (type="Other")
+       • First formal grievance / demand letter               (type="Other")
+       • Legal notice issuance                                (type="Other")
+       • Response / filing / compliance / evidence deadlines  (type="Deadline")
+       • Court hearings, adjournments, next-date orders       (type="Court Hearing")
+       • Actual past court filings                            (type="Filing")
+       • Scheduled meetings / consultations                   (type="Meeting")
+  4. **MANDATORY** — if any raw entry concerns a LEGAL NOTICE (title contains
+     "Notice", description mentions a legal/demand/statutory notice), OR any
+     source-doc name starts with a legal-notice filename prefix
+     (e.g. "YY MM DD Legal Notice..."), the final timeline MUST contain BOTH:
+       (a) an "Issuance of Legal Notice" entry (type="Other") on the notice date.
            If the notice date is not explicit in the raw entries, derive it from the
            filename prefix (e.g. "26 03 13 Legal Notice ..." → 2026-03-13).
-       (b) a "Legal Notice Response Deadline" entry (type="filing"). Prefer any
+       (b) a "Legal Notice Response Deadline" entry (type="Deadline"). Prefer any
            explicit deadline mentioned in source descriptions; otherwise compute
            notice_date + 15 days (common Indian statutory period) or + 30 days.
      Do NOT skip these two entries even if no raw entry listed them — infer them.
   5. Keep AT MOST 6-8 entries total. Prioritise events in this order:
-       filing/notice-response deadlines > hearings > notice issuance >
-       first grievance > first service registration > other milestones.
+       response/filing deadlines > court hearings > legal-notice issuance >
+       first formal grievance > first service registration > everything else.
 
 RAW ENTRIES:
 {entries_json}
@@ -549,7 +565,8 @@ first). Each entry:
   "title"       : 3–6 words (concise, authoritative)
   "date"        : YYYY-MM-DD
   "description" : one sentence ≤ 20 words
-  "type"        : one of "milestone" | "notice" | "filing" | "hearing" | "evidence" | "compliance" | "adjournment"
+  "type"        : EXACTLY one of (case-sensitive):
+                    "Court Hearing" | "Deadline" | "Filing" | "Meeting" | "Other"
 
 Output ONLY the JSON array — no markdown fences, no commentary."""
 
@@ -557,7 +574,7 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
             raw = await gemini_client.generate(
                 prompt=prompt,
                 temperature=0.0,
-                max_tokens=4096,
+                max_tokens=8000,
                 response_mime_type="application/json",
             )
         except Exception as exc:
@@ -628,59 +645,90 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
         except ValueError:
             today_dt = datetime.utcnow()
 
-        # Seven canonical types covering the whole legal journey.
+        # Five canonical types — the only values the frontend understands.
+        # Stored as Title Case because that is what the FE renders directly.
         _ALLOWED_TYPES = frozenset(
             {
-                "milestone",     # pre-litigation key event (SRF, grievance, etc.)
-                "notice",        # legal / demand / statutory notice issuance
-                "filing",        # filing deadline or computed notice-response deadline
-                "hearing",       # court / tribunal hearing
-                "evidence",      # evidence submission deadline
-                "compliance",    # compliance with a court order
-                "adjournment",   # adjourned / next date
+                "Court Hearing",  # court / tribunal hearings, adjournments, next dates
+                "Deadline",       # any obligation deadline (response, filing, evidence,
+                                  # compliance, statutory response window)
+                "Filing",         # an actual past filing event in a court / tribunal
+                "Meeting",        # scheduled meetings, mediations, consultations
+                "Other",          # pre-litigation milestones, legal-notice issuance,
+                                  # service registrations, formal grievances, etc.
             }
         )
+        # Map every plausible variant the model might emit (lowercased) → canonical
+        # FE Title Case value. Includes legacy internal names for backward-compat.
         _TYPE_ALIASES: Dict[str, str] = {
-            # hearing
-            "court hearing": "hearing",
-            "hearing date": "hearing",
-            "next date": "hearing",
-            "next hearing": "hearing",
-            # adjournment
-            "adjourned": "adjournment",
-            "adjournment date": "adjournment",
-            "adjourned date": "adjournment",
-            # filing (deadlines)
-            "deadline": "filing",
-            "filing deadline": "filing",
-            "response deadline": "filing",
-            "notice response deadline": "filing",
-            "notice response": "filing",
-            "legal notice deadline": "filing",
-            # evidence
-            "document submission": "evidence",
-            "affidavit submission": "evidence",
-            "evidence submission": "evidence",
-            # compliance
-            "compliance order": "compliance",
-            "court order compliance": "compliance",
-            # milestone (pre-litigation events)
-            "pre-litigation": "milestone",
-            "pre_litigation": "milestone",
-            "event": "milestone",
-            "case event": "milestone",
-            "registration": "milestone",
-            "service registration": "milestone",
-            "grievance": "milestone",
-            "formal grievance": "milestone",
-            "grievance initiated": "milestone",
-            # notice (issuance)
-            "legal notice": "notice",
-            "demand notice": "notice",
-            "notice issuance": "notice",
-            "notice sent": "notice",
-            "issuance": "notice",
-            "statutory notice": "notice",
+            # ----- Court Hearing -----
+            "court hearing": "Court Hearing",
+            "hearing": "Court Hearing",
+            "hearing date": "Court Hearing",
+            "next date": "Court Hearing",
+            "next hearing": "Court Hearing",
+            "adjourned": "Court Hearing",
+            "adjournment": "Court Hearing",
+            "adjournment date": "Court Hearing",
+            "adjourned date": "Court Hearing",
+            "tribunal hearing": "Court Hearing",
+            "court date": "Court Hearing",
+
+            # ----- Deadline -----
+            "deadline": "Deadline",
+            "response deadline": "Deadline",
+            "filing deadline": "Deadline",
+            "notice response": "Deadline",
+            "notice response deadline": "Deadline",
+            "legal notice deadline": "Deadline",
+            "compliance": "Deadline",
+            "compliance deadline": "Deadline",
+            "compliance order": "Deadline",
+            "court order compliance": "Deadline",
+            "evidence": "Deadline",
+            "evidence deadline": "Deadline",
+            "evidence submission": "Deadline",
+            "document submission": "Deadline",
+            "affidavit submission": "Deadline",
+            "due date": "Deadline",
+            "limitation": "Deadline",
+            "limitation deadline": "Deadline",
+
+            # ----- Filing -----
+            "filing": "Filing",
+            "court filing": "Filing",
+            "petition filed": "Filing",
+            "complaint filed": "Filing",
+            "written statement filed": "Filing",
+            "reply filed": "Filing",
+            "filed": "Filing",
+
+            # ----- Meeting -----
+            "meeting": "Meeting",
+            "consultation": "Meeting",
+            "mediation": "Meeting",
+            "client meeting": "Meeting",
+            "conference": "Meeting",
+
+            # ----- Other (catch-all for milestones / notices / pre-litigation) -----
+            "other": "Other",
+            "milestone": "Other",
+            "pre-litigation": "Other",
+            "pre_litigation": "Other",
+            "event": "Other",
+            "case event": "Other",
+            "registration": "Other",
+            "service registration": "Other",
+            "grievance": "Other",
+            "formal grievance": "Other",
+            "grievance initiated": "Other",
+            "notice": "Other",
+            "legal notice": "Other",
+            "demand notice": "Other",
+            "notice issuance": "Other",
+            "notice sent": "Other",
+            "issuance": "Other",
+            "statutory notice": "Other",
         }
 
         result: List[Dict[str, Any]] = []
@@ -719,9 +767,9 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
                 continue
 
             # Sanity-cap: reject dates too far in past / future, UNLESS the entry is
-            # a court-scheduled hearing or adjournment (those can legitimately be far out).
+            # a court-scheduled hearing / adjournment (those can legitimately be far out).
             raw_type_check = (item.get("type") or "").strip().lower()
-            if raw_type_check not in ("hearing", "adjournment"):
+            if raw_type_check not in ("hearing", "adjournment", "court hearing"):
                 days_delta = (parsed_date - today_dt).days
                 if days_delta > 365 * 2:
                     logger.info(
@@ -749,9 +797,20 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
             first_sentence = re.split(r"(?<=[.!?])\s", description)[0]
             description = first_sentence[:150]
 
-            raw_type = (item.get("type") or "").strip().lower()
-            if raw_type not in _ALLOWED_TYPES:
-                raw_type = _TYPE_ALIASES.get(raw_type, "")
+            raw_type_input = (item.get("type") or "").strip()
+            raw_type_lower = raw_type_input.lower()
+            # 1. Direct match (model emitted exact FE Title Case value).
+            if raw_type_input in _ALLOWED_TYPES:
+                raw_type = raw_type_input
+            else:
+                # 2. Alias lookup on lowercased value.
+                raw_type = _TYPE_ALIASES.get(raw_type_lower, "")
+                # 3. Last-resort: if model emitted any of the FE values with weird
+                #    casing (e.g. "court hearing"), recover by Title Case lookup.
+                if not raw_type:
+                    title_cased = " ".join(w.capitalize() for w in raw_type_lower.split())
+                    if title_cased in _ALLOWED_TYPES:
+                        raw_type = title_cased
             if not raw_type:
                 logger.info(
                     "Procedural timeline: ❌ dropped (unrecognised type '{}') "

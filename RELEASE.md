@@ -1,3 +1,32 @@
+# Release v3.0.0 - 2026-04-27
+
+This major release (`v3.0.0`) introduces the new procedural timeline capability and upgrades legal reasoning behavior across agents to consistently evaluate both civil-law and criminal-law branches where facts support both.
+
+## Highlights
+
+- New **Procedural Timeline Agent** builds a cleaner legal-journey timeline (events, filings, hearings, orders) across uploaded case documents.
+- New feature payload **`procedural_timeline`** is emitted via `document_feature_response` and is cached for reconnect-safe re-emission.
+- Strategy, analysis, applicable-laws, and intelligence-chat reasoning now follow a **civil + criminal dual-track** legal lens by default when both branches are live.
+- Prompt and socket behavior updates improve consistency of event typing and cross-module legal framing.
+
+## Features Delivered
+
+- Added `app/langgraph/procedural_timeline_agent.py` with extraction, consolidation, validation, and merge-safe timeline output behavior.
+- Added procedural timeline generation and emission flow in `app/socket/events.py` including scheduling after list-of-dates and applicable-laws.
+- Added prompt support (`app/prompts/applicable_acts.py`) and legal reasoning instructions that reinforce dual-branch Indian-law coverage.
+
+## Quality and Stability Improvements
+
+- Strengthened legal output coherence so criminal and civil implications are handled together where applicable, without forced artificial balancing where only one branch is relevant.
+- Improved downstream feature consistency via event type normalization and structured timeline payload handling.
+
+## Compatibility Notes
+
+- This is a **major release** because legal reasoning behavior is expanded across strategy/report/chat surfaces and a new `procedural_timeline` feature type is now part of emitted capabilities.
+- Ensure backend/frontend consumers that maintain feature allow-lists include `procedural_timeline` in accepted feature types.
+
+---
+
 # Release v2.0.1 - 2026-04-23
 
 This is a hotfix release (`v2.0.1`) on top of `v2.0.0`, addressing two targeted bugs reported after the `v2.0.0` rollout: incorrect quality score explanation rendering and noisy/invalid entries in the list-of-dates extraction flow.

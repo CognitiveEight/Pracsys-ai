@@ -13,8 +13,9 @@ SimplerToday is the **AI engine** that connects to your application backend over
 | **Analysis report** | A structured view of **strengths**, **risks**, **missing information**, **score context**, and pointers for improvement. |
 | **Document generation** | AI outputs can be transformed into **structured DOCX/report drafts** for legal review and downstream editing workflows. |
 | **Important dates** | A **timeline / list of dates** derived from the materials where applicable. |
+| **Procedural timeline** | A dedicated **procedural timeline** feature that models the case journey (events, filings, hearings, orders) and emits structured timeline entries for downstream UI/workflows. |
 | **Applicable laws** | Suggestions for **relevant legal frameworks** tied to the matter (for research direction, not as final legal advice). |
-| **Intelligence chat** | A **chat** where lawyers ask follow‑ups (explain a risk, compare options, procedural questions, hypotheticals). Replies aim to be **balanced and accurate**; workspace role mainly affects **panel** drafts, not an automatic advocacy slant in chat. |
+| **Intelligence chat** | A **chat** where lawyers ask follow‑ups (explain a risk, compare options, procedural questions, hypotheticals). Replies aim to be **balanced and accurate** and evaluate both **civil-law** and **criminal-law** implications when both are factually live; workspace role mainly affects **panel** drafts, not an automatic advocacy slant in chat. |
 | **Responsive during generation** | Long jobs (strategy, analysis, dates, laws) run in the background when possible so **chat can still answer** while other outputs are being prepared. |
 
 Nothing here replaces a qualified lawyer or predicts court outcomes. Outputs support **professional judgment**, not **decisions**.
@@ -24,7 +25,7 @@ Nothing here replaces a qualified lawyer or predicts court outcomes. Outputs sup
 ## Who should read this?
 
 - **Lawyers, product, and programme managers** — read *In plain language* and *Trust and limitations* below.
-- **Engineers and DevOps** — read *Technical overview*, *Configuration*, and *Running the service*. Deeper behaviour is described in [`SYSTEM_ARCHITECTURE.md`](SYSTEM_ARCHITECTURE.md).
+- **Engineers and DevOps** — read *Technical overview*, *Configuration*, and *Running the service*. Deeper behaviour is described in [`docs/SYSTEM_ARCHITECTURE.md`](docs/SYSTEM_ARCHITECTURE.md).
 
 ---
 
@@ -32,6 +33,7 @@ Nothing here replaces a qualified lawyer or predicts court outcomes. Outputs sup
 
 - The AI **must not invent** facts, amounts, dates, or citations that are not grounded in supplied materials or clearly labelled general legal background.
 - **Workspace role** (petitioner, respondent, etc.) mainly shapes how **panel outputs** (e.g. strategy blocks) are **generated**. **Intelligence chat** is configured for **neutral, accuracy‑first** analysis unless the user explicitly asks for a one‑sided view.
+- For case-specific legal reasoning, the system applies a **civil + criminal dual-track check** when facts support both branches; if facts support only one branch, it remains in that branch.
 - Use generated content as **drafting and thinking support**, subject to review by qualified counsel and local rules.
 
 ---
@@ -54,7 +56,7 @@ Nothing here replaces a qualified lawyer or predicts court outcomes. Outputs sup
 
 **Outbound (AI → backend)**
 
-- `document_feature_response` — payloads such as `document_assessments`, `strategy_objective`, `analysis_report`, `list_of_dates`, `applicable_laws`, `workspace_metadata`, etc.
+- `document_feature_response` — payloads such as `document_assessments`, `strategy_objective`, `analysis_report`, `list_of_dates`, `procedural_timeline`, `applicable_laws`, `workspace_metadata`, etc.
 - `ai_response` — natural language chat reply.
 
 Exact payload shapes are defined in code (`app/socket/schemas.py`) and integration notes under `docs/` where present.
@@ -63,7 +65,7 @@ Exact payload shapes are defined in code (`app/socket/schemas.py`) and integrati
 
 ## Repository layout
 
-This section matches the idea of [`STRUCTURE.txt`](STRUCTURE.txt) (printable ASCII tree) but is **updated** for the current legal-AI codebase. Use either this README or `STRUCTURE.txt` to find your way around; for deep behaviour, see [`SYSTEM_ARCHITECTURE.md`](SYSTEM_ARCHITECTURE.md).
+This section matches the idea of [`docs/STRUCTURE.txt`](docs/STRUCTURE.txt) (printable ASCII tree) but is **updated** for the current legal-AI codebase. Use either this README or `docs/STRUCTURE.txt` to find your way around; for deep behaviour, see [`docs/SYSTEM_ARCHITECTURE.md`](docs/SYSTEM_ARCHITECTURE.md).
 
 ### Top of the repository
 
@@ -79,9 +81,9 @@ simplertoday/
 ├── Dockerfile                    # Optional container image
 ├── Makefile                      # make setup | run | docker-up | …
 ├── run.sh                        # Optional: shell helper to start the service
-├── STRUCTURE.txt                 # Detailed folder tree (companion doc)
+├── docs/STRUCTURE.txt            # Detailed folder tree (companion doc)
 ├── README.md                     # This file
-└── SYSTEM_ARCHITECTURE.md       # Event flow & multi-agent design
+└── docs/SYSTEM_ARCHITECTURE.md   # Event flow & multi-agent design
 ```
 
 ### Inside `app/` — what each folder is for
@@ -90,7 +92,7 @@ simplertoday/
 |------|----------------|
 | `main.py` | Starts the program and handles graceful shutdown. |
 | `socket/` | Socket.IO **client**: connect to your backend, handle events, emit AI results. |
-| `langgraph/` | **Strategy generation** and **intelligence chat** workflows (step-by-step AI). |
+| `langgraph/` | **Strategy generation**, **intelligence chat**, and **procedural timeline** workflows (step-by-step AI). |
 | `prompts/` | Legal system prompts (chat behaviour, guardrails, role context). |
 | `ai/` | **Google Gemini** client: text generation, chat, embeddings. |
 | `processing/` | Document download, text extraction, batch processing, readability. |
@@ -187,7 +189,7 @@ python -m app.main
 
 ## Contributing and support
 
-- **Architecture and event flow:** [`SYSTEM_ARCHITECTURE.md`](SYSTEM_ARCHITECTURE.md)
+- **Architecture and event flow:** [`docs/SYSTEM_ARCHITECTURE.md`](docs/SYSTEM_ARCHITECTURE.md)
 - **Additional docs:** see `docs/` and topic‑specific `*.md` files at the repo root where maintained.
 
 ---

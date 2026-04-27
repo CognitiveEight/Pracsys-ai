@@ -51,29 +51,43 @@ class ListOfDatesTemporalAgent:
 
         anchor_year = state.get("anchor_year")
         anchor_txt = str(anchor_year) if isinstance(anchor_year, int) else "unknown"
-        prompt = f"""You extract timeline events from legal text.
+        prompt = f"""You are a legal timeline extractor. Extract only factual, case-relevant dates from the legal text below.
 
-Capture BOTH:
-1) Directly mentioned dates (explicit date strings in the text), and
-2) Relative/implicit date scenarios, for example:
-   - "approximately ten years"
-   - "past four to five years"
-   - "after five years", "before three years", "five years later"
+INCLUDE only dates that represent actual case events, such as:
+- Incident/accident dates
+- Filing dates (complaints, petitions, motions)
+- Court hearing or trial dates where a substantive order/action occurred
+- Judgment or order dates
+- Service of process / notice dates
+- Deadlines set by court or statute
+- Key meeting or negotiation dates directly tied to the case
+- Dates of medical treatment, injuries, or damages (if case-related)
+- Relative/implicit dates (e.g. "five years prior") ONLY if they describe a clear case fact
+
+EXCLUDE the following — do NOT create an entry for them:
+- Any date that is a placeholder, dummy, or system-generated (e.g. "1111", "9999", "0000", "11-11-1111")
+- General legal citation years, statute enactment years, or publication years
+- Background or biographical dates unrelated to the case
+- Speculative or hypothetical dates
+- Dates that appear ONLY in a court case listing/history table (rows of "Date of Listing | Date of Upload | Order") — from such tables extract ONLY the most significant dates: the case filing date, registration date, and the most recent substantive hearing date (max 3 entries per such document)
+- Any date whose only evidence is website navigation text, footer text, or UI elements (e.g. "Feedback", "Copyright Policy", "View PDF", "Skip to main content", "Sitemap")
+- Dates already captured by a more specific entry
 
 Rules:
-1) Use only evidence from the provided text.
-2) Every explicit date mention that is materially relevant should appear in output.
-3) If text contains explicit date/year anchors, use them for relative-year calculation.
-4) If you infer year from relative phrase, output date as YYYY-01-01.
-4) Do not invent facts not grounded in text.
-5) Output only JSON array of objects:
+1) Use ONLY evidence from the provided text — do not invent any fact.
+2) If a relative phrase is used (e.g. "three years ago"), calculate the absolute year using the anchor year hint; output date as YYYY-01-01.
+3) If no anchor year is available for a relative phrase, skip that entry.
+4) "description" must be ONE short factual sentence (max 12 words) describing what happened on that date. It must be human-readable and meaningful — never paste raw document fragments.
+5) "evidenceSnippet" must be a clean, readable excerpt from the source text — never paste a list of dates or PDF links.
+6) Output ONLY a JSON array. No extra text.
+
 [
   {{
     "date": "YYYY-MM-DD",
-    "title": "short event title",
-    "description": "short evidence-based explanation",
-    "evidenceSnippet": "exact/nearby source text proving date (max 220 chars)",
-    "pageNumber": integer (mandatory if inferable from text markers),
+    "title": "short event title (5 words max)",
+    "description": "one factual sentence, max 12 words",
+    "evidenceSnippet": "clean readable source excerpt proving this date (max 200 chars)",
+    "pageNumber": integer (if inferable from page markers in text),
     "isIncident": true|false,
     "eventType": "Court Hearing|Deadline|Meeting|Filing|Other",
     "relevance": "High|Medium|Low"
@@ -82,7 +96,7 @@ Rules:
 
 Anchor year hint (if available): {anchor_txt}
 
-Text:
+Legal text:
 {document_text[:20000]}
 """
         try:
@@ -178,19 +192,102 @@ Text:
                     break
             return page if page > 0 else 1
 
+        # Patterns that indicate garbage/scraped-UI content in description or evidence
+        _GARBAGE_PATTERNS = re.compile(
+            r"View PDF|"                       # any "View PDF" (with or without number)
+            r"Date of (Listing|Upload)|"
+            r"Listing History|"
+            r"Case Status Pending|"
+            r"Last Listed|"
+            r"Next Listing Date|"
+            r"All Parties|"
+            r"IA/MA|"
+            r"Copyright Policy|"
+            r"Feedback|"
+            r"Skip to main content|"
+            r"Sitemap|"
+            r"Hyperlinking Polic|"
+            r"Contact Us|"
+            r"Screen Reader Access|"
+            r"Page last updated|"
+            r"Connected Matters",
+            re.I,
+        )
+
+        def _is_garbage_text(text: str) -> bool:
+            """Return True if text looks like raw scraped UI/navigation content."""
+            if not text:
+                return False
+            if _GARBAGE_PATTERNS.search(text):
+                return True
+            # Raw date-list dump: 3+ DD-MM-YYYY or DD/MM/YYYY tokens in the text
+            if len(re.findall(r"\d{2}[-/]\d{2}[-/]\d{4}", text)) >= 3:
+                return True
+            return False
+
         document_text = str(state.get("document_text") or "")
         normalized: List[Dict[str, Any]] = []
+        seen_dates: set = set()
         for item in arr:
             if not isinstance(item, dict):
                 continue
             date_val = str(item.get("date") or "").strip()
             if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_val):
                 continue
+
+            # Reject placeholder / out-of-range years (e.g. 1111-11-11, 9999-99-99)
+            try:
+                year = int(date_val[:4])
+                if year < 1900 or year > 2099:
+                    continue
+            except ValueError:
+                continue
+
+            # Skip duplicate dates (keep first occurrence)
+            if date_val in seen_dates:
+                continue
+            seen_dates.add(date_val)
+
+            title = str(item.get("title") or "").strip()
+            evidence = str(item.get("evidenceSnippet") or "").strip()
+            raw_desc = str(item.get("description") or "").strip()
+
+            # Drop entries with no title and no evidence
+            if not title and not evidence:
+                continue
+
+            # Drop entries whose description or evidence is raw garbage/UI text
+            if _is_garbage_text(raw_desc) or _is_garbage_text(evidence):
+                continue
+
+            # Drop ALL generic "Date Mentioned in Document" entries — this title
+            # is the LLM's fallback meaning it could not identify the event, so
+            # it is never a factual case-relevant date worth keeping.
+            if title.lower() in (
+                "date mentioned in document",
+                "date mentioned in text",
+                "date in document",
+                "mentioned date",
+            ):
+                continue
+
+            # Trim description to a single concise sentence (hard cap 120 chars)
+            if raw_desc:
+                first_sentence = re.split(r"(?<=[.!?])\s", raw_desc)[0]
+                description = first_sentence[:120]
+            else:
+                description = ""
+
+            # Drop entries whose final description is too short to be meaningful
+            # (e.g. truncated garbage like "Dr." or "Ltd.")
+            if description and len(description.strip()) < 8:
+                continue
+
             page_number = _resolve_page_from_text(item, document_text)
             entry = {
                 "date": date_val,
-                "title": (str(item.get("title") or "").strip() or "Inferred Timeline Event"),
-                "description": str(item.get("description") or "").strip(),
+                "title": (title or "Inferred Timeline Event"),
+                "description": description,
                 "sourceDocId": source_doc_id or None,
                 "sourceDocName": source_doc_name or None,
                 "pageNumber": page_number,

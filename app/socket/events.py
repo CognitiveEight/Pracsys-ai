@@ -2960,47 +2960,52 @@ Rules:
             if not gemini_client.model:
                 return []
 
-            prompt = f"""You are a legal case analyst. From the following annexures, extract a comprehensive chronological list of important dates and events (e.g. agreement signed, payment made, notice sent, reply received, court filing, hearing, deadline).
+            prompt = f"""You are a legal case analyst. From the following annexures, extract a chronological list of FACTUAL, CASE-RELEVANT dates and events.
 
 **Annexure content** (each file is labeled Annexure 1, Annexure 2, etc. with id and name):
 {combined}
 
 **Task**:
-1) Build an inventory across ALL provided annexures (Annexure 1..N).
-2) Extract every date-like expression you can find and attach it to the nearest meaningful event/action described near that date.
+1) Identify dates directly tied to this dispute: agreements, payments, notices, hearings where an order/action occurred, deadlines, possession, filings, and key communications.
+2) For every such date, write a short, single-sentence description (max 12 words) of what actually happened.
 3) Output a JSON array of date entries.
 
 Each entry MUST have:
 - "date": string in YYYY-MM-DD format only
-- "title": string, short title for the event (e.g. "FIR Filed", "Notice Sent", "Affidavit Filed", "Hearing Date")
-- "description": string (optional), brief context tied to the event/date
+- "title": string, 3-5 word title for the event (e.g. "FIR Filed", "Notice Sent", "Possession Deadline")
+- "description": string, one concise sentence describing what happened (max 12 words, no raw text dumps)
 - "sourceDocumentIndex": integer (1-based), which document (1, 2, 3...) the event comes from
-- "pageNumber": integer (mandatory)
+- "pageNumber": integer (mandatory, default 1 if unclear)
 - "isIncident": boolean (optional, default true)
-- "eventType": one of "Court Hearing" | "Deadline" | "Meeting" | "Filing" | "Other" (optional)
-- "relevance": one of "High" | "Medium" | "Low" (optional)
+- "eventType": one of "Court Hearing" | "Deadline" | "Meeting" | "Filing" | "Other"
+- "relevance": one of "High" | "Medium" | "Low"
 
-Rules (CRITICAL for consistency):
+INCLUDE:
+- Actual incidents (accidents, crimes, disputes, possession delays)
+- Agreement/contract signings and key clauses
+- Payments made or demanded
+- Notices, replies, and formal communications
+- Court/tribunal filings, hearings where orders were passed, and judgments
+- Deadlines (possession, refund, compliance)
+- Site inspections and compliance reports
+
+EXCLUDE (do NOT include these):
+- Every row of a court listing/hearing table — include at most 3 key dates from such tables (filing date, registration date, most recent hearing with an order)
+- Dates appearing only in "Date of Listing / Date of Upload / Order/Judgement" table columns with no substantive context
+- Dates alongside "View PDF", "IA/MA", "Connected Matters", "Contact Us", "Feedback", "Sitemap" or other website navigation text
+- Placeholder dates like 11-11-1111 or 9999-99-99
+- Background/historical company information unrelated to this dispute
+- Duplicate entries (same date + title + document)
+
+Rules:
 - Output ONLY a single valid JSON array. No markdown, no code fences, no other text.
-- The first character of your response MUST be [ and the last character MUST be ].
-- Inventory completeness: if the documents contain ANY date-like expressions, you MUST NOT return []. You must return the full list of all extractable date-events.
-- Date normalization: output each "date" as YYYY-MM-DD only (convert common formats to YYYY-MM-DD).
-  - If you cannot determine the year, omit only that single entry.
-- pageNumber rule: always return an integer >= 1. If exact page is unclear (common in DOCX/TXT), set pageNumber to 1.
-- Sorting: sort by date ascending (oldest first). For the same date, tie-break by "sourceDocumentIndex" ascending, then by "title" alphabetically.
-- De-duplication: remove exact duplicates only (same date + same title + same sourceDocumentIndex). Otherwise keep distinct events.
-- Return the full array; do not truncate the list of events.
-- Escape quotes inside strings with \\". Keep each title and description to one short phrase (under 80 chars) so the full JSON is not truncated.
-
-CASE MATERIALITY + COVERAGE RULE (MANDATORY):
-- Include all date-events that are materially connected to this case/dispute across ALL annexures.
-- Include procedural events, factual incidents, communications, notices, filings, service/repair steps, contractual and payment milestones, and deadlines.
-- EXCLUDE background-only chronology that is not tied to the parties' present dispute (e.g., founder biographies, company origin history, awards, old brand milestones, industrial history).
-- If an annexure is a reference/background article, keep only dates that directly support a pleaded issue in this case.
-- Keep deduplication rule: remove only exact duplicates (same date + title + sourceDocumentIndex).
+- The first character of your response MUST be [ and the last MUST be ].
+- Date normalization: output each "date" as YYYY-MM-DD. If year is unknown, omit the entry.
+- Sorting: sort by date ascending. Tie-break: sourceDocumentIndex ascending, then title alphabetically.
+- Escape quotes inside strings with \\". Keep title ≤ 5 words, description ≤ 12 words.
 
 Example shape:
-[{{"date":"2026-01-15","title":"Notice Sent","description":"Cease and desist","sourceDocumentIndex":1,"pageNumber":3,"isIncident":true,"eventType":"Filing","relevance":"High"}}]
+[{{"date":"2026-01-15","title":"Notice Sent","description":"Complainant issued legal notice to respondent.","sourceDocumentIndex":1,"pageNumber":3,"isIncident":true,"eventType":"Filing","relevance":"High"}}]
 """
             # Keep deterministic JSON extraction for timeline completeness.
             raw = await gemini_client.generate(
@@ -3116,6 +3121,92 @@ Example shape:
                 r"brand history|company history|legacy history|origin story|corporate history)\b",
                 flags=re.IGNORECASE,
             )
+            # Patterns that indicate scraped UI/navigation/listing-table content
+            _garbage_text_pattern = re.compile(
+                r"View PDF|"
+                r"Date of (Listing|Upload)|"
+                r"Listing History|"
+                r"Case Status Pending|"
+                r"Last Listed|"
+                r"Next Listing Date|"
+                r"All Parties|"
+                r"IA/MA|"
+                r"Copyright Policy|"
+                r"Feedback|"
+                r"Skip to main content|"
+                r"Sitemap|"
+                r"Hyperlinking Polic|"
+                r"Contact Us|"
+                r"Screen Reader Access|"
+                r"Page last updated|"
+                r"Connected Matters|"
+                r"Order/Judgement",
+                re.I,
+            )
+
+            _generic_titles = frozenset(
+                (
+                    "date mentioned in document",
+                    "date mentioned in text",
+                    "date in document",
+                    "mentioned date",
+                    "event",
+                    "date",
+                )
+            )
+
+            _ALLOWED_EVENT_TYPES = frozenset(
+                ("Court Hearing", "Deadline", "Meeting", "Filing", "Incident", "Other")
+            )
+            # Map common LLM-invented variants to the canonical allowed values
+            _EVENT_TYPE_ALIASES: Dict[str, str] = {
+                "hearing": "Court Hearing",
+                "court hearing": "Court Hearing",
+                "tribunal hearing": "Court Hearing",
+                "hearing date": "Court Hearing",
+                "judgment": "Court Hearing",
+                "judgement": "Court Hearing",
+                "judgment or order": "Court Hearing",
+                "judgement or order": "Court Hearing",
+                "order": "Court Hearing",
+                "court order": "Court Hearing",
+                "tribunal order": "Court Hearing",
+                "final order": "Court Hearing",
+                "interim order": "Court Hearing",
+                "filing": "Filing",
+                "court filing": "Filing",
+                "complaint": "Filing",
+                "application": "Filing",
+                "appeal": "Filing",
+                "deadline": "Deadline",
+                "due date": "Deadline",
+                "possession deadline": "Deadline",
+                "meeting": "Meeting",
+                "incident": "Incident",
+                "other": "Other",
+                "payment": "Other",
+                "communication": "Other",
+                "notice": "Filing",
+                "reply": "Filing",
+            }
+
+            def _normalize_event_type(raw: str) -> str:
+                """Map any LLM-returned eventType to one of the allowed canonical values."""
+                if not raw:
+                    return "Other"
+                if raw in _ALLOWED_EVENT_TYPES:
+                    return raw
+                return _EVENT_TYPE_ALIASES.get(raw.lower(), "Other")
+
+            def _is_garbage_text_local(text: str) -> bool:
+                if not text:
+                    return False
+                if _garbage_text_pattern.search(text):
+                    return True
+                # Raw date-list dump: 3+ DD-MM-YYYY or DD/MM/YYYY tokens
+                if len(re.findall(r"\d{2}[-/]\d{2}[-/]\d{4}", text)) >= 3:
+                    return True
+                return False
 
             def _is_background_timeline_entry(
                 title: str, description: str, source_name: str
@@ -3454,15 +3545,36 @@ Example shape:
                 page_number = _resolve_page_number(item, source_content)
 
                 # Build core entry used by backend List of Dates UI
+                raw_title = (item.get("title") or "").strip()
+                raw_desc = (item.get("description") or "").strip()
+
+                # Drop generic meaningless titles that indicate the LLM had no context
+                if raw_title.lower() in _generic_titles:
+                    continue
+
+                # Drop entries whose title or description contain scraped UI garbage
+                if _is_garbage_text_local(raw_title) or _is_garbage_text_local(raw_desc):
+                    continue
+
+                # Trim description to a single concise sentence (hard cap 120 chars)
+                if raw_desc:
+                    first_sentence = re.split(r"(?<=[.!?])\s", raw_desc)[0]
+                    raw_desc = first_sentence[:120]
+
+                # Drop entries with a description too short to be meaningful
+                if raw_desc and len(raw_desc.strip()) < 8:
+                    continue
+
+                raw_event_type = (item.get("eventType") or "").strip()
                 entry = {
                     "date": date_val,
-                    "title": (item.get("title") or "").strip() or "Event",
-                    "description": (item.get("description") or "").strip(),
+                    "title": raw_title or "Event",
+                    "description": raw_desc,
                     "sourceDocId": source_doc_id or None,
                     "sourceDocName": source_doc_name or None,
                     "pageNumber": page_number,
                     "isIncident": item.get("isIncident", True),
-                    "eventType": (item.get("eventType") or "").strip() or None,
+                    "eventType": _normalize_event_type(raw_event_type),
                     "relevance": (item.get("relevance") or "").strip() or None,
                 }
                 # For frontend compatibility: many UIs expect a generic 'source'/'sourceAnswer' field.
@@ -3482,68 +3594,12 @@ Example shape:
                 entry = {k: v for k, v in entry.items() if v is not None and v != ""}
                 result.append(entry)
 
-            # Deterministic backfill: ensure explicit dates present in source docs are not missed
-            # by model output on long/noisy documents.
-            existing_doc_date_pairs = {
-                (str(e.get("sourceDocId") or ""), str(e.get("date") or ""))
-                for e in result
-            }
-            for idx, source_content in doc_content_by_index.items():
-                source_doc_id = doc_id_by_index.get(idx, "")
-                source_doc_name = doc_name_by_index.get(idx, "")
-                mentions = _extract_explicit_date_mentions(source_content)
-                if not mentions:
-                    continue
-
-                page_markers = _extract_page_markers(source_content)
-
-                for normalized_date, pos in mentions:
-                    pair = (str(source_doc_id or ""), normalized_date)
-                    if pair in existing_doc_date_pairs:
-                        continue
-
-                    page_number = 1
-                    if page_markers:
-                        for marker_pos, marker_page in page_markers:
-                            if marker_pos <= pos:
-                                try:
-                                    page_number = int(marker_page)
-                                except Exception:
-                                    page_number = 1
-                            else:
-                                break
-
-                    snippet_start = max(0, pos - 70)
-                    snippet_end = min(len(source_content), pos + 130)
-                    snippet = re.sub(
-                        r"\s+",
-                        " ",
-                        source_content[snippet_start:snippet_end].strip(),
-                    )
-                    if len(snippet) > 180:
-                        snippet = snippet[:177].rstrip() + "..."
-
-                    supplemental = {
-                        "date": normalized_date,
-                        "title": "Date Mentioned in Document",
-                        "description": snippet or "Date explicitly mentioned in source document.",
-                        "sourceDocId": source_doc_id or None,
-                        "sourceDocName": source_doc_name or None,
-                        "pageNumber": page_number if page_number > 0 else 1,
-                        "isIncident": False,
-                        "eventType": "Other",
-                        "relevance": "Medium",
-                    }
-                    if source_doc_name:
-                        supplemental["source"] = source_doc_name
-                        supplemental["sourceAnswer"] = source_doc_name
-                    supplemental = {
-                        k: v
-                        for k, v in supplemental.items()
-                        if v is not None and v != ""
-                    }
-                    result.append(supplemental)
-                    existing_doc_date_pairs.add(pair)
+            # NOTE: The raw-snippet "Date Mentioned in Document" backfill has been
+            # removed. It could only produce literal text extracts (including raw Hindi
+            # court orders, email headers, and listing-table rows) as descriptions,
+            # which are never clean single-sentence summaries. The LLM prompt already
+            # instructs the model to capture all case-relevant dates, so the backfill
+            # was adding noise rather than value.
 
             # LLM temporal-inference backfill via LangGraph:
             # captures relative/chained timeline statements grounded in document text.
@@ -5315,6 +5371,30 @@ Rules:
                 max_tokens=12000,
             )
             txt = (txt or "").strip()
+            # Unwrap if the model returned JSON instead of plain text
+            # e.g. {"analysis": "..."} or {"explanation": "..."} or {"qualityScoreExplanation": "..."}
+            if txt.startswith("{"):
+                try:
+                    parsed = _json.loads(txt)
+                    if isinstance(parsed, dict):
+                        txt = (
+                            parsed.get("analysis")
+                            or parsed.get("explanation")
+                            or parsed.get("qualityScoreExplanation")
+                            or parsed.get("quality_score_explanation")
+                            or parsed.get("text")
+                            or next(
+                                (v for v in parsed.values() if isinstance(v, str) and len(v) >= 40),
+                                "",
+                            )
+                        ).strip()
+                except (_json.JSONDecodeError, Exception):
+                    pass
+            # Strip markdown code fences if present
+            if "```" in txt:
+                _fence_match = re.search(r"```(?:\w+)?\s*([\s\S]*?)```", txt)
+                if _fence_match:
+                    txt = _fence_match.group(1).strip()
             if len(txt) >= 40:
                 return txt
         except Exception as e:
@@ -6115,26 +6195,26 @@ Output ONLY valid JSON, no markdown, no code block:
         new_score = min(new_score, max_allowed)
         report["caseResolutionScore"] = new_score
 
-        explanation = (
-            report.get("qualityScoreExplanation")
-            or report.get("quality_score_explanation")
-            or ""
-        ).strip()
-        report_explanation = (
-            report.get("reportQualityScoreExplanation")
-            or report.get("report_quality_score_explanation")
-            or ""
-        ).strip()
-        snippet = rejected_value[:80] + ("..." if len(rejected_value) > 80 else "")
-        feedback_note = (
-            f' User rejected 1 item from {section}: "{snippet}". '
-            f"Score adjusted by +{score_delta} (from {old_score}% to {new_score}%). {delta_reason}"
+        # Regenerate a clean, generic explanation based on the updated report state.
+        # Do NOT mention the rejection, score delta, or any change tracking — lawyers
+        # share this explanation directly with clients.
+        updated_missing = report.get("missingInfo") or report.get("missing_info") or []
+        updated_weaknesses = report.get("weaknesses") or []
+        updated_risks = report.get("risks") or []
+        updated_strengths = report.get("strengths") or []
+
+        fresh_explanation = await self._ensure_quality_score_explanation(
+            workspace_role=workspace_role,
+            case_resolution_score=new_score,
+            missing_info=updated_missing,
+            weaknesses=updated_weaknesses,
+            risks=updated_risks,
+            strengths=updated_strengths,
+            existing="",  # force regeneration so the explanation reflects current state
         )
-        report["qualityScoreExplanation"] = (explanation + feedback_note).strip()
+        report["qualityScoreExplanation"] = fresh_explanation
         report["reportQualityScoreExplanation"] = (
-            self._sanitize_report_quality_score_explanation(
-                report_explanation + feedback_note
-            )
+            self._sanitize_report_quality_score_explanation(fresh_explanation)
         ).strip()
 
         self._workspace_analysis_payload[workspace_id] = report

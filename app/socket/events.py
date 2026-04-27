@@ -1744,6 +1744,112 @@ Reply JSON only: {{"objectiveText": "..."}}"""
             logger.warning("Objective instruction summarization failed: {}", e)
             return None
 
+    @staticmethod
+    def _extract_declarative_objective_text(user_message: str) -> str:
+        """Detect declarative "objective is …" / "client objective is …" / "objective: …"
+        patterns and return the extracted objective text.
+
+        Returns "" when:
+        - the message is a question (ends with "?" or starts with question word),
+        - the pattern is an explanatory framing like "the objective of <concept> is …",
+        - no recognized declarative pattern matches,
+        - the extracted text is too short / too generic to be a real objective.
+
+        This is a deterministic safety net for the LLM classifier — when it fires,
+        it forces mode="direct_update" with this text as objectiveText.
+        """
+        msg = (user_message or "").strip()
+        if not msg or len(msg) < 12:
+            return ""
+        # Strip trailing/leading quotes/punctuation noise that confuses regexes
+        stripped = msg.strip().strip('"\u201c\u201d\u2018\u2019')
+        if not stripped:
+            return ""
+        # Skip obvious questions.
+        if stripped.endswith("?"):
+            return ""
+        first_word = re.match(r"\s*(\w+)", stripped, flags=re.UNICODE)
+        if first_word:
+            fw = first_word.group(1).lower()
+            if fw in {
+                "what",
+                "why",
+                "how",
+                "which",
+                "when",
+                "where",
+                "who",
+                "should",
+                "can",
+                "could",
+                "would",
+                "is",
+                "are",
+                "do",
+                "does",
+                "did",
+            }:
+                return ""
+
+        # Reject explanatory framing where "objective" is being defined, not set:
+        #   "the objective of a writ petition is to ..."
+        #   "an objective in such cases is usually ..."
+        if re.search(
+            r"\b(?:the|an|a)\s+(?:strategic\s+|primary\s+|main\s+)?objective\s+(?:of|in)\s+\w+",
+            stripped,
+            flags=re.IGNORECASE,
+        ):
+            return ""
+
+        # Patterns we treat as declarative objective-setters.
+        # Each pattern captures the objective text in group 1.
+        patterns = [
+            # "objective: <X>"  /  "the objective: <X>"
+            r"(?:^|[\.\!\n;])\s*(?:the\s+|our\s+|my\s+|case\s+|client(?:'s|s)?\s+)?objective\s*[:=]\s*(.+?)(?:[\.\!\n;]|$)",
+            # "set (the) objective to <X>"  /  "set objective: <X>" already covered above
+            r"\bset\s+(?:the\s+)?objective\s+to\s+(.+?)(?:[\.\!\n;]|$)",
+            # "(client(?:'s)?|our|my|the|case) objective (is|should be) <X>"
+            r"(?:^|[\.\!\n;]|\s)(?:the|our|my|case|client(?:'s|s)?)\s+objective\s+(?:is|should\s+be|will\s+be|must\s+be)\s+(.+?)(?:[\.\!\n;]|$)",
+            # bare "objective is <X>" / "objective should be <X>" at sentence start
+            r"(?:^|[\.\!\n;])\s*objective\s+(?:is|should\s+be|will\s+be|must\s+be)\s+(.+?)(?:[\.\!\n;]|$)",
+        ]
+
+        for pat in patterns:
+            m = re.search(pat, stripped, flags=re.IGNORECASE | re.DOTALL)
+            if not m:
+                continue
+            captured = (m.group(1) or "").strip()
+            if not captured:
+                continue
+            # Strip leading filler tokens that are not part of the objective itself.
+            captured = re.sub(
+                r"^(?:to\s+|that\s+|going\s+to\s+|gonna\s+)",
+                "",
+                captured,
+                flags=re.IGNORECASE,
+            ).strip()
+            # Reject vague / placeholder content that wouldn't be a real objective.
+            if len(captured) < 6:
+                continue
+            low = captured.lower()
+            vague = {
+                "tbd",
+                "to be decided",
+                "unclear",
+                "unknown",
+                "not sure",
+                "discussed",
+            }
+            if low in vague:
+                continue
+            # Cap length so we don't accidentally swallow a paragraph.
+            if len(captured) > 400:
+                captured = captured[:400].rstrip() + "…"
+            # Capitalize first letter for nicer display, leave rest intact.
+            return captured[:1].upper() + captured[1:]
+
+        return ""
+
     async def _should_offer_objective_update_after_discussion(
         self,
         user_message: str,
@@ -1911,6 +2017,47 @@ If the above statements are:
 -> isQuestionLike = false
 
 --------------------------------
+DECLARATIVE OBJECTIVE STATEMENTS (CRITICAL — VERY COMMON)
+--------------------------------
+
+When the lawyer DECLARES the objective using phrasing like:
+- "objective is <X>"
+- "the objective is <X>"
+- "our objective is <X>"
+- "client objective is <X>" / "client's objective is <X>"
+- "the client's goal/aim is <X>"
+- "objective should be <X>" / "the objective should be <X>"
+- "the objective of the case is <X>"
+- "set the objective to <X>" / "set objective: <X>"
+- "objective: <X>"
+- "we want <X>" / "we are seeking <X>" (declarative, not exploratory)
+
+…this is a DECLARATIVE STATEMENT OF THE STRATEGIC OBJECTIVE.
+
+It is NOT an explanation, NOT informational, and NOT exploratory.
+You MUST classify it as:
+-> mode = "direct_update"
+-> updateRequestedNow = true
+-> isQuestionLike = false
+-> objectiveText = the concrete content of <X> (the part AFTER "is" / ":" / "to")
+
+Counter-examples that are NOT declarative objective statements
+(these remain mode = "none"):
+- Meta-talk about the concept: "the objective of a writ petition is generally to..."
+  (talking ABOUT what an objective is, not setting one)
+- Generic teaching: "in cases like this, the objective is usually to ..."
+  (describing typical practice, no first-person commitment)
+- Question forms: "what should the objective be?", "is the objective to ...?"
+- Hypotheticals: "if the objective were X, then ..."
+
+Heuristic to disambiguate:
+- First-person / case-specific subject ("our", "client", "the case", "we")
+  + "objective"/"goal"/"aim" + "is"/"should be"/":"/"to"
+  -> DECLARATIVE -> direct_update
+- Third-person / generic subject ("the objective of <concept>", "an objective is")
+  + descriptive verb -> EXPLANATORY -> none
+
+--------------------------------
 HARD CONSTRAINTS (MANDATORY)
 --------------------------------
 
@@ -1939,10 +2086,23 @@ OBJECTIVE TEXT RULE
 - Keep it SHORT, CLEAR, and ACTION-ORIENTED
 - Do NOT add new information
 - Do NOT hallucinate or expand meaning
+- For declarative statements ("objective is X", "client objective is X",
+  "objective: X", "set the objective to X"), the objectiveText is exactly
+  the content X — strip the leading "objective is" / "the objective is" /
+  "client objective is" / ":" / "to " framing.
 
 Examples:
 Input: "Focus on breach of contract instead of negligence"
 Output: "Focus on breach of contract over negligence"
+
+Input: "Client objective is to obtain regular bail under Section 439 CrPC"
+Output: "Obtain regular bail under Section 439 CrPC"
+
+Input: "the objective is to challenge the territorial jurisdiction"
+Output: "Challenge the territorial jurisdiction"
+
+Input: "objective: secure interim injunction before next hearing"
+Output: "Secure interim injunction before next hearing"
 
 --------------------------------
 FINAL INSTRUCTION
@@ -1998,6 +2158,22 @@ USER MESSAGE
                 and update_requested_now
             ):
                 mode = "direct_update"
+            # Deterministic safety net: lawyers very often state the objective
+            # using literal patterns like "objective is X", "client objective is X",
+            # "the objective should be X", "objective: X". Some model variants still
+            # treat these as informational/explanatory and emit mode="none" with
+            # empty objectiveText. Detect those patterns from the raw message and
+            # force a direct_update so the strategy panel actually moves.
+            if mode == "none" and not is_question_like:
+                fallback_obj = self._extract_declarative_objective_text(msg)
+                if fallback_obj:
+                    logger.info(
+                        "Objective intent classifier overridden by declarative pattern: '{}…'",
+                        fallback_obj[:60],
+                    )
+                    mode = "direct_update"
+                    update_requested_now = True
+                    obj_text = fallback_obj
             if mode == "direct_update" and not update_requested_now:
                 mode = "none"
             if mode == "none":
@@ -6703,6 +6879,19 @@ Output ONLY valid JSON, no markdown, no code block:
         if not is_rejected:
             logger.debug("analysis_report_feedback: isRejected=false – no score change")
             return
+
+        # Repopulate in-memory caches from Qdrant when the AI service was
+        # restarted between the original analysis_report emit and this feedback.
+        # Without this, post-restart rejections would be silently dropped because
+        # the in-memory _workspace_analysis_payload is empty until hydration.
+        try:
+            await self._hydrate_workspace_caches(workspace_id, user_id=user_id)
+        except Exception as e:  # pragma: no cover - best-effort hydration
+            logger.debug(
+                "analysis_report_feedback: hydration failed for workspace {}: {}",
+                workspace_id,
+                e,
+            )
 
         current = self._workspace_analysis_payload.get(workspace_id)
         if not current:

@@ -21,6 +21,10 @@ from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
 from app.processing.document_processor import document_processor
+from app.prompts.applicable_acts import (
+    TARGETED_INDIAN_ACTS,
+    format_targeted_acts_for_prompt,
+)
 from app.prompts.legal_intelligence_system import (
     ANNEXURE_UPLOAD_GATE_MESSAGE,
     get_legal_intelligence_system_instruction,
@@ -263,6 +267,8 @@ class SocketEventHandler:
         self._workspace_list_of_dates_payload: Dict[str, List[Dict[str, Any]]] = {}
         # Applicable laws payload per workspace (acts/sections inferred from docs + case law search)
         self._workspace_applicable_laws_payload: Dict[str, Dict[str, Any]] = {}
+        # Procedural timeline payload per workspace (upcoming filing/hearing/compliance/evidence/adjournment dates)
+        self._workspace_procedural_timeline_payload: Dict[str, List[Dict[str, Any]]] = {}
         # Re-emit after reconnect when socket dropped right after analysis report (so backend gets the update)
         self._had_disconnect: bool = False
         self._pending_reemit_workspace_id: Optional[str] = None
@@ -672,7 +678,18 @@ class SocketEventHandler:
 - For IT Act, continue using Information Technology Act, 2000 sections as it's still in force.
 - Make next steps actionable and role-specific.
 - If documents do not contain enough information, explicitly state the limitation in caseSummary/reportCaseSummary/strategicObjective (do not guess).
-- If documents seem to include multiple matters, explicitly call out the split and focus your output on the dominant dispute supported by strongest evidence."""
+- If documents seem to include multiple matters, explicitly call out the split and focus your output on the dominant dispute supported by strongest evidence.
+
+**Legal-domain coverage (civil law AND criminal law — BOTH branches):**
+- Treat caseSummary / reportCaseSummary / strategicObjective / possibleNextSteps as a dual-lens exercise. Before writing each field, consciously ask:
+  (1) "What CRIMINAL-law angle (e.g. BNS 2023 / BNSS 2023 / BSA 2023 / IT Act 2000 / NI Act §138 / PMLA / NDPS / POCSO / PCA, etc.) do the facts attract?", and
+  (2) "What CIVIL-law angle (e.g. Indian Contract Act 1872 / Specific Relief Act 1963 / Transfer of Property Act 1882 / CPC 1908 / Limitation Act 1963 / Sale of Goods Act 1930 / Consumer Protection Act 2019 / Companies Act 2013 / Arbitration Act 1996 / family laws / RERA / MV Act / CGST Act / Insolvency & Bankruptcy Code, etc.) do the same facts attract?"
+- When BOTH branches are plausibly supported by the documents, the output MUST cover both:
+  * `caseSummary` and `reportCaseSummary`: name the criminal-law issues AND the civil-law / private-law issues raised by the facts.
+  * `strategicObjective`: address the role's plan on BOTH the criminal-law track (e.g. FIR / complaint / prosecution / defence / quashing under BNSS) AND the civil-law track (e.g. suit for damages / specific performance / declaration / injunction / consumer complaint / arbitration / NCLT petition), in priority order.
+  * `possibleNextSteps`: include at least one immediate criminal-track action AND at least one immediate civil-track action when both branches are live (e.g. "Preserve digital evidence and prepare BNS §318 cheating complaint" alongside "Issue legal notice under Indian Contract Act §73 demanding compensation").
+- When the facts only support one branch (purely civil OR purely criminal), stay in that branch — do NOT manufacture the other side just to look balanced. Coherence beats balance.
+- **No bracket tags in user-facing output.** Do NOT prefix or label items with "(criminal angle)", "(civil angle)", "(criminal-law angle)", "(civil-law angle)", or any similar bracketed tag. Weave the criminal-law and civil-law content naturally into the prose of `caseSummary` / `reportCaseSummary` / `strategicObjective` and into the plain text of each `possibleNextSteps` bullet, the same way a lawyer would draft them in a memo."""
 
             try:
                 # Improved prompt for better JSON generation
@@ -691,22 +708,44 @@ TASK:
 
 LEGAL FRAMEWORK (CRITICAL - USE CORRECT INDIAN LAWS):
 - Always reference applicable and **most relevant Indian statutes/sections based on the case facts**, including but not limited to:
-  • Bharatiya Nyaya Sanhita (BNS), 2023
-  • Bharatiya Nagarik Suraksha Sanhita (BNSS), 2023
-  • Bharatiya Sakshya Adhiniyam (BSA), 2023
-  • Information Technology Act, 2000
+  CRIMINAL-LAW SIDE:
+  • Bharatiya Nyaya Sanhita (BNS), 2023 — substantive offences
+  • Bharatiya Nagarik Suraksha Sanhita (BNSS), 2023 — criminal procedure
+  • Bharatiya Sakshya Adhiniyam (BSA), 2023 — evidence
+  • Information Technology Act, 2000 — cyber-offences
+  • Negotiable Instruments Act, 1881 — Section 138 (cheque dishonour, quasi-criminal)
+  • Prevention of Money Laundering Act, 2002; NDPS Act, 1985; Arms Act, 1959; POCSO, 2012; PCA, 1988; UAPA, 1967, etc., where facts fit
+  CIVIL-LAW SIDE:
+  • Indian Contract Act, 1872
+  • Specific Relief Act, 1963
+  • Transfer of Property Act, 1882
+  • Code of Civil Procedure, 1908
+  • Limitation Act, 1963
+  • Sale of Goods Act, 1930
+  • Consumer Protection Act, 2019
   • Companies Act, 2013
+  • Arbitration and Conciliation Act, 1996
+  • Hindu Marriage Act 1955 / Special Marriage Act 1954 / Hindu Succession Act 1956 / Guardians and Wards Act 1890 (family / succession matters)
+  • Real Estate (Regulation and Development) Act, 2016; Motor Vehicles Act, 1988; Insolvency and Bankruptcy Code, 2016, etc., where facts fit
+  REGULATORY / TAX (where relevant):
   • Goods and Services Tax (GST) Acts
   • Right to Information Act, 2005
   • SC/ST (Prevention of Atrocities) Act, 1989
-  • Indian Contract Act, 1872
-  • Transfer of Property Act, 1882
-  • Consumer Protection Act, 2019
   • Any other applicable central or state law
 
 - Do NOT restrict analysis to only one statute—identify and apply **all relevant laws**.
-- Prefer **latest applicable laws** (e.g., BNS/BNSS/BSA instead of IPC/CrPC/Evidence Act where applicable).
-- If multiple legal domains are involved (civil, criminal, corporate, tax, cyber), reflect all relevant frameworks.
+- Prefer **latest applicable laws** (e.g., BNS/BNSS/BSA instead of IPC/CrPC/Evidence Act where applicable). Do NOT cite IPC 1860, CrPC 1973, or the Indian Evidence Act 1872.
+
+DUAL-LENS RULE (CIVIL LAW + CRIMINAL LAW — BOTH BRANCHES):
+- Before writing caseSummary / reportCaseSummary / strategicObjective / possibleNextSteps, consciously ask:
+  (1) What is the **criminal-law angle** of these facts? (BNS / BNSS / BSA / IT Act / NI Act §138 / etc.)
+  (2) What is the **civil-law angle** of the same facts? (Contract / Specific Relief / TPA / CPC / Consumer Protection / Companies Act / Arbitration / family law / etc.)
+- When BOTH branches are plausibly supported by the documents, the output MUST cover both:
+  * caseSummary + reportCaseSummary: name the criminal-law issues AND the civil-law / private-law issues raised by the facts.
+  * strategicObjective: address the role's plan on BOTH the criminal-law track (e.g. FIR / complaint / prosecution / defence / quashing under BNSS) AND the civil-law track (e.g. suit for damages / specific performance / declaration / injunction / consumer complaint / arbitration / NCLT petition), in priority order.
+  * possibleNextSteps: include at least one immediate criminal-track action AND at least one immediate civil-track action when both branches are live.
+- When the facts only support one branch (purely civil OR purely criminal), stay in that branch — do NOT manufacture the other side just for balance. Coherence beats balance.
+- **No bracket tags in user-facing output.** Do NOT prefix or label items with "(criminal angle)", "(civil angle)", "(criminal-law angle)", "(civil-law angle)", or any similar bracketed tag. Weave both threads into natural prose / bullet text the way a lawyer would draft them in a memo.
 
 MULTIPLE MATTERS:
 If documents appear to include multiple matters, explicitly mention ambiguity and focus your output on the dominant dispute supported by strongest evidence.
@@ -2002,26 +2041,69 @@ OBJECTIVE-ALIGNMENT RULES (MANDATORY):
 - Never fabricate facts to force alignment; when objective and evidence conflict, state the conflict as weakness/risk.
 
 RELEVANT JURISDICTION FORMAT (STRICT):
-- Output must be COURT/FORUM-centric by location (High Court / Supreme Court / District Court / Family Court / Magistrate Court / Commission etc.).
+- Output must be COURT/FORUM-centric by location (High Court / Supreme Court / District Court / Family Court / Magistrate Court / Sessions Court / Tribunal / Commission etc.). Cover BOTH the criminal-side forum and the civil-side forum where both branches are live.
 - Return ONLY jurisdiction/forum names (no reasons, no legal basis text, no explanatory suffix).
 - Do NOT output location-only permissibility lines like "Patna, Bihar: Permissible under ...".
-- Good examples:
-  - "High Court of Delhi"
-  - "District & Sessions Court, Patna"
+- Good examples (criminal side):
   - "Metropolitan Magistrate Court, Delhi"
+  - "District & Sessions Court, Patna"
+  - "High Court of Delhi (Criminal Side)"
   - "Supreme Court of India"
+- Good examples (civil / tribunal side):
+  - "District Civil Judge, Patna"
+  - "Family Court, Bandra, Mumbai"
+  - "District Consumer Disputes Redressal Commission, Pune"
+  - "State Consumer Disputes Redressal Commission, Maharashtra"
+  - "National Consumer Disputes Redressal Commission, New Delhi"
+  - "National Company Law Tribunal, Mumbai Bench"
+  - "Debts Recovery Tribunal, Delhi"
+  - "Real Estate Regulatory Authority, Karnataka"
+  - "Arbitral Tribunal (seat: Mumbai)"
+  - "High Court of Bombay (Civil Side / Commercial Division)"
 
 LEGAL FRAMEWORK:
-Use only the following laws where relevant:
-- Bharatiya Nyaya Sanhita (BNS)
-- Bharatiya Nagarik Suraksha Sanhita (BNSS)
-- Bharatiya Sakshya Adhiniyam (BSA)
-- Information Technology Act 2000 (if applicable)
+Use applicable Indian laws across BOTH civil-law and criminal-law branches. The following are illustrative (NOT exhaustive — any other Indian central or state law may be cited if facts and sources support it):
+
+CRIMINAL-LAW SIDE (preferred citations):
+- Bharatiya Nyaya Sanhita (BNS), 2023 — substantive offences
+- Bharatiya Nagarik Suraksha Sanhita (BNSS), 2023 — criminal procedure
+- Bharatiya Sakshya Adhiniyam (BSA), 2023 — evidence
+- Information Technology Act, 2000 (cyber-offences)
+- Negotiable Instruments Act, 1881 — Section 138 (cheque dishonour, quasi-criminal)
+- PMLA 2002, NDPS 1985, Arms Act 1959, POCSO 2012, PCA 1988, UAPA 1967, Dowry Prohibition Act 1961, etc., where facts fit
+
+CIVIL-LAW SIDE:
+- Indian Contract Act, 1872 (breach, misrepresentation, indemnity, agency)
+- Specific Relief Act, 1963 (specific performance, injunctions, declarations)
+- Transfer of Property Act, 1882 (sale, mortgage, lease, gift, easement)
+- Code of Civil Procedure, 1908 (suit / plaint / appeal / execution)
+- Limitation Act, 1963 (time-bar)
+- Sale of Goods Act, 1930 (goods quality / passing of property)
+- Consumer Protection Act, 2019 (defect / deficiency / unfair trade practice)
+- Companies Act, 2013 (oppression, mismanagement, director duties, NCLT)
+- Arbitration and Conciliation Act, 1996 (arbitration clauses)
+- Hindu Marriage Act 1955 / Special Marriage Act 1954 / Hindu Succession Act 1956 / Guardians and Wards Act 1890 (family / succession)
+- Real Estate (Regulation and Development) Act, 2016; Motor Vehicles Act, 1988; Insolvency and Bankruptcy Code, 2016, etc., where facts fit
 
 DO NOT cite:
-- IPC
-- CrPC
-- Indian Evidence Act
+- IPC (Indian Penal Code, 1860) — use BNS 2023 instead
+- CrPC (Code of Criminal Procedure, 1973) — use BNSS 2023 instead
+- Indian Evidence Act, 1872 — use BSA 2023 instead
+
+DUAL LENS — CIVIL LAW + CRIMINAL LAW (MANDATORY):
+Before producing strengths / weaknesses / risks / pendingActions / nextSteps / relevantJurisdiction, consciously scan BOTH branches:
+- (Criminal angle) "What offence / criminal-procedural / evidence question do these facts attract?" → BNS / BNSS / BSA / IT Act / NI Act §138 / PMLA / NDPS, etc.
+- (Civil angle)    "What private remedy / suit / regulatory complaint do the same facts support?" → Contract Act / Specific Relief Act / TPA / CPC / Limitation Act / Consumer Protection Act / Companies Act / Arbitration Act / family laws / RERA / IBC, etc.
+
+When BOTH branches are plausibly supported by the documents, the analysis MUST cover both:
+- `strengths`: include factual strengths from each branch where present (each row's `laws` array can mix branches: e.g. `["BNS Section 318", "Indian Contract Act, 1872 Section 17"]`).
+- `weaknesses` and `risks`: surface gaps / objections / procedural risks from BOTH the criminal track (e.g. ingredients of offence not made out, BNSS bail risk, evidence admissibility under BSA) and the civil track (e.g. limitation under Limitation Act 1963, want of cause of action, jurisdiction, forum-selection / arbitration clause, locus, deficiency-vs-defect framing).
+- `pendingActions` and `nextSteps`: when both branches are live, include at least one immediate criminal-track action AND at least one immediate civil-track action (e.g. "Preserve digital evidence and file BNS §318 complaint" alongside "Issue legal notice and prepare suit for damages under Contract Act §73 / Specific Relief Act §10").
+- `relevantJurisdiction`: list forums from BOTH branches where applicable (criminal: Magistrate / Sessions / High Court criminal side; civil: District Civil Judge / Family Court / High Court civil side / Consumer Commissions (DCDRC / SCDRC / NCDRC) / NCLT / NCLAT / Debts Recovery Tribunal / RERA Authority / Arbitral Tribunal / Labour Court / Industrial Tribunal, as facts warrant).
+
+When the facts only support one branch (purely civil OR purely criminal), stay in that branch — do NOT manufacture the other side just to look balanced. Coherence beats balance.
+
+**No bracket tags in user-facing output.** Do NOT prefix or label any item in `strengths` / `weaknesses` / `risks` / `pendingActions` / `nextSteps` / `suggestedDrafts` / `relevantJurisdiction` with "(criminal angle)", "(civil angle)", "(criminal-law angle)", "(civil-law angle)", or any similar bracketed tag. Cite the relevant statutes inside the `laws` array (where present) or weave them into normal sentences — never use a parenthesised "angle" prefix.
 
 DOCUMENT RELATION RULE:
 If documents appear to include multiple matters, mention that ambiguity and prioritize the dispute best supported by evidence.
@@ -3916,13 +3998,25 @@ Example shape:
             act = str(item.get("act") or "").strip()
             section = normalize_section_label(item.get("section"))
             description = str(item.get("description") or "").strip()
-            # Guardrail: user explicitly asked to not show IPC items in output.
+            # Guardrail: user explicitly asked to not show IPC / CrPC / Indian
+            # Evidence Act 1872 items. Map those to BNS 2023 / BNSS 2023 / BSA
+            # 2023 in upstream prompt; here we just drop any leakage.
             act_l = act.lower()
             desc_l = description.lower()
             if (
                 re.search(r"\bindian\s*penal\s*code\b", act_l)
                 or re.search(r"\bipc\b", act_l)
                 or re.search(r"\bipc\b", desc_l)
+            ):
+                continue
+            if (
+                re.search(r"\bcode\s*of\s*criminal\s*procedure\b", act_l)
+                or re.search(r"\bcr\.?\s*p\.?\s*c\.?\b", act_l)
+                or re.search(r"\bcr\.?\s*p\.?\s*c\.?\b", desc_l)
+            ):
+                continue
+            if re.search(r"\bindian\s*evidence\s*act\b", act_l) and re.search(
+                r"\b1872\b", act_l
             ):
                 continue
             relevance_in = str(item.get("relevance") or "").strip().lower()
@@ -3945,7 +4039,13 @@ Example shape:
     def _heuristic_applicable_laws_fallback(
         self, evidence_snippet: str
     ) -> Dict[str, Any]:
-        """Best-effort law mapping from keywords when model JSON fails or returns empty."""
+        """Best-effort law mapping from keywords when model JSON fails or returns empty.
+
+        Designed to produce a BALANCED list across Indian civil law and criminal law:
+        criminal-side keywords route to BNS / BNSS / BSA / IT Act / NI Act 138 etc.,
+        while civil-side keywords route to Contract Act, Specific Relief Act, TPA,
+        Consumer Protection Act, Companies Act, Limitation Act, etc.
+        """
         txt = (evidence_snippet or "").lower()
         candidates: List[Dict[str, str]] = []
 
@@ -3962,13 +4062,15 @@ Example shape:
                 }
             )
 
+        # ----------------------------- CRIMINAL LAW -----------------------------
         if re.search(
-            r"\b(hack|hacked|phish|otp|password|account|cyber|digital)\b", txt
+            r"\b(hack|hacked|phish|otp|password|account|cyber|digital|upi|wallet)\b",
+            txt,
         ):
             add(
                 "Information Technology Act, 2000",
                 "Section 66C",
-                "Potential identity/credential misuse through digital systems.",
+                "Potential identity / credential misuse through digital systems.",
                 "High",
             )
             add(
@@ -3977,11 +4079,20 @@ Example shape:
                 "Potential cheating by personation using computer resources.",
                 "High",
             )
-        if re.search(r"\b(theft|stolen|stole|robbery|vehicle|car|bike)\b", txt):
+        if re.search(r"\b(theft|stolen|stole|robbery|burglar|dacoity|loot)\b", txt):
             add(
                 "Bharatiya Nyaya Sanhita, 2023",
                 "Section 303",
                 "Potential theft of movable property based on allegations.",
+                "High",
+            )
+        if re.search(
+            r"\b(cheat|fraud|defraud|forgery|forged|fake document|fabricat)\b", txt
+        ):
+            add(
+                "Bharatiya Nyaya Sanhita, 2023",
+                "Section 318",
+                "Potential cheating / dishonest inducement of property.",
                 "High",
             )
         if re.search(r"\b(threat|intimidat|blackmail|extort)\b", txt):
@@ -3991,22 +4102,136 @@ Example shape:
                 "Potential criminal intimidation-related conduct.",
                 "Medium",
             )
-        if re.search(r"\b(company|director|shareholder|board|mismanagement)\b", txt):
+        if re.search(r"\b(assault|hurt|injur|beat|attack|grievous)\b", txt):
+            add(
+                "Bharatiya Nyaya Sanhita, 2023",
+                "Section 115",
+                "Potential voluntarily causing hurt allegations.",
+                "Medium",
+            )
+        if re.search(r"\b(criminal breach of trust|misappropriat|embezzl)\b", txt):
+            add(
+                "Bharatiya Nyaya Sanhita, 2023",
+                "Section 316",
+                "Potential criminal breach of trust over entrusted property.",
+                "High",
+            )
+        if re.search(
+            r"\b(fir|f\.i\.r\.|police complaint|investigation|charge ?sheet|"
+            r"chargesheet|magistrate|bail)\b",
+            txt,
+        ):
+            add(
+                "Bharatiya Nagarik Suraksha Sanhita, 2023",
+                "Section 173",
+                "Registration / handling of information of cognizable offence.",
+                "Medium",
+            )
+        if re.search(r"\b(cheque|cheque bounce|dishonour|dishonor|bounced)\b", txt):
+            add(
+                "Negotiable Instruments Act, 1881",
+                "Section 138",
+                "Dishonour of cheque for insufficiency of funds.",
+                "High",
+            )
+
+        # ------------------------------- CIVIL LAW ------------------------------
+        if re.search(
+            r"\b(contract|agreement|mou|breach|consideration|offer|acceptance)\b",
+            txt,
+        ):
+            add(
+                "Indian Contract Act, 1872",
+                "Section 73",
+                "Compensation for loss caused by breach of contract.",
+                "High",
+            )
+        if re.search(
+            r"\b(specific performance|injunction|declaration|relief|recover possession)\b",
+            txt,
+        ):
+            add(
+                "Specific Relief Act, 1963",
+                "Section 10",
+                "Possible specific performance of a contract is enforceable.",
+                "Medium",
+            )
+            add(
+                "Specific Relief Act, 1963",
+                "Section 38",
+                "Perpetual injunction may be sought to prevent breach of obligation.",
+                "Medium",
+            )
+        if re.search(
+            r"\b(sale deed|mortgage|lease|tenant|landlord|gift deed|"
+            r"transfer of property|easement)\b",
+            txt,
+        ):
+            add(
+                "Transfer of Property Act, 1882",
+                "Section 54",
+                "Sale-of-immovable-property obligations may govern the transaction.",
+                "Medium",
+            )
+        if re.search(r"\b(suit|plaint|written statement|decree|civil court)\b", txt):
+            add(
+                "Code of Civil Procedure, 1908",
+                "Order VII Rule 1",
+                "Framing / maintainability of the plaint.",
+                "Medium",
+            )
+        if re.search(r"\b(time ?bar|barred by limitation|delay|condonation)\b", txt):
+            add(
+                "Limitation Act, 1963",
+                "Section 3",
+                "Limitation bar must be tested before the cause of action proceeds.",
+                "Medium",
+            )
+        if re.search(
+            r"\b(consumer|deficiency in service|unfair trade|product defect|service provider)\b",
+            txt,
+        ):
+            add(
+                "Consumer Protection Act, 2019",
+                "Section 35",
+                "Consumer complaint for deficiency in service / unfair trade practice.",
+                "Medium",
+            )
+        if re.search(r"\b(company|director|shareholder|board|mismanagement|nclt)\b", txt):
             add(
                 "Companies Act, 2013",
                 "Section 241",
-                "Possible oppression and mismanagement concerns requiring review.",
+                "Oppression and mismanagement concerns requiring review.",
+                "Medium",
+            )
+        if re.search(
+            r"\b(arbitration|arbitral|arbitrator|seat|venue|award)\b", txt
+        ):
+            add(
+                "Arbitration and Conciliation Act, 1996",
+                "Section 11",
+                "Appointment of arbitrator if the parties cannot agree.",
                 "Medium",
             )
         if re.search(r"\b(gst|invoice|input tax|itc|tax credit)\b", txt):
             add(
                 "Central Goods and Services Tax Act, 2017",
                 "Section 16",
-                "Input tax credit eligibility may be relevant to the dispute.",
+                "Input tax credit eligibility may be relevant.",
+                "Medium",
+            )
+        if re.search(
+            r"\b(divorce|matrimonial|maintenance|guardianship|custody|alimony|"
+            r"hindu marriage)\b",
+            txt,
+        ):
+            add(
+                "Hindu Marriage Act, 1955",
+                "Section 13",
+                "Grounds for divorce may be invoked.",
                 "Medium",
             )
 
-        # Keep output non-empty only when there is at least one signal.
         return self._normalize_applicable_laws_payload({"laws": candidates})
 
     async def _extract_case_signals_from_documents(
@@ -4086,6 +4311,14 @@ Example shape:
         query = " ".join(query_parts).strip()
         if not query:
             query = "Indian legal case applicable sections"
+        # Bias case-law search toward both civil-law and criminal-law angles so the
+        # downstream LLM sees grounded snippets from each branch instead of skewing
+        # the entire applicable_laws output toward one side of Indian law.
+        civil_criminal_hint = "civil law criminal law"
+        if not re.search(
+            r"\b(civil law|criminal law|civil|criminal)\b", query, flags=re.IGNORECASE
+        ):
+            query = f"{query} {civil_criminal_hint}".strip()
         return {
             "workspaceTitle": workspace_title,
             "query": query,
@@ -4218,6 +4451,8 @@ Example shape:
             if sources_text
             else "No external case snippets available."
         )
+        targeted_acts_block = format_targeted_acts_for_prompt()
+        targeted_acts_count = len(TARGETED_INDIAN_ACTS)
         prompt = f"""
 You are an Indian legal research assistant.
 Return ONLY one valid JSON object with this exact shape:
@@ -4233,16 +4468,57 @@ Return ONLY one valid JSON object with this exact shape:
   ]
 }}
 
-Rules:
-- Focus on likely applicable Indian laws/sections from the case facts.
-- Do NOT restrict to only predefined acts; any Indian law can be used.
-- Do NOT cite IPC (Indian Penal Code). If a section is IPC-linked, prefer the corresponding BNS section where applicable.
+Scope of analysis — Indian civil law AND criminal law (BOTH branches):
+- Treat this as a dual-lens exercise. Before finalising the list, consciously ask:
+  (1) "What CRIMINAL-law provisions could the documented facts attract?" and
+  (2) "What CIVIL-law provisions / private remedies could the same facts attract?"
+- Where the facts plausibly support BOTH a criminal angle and a civil angle, include
+  representative sections from EACH branch (balanced coverage). Do not silently drop
+  one branch just because the other is more obvious.
+- Where the facts only support one branch, return only that branch — do NOT invent
+  the other side just to fill a quota. Coherence beats balance.
+
+Typical Indian statutes to consider (illustrative, NOT exhaustive — any other Indian
+law may be cited if the facts and sources support it):
+- Criminal-law side (preferred citations):
+  * Bharatiya Nyaya Sanhita, 2023 (BNS) — substantive offences
+  * Bharatiya Nagarik Suraksha Sanhita, 2023 (BNSS) — criminal procedure
+  * Bharatiya Sakshya Adhiniyam, 2023 (BSA) — evidence
+  * Information Technology Act, 2000 (cyber-offence sections)
+  * Negotiable Instruments Act, 1881 (Section 138 — dishonour of cheque, quasi-criminal)
+  * PMLA 2002, NDPS 1985, Arms Act 1959, POCSO 2012, Dowry Prohibition Act 1961, PCA 1988, etc., where facts fit.
+- Civil-law side:
+  * Indian Contract Act, 1872 (breach, misrepresentation, indemnity, agency)
+  * Specific Relief Act, 1963 (specific performance, injunctions, declarations)
+  * Transfer of Property Act, 1882 (sale, mortgage, lease, gift disputes)
+  * Code of Civil Procedure, 1908 (suit / appeal / execution-related provisions)
+  * Limitation Act, 1963 (time-bar issues)
+  * Sale of Goods Act, 1930 (goods-quality / passing-of-property disputes)
+  * Consumer Protection Act, 2019 (deficiency in service, unfair trade practice)
+  * Companies Act, 2013 (oppression, mismanagement, director duties, NCLT)
+  * Arbitration and Conciliation Act, 1996 (where there is an arbitration clause)
+  * Hindu / Muslim / Special Marriage / Succession laws, family law statutes (matrimonial / succession / guardianship matters)
+  * RERA 2016, Rent Control statutes, MV Act 1988 (compensation), CGST Act 2017, etc., where facts fit.
+
+Hard rules:
+- Do NOT cite the **Indian Penal Code, 1860 (IPC)**. If a provision is IPC-linked, map it to the corresponding **BNS, 2023** section instead.
+- Do NOT cite the **Code of Criminal Procedure, 1973 (CrPC)**. If procedural, map it to the corresponding **BNSS, 2023** section instead.
+- Do NOT cite the **Indian Evidence Act, 1872**. If an evidence rule is needed, use the corresponding **BSA, 2023** section instead.
+- Do NOT restrict to only the lists above; ANY Indian statute (central or state) is allowed when it actually governs the fact pattern.
 - **Grounding (any type of matter):** Every row must be justified only from (a) the document excerpt below and/or (b) the numbered Indian Kanoon search lines. Do **not** invent or guess Act/Section numbers; the statutory label you output must match the **legal wrong or remedy** actually discussed in those sources.
 - **Coherence:** The offence, liability, or remedy described in your `description` must match what that Act and Section actually govern. If you cannot tie the fact pattern to the section with the sources in hand, **omit that row** rather than stretching unrelated provisions.
 - In each `description`, briefly show the link (e.g. a concrete fact from the documents, or "Search line N …" referring to one of the numbered results).
+- **No bracket tags or "angle" labels in `description`.** Do NOT prefix the description with "Criminal angle:", "Civil angle:", "Quasi-criminal angle:", "(criminal angle)", "(civil angle)", or any similar tag. The `act` field already makes the branch obvious to the lawyer; keep `description` as plain case-specific prose.
 - Relevance must be one of: High, Medium, Low.
 - Keep description concise and case-specific.
 - If evidence is insufficient, return {{"laws":[]}}.
+
+TARGETED INDIAN ACTS — strongly preferred universe ({targeted_acts_count} acts):
+The product targets the following curated list of Indian statutes / codes / rules. **Every `act` value you emit MUST be drawn from this list whenever the fact pattern is governed by any act on the list.** Match the act name as closely as possible to the wording shown here.
+
+If — and only if — a fact in the documents is clearly governed by an Indian law that is NOT on this list (rare), you may include it, provided (a) the source documents or numbered Indian Kanoon results explicitly support it, and (b) you are NOT citing IPC 1860, CrPC 1973, or the Indian Evidence Act 1872 (use BNS 2023 / BNSS 2023 / BSA 2023 instead).
+
+{targeted_acts_block}
 
 Workspace role: {workspace_role}
 Workspace title: {signals.get("workspaceTitle","")}
@@ -4350,6 +4626,140 @@ Indian Kanoon / case-law search results:
         )
         await asyncio.sleep(0.1)
 
+    async def _generate_procedural_timeline_from_documents(
+        self,
+        workspace_id: str,
+        user_id: str,
+        all_docs: List[Dict[str, Any]],
+        workspace_role: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Delegate to the ProceduralTimelineAgent (LangGraph 3-node pipeline).
+
+        The agent:
+          1. Extracts timeline entries per document in parallel
+             (self-classifying prompt — one call per document).
+          2. Runs a consolidation LLM pass that semantically merges
+             cross-document duplicates and drops commercial noise.
+          3. Validates formats, normalises types, fuzzy-deduplicates,
+             and sorts chronologically.
+
+        Returns list of {title, date, description, type} procedural entries.
+        """
+        from datetime import datetime as _dt
+
+        if not all_docs:
+            return []
+
+        from app.langgraph.procedural_timeline_agent import procedural_timeline_agent
+
+        # Build the document list the agent expects: {document_id, name, content}
+        documents = []
+        for i, doc in enumerate(all_docs, 1):
+            content = (doc.get("content") or "").strip()
+            if not content or len(content) < 20:
+                continue
+            documents.append(
+                {
+                    "document_id": str(doc.get("document_id") or f"doc_{i}"),
+                    "name": str(doc.get("name") or doc.get("filename") or f"Annexure {i}"),
+                    "content": content,
+                }
+            )
+
+        if not documents:
+            return []
+
+        try:
+            result = await procedural_timeline_agent.extract(
+                workspace_id=workspace_id,
+                documents=documents,
+                today_str=_dt.utcnow().strftime("%Y-%m-%d"),
+            )
+            logger.info(
+                "Procedural timeline: generated {} entries for workspace {}",
+                len(result),
+                workspace_id[:12] if workspace_id else "",
+            )
+            return result
+        except Exception as e:
+            logger.warning("Procedural timeline agent failed: {}", e)
+            return []
+
+    async def _generate_and_emit_procedural_timeline(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: Optional[str] = None,
+        batch_result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Fetch workspace documents, generate procedural/upcoming dates, emit to backend and cache.
+        Emits document_feature_response with featureType "procedural_timeline".
+        """
+        if not self._socket_client:
+            return
+        try:
+            from app.vectorstore.qdrant import vector_store
+
+            all_docs = await vector_store.get_all_documents(workspace_id=workspace_id)
+        except Exception as e:
+            logger.warning("Procedural timeline: could not fetch documents: {}", e)
+            all_docs = []
+
+        processed_doc_ids: set = set()
+        if isinstance(batch_result, dict):
+            for r in batch_result.get("results") or []:
+                did = str(r.get("document_id") or "").strip()
+                if did:
+                    processed_doc_ids.add(did)
+
+        target_docs = all_docs
+        if processed_doc_ids:
+            target_docs = [
+                d for d in (all_docs or [])
+                if str(d.get("document_id") or "").strip() in processed_doc_ids
+            ]
+
+        timeline = await self._generate_procedural_timeline_from_documents(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            all_docs=target_docs,
+            workspace_role=workspace_role,
+        )
+
+        if processed_doc_ids:
+            prior = self._workspace_procedural_timeline_payload.get(workspace_id) or []
+            if not isinstance(prior, list):
+                prior = []
+            retained = [
+                e for e in prior
+                if str(e.get("sourceDocId") or "").strip() not in processed_doc_ids
+            ]
+            merged = retained + (timeline or [])
+            merged.sort(key=lambda x: str(x.get("date") or ""))
+            self._workspace_procedural_timeline_payload[workspace_id] = merged
+            timeline = merged
+        else:
+            self._workspace_procedural_timeline_payload[workspace_id] = timeline
+
+        payload = {
+            "proceduralTimeline": timeline,
+        }
+        await self._socket_client.emit(
+            "document_feature_response",
+            {
+                "featureType": "procedural_timeline",
+                "workspaceId": workspace_id,
+                "userId": user_id,
+                "payload": payload,
+            },
+        )
+        logger.success(
+            "✅ Procedural timeline sent to backend ({} entries)", len(timeline)
+        )
+        await asyncio.sleep(0.1)
+
     def _strategy_objective_fallback(
         self,
         workspace_id: str,
@@ -4391,8 +4801,9 @@ Indian Kanoon / case-law search results:
         log_context: str = "",
     ) -> None:
         """
-        Run list_of_dates then applicable_laws without blocking the active socket handler,
-        so user_message_request (intelligence chat) can be processed while these emit.
+        Run list_of_dates → applicable_laws → procedural_timeline without blocking the
+        active socket handler, so user_message_request (intelligence chat) can be
+        processed while these emit.
         """
         ctx = log_context or ""
 
@@ -4427,11 +4838,29 @@ Indian Kanoon / case-law search results:
                     ctx,
                     laws_err,
                 )
+            try:
+                logger.info(
+                    "Procedural timeline: invoking (background{}) for workspace {}",
+                    ctx,
+                    workspace_id[:12] if workspace_id else "",
+                )
+                await self._generate_and_emit_procedural_timeline(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=workspace_role,
+                    batch_result=batch_result,
+                )
+            except Exception as pt_err:
+                logger.warning(
+                    "Procedural timeline (background{}) failed: {}",
+                    ctx,
+                    pt_err,
+                )
 
         try:
             asyncio.create_task(_runner())
             logger.debug(
-                "Scheduled list_of_dates + applicable_laws{} for workspace {}",
+                "Scheduled list_of_dates + applicable_laws + procedural_timeline{} for workspace {}",
                 ctx,
                 workspace_id[:12] if workspace_id else "",
             )
@@ -4493,6 +4922,7 @@ Indian Kanoon / case-law search results:
             "analysis_report",
             "list_of_dates",
             "applicable_laws",
+            "procedural_timeline",
         ]
         payload: Dict[str, Any] = {
             "workspaceId": workspace_id,
@@ -7730,6 +8160,21 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 )
                 logger.success(
                     "✅ Applicable laws re-emitted to backend after reconnect"
+                )
+            # 7) Procedural timeline
+            procedural_timeline = self._workspace_procedural_timeline_payload.get(workspace_id)
+            if procedural_timeline is not None:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "procedural_timeline",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": {"proceduralTimeline": procedural_timeline},
+                    },
+                )
+                logger.success(
+                    "✅ Procedural timeline re-emitted to backend after reconnect"
                 )
         except Exception as e:
             logger.warning("Failed to re-emit after reconnect: {}", e)

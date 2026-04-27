@@ -9,10 +9,26 @@ import re
 from typing import Any, Dict, List, Optional
 
 import google.generativeai as genai
+from google.generativeai.types import HarmBlockThreshold, HarmCategory
 from loguru import logger
 
 from app.core.config import settings
 from app.observability.trace import tracer
+
+
+# Permissive safety settings for legal document analysis.
+# Legal documents routinely contain content that trips Gemini's default safety
+# filters (allegations, threats of legal action, references to violence, medical
+# content, etc.). Without relaxing these thresholds, ~40-60% of legal-notice,
+# court-order, and consumer-complaint documents return finish_reason=2 (SAFETY).
+# We process legal content only — not user-facing generation — so BLOCK_NONE is
+# appropriate here.
+_PERMISSIVE_SAFETY_SETTINGS = {
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+}
 
 
 class GeminiClient:
@@ -167,7 +183,9 @@ class GeminiClient:
             # the asyncio loop (intelligence chat must stay responsive).
             def _sync_generate():
                 return self.model.generate_content(
-                    full_prompt, generation_config=generation_config
+                    full_prompt,
+                    generation_config=generation_config,
+                    safety_settings=_PERMISSIVE_SAFETY_SETTINGS,
                 )
 
             response = await asyncio.to_thread(_sync_generate)
@@ -195,7 +213,9 @@ class GeminiClient:
 
                         def _sync_repair():
                             return self.model.generate_content(
-                                repair_prompt, generation_config=repair_config
+                                repair_prompt,
+                                generation_config=repair_config,
+                                safety_settings=_PERMISSIVE_SAFETY_SETTINGS,
                             )
 
                         repair_response = await asyncio.to_thread(_sync_repair)
@@ -277,7 +297,9 @@ class GeminiClient:
             def _sync_chat():
                 chat = self.model.start_chat(history=[])
                 return chat.send_message(
-                    conversation_text, generation_config=generation_config
+                    conversation_text,
+                    generation_config=generation_config,
+                    safety_settings=_PERMISSIVE_SAFETY_SETTINGS,
                 )
 
             response = await asyncio.to_thread(_sync_chat)

@@ -6689,20 +6689,29 @@ Rules:
         section: str,
         rejected_value: str,
         report: Dict[str, Any],
-    ) -> tuple[int, str]:
+    ) -> Tuple[bool, int, str]:
         """
-        Ask AI to compute score increase (0–15) and reason based on priority of the rejected item.
-        Returns (delta, reason). On failure returns (default_bump, generic reason).
-        """
-        import json
-        import re
+        Ask AI to (a) decide if the user's rejection is VALID — i.e. the rejected
+        item is genuinely not relevant to this specific case — and (b) compute a
+        score INCREASE (1-5) when valid. The system will ADD the returned delta
+        to the current case resolution score.
 
+        - Valid rejection (item truly not relevant) → isValidRejection=true,
+          scoreIncrease 1-5.
+        - Invalid rejection (item IS relevant; user is dismissing a real gap) →
+          isValidRejection=false, scoreIncrease=0.
+
+        Returns (is_valid_rejection, delta, reason). On AI failure returns
+        (True, default_bump, generic reason) so the legacy "always bump" behaviour
+        is preserved when Gemini is unavailable.
+        """
         try:
             from app.ai.gemini_client import gemini_client
 
             gemini_client.initialize()
             if not gemini_client.model:
                 return (
+                    True,
                     self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT,
                     "Score adjusted to reflect user rejection.",
                 )
@@ -6711,6 +6720,21 @@ Rules:
             )
             remaining_weak = len(report.get("weaknesses") or [])
             remaining_risks = len(report.get("risks") or [])
+
+            case_summary = (
+                report.get("caseSummary") or report.get("case_summary") or ""
+            ).strip()
+            report_summary = (
+                report.get("reportCaseSummary")
+                or report.get("report_case_summary")
+                or ""
+            ).strip()
+            strategic_objective = (
+                report.get("strategicObjective")
+                or report.get("strategic_objective")
+                or ""
+            ).strip()
+
             # Build short context: other items in the same section so the model can judge relative impact
             section_items: List[str] = []
             if section == "missingInfo":
@@ -6733,22 +6757,30 @@ Rules:
             can_reach_100 = (
                 remaining_missing == 0 and remaining_weak == 0 and remaining_risks == 0
             )
-            prompt = f"""You are a legal case analyst. The user rejected ONE item from their analysis report as not relevant. The system will ADD your scoreIncrease to the current score. Output a JSON object with "scoreIncrease" (integer 1-5) and "reason" (one short sentence).
+            prompt = f"""You are a legal case analyst. The user rejected ONE item from their analysis report as not relevant. Two decisions are required:
+
+1) Is the rejection VALID? It is VALID only when the rejected item is genuinely NOT relevant to THIS case (per the case summary, strategic objective, and remaining items below). If the rejected item IS relevant — i.e. it is a real evidence gap, factual weakness, or procedural risk that this case actually faces — the rejection is INVALID and the user should not be rewarded with a score increase.
+2) If VALID, choose an integer scoreIncrease 1-5. The system will ADD this to the current score. If INVALID, set scoreIncrease=0.
 
 **Current case resolution score**: {current_score}%
+**Case summary**: {case_summary[:600] or "(not available)"}
+**Report-facing summary**: {report_summary[:400] or "(not available)"}
+**Strategic objective**: {strategic_objective[:400] or "(not available)"}
 **Section from which item was rejected**: {section}
 **Rejected item (exact text)**: "{rejected_value[:400]}"
 **Remaining counts after this rejection**: missingInfo={remaining_missing}, weaknesses={remaining_weak}, risks={remaining_risks}
 {f'**{section_context}**' if section_context else ''}
 **Score rule**: When missingInfo, weaknesses, and risks are all 0 (no remaining items), the score can reach 100%. When any remain, score is capped at 95%. {"This rejection leaves no items in any category – score can go to 100%." if can_reach_100 else "Items still remain – score will be capped at 95%."}
 
-IMPACT RULES – choose scoreIncrease (1-5) based on the SPECIFIC rejected item. The score will increase by this amount.
+VALIDITY GUIDELINES (decide isValidRejection)
+- VALID: the rejected item is off-topic, generic boilerplate that doesn't fit this case's facts, addressed by another item, or clearly out-of-scope for the parties/role/jurisdiction.
+- INVALID: the rejected item is core to the pleaded facts, supports a key element the case relies on, or directly addresses a real risk this case faces. Generic items that DO apply to this case are still INVALID rejections.
 
-- scoreIncrease MUST be an integer between 1 and 5 only.
-- Do NOT output numbers outside this range.
+IMPACT RULES (only when isValidRejection=true) – choose scoreIncrease (1-5) based on the SPECIFIC rejected item:
+- scoreIncrease MUST be an integer between 1 and 5.
 - When this is the last rejection (all counts 0 above), use 4 or 5 so the score can reach 100%.
 
-SECTION GUIDELINES
+SECTION GUIDELINES (when isValidRejection=true)
 
 missingInfo (user says this "missing" item is not needed):
 - Minor detail (dates, small clarification): scoreIncrease = 1
@@ -6761,7 +6793,7 @@ riskOrWeakness (user says this risk/weakness does not apply):
 - Major legal risk or strong weakness: scoreIncrease = 4–5
 
 Output ONLY valid JSON, no markdown, no code block:
-{{"scoreIncrease": <integer 1-5>, "reason": "<one short sentence explaining why this increase for this item>"}}
+{{"isValidRejection": <true|false>, "scoreIncrease": <integer 0-5>, "reason": "<one short sentence>"}}
 """
             raw = await gemini_client.generate(
                 prompt=prompt,
@@ -6779,6 +6811,7 @@ Output ONLY valid JSON, no markdown, no code block:
                     (raw or "")[:100],
                 )
                 return (
+                    True,
                     self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT,
                     "Score adjusted to reflect user rejection.",
                 )
@@ -6790,7 +6823,7 @@ Output ONLY valid JSON, no markdown, no code block:
                 else:
                     raw = re.sub(r"^```\w*\s*", "", raw)
                     raw = re.sub(r"\s*```\s*$", "", raw)
-            obj = None
+            obj: Optional[Dict[str, Any]] = None
             start = raw.find("{")
             if start >= 0:
                 depth = 0
@@ -6803,44 +6836,79 @@ Output ONLY valid JSON, no markdown, no code block:
                             try:
                                 obj = json.loads(raw[start : i + 1])
                             except json.JSONDecodeError:
-                                pass
+                                obj = None
                             break
+
+            def _coerce_bool(value: Any, default: bool) -> bool:
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, (int, float)):
+                    return bool(value)
+                if isinstance(value, str):
+                    return value.strip().lower() in ("true", "yes", "1")
+                return default
+
             if obj and isinstance(obj, dict) and "scoreIncrease" in obj:
+                is_valid = _coerce_bool(
+                    obj.get("isValidRejection", obj.get("is_valid_rejection")),
+                    default=True,
+                )
                 delta = int(
                     obj.get("scoreIncrease", self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT)
                 )
-                delta = max(1, min(5, delta))  # Rejection bump 1-5 as per prompt
-                if current_score + delta > 100:
-                    delta = max(0, 100 - current_score)
+                if not is_valid:
+                    delta = 0
+                else:
+                    delta = max(1, min(5, delta))  # Rejection bump 1-5 as per prompt
+                    if current_score + delta > 100:
+                        delta = max(0, 100 - current_score)
                 reason = (
                     obj.get("reason") or "Score adjusted based on rejection priority."
                 ).strip()
                 logger.info(
-                    "Rejection score delta: AI delta={}, reason={}",
+                    "Rejection score delta: AI isValid={} delta={}, reason={}",
+                    is_valid,
                     delta,
                     (reason or "")[:80],
                 )
-                return (delta, reason[:200])
+                return (is_valid, delta, reason[:200])
             # Regex fallback: extract scoreIncrease from raw text (e.g. malformed or truncated JSON)
             num_match = re.search(
                 r'"scoreIncrease"\s*:\s*(\d+)|scoreIncrease"\s*:\s*(\d+)|\bscoreIncrease\s*:\s*(\d+)',
                 raw,
             )
             if num_match:
+                valid_match = re.search(
+                    r'"isValidRejection"\s*:\s*(true|false)',
+                    raw,
+                    flags=re.IGNORECASE,
+                )
+                is_valid = (
+                    valid_match.group(1).strip().lower() == "true"
+                    if valid_match
+                    else True
+                )
                 delta = int(
                     num_match.group(1) or num_match.group(2) or num_match.group(3) or 0
                 )
-                delta = max(1, min(5, delta))  # Rejection bump 1-5 as per prompt
-                if current_score + delta > 100:
-                    delta = max(0, 100 - current_score)
+                if not is_valid:
+                    delta = 0
+                else:
+                    delta = max(1, min(5, delta))  # Rejection bump 1-5 as per prompt
+                    if current_score + delta > 100:
+                        delta = max(0, 100 - current_score)
                 reason_match = re.search(r'"reason"\s*:\s*"([^"]*)"', raw)
                 reason = (
                     reason_match.group(1).strip()
                     if reason_match
                     else "Score adjusted based on rejection priority."
                 )[:200]
-                logger.info("Rejection score delta: parsed via regex delta={}", delta)
-                return (delta, reason)
+                logger.info(
+                    "Rejection score delta: parsed via regex isValid={} delta={}",
+                    is_valid,
+                    delta,
+                )
+                return (is_valid, delta, reason)
             logger.warning(
                 "Rejection score delta: could not parse response; using default. raw={}",
                 raw[:200],
@@ -6848,6 +6916,7 @@ Output ONLY valid JSON, no markdown, no code block:
         except Exception as e:
             logger.warning("Rejection score delta failed: {}; using default bump", e)
         return (
+            True,
             self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT,
             "Score adjusted to reflect user rejection.",
         )
@@ -6855,8 +6924,17 @@ Output ONLY valid JSON, no markdown, no code block:
     async def on_analysis_report_feedback(self, data: Dict[str, Any]) -> None:
         """
         Handle analysis_report_feedback: user rejected an analysis item (missingInfo or riskOrWeakness).
-        Remove the item, bump caseResolutionScore, update qualityScoreExplanation and
-        reportQualityScoreExplanation, re-emit report.
+
+        - The matching item is always removed from the list (the user explicitly
+          rejected it).
+        - The AI then judges whether the rejection itself is VALID — i.e. the
+          rejected item is genuinely not relevant to this case.
+            - VALID rejection → caseResolutionScore is bumped 1–5.
+            - INVALID rejection (item IS relevant; user dismissed a real gap) →
+              score is unchanged.
+        - qualityScoreExplanation and reportQualityScoreExplanation are
+          regenerated either way, and the analysis report is always re-emitted
+          so the FE loader clears.
         """
         import copy
 
@@ -6950,18 +7028,57 @@ Output ONLY valid JSON, no markdown, no code block:
                     removed = True
 
         if not removed:
+            # Stale / duplicate rejection: the rejectedValue does not match any
+            # current item (already removed by an earlier reject, or the FE sent
+            # slightly different text). Don't bump the score and don't waste an
+            # AI call – just refresh the timestamp and re-emit so the FE loader
+            # clears against an unchanged report.
             logger.info(
-                "analysis_report_feedback: no matching item found for rejectedValue in {} – applying score bump only",
+                "analysis_report_feedback: no matching item found for rejectedValue in {} – "
+                "no score change, re-emitting unchanged analysis_report (workspace={})",
                 section,
+                workspace_id,
             )
+            report["timestamp"] = datetime.utcnow().isoformat() + "Z"
+            self._workspace_analysis_payload[workspace_id] = report
+            if self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "analysis_report",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": report,
+                    },
+                )
+                logger.success(
+                    "✅ analysis_report_feedback no-op (stale reject): re-emitted unchanged analysis_report (score stays at {}%)",
+                    old_score,
+                )
+            else:
+                logger.warning(
+                    "analysis_report_feedback: no socket client – cannot clear FE loader for workspace {}",
+                    workspace_id,
+                )
+            return
 
-        # Compute score increase based on priority/significance of the rejected item (AI)
-        score_delta, delta_reason = await self._compute_rejection_score_delta(
-            current_score=old_score,
-            section=section,
-            rejected_value=rejected_value,
-            report=report,
+        # AI validates the rejection and computes the score delta.
+        # Invalid rejection (rejected item is actually relevant to this case) →
+        # delta is forced to 0 so the user is not rewarded for dismissing a real gap.
+        is_valid_rejection, score_delta, _delta_reason = (
+            await self._compute_rejection_score_delta(
+                current_score=old_score,
+                section=section,
+                rejected_value=rejected_value,
+                report=report,
+            )
         )
+        if not is_valid_rejection:
+            logger.info(
+                "analysis_report_feedback: AI judged rejection INVALID (item is relevant) – "
+                "removing item but not bumping score (workspace={})",
+                workspace_id,
+            )
         new_score = min(100, old_score + score_delta)
         # Cap at 95% when Missing Info / Risks / Weaknesses still have items (100% only when all empty)
         max_allowed = self._analysis_report_max_allowed_score(report=report)
@@ -7212,14 +7329,15 @@ Output ONLY valid JSON, no markdown, no code block:
         Handle added_missing_information: user manually supplies title+description
         to address previously-flagged missing information.
 
-        - If the user-supplied text is RELATED to the case (per AI judgement), the
-          caseResolutionScore is DECREASED, qualityScoreExplanation is freshly
-          regenerated, and the analysis report is re-emitted.
+        - If the user-supplied text is RELATED to the case (per AI judgement),
+          the entry is APPENDED to the missingInfo list (deduped against existing
+          entries) so it is visible to the user and can later be rejected via the
+          existing analysis_report_feedback flow. caseResolutionScore is then
+          DECREASED, qualityScoreExplanation is regenerated freshly, and the
+          analysis report is re-emitted.
         - If the text is NOT related, the cached analysis report is re-emitted
           unchanged (only the timestamp is refreshed) so the frontend loader
           clears. Score, explanations, and list items stay exactly as-is.
-        - The missingInfo list is never modified by this event (the user is
-          providing context, not curating items).
         """
         import copy
 
@@ -7314,8 +7432,45 @@ Output ONLY valid JSON, no markdown, no code block:
                 )
             return
 
-        # Apply score decrease (clamped at 0). Pending-item cap (95%) is unchanged
-        # because we are not modifying the missing/weakness/risk lists here.
+        # Append the user-supplied entry to missingInfo so it is visible in the
+        # report and can later be rejected via analysis_report_feedback. Use a
+        # plain string (matches the existing missingInfo schema) and dedupe
+        # against the current list using the same matcher the rejection flow
+        # relies on.
+        if title and description:
+            new_entry = f"{title}: {description}"
+        else:
+            new_entry = title or description
+        new_entry = new_entry.strip()
+
+        missing_list_key = (
+            "missingInfo" if "missingInfo" in report else "missing_info"
+        )
+        current_missing = report.get(missing_list_key) or []
+        if not isinstance(current_missing, list):
+            current_missing = [current_missing] if current_missing else []
+
+        already_present = any(
+            self._match_rejected_value(x, new_entry) for x in current_missing
+        )
+        if not already_present and new_entry:
+            current_missing = list(current_missing) + [new_entry]
+            report[missing_list_key] = current_missing
+            logger.info(
+                "added_missing_information: appended new entry to missingInfo "
+                "(workspace={}, total={})",
+                workspace_id,
+                len(current_missing),
+            )
+        else:
+            logger.info(
+                "added_missing_information: entry already present in missingInfo – not duplicating (workspace={})",
+                workspace_id,
+            )
+
+        # Apply score decrease (clamped at 0). The 95% cap still applies because
+        # we just appended a missingInfo item, so the case has at least one
+        # pending item.
         new_score = max(0, old_score - score_delta)
         max_allowed = self._analysis_report_max_allowed_score(report=report)
         new_score = min(new_score, max_allowed)

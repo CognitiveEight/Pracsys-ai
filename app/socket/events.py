@@ -47,8 +47,12 @@ from app.socket.schemas import (
 )
 from app.utils.exceptions import SocketEventError
 from app.workspace.custom_instructions import (build_custom_instruction_suffix,
+                                               hydrate_custom_instructions_from_cache,
                                                set_custom_instructions)
 from app.workspace.manager import workspace_manager
+from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
+                                       hydrate_workspace_state, persist_state,
+                                       restore_state)
 from agent import process_analysis_docx_request
 
 EventHandler = Callable[[Dict[str, Any]], Awaitable[None]]
@@ -237,14 +241,18 @@ class SocketEventHandler:
     def __init__(self):
         self._handlers: Dict[str, EventHandler] = {}
         self._socket_client = None  # Will be set by main service
+        # NOTE: every per-workspace cache below is a PersistentWorkspaceDict so
+        # that writes (`self._workspace_X[workspace_id] = ...`) are mirrored to
+        # Qdrant in the background. After an AI service restart we hydrate the
+        # cache by reading these same kinds back via `restore_state`.
         self._workspace_suggestion_chips: Dict[str, List[str]] = (
-            {}
+            PersistentWorkspaceDict("strategy_suggestion_chips")
         )  # workspace_id -> 15-16 strategy chips
         self._workspace_analysis_suggestion_chips: Dict[str, List[str]] = (
-            {}
+            PersistentWorkspaceDict("analysis_suggestion_chips")
         )  # workspace_id -> 15-16 analysis-report chips
         self._workspace_chat_suggestion_chips: Dict[str, List[str]] = (
-            {}
+            PersistentWorkspaceDict("chat_suggestion_chips")
         )  # workspace_id -> 10-12 contextual chips (refreshed per AI reply; we return random 4 on each request)
         self._last_workspace_id_with_chips: Optional[str] = (
             None  # fallback when request workspace has no chips
@@ -259,16 +267,30 @@ class SocketEventHandler:
         # - strategy_objective: detailed strategy/opinion
         # - analysis_report: score + strengths/weaknesses
         # - list_of_dates: timeline extracted from documents
-        self._workspace_document_assessments_payload: Dict[str, Any] = {}
-        self._workspace_metadata_payload: Dict[str, Any] = {}
-        self._workspace_strategy_payload: Dict[str, Any] = {}
-        self._workspace_analysis_payload: Dict[str, Any] = {}
+        self._workspace_document_assessments_payload: Dict[str, Any] = (
+            PersistentWorkspaceDict(CacheKinds.DOCUMENT_ASSESSMENTS)
+        )
+        self._workspace_metadata_payload: Dict[str, Any] = PersistentWorkspaceDict(
+            CacheKinds.WORKSPACE_METADATA_PAYLOAD
+        )
+        self._workspace_strategy_payload: Dict[str, Any] = PersistentWorkspaceDict(
+            CacheKinds.STRATEGY_PAYLOAD
+        )
+        self._workspace_analysis_payload: Dict[str, Any] = PersistentWorkspaceDict(
+            CacheKinds.ANALYSIS_REPORT
+        )
         # List of Dates timeline per workspace (chronological events from case documents)
-        self._workspace_list_of_dates_payload: Dict[str, List[Dict[str, Any]]] = {}
+        self._workspace_list_of_dates_payload: Dict[str, List[Dict[str, Any]]] = (
+            PersistentWorkspaceDict(CacheKinds.LIST_OF_DATES)
+        )
         # Applicable laws payload per workspace (acts/sections inferred from docs + case law search)
-        self._workspace_applicable_laws_payload: Dict[str, Dict[str, Any]] = {}
+        self._workspace_applicable_laws_payload: Dict[str, Dict[str, Any]] = (
+            PersistentWorkspaceDict(CacheKinds.APPLICABLE_LAWS)
+        )
         # Procedural timeline payload per workspace (upcoming filing/hearing/compliance/evidence/adjournment dates)
-        self._workspace_procedural_timeline_payload: Dict[str, List[Dict[str, Any]]] = {}
+        self._workspace_procedural_timeline_payload: Dict[
+            str, List[Dict[str, Any]]
+        ] = PersistentWorkspaceDict(CacheKinds.PROCEDURAL_TIMELINE)
         # Re-emit after reconnect when socket dropped right after analysis report (so backend gets the update)
         self._had_disconnect: bool = False
         self._pending_reemit_workspace_id: Optional[str] = None
@@ -293,6 +315,119 @@ class SocketEventHandler:
         # from older pipelines so FE receives only the fresh objective-aligned report.
         self._suppress_analysis_emit_until_ts: Dict[str, float] = {}
         self._register_default_handlers()
+
+    async def _hydrate_workspace_caches(
+        self,
+        workspace_id: str,
+        *,
+        user_id: Optional[str] = None,
+    ) -> None:
+        """Repopulate in-memory per-workspace caches from Qdrant.
+
+        Runs at the start of chat and document-feature handlers so that an AI
+        service restart does not silently degrade chat with empty annexures,
+        missing analysis report and missing applicable laws. No-ops when the
+        in-memory cache already has data for this workspace (the live process
+        is the source of truth).
+        """
+        if not workspace_id:
+            return
+        try:
+            # Workspace context (title, status, role, evidence files, metadata)
+            from app.workspace.context import context_manager
+
+            existing_ctx = context_manager.get_context(workspace_id)
+            need_meta_hydration = (
+                existing_ctx is None
+                or not (existing_ctx.evidence_files or [])
+                or not existing_ctx.metadata
+            )
+        except Exception:
+            existing_ctx = None
+            need_meta_hydration = True
+
+        # Skip work entirely when every cache we care about is already warm.
+        all_warm = (
+            not need_meta_hydration
+            and bool(self._workspace_analysis_payload.get(workspace_id))
+            and bool(self._workspace_applicable_laws_payload.get(workspace_id))
+            and bool(self._workspace_procedural_timeline_payload.get(workspace_id))
+        )
+        if all_warm:
+            return
+
+        try:
+            cached_kinds = await hydrate_workspace_state(workspace_id)
+        except Exception as e:  # pragma: no cover - best-effort
+            logger.debug(
+                "Workspace cache hydration failed (workspace={}): {}",
+                workspace_id,
+                e,
+            )
+            cached_kinds = {}
+
+        if not cached_kinds:
+            return
+
+        meta_payload = cached_kinds.get(CacheKinds.WORKSPACE_META)
+        if isinstance(meta_payload, dict):
+            try:
+                from app.workspace.context import context_manager
+
+                if existing_ctx is not None:
+                    existing_ctx.apply_cache_dict(meta_payload)
+                else:
+                    await context_manager.hydrate_context_from_cache(
+                        workspace_id=workspace_id, user_id=user_id
+                    )
+            except Exception as e:
+                logger.debug(
+                    "Workspace context hydration failed (workspace={}): {}",
+                    workspace_id,
+                    e,
+                )
+
+        # Hydrate per-kind in-memory dicts only when nothing is in memory yet.
+        kind_to_dict = {
+            CacheKinds.ANALYSIS_REPORT: self._workspace_analysis_payload,
+            CacheKinds.APPLICABLE_LAWS: self._workspace_applicable_laws_payload,
+            CacheKinds.PROCEDURAL_TIMELINE: self._workspace_procedural_timeline_payload,
+            CacheKinds.LIST_OF_DATES: self._workspace_list_of_dates_payload,
+            CacheKinds.WORKSPACE_METADATA_PAYLOAD: self._workspace_metadata_payload,
+            CacheKinds.DOCUMENT_ASSESSMENTS: self._workspace_document_assessments_payload,
+            CacheKinds.STRATEGY_PAYLOAD: self._workspace_strategy_payload,
+        }
+        for kind, target in kind_to_dict.items():
+            payload = cached_kinds.get(kind)
+            if payload is None:
+                continue
+            if target.get(workspace_id):
+                continue
+            try:
+                if isinstance(target, PersistentWorkspaceDict):
+                    target.hydrate_from_cache(workspace_id, payload)
+                else:
+                    target[workspace_id] = payload
+            except Exception as e:
+                logger.debug(
+                    "Cache rehydration skipped (kind={}, workspace={}): {}",
+                    kind,
+                    workspace_id,
+                    e,
+                )
+
+        ci_payload = cached_kinds.get(CacheKinds.CUSTOM_INSTRUCTIONS)
+        if isinstance(ci_payload, dict):
+            try:
+                hydrate_custom_instructions_from_cache(workspace_id, ci_payload)
+            except Exception:
+                pass
+
+        logger.info(
+            "Hydrated workspace caches from Qdrant: {} (kinds={})",
+            workspace_id,
+            sorted(cached_kinds.keys()),
+        )
 
     async def _remember_workspace_role(
         self,
@@ -444,6 +579,10 @@ class SocketEventHandler:
         self.register("user_message_request", self.on_user_message_request)
         self.register("probing_prompts_request", self.on_probing_prompts_request)
         self.register("analysis_report_feedback", self.on_analysis_report_feedback)
+        self.register(
+            "added_missing_information",
+            self.on_added_missing_information,
+        )
         self.register(
             "applicable_law_relevance_request",
             self.on_applicable_law_relevance_request,
@@ -1609,6 +1748,112 @@ Reply JSON only: {{"objectiveText": "..."}}"""
             logger.warning("Objective instruction summarization failed: {}", e)
             return None
 
+    @staticmethod
+    def _extract_declarative_objective_text(user_message: str) -> str:
+        """Detect declarative "objective is …" / "client objective is …" / "objective: …"
+        patterns and return the extracted objective text.
+
+        Returns "" when:
+        - the message is a question (ends with "?" or starts with question word),
+        - the pattern is an explanatory framing like "the objective of <concept> is …",
+        - no recognized declarative pattern matches,
+        - the extracted text is too short / too generic to be a real objective.
+
+        This is a deterministic safety net for the LLM classifier — when it fires,
+        it forces mode="direct_update" with this text as objectiveText.
+        """
+        msg = (user_message or "").strip()
+        if not msg or len(msg) < 12:
+            return ""
+        # Strip trailing/leading quotes/punctuation noise that confuses regexes
+        stripped = msg.strip().strip('"\u201c\u201d\u2018\u2019')
+        if not stripped:
+            return ""
+        # Skip obvious questions.
+        if stripped.endswith("?"):
+            return ""
+        first_word = re.match(r"\s*(\w+)", stripped, flags=re.UNICODE)
+        if first_word:
+            fw = first_word.group(1).lower()
+            if fw in {
+                "what",
+                "why",
+                "how",
+                "which",
+                "when",
+                "where",
+                "who",
+                "should",
+                "can",
+                "could",
+                "would",
+                "is",
+                "are",
+                "do",
+                "does",
+                "did",
+            }:
+                return ""
+
+        # Reject explanatory framing where "objective" is being defined, not set:
+        #   "the objective of a writ petition is to ..."
+        #   "an objective in such cases is usually ..."
+        if re.search(
+            r"\b(?:the|an|a)\s+(?:strategic\s+|primary\s+|main\s+)?objective\s+(?:of|in)\s+\w+",
+            stripped,
+            flags=re.IGNORECASE,
+        ):
+            return ""
+
+        # Patterns we treat as declarative objective-setters.
+        # Each pattern captures the objective text in group 1.
+        patterns = [
+            # "objective: <X>"  /  "the objective: <X>"
+            r"(?:^|[\.\!\n;])\s*(?:the\s+|our\s+|my\s+|case\s+|client(?:'s|s)?\s+)?objective\s*[:=]\s*(.+?)(?:[\.\!\n;]|$)",
+            # "set (the) objective to <X>"  /  "set objective: <X>" already covered above
+            r"\bset\s+(?:the\s+)?objective\s+to\s+(.+?)(?:[\.\!\n;]|$)",
+            # "(client(?:'s)?|our|my|the|case) objective (is|should be) <X>"
+            r"(?:^|[\.\!\n;]|\s)(?:the|our|my|case|client(?:'s|s)?)\s+objective\s+(?:is|should\s+be|will\s+be|must\s+be)\s+(.+?)(?:[\.\!\n;]|$)",
+            # bare "objective is <X>" / "objective should be <X>" at sentence start
+            r"(?:^|[\.\!\n;])\s*objective\s+(?:is|should\s+be|will\s+be|must\s+be)\s+(.+?)(?:[\.\!\n;]|$)",
+        ]
+
+        for pat in patterns:
+            m = re.search(pat, stripped, flags=re.IGNORECASE | re.DOTALL)
+            if not m:
+                continue
+            captured = (m.group(1) or "").strip()
+            if not captured:
+                continue
+            # Strip leading filler tokens that are not part of the objective itself.
+            captured = re.sub(
+                r"^(?:to\s+|that\s+|going\s+to\s+|gonna\s+)",
+                "",
+                captured,
+                flags=re.IGNORECASE,
+            ).strip()
+            # Reject vague / placeholder content that wouldn't be a real objective.
+            if len(captured) < 6:
+                continue
+            low = captured.lower()
+            vague = {
+                "tbd",
+                "to be decided",
+                "unclear",
+                "unknown",
+                "not sure",
+                "discussed",
+            }
+            if low in vague:
+                continue
+            # Cap length so we don't accidentally swallow a paragraph.
+            if len(captured) > 400:
+                captured = captured[:400].rstrip() + "…"
+            # Capitalize first letter for nicer display, leave rest intact.
+            return captured[:1].upper() + captured[1:]
+
+        return ""
+
     async def _should_offer_objective_update_after_discussion(
         self,
         user_message: str,
@@ -1642,13 +1887,26 @@ User message:
 
 Assistant reply (for context, first 1200 chars):
 {ar[:1200]}"""
+            # max_tokens is generous because gemini-3-flash-preview counts
+            # internal "thinking" tokens against the same budget; 120 was too
+            # small and the response was returning with finish_reason=MAX_TOKENS
+            # (no Part), which produced a non-JSON error string for callers.
             raw = await gemini_client.generate(
                 prompt=prompt,
                 temperature=0.0,
-                max_tokens=120,
+                max_tokens=512,
                 response_mime_type="application/json",
             )
-            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            raw_text = (raw or "").strip()
+            # gemini_client now returns "" when the candidate had no Part and
+            # the legacy code returned an "Error generating response: …" string.
+            # Treat both as "no offer" without spamming WARN logs.
+            if not raw_text or raw_text.lower().startswith("error generating"):
+                logger.debug(
+                    "Objective-offer classifier got empty/error response; treating as no-offer"
+                )
+                return False
+            json_str = self._prepare_json_candidate(raw_text, prefer="object")
             if not json_str:
                 return False
             data = json.loads(json_str)
@@ -1763,6 +2021,47 @@ If the above statements are:
 -> isQuestionLike = false
 
 --------------------------------
+DECLARATIVE OBJECTIVE STATEMENTS (CRITICAL — VERY COMMON)
+--------------------------------
+
+When the lawyer DECLARES the objective using phrasing like:
+- "objective is <X>"
+- "the objective is <X>"
+- "our objective is <X>"
+- "client objective is <X>" / "client's objective is <X>"
+- "the client's goal/aim is <X>"
+- "objective should be <X>" / "the objective should be <X>"
+- "the objective of the case is <X>"
+- "set the objective to <X>" / "set objective: <X>"
+- "objective: <X>"
+- "we want <X>" / "we are seeking <X>" (declarative, not exploratory)
+
+…this is a DECLARATIVE STATEMENT OF THE STRATEGIC OBJECTIVE.
+
+It is NOT an explanation, NOT informational, and NOT exploratory.
+You MUST classify it as:
+-> mode = "direct_update"
+-> updateRequestedNow = true
+-> isQuestionLike = false
+-> objectiveText = the concrete content of <X> (the part AFTER "is" / ":" / "to")
+
+Counter-examples that are NOT declarative objective statements
+(these remain mode = "none"):
+- Meta-talk about the concept: "the objective of a writ petition is generally to..."
+  (talking ABOUT what an objective is, not setting one)
+- Generic teaching: "in cases like this, the objective is usually to ..."
+  (describing typical practice, no first-person commitment)
+- Question forms: "what should the objective be?", "is the objective to ...?"
+- Hypotheticals: "if the objective were X, then ..."
+
+Heuristic to disambiguate:
+- First-person / case-specific subject ("our", "client", "the case", "we")
+  + "objective"/"goal"/"aim" + "is"/"should be"/":"/"to"
+  -> DECLARATIVE -> direct_update
+- Third-person / generic subject ("the objective of <concept>", "an objective is")
+  + descriptive verb -> EXPLANATORY -> none
+
+--------------------------------
 HARD CONSTRAINTS (MANDATORY)
 --------------------------------
 
@@ -1791,10 +2090,23 @@ OBJECTIVE TEXT RULE
 - Keep it SHORT, CLEAR, and ACTION-ORIENTED
 - Do NOT add new information
 - Do NOT hallucinate or expand meaning
+- For declarative statements ("objective is X", "client objective is X",
+  "objective: X", "set the objective to X"), the objectiveText is exactly
+  the content X — strip the leading "objective is" / "the objective is" /
+  "client objective is" / ":" / "to " framing.
 
 Examples:
 Input: "Focus on breach of contract instead of negligence"
 Output: "Focus on breach of contract over negligence"
+
+Input: "Client objective is to obtain regular bail under Section 439 CrPC"
+Output: "Obtain regular bail under Section 439 CrPC"
+
+Input: "the objective is to challenge the territorial jurisdiction"
+Output: "Challenge the territorial jurisdiction"
+
+Input: "objective: secure interim injunction before next hearing"
+Output: "Secure interim injunction before next hearing"
 
 --------------------------------
 FINAL INSTRUCTION
@@ -1850,6 +2162,22 @@ USER MESSAGE
                 and update_requested_now
             ):
                 mode = "direct_update"
+            # Deterministic safety net: lawyers very often state the objective
+            # using literal patterns like "objective is X", "client objective is X",
+            # "the objective should be X", "objective: X". Some model variants still
+            # treat these as informational/explanatory and emit mode="none" with
+            # empty objectiveText. Detect those patterns from the raw message and
+            # force a direct_update so the strategy panel actually moves.
+            if mode == "none" and not is_question_like:
+                fallback_obj = self._extract_declarative_objective_text(msg)
+                if fallback_obj:
+                    logger.info(
+                        "Objective intent classifier overridden by declarative pattern: '{}…'",
+                        fallback_obj[:60],
+                    )
+                    mode = "direct_update"
+                    update_requested_now = True
+                    obj_text = fallback_obj
             if mode == "direct_update" and not update_requested_now:
                 mode = "none"
             if mode == "none":
@@ -5671,6 +5999,8 @@ Rules:
 
     # Fallback score bump when AI-based delta is unavailable
     _ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT = 4
+    # Fallback score drop when AI-based delta is unavailable for added_missing_information
+    _ADDED_MISSING_INFO_SCORE_DROP_DEFAULT = 3
     # Max score when Missing Information / Risks / Weaknesses still have items (100% only when all are empty)
     _ANALYSIS_REPORT_MAX_SCORE_WITH_PENDING_ITEMS = 95
 
@@ -6359,20 +6689,29 @@ Rules:
         section: str,
         rejected_value: str,
         report: Dict[str, Any],
-    ) -> tuple[int, str]:
+    ) -> Tuple[bool, int, str]:
         """
-        Ask AI to compute score increase (0–15) and reason based on priority of the rejected item.
-        Returns (delta, reason). On failure returns (default_bump, generic reason).
-        """
-        import json
-        import re
+        Ask AI to (a) decide if the user's rejection is VALID — i.e. the rejected
+        item is genuinely not relevant to this specific case — and (b) compute a
+        score INCREASE (1-5) when valid. The system will ADD the returned delta
+        to the current case resolution score.
 
+        - Valid rejection (item truly not relevant) → isValidRejection=true,
+          scoreIncrease 1-5.
+        - Invalid rejection (item IS relevant; user is dismissing a real gap) →
+          isValidRejection=false, scoreIncrease=0.
+
+        Returns (is_valid_rejection, delta, reason). On AI failure returns
+        (True, default_bump, generic reason) so the legacy "always bump" behaviour
+        is preserved when Gemini is unavailable.
+        """
         try:
             from app.ai.gemini_client import gemini_client
 
             gemini_client.initialize()
             if not gemini_client.model:
                 return (
+                    True,
                     self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT,
                     "Score adjusted to reflect user rejection.",
                 )
@@ -6381,6 +6720,21 @@ Rules:
             )
             remaining_weak = len(report.get("weaknesses") or [])
             remaining_risks = len(report.get("risks") or [])
+
+            case_summary = (
+                report.get("caseSummary") or report.get("case_summary") or ""
+            ).strip()
+            report_summary = (
+                report.get("reportCaseSummary")
+                or report.get("report_case_summary")
+                or ""
+            ).strip()
+            strategic_objective = (
+                report.get("strategicObjective")
+                or report.get("strategic_objective")
+                or ""
+            ).strip()
+
             # Build short context: other items in the same section so the model can judge relative impact
             section_items: List[str] = []
             if section == "missingInfo":
@@ -6403,22 +6757,30 @@ Rules:
             can_reach_100 = (
                 remaining_missing == 0 and remaining_weak == 0 and remaining_risks == 0
             )
-            prompt = f"""You are a legal case analyst. The user rejected ONE item from their analysis report as not relevant. The system will ADD your scoreIncrease to the current score. Output a JSON object with "scoreIncrease" (integer 1-5) and "reason" (one short sentence).
+            prompt = f"""You are a legal case analyst. The user rejected ONE item from their analysis report as not relevant. Two decisions are required:
+
+1) Is the rejection VALID? It is VALID only when the rejected item is genuinely NOT relevant to THIS case (per the case summary, strategic objective, and remaining items below). If the rejected item IS relevant — i.e. it is a real evidence gap, factual weakness, or procedural risk that this case actually faces — the rejection is INVALID and the user should not be rewarded with a score increase.
+2) If VALID, choose an integer scoreIncrease 1-5. The system will ADD this to the current score. If INVALID, set scoreIncrease=0.
 
 **Current case resolution score**: {current_score}%
+**Case summary**: {case_summary[:600] or "(not available)"}
+**Report-facing summary**: {report_summary[:400] or "(not available)"}
+**Strategic objective**: {strategic_objective[:400] or "(not available)"}
 **Section from which item was rejected**: {section}
 **Rejected item (exact text)**: "{rejected_value[:400]}"
 **Remaining counts after this rejection**: missingInfo={remaining_missing}, weaknesses={remaining_weak}, risks={remaining_risks}
 {f'**{section_context}**' if section_context else ''}
 **Score rule**: When missingInfo, weaknesses, and risks are all 0 (no remaining items), the score can reach 100%. When any remain, score is capped at 95%. {"This rejection leaves no items in any category – score can go to 100%." if can_reach_100 else "Items still remain – score will be capped at 95%."}
 
-IMPACT RULES – choose scoreIncrease (1-5) based on the SPECIFIC rejected item. The score will increase by this amount.
+VALIDITY GUIDELINES (decide isValidRejection)
+- VALID: the rejected item is off-topic, generic boilerplate that doesn't fit this case's facts, addressed by another item, or clearly out-of-scope for the parties/role/jurisdiction.
+- INVALID: the rejected item is core to the pleaded facts, supports a key element the case relies on, or directly addresses a real risk this case faces. Generic items that DO apply to this case are still INVALID rejections.
 
-- scoreIncrease MUST be an integer between 1 and 5 only.
-- Do NOT output numbers outside this range.
+IMPACT RULES (only when isValidRejection=true) – choose scoreIncrease (1-5) based on the SPECIFIC rejected item:
+- scoreIncrease MUST be an integer between 1 and 5.
 - When this is the last rejection (all counts 0 above), use 4 or 5 so the score can reach 100%.
 
-SECTION GUIDELINES
+SECTION GUIDELINES (when isValidRejection=true)
 
 missingInfo (user says this "missing" item is not needed):
 - Minor detail (dates, small clarification): scoreIncrease = 1
@@ -6431,7 +6793,7 @@ riskOrWeakness (user says this risk/weakness does not apply):
 - Major legal risk or strong weakness: scoreIncrease = 4–5
 
 Output ONLY valid JSON, no markdown, no code block:
-{{"scoreIncrease": <integer 1-5>, "reason": "<one short sentence explaining why this increase for this item>"}}
+{{"isValidRejection": <true|false>, "scoreIncrease": <integer 0-5>, "reason": "<one short sentence>"}}
 """
             raw = await gemini_client.generate(
                 prompt=prompt,
@@ -6449,6 +6811,7 @@ Output ONLY valid JSON, no markdown, no code block:
                     (raw or "")[:100],
                 )
                 return (
+                    True,
                     self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT,
                     "Score adjusted to reflect user rejection.",
                 )
@@ -6460,7 +6823,7 @@ Output ONLY valid JSON, no markdown, no code block:
                 else:
                     raw = re.sub(r"^```\w*\s*", "", raw)
                     raw = re.sub(r"\s*```\s*$", "", raw)
-            obj = None
+            obj: Optional[Dict[str, Any]] = None
             start = raw.find("{")
             if start >= 0:
                 depth = 0
@@ -6473,44 +6836,79 @@ Output ONLY valid JSON, no markdown, no code block:
                             try:
                                 obj = json.loads(raw[start : i + 1])
                             except json.JSONDecodeError:
-                                pass
+                                obj = None
                             break
+
+            def _coerce_bool(value: Any, default: bool) -> bool:
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, (int, float)):
+                    return bool(value)
+                if isinstance(value, str):
+                    return value.strip().lower() in ("true", "yes", "1")
+                return default
+
             if obj and isinstance(obj, dict) and "scoreIncrease" in obj:
+                is_valid = _coerce_bool(
+                    obj.get("isValidRejection", obj.get("is_valid_rejection")),
+                    default=True,
+                )
                 delta = int(
                     obj.get("scoreIncrease", self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT)
                 )
-                delta = max(1, min(5, delta))  # Rejection bump 1-5 as per prompt
-                if current_score + delta > 100:
-                    delta = max(0, 100 - current_score)
+                if not is_valid:
+                    delta = 0
+                else:
+                    delta = max(1, min(5, delta))  # Rejection bump 1-5 as per prompt
+                    if current_score + delta > 100:
+                        delta = max(0, 100 - current_score)
                 reason = (
                     obj.get("reason") or "Score adjusted based on rejection priority."
                 ).strip()
                 logger.info(
-                    "Rejection score delta: AI delta={}, reason={}",
+                    "Rejection score delta: AI isValid={} delta={}, reason={}",
+                    is_valid,
                     delta,
                     (reason or "")[:80],
                 )
-                return (delta, reason[:200])
+                return (is_valid, delta, reason[:200])
             # Regex fallback: extract scoreIncrease from raw text (e.g. malformed or truncated JSON)
             num_match = re.search(
                 r'"scoreIncrease"\s*:\s*(\d+)|scoreIncrease"\s*:\s*(\d+)|\bscoreIncrease\s*:\s*(\d+)',
                 raw,
             )
             if num_match:
+                valid_match = re.search(
+                    r'"isValidRejection"\s*:\s*(true|false)',
+                    raw,
+                    flags=re.IGNORECASE,
+                )
+                is_valid = (
+                    valid_match.group(1).strip().lower() == "true"
+                    if valid_match
+                    else True
+                )
                 delta = int(
                     num_match.group(1) or num_match.group(2) or num_match.group(3) or 0
                 )
-                delta = max(1, min(5, delta))  # Rejection bump 1-5 as per prompt
-                if current_score + delta > 100:
-                    delta = max(0, 100 - current_score)
+                if not is_valid:
+                    delta = 0
+                else:
+                    delta = max(1, min(5, delta))  # Rejection bump 1-5 as per prompt
+                    if current_score + delta > 100:
+                        delta = max(0, 100 - current_score)
                 reason_match = re.search(r'"reason"\s*:\s*"([^"]*)"', raw)
                 reason = (
                     reason_match.group(1).strip()
                     if reason_match
                     else "Score adjusted based on rejection priority."
                 )[:200]
-                logger.info("Rejection score delta: parsed via regex delta={}", delta)
-                return (delta, reason)
+                logger.info(
+                    "Rejection score delta: parsed via regex isValid={} delta={}",
+                    is_valid,
+                    delta,
+                )
+                return (is_valid, delta, reason)
             logger.warning(
                 "Rejection score delta: could not parse response; using default. raw={}",
                 raw[:200],
@@ -6518,6 +6916,7 @@ Output ONLY valid JSON, no markdown, no code block:
         except Exception as e:
             logger.warning("Rejection score delta failed: {}; using default bump", e)
         return (
+            True,
             self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT,
             "Score adjusted to reflect user rejection.",
         )
@@ -6525,8 +6924,17 @@ Output ONLY valid JSON, no markdown, no code block:
     async def on_analysis_report_feedback(self, data: Dict[str, Any]) -> None:
         """
         Handle analysis_report_feedback: user rejected an analysis item (missingInfo or riskOrWeakness).
-        Remove the item, bump caseResolutionScore, update qualityScoreExplanation and
-        reportQualityScoreExplanation, re-emit report.
+
+        - The matching item is always removed from the list (the user explicitly
+          rejected it).
+        - The AI then judges whether the rejection itself is VALID — i.e. the
+          rejected item is genuinely not relevant to this case.
+            - VALID rejection → caseResolutionScore is bumped 1–5.
+            - INVALID rejection (item IS relevant; user dismissed a real gap) →
+              score is unchanged.
+        - qualityScoreExplanation and reportQualityScoreExplanation are
+          regenerated either way, and the analysis report is always re-emitted
+          so the FE loader clears.
         """
         import copy
 
@@ -6555,6 +6963,19 @@ Output ONLY valid JSON, no markdown, no code block:
         if not is_rejected:
             logger.debug("analysis_report_feedback: isRejected=false – no score change")
             return
+
+        # Repopulate in-memory caches from Qdrant when the AI service was
+        # restarted between the original analysis_report emit and this feedback.
+        # Without this, post-restart rejections would be silently dropped because
+        # the in-memory _workspace_analysis_payload is empty until hydration.
+        try:
+            await self._hydrate_workspace_caches(workspace_id, user_id=user_id)
+        except Exception as e:  # pragma: no cover - best-effort hydration
+            logger.debug(
+                "analysis_report_feedback: hydration failed for workspace {}: {}",
+                workspace_id,
+                e,
+            )
 
         current = self._workspace_analysis_payload.get(workspace_id)
         if not current:
@@ -6607,18 +7028,57 @@ Output ONLY valid JSON, no markdown, no code block:
                     removed = True
 
         if not removed:
+            # Stale / duplicate rejection: the rejectedValue does not match any
+            # current item (already removed by an earlier reject, or the FE sent
+            # slightly different text). Don't bump the score and don't waste an
+            # AI call – just refresh the timestamp and re-emit so the FE loader
+            # clears against an unchanged report.
             logger.info(
-                "analysis_report_feedback: no matching item found for rejectedValue in {} – applying score bump only",
+                "analysis_report_feedback: no matching item found for rejectedValue in {} – "
+                "no score change, re-emitting unchanged analysis_report (workspace={})",
                 section,
+                workspace_id,
             )
+            report["timestamp"] = datetime.utcnow().isoformat() + "Z"
+            self._workspace_analysis_payload[workspace_id] = report
+            if self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "analysis_report",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": report,
+                    },
+                )
+                logger.success(
+                    "✅ analysis_report_feedback no-op (stale reject): re-emitted unchanged analysis_report (score stays at {}%)",
+                    old_score,
+                )
+            else:
+                logger.warning(
+                    "analysis_report_feedback: no socket client – cannot clear FE loader for workspace {}",
+                    workspace_id,
+                )
+            return
 
-        # Compute score increase based on priority/significance of the rejected item (AI)
-        score_delta, delta_reason = await self._compute_rejection_score_delta(
-            current_score=old_score,
-            section=section,
-            rejected_value=rejected_value,
-            report=report,
+        # AI validates the rejection and computes the score delta.
+        # Invalid rejection (rejected item is actually relevant to this case) →
+        # delta is forced to 0 so the user is not rewarded for dismissing a real gap.
+        is_valid_rejection, score_delta, _delta_reason = (
+            await self._compute_rejection_score_delta(
+                current_score=old_score,
+                section=section,
+                rejected_value=rejected_value,
+                report=report,
+            )
         )
+        if not is_valid_rejection:
+            logger.info(
+                "analysis_report_feedback: AI judged rejection INVALID (item is relevant) – "
+                "removing item but not bumping score (workspace={})",
+                workspace_id,
+            )
         new_score = min(100, old_score + score_delta)
         # Cap at 95% when Missing Info / Risks / Weaknesses still have items (100% only when all empty)
         max_allowed = self._analysis_report_max_allowed_score(report=report)
@@ -6667,6 +7127,401 @@ Output ONLY valid JSON, no markdown, no code block:
         else:
             logger.warning(
                 "analysis_report_feedback: no socket client – report updated in cache only"
+            )
+
+    async def _compute_added_missing_info_score_delta(
+        self,
+        current_score: int,
+        title: str,
+        description: str,
+        report: Dict[str, Any],
+    ) -> Tuple[bool, int, str]:
+        """
+        Ask AI to (a) decide if user-supplied title+description is RELATED to the case
+        and (b) compute a score DECREASE (1-5) when related. The system will SUBTRACT
+        the returned delta from the current case resolution score.
+
+        Returns (is_related, decrease, reason). On failure returns
+        (False, 0, "") so the caller can no-op safely.
+        """
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            gemini_client.initialize()
+            if not gemini_client.model:
+                logger.warning(
+                    "added_missing_information: Gemini unavailable; assuming not related"
+                )
+                return (False, 0, "")
+
+            case_summary = (
+                report.get("caseSummary") or report.get("case_summary") or ""
+            ).strip()
+            report_summary = (
+                report.get("reportCaseSummary")
+                or report.get("report_case_summary")
+                or ""
+            ).strip()
+            strategic_objective = (
+                report.get("strategicObjective")
+                or report.get("strategic_objective")
+                or ""
+            ).strip()
+
+            def _flatten(items: Any, limit: int = 6) -> List[str]:
+                out: List[str] = []
+                if not isinstance(items, list):
+                    return out
+                for x in items[:limit]:
+                    if isinstance(x, dict):
+                        t = x.get("point") or x.get("text") or ""
+                    else:
+                        t = x
+                    if isinstance(t, str) and t.strip():
+                        out.append(t.strip()[:200])
+                return out
+
+            missing_items = _flatten(
+                report.get("missingInfo") or report.get("missing_info") or [],
+                limit=8,
+            )
+            weakness_items = _flatten(report.get("weaknesses") or [], limit=6)
+            risk_items = _flatten(report.get("risks") or [], limit=6)
+
+            missing_block = (
+                "\n".join(f"- {x}" for x in missing_items) if missing_items else "- (none)"
+            )
+            weakness_block = (
+                "\n".join(f"- {x}" for x in weakness_items)
+                if weakness_items
+                else "- (none)"
+            )
+            risk_block = (
+                "\n".join(f"- {x}" for x in risk_items) if risk_items else "- (none)"
+            )
+
+            safe_title = (title or "").strip()[:300]
+            safe_description = (description or "").strip()[:1500]
+
+            prompt = f"""You are a legal case analyst. The user manually supplied additional information to address previously-flagged "missing information" items in their analysis report. Two decisions are required:
+
+1) Is the user-supplied text RELATED to this specific case? Use the case summary, missing info, weaknesses, and risks below as ground truth. Generic, off-topic, gibberish, or unrelated text → isRelated=false.
+2) If RELATED, choose an integer scoreDecrease between 1 and 5. The system will SUBTRACT this from the current score because the user has just confirmed a real gap existed and the new context may surface additional risks/weaknesses.
+
+**Current case resolution score**: {current_score}%
+
+**Case summary**: {case_summary[:800] or "(not available)"}
+**Report-facing summary**: {report_summary[:600] or "(not available)"}
+**Strategic objective**: {strategic_objective[:400] or "(not available)"}
+
+**Existing missingInfo items**:
+{missing_block}
+
+**Existing weaknesses**:
+{weakness_block}
+
+**Existing risks**:
+{risk_block}
+
+**User-supplied title**: "{safe_title}"
+**User-supplied description**: "{safe_description}"
+
+IMPACT RULES (only when isRelated=true):
+- Minor / vague clarification that lightly touches one missing item: scoreDecrease = 1
+- Moderate, on-topic information that addresses one missing item but introduces small new uncertainty: scoreDecrease = 2-3
+- Highly relevant information that exposes additional gaps, factual weaknesses, or procedural risks: scoreDecrease = 4-5
+
+When isRelated=false set scoreDecrease=0 and reason explains briefly why it is off-topic.
+
+Output ONLY valid JSON, no markdown, no code block:
+{{"isRelated": <true|false>, "scoreDecrease": <integer 0-5>, "reason": "<one short sentence>"}}
+"""
+
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                system_instruction=get_structured_document_feature_system_instruction(
+                    None
+                ),
+                temperature=0.3,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+            raw = (raw or "").strip()
+            if not raw or raw.startswith("Error") or "Error generating" in raw[:50]:
+                logger.warning(
+                    "added_missing_information score delta: empty/error response; treating as not related. raw={}",
+                    (raw or "")[:120],
+                )
+                return (False, 0, "")
+
+            if "```" in raw:
+                fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
+                if fence_match:
+                    raw = fence_match.group(1).strip()
+                else:
+                    raw = re.sub(r"^```\w*\s*", "", raw)
+                    raw = re.sub(r"\s*```\s*$", "", raw)
+
+            obj: Optional[Dict[str, Any]] = None
+            start = raw.find("{")
+            if start >= 0:
+                depth = 0
+                for i in range(start, len(raw)):
+                    if raw[i] == "{":
+                        depth += 1
+                    elif raw[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                obj = json.loads(raw[start : i + 1])
+                            except json.JSONDecodeError:
+                                obj = None
+                            break
+
+            if not (obj and isinstance(obj, dict)):
+                logger.warning(
+                    "added_missing_information score delta: could not parse JSON; treating as not related. raw={}",
+                    raw[:200],
+                )
+                return (False, 0, "")
+
+            is_related_raw = obj.get("isRelated")
+            if isinstance(is_related_raw, str):
+                is_related = is_related_raw.strip().lower() in ("true", "yes", "1")
+            else:
+                is_related = bool(is_related_raw)
+
+            try:
+                delta = int(
+                    obj.get("scoreDecrease") or obj.get("score_decrease") or 0
+                )
+            except (TypeError, ValueError):
+                delta = 0
+            delta = max(0, min(5, delta))
+            reason = (obj.get("reason") or "").strip()[:200]
+
+            if not is_related:
+                logger.info(
+                    "added_missing_information: AI judged not related (reason={})",
+                    reason or "(no reason)",
+                )
+                return (False, 0, reason)
+
+            if delta < 1:
+                # Related but no magnitude provided → fall back to default drop so the score actually moves.
+                delta = self._ADDED_MISSING_INFO_SCORE_DROP_DEFAULT
+
+            logger.info(
+                "added_missing_information score delta: AI delta=-{}, reason={}",
+                delta,
+                reason or "(no reason)",
+            )
+            return (True, delta, reason or "Score adjusted to reflect newly disclosed information.")
+        except Exception as e:
+            logger.warning(
+                "added_missing_information score delta failed: {}; treating as not related",
+                e,
+            )
+            return (False, 0, "")
+
+    async def on_added_missing_information(self, data: Dict[str, Any]) -> None:
+        """
+        Handle added_missing_information: user manually supplies title+description
+        to address previously-flagged missing information.
+
+        - If the user-supplied text is RELATED to the case (per AI judgement),
+          the entry is APPENDED to the missingInfo list (deduped against existing
+          entries) so it is visible to the user and can later be rejected via the
+          existing analysis_report_feedback flow. caseResolutionScore is then
+          DECREASED, qualityScoreExplanation is regenerated freshly, and the
+          analysis report is re-emitted.
+        - If the text is NOT related, the cached analysis report is re-emitted
+          unchanged (only the timestamp is refreshed) so the frontend loader
+          clears. Score, explanations, and list items stay exactly as-is.
+        """
+        import copy
+
+        payload = data if isinstance(data, dict) else {}
+        workspace_id = (
+            payload.get("workspaceId") or payload.get("workspace_id") or ""
+        ).strip()
+        user_id = (payload.get("userId") or payload.get("user_id") or "").strip()
+        workspace_role = (
+            payload.get("workspaceRole") or payload.get("workspace_role") or ""
+        )
+        title = (payload.get("title") or "").strip()
+        description = (payload.get("description") or "").strip()
+
+        if not workspace_id:
+            logger.warning(
+                "added_missing_information: missing workspaceId – ignoring"
+            )
+            return
+        if not title and not description:
+            logger.warning(
+                "added_missing_information: both title and description are empty – ignoring (workspace={})",
+                workspace_id,
+            )
+            return
+
+        # Repopulate in-memory caches from Qdrant when AI service was restarted
+        # between the original analysis_report emit and this event.
+        try:
+            await self._hydrate_workspace_caches(workspace_id, user_id=user_id)
+        except Exception as e:  # pragma: no cover - best-effort hydration
+            logger.debug(
+                "added_missing_information: hydration failed for workspace {}: {}",
+                workspace_id,
+                e,
+            )
+
+        current = self._workspace_analysis_payload.get(workspace_id)
+        if not current:
+            logger.warning(
+                "added_missing_information: no cached analysis report for workspace {} – cannot apply update",
+                workspace_id,
+            )
+            return
+
+        report = copy.deepcopy(current)
+        old_score = int(
+            report.get("caseResolutionScore")
+            or report.get("case_resolution_score")
+            or 0
+        )
+
+        is_related, score_delta, _delta_reason = (
+            await self._compute_added_missing_info_score_delta(
+                current_score=old_score,
+                title=title,
+                description=description,
+                report=report,
+            )
+        )
+
+        if not is_related:
+            # Frontend shows a loader on submit and clears it only when a fresh
+            # analysis_report payload is received. Re-emit the cached report
+            # unchanged (only refresh the timestamp) so the loader resolves
+            # without altering the score, explanation, or list items.
+            logger.info(
+                "added_missing_information: input is not related to the case – "
+                "re-emitting unchanged analysis_report to clear FE loader (workspace={})",
+                workspace_id,
+            )
+            report["timestamp"] = datetime.utcnow().isoformat() + "Z"
+            self._workspace_analysis_payload[workspace_id] = report
+            if self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "analysis_report",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": report,
+                    },
+                )
+                logger.success(
+                    "✅ added_missing_information no-op: re-emitted unchanged analysis_report (score stays at {}%)",
+                    old_score,
+                )
+            else:
+                logger.warning(
+                    "added_missing_information: no socket client – cannot clear FE loader for workspace {}",
+                    workspace_id,
+                )
+            return
+
+        # Append the user-supplied entry to missingInfo so it is visible in the
+        # report and can later be rejected via analysis_report_feedback. Use a
+        # plain string (matches the existing missingInfo schema) and dedupe
+        # against the current list using the same matcher the rejection flow
+        # relies on.
+        if title and description:
+            new_entry = f"{title}: {description}"
+        else:
+            new_entry = title or description
+        new_entry = new_entry.strip()
+
+        missing_list_key = (
+            "missingInfo" if "missingInfo" in report else "missing_info"
+        )
+        current_missing = report.get(missing_list_key) or []
+        if not isinstance(current_missing, list):
+            current_missing = [current_missing] if current_missing else []
+
+        already_present = any(
+            self._match_rejected_value(x, new_entry) for x in current_missing
+        )
+        if not already_present and new_entry:
+            current_missing = list(current_missing) + [new_entry]
+            report[missing_list_key] = current_missing
+            logger.info(
+                "added_missing_information: appended new entry to missingInfo "
+                "(workspace={}, total={})",
+                workspace_id,
+                len(current_missing),
+            )
+        else:
+            logger.info(
+                "added_missing_information: entry already present in missingInfo – not duplicating (workspace={})",
+                workspace_id,
+            )
+
+        # Apply score decrease (clamped at 0). The 95% cap still applies because
+        # we just appended a missingInfo item, so the case has at least one
+        # pending item.
+        new_score = max(0, old_score - score_delta)
+        max_allowed = self._analysis_report_max_allowed_score(report=report)
+        new_score = min(new_score, max_allowed)
+        report["caseResolutionScore"] = new_score
+
+        # Regenerate a clean, generic explanation that reflects the updated state.
+        # Lawyers share this with clients, so do NOT mention deltas or that the
+        # user manually added information.
+        updated_missing = (
+            report.get("missingInfo") or report.get("missing_info") or []
+        )
+        updated_weaknesses = report.get("weaknesses") or []
+        updated_risks = report.get("risks") or []
+        updated_strengths = report.get("strengths") or []
+
+        fresh_explanation = await self._ensure_quality_score_explanation(
+            workspace_role=workspace_role,
+            case_resolution_score=new_score,
+            missing_info=updated_missing,
+            weaknesses=updated_weaknesses,
+            risks=updated_risks,
+            strengths=updated_strengths,
+            existing="",  # force regeneration so the explanation reflects current state
+        )
+        report["qualityScoreExplanation"] = fresh_explanation
+        report["reportQualityScoreExplanation"] = (
+            self._sanitize_report_quality_score_explanation(fresh_explanation)
+        ).strip()
+        report["timestamp"] = datetime.utcnow().isoformat() + "Z"
+
+        self._workspace_analysis_payload[workspace_id] = report
+
+        if self._socket_client:
+            await self._socket_client.emit(
+                "document_feature_response",
+                {
+                    "featureType": "analysis_report",
+                    "workspaceId": workspace_id,
+                    "userId": user_id,
+                    "payload": report,
+                },
+            )
+            logger.success(
+                "✅ added_missing_information applied: score {}% → {}% (-{}), re-emitted analysis_report",
+                old_score,
+                new_score,
+                score_delta,
+            )
+        else:
+            logger.warning(
+                "added_missing_information: no socket client – report updated in cache only"
             )
 
     def _normalize_manual_law_relevance(self, raw: Optional[str]) -> str:
@@ -7173,6 +8028,61 @@ Indian Kanoon / search results (titles and snippets):
             response_body.get("requestId"),
         )
 
+    def _normalize_case_title(self, title: str) -> str:
+        """
+        Normalize a case title to "Petitioner vs Respondent" style with
+        Indian-court multi-party shorthand:
+
+        - When a side has 2 parties joined by " & ", reduce to "<first> & Anr".
+        - When a side has 3+ parties joined by " & ", reduce to "<first> & Ors".
+        - Single-party sides and sides already ending in "& Anr" / "& Ors" are
+          left untouched.
+        - Also rewrites " v ", " v. ", " versus " (case-insensitive) to " vs ".
+
+        Only " & " is treated as a multi-party separator. We deliberately do
+        NOT split on commas or the word "and" because those frequently appear
+        inside legitimate party / company names (e.g. "Smith, Patel & Co",
+        "Pradeep Mehra and Sons").
+        """
+        if not (title or "").strip():
+            return title or ""
+
+        t = title.strip().strip('"').strip("'")
+
+        vs_match = re.search(
+            r"\s+(vs|versus|v\.?)\s+",
+            t,
+            flags=re.IGNORECASE,
+        )
+        if not vs_match:
+            return t
+
+        left = t[: vs_match.start()].strip()
+        right = t[vs_match.end() :].strip()
+
+        anr_ors_re = re.compile(
+            r"\s*&\s*(anr|ors|another|others)\.?$",
+            flags=re.IGNORECASE,
+        )
+
+        def _reduce_side(side: str) -> str:
+            s = (side or "").strip().rstrip(",")
+            if not s:
+                return s
+            if anr_ors_re.search(s):
+                return s
+            parts = [p.strip() for p in re.split(r"\s+&\s+", s) if p.strip()]
+            if len(parts) <= 1:
+                return s
+            first = parts[0]
+            if len(parts) == 2:
+                return f"{first} & Anr"
+            return f"{first} & Ors"
+
+        normalized = f"{_reduce_side(left)} vs {_reduce_side(right)}"
+        normalized = re.sub(r"\s{2,}", " ", normalized).strip()
+        return normalized
+
     def _salvage_workspace_metadata_from_truncated_json(
         self, raw: str, combined: str = ""
     ) -> Dict[str, Any]:
@@ -7194,7 +8104,7 @@ Indian Kanoon / search results (titles and snippets):
         if title_match:
             val = title_match.group(1).strip()
             if val:
-                result["caseTitle"] = val
+                result["caseTitle"] = self._normalize_case_title(val)
         # Salvage caseCategory
         if "caseCategory" in raw:
             cat_match = re.search(r'"caseCategory"\s*:\s*"([^"]*)"', raw)
@@ -7641,6 +8551,9 @@ Summary (3-4 lines, one sentence per line):"""
             else:
                 title = f"{title} vs Matter"
             result["caseTitle"] = title
+        # Final pass: collapse multi-party sides to "<first> & Anr"/"& Ors"
+        # so titles never appear as "A vs B & C" or "A & B vs C".
+        result["caseTitle"] = self._normalize_case_title(result["caseTitle"])
         return result
 
     async def _generate_fallback_metadata(
@@ -7653,14 +8566,14 @@ Summary (3-4 lines, one sentence per line):"""
             gemini_client.initialize()
             doc_preview = combined[:400].replace("\n", " ")
             fallback_prompt = f"""From this document content, extract ACTUAL CASE DETAILS:
-1. Two parties/names for title format "Party1 vs Party2" (or "Party vs Issue" if only one)
+1. Title in strict "Petitioner vs Respondent" format. Indian-court multi-party shorthand: 2 parties on a side → "<First> & Anr"; 3+ parties → "<First> & Ors". Never join multiple parties with " & " in the final title. Use exactly " vs " (lowercase, with spaces). If only one party is identifiable, use "<Party> vs <Issue>".
 2. One legal category (CRIMINAL LAW, CIVIL LAW, CYBER LAW, etc.)
 3. One relevant Indian act
 4. A SHORT CASE SUMMARY in English only (3-4 lines). Summarize in your own words; do NOT copy-paste document text. Each line one short sentence.
 
 Document: {doc_preview}
 
-Return JSON: {{"caseTitle": "Name1 vs Name2", "caseCategory": "CIVIL LAW", "subcategories": ["Act Name"], "description": "Line 1: Actual party and issue from documents\\nLine 2: Key facts/allegations from documents\\nLine 3: Relief sought from documents\\nLine 4: Additional relevant details"}}"""
+Return JSON: {{"caseTitle": "<First Petitioner> vs <First Respondent> & Anr", "caseCategory": "CIVIL LAW", "subcategories": ["Act Name"], "description": "Line 1: Actual party and issue from documents\\nLine 2: Key facts/allegations from documents\\nLine 3: Relief sought from documents\\nLine 4: Additional relevant details"}}"""
             raw = await gemini_client.generate(
                 fallback_prompt, temperature=0.3, max_tokens=12000
             )
@@ -7754,7 +8667,7 @@ Return JSON: {{"caseTitle": "Name1 vs Name2", "caseCategory": "CIVIL LAW", "subc
                             elif len(desc_lines) > 4:
                                 desc = "\n".join(desc_lines[:4])
                         return {
-                            "caseTitle": title,
+                            "caseTitle": self._normalize_case_title(title),
                             "caseCategory": category,
                             "subcategories": subs[:3],
                             "description": desc[:500],
@@ -7830,7 +8743,7 @@ Return JSON: {{"caseTitle": "Name1 vs Name2", "caseCategory": "CIVIL LAW", "subc
             gemini_client.initialize()
             prompt = f"""Based on the document content below, output a JSON object with ALL fields REQUIRED (no empty/null values):
 
-- caseTitle: MUST be in format "Petitioner vs Respondent" or "Party1 vs Party2" (e.g. "Umesh Malik vs Karnataka State Cricket Association", "Shubham Malik vs Social Media Hacking"). Extract actual party names from documents. Format: "[Petitioner/Complainant Name] vs [Respondent/Defendant Name]" or "[Party] vs [Issue/Matter]". This field is MANDATORY - always provide a title.
+- caseTitle: MUST be in format "Petitioner vs Respondent". Use Indian-court multi-party shorthand: when one side has exactly 2 parties, use "<First Party> & Anr" (e.g. "Pradeep Mehra vs Ethos Limited & Anr"); when 3+ parties, use "<First Party> & Ors" (e.g. "Umesh Malik vs State of Karnataka & Ors"). Never join multiple parties with " & " in the final title — always reduce to first party + "& Anr"/"& Ors". Use exactly " vs " (lowercase, with spaces). If only one party can be identified, use "[Party] vs [Issue/Matter]". MANDATORY field.
 - caseCategory: exactly one category in UPPERCASE (e.g. CRIMINAL LAW, CYBER LAW, CIVIL LAW, TRADE MARK LAW). MANDATORY - must be one of: CRIMINAL LAW, CIVIL LAW, CYBER LAW, CONTRACT LAW, PROPERTY LAW, LABOUR LAW, TAX LAW, or similar.
 - subcategories: array of 1-3 relevant Indian acts (e.g. ["Bharatiya Nyaya Sanhita", "Information Technology Act, 2000", "The Trade Marks Act, 1999"]). MANDATORY - must have at least 1 act.
 - description: a SHORT CASE SUMMARY in English only, exactly 3 to 4 lines (minimum 3, maximum 4). You MUST write a SPECIFIC summary for this case: name the actual parties (people or organizations) and the actual dispute. Do NOT use generic phrases like "Legal matter based on uploaded documents" or "The case involves parties and issues requiring legal review". Write in your own words; do NOT copy-paste the document. Each line one short sentence (under 120 characters). Line 1: actual parties and main issue. Line 2: key facts or allegations. Line 3: relief or action sought. Line 4 (optional): one more relevant detail. Output only the summary text, no prefixes like "Line 1:".
@@ -7840,7 +8753,7 @@ Document content:
 
 CRITICAL: All four fields (caseTitle, caseCategory, subcategories, description) are MANDATORY. Do not leave any field empty or null.
 
-Output ONLY this JSON, no markdown: {{"caseTitle": "Petitioner Name vs Respondent Name", "caseCategory": "CRIMINAL LAW", "subcategories": ["Bharatiya Nyaya Sanhita", "IT Act 2000"], "description": "MLA Umesh Malik has filed a complaint regarding his son Shubham Malik's hacked social media account.\\nEdited videos and posts were made viral to defame the complainant and damage his political image.\\nThe complainant seeks a high-level investigation and strict action against the perpetrators.\\nThe complaint involves alleged violations under IT Act 2000 and requests preservation of digital evidence."}}"""
+Output ONLY this JSON, no markdown: {{"caseTitle": "Pradeep Mehra vs Ethos Limited & Anr", "caseCategory": "CIVIL LAW", "subcategories": ["Consumer Protection Act, 2019"], "description": "MLA Umesh Malik has filed a complaint regarding his son Shubham Malik's hacked social media account.\\nEdited videos and posts were made viral to defame the complainant and damage his political image.\\nThe complainant seeks a high-level investigation and strict action against the perpetrators.\\nThe complaint involves alleged violations under IT Act 2000 and requests preservation of digital evidence."}}"""
             raw = await gemini_client.generate(prompt, temperature=0.2, max_tokens=12000)
             if not raw or "Error" in (raw[:80] or ""):
                 return await self._generate_fallback_metadata(combined, workspace_id)
@@ -7897,7 +8810,9 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Petitioner Name vs Responden
                     )
                     return salvaged
                 return await self._generate_fallback_metadata(combined, workspace_id)
-            case_title = (data.get("caseTitle") or "").strip()
+            case_title = self._normalize_case_title(
+                (data.get("caseTitle") or "").strip()
+            )
             case_category = (data.get("caseCategory") or "").strip().upper()
             subcategories = data.get("subcategories") or data.get("subcategory") or []
             if isinstance(subcategories, str):
@@ -9650,6 +10565,12 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
             workspace_id = payload.workspaceId or "unknown"
             user_id = payload.userId or "unknown"
             chat_id = payload.chatId or f"chat_{datetime.utcnow().timestamp()}"
+
+            # Repopulate in-memory caches from Qdrant when the AI service was
+            # restarted between the original workspace_sync and this message.
+            # No-op if the cache is already warm or workspace_id is missing.
+            if workspace_id and workspace_id != "unknown":
+                await self._hydrate_workspace_caches(workspace_id, user_id=user_id)
 
             role_context = {
                 "role": "ADJUDICATOR",

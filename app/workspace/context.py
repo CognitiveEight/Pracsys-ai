@@ -9,6 +9,33 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from app.socket.schemas import EvidenceFile, WorkspaceData
+from app.workspace.persistence import CacheKinds, persist_state
+
+
+class _DictAttrShim:
+    """Lightweight attribute-access wrapper used when an evidence-file dict
+    cannot be rebuilt into a Pydantic model on cache hydration. Lets call
+    sites that use `getattr(ef, "id", None)` keep working."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: dict) -> None:
+        self._data = dict(data)
+
+    def __getattr__(self, name: str):
+        if name == "_data":
+            raise AttributeError(name)
+        if name in self._data:
+            return self._data[name]
+        # Common alias: backend uses `_id`, downstream uses `id`.
+        if name == "id" and "_id" in self._data:
+            return self._data.get("_id")
+        if name == "_id" and "id" in self._data:
+            return self._data.get("id")
+        return None
+
+    def __repr__(self) -> str:  # pragma: no cover - debug helper
+        return f"_DictAttrShim({self._data!r})"
 
 
 @dataclass
@@ -64,6 +91,7 @@ class WorkspaceContext:
         self.evidence_files = data.evidenceFiles
         self.updated_at = data.updatedAt
         logger.debug("Updated context for workspace: {}", self.workspace_id)
+        self._persist_meta()
 
     def add_message(
         self, role: str, content: str, metadata: Optional[Dict[str, Any]] = None
@@ -129,6 +157,7 @@ class WorkspaceContext:
         """
         self.metadata[key] = value
         logger.debug("Set metadata {} for workspace {}", key, self.workspace_id)
+        self._persist_meta()
 
     def get_metadata(self, key: str, default: Any = None) -> Any:
         """
@@ -163,6 +192,146 @@ class WorkspaceContext:
             "metadata": self.metadata,
         }
 
+    # ------------------------------------------------------------------
+    # Persistence helpers (Qdrant-backed cache so context survives restart)
+    # ------------------------------------------------------------------
+
+    def _serialize_evidence_file(self, ef: Any) -> Dict[str, Any]:
+        """Convert an EvidenceFile / EvidenceFilePayload to a JSON-friendly dict."""
+        if ef is None:
+            return {}
+        # Pydantic models support model_dump; fall back to __dict__/getattr.
+        try:
+            dumped = ef.model_dump(mode="json", by_alias=True)  # type: ignore[attr-defined]
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+        try:
+            dumped = ef.model_dump()  # type: ignore[attr-defined]
+            if isinstance(dumped, dict):
+                # Normalize datetime serialization for round-tripping.
+                for k, v in list(dumped.items()):
+                    if isinstance(v, datetime):
+                        dumped[k] = v.isoformat()
+                return dumped
+        except Exception:
+            pass
+        # Best-effort plain object.
+        return {
+            "id": getattr(ef, "id", None) or getattr(ef, "_id", None),
+            "filename": getattr(ef, "filename", None),
+            "url": getattr(ef, "url", None),
+            "path": getattr(ef, "path", None),
+            "uploadedAt": (
+                getattr(ef, "uploadedAt", None).isoformat()
+                if isinstance(getattr(ef, "uploadedAt", None), datetime)
+                else getattr(ef, "uploadedAt", None)
+            ),
+        }
+
+    def to_cache_dict(self) -> Dict[str, Any]:
+        """JSON-friendly representation used by the persistence layer."""
+        return {
+            "workspace_id": self.workspace_id,
+            "user_id": self.user_id,
+            "title": self.title,
+            "workspace_role": self.workspace_role,
+            "status": self.status,
+            "evidence_files": [
+                self._serialize_evidence_file(ef) for ef in (self.evidence_files or [])
+            ],
+            "created_at": (
+                self.created_at.isoformat()
+                if isinstance(self.created_at, datetime)
+                else self.created_at
+            ),
+            "updated_at": (
+                self.updated_at.isoformat()
+                if isinstance(self.updated_at, datetime)
+                else self.updated_at
+            ),
+            "metadata": self.metadata,
+        }
+
+    def apply_cache_dict(self, data: Dict[str, Any]) -> None:
+        """Restore non-conversation state from a cached payload.
+
+        Conversation history is intentionally NOT mirrored to Qdrant; the
+        chat server replays conversation_history on every user_message_request.
+        """
+        if not isinstance(data, dict):
+            return
+        title = data.get("title")
+        if isinstance(title, str) and title and not self.title:
+            self.title = title
+        status = data.get("status")
+        if isinstance(status, str) and status and not self.status:
+            self.status = status
+        role = data.get("workspace_role")
+        if isinstance(role, str) and role and not self.workspace_role:
+            self.workspace_role = role
+        evidence = data.get("evidence_files")
+        if isinstance(evidence, list) and evidence and not self.evidence_files:
+            self.evidence_files = self._restore_evidence_files(evidence)
+        meta = data.get("metadata")
+        if isinstance(meta, dict):
+            for k, v in meta.items():
+                # Don't overwrite metadata that was already set in this process.
+                self.metadata.setdefault(k, v)
+        try:
+            updated_at = data.get("updated_at")
+            if isinstance(updated_at, str) and updated_at:
+                self.updated_at = datetime.fromisoformat(updated_at)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _restore_evidence_files(items: List[Dict[str, Any]]) -> List[Any]:
+        """Rebuild EvidenceFile-like objects from cached dicts.
+
+        Downstream call sites (e.g. annexure label lookup in the chat handler)
+        access fields via `getattr(ef, "id", None)`, which fails on plain
+        dicts. We rehydrate to pydantic models when possible and fall back to
+        a `_DictAttrShim` so attribute access keeps working either way.
+        """
+        out: List[Any] = []
+        # Lazy import to avoid circulars at module load.
+        try:
+            from app.socket.schemas import EvidenceFilePayload
+        except Exception:
+            EvidenceFilePayload = None  # type: ignore[assignment]
+
+        for raw in items:
+            if not isinstance(raw, dict):
+                out.append(raw)
+                continue
+            rebuilt = None
+            if EvidenceFilePayload is not None:
+                try:
+                    rebuilt = EvidenceFilePayload(**raw)
+                except Exception:
+                    rebuilt = None
+            if rebuilt is None:
+                rebuilt = _DictAttrShim(raw)
+            out.append(rebuilt)
+        return out
+
+    def _persist_meta(self) -> None:
+        """Schedule a fire-and-forget Qdrant write of this context."""
+        try:
+            persist_state(
+                workspace_id=self.workspace_id,
+                kind=CacheKinds.WORKSPACE_META,
+                data=self.to_cache_dict(),
+            )
+        except Exception as e:  # pragma: no cover - persistence is best-effort
+            logger.debug(
+                "Workspace meta persistence skipped (workspace={}): {}",
+                self.workspace_id,
+                e,
+            )
+
 
 class ContextManager:
     """Manages all workspace contexts."""
@@ -183,6 +352,7 @@ class ContextManager:
         context = WorkspaceContext.from_workspace_data(data)
         self._contexts[context.workspace_id] = context
         logger.info("Created context for workspace: {}", context.workspace_id)
+        context._persist_meta()
         return context
 
     def get_context(self, workspace_id: str) -> Optional[WorkspaceContext]:
@@ -261,6 +431,7 @@ class ContextManager:
                 workspace_id,
                 context.workspace_role,
             )
+            context._persist_meta()
             return context
         role = (workspace_role or "ADJUDICATOR").strip().upper()
         if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
@@ -277,6 +448,68 @@ class ContextManager:
         )
         self._contexts[workspace_id] = context
         logger.info("Created context for workspace: {} (role={})", workspace_id, role)
+        context._persist_meta()
+        return context
+
+    async def hydrate_context_from_cache(
+        self,
+        workspace_id: str,
+        user_id: Optional[str] = None,
+    ) -> Optional[WorkspaceContext]:
+        """Restore a workspace context from Qdrant when memory is cold.
+
+        Returns the rehydrated context (also stored in `_contexts`) or None
+        when no cache row exists. Conversation history is intentionally NOT
+        restored — the chat server already replays it per request.
+        """
+        if not workspace_id:
+            return None
+        # Defer import to avoid a circular dependency at module load.
+        from app.workspace.persistence import CacheKinds, restore_state
+
+        cached = await restore_state(
+            workspace_id=workspace_id, kind=CacheKinds.WORKSPACE_META
+        )
+        if not isinstance(cached, dict):
+            return None
+
+        existing = self._contexts.get(workspace_id)
+        if existing:
+            existing.apply_cache_dict(cached)
+            return existing
+
+        cached_role = (
+            (cached.get("workspace_role") or "ADJUDICATOR").strip().upper()
+        )
+        if cached_role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+            cached_role = "ADJUDICATOR"
+        try:
+            created_at = datetime.fromisoformat(str(cached.get("created_at")))
+        except Exception:
+            created_at = datetime.utcnow()
+        try:
+            updated_at = datetime.fromisoformat(str(cached.get("updated_at")))
+        except Exception:
+            updated_at = created_at
+
+        context = WorkspaceContext(
+            workspace_id=workspace_id,
+            user_id=str(cached.get("user_id") or user_id or ""),
+            title=str(cached.get("title") or ""),
+            workspace_role=cached_role,
+            status=str(cached.get("status") or "active"),
+            evidence_files=list(cached.get("evidence_files") or []),
+            created_at=created_at,
+            updated_at=updated_at,
+            metadata=dict(cached.get("metadata") or {}),
+        )
+        self._contexts[workspace_id] = context
+        logger.info(
+            "Rehydrated workspace context from Qdrant cache: {} (role={}, files={})",
+            workspace_id,
+            cached_role,
+            len(context.evidence_files or []),
+        )
         return context
 
     def delete_context(self, workspace_id: str) -> bool:

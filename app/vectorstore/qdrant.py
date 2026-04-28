@@ -591,6 +591,208 @@ class QdrantStore:
                 return role
         return await _read("__default__")
 
+    # ------------------------------------------------------------------
+    # Generic per-workspace state cache (analysis report, procedural
+    # timeline, applicable laws, workspace meta, etc.)
+    #
+    # Each entry is a payload-only Qdrant point keyed deterministically by
+    # (workspace_id, cache_kind, scope), where scope is "__default__" for
+    # workspace-level caches or the chat_id string for chat-scoped caches.
+    # Payload shape mirrors `upsert_workspace_role` so we can reuse the
+    # collection without a schema migration: the JSON-serialized data lives
+    # in `cache_data` and a `cache_kind` filter isolates rows.
+    # ------------------------------------------------------------------
+
+    async def upsert_workspace_state_cache(
+        self,
+        workspace_id: str,
+        kind: str,
+        data: Any,
+        *,
+        chat_id: Optional[str] = None,
+    ) -> bool:
+        """Persist arbitrary workspace state as a JSON payload in Qdrant.
+
+        The data is serialized to JSON. A scope of "__default__" is used for
+        workspace-level caches; a chat_id scope is used for chat-level caches.
+        Subsequent upserts overwrite the previous point.
+        """
+        if not workspace_id or not kind:
+            return False
+        if self.client is None:
+            await self.initialize()
+
+        scope = str(chat_id) if chat_id else "__default__"
+
+        try:
+            import json as _json
+
+            cache_data_json = _json.dumps(data, default=str)
+        except Exception as e:
+            logger.warning(
+                "State cache serialization failed (workspace={}, kind={}): {}",
+                workspace_id,
+                kind,
+                e,
+            )
+            return False
+
+        point_id = str(
+            uuid5(NAMESPACE_DNS, f"state-cache:{workspace_id}:{kind}:{scope}")
+        )
+        now_iso = datetime.utcnow().isoformat()
+        payload = {
+            "workspace_id": workspace_id,
+            "document_id": "__workspace_state_cache__",
+            "original_document_id": "__workspace_state_cache__",
+            "content": "",
+            "uploaded_at": now_iso,
+            "cache_kind": str(kind),
+            "cache_scope": "chat" if chat_id else "workspace",
+            "cache_chat_id": scope,
+            "cache_data": cache_data_json,
+            "metadata": {
+                "kind": str(kind),
+                "scope": "chat" if chat_id else "workspace",
+                "chat_id": scope,
+                "updated_at": now_iso,
+            },
+        }
+        point = PointStruct(
+            id=point_id, vector=[0.0] * self.vector_size, payload=payload
+        )
+        try:
+            await asyncio.to_thread(
+                self.client.upsert,
+                collection_name=self.collection_name,
+                points=[point],
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "Failed to upsert workspace state cache (workspace={}, kind={}): {}",
+                workspace_id,
+                kind,
+                e,
+            )
+            return False
+
+    async def get_workspace_state_cache(
+        self,
+        workspace_id: str,
+        kind: str,
+        *,
+        chat_id: Optional[str] = None,
+    ) -> Optional[Any]:
+        """Read a previously-persisted workspace state payload from Qdrant.
+
+        Returns the JSON-decoded data, or None when the cache row is missing
+        or the payload is malformed.
+        """
+        if not workspace_id or not kind:
+            return None
+        if self.client is None:
+            await self.initialize()
+
+        scope = str(chat_id) if chat_id else "__default__"
+        filt = Filter(
+            must=[
+                FieldCondition(
+                    key="workspace_id", match=MatchValue(value=workspace_id)
+                ),
+                FieldCondition(key="cache_kind", match=MatchValue(value=str(kind))),
+                FieldCondition(
+                    key="cache_chat_id", match=MatchValue(value=scope)
+                ),
+            ]
+        )
+        try:
+            result, _next = await asyncio.to_thread(
+                self.client.scroll,
+                collection_name=self.collection_name,
+                scroll_filter=filt,
+                limit=1,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to read workspace state cache (workspace={}, kind={}): {}",
+                workspace_id,
+                kind,
+                e,
+            )
+            return None
+        if not result:
+            return None
+        payload = result[0].payload or {}
+        raw = payload.get("cache_data")
+        if raw is None:
+            return None
+        try:
+            import json as _json
+
+            return _json.loads(raw)
+        except Exception:
+            # Backwards-compatibility: return raw value if it isn't JSON.
+            return raw
+
+    async def delete_workspace_state_cache(
+        self,
+        workspace_id: str,
+        kind: Optional[str] = None,
+    ) -> bool:
+        """Remove every cache point for a workspace, optionally narrowed by kind.
+
+        Used during workspace deletion so cached state does not survive
+        the parent workspace.
+        """
+        if not workspace_id:
+            return False
+        if self.client is None:
+            await self.initialize()
+
+        must: List[Any] = [
+            FieldCondition(key="workspace_id", match=MatchValue(value=workspace_id))
+        ]
+        if kind:
+            must.append(
+                FieldCondition(key="cache_kind", match=MatchValue(value=str(kind)))
+            )
+        else:
+            # Limit deletion to known cache kinds so document chunks remain.
+            must.append(
+                FieldCondition(
+                    key="cache_kind",
+                    match=MatchAny(
+                        any=[
+                            "workspace_role_cache",
+                            "workspace_meta",
+                            "analysis_report",
+                            "procedural_timeline",
+                            "applicable_laws",
+                            "custom_instructions",
+                        ]
+                    ),
+                )
+            )
+        delete_filter = Filter(must=must)
+        try:
+            await asyncio.to_thread(
+                self.client.delete,
+                collection_name=self.collection_name,
+                points_selector=models.FilterSelector(filter=delete_filter),
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "Failed to delete workspace state cache (workspace={}, kind={}): {}",
+                workspace_id,
+                kind,
+                e,
+            )
+            return False
+
 
 # Global vector store instance
 vector_store = QdrantStore()

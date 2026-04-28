@@ -41,6 +41,11 @@ class CacheKinds:
     WORKSPACE_METADATA_PAYLOAD = "workspace_metadata_payload"
     DOCUMENT_ASSESSMENTS = "document_assessments"
     STRATEGY_PAYLOAD = "strategy_payload"
+    # Per-workspace memory of analysis-report items the user has rejected via
+    # analysis_report_feedback. Used so that an objective-change regeneration
+    # does not silently re-introduce items the user already dismissed.
+    # Shape: {"missingInfo": [str, ...], "riskOrWeakness": [str, ...]}
+    REJECTED_ANALYSIS_ITEMS = "rejected_analysis_items"
 
 
 # All workspace-scoped cache kinds we routinely read on hydrate.
@@ -54,6 +59,7 @@ WORKSPACE_HYDRATION_KINDS = (
     CacheKinds.WORKSPACE_METADATA_PAYLOAD,
     CacheKinds.DOCUMENT_ASSESSMENTS,
     CacheKinds.STRATEGY_PAYLOAD,
+    CacheKinds.REJECTED_ANALYSIS_ITEMS,
 )
 
 

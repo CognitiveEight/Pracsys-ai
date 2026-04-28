@@ -279,6 +279,14 @@ class SocketEventHandler:
         self._workspace_analysis_payload: Dict[str, Any] = PersistentWorkspaceDict(
             CacheKinds.ANALYSIS_REPORT
         )
+        # Per-workspace memory of rejected analysis-report items so that an
+        # objective-change regeneration does not silently re-introduce a
+        # missingInfo / weakness / risk the user already dismissed via
+        # analysis_report_feedback. Shape per workspace_id:
+        #   {"missingInfo": [str, ...], "riskOrWeakness": [str, ...]}
+        self._workspace_rejected_analysis_items: Dict[str, Dict[str, List[str]]] = (
+            PersistentWorkspaceDict(CacheKinds.REJECTED_ANALYSIS_ITEMS)
+        )
         # List of Dates timeline per workspace (chronological events from case documents)
         self._workspace_list_of_dates_payload: Dict[str, List[Dict[str, Any]]] = (
             PersistentWorkspaceDict(CacheKinds.LIST_OF_DATES)
@@ -396,6 +404,7 @@ class SocketEventHandler:
             CacheKinds.WORKSPACE_METADATA_PAYLOAD: self._workspace_metadata_payload,
             CacheKinds.DOCUMENT_ASSESSMENTS: self._workspace_document_assessments_payload,
             CacheKinds.STRATEGY_PAYLOAD: self._workspace_strategy_payload,
+            CacheKinds.REJECTED_ANALYSIS_ITEMS: self._workspace_rejected_analysis_items,
         }
         for kind, target in kind_to_dict.items():
             payload = cached_kinds.get(kind)
@@ -5532,8 +5541,36 @@ Rules:
     ) -> None:
         ctx = log_context or " (objective change)"
 
-        # 1) Analysis report: regenerate and emit only the fresh payload
-        # (do not merge with previous analysis report for objective-change flow).
+        # 1) Analysis report: TRUE incremental merge with the previous report.
+        # Policy (per product decision):
+        #   - List-typed user-curated fields (missingInfo, weaknesses, risks,
+        #     strengths, relevantJurisdiction, nextSteps, pendingActions,
+        #     suggestedDrafts) → union of (previous + new), then semantic
+        #     dedupe and length-cap. Previous content is preserved; only
+        #     genuinely-new objective-driven points are added.
+        #   - Items the user already rejected via analysis_report_feedback
+        #     are filtered out of the new report so they cannot silently
+        #     re-appear after an objective change.
+        #   - caseResolutionScore / reportQualityScore: keep the previous
+        #     score so user-feedback deltas (rejections / additions) are not
+        #     erased; re-cap with `_analysis_report_max_allowed_score` against
+        #     the merged list state.
+        #   - Quality explanations: regenerate from the merged state so they
+        #     stay consistent with the merged lists and the preserved score.
+        #   - Identity fields (caseTitle, caseCategory, subcategories,
+        #     description, caseType): keep previous values; the case identity
+        #     does not shift just because the strategic objective shifted.
+        #   - Objective-aligned narrative (caseSummary, reportCaseSummary,
+        #     strategicObjective): take the new values so the report mirrors
+        #     the new objective. The strategy panel itself preserves
+        #     caseSummary / reportCaseSummary via
+        #     `_regenerate_strategy_objective_preserving_case_summary`, so
+        #     these stay aligned across panels.
+        prev_analysis_raw = self._workspace_analysis_payload.get(workspace_id)
+        prev_analysis: Dict[str, Any] = (
+            dict(prev_analysis_raw) if isinstance(prev_analysis_raw, dict) else {}
+        )
+
         new_analysis = await self._generate_analysis_report_from_documents(
             workspace_id=workspace_id,
             user_id=user_id,
@@ -5541,52 +5578,205 @@ Rules:
             batch_result=None,
             is_update=True,
         )
-        merged_analysis = (
-            dict(new_analysis)
-            if isinstance(new_analysis, dict) and new_analysis
-            else self._analysis_report_fallback(
+        if not (isinstance(new_analysis, dict) and new_analysis):
+            new_analysis = self._analysis_report_fallback(
                 (workspace_role or "ADJUDICATOR").strip().upper()
             )
+
+        # Start from the freshly-generated, objective-aligned report.
+        merged_analysis: Dict[str, Any] = dict(new_analysis)
+
+        def _str_list(items: Any) -> List[str]:
+            out: List[str] = []
+            if not isinstance(items, list):
+                return out
+            for x in items:
+                s = str(x).strip() if x is not None else ""
+                if s:
+                    out.append(s)
+            return out
+
+        def _union_strs(prev_items: Any, new_items: Any) -> List[str]:
+            # Preserve previous items first so user-curated state stays at
+            # the top; append new items not already present (by lowercased
+            # exact match here — semantic dedupe runs afterwards).
+            seen_lower: set = set()
+            ordered: List[str] = []
+            for s in _str_list(prev_items) + _str_list(new_items):
+                key = s.lower()
+                if key in seen_lower:
+                    continue
+                seen_lower.add(key)
+                ordered.append(s)
+            return ordered
+
+        # Filter out items the user has previously rejected (per-section
+        # memory) before merging — applies to missingInfo + weaknesses + risks.
+        def _filter_rejected(section: str, items: List[str]) -> List[str]:
+            if not items:
+                return items
+            return [
+                s
+                for s in items
+                if not self._is_previously_rejected_analysis_item(
+                    workspace_id=workspace_id,
+                    section=section,
+                    candidate=s,
+                )
+            ]
+
+        new_missing_filtered = _filter_rejected(
+            "missingInfo", _str_list(new_analysis.get("missingInfo"))
         )
-        # Semantic dedupe by meaning (LLM-based), not only exact text.
+        new_weak_filtered = _filter_rejected(
+            "riskOrWeakness", _str_list(new_analysis.get("weaknesses"))
+        )
+        new_risks_filtered = _filter_rejected(
+            "riskOrWeakness", _str_list(new_analysis.get("risks"))
+        )
+
         merged_analysis["missingInfo"] = await self._llm_semantic_dedupe_strings(
-            merged_analysis.get("missingInfo") or [],
+            _union_strs(prev_analysis.get("missingInfo"), new_missing_filtered),
             item_type="missing information items",
             max_keep=10,
         )
         merged_analysis["weaknesses"] = await self._llm_semantic_dedupe_strings(
-            merged_analysis.get("weaknesses") or [],
+            _union_strs(prev_analysis.get("weaknesses"), new_weak_filtered),
             item_type="weaknesses",
             max_keep=8,
         )
         merged_analysis["risks"] = await self._llm_semantic_dedupe_strings(
-            merged_analysis.get("risks") or [],
+            _union_strs(prev_analysis.get("risks"), new_risks_filtered),
             item_type="risks",
             max_keep=8,
         )
         merged_analysis["pendingActions"] = await self._llm_semantic_dedupe_strings(
-            merged_analysis.get("pendingActions") or [],
+            _union_strs(
+                prev_analysis.get("pendingActions"),
+                new_analysis.get("pendingActions"),
+            ),
             item_type="pending actions",
             max_keep=6,
         )
         merged_analysis["nextSteps"] = await self._llm_semantic_dedupe_strings(
-            merged_analysis.get("nextSteps") or [],
+            _union_strs(prev_analysis.get("nextSteps"), new_analysis.get("nextSteps")),
             item_type="next steps",
             max_keep=6,
         )
         merged_analysis["suggestedDrafts"] = await self._llm_semantic_dedupe_strings(
-            merged_analysis.get("suggestedDrafts") or [],
+            _union_strs(
+                prev_analysis.get("suggestedDrafts"),
+                new_analysis.get("suggestedDrafts"),
+            ),
             item_type="suggested drafts",
             max_keep=6,
         )
         merged_analysis["relevantJurisdiction"] = await self._llm_semantic_dedupe_strings(
-            merged_analysis.get("relevantJurisdiction") or [],
+            _union_strs(
+                prev_analysis.get("relevantJurisdiction"),
+                new_analysis.get("relevantJurisdiction"),
+            ),
             item_type="relevant jurisdiction entries",
             max_keep=6,
         )
-        merged_analysis["strengths"] = await self._llm_semantic_dedupe_strengths(
-            merged_analysis.get("strengths") or [], max_keep=8
+        # Strengths is List[Dict{point, laws}]; concat then semantic dedupe.
+        prev_strengths = (
+            prev_analysis.get("strengths")
+            if isinstance(prev_analysis.get("strengths"), list)
+            else []
         )
+        new_strengths = (
+            new_analysis.get("strengths")
+            if isinstance(new_analysis.get("strengths"), list)
+            else []
+        )
+        merged_analysis["strengths"] = await self._llm_semantic_dedupe_strengths(
+            list(prev_strengths) + list(new_strengths), max_keep=8
+        )
+
+        # Identity fields: keep previous values when present; the case
+        # identity does not change with an objective shift.
+        for identity_field in (
+            "caseTitle",
+            "caseCategory",
+            "subcategories",
+            "description",
+            "caseType",
+        ):
+            prev_val = prev_analysis.get(identity_field)
+            if prev_val not in (None, "", []):
+                merged_analysis[identity_field] = prev_val
+
+        # Score: preserve the previous score (and the previous user-feedback
+        # deltas baked into it) when available, then re-cap against the
+        # merged list state so we never exceed 95% while pending items remain.
+        prev_score_val = prev_analysis.get("caseResolutionScore")
+        if prev_score_val is None:
+            prev_score_val = prev_analysis.get("case_resolution_score")
+        try:
+            prev_score_int = (
+                int(prev_score_val) if prev_score_val is not None else None
+            )
+        except (TypeError, ValueError):
+            prev_score_int = None
+        if prev_score_int is not None:
+            max_allowed = self._analysis_report_max_allowed_score(report=merged_analysis)
+            merged_analysis["caseResolutionScore"] = min(
+                max(0, prev_score_int), max_allowed
+            )
+        # Mirror the same value into reportQualityScore if the previous
+        # report tracked it explicitly.
+        prev_report_score = prev_analysis.get("reportQualityScore")
+        if prev_report_score is not None:
+            try:
+                prev_report_score_int = int(prev_report_score)
+                max_allowed = self._analysis_report_max_allowed_score(
+                    report=merged_analysis
+                )
+                merged_analysis["reportQualityScore"] = min(
+                    max(0, prev_report_score_int), max_allowed
+                )
+            except (TypeError, ValueError):
+                pass
+
+        # Regenerate quality explanations against the merged state so they
+        # stay consistent with the preserved score and the merged lists.
+        # (Mirrors the analysis_report_feedback flow: pass existing="" so
+        # `_ensure_quality_score_explanation` re-derives fresh text.)
+        try:
+            current_score_for_explanation = int(
+                merged_analysis.get("caseResolutionScore") or 0
+            )
+        except (TypeError, ValueError):
+            current_score_for_explanation = 0
+        try:
+            fresh_explanation = await self._ensure_quality_score_explanation(
+                workspace_role=workspace_role,
+                case_resolution_score=current_score_for_explanation,
+                missing_info=merged_analysis.get("missingInfo") or [],
+                weaknesses=merged_analysis.get("weaknesses") or [],
+                risks=merged_analysis.get("risks") or [],
+                strengths=merged_analysis.get("strengths") or [],
+                existing="",
+            )
+        except Exception as expl_err:
+            logger.warning(
+                "Objective-change merge: quality explanation regen failed{}: {}",
+                ctx,
+                expl_err,
+            )
+            fresh_explanation = (
+                merged_analysis.get("qualityScoreExplanation")
+                or prev_analysis.get("qualityScoreExplanation")
+                or ""
+            )
+        if fresh_explanation:
+            merged_analysis["qualityScoreExplanation"] = fresh_explanation
+            merged_analysis["reportQualityScoreExplanation"] = (
+                self._sanitize_report_quality_score_explanation(fresh_explanation)
+            ).strip()
+
+        merged_analysis["timestamp"] = datetime.utcnow().isoformat() + "Z"
         self._workspace_analysis_payload[workspace_id] = merged_analysis
         if self._socket_client:
             await self._socket_client.emit(
@@ -5599,7 +5789,8 @@ Rules:
                 },
             )
             logger.success(
-                "✅ Objective-change incremental analysis update emitted{}",
+                "✅ Objective-change incremental analysis update emitted "
+                "(prev preserved, new points merged, rejections respected){}",
                 ctx,
             )
             # Fresh objective-aligned report is emitted; lift suppression so future emits are allowed.
@@ -6166,6 +6357,76 @@ Rules:
             risks,
             strengths,
         )
+
+    def _record_rejected_analysis_item(
+        self,
+        workspace_id: str,
+        section: str,
+        rejected_value: str,
+    ) -> None:
+        """
+        Persist a rejected missingInfo / riskOrWeakness value into the
+        per-workspace rejection memory so that subsequent flows (notably the
+        objective-change incremental refresh) do not silently re-introduce
+        items the user has already dismissed.
+        """
+        rv = (rejected_value or "").strip()
+        if not workspace_id or not rv:
+            return
+        if section not in ("missingInfo", "riskOrWeakness"):
+            return
+        try:
+            current = self._workspace_rejected_analysis_items.get(workspace_id) or {}
+            if not isinstance(current, dict):
+                current = {}
+            bucket = current.get(section)
+            if not isinstance(bucket, list):
+                bucket = []
+            for existing in bucket:
+                if not isinstance(existing, str):
+                    continue
+                if self._match_rejected_value(existing, rv) or self._match_rejected_value(
+                    rv, existing
+                ):
+                    return
+            bucket.append(rv)
+            current[section] = bucket[-50:]
+            self._workspace_rejected_analysis_items[workspace_id] = current
+        except Exception as e:
+            logger.debug(
+                "Failed to record rejected analysis item (workspace={}, section={}): {}",
+                workspace_id,
+                section,
+                e,
+            )
+
+    def _is_previously_rejected_analysis_item(
+        self,
+        workspace_id: str,
+        section: str,
+        candidate: Any,
+    ) -> bool:
+        """
+        Return True when `candidate` semantically matches any value the user
+        has previously rejected for this workspace+section.
+        """
+        if not workspace_id or section not in ("missingInfo", "riskOrWeakness"):
+            return False
+        try:
+            current = self._workspace_rejected_analysis_items.get(workspace_id) or {}
+            if not isinstance(current, dict):
+                return False
+            bucket = current.get(section)
+            if not isinstance(bucket, list) or not bucket:
+                return False
+            for prev_rv in bucket:
+                if not isinstance(prev_rv, str) or not prev_rv.strip():
+                    continue
+                if self._match_rejected_value(candidate, prev_rv):
+                    return True
+        except Exception:
+            return False
+        return False
 
     def _match_rejected_value(self, item: Any, rejected_value: str) -> bool:
         """Return True if item matches/addresses rejectedValue using robust text overlap."""
@@ -7026,6 +7287,15 @@ Output ONLY valid JSON, no markdown, no code block:
                 if len(new_risks) < len(risks):
                     report["risks"] = new_risks
                     removed = True
+
+        # Persist the rejection so future regenerations (e.g. objective-change
+        # incremental refresh) do not silently re-introduce this item.
+        if removed:
+            self._record_rejected_analysis_item(
+                workspace_id=workspace_id,
+                section=section,
+                rejected_value=rejected_value,
+            )
 
         if not removed:
             # Stale / duplicate rejection: the rejectedValue does not match any

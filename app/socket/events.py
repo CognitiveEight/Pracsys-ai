@@ -95,6 +95,64 @@ def _derive_report_case_summary(case_summary: str) -> str:
     return t.strip()
 
 
+def _coerce_analysis_text_item(value: Any) -> str:
+    """
+    Normalize a single analysis-report list item into a clean display string.
+
+    Risks / weaknesses / missingInfo / relevantJurisdiction in the analysis
+    report schema are `List[str]`, but the LLM occasionally returns them in
+    the same `{"point": "...", "laws": [...]}` shape used for strengths.
+    Without normalization, those entries leak into the emitted payload as
+    Python dict reprs (e.g. ``"{'point': '...', 'laws': [...]}"``), which
+    is exactly what the user sees in the Risks & Weaknesses panel.
+
+    Coercion rules:
+      - ``None``                                  → ``""``
+      - ``str``                                   → stripped string
+      - ``dict`` with ``point``/``text``/``description``/``value`` keys
+                                                  → that text, stripped
+      - any other type                            → ``str(value).strip()``
+        (only as a last resort; we never want to surface a dict literal)
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("point", "text", "description", "value", "title"):
+            candidate = value.get(key) if hasattr(value, "get") else None
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        # Fall back to the first non-empty string value (e.g. nested
+        # custom keys) before giving up.
+        for v in value.values():
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        # Defensive: surface the first text-like element.
+        for inner in value:
+            coerced = _coerce_analysis_text_item(inner)
+            if coerced:
+                return coerced
+        return ""
+    return str(value).strip()
+
+
+def _coerce_analysis_text_list(items: Any) -> List[str]:
+    """Apply `_coerce_analysis_text_item` to every entry, dropping empties."""
+    if not isinstance(items, list):
+        if items is None:
+            return []
+        items = [items]
+    out: List[str] = []
+    for x in items:
+        s = _coerce_analysis_text_item(x)
+        if s:
+            out.append(s)
+    return out
+
+
 def _strip_strength_point_statute_boilerplate(text: str) -> str:
     """
     Remove trailing citation boilerplate from analysis strength points (statutes belong in `laws`, not prose).
@@ -412,6 +470,21 @@ class SocketEventHandler:
                 continue
             if target.get(workspace_id):
                 continue
+            # Defensive normalization: historical analysis-report payloads
+            # may still contain dict-shaped risks / weaknesses / missingInfo
+            # entries that would otherwise render as Python dict literals
+            # in the FE. Clean them up at hydration time so the in-memory
+            # cache (and every downstream emit) stays well-formed.
+            if kind == CacheKinds.ANALYSIS_REPORT and isinstance(payload, dict):
+                try:
+                    self._normalize_analysis_report_lists(payload)
+                except Exception as norm_err:
+                    logger.debug(
+                        "Analysis report hydration normalization skipped "
+                        "(workspace={}): {}",
+                        workspace_id,
+                        norm_err,
+                    )
             try:
                 if isinstance(target, PersistentWorkspaceDict):
                     target.hydrate_from_cache(workspace_id, payload)
@@ -2815,9 +2888,9 @@ Rules:
                     )
 
             missing_info = data.get("missingInfo") or data.get("missing_info") or []
-            if not isinstance(missing_info, list):
-                missing_info = [missing_info] if missing_info else []
-            missing_info = [str(x).strip() for x in missing_info if x][:10]
+            # Coerce off-schema shapes (e.g. {"point": ..., "laws": [...]})
+            # back to plain strings so the FE never sees Python dict reprs.
+            missing_info = _coerce_analysis_text_list(missing_info)[:10]
             # Product language requirement: refer to uploaded files as annexures in analysis text.
             missing_info = [
                 re.sub(
@@ -2867,9 +2940,10 @@ Rules:
                     strengths.append({"point": point, "laws": []})
 
             weaknesses = data.get("weaknesses") or []
-            if not isinstance(weaknesses, list):
-                weaknesses = [weaknesses] if weaknesses else []
-            weaknesses = [str(x).strip() for x in weaknesses if x][:8]
+            # Coerce off-schema shapes (the model sometimes returns
+            # `{"point": ..., "laws": [...]}` here, which would otherwise
+            # render as a raw Python dict literal in the FE panel).
+            weaknesses = _coerce_analysis_text_list(weaknesses)[:8]
             weaknesses = [
                 re.sub(
                     r"\bdocuments\b",
@@ -2881,9 +2955,7 @@ Rules:
             ]
 
             risks = data.get("risks") or []
-            if not isinstance(risks, list):
-                risks = [risks] if risks else []
-            risks = [str(x).strip() for x in risks if x][:8]
+            risks = _coerce_analysis_text_list(risks)[:8]
             risks = [
                 re.sub(
                     r"\bdocuments\b",
@@ -2900,13 +2972,9 @@ Rules:
                 or data.get("jurisdiction")
                 or []
             )
-            if not isinstance(relevant_jurisdiction, list):
-                relevant_jurisdiction = (
-                    [relevant_jurisdiction] if relevant_jurisdiction else []
-                )
-            relevant_jurisdiction = [
-                str(x).strip() for x in relevant_jurisdiction if x
-            ][:6]
+            relevant_jurisdiction = _coerce_analysis_text_list(relevant_jurisdiction)[
+                :6
+            ]
             relevant_jurisdiction = await self._ensure_structured_relevant_jurisdiction(
                 relevant_jurisdiction,
                 workspace_role=workspace_role,
@@ -2964,25 +3032,19 @@ Rules:
                     force_obj = json.loads((force_raw or "").strip())
                     if isinstance(force_obj, dict):
                         if not weaknesses and isinstance(force_obj.get("weaknesses"), list):
-                            weaknesses = [
-                                str(x).strip()
-                                for x in (force_obj.get("weaknesses") or [])
-                                if str(x).strip()
-                            ][:8]
+                            weaknesses = _coerce_analysis_text_list(
+                                force_obj.get("weaknesses")
+                            )[:8]
                         if not risks and isinstance(force_obj.get("risks"), list):
-                            risks = [
-                                str(x).strip()
-                                for x in (force_obj.get("risks") or [])
-                                if str(x).strip()
-                            ][:8]
+                            risks = _coerce_analysis_text_list(
+                                force_obj.get("risks")
+                            )[:8]
                         if (not relevant_jurisdiction) and isinstance(
                             force_obj.get("relevantJurisdiction"), list
                         ):
-                            relevant_jurisdiction = [
-                                str(x).strip()
-                                for x in (force_obj.get("relevantJurisdiction") or [])
-                                if str(x).strip()
-                            ][:6]
+                            relevant_jurisdiction = _coerce_analysis_text_list(
+                                force_obj.get("relevantJurisdiction")
+                            )[:6]
                     logger.info(
                         "Forced analysis tail regeneration attempted for: {}",
                         ", ".join(must_fill),
@@ -5587,14 +5649,10 @@ Rules:
         merged_analysis: Dict[str, Any] = dict(new_analysis)
 
         def _str_list(items: Any) -> List[str]:
-            out: List[str] = []
-            if not isinstance(items, list):
-                return out
-            for x in items:
-                s = str(x).strip() if x is not None else ""
-                if s:
-                    out.append(s)
-            return out
+            # Use the shared coercion helper so dict-shaped entries from a
+            # stale cached previous report (or a misbehaving LLM response)
+            # are flattened to plain strings instead of leaking dict reprs.
+            return _coerce_analysis_text_list(items)
 
         def _union_strs(prev_items: Any, new_items: Any) -> List[str]:
             # Preserve previous items first so user-curated state stays at
@@ -5777,6 +5835,9 @@ Rules:
             ).strip()
 
         merged_analysis["timestamp"] = datetime.utcnow().isoformat() + "Z"
+        # Final guarantee: every user-facing list field on the merged
+        # payload is a List[str] (no dict reprs) before we cache + emit.
+        self._normalize_analysis_report_lists(merged_analysis)
         self._workspace_analysis_payload[workspace_id] = merged_analysis
         if self._socket_client:
             await self._socket_client.emit(
@@ -6357,6 +6418,44 @@ Rules:
             risks,
             strengths,
         )
+
+    def _normalize_analysis_report_lists(
+        self, report: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Defense-in-depth sanitizer: ensures the user-facing list fields of an
+        analysis-report payload contain only plain strings, never dict reprs.
+
+        The model occasionally returns ``risks`` / ``weaknesses`` /
+        ``missingInfo`` / etc. as dicts (the same ``{"point": ..., "laws": [...]}``
+        shape used for ``strengths``). Without this sanitizer those entries
+        would render in the FE as Python dict literals like
+        ``"{'point': '...', 'laws': [...]}"``. Strengths are intentionally
+        left untouched because they are a typed `List[Dict{point, laws}]`.
+
+        Mutates the dict in place and returns it for convenience. Returns
+        the input unchanged when it is not a dict.
+        """
+        if not isinstance(report, dict):
+            return report
+        for key in (
+            "missingInfo",
+            "weaknesses",
+            "risks",
+            "relevantJurisdiction",
+            "pendingActions",
+            "nextSteps",
+            "suggestedDrafts",
+        ):
+            if key in report:
+                report[key] = _coerce_analysis_text_list(report.get(key))
+        # `missing_info` snake_case alias is occasionally used as a fallback
+        # source — clean it too if present.
+        if "missing_info" in report:
+            report["missing_info"] = _coerce_analysis_text_list(
+                report.get("missing_info")
+            )
+        return report
 
     def _record_rejected_analysis_item(
         self,
@@ -7247,6 +7346,11 @@ Output ONLY valid JSON, no markdown, no code block:
             return
 
         report = copy.deepcopy(current)
+        # Self-heal any dict-shaped list entries that may already be sitting
+        # in the cached report from before the dict→string coercion fix.
+        # Without this, a stale `{'point': ..., 'laws': [...]}` weakness/risk
+        # would be re-emitted verbatim and render as a Python dict literal.
+        self._normalize_analysis_report_lists(report)
         old_score = int(
             report.get("caseResolutionScore")
             or report.get("case_resolution_score")
@@ -7654,6 +7758,9 @@ Output ONLY valid JSON, no markdown, no code block:
             return
 
         report = copy.deepcopy(current)
+        # Self-heal any dict-shaped list entries that may already be sitting
+        # in the cached report from before the dict→string coercion fix.
+        self._normalize_analysis_report_lists(report)
         old_score = int(
             report.get("caseResolutionScore")
             or report.get("case_resolution_score")

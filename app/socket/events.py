@@ -7215,7 +7215,9 @@ Output ONLY valid JSON, no markdown, no code block:
         - If the user-supplied text is RELATED to the case (per AI judgement), the
           caseResolutionScore is DECREASED, qualityScoreExplanation is freshly
           regenerated, and the analysis report is re-emitted.
-        - If the text is NOT related, no changes are made and nothing is re-emitted.
+        - If the text is NOT related, the cached analysis report is re-emitted
+          unchanged (only the timestamp is refreshed) so the frontend loader
+          clears. Score, explanations, and list items stay exactly as-is.
         - The missingInfo list is never modified by this event (the user is
           providing context, not curating items).
         """
@@ -7280,11 +7282,36 @@ Output ONLY valid JSON, no markdown, no code block:
         )
 
         if not is_related:
+            # Frontend shows a loader on submit and clears it only when a fresh
+            # analysis_report payload is received. Re-emit the cached report
+            # unchanged (only refresh the timestamp) so the loader resolves
+            # without altering the score, explanation, or list items.
             logger.info(
                 "added_missing_information: input is not related to the case – "
-                "no score change, no re-emit (workspace={})",
+                "re-emitting unchanged analysis_report to clear FE loader (workspace={})",
                 workspace_id,
             )
+            report["timestamp"] = datetime.utcnow().isoformat() + "Z"
+            self._workspace_analysis_payload[workspace_id] = report
+            if self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "analysis_report",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": report,
+                    },
+                )
+                logger.success(
+                    "✅ added_missing_information no-op: re-emitted unchanged analysis_report (score stays at {}%)",
+                    old_score,
+                )
+            else:
+                logger.warning(
+                    "added_missing_information: no socket client – cannot clear FE loader for workspace {}",
+                    workspace_id,
+                )
             return
 
         # Apply score decrease (clamped at 0). Pending-item cap (95%) is unchanged

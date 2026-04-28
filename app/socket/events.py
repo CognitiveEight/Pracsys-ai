@@ -8028,6 +8028,61 @@ Indian Kanoon / search results (titles and snippets):
             response_body.get("requestId"),
         )
 
+    def _normalize_case_title(self, title: str) -> str:
+        """
+        Normalize a case title to "Petitioner vs Respondent" style with
+        Indian-court multi-party shorthand:
+
+        - When a side has 2 parties joined by " & ", reduce to "<first> & Anr".
+        - When a side has 3+ parties joined by " & ", reduce to "<first> & Ors".
+        - Single-party sides and sides already ending in "& Anr" / "& Ors" are
+          left untouched.
+        - Also rewrites " v ", " v. ", " versus " (case-insensitive) to " vs ".
+
+        Only " & " is treated as a multi-party separator. We deliberately do
+        NOT split on commas or the word "and" because those frequently appear
+        inside legitimate party / company names (e.g. "Smith, Patel & Co",
+        "Pradeep Mehra and Sons").
+        """
+        if not (title or "").strip():
+            return title or ""
+
+        t = title.strip().strip('"').strip("'")
+
+        vs_match = re.search(
+            r"\s+(vs|versus|v\.?)\s+",
+            t,
+            flags=re.IGNORECASE,
+        )
+        if not vs_match:
+            return t
+
+        left = t[: vs_match.start()].strip()
+        right = t[vs_match.end() :].strip()
+
+        anr_ors_re = re.compile(
+            r"\s*&\s*(anr|ors|another|others)\.?$",
+            flags=re.IGNORECASE,
+        )
+
+        def _reduce_side(side: str) -> str:
+            s = (side or "").strip().rstrip(",")
+            if not s:
+                return s
+            if anr_ors_re.search(s):
+                return s
+            parts = [p.strip() for p in re.split(r"\s+&\s+", s) if p.strip()]
+            if len(parts) <= 1:
+                return s
+            first = parts[0]
+            if len(parts) == 2:
+                return f"{first} & Anr"
+            return f"{first} & Ors"
+
+        normalized = f"{_reduce_side(left)} vs {_reduce_side(right)}"
+        normalized = re.sub(r"\s{2,}", " ", normalized).strip()
+        return normalized
+
     def _salvage_workspace_metadata_from_truncated_json(
         self, raw: str, combined: str = ""
     ) -> Dict[str, Any]:
@@ -8049,7 +8104,7 @@ Indian Kanoon / search results (titles and snippets):
         if title_match:
             val = title_match.group(1).strip()
             if val:
-                result["caseTitle"] = val
+                result["caseTitle"] = self._normalize_case_title(val)
         # Salvage caseCategory
         if "caseCategory" in raw:
             cat_match = re.search(r'"caseCategory"\s*:\s*"([^"]*)"', raw)
@@ -8496,6 +8551,9 @@ Summary (3-4 lines, one sentence per line):"""
             else:
                 title = f"{title} vs Matter"
             result["caseTitle"] = title
+        # Final pass: collapse multi-party sides to "<first> & Anr"/"& Ors"
+        # so titles never appear as "A vs B & C" or "A & B vs C".
+        result["caseTitle"] = self._normalize_case_title(result["caseTitle"])
         return result
 
     async def _generate_fallback_metadata(
@@ -8508,14 +8566,14 @@ Summary (3-4 lines, one sentence per line):"""
             gemini_client.initialize()
             doc_preview = combined[:400].replace("\n", " ")
             fallback_prompt = f"""From this document content, extract ACTUAL CASE DETAILS:
-1. Two parties/names for title format "Party1 vs Party2" (or "Party vs Issue" if only one)
+1. Title in strict "Petitioner vs Respondent" format. Indian-court multi-party shorthand: 2 parties on a side → "<First> & Anr"; 3+ parties → "<First> & Ors". Never join multiple parties with " & " in the final title. Use exactly " vs " (lowercase, with spaces). If only one party is identifiable, use "<Party> vs <Issue>".
 2. One legal category (CRIMINAL LAW, CIVIL LAW, CYBER LAW, etc.)
 3. One relevant Indian act
 4. A SHORT CASE SUMMARY in English only (3-4 lines). Summarize in your own words; do NOT copy-paste document text. Each line one short sentence.
 
 Document: {doc_preview}
 
-Return JSON: {{"caseTitle": "Name1 vs Name2", "caseCategory": "CIVIL LAW", "subcategories": ["Act Name"], "description": "Line 1: Actual party and issue from documents\\nLine 2: Key facts/allegations from documents\\nLine 3: Relief sought from documents\\nLine 4: Additional relevant details"}}"""
+Return JSON: {{"caseTitle": "<First Petitioner> vs <First Respondent> & Anr", "caseCategory": "CIVIL LAW", "subcategories": ["Act Name"], "description": "Line 1: Actual party and issue from documents\\nLine 2: Key facts/allegations from documents\\nLine 3: Relief sought from documents\\nLine 4: Additional relevant details"}}"""
             raw = await gemini_client.generate(
                 fallback_prompt, temperature=0.3, max_tokens=12000
             )
@@ -8609,7 +8667,7 @@ Return JSON: {{"caseTitle": "Name1 vs Name2", "caseCategory": "CIVIL LAW", "subc
                             elif len(desc_lines) > 4:
                                 desc = "\n".join(desc_lines[:4])
                         return {
-                            "caseTitle": title,
+                            "caseTitle": self._normalize_case_title(title),
                             "caseCategory": category,
                             "subcategories": subs[:3],
                             "description": desc[:500],
@@ -8685,7 +8743,7 @@ Return JSON: {{"caseTitle": "Name1 vs Name2", "caseCategory": "CIVIL LAW", "subc
             gemini_client.initialize()
             prompt = f"""Based on the document content below, output a JSON object with ALL fields REQUIRED (no empty/null values):
 
-- caseTitle: MUST be in format "Petitioner vs Respondent" or "Party1 vs Party2" (e.g. "Umesh Malik vs Karnataka State Cricket Association", "Shubham Malik vs Social Media Hacking"). Extract actual party names from documents. Format: "[Petitioner/Complainant Name] vs [Respondent/Defendant Name]" or "[Party] vs [Issue/Matter]". This field is MANDATORY - always provide a title.
+- caseTitle: MUST be in format "Petitioner vs Respondent". Use Indian-court multi-party shorthand: when one side has exactly 2 parties, use "<First Party> & Anr" (e.g. "Pradeep Mehra vs Ethos Limited & Anr"); when 3+ parties, use "<First Party> & Ors" (e.g. "Umesh Malik vs State of Karnataka & Ors"). Never join multiple parties with " & " in the final title — always reduce to first party + "& Anr"/"& Ors". Use exactly " vs " (lowercase, with spaces). If only one party can be identified, use "[Party] vs [Issue/Matter]". MANDATORY field.
 - caseCategory: exactly one category in UPPERCASE (e.g. CRIMINAL LAW, CYBER LAW, CIVIL LAW, TRADE MARK LAW). MANDATORY - must be one of: CRIMINAL LAW, CIVIL LAW, CYBER LAW, CONTRACT LAW, PROPERTY LAW, LABOUR LAW, TAX LAW, or similar.
 - subcategories: array of 1-3 relevant Indian acts (e.g. ["Bharatiya Nyaya Sanhita", "Information Technology Act, 2000", "The Trade Marks Act, 1999"]). MANDATORY - must have at least 1 act.
 - description: a SHORT CASE SUMMARY in English only, exactly 3 to 4 lines (minimum 3, maximum 4). You MUST write a SPECIFIC summary for this case: name the actual parties (people or organizations) and the actual dispute. Do NOT use generic phrases like "Legal matter based on uploaded documents" or "The case involves parties and issues requiring legal review". Write in your own words; do NOT copy-paste the document. Each line one short sentence (under 120 characters). Line 1: actual parties and main issue. Line 2: key facts or allegations. Line 3: relief or action sought. Line 4 (optional): one more relevant detail. Output only the summary text, no prefixes like "Line 1:".
@@ -8695,7 +8753,7 @@ Document content:
 
 CRITICAL: All four fields (caseTitle, caseCategory, subcategories, description) are MANDATORY. Do not leave any field empty or null.
 
-Output ONLY this JSON, no markdown: {{"caseTitle": "Petitioner Name vs Respondent Name", "caseCategory": "CRIMINAL LAW", "subcategories": ["Bharatiya Nyaya Sanhita", "IT Act 2000"], "description": "MLA Umesh Malik has filed a complaint regarding his son Shubham Malik's hacked social media account.\\nEdited videos and posts were made viral to defame the complainant and damage his political image.\\nThe complainant seeks a high-level investigation and strict action against the perpetrators.\\nThe complaint involves alleged violations under IT Act 2000 and requests preservation of digital evidence."}}"""
+Output ONLY this JSON, no markdown: {{"caseTitle": "Pradeep Mehra vs Ethos Limited & Anr", "caseCategory": "CIVIL LAW", "subcategories": ["Consumer Protection Act, 2019"], "description": "MLA Umesh Malik has filed a complaint regarding his son Shubham Malik's hacked social media account.\\nEdited videos and posts were made viral to defame the complainant and damage his political image.\\nThe complainant seeks a high-level investigation and strict action against the perpetrators.\\nThe complaint involves alleged violations under IT Act 2000 and requests preservation of digital evidence."}}"""
             raw = await gemini_client.generate(prompt, temperature=0.2, max_tokens=12000)
             if not raw or "Error" in (raw[:80] or ""):
                 return await self._generate_fallback_metadata(combined, workspace_id)
@@ -8752,7 +8810,9 @@ Output ONLY this JSON, no markdown: {{"caseTitle": "Petitioner Name vs Responden
                     )
                     return salvaged
                 return await self._generate_fallback_metadata(combined, workspace_id)
-            case_title = (data.get("caseTitle") or "").strip()
+            case_title = self._normalize_case_title(
+                (data.get("caseTitle") or "").strip()
+            )
             case_category = (data.get("caseCategory") or "").strip().upper()
             subcategories = data.get("subcategories") or data.get("subcategory") or []
             if isinstance(subcategories, str):

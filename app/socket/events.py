@@ -4233,6 +4233,11 @@ Example shape:
                 if str(e.get("sourceDocId") or "").strip() not in processed_doc_ids
             ]
             merged = retained + (list_of_dates or [])
+            # Drop near-duplicates that share a date but came in with slightly
+            # different titles after a transcript edit / regeneration.
+            merged = await self._dedupe_dated_entries_semantically(
+                merged, item_type="list of dates"
+            )
             merged.sort(
                 key=lambda x: (
                     str(x.get("date") or ""),
@@ -4244,7 +4249,11 @@ Example shape:
             self._workspace_list_of_dates_payload[workspace_id] = merged
             list_of_dates = merged
         else:
-            # Full refresh mode (workspace created/delete flows): replace complete payload.
+            # Full refresh mode (workspace created/delete flows): still dedupe in
+            # case the single regeneration produced same-date duplicates.
+            list_of_dates = await self._dedupe_dated_entries_semantically(
+                list_of_dates or [], item_type="list of dates"
+            )
             self._workspace_list_of_dates_payload[workspace_id] = list_of_dates
         # Payload matches backend spec: workspaceId, userId at root and inside payload for storage
         payload = {
@@ -5017,11 +5026,17 @@ Indian Kanoon / case-law search results:
             workspace_id[:12] if workspace_id else "",
         )
 
-        payload = await self._generate_applicable_laws_from_sources(
+        new_payload = await self._generate_applicable_laws_from_sources(
             workspace_id=workspace_id,
             workspace_role=role,
             signals=signals,
             search_results=search_results,
+        )
+        # Union with the previously cached payload and dedupe so a regeneration
+        # after a transcript edit doesn't drop laws the user has already seen
+        # while still folding in any genuinely new entries.
+        payload = await self._merge_applicable_laws_with_previous(
+            workspace_id, new_payload
         )
         self._workspace_applicable_laws_payload[workspace_id] = payload
         if not self._socket_client:
@@ -5152,10 +5167,18 @@ Indian Kanoon / case-law search results:
                 if str(e.get("sourceDocId") or "").strip() not in processed_doc_ids
             ]
             merged = retained + (timeline or [])
+            # Drop near-duplicate entries on the same date (post-edit regenerations
+            # often produce slightly-reworded versions of the same milestone).
+            merged = await self._dedupe_dated_entries_semantically(
+                merged, item_type="procedural timeline"
+            )
             merged.sort(key=lambda x: str(x.get("date") or ""))
             self._workspace_procedural_timeline_payload[workspace_id] = merged
             timeline = merged
         else:
+            timeline = await self._dedupe_dated_entries_semantically(
+                timeline or [], item_type="procedural timeline"
+            )
             self._workspace_procedural_timeline_payload[workspace_id] = timeline
 
         payload = {
@@ -5608,6 +5631,159 @@ Rules:
         return [valid_strengths[i - 1] for i in keep if 1 <= i <= len(valid_strengths)][
             :max_keep
         ]
+
+    async def _dedupe_dated_entries_semantically(
+        self,
+        entries: List[Dict[str, Any]],
+        *,
+        item_type: str,
+        title_field: str = "title",
+        description_field: str = "description",
+        date_field: str = "date",
+    ) -> List[Dict[str, Any]]:
+        """Drop near-duplicate dated entries that share the same date.
+
+        Groups by ``date_field`` and, for each date with ≥2 entries, asks the
+        same LLM-semantic dedupe used for analysis_report to keep only the
+        meaning-distinct ones. Entries on different dates are never compared,
+        so two genuinely separate events on the same day with different titles
+        are preserved.
+
+        Used for list_of_dates and procedural_timeline regenerations after a
+        workspace_sync — without it, regenerating from edited transcripts
+        produces near-duplicate entries with slightly different titles for the
+        same date.
+        """
+        if not entries:
+            return []
+
+        grouped: Dict[str, List[int]] = {}
+        for idx, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            d = str(entry.get(date_field) or "").strip()
+            if not d:
+                continue
+            grouped.setdefault(d, []).append(idx)
+
+        # Indexes that survive dedup. Start with everything, then remove
+        # within each duplicate group.
+        kept_indexes: set[int] = set(range(len(entries)))
+
+        for date_value, idxs in grouped.items():
+            if len(idxs) < 2:
+                continue
+
+            def _label_for(entry: Dict[str, Any]) -> str:
+                title = str(entry.get(title_field) or "").strip()
+                desc = str(entry.get(description_field) or "").strip()
+                return f"{title} — {desc}" if title and desc else (title or desc)
+
+            labels = [_label_for(entries[i]) for i in idxs]
+            if not all(labels):
+                continue
+
+            kept_label_indexes = await self._llm_semantic_keep_indexes(
+                labels, item_type=f"{item_type} on {date_value}", max_keep=len(idxs)
+            )
+            if not kept_label_indexes:
+                continue  # Dedupe failed; keep all on this date.
+
+            keep_set_for_date = {idxs[i - 1] for i in kept_label_indexes if 1 <= i <= len(idxs)}
+            for original_idx in idxs:
+                if original_idx not in keep_set_for_date:
+                    kept_indexes.discard(original_idx)
+
+        if len(kept_indexes) == len(entries):
+            return entries
+
+        before = len(entries)
+        deduped = [entries[i] for i in range(len(entries)) if i in kept_indexes]
+        logger.info(
+            "Dedupe ({}): {} entries → {} after per-date semantic dedup",
+            item_type, before, len(deduped),
+        )
+        return deduped
+
+    def _law_signature(self, law: Dict[str, Any]) -> str:
+        """Stable identity for an applicable_laws entry: lowercase act+section."""
+        act = str(law.get("act") or "").strip().lower()
+        section = str(law.get("section") or "").strip().lower()
+        # Normalise away whitespace and punctuation noise.
+        act = re.sub(r"\s+", " ", act)
+        section = re.sub(r"\s+", " ", section)
+        return f"{act}|{section}"
+
+    async def _merge_applicable_laws_with_previous(
+        self,
+        workspace_id: str,
+        new_payload: Dict[str, Any],
+        *,
+        max_laws: int = 12,
+    ) -> Dict[str, Any]:
+        """Union new applicable_laws with the previous cached payload.
+
+        First pass: drop entries with identical (act, section) signatures —
+        deterministic, free.
+        Second pass: LLM semantic dedup on full ``act + section + description``
+        strings to catch rephrased descriptions of the same provision.
+        Caps the final list at ``max_laws`` (existing limit).
+        """
+        new_laws_raw = new_payload.get("laws") if isinstance(new_payload, dict) else None
+        new_laws: List[Dict[str, Any]] = (
+            [law for law in new_laws_raw if isinstance(law, dict)]
+            if isinstance(new_laws_raw, list)
+            else []
+        )
+
+        prev_payload = self._workspace_applicable_laws_payload.get(workspace_id)
+        prev_laws: List[Dict[str, Any]] = []
+        if isinstance(prev_payload, dict):
+            prev_laws_raw = prev_payload.get("laws")
+            if isinstance(prev_laws_raw, list):
+                prev_laws = [law for law in prev_laws_raw if isinstance(law, dict)]
+
+        if not prev_laws:
+            # No prior payload; still dedupe within the new list itself.
+            unioned = list(new_laws)
+        else:
+            # Prefer NEW entries when (act, section) collides — they reflect the
+            # latest description text from the regeneration.
+            seen: set[str] = set()
+            unioned: List[Dict[str, Any]] = []
+            for law in new_laws + prev_laws:
+                sig = self._law_signature(law)
+                if not sig or sig == "|":
+                    continue
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                unioned.append(law)
+
+        if len(unioned) <= 1:
+            return {"laws": unioned[:max_laws]}
+
+        # LLM semantic pass on richer keys (act + section + description) to
+        # catch paraphrased duplicates that signatures alone miss.
+        labels = []
+        for law in unioned:
+            act = str(law.get("act") or "").strip()
+            section = str(law.get("section") or "").strip()
+            desc = str(law.get("description") or "").strip()
+            labels.append(f"{act} {section} — {desc}".strip(" —"))
+
+        keep_idx = await self._llm_semantic_keep_indexes(
+            labels, item_type="applicable laws", max_keep=max_laws
+        )
+        if keep_idx:
+            unioned = [unioned[i - 1] for i in keep_idx if 1 <= i <= len(unioned)]
+        else:
+            unioned = unioned[:max_laws]
+
+        # Re-stamp ids so the FE sees stable law_N ordering.
+        for i, law in enumerate(unioned):
+            law["id"] = f"law_{i+1}"
+        return {"laws": unioned[:max_laws]}
 
     async def _run_objective_change_incremental_refresh(
         self,

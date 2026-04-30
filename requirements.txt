@@ -16,6 +16,11 @@ google-ai-generativelanguage>=0.4.0
 # Google Cloud (for Vision API OCR)
 google-cloud-vision>=3.4.0
 
+# Google Cloud Speech-to-Text V2 (Chirp 3) for audio transcription + diarization
+google-cloud-speech>=2.29.0
+# Required for GCS-backed BatchRecognize (native Chirp 3 speaker diarization)
+google-cloud-storage>=2.10.0
+
 # LangChain with Google (compatible versions)
 langchain>=0.1.6
 langchain-google-genai>=0.0.11

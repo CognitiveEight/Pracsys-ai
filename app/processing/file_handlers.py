@@ -65,6 +65,11 @@ except ImportError:
     logger.warning("docx2txt not available")
 
 
+AUDIO_EXTENSIONS = (
+    ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".opus", ".webm", ".aac",
+)
+
+
 class FileProcessor:
     """Utility class to process different file types and extract text content."""
 
@@ -77,6 +82,13 @@ class FileProcessor:
     def is_base64_image(content: str) -> bool:
         """Check if content is a base64 encoded image."""
         return content.startswith("data:image/") and ";base64," in content
+
+    @staticmethod
+    def is_audio_file(filename: str) -> bool:
+        """Return True when the filename has an audio extension we transcribe."""
+        if not filename:
+            return False
+        return filename.lower().endswith(AUDIO_EXTENSIONS)
 
     @staticmethod
     def extract_text_from_image(image_data: bytes) -> str:
@@ -436,6 +448,15 @@ class FileProcessor:
             Extracted text content
         """
         filename_lower = filename.lower()
+
+        # Audio files: handled separately by document_processor (Chirp 3 transcription).
+        # Returning a sentinel here protects callers that route everything through this
+        # method but should not try to OCR audio bytes.
+        if filename_lower.endswith(AUDIO_EXTENSIONS):
+            logger.debug(
+                "Audio file routed through file_handlers; document_processor handles transcription"
+            )
+            return "[Audio file - transcription handled by document_processor]"
 
         # Image files
         if any(

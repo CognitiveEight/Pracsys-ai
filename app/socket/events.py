@@ -361,6 +361,22 @@ class SocketEventHandler:
         self._had_disconnect: bool = False
         self._pending_reemit_workspace_id: Optional[str] = None
         self._pending_reemit_user_id: Optional[str] = None
+        # Per-workspace coalescing for analysis_report_feedback. Bulk-reject sends
+        # N events in ~2ms; processing them sequentially under a lock is correct
+        # but takes ~19s × N (Gemini scoring + explanation regeneration). We
+        # instead debounce: events accumulate in a queue, and a single batch
+        # flush kicks off ~500ms after the last event, removing every rejected
+        # item at once and emitting ONE updated report. The lock still guards
+        # the flush itself so a re-burst can't race a flush in flight.
+        self._analysis_feedback_locks: Dict[str, asyncio.Lock] = {}
+        self._pending_feedback_queue: Dict[str, List[Dict[str, Any]]] = {}
+        self._pending_feedback_task: Dict[str, asyncio.Task] = {}
+        # Window for collecting bulk-reject bursts before flushing.
+        self._feedback_debounce_seconds: float = 0.5
+        # Max total score bump from a single batch (each valid rejection
+        # contributes 1–5; capping the sum prevents huge scores when the user
+        # rejects many items at once).
+        self._feedback_batch_max_score_delta: int = 15
         # Chat attachment cache: chat_id -> list of {fileName, content} so follow-up questions in same chat see the document
         self._chat_attachment_by_chat: Dict[str, List[Dict[str, Any]]] = {}
         # Intelligence chat: last assistant text per chat_id (client may omit conversation_history)
@@ -4217,6 +4233,11 @@ Example shape:
                 if str(e.get("sourceDocId") or "").strip() not in processed_doc_ids
             ]
             merged = retained + (list_of_dates or [])
+            # Drop near-duplicates that share a date but came in with slightly
+            # different titles after a transcript edit / regeneration.
+            merged = await self._dedupe_dated_entries_semantically(
+                merged, item_type="list of dates"
+            )
             merged.sort(
                 key=lambda x: (
                     str(x.get("date") or ""),
@@ -4228,7 +4249,11 @@ Example shape:
             self._workspace_list_of_dates_payload[workspace_id] = merged
             list_of_dates = merged
         else:
-            # Full refresh mode (workspace created/delete flows): replace complete payload.
+            # Full refresh mode (workspace created/delete flows): still dedupe in
+            # case the single regeneration produced same-date duplicates.
+            list_of_dates = await self._dedupe_dated_entries_semantically(
+                list_of_dates or [], item_type="list of dates"
+            )
             self._workspace_list_of_dates_payload[workspace_id] = list_of_dates
         # Payload matches backend spec: workspaceId, userId at root and inside payload for storage
         payload = {
@@ -5001,11 +5026,17 @@ Indian Kanoon / case-law search results:
             workspace_id[:12] if workspace_id else "",
         )
 
-        payload = await self._generate_applicable_laws_from_sources(
+        new_payload = await self._generate_applicable_laws_from_sources(
             workspace_id=workspace_id,
             workspace_role=role,
             signals=signals,
             search_results=search_results,
+        )
+        # Union with the previously cached payload and dedupe so a regeneration
+        # after a transcript edit doesn't drop laws the user has already seen
+        # while still folding in any genuinely new entries.
+        payload = await self._merge_applicable_laws_with_previous(
+            workspace_id, new_payload
         )
         self._workspace_applicable_laws_payload[workspace_id] = payload
         if not self._socket_client:
@@ -5136,10 +5167,18 @@ Indian Kanoon / case-law search results:
                 if str(e.get("sourceDocId") or "").strip() not in processed_doc_ids
             ]
             merged = retained + (timeline or [])
+            # Drop near-duplicate entries on the same date (post-edit regenerations
+            # often produce slightly-reworded versions of the same milestone).
+            merged = await self._dedupe_dated_entries_semantically(
+                merged, item_type="procedural timeline"
+            )
             merged.sort(key=lambda x: str(x.get("date") or ""))
             self._workspace_procedural_timeline_payload[workspace_id] = merged
             timeline = merged
         else:
+            timeline = await self._dedupe_dated_entries_semantically(
+                timeline or [], item_type="procedural timeline"
+            )
             self._workspace_procedural_timeline_payload[workspace_id] = timeline
 
         payload = {
@@ -5592,6 +5631,159 @@ Rules:
         return [valid_strengths[i - 1] for i in keep if 1 <= i <= len(valid_strengths)][
             :max_keep
         ]
+
+    async def _dedupe_dated_entries_semantically(
+        self,
+        entries: List[Dict[str, Any]],
+        *,
+        item_type: str,
+        title_field: str = "title",
+        description_field: str = "description",
+        date_field: str = "date",
+    ) -> List[Dict[str, Any]]:
+        """Drop near-duplicate dated entries that share the same date.
+
+        Groups by ``date_field`` and, for each date with ≥2 entries, asks the
+        same LLM-semantic dedupe used for analysis_report to keep only the
+        meaning-distinct ones. Entries on different dates are never compared,
+        so two genuinely separate events on the same day with different titles
+        are preserved.
+
+        Used for list_of_dates and procedural_timeline regenerations after a
+        workspace_sync — without it, regenerating from edited transcripts
+        produces near-duplicate entries with slightly different titles for the
+        same date.
+        """
+        if not entries:
+            return []
+
+        grouped: Dict[str, List[int]] = {}
+        for idx, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            d = str(entry.get(date_field) or "").strip()
+            if not d:
+                continue
+            grouped.setdefault(d, []).append(idx)
+
+        # Indexes that survive dedup. Start with everything, then remove
+        # within each duplicate group.
+        kept_indexes: set[int] = set(range(len(entries)))
+
+        for date_value, idxs in grouped.items():
+            if len(idxs) < 2:
+                continue
+
+            def _label_for(entry: Dict[str, Any]) -> str:
+                title = str(entry.get(title_field) or "").strip()
+                desc = str(entry.get(description_field) or "").strip()
+                return f"{title} — {desc}" if title and desc else (title or desc)
+
+            labels = [_label_for(entries[i]) for i in idxs]
+            if not all(labels):
+                continue
+
+            kept_label_indexes = await self._llm_semantic_keep_indexes(
+                labels, item_type=f"{item_type} on {date_value}", max_keep=len(idxs)
+            )
+            if not kept_label_indexes:
+                continue  # Dedupe failed; keep all on this date.
+
+            keep_set_for_date = {idxs[i - 1] for i in kept_label_indexes if 1 <= i <= len(idxs)}
+            for original_idx in idxs:
+                if original_idx not in keep_set_for_date:
+                    kept_indexes.discard(original_idx)
+
+        if len(kept_indexes) == len(entries):
+            return entries
+
+        before = len(entries)
+        deduped = [entries[i] for i in range(len(entries)) if i in kept_indexes]
+        logger.info(
+            "Dedupe ({}): {} entries → {} after per-date semantic dedup",
+            item_type, before, len(deduped),
+        )
+        return deduped
+
+    def _law_signature(self, law: Dict[str, Any]) -> str:
+        """Stable identity for an applicable_laws entry: lowercase act+section."""
+        act = str(law.get("act") or "").strip().lower()
+        section = str(law.get("section") or "").strip().lower()
+        # Normalise away whitespace and punctuation noise.
+        act = re.sub(r"\s+", " ", act)
+        section = re.sub(r"\s+", " ", section)
+        return f"{act}|{section}"
+
+    async def _merge_applicable_laws_with_previous(
+        self,
+        workspace_id: str,
+        new_payload: Dict[str, Any],
+        *,
+        max_laws: int = 12,
+    ) -> Dict[str, Any]:
+        """Union new applicable_laws with the previous cached payload.
+
+        First pass: drop entries with identical (act, section) signatures —
+        deterministic, free.
+        Second pass: LLM semantic dedup on full ``act + section + description``
+        strings to catch rephrased descriptions of the same provision.
+        Caps the final list at ``max_laws`` (existing limit).
+        """
+        new_laws_raw = new_payload.get("laws") if isinstance(new_payload, dict) else None
+        new_laws: List[Dict[str, Any]] = (
+            [law for law in new_laws_raw if isinstance(law, dict)]
+            if isinstance(new_laws_raw, list)
+            else []
+        )
+
+        prev_payload = self._workspace_applicable_laws_payload.get(workspace_id)
+        prev_laws: List[Dict[str, Any]] = []
+        if isinstance(prev_payload, dict):
+            prev_laws_raw = prev_payload.get("laws")
+            if isinstance(prev_laws_raw, list):
+                prev_laws = [law for law in prev_laws_raw if isinstance(law, dict)]
+
+        if not prev_laws:
+            # No prior payload; still dedupe within the new list itself.
+            unioned = list(new_laws)
+        else:
+            # Prefer NEW entries when (act, section) collides — they reflect the
+            # latest description text from the regeneration.
+            seen: set[str] = set()
+            unioned: List[Dict[str, Any]] = []
+            for law in new_laws + prev_laws:
+                sig = self._law_signature(law)
+                if not sig or sig == "|":
+                    continue
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                unioned.append(law)
+
+        if len(unioned) <= 1:
+            return {"laws": unioned[:max_laws]}
+
+        # LLM semantic pass on richer keys (act + section + description) to
+        # catch paraphrased duplicates that signatures alone miss.
+        labels = []
+        for law in unioned:
+            act = str(law.get("act") or "").strip()
+            section = str(law.get("section") or "").strip()
+            desc = str(law.get("description") or "").strip()
+            labels.append(f"{act} {section} — {desc}".strip(" —"))
+
+        keep_idx = await self._llm_semantic_keep_indexes(
+            labels, item_type="applicable laws", max_keep=max_laws
+        )
+        if keep_idx:
+            unioned = [unioned[i - 1] for i in keep_idx if 1 <= i <= len(unioned)]
+        else:
+            unioned = unioned[:max_laws]
+
+        # Re-stamp ids so the FE sees stable law_N ordering.
+        for i, law in enumerate(unioned):
+            law["id"] = f"law_{i+1}"
+        return {"laws": unioned[:max_laws]}
 
     async def _run_objective_change_incremental_refresh(
         self,
@@ -7295,6 +7487,10 @@ Output ONLY valid JSON, no markdown, no code block:
         - qualityScoreExplanation and reportQualityScoreExplanation are
           regenerated either way, and the analysis report is always re-emitted
           so the FE loader clears.
+
+        Concurrency: a per-workspace ``asyncio.Lock`` serialises rejections so
+        bulk-reject (e.g. user clicks "Reject" on 5 items at once) cannot race —
+        each rejection reads the cache AFTER the previous one's write completes.
         """
         import copy
 
@@ -7324,15 +7520,97 @@ Output ONLY valid JSON, no markdown, no code block:
             logger.debug("analysis_report_feedback: isRejected=false – no score change")
             return
 
-        # Repopulate in-memory caches from Qdrant when the AI service was
-        # restarted between the original analysis_report emit and this feedback.
-        # Without this, post-restart rejections would be silently dropped because
-        # the in-memory _workspace_analysis_payload is empty until hydration.
+        # Bulk reject sends N events within ~2ms. Instead of processing each
+        # under a lock (which is correct but takes ~19s per event because of the
+        # AI calls — the user disconnects before items 2..N finish), we
+        # accumulate them in a per-workspace queue and flush the whole batch
+        # ~500ms after the last event arrives. One regeneration, one emit, all
+        # rejections applied. Single rejections still work — they just incur the
+        # short debounce delay before flushing.
+        self._pending_feedback_queue.setdefault(workspace_id, []).append(
+            {
+                "section": section,
+                "rejected_value": rejected_value,
+                "user_id": user_id,
+                "workspace_role": workspace_role,
+            }
+        )
+        existing_task = self._pending_feedback_task.get(workspace_id)
+        if existing_task is None or existing_task.done():
+            self._pending_feedback_task[workspace_id] = asyncio.create_task(
+                self._debounce_and_flush_feedback(workspace_id)
+            )
+        logger.info(
+            "analysis_report_feedback queued ({} pending) for workspace {} (section={}, value={!r})",
+            len(self._pending_feedback_queue[workspace_id]),
+            workspace_id,
+            section,
+            rejected_value[:80],
+        )
+
+    async def _debounce_and_flush_feedback(self, workspace_id: str) -> None:
+        """Wait briefly so a burst of rejections coalesces, then flush them all."""
+        try:
+            await asyncio.sleep(self._feedback_debounce_seconds)
+        except asyncio.CancelledError:
+            return
+
+        lock = self._analysis_feedback_locks.setdefault(
+            workspace_id, asyncio.Lock()
+        )
+        # Loop because new events that arrive during processing are queued;
+        # the handler only schedules a fresh task after this one finishes, so
+        # we must drain everything we see before exiting.
+        while True:
+            async with lock:
+                queued = self._pending_feedback_queue.get(workspace_id) or []
+                if not queued:
+                    return
+                # Snapshot and clear under the lock so concurrent appends from
+                # the handler are picked up by the next loop iteration.
+                events = list(queued)
+                self._pending_feedback_queue[workspace_id] = []
+            try:
+                await self._apply_batched_feedback(workspace_id, events)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.exception(
+                    "analysis_report_feedback batch flush failed for {}: {}",
+                    workspace_id,
+                    exc,
+                )
+
+    async def _apply_batched_feedback(
+        self, workspace_id: str, events: List[Dict[str, Any]]
+    ) -> None:
+        """Apply a coalesced batch of rejections in one regeneration cycle."""
+        import copy
+
+        if not events:
+            return
+
+        # All events for one workspace share user_id / workspace_role — take from
+        # the first; fall back to whichever is present if any are missing.
+        first = events[0]
+        user_id = first.get("user_id") or ""
+        workspace_role = first.get("workspace_role") or ""
+        for ev in events:
+            if not user_id and ev.get("user_id"):
+                user_id = ev["user_id"]
+            if not workspace_role and ev.get("workspace_role"):
+                workspace_role = ev["workspace_role"]
+
+        logger.info(
+            "analysis_report_feedback flushing batch of {} rejections for workspace {}",
+            len(events),
+            workspace_id,
+        )
+
+        # Hydrate cache once per batch.
         try:
             await self._hydrate_workspace_caches(workspace_id, user_id=user_id)
-        except Exception as e:  # pragma: no cover - best-effort hydration
+        except Exception as e:  # pragma: no cover
             logger.debug(
-                "analysis_report_feedback: hydration failed for workspace {}: {}",
+                "analysis_report_feedback batch: hydration failed for workspace {}: {}",
                 workspace_id,
                 e,
             )
@@ -7340,77 +7618,77 @@ Output ONLY valid JSON, no markdown, no code block:
         current = self._workspace_analysis_payload.get(workspace_id)
         if not current:
             logger.warning(
-                "analysis_report_feedback: no cached analysis report for workspace {} – cannot apply rejection",
+                "analysis_report_feedback batch: no cached analysis report for workspace {} – dropping {} rejections",
                 workspace_id,
+                len(events),
             )
             return
 
         report = copy.deepcopy(current)
-        # Self-heal any dict-shaped list entries that may already be sitting
-        # in the cached report from before the dict→string coercion fix.
-        # Without this, a stale `{'point': ..., 'laws': [...]}` weakness/risk
-        # would be re-emitted verbatim and render as a Python dict literal.
         self._normalize_analysis_report_lists(report)
         old_score = int(
             report.get("caseResolutionScore")
             or report.get("case_resolution_score")
             or 0
         )
-        removed = False
 
-        if section == "missingInfo":
-            missing = report.get("missingInfo") or report.get("missing_info") or []
-            if isinstance(missing, list):
-                new_missing = [
-                    x
-                    for x in missing
-                    if not self._match_rejected_value(x, rejected_value)
-                ]
-                if len(new_missing) < len(missing):
-                    report["missingInfo"] = new_missing
-                    removed = True
-        else:
-            # riskOrWeakness: remove from weaknesses then risks
-            weaknesses = report.get("weaknesses") or []
-            if isinstance(weaknesses, list):
-                new_weak = [
-                    x
-                    for x in weaknesses
-                    if not self._match_rejected_value(x, rejected_value)
-                ]
-                if len(new_weak) < len(weaknesses):
-                    report["weaknesses"] = new_weak
-                    removed = True
-            risks = report.get("risks") or []
-            if isinstance(risks, list):
-                new_risks = [
-                    x
-                    for x in risks
-                    if not self._match_rejected_value(x, rejected_value)
-                ]
-                if len(new_risks) < len(risks):
-                    report["risks"] = new_risks
-                    removed = True
+        # Pass 1: remove every matching item up front. We collect the events
+        # that actually removed something so the score-delta calls only run for
+        # real removals, not stale duplicates.
+        removed_events: list[dict] = []
+        for ev in events:
+            section = ev["section"]
+            rejected_value = ev["rejected_value"]
+            removed_here = False
+            if section == "missingInfo":
+                missing = (
+                    report.get("missingInfo") or report.get("missing_info") or []
+                )
+                if isinstance(missing, list):
+                    new_missing = [
+                        x
+                        for x in missing
+                        if not self._match_rejected_value(x, rejected_value)
+                    ]
+                    if len(new_missing) < len(missing):
+                        report["missingInfo"] = new_missing
+                        removed_here = True
+            else:
+                weaknesses = report.get("weaknesses") or []
+                if isinstance(weaknesses, list):
+                    new_weak = [
+                        x
+                        for x in weaknesses
+                        if not self._match_rejected_value(x, rejected_value)
+                    ]
+                    if len(new_weak) < len(weaknesses):
+                        report["weaknesses"] = new_weak
+                        removed_here = True
+                risks = report.get("risks") or []
+                if isinstance(risks, list):
+                    new_risks = [
+                        x
+                        for x in risks
+                        if not self._match_rejected_value(x, rejected_value)
+                    ]
+                    if len(new_risks) < len(risks):
+                        report["risks"] = new_risks
+                        removed_here = True
 
-        # Persist the rejection so future regenerations (e.g. objective-change
-        # incremental refresh) do not silently re-introduce this item.
-        if removed:
-            self._record_rejected_analysis_item(
-                workspace_id=workspace_id,
-                section=section,
-                rejected_value=rejected_value,
-            )
+            if removed_here:
+                self._record_rejected_analysis_item(
+                    workspace_id=workspace_id,
+                    section=section,
+                    rejected_value=rejected_value,
+                )
+                removed_events.append(ev)
 
-        if not removed:
-            # Stale / duplicate rejection: the rejectedValue does not match any
-            # current item (already removed by an earlier reject, or the FE sent
-            # slightly different text). Don't bump the score and don't waste an
-            # AI call – just refresh the timestamp and re-emit so the FE loader
-            # clears against an unchanged report.
+        if not removed_events:
+            # Every rejection was stale (already removed). Just refresh the
+            # timestamp and re-emit so the FE loader clears.
             logger.info(
-                "analysis_report_feedback: no matching item found for rejectedValue in {} – "
-                "no score change, re-emitting unchanged analysis_report (workspace={})",
-                section,
+                "analysis_report_feedback batch: all {} rejections were stale for workspace {} – re-emitting unchanged",
+                len(events),
                 workspace_id,
             )
             report["timestamp"] = datetime.utcnow().isoformat() + "Z"
@@ -7425,44 +7703,56 @@ Output ONLY valid JSON, no markdown, no code block:
                         "payload": report,
                     },
                 )
-                logger.success(
-                    "✅ analysis_report_feedback no-op (stale reject): re-emitted unchanged analysis_report (score stays at {}%)",
-                    old_score,
-                )
-            else:
-                logger.warning(
-                    "analysis_report_feedback: no socket client – cannot clear FE loader for workspace {}",
-                    workspace_id,
-                )
             return
 
-        # AI validates the rejection and computes the score delta.
-        # Invalid rejection (rejected item is actually relevant to this case) →
-        # delta is forced to 0 so the user is not rewarded for dismissing a real gap.
-        is_valid_rejection, score_delta, _delta_reason = (
-            await self._compute_rejection_score_delta(
+        # Pass 2: validity check + score delta for each real removal, in parallel.
+        delta_tasks = [
+            self._compute_rejection_score_delta(
                 current_score=old_score,
-                section=section,
-                rejected_value=rejected_value,
+                section=ev["section"],
+                rejected_value=ev["rejected_value"],
                 report=report,
             )
-        )
-        if not is_valid_rejection:
+            for ev in removed_events
+        ]
+        delta_results = await asyncio.gather(*delta_tasks, return_exceptions=True)
+
+        total_delta = 0
+        for ev, result in zip(removed_events, delta_results):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "analysis_report_feedback batch: score-delta call failed for {!r}: {}",
+                    ev["rejected_value"][:80],
+                    result,
+                )
+                continue
+            is_valid, delta, _reason = result
+            if not is_valid:
+                logger.info(
+                    "analysis_report_feedback batch: rejection judged INVALID — no score bump for {!r}",
+                    ev["rejected_value"][:80],
+                )
+                continue
+            total_delta += int(delta or 0)
+
+        # Cap the batch's combined score bump.
+        if total_delta > self._feedback_batch_max_score_delta:
             logger.info(
-                "analysis_report_feedback: AI judged rejection INVALID (item is relevant) – "
-                "removing item but not bumping score (workspace={})",
-                workspace_id,
+                "analysis_report_feedback batch: capping combined score delta {} → {}",
+                total_delta,
+                self._feedback_batch_max_score_delta,
             )
-        new_score = min(100, old_score + score_delta)
-        # Cap at 95% when Missing Info / Risks / Weaknesses still have items (100% only when all empty)
+            total_delta = self._feedback_batch_max_score_delta
+
+        new_score = min(100, old_score + total_delta)
         max_allowed = self._analysis_report_max_allowed_score(report=report)
         new_score = min(new_score, max_allowed)
         report["caseResolutionScore"] = new_score
 
-        # Regenerate a clean, generic explanation based on the updated report state.
-        # Do NOT mention the rejection, score delta, or any change tracking — lawyers
-        # share this explanation directly with clients.
-        updated_missing = report.get("missingInfo") or report.get("missing_info") or []
+        # Regenerate the explanation once for the final state.
+        updated_missing = (
+            report.get("missingInfo") or report.get("missing_info") or []
+        )
         updated_weaknesses = report.get("weaknesses") or []
         updated_risks = report.get("risks") or []
         updated_strengths = report.get("strengths") or []
@@ -7474,12 +7764,13 @@ Output ONLY valid JSON, no markdown, no code block:
             weaknesses=updated_weaknesses,
             risks=updated_risks,
             strengths=updated_strengths,
-            existing="",  # force regeneration so the explanation reflects current state
+            existing="",
         )
         report["qualityScoreExplanation"] = fresh_explanation
         report["reportQualityScoreExplanation"] = (
             self._sanitize_report_quality_score_explanation(fresh_explanation)
         ).strip()
+        report["timestamp"] = datetime.utcnow().isoformat() + "Z"
 
         self._workspace_analysis_payload[workspace_id] = report
 
@@ -7494,13 +7785,15 @@ Output ONLY valid JSON, no markdown, no code block:
                 },
             )
             logger.success(
-                "✅ analysis_report_feedback applied: score {}% → {}%, re-emitted analysis_report",
+                "✅ analysis_report_feedback batch applied: {} rejections, score {}% → {}% (delta +{})",
+                len(removed_events),
                 old_score,
                 new_score,
+                total_delta,
             )
         else:
             logger.warning(
-                "analysis_report_feedback: no socket client – report updated in cache only"
+                "analysis_report_feedback batch: no socket client – report updated in cache only"
             )
 
     async def _compute_added_missing_info_score_delta(
@@ -9712,7 +10005,24 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                         "evidentiary_strength", "N/A"
                                     ),
                                 }
-                                if not result.get("success"):
+                                # Audio: attach transcript + transcriptStatus.
+                                # When transcription has not produced text yet ("pending")
+                                # or has errored ("failed"), emit a minimal entry to match
+                                # the backend contract (no quality / summary fields).
+                                if result.get("is_audio"):
+                                    status = result.get("transcript_status", "failed")
+                                    transcript_text = result.get("transcript", "") or ""
+                                    if status == "ready" and transcript_text:
+                                        doc_result["transcript"] = transcript_text
+                                        doc_result["transcriptStatus"] = "ready"
+                                    else:
+                                        # Drop quality/summary fields for not-ready audio
+                                        doc_result = {
+                                            "documentId": result.get("document_id"),
+                                            "fileName": result.get("filename"),
+                                            "transcriptStatus": status if status in ("pending", "failed") else "failed",
+                                        }
+                                if not result.get("success") and "transcriptStatus" not in doc_result:
                                     doc_result["error"] = result.get(
                                         "error", "Unknown error"
                                     )
@@ -10507,7 +10817,20 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                         "evidentiary_strength", "N/A"
                                     ),
                                 }
-                                if not result.get("success"):
+                                # Audio: attach transcript + transcriptStatus.
+                                if result.get("is_audio"):
+                                    status = result.get("transcript_status", "failed")
+                                    transcript_text = result.get("transcript", "") or ""
+                                    if status == "ready" and transcript_text:
+                                        doc_result["transcript"] = transcript_text
+                                        doc_result["transcriptStatus"] = "ready"
+                                    else:
+                                        doc_result = {
+                                            "documentId": result.get("document_id"),
+                                            "fileName": result.get("filename"),
+                                            "transcriptStatus": status if status in ("pending", "failed") else "failed",
+                                        }
+                                if not result.get("success") and "transcriptStatus" not in doc_result:
                                     doc_result["error"] = result.get(
                                         "error", "Unknown error"
                                     )

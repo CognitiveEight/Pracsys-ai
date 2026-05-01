@@ -5,10 +5,12 @@ and vector storage.
 
 import asyncio
 import json
+import os
 import re
 import socket
+import tempfile
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import httpx
 from loguru import logger
@@ -277,20 +279,51 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
             # Download file
             file_content, file_size = await self._download_file(file_url, filename)
 
-            # Extract text using GCP-powered file processor
-            extracted_text = file_processor.process_file_by_extension(
-                file_content, filename
-            )
+            # Audio path: transcribe + diarize via Chirp 3, then treat the formatted
+            # transcript as the document's extracted text so summary/strength/vector
+            # store all keep working unchanged.
+            audio_extras: Dict[str, Any] = {}
+            if file_processor.is_audio_file(filename):
+                audio_result = await self._transcribe_audio_bytes(
+                    file_content, filename
+                )
+                if audio_result.success:
+                    extracted_text = audio_result.transcript or audio_result.raw_transcript
+                    audio_extras = {
+                        "is_audio": True,
+                        "transcript": audio_result.transcript,
+                        "transcript_status": "ready",
+                        "audio_segments": audio_result.segments,
+                        "audio_speaker_source": audio_result.speaker_source,
+                        "audio_languages": audio_result.detected_languages,
+                    }
+                else:
+                    extracted_text = ""
+                    audio_extras = {
+                        "is_audio": True,
+                        "transcript": "",
+                        "transcript_status": "failed",
+                        "audio_error": audio_result.error or "transcription_failed",
+                    }
+            else:
+                # Extract text using GCP-powered file processor
+                extracted_text = file_processor.process_file_by_extension(
+                    file_content, filename
+                )
 
             # Create extraction metadata
             extraction_metadata = {
                 "extraction_method": (
-                    "gcp_vision"
-                    if any(
-                        ext in filename.lower()
-                        for ext in [".jpg", ".jpeg", ".png", ".gif", ".bmp"]
+                    "audio_transcription"
+                    if audio_extras.get("is_audio")
+                    else (
+                        "gcp_vision"
+                        if any(
+                            ext in filename.lower()
+                            for ext in [".jpg", ".jpeg", ".png", ".gif", ".bmp"]
+                        )
+                        else "direct"
                     )
-                    else "direct"
                 ),
                 "has_errors": extracted_text.startswith("[Error")
                 or extracted_text.startswith("["),
@@ -350,6 +383,8 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
                 "summary": summary_strength["summary"],
                 "evidentiary_strength": summary_strength["evidentiary_strength"],
             }
+            if audio_extras:
+                result.update(audio_extras)
 
             # Log audit event
             audit_logger.log_event(
@@ -380,7 +415,7 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
                 user_id=user_id,
             )
 
-            return {
+            failure_result: Dict[str, Any] = {
                 "success": False,
                 "document_id": document_id,
                 "filename": filename,
@@ -390,6 +425,59 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
                 "summary": "",
                 "evidentiary_strength": "N/A",
             }
+            if file_processor.is_audio_file(filename):
+                failure_result["is_audio"] = True
+                failure_result["transcript"] = ""
+                failure_result["transcript_status"] = "failed"
+            return failure_result
+
+    async def _transcribe_audio_bytes(self, file_content: bytes, filename: str):
+        """Write audio bytes to a temp file and run Chirp 3 transcription.
+
+        Always returns an ``AudioTranscriptionResult`` (never raises) so the
+        caller can branch on ``.success`` and emit ``transcript_status:
+        "failed"`` for the document_assessments payload.
+        """
+        from app.processing.audio_transcription import (
+            AudioTranscriptionResult,
+            transcribe_audio,
+        )
+
+        suffix = Path(filename).suffix.lower() or ".audio"
+        tmp_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="audio_", suffix=suffix, delete=False
+            ) as fh:
+                fh.write(file_content)
+                tmp_path = fh.name
+            logger.info("Audio transcription starting: {}", filename)
+            result = await transcribe_audio(tmp_path)
+            if result.success:
+                logger.success(
+                    "Audio transcription succeeded: {} (source={}, segs={})",
+                    filename,
+                    result.speaker_source,
+                    len(result.segments),
+                )
+            else:
+                logger.warning(
+                    "Audio transcription failed: {} ({})",
+                    filename,
+                    result.error,
+                )
+            return result
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("Audio transcription crashed for {}: {}", filename, exc)
+            return AudioTranscriptionResult(
+                success=False, error=f"transcription_crashed: {exc}"
+            )
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     @tracer.trace("process_batch")
     async def process_batch(

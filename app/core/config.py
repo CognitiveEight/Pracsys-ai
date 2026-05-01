@@ -58,6 +58,10 @@ class Settings(BaseSettings):
 
     # Google Cloud Platform
     google_application_credentials: Optional[str] = None
+    # Separate service-account for Speech-to-Text V2 (Chirp 3) + audio GCS bucket.
+    # The OCR/Vision SA does not have Speech API permissions, so audio uses its own.
+    # Falls back to ``google_application_credentials`` when unset.
+    speech_google_application_credentials: Optional[str] = None
     gcp_project_id: Optional[str] = None
     # Optional: use an API key for Vision OCR instead of service-account credentials.
     # Environment variable supported: GOOGLE_CLOUD_VISION_API_KEY
@@ -72,6 +76,20 @@ class Settings(BaseSettings):
     qdrant_timeout_seconds: float = (
         60.0  # Request timeout for Qdrant (delete/index can be slow)
     )
+
+    # Audio transcription (Chirp 3 / Speech-to-Text V2)
+    # GCS bucket is required for native Chirp 3 speaker diarization via
+    # BatchRecognize. Without it, the pipeline falls back to chunked Recognize
+    # (transcription works, but speaker tags may be absent).
+    gcs_bucket_name: Optional[str] = None
+    chirp_region: str = "us"  # Speech-to-Text V2 regional endpoint (us / eu / asia)
+    audio_languages: str = (
+        "en-IN,hi-IN"  # Comma-separated language codes (Chirp 3 diarization-supported)
+    )
+    audio_min_speakers: int = 2
+    audio_max_speakers: int = 6
+    huggingface_token: Optional[str] = None  # Optional, for pyannote fallback
+    pyannote_model: str = "pyannote/speaker-diarization-3.1"
 
     # Redis Configuration
     redis_host: str = "localhost"

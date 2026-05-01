@@ -164,6 +164,14 @@ def _build_extraction_prompt(
     excerpt: str,
     filename_date_hint: Optional[str] = None,
 ) -> str:
+    from datetime import timedelta as _timedelta
+    try:
+        today_dt = datetime.strptime(today_str, "%Y-%m-%d")
+    except ValueError:
+        today_dt = datetime.utcnow()
+    tomorrow_str = (today_dt + _timedelta(days=1)).strftime("%Y-%m-%d")
+    next_week_str = (today_dt + _timedelta(days=7)).strftime("%Y-%m-%d")
+
     hint_block = ""
     if filename_date_hint:
         hint_block = (
@@ -175,6 +183,8 @@ def _build_extraction_prompt(
     return f"""{_EXTRACTION_SYSTEM_INSTRUCTION}
 
 Today's date: {today_str}
+Tomorrow's date: {tomorrow_str}
+One week from today: {next_week_str}
 Document name: {doc_name}
 {hint_block}
 ========================================================================
@@ -278,6 +288,18 @@ RULES
          must have already happened.
        • Only fall back to omitting the entry if the document EXPLICITLY states
          a year that contradicts both options or is unreadable.
+  1b. **Relative-time anchors** — phrases like "tomorrow" / "today" / "कल" /
+     "आज" / "in 24 hours" / "within 24 hours" / "by 5 PM tomorrow" / "next
+     week" / "next Monday" must anchor STRICTLY to today's date ({today_str}).
+     Do NOT derive these from any other date mentioned in the document.
+       • "tomorrow" / "कल" / "by 5 PM tomorrow" → {tomorrow_str}.
+       • "today" / "आज" / "in 24 hours" / "within 24 hours" → {today_str}.
+       • "next week" / "in a week" / "in 7 days" → {next_week_str}.
+       • "next Monday/Tuesday/..." → next occurrence of that weekday strictly
+         AFTER today ({today_str}).
+  1c. **Currency / money is NOT a year**. Numbers like "₹2000", "Rs. 7000",
+     "$5000" are AMOUNTS in the case (salary, fines, transaction values), NOT
+     year references. Never use a currency amount as a year for any date.
   2. Include both past and future dates — past milestones give the case its chronology,
      future dates are upcoming deadlines.
   3. "Milestone vs. commercial event" test: ask "Did this date create a legal record,

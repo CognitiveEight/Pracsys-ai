@@ -59,7 +59,29 @@ def snap_hallucinated_year(
         return date_iso
     if year >= current_year_int - slack_years:
         return date_iso
-    if re.search(rf"\b{year}\b", document_text or ""):
+
+    # Mask out currency / numeric quantities before checking whether the
+    # 4-digit year appears as a genuine year mention in the source. Without
+    # this, a transcript that mentions "₹2000 salary" or "Rs. 2000" passes
+    # the year-in-source test trivially, the snap doesn't fire, and the LLM's
+    # hallucinated year leaks through. Strip the most common Indian currency
+    # forms first; numeric prefixes after symbol/word currency markers are
+    # treated as money, not year references.
+    masked_text = document_text or ""
+    masked_text = re.sub(
+        r"(?:₹|Rs\.?|INR|\$|€|£)\s*[\d,]+(?:\.\d+)?",
+        " ",
+        masked_text,
+        flags=re.IGNORECASE,
+    )
+    # Also strip patterns like "2000 rupees" / "2000 rs" / "2000/-".
+    masked_text = re.sub(
+        r"\b\d[\d,]*\s*(?:rupees?|rs\.?|/-?)\b",
+        " ",
+        masked_text,
+        flags=re.IGNORECASE,
+    )
+    if re.search(rf"\b{year}\b", masked_text):
         return date_iso
 
     snapped_year = current_year_int
@@ -126,9 +148,16 @@ class ListOfDatesTemporalAgent:
         if not gemini_client.model:
             return {"raw_response": "[]"}
 
+        from datetime import timedelta as _timedelta
         anchor_year = state.get("anchor_year")
         anchor_txt = str(anchor_year) if isinstance(anchor_year, int) else "unknown"
         today_str = state.get("today_str") or datetime.utcnow().strftime("%Y-%m-%d")
+        try:
+            today_dt = datetime.strptime(today_str, "%Y-%m-%d")
+        except ValueError:
+            today_dt = datetime.utcnow()
+        tomorrow_str = (today_dt + _timedelta(days=1)).strftime("%Y-%m-%d")
+        next_week_str = (today_dt + _timedelta(days=7)).strftime("%Y-%m-%d")
         current_year = today_str[:4]
         try:
             previous_year = str(int(current_year) - 1)
@@ -175,6 +204,18 @@ Rules:
 3) If a fully relative phrase is used (e.g. "three years ago"), calculate the
    absolute year from the anchor year hint when available, else from the current
    year ({current_year}); output date as YYYY-01-01.
+3a) **Relative-time anchors** — phrases like "tomorrow" / "today" / "कल" / "आज"
+    / "in 24 hours" / "within 24 hours" / "by 5 PM tomorrow" / "next week" /
+    "next Monday" must anchor STRICTLY to today's date ({today_str}). Do NOT
+    derive these from any other date mentioned in the source.
+      • "tomorrow" / "कल" / "by 5 PM tomorrow" → {tomorrow_str}
+      • "today" / "आज" / "in 24 hours" / "within 24 hours" → {today_str}
+      • "next week" / "in a week" / "in 7 days" → {next_week_str}
+      • "next Monday/Tuesday/..." → next occurrence of that weekday strictly
+        AFTER today ({today_str}).
+3b) **Currency / money is NOT a year**. Numbers like "₹2000", "Rs. 7000",
+    "$5000" are AMOUNTS in the case (salary, fines, transaction values), NOT
+    year references. Never use a currency amount as a year for any date.
 4) "description" must be ONE short factual sentence (max 12 words) describing what happened on that date. It must be human-readable and meaningful — never paste raw document fragments.
 5) "evidenceSnippet" must be a clean, readable excerpt from the source text — never paste a list of dates or PDF links.
 6) Output ONLY a JSON array. No extra text.

@@ -4248,39 +4248,34 @@ Example shape:
             workspace_role=workspace_role,
             batch_result=batch_result,
         )
-        if processed_doc_ids:
-            # Replace only the updated docs' timeline entries; preserve other docs unchanged.
-            prior = self._workspace_list_of_dates_payload.get(workspace_id) or []
-            if not isinstance(prior, list):
-                prior = []
-            retained = [
-                e
-                for e in prior
-                if str(e.get("sourceDocId") or "").strip() not in processed_doc_ids
-            ]
-            merged = retained + (list_of_dates or [])
-            # Drop near-duplicates that share a date but came in with slightly
-            # different titles after a transcript edit / regeneration.
-            merged = await self._dedupe_dated_entries_semantically(
-                merged, item_type="list of dates"
+        # Always merge against the FULL prior cache, regardless of whether this
+        # is a sync (with `processed_doc_ids`) or a full refresh. The previous
+        # retained/replaced split skipped cross-document paraphrase comparisons
+        # — a regenerated entry from the audio doc could be a paraphrase of
+        # an existing entry from a different doc, and that pair never reached
+        # the LLM merge. The merge helper preserves prev verbatim, so this is
+        # safe for the sync case too: entries from non-changed docs stay as-is
+        # and only the LLM decides whether new entries are duplicates of ANY
+        # prior entry.
+        prior = self._workspace_list_of_dates_payload.get(workspace_id) or []
+        if not isinstance(prior, list):
+            prior = []
+        if prior:
+            merged = await self._llm_merge_dated_entries_against_previous(
+                prior, list_of_dates or [],
+                item_type="list of dates",
             )
-            merged.sort(
-                key=lambda x: (
-                    str(x.get("date") or ""),
-                    str(x.get("title") or ""),
-                    str(x.get("sourceDocName") or ""),
-                )
-            )
-            # Cache before emit so re-emit on reconnect has data even if emit fails.
-            self._workspace_list_of_dates_payload[workspace_id] = merged
-            list_of_dates = merged
         else:
-            # Full refresh mode (workspace created/delete flows): still dedupe in
-            # case the single regeneration produced same-date duplicates.
-            list_of_dates = await self._dedupe_dated_entries_semantically(
-                list_of_dates or [], item_type="list of dates"
+            merged = list(list_of_dates or [])
+        merged.sort(
+            key=lambda x: (
+                str(x.get("date") or ""),
+                str(x.get("title") or ""),
+                str(x.get("sourceDocName") or ""),
             )
-            self._workspace_list_of_dates_payload[workspace_id] = list_of_dates
+        )
+        self._workspace_list_of_dates_payload[workspace_id] = merged
+        list_of_dates = merged
         # Payload matches backend spec: workspaceId, userId at root and inside payload for storage
         payload = {
             "workspaceId": workspace_id,
@@ -5184,28 +5179,22 @@ Indian Kanoon / case-law search results:
             workspace_role=workspace_role,
         )
 
-        if processed_doc_ids:
-            prior = self._workspace_procedural_timeline_payload.get(workspace_id) or []
-            if not isinstance(prior, list):
-                prior = []
-            retained = [
-                e for e in prior
-                if str(e.get("sourceDocId") or "").strip() not in processed_doc_ids
-            ]
-            merged = retained + (timeline or [])
-            # Drop near-duplicate entries on the same date (post-edit regenerations
-            # often produce slightly-reworded versions of the same milestone).
-            merged = await self._dedupe_dated_entries_semantically(
-                merged, item_type="procedural timeline"
+        # Same full-prior merge pattern as list_of_dates: feed the entire prior
+        # cache to the LLM merge so cross-document paraphrases get caught,
+        # regardless of which docs were re-processed in this regeneration.
+        prior = self._workspace_procedural_timeline_payload.get(workspace_id) or []
+        if not isinstance(prior, list):
+            prior = []
+        if prior:
+            merged = await self._llm_merge_dated_entries_against_previous(
+                prior, timeline or [],
+                item_type="procedural timeline",
             )
-            merged.sort(key=lambda x: str(x.get("date") or ""))
-            self._workspace_procedural_timeline_payload[workspace_id] = merged
-            timeline = merged
         else:
-            timeline = await self._dedupe_dated_entries_semantically(
-                timeline or [], item_type="procedural timeline"
-            )
-            self._workspace_procedural_timeline_payload[workspace_id] = timeline
+            merged = list(timeline or [])
+        merged.sort(key=lambda x: str(x.get("date") or ""))
+        self._workspace_procedural_timeline_payload[workspace_id] = merged
+        timeline = merged
 
         payload = {
             "proceduralTimeline": timeline,
@@ -5630,6 +5619,246 @@ Rules:
         out = [items[i - 1] for i in keep if 1 <= i <= len(items)]
         return out[:max_keep]
 
+    async def _llm_merge_against_previous(
+        self,
+        prev_items: List[str],
+        new_items: List[str],
+        *,
+        item_type: str,
+        max_keep: int,
+    ) -> List[str]:
+        """Single Gemini call that merges a fresh-regeneration list with the
+        previously-emitted list, preserving prev verbatim and adding only
+        genuinely new items.
+
+        Replaces the older "union + flat dedupe" pattern. The flat dedup didn't
+        know which items were old vs new, so when the LLM saw a paraphrased
+        pair it sometimes kept the new wording and dropped the old one — which
+        the user has been seeing in the UI for hours and now suddenly
+        disappears. This call gives the LLM the prev/new split explicitly and
+        instructs it to keep prev verbatim, drop new items that are paraphrases
+        of any prev item, and append the rest.
+
+        Returns the merged list. Falls back to ``prev_items + (non-empty new
+        items not exact-duplicates of prev) [:max_keep]`` on any LLM failure.
+        """
+        prev_clean = [s.strip() for s in (prev_items or []) if isinstance(s, str) and s.strip()]
+        new_clean = [s.strip() for s in (new_items or []) if isinstance(s, str) and s.strip()]
+
+        if not prev_clean and not new_clean:
+            return []
+        if not prev_clean:
+            # Nothing to merge against — just dedupe within new.
+            return await self._llm_semantic_dedupe_strings(
+                new_clean, item_type=item_type, max_keep=max_keep,
+            )
+        if not new_clean:
+            return prev_clean[:max_keep]
+
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            numbered_prev = "\n".join(f"{i+1}. {s}" for i, s in enumerate(prev_clean))
+            numbered_new = "\n".join(f"{i+1}. {s}" for i, s in enumerate(new_clean))
+            prompt = f"""You are merging two versions of a {item_type} list from regenerations of the same legal case analysis.
+
+PREVIOUS list (already shown to the user — must be preserved verbatim, in original order):
+{numbered_prev}
+
+NEW list (freshly regenerated — may contain rephrased duplicates of items already in PREVIOUS, or genuinely new items):
+{numbered_new}
+
+YOUR TASK: produce the cumulative list the user should see.
+
+RULES (apply strictly):
+1. Keep EVERY item from PREVIOUS verbatim, in its original order.
+2. From NEW: append an item ONLY if it expresses a genuinely DIFFERENT meaning from EVERY item already in PREVIOUS.
+3. Treat as DUPLICATES (drop the NEW item, do not append):
+     - Wording variations of the same concept ("Name of the Petitioner's bank" vs "Name of the Petitioner's bank and specific branch").
+     - Paraphrased restatements of the same fact / requirement / risk.
+     - Same underlying entity / document / event with slightly different framing.
+4. KEEP as new (do append) only when the NEW item refers to a clearly distinct object, requirement, or concern not already covered by any PREVIOUS item.
+5. Do NOT merge items together, do NOT rewrite anything — just preserve PREVIOUS verbatim and append the genuine novelties from NEW.
+6. Cap the final list at {max_keep} items. If more would qualify, drop the lowest-priority ones from NEW.
+
+Return ONLY this JSON, no commentary:
+{{"merged":["...","..."]}}
+"""
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+            candidate = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            parsed = json.loads(candidate) if candidate else json.loads((raw or "").strip())
+            merged_raw = parsed.get("merged") if isinstance(parsed, dict) else None
+            if not isinstance(merged_raw, list) or not merged_raw:
+                raise ValueError(f"missing or empty 'merged' field: {parsed!r}")
+            merged: List[str] = []
+            seen_lower: set = set()
+            for x in merged_raw:
+                s = str(x).strip()
+                if not s:
+                    continue
+                key = s.lower()
+                if key in seen_lower:
+                    continue
+                seen_lower.add(key)
+                merged.append(s)
+                if len(merged) >= max_keep:
+                    break
+            # Sanity: every prev item should be present (the LLM was instructed
+            # to preserve them verbatim). If the LLM dropped one, splice it
+            # back to honour the contract; the user's already seen it.
+            for prev_item in prev_clean:
+                if prev_item.lower() not in seen_lower:
+                    if len(merged) < max_keep:
+                        merged.append(prev_item)
+                        seen_lower.add(prev_item.lower())
+            logger.info(
+                "LLM merge ({}): prev={} new={} → merged={}",
+                item_type, len(prev_clean), len(new_clean), len(merged),
+            )
+            return merged[:max_keep]
+        except Exception as e:
+            logger.warning(
+                "LLM merge against previous failed for {}: {}; falling back to "
+                "prev + non-duplicate-by-string new",
+                item_type, e,
+            )
+            # Conservative fallback: keep prev verbatim, append new items that
+            # aren't exact case-insensitive matches of any prev item.
+            seen_lower = {p.lower() for p in prev_clean}
+            fallback = list(prev_clean)
+            for n in new_clean:
+                if n.lower() in seen_lower:
+                    continue
+                seen_lower.add(n.lower())
+                fallback.append(n)
+                if len(fallback) >= max_keep:
+                    break
+            return fallback[:max_keep]
+
+    async def _llm_merge_strengths_against_previous(
+        self,
+        prev_strengths: List[Dict[str, Any]],
+        new_strengths: List[Dict[str, Any]],
+        *,
+        max_keep: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """Strengths variant of `_llm_merge_against_previous`. Operates on
+        ``[{"point": str, "laws": [str, ...]}]`` and asks Gemini to keep prev
+        verbatim then append only genuinely-new strengths from the regenerated
+        list. Returns the merged list with prev objects preserved as-is.
+        """
+        prev_clean = [
+            s for s in (prev_strengths or [])
+            if isinstance(s, dict) and str(s.get("point") or "").strip()
+        ]
+        new_clean = [
+            s for s in (new_strengths or [])
+            if isinstance(s, dict) and str(s.get("point") or "").strip()
+        ]
+
+        if not prev_clean and not new_clean:
+            return []
+        if not prev_clean:
+            return await self._llm_semantic_dedupe_strengths(new_clean, max_keep=max_keep)
+        if not new_clean:
+            return prev_clean[:max_keep]
+
+        def _label(s: Dict[str, Any]) -> str:
+            point = str(s.get("point") or "").strip()
+            laws = s.get("laws") if isinstance(s.get("laws"), list) else []
+            laws_s = ", ".join(str(x).strip() for x in laws if str(x).strip())
+            return point if not laws_s else f"{point} | laws: {laws_s}"
+
+        prev_labels = [_label(s) for s in prev_clean]
+        new_labels = [_label(s) for s in new_clean]
+
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            numbered_prev = "\n".join(f"{i+1}. {s}" for i, s in enumerate(prev_labels))
+            numbered_new = "\n".join(f"{i+1}. {s}" for i, s in enumerate(new_labels))
+            prompt = f"""You are merging two versions of a CASE STRENGTHS list from regenerations of the same legal case analysis.
+
+PREVIOUS list (already shown to the user — must be preserved):
+{numbered_prev}
+
+NEW list (freshly regenerated — may contain rephrased duplicates of items already in PREVIOUS, or genuinely new strengths):
+{numbered_new}
+
+YOUR TASK: produce the cumulative strengths list using indexes:
+- Output an array of items, each with a "source" ("prev" or "new") and "index" (1-based).
+- Include EVERY item from PREVIOUS (in order), as ``{{"source":"prev","index":N}}``.
+- After all PREVIOUS items, append NEW items as ``{{"source":"new","index":M}}`` ONLY if they express a genuinely DIFFERENT strength from EVERY item already in PREVIOUS.
+- Drop NEW items that are paraphrased duplicates of any PREVIOUS item.
+- Cap at {max_keep} items total.
+
+Return ONLY this JSON, no commentary:
+{{"items":[{{"source":"prev","index":1}},{{"source":"prev","index":2}},{{"source":"new","index":3}}]}}
+"""
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=8000,
+                response_mime_type="application/json",
+            )
+            candidate = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            parsed = json.loads(candidate) if candidate else json.loads((raw or "").strip())
+            items = parsed.get("items") if isinstance(parsed, dict) else None
+            if not isinstance(items, list):
+                raise ValueError(f"missing/malformed 'items': {parsed!r}")
+
+            merged: List[Dict[str, Any]] = []
+            included_prev_indexes: set = set()
+            for entry in items:
+                if not isinstance(entry, dict):
+                    continue
+                src = str(entry.get("source") or "").strip().lower()
+                try:
+                    idx = int(entry.get("index"))
+                except (TypeError, ValueError):
+                    continue
+                if src == "prev" and 1 <= idx <= len(prev_clean):
+                    merged.append(prev_clean[idx - 1])
+                    included_prev_indexes.add(idx)
+                elif src == "new" and 1 <= idx <= len(new_clean):
+                    merged.append(new_clean[idx - 1])
+                if len(merged) >= max_keep:
+                    break
+
+            # Splice back any prev items the LLM dropped — they were already
+            # shown to the user; honour the contract.
+            for i, prev_item in enumerate(prev_clean, start=1):
+                if i not in included_prev_indexes and len(merged) < max_keep:
+                    merged.append(prev_item)
+
+            logger.info(
+                "LLM merge (strengths): prev={} new={} → merged={}",
+                len(prev_clean), len(new_clean), len(merged),
+            )
+            return merged[:max_keep]
+        except Exception as e:
+            logger.warning(
+                "LLM merge against previous (strengths) failed: {}; "
+                "falling back to prev + non-duplicate-by-point new",
+                e,
+            )
+            seen_points = {str(s.get("point") or "").strip().lower() for s in prev_clean}
+            fallback = list(prev_clean)
+            for s in new_clean:
+                pkey = str(s.get("point") or "").strip().lower()
+                if pkey in seen_points:
+                    continue
+                seen_points.add(pkey)
+                fallback.append(s)
+                if len(fallback) >= max_keep:
+                    break
+            return fallback[:max_keep]
+
     async def _llm_semantic_dedupe_strengths(
         self, strengths: List[Dict[str, Any]], *, max_keep: int = 8
     ) -> List[Dict[str, Any]]:
@@ -5657,6 +5886,182 @@ Rules:
         return [valid_strengths[i - 1] for i in keep if 1 <= i <= len(valid_strengths)][
             :max_keep
         ]
+
+    async def _llm_merge_dated_entries_against_previous(
+        self,
+        prev_entries: List[Dict[str, Any]],
+        new_entries: List[Dict[str, Any]],
+        *,
+        item_type: str,
+        title_field: str = "title",
+        description_field: str = "description",
+        date_field: str = "date",
+        max_keep: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """LLM-only prev-vs-new merge for dated entries (list_of_dates,
+        procedural_timeline). Keeps every prev entry, appends new entries only
+        when the LLM judges them a genuinely different event from every prev
+        entry on the same date.
+
+        Uses index-based references so the original entry dicts (with
+        sourceDocId, pageNumber, eventType, etc.) are preserved verbatim.
+        """
+        prev_clean = [
+            e for e in (prev_entries or [])
+            if isinstance(e, dict) and str(e.get(date_field) or "").strip()
+        ]
+        new_clean = [
+            e for e in (new_entries or [])
+            if isinstance(e, dict) and str(e.get(date_field) or "").strip()
+        ]
+
+        if not prev_clean and not new_clean:
+            return []
+        if not prev_clean:
+            return new_clean[:max_keep]
+        if not new_clean:
+            return prev_clean[:max_keep]
+
+        def _label(e: Dict[str, Any]) -> str:
+            d = str(e.get(date_field) or "").strip()
+            t = str(e.get(title_field) or "").strip()
+            desc = str(e.get(description_field) or "").strip()
+            parts = [d, t]
+            if desc:
+                parts.append(desc)
+            return " — ".join(p for p in parts if p)
+
+        prev_labels = [_label(e) for e in prev_clean]
+        new_labels = [_label(e) for e in new_clean]
+
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            numbered_prev = "\n".join(f"{i+1}. {s}" for i, s in enumerate(prev_labels))
+            numbered_new = "\n".join(f"{i+1}. {s}" for i, s in enumerate(new_labels))
+            prompt = f"""You are merging two versions of a {item_type} timeline from regenerations of the same legal case.
+
+Each entry is formatted as ``<date> — <title> — <description>``.
+
+PREVIOUS list (already shown to the user — must be preserved):
+{numbered_prev}
+
+NEW list (freshly regenerated — may contain rephrased duplicates of items already in PREVIOUS, or genuinely new events):
+{numbered_new}
+
+YOUR TASK: produce the cumulative timeline by reference, NOT by rewriting.
+
+RULES (apply strictly):
+1. Include EVERY item from PREVIOUS, in original order, as ``{{"source":"prev","index":N}}``.
+2. After all PREVIOUS items, append items from NEW as ``{{"source":"new","index":M}}`` ONLY when they describe a genuinely DIFFERENT event from every PREVIOUS item.
+
+3. **DESCRIPTION is a primary duplicate signal** — weight it equally with title.
+   Two entries on the SAME date (or within ~3 days) are DUPLICATES when their
+   descriptions describe the same action/observation, EVEN IF the titles are
+   worded differently. The model writing each version may pick different
+   titles ("Marked as Absconded" vs "Alleged Absconding Date") for the same
+   underlying fact — do not treat the title difference as evidence of distinct
+   events when the descriptions are about the same thing.
+
+   Two descriptions are "the same action/observation" when they reference:
+     • the same actor (the company / the bank / the court / the petitioner),
+     • the same action (marked, signed, filed, deposited, dismissed), and
+     • the same object/target (the employee, the contract, the petition).
+   Allowed paraphrasing: a specific name vs a generic referent
+   ("Yogesh" ↔ "the employee"), tense ("marked" ↔ "has marked"), and
+   trailing date phrasing ("on February 21st" ↔ "" when the entry's date is
+   already 2026-02-21).
+
+   **Worked example (drop the NEW one):**
+     PREVIOUS: ``2026-02-21 — Marked as Absconded — The company marked Yogesh as absconded after his visit on February 21st.``
+     NEW:      ``2026-02-21 — Alleged Absconding Date — The company marked the employee as absconded after his visit.``
+     → Same date, same actor (company), same action (marked absconded), same
+       target (Yogesh = "the employee"). DUPLICATE. Drop the NEW entry.
+
+4. **KEEP genuinely distinct events** even when they share a date — multiple
+   legal events can occur on the same day. Two entries on the same date are
+   distinct when their descriptions reference different actors, actions, OR
+   objects (e.g. "Bank notice issued" + "Reply filed" on the same day are two
+   different events).
+
+5. Other duplicate patterns to drop:
+     - "01-04-2020 Initial Plot Booking" vs "01-04-2020 First booking made".
+     - Same legal filing / hearing / deadline on the same or adjacent date
+       phrased with different wording.
+     - The same notice / order / payment described with title variations.
+
+6. Cap at {max_keep} items total.
+
+Return ONLY this JSON, no commentary:
+{{"items":[{{"source":"prev","index":1}},{{"source":"prev","index":2}},{{"source":"new","index":3}}]}}
+"""
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+            candidate = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            parsed = json.loads(candidate) if candidate else json.loads((raw or "").strip())
+            items = parsed.get("items") if isinstance(parsed, dict) else None
+            if not isinstance(items, list):
+                raise ValueError(f"missing/malformed 'items': {parsed!r}")
+
+            merged: List[Dict[str, Any]] = []
+            included_prev: set = set()
+            for entry in items:
+                if not isinstance(entry, dict):
+                    continue
+                src = str(entry.get("source") or "").strip().lower()
+                try:
+                    idx = int(entry.get("index"))
+                except (TypeError, ValueError):
+                    continue
+                if src == "prev" and 1 <= idx <= len(prev_clean):
+                    merged.append(prev_clean[idx - 1])
+                    included_prev.add(idx)
+                elif src == "new" and 1 <= idx <= len(new_clean):
+                    merged.append(new_clean[idx - 1])
+                if len(merged) >= max_keep:
+                    break
+
+            # Splice back any prev entries the LLM dropped — they were already
+            # shown to the user; honour the contract.
+            for i, prev_item in enumerate(prev_clean, start=1):
+                if i not in included_prev and len(merged) < max_keep:
+                    merged.append(prev_item)
+
+            logger.info(
+                "LLM merge ({}): prev={} new={} → merged={}",
+                item_type, len(prev_clean), len(new_clean), len(merged),
+            )
+            return merged[:max_keep]
+        except Exception as e:
+            logger.warning(
+                "LLM merge against previous ({}) failed: {}; "
+                "falling back to prev + new minus exact (date,title) matches",
+                item_type, e,
+            )
+            seen_keys = {
+                (
+                    str(p.get(date_field) or "").strip(),
+                    str(p.get(title_field) or "").strip().lower(),
+                )
+                for p in prev_clean
+            }
+            fallback = list(prev_clean)
+            for n in new_clean:
+                key = (
+                    str(n.get(date_field) or "").strip(),
+                    str(n.get(title_field) or "").strip().lower(),
+                )
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                fallback.append(n)
+                if len(fallback) >= max_keep:
+                    break
+            return fallback[:max_keep]
 
     async def _dedupe_dated_entries_semantically(
         self,
@@ -5747,13 +6152,13 @@ Rules:
         *,
         max_laws: int = 12,
     ) -> Dict[str, Any]:
-        """Union new applicable_laws with the previous cached payload.
+        """LLM-only prev-vs-new merge for applicable_laws.
 
-        First pass: drop entries with identical (act, section) signatures —
-        deterministic, free.
-        Second pass: LLM semantic dedup on full ``act + section + description``
-        strings to catch rephrased descriptions of the same provision.
-        Caps the final list at ``max_laws`` (existing limit).
+        Same explicit prev/new split as analysis_report and list_of_dates: the
+        LLM sees the previously-cached laws and the freshly-regenerated laws
+        with labels, returns merged indexes, and we map back to the original
+        dict entries (preserving act/section/description/relevance verbatim).
+        Caps at ``max_laws`` (existing 12 limit) and re-stamps stable law_N ids.
         """
         new_laws_raw = new_payload.get("laws") if isinstance(new_payload, dict) else None
         new_laws: List[Dict[str, Any]] = (
@@ -5769,47 +6174,118 @@ Rules:
             if isinstance(prev_laws_raw, list):
                 prev_laws = [law for law in prev_laws_raw if isinstance(law, dict)]
 
+        # No prior cache → just take new (cap + stamp ids).
         if not prev_laws:
-            # No prior payload; still dedupe within the new list itself.
-            unioned = list(new_laws)
-        else:
-            # Prefer NEW entries when (act, section) collides — they reflect the
-            # latest description text from the regeneration.
-            seen: set[str] = set()
-            unioned: List[Dict[str, Any]] = []
-            for law in new_laws + prev_laws:
-                sig = self._law_signature(law)
-                if not sig or sig == "|":
-                    continue
-                if sig in seen:
-                    continue
-                seen.add(sig)
-                unioned.append(law)
+            ordered = new_laws[:max_laws]
+            for i, law in enumerate(ordered):
+                law["id"] = f"law_{i+1}"
+            return {"laws": ordered}
+        # No new laws → keep prev verbatim.
+        if not new_laws:
+            ordered = prev_laws[:max_laws]
+            for i, law in enumerate(ordered):
+                law["id"] = f"law_{i+1}"
+            return {"laws": ordered}
 
-        if len(unioned) <= 1:
-            return {"laws": unioned[:max_laws]}
-
-        # LLM semantic pass on richer keys (act + section + description) to
-        # catch paraphrased duplicates that signatures alone miss.
-        labels = []
-        for law in unioned:
+        def _label(law: Dict[str, Any]) -> str:
             act = str(law.get("act") or "").strip()
             section = str(law.get("section") or "").strip()
             desc = str(law.get("description") or "").strip()
-            labels.append(f"{act} {section} — {desc}".strip(" —"))
+            return f"{act} {section} — {desc}".strip(" —")
 
-        keep_idx = await self._llm_semantic_keep_indexes(
-            labels, item_type="applicable laws", max_keep=max_laws
-        )
-        if keep_idx:
-            unioned = [unioned[i - 1] for i in keep_idx if 1 <= i <= len(unioned)]
-        else:
-            unioned = unioned[:max_laws]
+        prev_labels = [_label(law) for law in prev_laws]
+        new_labels = [_label(law) for law in new_laws]
 
-        # Re-stamp ids so the FE sees stable law_N ordering.
-        for i, law in enumerate(unioned):
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            numbered_prev = "\n".join(f"{i+1}. {s}" for i, s in enumerate(prev_labels))
+            numbered_new = "\n".join(f"{i+1}. {s}" for i, s in enumerate(new_labels))
+            prompt = f"""You are merging two versions of an APPLICABLE LAWS list from regenerations of the same Indian legal case.
+
+Each entry is formatted as ``<Act> <Section> — <description>``.
+
+PREVIOUS list (already shown to the user — must be preserved):
+{numbered_prev}
+
+NEW list (freshly regenerated — may contain rephrased duplicates of items already in PREVIOUS, or genuinely new applicable provisions):
+{numbered_new}
+
+YOUR TASK: produce the cumulative applicable-laws list using indexes.
+
+RULES (apply strictly):
+1. Include EVERY entry from PREVIOUS, in original order, as ``{{"source":"prev","index":N}}``.
+2. After all PREVIOUS items, append entries from NEW as ``{{"source":"new","index":M}}`` ONLY when they refer to a DIFFERENT statutory provision than every PREVIOUS entry.
+3. Treat as DUPLICATES (drop the NEW item, do NOT append):
+     - Same Act + same Section number, even if description is rephrased
+       ("BNS Section 85 — cruelty by husband" vs "Bharatiya Nyaya Sanhita Section 85 — wife abuse").
+     - Different formal name for the same provision (e.g. "BNS Sec. 85" and "BNS s.85").
+     - Description rephrasing of an already-included section.
+4. KEEP genuinely distinct sections, even from the same Act ("BNS Section 85" and "BNS Section 318" are different provisions).
+5. Cap at {max_laws} entries total. Drop the lowest-priority NEW entries first if needed.
+
+Return ONLY this JSON, no commentary:
+{{"items":[{{"source":"prev","index":1}},{{"source":"prev","index":2}},{{"source":"new","index":3}}]}}
+"""
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=8000,
+                response_mime_type="application/json",
+            )
+            candidate = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            parsed = json.loads(candidate) if candidate else json.loads((raw or "").strip())
+            items = parsed.get("items") if isinstance(parsed, dict) else None
+            if not isinstance(items, list):
+                raise ValueError(f"missing/malformed 'items': {parsed!r}")
+
+            merged: List[Dict[str, Any]] = []
+            included_prev: set = set()
+            for entry in items:
+                if not isinstance(entry, dict):
+                    continue
+                src = str(entry.get("source") or "").strip().lower()
+                try:
+                    idx = int(entry.get("index"))
+                except (TypeError, ValueError):
+                    continue
+                if src == "prev" and 1 <= idx <= len(prev_laws):
+                    merged.append(dict(prev_laws[idx - 1]))
+                    included_prev.add(idx)
+                elif src == "new" and 1 <= idx <= len(new_laws):
+                    merged.append(dict(new_laws[idx - 1]))
+                if len(merged) >= max_laws:
+                    break
+
+            # Splice back any prev entries the LLM dropped.
+            for i, prev_law in enumerate(prev_laws, start=1):
+                if i not in included_prev and len(merged) < max_laws:
+                    merged.append(dict(prev_law))
+
+            logger.info(
+                "LLM merge (applicable laws): prev={} new={} → merged={}",
+                len(prev_laws), len(new_laws), len(merged),
+            )
+        except Exception as e:
+            logger.warning(
+                "LLM merge against previous (applicable laws) failed: {}; "
+                "falling back to prev + non-duplicate-by-(act,section) new",
+                e,
+            )
+            merged = [dict(p) for p in prev_laws]
+            seen_sigs = {self._law_signature(p) for p in prev_laws if self._law_signature(p)}
+            for n in new_laws:
+                sig = self._law_signature(n)
+                if not sig or sig in seen_sigs:
+                    continue
+                seen_sigs.add(sig)
+                merged.append(dict(n))
+                if len(merged) >= max_laws:
+                    break
+
+        for i, law in enumerate(merged[:max_laws]):
             law["id"] = f"law_{i+1}"
-        return {"laws": unioned[:max_laws]}
+        return {"laws": merged[:max_laws]}
 
     async def _merge_analysis_report_with_previous(
         self,
@@ -5846,17 +6322,6 @@ Rules:
         def _str_list(items: Any) -> List[str]:
             return _coerce_analysis_text_list(items)
 
-        def _union_strs(prev_items: Any, new_items: Any) -> List[str]:
-            seen_lower: set = set()
-            ordered: List[str] = []
-            for s in _str_list(prev_items) + _str_list(new_items):
-                key = s.lower()
-                if key in seen_lower:
-                    continue
-                seen_lower.add(key)
-                ordered.append(s)
-            return ordered
-
         def _filter_rejected(section: str, items: List[str]) -> List[str]:
             if not items:
                 return items
@@ -5878,47 +6343,51 @@ Rules:
             "riskOrWeakness", _str_list(new_analysis.get("risks"))
         )
 
-        merged["missingInfo"] = await self._llm_semantic_dedupe_strings(
-            _union_strs(prev_analysis.get("missingInfo"), new_missing_filtered),
+        # All list fields go through the SAME prev-vs-new LLM merge so the
+        # model sees the explicit "this is what the user already saw" / "this
+        # is the freshly regenerated candidate" split. Replaces the older
+        # "union + flat dedup" which lost that signal and sometimes kept the
+        # newly-rephrased copy while dropping the original the user has been
+        # seeing in the UI.
+        merged["missingInfo"] = await self._llm_merge_against_previous(
+            _str_list(prev_analysis.get("missingInfo")),
+            new_missing_filtered,
             item_type="missing information items",
             max_keep=10,
         )
-        merged["weaknesses"] = await self._llm_semantic_dedupe_strings(
-            _union_strs(prev_analysis.get("weaknesses"), new_weak_filtered),
+        merged["weaknesses"] = await self._llm_merge_against_previous(
+            _str_list(prev_analysis.get("weaknesses")),
+            new_weak_filtered,
             item_type="weaknesses",
             max_keep=8,
         )
-        merged["risks"] = await self._llm_semantic_dedupe_strings(
-            _union_strs(prev_analysis.get("risks"), new_risks_filtered),
+        merged["risks"] = await self._llm_merge_against_previous(
+            _str_list(prev_analysis.get("risks")),
+            new_risks_filtered,
             item_type="risks",
             max_keep=8,
         )
-        merged["pendingActions"] = await self._llm_semantic_dedupe_strings(
-            _union_strs(
-                prev_analysis.get("pendingActions"),
-                new_analysis.get("pendingActions"),
-            ),
+        merged["pendingActions"] = await self._llm_merge_against_previous(
+            _str_list(prev_analysis.get("pendingActions")),
+            _str_list(new_analysis.get("pendingActions")),
             item_type="pending actions",
             max_keep=6,
         )
-        merged["nextSteps"] = await self._llm_semantic_dedupe_strings(
-            _union_strs(prev_analysis.get("nextSteps"), new_analysis.get("nextSteps")),
+        merged["nextSteps"] = await self._llm_merge_against_previous(
+            _str_list(prev_analysis.get("nextSteps")),
+            _str_list(new_analysis.get("nextSteps")),
             item_type="next steps",
             max_keep=6,
         )
-        merged["suggestedDrafts"] = await self._llm_semantic_dedupe_strings(
-            _union_strs(
-                prev_analysis.get("suggestedDrafts"),
-                new_analysis.get("suggestedDrafts"),
-            ),
+        merged["suggestedDrafts"] = await self._llm_merge_against_previous(
+            _str_list(prev_analysis.get("suggestedDrafts")),
+            _str_list(new_analysis.get("suggestedDrafts")),
             item_type="suggested drafts",
             max_keep=6,
         )
-        merged["relevantJurisdiction"] = await self._llm_semantic_dedupe_strings(
-            _union_strs(
-                prev_analysis.get("relevantJurisdiction"),
-                new_analysis.get("relevantJurisdiction"),
-            ),
+        merged["relevantJurisdiction"] = await self._llm_merge_against_previous(
+            _str_list(prev_analysis.get("relevantJurisdiction")),
+            _str_list(new_analysis.get("relevantJurisdiction")),
             item_type="relevant jurisdiction entries",
             max_keep=6,
         )
@@ -5933,8 +6402,8 @@ Rules:
             if isinstance(new_analysis.get("strengths"), list)
             else []
         )
-        merged["strengths"] = await self._llm_semantic_dedupe_strengths(
-            list(prev_strengths) + list(new_strengths), max_keep=8
+        merged["strengths"] = await self._llm_merge_strengths_against_previous(
+            prev_strengths, new_strengths, max_keep=8,
         )
 
         # Identity fields don't shift on a doc-edit re-upload — same case.
@@ -6544,6 +7013,28 @@ Rules:
             analysis_report = self._analysis_report_fallback(
                 (workspace_role or "ADJUDICATOR").strip().upper()
             )
+        # Merge with the previously cached version when this is a regeneration
+        # (audio re-uploaded, transcript edited, sync after add/edit). Without
+        # this, the FE sees v1 from the first emit AND v2 from the second emit
+        # with overlapping items — e.g. "Name of the Petitioner's bank and
+        # specific branch" (v1) plus "Name of the Petitioner's bank" (v2).
+        # The merge unions prev + new and runs LLM semantic dedup so each
+        # emitted report is the cumulative state with no semantic duplicates,
+        # rejection memory preserved, and identity/score from prev kept.
+        if is_update and isinstance(analysis_report, dict):
+            try:
+                analysis_report = await self._merge_analysis_report_with_previous(
+                    workspace_id=workspace_id,
+                    workspace_role=workspace_role,
+                    new_analysis=analysis_report,
+                    log_context=log_context or " (emit)",
+                )
+            except Exception as merge_err:
+                logger.warning(
+                    "Analysis report merge with previous failed{}: {}; "
+                    "emitting unmerged",
+                    log_context, merge_err,
+                )
         # Guard: if objective-change refresh is active, skip stale background emits
         # so workspace sees only objective-aligned analysis report.
         suppress_until = self._suppress_analysis_emit_until_ts.get(workspace_id, 0.0)
@@ -10871,6 +11362,22 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         analysis_report = self._analysis_report_fallback(
                             (workspace_role or "ADJUDICATOR").strip().upper()
                         )
+                    # Merge with previous so post-deletion regeneration doesn't
+                    # re-emit duplicates of items the user already saw.
+                    if isinstance(analysis_report, dict):
+                        try:
+                            analysis_report = await self._merge_analysis_report_with_previous(
+                                workspace_id=str(payload.workspaceId),
+                                workspace_role=workspace_role,
+                                new_analysis=analysis_report,
+                                log_context=" (post-delete)",
+                            )
+                        except Exception as merge_err:
+                            logger.warning(
+                                "Analysis report merge after delete failed: {}; "
+                                "emitting unmerged",
+                                merge_err,
+                            )
                     try:
                         if self._socket_client:
                             await self._socket_client.emit(

@@ -3460,7 +3460,11 @@ Rules:
             if not gemini_client.model:
                 return []
 
-            today_str = datetime.utcnow().strftime("%Y-%m-%d")
+            from datetime import timedelta as _timedelta
+            today_dt = datetime.utcnow()
+            today_str = today_dt.strftime("%Y-%m-%d")
+            tomorrow_str = (today_dt + _timedelta(days=1)).strftime("%Y-%m-%d")
+            next_week_str = (today_dt + _timedelta(days=7)).strftime("%Y-%m-%d")
             current_year = today_str[:4]
             prompt = f"""You are a legal case analyst. From the following annexures, extract a chronological list of FACTUAL, CASE-RELEVANT dates and events.
 
@@ -3509,6 +3513,12 @@ Rules:
   - Default to the CURRENT YEAR ({current_year}) — these are recent events from a live conversation/document, not historical records.
   - Pick the year that places the event ON OR BEFORE today ({today_str}); if "{current_year}-MM-DD" would be in the future relative to today, use {int(current_year) - 1} instead (event must have already happened to be reported).
   - Only omit the entry if the source itself explicitly states a year that is unreadable/contradictory.
+- **Relative-time anchors** (e.g. "tomorrow", "today", "कल", "आज", "in 24 hours", "within 24 hours", "by 5 PM tomorrow", "next week", "next Monday"): anchor STRICTLY to today's date ({today_str}). Do NOT derive these from any other date mentioned in the source. Specifically:
+  - "tomorrow" / "कल" / "by 5 PM tomorrow" / "by EOD tomorrow" → {tomorrow_str}.
+  - "today" / "आज" / "in 24 hours" / "within 24 hours" → {today_str}.
+  - "next week" / "in a week" / "in 7 days" → {next_week_str}.
+  - "next Monday" / "next Tuesday" etc. → the next occurrence of that weekday strictly AFTER today ({today_str}).
+- **Currency / money is NOT a year**. Numbers like "₹2000", "Rs. 7000", "$5000" are AMOUNTS in the case (salary, fines, transaction values), NOT year references. Never use a currency amount as a year for any date entry.
 - Sorting: sort by date ascending. Tie-break: sourceDocumentIndex ascending, then title alphabetically.
 - Escape quotes inside strings with \\". Keep title ≤ 5 words, description ≤ 12 words.
 
@@ -3860,11 +3870,29 @@ Example shape:
                 return out
 
             def _extract_explicit_years(source_content: str) -> set[int]:
-                """Extract explicit 4-digit years written in source text."""
-                years = set()
+                """Extract explicit 4-digit years written in source text.
+
+                Masks out currency / money amounts before extracting so that
+                "₹2000" / "Rs. 2000" / "$2000" don't pollute the year set —
+                otherwise an audio transcript that mentions a salary can
+                anchor every relative date to year 2000.
+                """
+                years: set[int] = set()
                 if not source_content:
                     return years
-                for m in re.finditer(r"\b(19|20)\d{2}\b", source_content):
+                masked = re.sub(
+                    r"(?:₹|Rs\.?|INR|\$|€|£)\s*[\d,]+(?:\.\d+)?",
+                    " ",
+                    source_content,
+                    flags=re.IGNORECASE,
+                )
+                masked = re.sub(
+                    r"\b\d[\d,]*\s*(?:rupees?|rs\.?|/-?)\b",
+                    " ",
+                    masked,
+                    flags=re.IGNORECASE,
+                )
+                for m in re.finditer(r"\b(19|20)\d{2}\b", masked):
                     try:
                         years.add(int(m.group(0)))
                     except Exception:

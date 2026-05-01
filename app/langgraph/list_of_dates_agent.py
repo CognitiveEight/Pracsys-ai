@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -17,6 +18,7 @@ class TemporalInferenceState(TypedDict, total=False):
     source_doc_id: str
     source_doc_name: str
     anchor_year: Optional[int]
+    today_str: Optional[str]  # YYYY-MM-DD; pinned to call time, used for year resolution
     raw_response: str
     events: List[Dict[str, Any]]
 
@@ -51,7 +53,16 @@ class ListOfDatesTemporalAgent:
 
         anchor_year = state.get("anchor_year")
         anchor_txt = str(anchor_year) if isinstance(anchor_year, int) else "unknown"
+        today_str = state.get("today_str") or datetime.utcnow().strftime("%Y-%m-%d")
+        current_year = today_str[:4]
+        try:
+            previous_year = str(int(current_year) - 1)
+        except ValueError:
+            previous_year = current_year
+
         prompt = f"""You are a legal timeline extractor. Extract only factual, case-relevant dates from the legal text below.
+
+**Today's date**: {today_str} (current year is {current_year}). Anchor every relative or partial date against this — these documents describe RECENT events.
 
 INCLUDE only dates that represent actual case events, such as:
 - Incident/accident dates
@@ -75,8 +86,20 @@ EXCLUDE the following — do NOT create an entry for them:
 
 Rules:
 1) Use ONLY evidence from the provided text — do not invent any fact.
-2) If a relative phrase is used (e.g. "three years ago"), calculate the absolute year using the anchor year hint; output date as YYYY-01-01.
-3) If no anchor year is available for a relative phrase, skip that entry.
+2) **Year resolution** — when the source mentions a date WITHOUT an explicit year
+   (e.g. "2 February", "21 तारीख", "the 15th of March", "last Tuesday"):
+     a. If an Anchor year hint is provided below (≠ "unknown"), use that year.
+     b. Otherwise, default to the CURRENT YEAR ({current_year}). These documents
+        describe RECENT events, NOT historical ones — never default to {previous_year[:2]}00,
+        {previous_year[:2]}10, {previous_year[:2]}20 or similar legacy years.
+     c. If "{current_year}-MM-DD" would be in the FUTURE relative to today
+        ({today_str}), use {previous_year} instead — a reported event must have
+        already happened.
+     d. Only skip the entry if the source itself explicitly states a year that
+        contradicts both options or is unreadable.
+3) If a fully relative phrase is used (e.g. "three years ago"), calculate the
+   absolute year from the anchor year hint when available, else from the current
+   year ({current_year}); output date as YYYY-01-01.
 4) "description" must be ONE short factual sentence (max 12 words) describing what happened on that date. It must be human-readable and meaningful — never paste raw document fragments.
 5) "evidenceSnippet" must be a clean, readable excerpt from the source text — never paste a list of dates or PDF links.
 6) Output ONLY a JSON array. No extra text.
@@ -226,6 +249,15 @@ Legal text:
             return False
 
         document_text = str(state.get("document_text") or "")
+        anchor_year = state.get("anchor_year")
+        today_str_for_check = (
+            state.get("today_str") or datetime.utcnow().strftime("%Y-%m-%d")
+        )
+        try:
+            current_year_int = int(today_str_for_check[:4])
+        except (TypeError, ValueError):
+            current_year_int = datetime.utcnow().year
+
         normalized: List[Dict[str, Any]] = []
         seen_dates: set = set()
         for item in arr:
@@ -242,6 +274,36 @@ Legal text:
                     continue
             except ValueError:
                 continue
+
+            # Hallucination guard: if the LLM picked a year that's noticeably
+            # before the current year AND there's no anchor_year hint AND that
+            # 4-digit year does NOT appear anywhere in the source text, treat it
+            # as the LLM "guessing" a year for a partial date (e.g. transcript
+            # says "2 February" → LLM picks 2000) and snap to the current year.
+            if (
+                anchor_year is None
+                and year < current_year_int - 3
+                and re.search(rf"\b{year}\b", document_text) is None
+            ):
+                # If that year + month/day would be in the future, fall back to
+                # the previous year (the event must have already happened).
+                snapped_year = current_year_int
+                try:
+                    candidate = datetime.strptime(
+                        f"{snapped_year}-{date_val[5:]}", "%Y-%m-%d"
+                    )
+                    today_dt = datetime.strptime(today_str_for_check, "%Y-%m-%d")
+                    if candidate > today_dt:
+                        snapped_year -= 1
+                except ValueError:
+                    pass
+                logger.info(
+                    "List of dates agent: snapping hallucinated year {} → {} "
+                    "for date {} (no anchor, year not in source text)",
+                    year, snapped_year, date_val,
+                )
+                date_val = f"{snapped_year}-{date_val[5:]}"
+                year = snapped_year
 
             # Skip duplicate dates (keep first occurrence)
             if date_val in seen_dates:
@@ -312,12 +374,14 @@ Legal text:
         source_doc_id: str,
         source_doc_name: str,
         anchor_year: Optional[int],
+        today_str: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         state: TemporalInferenceState = {
             "document_text": document_text,
             "source_doc_id": source_doc_id,
             "source_doc_name": source_doc_name,
             "anchor_year": anchor_year,
+            "today_str": today_str or datetime.utcnow().strftime("%Y-%m-%d"),
         }
         result = await self._workflow.ainvoke(state)
         out = result.get("events") if isinstance(result, dict) else []

@@ -3457,7 +3457,11 @@ Rules:
             if not gemini_client.model:
                 return []
 
+            today_str = datetime.utcnow().strftime("%Y-%m-%d")
+            current_year = today_str[:4]
             prompt = f"""You are a legal case analyst. From the following annexures, extract a chronological list of FACTUAL, CASE-RELEVANT dates and events.
+
+**Today's date**: {today_str} (current year is {current_year}). Anchor every relative or partial date against this.
 
 **Annexure content** (each file is labeled Annexure 1, Annexure 2, etc. with id and name):
 {combined}
@@ -3497,12 +3501,16 @@ EXCLUDE (do NOT include these):
 Rules:
 - Output ONLY a single valid JSON array. No markdown, no code fences, no other text.
 - The first character of your response MUST be [ and the last MUST be ].
-- Date normalization: output each "date" as YYYY-MM-DD. If year is unknown, omit the entry.
+- Date normalization: output each "date" as YYYY-MM-DD.
+- **Year resolution when the source mentions a date without a year** (e.g. "2 February", "21 तारीख", "last Tuesday", "the 15th of March"):
+  - Default to the CURRENT YEAR ({current_year}) — these are recent events from a live conversation/document, not historical records.
+  - Pick the year that places the event ON OR BEFORE today ({today_str}); if "{current_year}-MM-DD" would be in the future relative to today, use {int(current_year) - 1} instead (event must have already happened to be reported).
+  - Only omit the entry if the source itself explicitly states a year that is unreadable/contradictory.
 - Sorting: sort by date ascending. Tie-break: sourceDocumentIndex ascending, then title alphabetically.
 - Escape quotes inside strings with \\". Keep title ≤ 5 words, description ≤ 12 words.
 
 Example shape:
-[{{"date":"2026-01-15","title":"Notice Sent","description":"Complainant issued legal notice to respondent.","sourceDocumentIndex":1,"pageNumber":3,"isIncident":true,"eventType":"Filing","relevance":"High"}}]
+[{{"date":"{current_year}-01-15","title":"Notice Sent","description":"Complainant issued legal notice to respondent.","sourceDocumentIndex":1,"pageNumber":3,"isIncident":true,"eventType":"Filing","relevance":"High"}}]
 """
             # Keep deterministic JSON extraction for timeline completeness.
             raw = await gemini_client.generate(
@@ -5785,6 +5793,217 @@ Rules:
             law["id"] = f"law_{i+1}"
         return {"laws": unioned[:max_laws]}
 
+    async def _merge_analysis_report_with_previous(
+        self,
+        workspace_id: str,
+        workspace_role: str,
+        new_analysis: Dict[str, Any],
+        *,
+        log_context: str = "",
+    ) -> Dict[str, Any]:
+        """Merge a freshly-regenerated analysis report against the cached
+        previous version: filter rejected items, union prev + new, run LLM
+        semantic dedup per list field, preserve identity + score, regenerate
+        explanations.
+
+        Used after workspace_sync regenerations (e.g. transcript edit + reupload)
+        so duplicates from the previous report don't surface again. Mirrors the
+        merge pattern already proven on the strategic-objective-change path
+        (`_run_objective_change_incremental_refresh`).
+
+        Returns the merged report. Caller is responsible for caching + emitting.
+        """
+        ctx = log_context or " (sync merge)"
+        prev_raw = self._workspace_analysis_payload.get(workspace_id)
+        prev_analysis: Dict[str, Any] = (
+            dict(prev_raw) if isinstance(prev_raw, dict) else {}
+        )
+
+        # No prior cached version → nothing to dedupe against; first emit.
+        if not prev_analysis:
+            return new_analysis
+
+        merged: Dict[str, Any] = dict(new_analysis)
+
+        def _str_list(items: Any) -> List[str]:
+            return _coerce_analysis_text_list(items)
+
+        def _union_strs(prev_items: Any, new_items: Any) -> List[str]:
+            seen_lower: set = set()
+            ordered: List[str] = []
+            for s in _str_list(prev_items) + _str_list(new_items):
+                key = s.lower()
+                if key in seen_lower:
+                    continue
+                seen_lower.add(key)
+                ordered.append(s)
+            return ordered
+
+        def _filter_rejected(section: str, items: List[str]) -> List[str]:
+            if not items:
+                return items
+            return [
+                s
+                for s in items
+                if not self._is_previously_rejected_analysis_item(
+                    workspace_id=workspace_id, section=section, candidate=s,
+                )
+            ]
+
+        new_missing_filtered = _filter_rejected(
+            "missingInfo", _str_list(new_analysis.get("missingInfo"))
+        )
+        new_weak_filtered = _filter_rejected(
+            "riskOrWeakness", _str_list(new_analysis.get("weaknesses"))
+        )
+        new_risks_filtered = _filter_rejected(
+            "riskOrWeakness", _str_list(new_analysis.get("risks"))
+        )
+
+        merged["missingInfo"] = await self._llm_semantic_dedupe_strings(
+            _union_strs(prev_analysis.get("missingInfo"), new_missing_filtered),
+            item_type="missing information items",
+            max_keep=10,
+        )
+        merged["weaknesses"] = await self._llm_semantic_dedupe_strings(
+            _union_strs(prev_analysis.get("weaknesses"), new_weak_filtered),
+            item_type="weaknesses",
+            max_keep=8,
+        )
+        merged["risks"] = await self._llm_semantic_dedupe_strings(
+            _union_strs(prev_analysis.get("risks"), new_risks_filtered),
+            item_type="risks",
+            max_keep=8,
+        )
+        merged["pendingActions"] = await self._llm_semantic_dedupe_strings(
+            _union_strs(
+                prev_analysis.get("pendingActions"),
+                new_analysis.get("pendingActions"),
+            ),
+            item_type="pending actions",
+            max_keep=6,
+        )
+        merged["nextSteps"] = await self._llm_semantic_dedupe_strings(
+            _union_strs(prev_analysis.get("nextSteps"), new_analysis.get("nextSteps")),
+            item_type="next steps",
+            max_keep=6,
+        )
+        merged["suggestedDrafts"] = await self._llm_semantic_dedupe_strings(
+            _union_strs(
+                prev_analysis.get("suggestedDrafts"),
+                new_analysis.get("suggestedDrafts"),
+            ),
+            item_type="suggested drafts",
+            max_keep=6,
+        )
+        merged["relevantJurisdiction"] = await self._llm_semantic_dedupe_strings(
+            _union_strs(
+                prev_analysis.get("relevantJurisdiction"),
+                new_analysis.get("relevantJurisdiction"),
+            ),
+            item_type="relevant jurisdiction entries",
+            max_keep=6,
+        )
+
+        prev_strengths = (
+            prev_analysis.get("strengths")
+            if isinstance(prev_analysis.get("strengths"), list)
+            else []
+        )
+        new_strengths = (
+            new_analysis.get("strengths")
+            if isinstance(new_analysis.get("strengths"), list)
+            else []
+        )
+        merged["strengths"] = await self._llm_semantic_dedupe_strengths(
+            list(prev_strengths) + list(new_strengths), max_keep=8
+        )
+
+        # Identity fields don't shift on a doc-edit re-upload — same case.
+        for identity_field in (
+            "caseTitle",
+            "caseCategory",
+            "subcategories",
+            "description",
+            "caseType",
+        ):
+            prev_val = prev_analysis.get(identity_field)
+            if prev_val not in (None, "", []):
+                merged[identity_field] = prev_val
+
+        # Preserve the score (and any user-feedback deltas baked in), then
+        # re-cap against the merged list state.
+        prev_score_val = prev_analysis.get("caseResolutionScore")
+        if prev_score_val is None:
+            prev_score_val = prev_analysis.get("case_resolution_score")
+        try:
+            prev_score_int = (
+                int(prev_score_val) if prev_score_val is not None else None
+            )
+        except (TypeError, ValueError):
+            prev_score_int = None
+        if prev_score_int is not None:
+            max_allowed = self._analysis_report_max_allowed_score(report=merged)
+            merged["caseResolutionScore"] = min(max(0, prev_score_int), max_allowed)
+        prev_report_score = prev_analysis.get("reportQualityScore")
+        if prev_report_score is not None:
+            try:
+                prev_report_score_int = int(prev_report_score)
+                max_allowed = self._analysis_report_max_allowed_score(report=merged)
+                merged["reportQualityScore"] = min(
+                    max(0, prev_report_score_int), max_allowed
+                )
+            except (TypeError, ValueError):
+                pass
+
+        try:
+            score_for_expl = int(merged.get("caseResolutionScore") or 0)
+        except (TypeError, ValueError):
+            score_for_expl = 0
+        try:
+            fresh_explanation = await self._ensure_quality_score_explanation(
+                workspace_role=workspace_role,
+                case_resolution_score=score_for_expl,
+                missing_info=merged.get("missingInfo") or [],
+                weaknesses=merged.get("weaknesses") or [],
+                risks=merged.get("risks") or [],
+                strengths=merged.get("strengths") or [],
+                existing="",
+            )
+        except Exception as expl_err:
+            logger.warning(
+                "Analysis sync merge: explanation regen failed{}: {}", ctx, expl_err
+            )
+            fresh_explanation = (
+                merged.get("qualityScoreExplanation")
+                or prev_analysis.get("qualityScoreExplanation")
+                or ""
+            )
+        if fresh_explanation:
+            merged["qualityScoreExplanation"] = fresh_explanation
+            merged["reportQualityScoreExplanation"] = (
+                self._sanitize_report_quality_score_explanation(fresh_explanation)
+            ).strip()
+
+        merged["timestamp"] = datetime.utcnow().isoformat() + "Z"
+        self._normalize_analysis_report_lists(merged)
+
+        logger.info(
+            "Analysis sync merge{}: prev_missing={} new_missing={} merged_missing={}; "
+            "prev_weak={} new_weak={} merged_weak={}; prev_risks={} new_risks={} merged_risks={}",
+            ctx,
+            len(_str_list(prev_analysis.get("missingInfo"))),
+            len(new_missing_filtered),
+            len(merged.get("missingInfo") or []),
+            len(_str_list(prev_analysis.get("weaknesses"))),
+            len(new_weak_filtered),
+            len(merged.get("weaknesses") or []),
+            len(_str_list(prev_analysis.get("risks"))),
+            len(new_risks_filtered),
+            len(merged.get("risks") or []),
+        )
+        return merged
+
     async def _run_objective_change_incremental_refresh(
         self,
         workspace_id: str,
@@ -6386,6 +6605,18 @@ Rules:
             if not analysis_report:
                 analysis_report = self._analysis_report_fallback(
                     (workspace_role or "ADJUDICATOR").strip().upper()
+                )
+            # Merge with the previous cached version: drops items the user
+            # already saw, preserves rejection memory, keeps identity + score.
+            # Without this, a transcript-edit re-upload re-emits the prev
+            # missingInfo / weaknesses / risks alongside any new ones, doubling
+            # up the list visible in the UI.
+            if isinstance(analysis_report, dict):
+                analysis_report = await self._merge_analysis_report_with_previous(
+                    workspace_id=workspace_id,
+                    workspace_role=workspace_role,
+                    new_analysis=analysis_report,
+                    log_context=" (sync)",
                 )
             if self._socket_client and analysis_report:
                 await self._socket_client.emit(

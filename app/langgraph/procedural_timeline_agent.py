@@ -267,6 +267,15 @@ RULES
 
   1. Always convert dates to YYYY-MM-DD. For relative periods ("within N days"),
      compute anchor_date + N days.
+  1a. **YEAR RESOLUTION when the source mentions a date without an explicit year**
+     (e.g. "2 February", "21 तारीख", "the 15th of March", "last Tuesday"):
+       • Default to the year of today's date ({today_str}). These events are
+         recent — they are NOT historical (do NOT pick years like 2000, 2010, 2020).
+       • If using the current year would place the event in the FUTURE relative
+         to today ({today_str}), use the previous year instead — a reported event
+         must have already happened.
+       • Only fall back to omitting the entry if the document EXPLICITLY states
+         a year that contradicts both options or is unreadable.
   2. Include both past and future dates — past milestones give the case its chronology,
      future dates are upcoming deadlines.
   3. "Milestone vs. commercial event" test: ask "Did this date create a legal record,

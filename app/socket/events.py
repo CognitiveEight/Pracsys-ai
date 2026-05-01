@@ -35,7 +35,10 @@ from app.langgraph.chat_nodes import (
     is_user_affirmation_to_continue,
     merge_intelligence_chat_history,
 )
-from app.langgraph.list_of_dates_agent import list_of_dates_temporal_agent
+from app.langgraph.list_of_dates_agent import (
+    list_of_dates_temporal_agent,
+    snap_hallucinated_year,
+)
 from app.socket.schemas import (
     AIResponseMetadata,
     AIResponsePayload,
@@ -4025,6 +4028,20 @@ Example shape:
                 explicit_years = doc_explicit_years_by_index.get(idx, set())
                 anchor_year = doc_anchor_year_by_index.get(idx)
 
+                # Post-LLM hallucination guard: when Gemini stamps a partial
+                # date with a wildly wrong year (e.g. "2 February" → 2000-02-02
+                # for a 2026 conversation), snap to the current year unless
+                # the LLM had an explicit anchor or the year is genuinely in
+                # the source text. Same helper used by the langgraph agent path
+                # so both paths agree on year correction.
+                date_val = snap_hallucinated_year(
+                    date_iso=date_val,
+                    document_text=source_content,
+                    today_iso=today_str,
+                    anchor_year=anchor_year if isinstance(anchor_year, int) else None,
+                    log_prefix="List of dates",
+                )
+
                 # Keep only grounded dates:
                 # 1) exact explicit date appears in source, OR
                 # 2) explicit year appears in source with YYYY-01-01 normalization, OR
@@ -4126,6 +4143,7 @@ Example shape:
                         source_doc_id=source_doc_id,
                         source_doc_name=source_doc_name,
                         anchor_year=anchor_year,
+                        today_str=today_str,
                     )
                 except Exception as temporal_err:
                     logger.debug(

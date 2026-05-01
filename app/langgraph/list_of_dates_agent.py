@@ -13,6 +13,81 @@ from langgraph.graph import END, START, StateGraph
 from loguru import logger
 
 
+def snap_hallucinated_year(
+    *,
+    date_iso: str,
+    document_text: str,
+    today_iso: str,
+    anchor_year: Optional[int] = None,
+    slack_years: int = 3,
+    future_tolerance_days: int = 365,
+    log_prefix: str = "Date guard",
+) -> str:
+    """Correct a hallucinated year on a single ``YYYY-MM-DD`` date string.
+
+    Used as a post-LLM defense for list-of-dates / procedural-timeline
+    extractors. Gemini sometimes ignores the prompt's "use current year" rule
+    and stamps recent partial dates ("2 February", "21 तारीख") with a wildly
+    wrong year (commonly 2000). This helper snaps such dates back to the
+    current year when there's no anchor, the year is well in the past, and
+    the suspicious 4-digit year does not appear anywhere in the source text.
+
+    When the snap to the current year produces a date in the FUTURE, we keep
+    it as long as it's within ``future_tolerance_days`` of today — these
+    typically represent deadlines, upcoming hearings, or commitments like
+    "I'll call you back tomorrow / within 30 days". Only past the tolerance
+    do we fall back to the previous year.
+
+    Returns the (possibly-corrected) date string. Returns input unchanged when:
+      - input is malformed (not a YYYY-MM-DD shape)
+      - an ``anchor_year`` was provided (anchor wins over the snap)
+      - the year is within ``slack_years`` of today
+      - the suspicious 4-digit year is literally present in ``document_text``
+    """
+    if not isinstance(date_iso, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_iso):
+        return date_iso
+    try:
+        year = int(date_iso[:4])
+    except ValueError:
+        return date_iso
+    try:
+        current_year_int = int(today_iso[:4])
+    except (TypeError, ValueError):
+        current_year_int = datetime.utcnow().year
+
+    if anchor_year is not None:
+        return date_iso
+    if year >= current_year_int - slack_years:
+        return date_iso
+    if re.search(rf"\b{year}\b", document_text or ""):
+        return date_iso
+
+    snapped_year = current_year_int
+    try:
+        candidate = datetime.strptime(
+            f"{snapped_year}-{date_iso[5:]}", "%Y-%m-%d"
+        )
+        today_dt = datetime.strptime(today_iso, "%Y-%m-%d")
+        if candidate > today_dt:
+            future_delta_days = (candidate - today_dt).days
+            # Allow near-future deadlines (tomorrow, next week, next quarter,
+            # next hearing) — these are valid and often what the LLM was
+            # actually computing. Only step back a year when the date is
+            # implausibly far in the future for an "already happened" event.
+            if future_delta_days > future_tolerance_days:
+                snapped_year -= 1
+    except ValueError:
+        pass
+
+    snapped = f"{snapped_year}-{date_iso[5:]}"
+    logger.info(
+        "{}: snapping hallucinated year {} → {} for date {} "
+        "(no anchor, year not in source text)",
+        log_prefix, year, snapped_year, date_iso,
+    )
+    return snapped
+
+
 class TemporalInferenceState(TypedDict, total=False):
     document_text: str
     source_doc_id: str
@@ -275,35 +350,23 @@ Legal text:
             except ValueError:
                 continue
 
-            # Hallucination guard: if the LLM picked a year that's noticeably
-            # before the current year AND there's no anchor_year hint AND that
-            # 4-digit year does NOT appear anywhere in the source text, treat it
-            # as the LLM "guessing" a year for a partial date (e.g. transcript
-            # says "2 February" → LLM picks 2000) and snap to the current year.
-            if (
-                anchor_year is None
-                and year < current_year_int - 3
-                and re.search(rf"\b{year}\b", document_text) is None
-            ):
-                # If that year + month/day would be in the future, fall back to
-                # the previous year (the event must have already happened).
-                snapped_year = current_year_int
+            # Post-LLM hallucination guard (shared across all date-extraction
+            # paths via `snap_hallucinated_year`). Snaps a suspect year to the
+            # current year when there's no anchor and the year isn't grounded
+            # in the source text.
+            snapped = snap_hallucinated_year(
+                date_iso=date_val,
+                document_text=document_text,
+                today_iso=today_str_for_check,
+                anchor_year=anchor_year if isinstance(anchor_year, int) else None,
+                log_prefix="List of dates agent",
+            )
+            if snapped != date_val:
+                date_val = snapped
                 try:
-                    candidate = datetime.strptime(
-                        f"{snapped_year}-{date_val[5:]}", "%Y-%m-%d"
-                    )
-                    today_dt = datetime.strptime(today_str_for_check, "%Y-%m-%d")
-                    if candidate > today_dt:
-                        snapped_year -= 1
+                    year = int(date_val[:4])
                 except ValueError:
                     pass
-                logger.info(
-                    "List of dates agent: snapping hallucinated year {} → {} "
-                    "for date {} (no anchor, year not in source text)",
-                    year, snapped_year, date_val,
-                )
-                date_val = f"{snapped_year}-{date_val[5:]}"
-                year = snapped_year
 
             # Skip duplicate dates (keep first occurrence)
             if date_val in seen_dates:

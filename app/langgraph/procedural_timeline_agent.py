@@ -36,6 +36,8 @@ from typing import Any, Dict, List, Optional, TypedDict
 from langgraph.graph import END, START, StateGraph
 from loguru import logger
 
+from app.langgraph.list_of_dates_agent import snap_hallucinated_year
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -774,6 +776,29 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
                     continue
             except Exception:
                 continue
+
+            # Post-LLM hallucination guard: rescue dates where Gemini stamped a
+            # partial date with a wildly old year (e.g. "2 February" → 2000).
+            # Same helper used by list_of_dates so both feeds agree on year
+            # correction. Source text per entry is the original document
+            # excerpt (cached on the entry via `_source_doc_text` or, when not
+            # present, fall back to empty string — the helper still works,
+            # it just won't be able to spot legitimate historical mentions).
+            entry_source_text = str(item.get("_source_doc_text") or "")
+            snapped_date = snap_hallucinated_year(
+                date_iso=date_val,
+                document_text=entry_source_text,
+                today_iso=today_str,
+                anchor_year=None,
+                log_prefix="Procedural timeline",
+            )
+            if snapped_date != date_val:
+                date_val = snapped_date
+                try:
+                    parsed_date = datetime.strptime(date_val, "%Y-%m-%d")
+                    year = parsed_date.year
+                except ValueError:
+                    pass
 
             # Sanity-cap: reject dates too far in past / future, UNLESS the entry is
             # a court-scheduled hearing / adjournment (those can legitimately be far out).

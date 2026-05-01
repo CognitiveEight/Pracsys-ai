@@ -6529,36 +6529,25 @@ Return ONLY this JSON, no commentary:
     ) -> None:
         ctx = log_context or " (objective change)"
 
-        # 1) Analysis report: TRUE incremental merge with the previous report.
-        # Policy (per product decision):
-        #   - List-typed user-curated fields (missingInfo, weaknesses, risks,
-        #     strengths, relevantJurisdiction, nextSteps, pendingActions,
-        #     suggestedDrafts) → union of (previous + new), then semantic
-        #     dedupe and length-cap. Previous content is preserved; only
-        #     genuinely-new objective-driven points are added.
-        #   - Items the user already rejected via analysis_report_feedback
-        #     are filtered out of the new report so they cannot silently
-        #     re-appear after an objective change.
-        #   - caseResolutionScore / reportQualityScore: keep the previous
-        #     score so user-feedback deltas (rejections / additions) are not
-        #     erased; re-cap with `_analysis_report_max_allowed_score` against
-        #     the merged list state.
-        #   - Quality explanations: regenerate from the merged state so they
-        #     stay consistent with the merged lists and the preserved score.
-        #   - Identity fields (caseTitle, caseCategory, subcategories,
-        #     description, caseType): keep previous values; the case identity
-        #     does not shift just because the strategic objective shifted.
-        #   - Objective-aligned narrative (caseSummary, reportCaseSummary,
-        #     strategicObjective): take the new values so the report mirrors
-        #     the new objective. The strategy panel itself preserves
-        #     caseSummary / reportCaseSummary via
-        #     `_regenerate_strategy_objective_preserving_case_summary`, so
-        #     these stay aligned across panels.
-        prev_analysis_raw = self._workspace_analysis_payload.get(workspace_id)
-        prev_analysis: Dict[str, Any] = (
-            dict(prev_analysis_raw) if isinstance(prev_analysis_raw, dict) else {}
-        )
-
+        # 1) Analysis report: regenerate on the new objective, then merge with
+        # the previous cached report using the SAME prev-vs-new LLM merge that
+        # the audio-edit / re-upload path uses. This replaces the older flat
+        # union+dedup logic that was inline here. Behaviour preserved:
+        #   - list fields (missingInfo, weaknesses, risks, pendingActions,
+        #     nextSteps, suggestedDrafts, relevantJurisdiction, strengths)
+        #     get a single Gemini merge per field that keeps prev verbatim and
+        #     appends only genuinely-new items;
+        #   - identity fields (caseTitle, caseCategory, subcategories,
+        #     description, caseType) are preserved from prev;
+        #   - caseResolutionScore / reportQualityScore are preserved from prev
+        #     (then re-capped against the merged list state);
+        #   - qualityScoreExplanation / reportQualityScoreExplanation are
+        #     regenerated from the merged state;
+        #   - rejected-item memory is honoured via `_filter_rejected` inside
+        #     the helper;
+        #   - timestamp + `_normalize_analysis_report_lists` are applied.
+        # Without this swap, paraphrased duplicates from the new objective
+        # generation could leak past the old union+flat-dedup pass.
         new_analysis = await self._generate_analysis_report_from_documents(
             workspace_id=workspace_id,
             user_id=user_id,
@@ -6571,199 +6560,12 @@ Return ONLY this JSON, no commentary:
                 (workspace_role or "ADJUDICATOR").strip().upper()
             )
 
-        # Start from the freshly-generated, objective-aligned report.
-        merged_analysis: Dict[str, Any] = dict(new_analysis)
-
-        def _str_list(items: Any) -> List[str]:
-            # Use the shared coercion helper so dict-shaped entries from a
-            # stale cached previous report (or a misbehaving LLM response)
-            # are flattened to plain strings instead of leaking dict reprs.
-            return _coerce_analysis_text_list(items)
-
-        def _union_strs(prev_items: Any, new_items: Any) -> List[str]:
-            # Preserve previous items first so user-curated state stays at
-            # the top; append new items not already present (by lowercased
-            # exact match here — semantic dedupe runs afterwards).
-            seen_lower: set = set()
-            ordered: List[str] = []
-            for s in _str_list(prev_items) + _str_list(new_items):
-                key = s.lower()
-                if key in seen_lower:
-                    continue
-                seen_lower.add(key)
-                ordered.append(s)
-            return ordered
-
-        # Filter out items the user has previously rejected (per-section
-        # memory) before merging — applies to missingInfo + weaknesses + risks.
-        def _filter_rejected(section: str, items: List[str]) -> List[str]:
-            if not items:
-                return items
-            return [
-                s
-                for s in items
-                if not self._is_previously_rejected_analysis_item(
-                    workspace_id=workspace_id,
-                    section=section,
-                    candidate=s,
-                )
-            ]
-
-        new_missing_filtered = _filter_rejected(
-            "missingInfo", _str_list(new_analysis.get("missingInfo"))
+        merged_analysis = await self._merge_analysis_report_with_previous(
+            workspace_id=workspace_id,
+            workspace_role=workspace_role,
+            new_analysis=new_analysis,
+            log_context=ctx,
         )
-        new_weak_filtered = _filter_rejected(
-            "riskOrWeakness", _str_list(new_analysis.get("weaknesses"))
-        )
-        new_risks_filtered = _filter_rejected(
-            "riskOrWeakness", _str_list(new_analysis.get("risks"))
-        )
-
-        merged_analysis["missingInfo"] = await self._llm_semantic_dedupe_strings(
-            _union_strs(prev_analysis.get("missingInfo"), new_missing_filtered),
-            item_type="missing information items",
-            max_keep=10,
-        )
-        merged_analysis["weaknesses"] = await self._llm_semantic_dedupe_strings(
-            _union_strs(prev_analysis.get("weaknesses"), new_weak_filtered),
-            item_type="weaknesses",
-            max_keep=8,
-        )
-        merged_analysis["risks"] = await self._llm_semantic_dedupe_strings(
-            _union_strs(prev_analysis.get("risks"), new_risks_filtered),
-            item_type="risks",
-            max_keep=8,
-        )
-        merged_analysis["pendingActions"] = await self._llm_semantic_dedupe_strings(
-            _union_strs(
-                prev_analysis.get("pendingActions"),
-                new_analysis.get("pendingActions"),
-            ),
-            item_type="pending actions",
-            max_keep=6,
-        )
-        merged_analysis["nextSteps"] = await self._llm_semantic_dedupe_strings(
-            _union_strs(prev_analysis.get("nextSteps"), new_analysis.get("nextSteps")),
-            item_type="next steps",
-            max_keep=6,
-        )
-        merged_analysis["suggestedDrafts"] = await self._llm_semantic_dedupe_strings(
-            _union_strs(
-                prev_analysis.get("suggestedDrafts"),
-                new_analysis.get("suggestedDrafts"),
-            ),
-            item_type="suggested drafts",
-            max_keep=6,
-        )
-        merged_analysis["relevantJurisdiction"] = await self._llm_semantic_dedupe_strings(
-            _union_strs(
-                prev_analysis.get("relevantJurisdiction"),
-                new_analysis.get("relevantJurisdiction"),
-            ),
-            item_type="relevant jurisdiction entries",
-            max_keep=6,
-        )
-        # Strengths is List[Dict{point, laws}]; concat then semantic dedupe.
-        prev_strengths = (
-            prev_analysis.get("strengths")
-            if isinstance(prev_analysis.get("strengths"), list)
-            else []
-        )
-        new_strengths = (
-            new_analysis.get("strengths")
-            if isinstance(new_analysis.get("strengths"), list)
-            else []
-        )
-        merged_analysis["strengths"] = await self._llm_semantic_dedupe_strengths(
-            list(prev_strengths) + list(new_strengths), max_keep=8
-        )
-
-        # Identity fields: keep previous values when present; the case
-        # identity does not change with an objective shift.
-        for identity_field in (
-            "caseTitle",
-            "caseCategory",
-            "subcategories",
-            "description",
-            "caseType",
-        ):
-            prev_val = prev_analysis.get(identity_field)
-            if prev_val not in (None, "", []):
-                merged_analysis[identity_field] = prev_val
-
-        # Score: preserve the previous score (and the previous user-feedback
-        # deltas baked into it) when available, then re-cap against the
-        # merged list state so we never exceed 95% while pending items remain.
-        prev_score_val = prev_analysis.get("caseResolutionScore")
-        if prev_score_val is None:
-            prev_score_val = prev_analysis.get("case_resolution_score")
-        try:
-            prev_score_int = (
-                int(prev_score_val) if prev_score_val is not None else None
-            )
-        except (TypeError, ValueError):
-            prev_score_int = None
-        if prev_score_int is not None:
-            max_allowed = self._analysis_report_max_allowed_score(report=merged_analysis)
-            merged_analysis["caseResolutionScore"] = min(
-                max(0, prev_score_int), max_allowed
-            )
-        # Mirror the same value into reportQualityScore if the previous
-        # report tracked it explicitly.
-        prev_report_score = prev_analysis.get("reportQualityScore")
-        if prev_report_score is not None:
-            try:
-                prev_report_score_int = int(prev_report_score)
-                max_allowed = self._analysis_report_max_allowed_score(
-                    report=merged_analysis
-                )
-                merged_analysis["reportQualityScore"] = min(
-                    max(0, prev_report_score_int), max_allowed
-                )
-            except (TypeError, ValueError):
-                pass
-
-        # Regenerate quality explanations against the merged state so they
-        # stay consistent with the preserved score and the merged lists.
-        # (Mirrors the analysis_report_feedback flow: pass existing="" so
-        # `_ensure_quality_score_explanation` re-derives fresh text.)
-        try:
-            current_score_for_explanation = int(
-                merged_analysis.get("caseResolutionScore") or 0
-            )
-        except (TypeError, ValueError):
-            current_score_for_explanation = 0
-        try:
-            fresh_explanation = await self._ensure_quality_score_explanation(
-                workspace_role=workspace_role,
-                case_resolution_score=current_score_for_explanation,
-                missing_info=merged_analysis.get("missingInfo") or [],
-                weaknesses=merged_analysis.get("weaknesses") or [],
-                risks=merged_analysis.get("risks") or [],
-                strengths=merged_analysis.get("strengths") or [],
-                existing="",
-            )
-        except Exception as expl_err:
-            logger.warning(
-                "Objective-change merge: quality explanation regen failed{}: {}",
-                ctx,
-                expl_err,
-            )
-            fresh_explanation = (
-                merged_analysis.get("qualityScoreExplanation")
-                or prev_analysis.get("qualityScoreExplanation")
-                or ""
-            )
-        if fresh_explanation:
-            merged_analysis["qualityScoreExplanation"] = fresh_explanation
-            merged_analysis["reportQualityScoreExplanation"] = (
-                self._sanitize_report_quality_score_explanation(fresh_explanation)
-            ).strip()
-
-        merged_analysis["timestamp"] = datetime.utcnow().isoformat() + "Z"
-        # Final guarantee: every user-facing list field on the merged
-        # payload is a List[str] (no dict reprs) before we cache + emit.
-        self._normalize_analysis_report_lists(merged_analysis)
         self._workspace_analysis_payload[workspace_id] = merged_analysis
         if self._socket_client:
             await self._socket_client.emit(

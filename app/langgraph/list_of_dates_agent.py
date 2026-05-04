@@ -201,9 +201,12 @@ Rules:
         already happened.
      d. Only skip the entry if the source itself explicitly states a year that
         contradicts both options or is unreadable.
-3) If a fully relative phrase is used (e.g. "three years ago"), calculate the
-   absolute year from the anchor year hint when available, else from the current
-   year ({current_year}); output date as YYYY-01-01.
+3) If the source uses a fully RELATIVE phrase ("three years ago", "1.5 years
+   ago", "for many years", "since long back", "a long time back") and no
+   concrete day/month is available, **DROP the entry**. Do NOT synthesize a
+   placeholder like ``YYYY-01-01`` or ``YYYY-MM-01``. This panel must contain
+   only entries with a concrete day/month/year derived from the source —
+   fake-precision dates ("Jan 1 of three years ago") mislead the user.
 3a) **Relative-time anchors** — phrases like "tomorrow" / "today" / "कल" / "आज"
     / "in 24 hours" / "within 24 hours" / "by 5 PM tomorrow" / "next week" /
     "next Monday" must anchor STRICTLY to today's date ({today_str}). Do NOT
@@ -402,6 +405,34 @@ Legal text:
                 if year < 1900 or year > 2099:
                     continue
             except ValueError:
+                continue
+
+            # Reject strictly-future entries — list_of_dates is past-only.
+            # Mirrors the same filter on the events.py path so a regeneration
+            # that uses only this agent can't leak future dates.
+            if date_val > today_str_for_check:
+                logger.info(
+                    "List of dates agent: dropped future-dated entry "
+                    "(date={}, today={}) — list_of_dates is past-only",
+                    date_val, today_str_for_check,
+                )
+                continue
+
+            # Reject fake YYYY-01-01 placeholders synthesized from relative
+            # phrases ("three years ago" → 2023-01-01) when the source does
+            # NOT actually contain that 4-digit year as a year reference. If
+            # the document explicitly mentions the year, we keep the entry —
+            # only fake-precision interpolations get dropped.
+            if (
+                date_val[5:] == "01-01"
+                and re.search(rf"\b{year}\b", document_text or "") is None
+            ):
+                logger.info(
+                    "List of dates agent: dropped fake YYYY-01-01 placeholder "
+                    "(date={}) — relative phrase only, no concrete day/month "
+                    "and year not in source",
+                    date_val,
+                )
                 continue
 
             # Post-LLM hallucination guard (shared across all date-extraction

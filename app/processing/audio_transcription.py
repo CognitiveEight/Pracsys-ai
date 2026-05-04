@@ -1682,6 +1682,171 @@ def _has_devanagari(text: str) -> bool:
     return bool(text) and bool(_DEVANAGARI_RE.search(text))
 
 
+# Number of utterances per Gemini call. Small enough that the JSON response
+# fits comfortably even when server-side streaming truncates aggressively.
+_HINGLISH_BATCH_SIZE = 25
+
+
+def _try_repair_truncated_json_array(text: str, key: str) -> Optional[list]:
+    """Salvage a partial JSON response that streamed in shape
+    ``{"<key>": [ "...", "...", ...`` but got cut off before the closing ``]}``.
+
+    Strategy: find the array opening, walk back from the end of the text to
+    the last complete string token (closing ``"`` followed only by whitespace
+    or trailing comma), drop any trailing comma, append ``]}``. Then JSON-load
+    and return the inner list.
+
+    Returns the list of recovered items on success, ``None`` when the text is
+    not a recognisable partial of the expected shape.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    s = text.strip()
+    # Optional fenced-code stripping (``` ```json ```)
+    if s.startswith("```"):
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)(?:```|$)", s, flags=re.I)
+        if m:
+            s = m.group(1).strip()
+
+    # Locate the start of the array. The prompt always emits
+    # `{"<key>": [ ... ]}` so we search for `"<key>"` followed by `[`.
+    pat = re.compile(rf'"{re.escape(key)}"\s*:\s*\[', re.DOTALL)
+    m = pat.search(s)
+    if not m:
+        return None
+    array_open = m.end()  # position right after the `[`
+    body = s[array_open:]
+
+    # Walk back to the last complete `"..."` token. A complete token ends with
+    # a closing double-quote that is NOT escaped, optionally followed by
+    # whitespace and/or a comma.
+    # Find the last unescaped closing double-quote.
+    last_close = -1
+    i = 0
+    in_str = False
+    escape = False
+    while i < len(body):
+        ch = body[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+                last_close = i  # remember last completed string
+        else:
+            if ch == '"':
+                in_str = True
+        i += 1
+    if last_close < 0:
+        return None
+    truncated = body[: last_close + 1]
+    # Strip any trailing comma + whitespace (we don't want a dangling `,`).
+    truncated = re.sub(r",\s*$", "", truncated.rstrip())
+    # Reconstruct the full JSON object and parse.
+    repaired = '{"' + key + '":[' + truncated + ']}'
+    try:
+        obj = json.loads(repaired)
+    except json.JSONDecodeError:
+        return None
+    arr = obj.get(key)
+    if isinstance(arr, list):
+        return arr
+    return None
+
+
+def _transliterate_one_batch_to_hinglish(
+    batch_texts: list[str],
+    *,
+    batch_label: str = "",
+) -> Optional[list[Optional[str]]]:
+    """Single Gemini call that converts a batch of utterances from Devanagari
+    to Hinglish. Returns a list of strings the same length as ``batch_texts``
+    (may contain ``None`` for items where the model didn't emit a useful
+    string). Returns ``None`` on total failure (no data from Gemini AND no
+    salvage from JSON repair).
+    """
+    if not batch_texts:
+        return []
+
+    numbered = "\n".join(
+        f"{i+1}. {(t or '').strip()}" for i, t in enumerate(batch_texts)
+    )
+    prompt = f"""Convert the following spoken-language utterances from Devanagari (Hindi) script to Roman / Hinglish script.
+
+RULES (apply strictly):
+1. Preserve MEANING and SPOKEN SOUND — write Hindi words the way they are pronounced, using Roman letters as a Hindi speaker would casually type on a phone (e.g. मैं → main, हूं → hoon, बात → baat, कर रहा → kar raha, ठीक है → theek hai, क्या → kya, नहीं → nahi, मेरी → meri, मतलब → matlab).
+2. Words that the speaker said in ENGLISH (already in the source as-is, like "WhatsApp", "yes", "ok", "company", "WhatsApp pe", "consultation", "yes sir", "policy") MUST stay in their original English spelling. Do NOT translate them.
+3. Code-switched / Hinglish phrases stay code-switched (e.g. "Within 24 hours" stays as "Within 24 hours"; "ये एंप्लॉयमेंट एग्रीमेंट को" → "yeh employment agreement ko").
+4. Numbers, currency (₹2000, ₹7000), and dates stay verbatim — do not translate or rewrite them.
+5. Do NOT translate Hindi to English. The output must be the same Hindi (or Hinglish) words, just typed in Roman letters.
+6. Preserve punctuation and the order of utterances exactly.
+
+Return ONLY this JSON:
+{{"transliterated":["<utterance 1 in Hinglish>","<utterance 2 in Hinglish>", ...]}}
+
+The output array MUST have exactly {len(batch_texts)} entries, in the same order as the numbered list below. If an utterance is already fully in Roman script, return it unchanged.
+
+Utterances:
+{numbered}
+"""
+    # Smaller per-batch budget — the response is just N short strings, so we
+    # don't need 65k tokens (which on some preview models silently downgrades
+    # the actual cap). 8000 is plenty for 25 utterances of typical length.
+    data = _generate_gemini_json(prompt, max_output_tokens=8000)
+
+    arr: Optional[list] = None
+    if isinstance(data, dict):
+        candidate = data.get("transliterated")
+        if isinstance(candidate, list):
+            arr = candidate
+        else:
+            logger.warning(
+                "Audio: Hinglish batch{} response missing 'transliterated' list "
+                "(got {})",
+                batch_label, type(candidate).__name__,
+            )
+
+    # If the validator rejected the response wholesale, try a JSON-repair on
+    # the raw text by re-running the call and extracting whatever streamed.
+    # We can't get the raw text from `_generate_gemini_json` (it returns None
+    # on parse failure), so as a fallback we repeat the call asking the model
+    # to keep its response very short. Cheap and only fires on total failure.
+    if arr is None:
+        logger.warning(
+            "Audio: Hinglish batch{} — full JSON parse failed; attempting "
+            "repaired single-shot retry with terse prompt",
+            batch_label,
+        )
+        # Re-issue the call but ask for a SHORTER output schema, which is
+        # less likely to truncate.
+        terse_prompt = (
+            "Transliterate each Devanagari Hindi utterance to Roman/Hinglish. "
+            "Keep English words verbatim. Numbers and ₹ amounts unchanged. "
+            "Reply ONLY with a JSON array of strings, no object wrapper, no "
+            "commentary. Array length must be exactly "
+            f"{len(batch_texts)}.\n\nUtterances:\n{numbered}"
+        )
+        retry = _generate_gemini_json(terse_prompt, max_output_tokens=8000)
+        # The terse retry may return a dict (Gemini auto-wraps) or fail.
+        if isinstance(retry, dict):
+            for v in retry.values():
+                if isinstance(v, list):
+                    arr = v
+                    break
+        if arr is None:
+            return None
+
+    # Pad / truncate to expected length.
+    out: list[Optional[str]] = [None] * len(batch_texts)
+    for i in range(min(len(arr), len(batch_texts))):
+        v = arr[i]
+        if isinstance(v, str) and v.strip():
+            out[i] = v.strip()
+    return out
+
+
 def _transliterate_segments_to_hinglish(
     segments: list[SpeakerSegment],
 ) -> list[SpeakerSegment]:
@@ -1694,10 +1859,12 @@ def _transliterate_segments_to_hinglish(
     code-switched portions are preserved verbatim — only the Devanagari runs
     are transliterated.
 
-    Implementation: one batched Gemini call over all segments at once.
-    Segments are submitted with stable indexes; the model returns the
-    transliterated text per index. Falls back to leaving segments as-is on
-    any parse / API failure (Devanagari is still readable, so no data loss).
+    Implementation: split the segments into batches of `_HINGLISH_BATCH_SIZE`
+    (default 25) and run a Gemini call per batch. Each call's JSON response
+    is small enough to avoid stream-truncation on environments with shorter
+    output budgets (this was the server-side failure mode that left
+    transcripts in Devanagari). A failed batch leaves THAT batch's segments
+    in Devanagari and the other batches still get Hinglish.
 
     Mutates the segments in place AND returns them for convenience.
     """
@@ -1716,72 +1883,59 @@ def _transliterate_segments_to_hinglish(
         )
         return segments
 
-    numbered = "\n".join(
-        f"{i+1}. {(seg.text or '').strip()}" for i, seg in enumerate(segments)
+    total = len(segments)
+    batches: list[tuple[int, int]] = [
+        (start, min(start + _HINGLISH_BATCH_SIZE, total))
+        for start in range(0, total, _HINGLISH_BATCH_SIZE)
+    ]
+    logger.info(
+        "Audio: Hinglish transliteration starting — {} segments split into "
+        "{} batch(es) of up to {}",
+        total, len(batches), _HINGLISH_BATCH_SIZE,
     )
-    prompt = f"""Convert the following spoken-language utterances from Devanagari (Hindi) script to Roman / Hinglish script.
 
-RULES (apply strictly):
-1. Preserve MEANING and SPOKEN SOUND — write Hindi words the way they are pronounced, using Roman letters as a Hindi speaker would casually type on a phone (e.g. मैं → main, हूं → hoon, बात → baat, कर रहा → kar raha, ठीक है → theek hai, क्या → kya, नहीं → nahi, मेरी → meri, मतलब → matlab).
-2. Words that the speaker said in ENGLISH (already in the source as-is, like "WhatsApp", "yes", "ok", "company", "WhatsApp pe", "consultation", "yes sir", "policy") MUST stay in their original English spelling. Do NOT translate them.
-3. Code-switched / Hinglish phrases stay code-switched (e.g. "Within 24 hours" stays as "Within 24 hours"; "ये एंप्लॉयमेंट एग्रीमेंट को" → "yeh employment agreement ko").
-4. Numbers, currency (₹2000, ₹7000), and dates stay verbatim — do not translate or rewrite them.
-5. Do NOT translate Hindi to English. The output must be the same Hindi (or Hinglish) words, just typed in Roman letters.
-6. Preserve punctuation, line breaks, and the order of utterances exactly.
+    converted_total = 0
+    for batch_idx, (start, end) in enumerate(batches, 1):
+        batch_segs = segments[start:end]
+        batch_texts = [(s.text or "").strip() for s in batch_segs]
+        batch_label = f" {batch_idx}/{len(batches)}"
+        result = _transliterate_one_batch_to_hinglish(batch_texts, batch_label=batch_label)
+        if result is None:
+            logger.warning(
+                "Audio: Hinglish batch{} failed; {} segments stay Devanagari",
+                batch_label, len(batch_segs),
+            )
+            continue
 
-Return ONLY this JSON:
-{{"transliterated":["<utterance 1 in Hinglish>","<utterance 2 in Hinglish>", ...]}}
-
-The output array MUST have exactly {len(segments)} entries, in the same order as the numbered list below. If an utterance is already fully in Roman script, return it unchanged.
-
-Utterances:
-{numbered}
-"""
-    data = _generate_gemini_json(prompt, max_output_tokens=_GEMINI_MAX_OUTPUT_TOKENS)
-    if not data:
-        logger.warning(
-            "Audio: Hinglish transliteration Gemini call returned no data; "
-            "transcript will retain Devanagari script."
-        )
-        return segments
-
-    arr = data.get("transliterated")
-    if not isinstance(arr, list):
-        logger.warning(
-            "Audio: Hinglish transliteration response missing 'transliterated' "
-            "list (got {}); transcript will retain Devanagari script.",
-            type(arr).__name__,
-        )
-        return segments
-
-    if len(arr) != len(segments):
-        logger.warning(
-            "Audio: Hinglish transliteration count mismatch (got {} vs {} "
-            "segments); applying as much as possible.",
-            len(arr), len(segments),
+        batch_converted = 0
+        for i, seg in enumerate(batch_segs):
+            if i >= len(result):
+                break
+            new_text = result[i]
+            if not isinstance(new_text, str) or not new_text.strip():
+                continue
+            new_text = new_text.strip()
+            if _has_devanagari(new_text) and new_text == (seg.text or "").strip():
+                continue
+            seg.text = new_text
+            batch_converted += 1
+        converted_total += batch_converted
+        logger.info(
+            "Audio: Hinglish batch{} — {}/{} segments converted",
+            batch_label, batch_converted, len(batch_segs),
         )
 
-    converted = 0
-    for i, seg in enumerate(segments):
-        if i >= len(arr):
-            break
-        new_text = arr[i]
-        if not isinstance(new_text, str):
-            continue
-        new_text = new_text.strip()
-        if not new_text:
-            continue
-        # Sanity guard: if the model returned the original Devanagari, skip
-        # so we don't pretend success when nothing changed.
-        if _has_devanagari(new_text) and new_text == (seg.text or "").strip():
-            continue
-        seg.text = new_text
-        converted += 1
     logger.info(
         "Audio: Hinglish transliteration applied to {}/{} segments",
-        converted, len(segments),
+        converted_total, total,
     )
     return segments
+
+
+_TRANSCRIPT_LINE_RE = re.compile(
+    r"^\s*(?P<prefix>\[\d{2}:\d{2}(?::\d{2})?\]\s*[^:]+?:\s*)"
+    r"(?P<text>.*)$"
+)
 
 
 def transliterate_formatted_transcript_to_hinglish(formatted: str) -> str:
@@ -1791,9 +1945,16 @@ def transliterate_formatted_transcript_to_hinglish(formatted: str) -> str:
     breaks. Used to retroactively heal cached transcripts that were generated
     before Hinglish output was supported.
 
+    Implementation: parse the formatted transcript into per-line entries,
+    extract the spoken text portion of each line, run the texts through the
+    SAME batched transliteration as the live audio path
+    (`_transliterate_one_batch_to_hinglish`), then re-assemble the lines
+    with original timestamps + speaker labels intact. This inherits the
+    chunked / repair-friendly behaviour and avoids the one-shot truncation
+    failure mode that bit the server.
+
     Returns the (possibly-transliterated) string. Returns the input unchanged
-    on any failure (no API key, parse error, empty response) — Devanagari is
-    still readable so this is lossless.
+    on any failure — Devanagari is still readable so this is lossless.
     """
     if not formatted or not _has_devanagari(formatted):
         return formatted
@@ -1804,51 +1965,79 @@ def transliterate_formatted_transcript_to_hinglish(formatted: str) -> str:
         )
         return formatted
 
-    prompt = f"""Convert the Devanagari (Hindi) portions of this transcript to Roman / Hinglish script. The transcript is a multi-line audio dialogue with timestamps and speaker labels.
+    # Parse line-by-line into (prefix, text) pairs. Lines that don't match the
+    # `[MM:SS] Label: text` shape are kept verbatim with prefix="" and the
+    # whole line as text — they get transliterated and re-emitted as-is.
+    lines = formatted.split("\n")
+    prefixes: list[str] = []
+    texts: list[str] = []
+    needs_translit_idx: list[int] = []
+    for i, line in enumerate(lines):
+        m = _TRANSCRIPT_LINE_RE.match(line)
+        if m:
+            prefixes.append(m.group("prefix"))
+            texts.append(m.group("text"))
+        else:
+            prefixes.append("")
+            texts.append(line)
+        if _has_devanagari(texts[-1]):
+            needs_translit_idx.append(i)
 
-RULES (apply strictly):
-1. Preserve ALL timestamps in their original ``[MM:SS]`` form — do not change any digit.
-2. Preserve speaker labels exactly as they appear (e.g. ``Lawyer:``, ``Caller:``, ``Speaker A:``, ``Speaker B:``) — do not translate or alter.
-3. Preserve line breaks and order of utterances exactly — one input line maps to one output line.
-4. Inside each utterance, transliterate Devanagari Hindi words phonetically to Roman as a Hindi speaker would casually type on a phone (e.g. मैं → main, हूं → hoon, बात → baat, ठीक है → theek hai, क्या → kya, नहीं → nahi, मेरी → meri, मतलब → matlab).
-5. English words already in the source (WhatsApp, yes, ok, company, consultation, policy, etc.) MUST stay in their original English spelling. Do NOT translate them.
-6. Numbers, currency (₹2000, ₹7000), and dates stay verbatim.
-7. Do NOT translate Hindi to English. The output must be the same Hindi (or Hinglish) words, just typed in Roman letters.
+    if not needs_translit_idx:
+        return formatted  # Nothing to transliterate after parsing.
 
-Return ONLY this JSON, no commentary:
-{{"transcript":"<entire transliterated transcript with original timestamps and labels>"}}
-
-Transcript to transliterate:
-{formatted}
-"""
-    data = _generate_gemini_json(prompt, max_output_tokens=_GEMINI_MAX_OUTPUT_TOKENS)
-    if not data:
-        logger.warning(
-            "Audio: cached transcript heal — Gemini returned no data; "
-            "transcript stays in Devanagari."
-        )
-        return formatted
-    new_text = data.get("transcript")
-    if not isinstance(new_text, str) or not new_text.strip():
-        logger.warning(
-            "Audio: cached transcript heal — response missing 'transcript' "
-            "string; transcript stays in Devanagari."
-        )
-        return formatted
-    new_text = new_text.strip()
-    # Sanity guard: if the model returned the original verbatim, treat as failure.
-    if _has_devanagari(new_text) and new_text == formatted.strip():
-        logger.warning(
-            "Audio: cached transcript heal — model returned unchanged Devanagari; "
-            "no heal applied."
-        )
-        return formatted
+    # Build batched calls only over the lines that need transliteration.
+    total_to_translit = len(needs_translit_idx)
+    batches: list[tuple[int, int]] = [
+        (start, min(start + _HINGLISH_BATCH_SIZE, total_to_translit))
+        for start in range(0, total_to_translit, _HINGLISH_BATCH_SIZE)
+    ]
     logger.info(
-        "Audio: cached transcript healed — Devanagari converted to Hinglish "
-        "({} chars → {} chars)",
-        len(formatted), len(new_text),
+        "Audio: cached transcript heal starting — {} of {} lines need "
+        "transliteration, split into {} batch(es)",
+        total_to_translit, len(lines), len(batches),
     )
-    return new_text
+
+    healed_count = 0
+    for batch_idx, (b_start, b_end) in enumerate(batches, 1):
+        batch_indexes_in_lines = needs_translit_idx[b_start:b_end]
+        batch_texts = [texts[i] for i in batch_indexes_in_lines]
+        batch_label = f" heal {batch_idx}/{len(batches)}"
+        result = _transliterate_one_batch_to_hinglish(
+            batch_texts, batch_label=batch_label
+        )
+        if result is None:
+            logger.warning(
+                "Audio: cached heal batch{} failed; those {} lines stay Devanagari",
+                batch_label, len(batch_texts),
+            )
+            continue
+        for j, line_idx in enumerate(batch_indexes_in_lines):
+            if j >= len(result):
+                break
+            new_text = result[j]
+            if not isinstance(new_text, str) or not new_text.strip():
+                continue
+            new_text = new_text.strip()
+            if _has_devanagari(new_text) and new_text == texts[line_idx].strip():
+                continue
+            texts[line_idx] = new_text
+            healed_count += 1
+        logger.info(
+            "Audio: cached heal batch{} — converted {} lines",
+            batch_label, healed_count,
+        )
+
+    if healed_count == 0:
+        return formatted
+
+    rebuilt = "\n".join(prefixes[i] + texts[i] for i in range(len(lines)))
+    logger.info(
+        "Audio: cached transcript healed — {} of {} lines converted "
+        "({} chars → {} chars)",
+        healed_count, len(lines), len(formatted), len(rebuilt),
+    )
+    return rebuilt
 
 
 def _format_transcript_with_speakers(segments: list[SpeakerSegment]) -> str:

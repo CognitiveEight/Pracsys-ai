@@ -3583,6 +3583,19 @@ Rules:
 - Output ONLY a single valid JSON array. No markdown, no code fences, no other text.
 - The first character of your response MUST be [ and the last MUST be ].
 - Date normalization: output each "date" as YYYY-MM-DD.
+- **Indian DD/MM/YYYY convention** — when the source contains a slash- or
+  dash-separated numeric date like ``01/05/2026``, ``01-05-2026``, ``01.05.2026``,
+  the FIRST number is the DAY and the SECOND number is the MONTH (Indian
+  convention). Do NOT interpret it as US MM/DD/YYYY.
+    • ``01/05/2026`` → DAY 1, MONTH 5 → ``2026-05-01`` (1 May 2026), NOT
+      ``2026-01-05`` (5 January 2026).
+    • ``13/04/2026`` → DAY 13, MONTH 4 → ``2026-04-13``.
+    • Whenever the first number is > 12, that already proves DD/MM/YYYY
+      (e.g. ``25/03/2026`` can only be 25 March). Apply the same rule even
+      when both numbers are ≤ 12 — DAY first, MONTH second.
+    • Only switch to MM/DD/YYYY if the source EXPLICITLY identifies the
+      format (e.g. labels like "Date (MM/DD/YYYY): 01/05/2026") or the date
+      sits inside a clearly US/foreign-jurisdiction document.
 - **Year resolution when the source mentions a date without a year** (e.g. "2 February", "21 तारीख", "last Tuesday", "the 15th of March"):
   - Default to the CURRENT YEAR ({current_year}) — these are recent events from a live conversation/document, not historical records.
   - Pick the year that places the event ON OR BEFORE today ({today_str}); if "{current_year}-MM-DD" would be in the future relative to today, use {int(current_year) - 1} instead (event must have already happened to be reported).

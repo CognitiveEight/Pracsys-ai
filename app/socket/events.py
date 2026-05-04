@@ -20,6 +20,10 @@ from app.agents.role_models import RoleEnum
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
+from app.processing.audio_transcription import (
+    _has_devanagari as _audio_has_devanagari,
+    transliterate_formatted_transcript_to_hinglish,
+)
 from app.processing.document_processor import document_processor
 from app.prompts.applicable_acts import (
     TARGETED_INDIAN_ACTS,
@@ -4258,6 +4262,12 @@ Example shape:
                         raw_event_type, raw_title,
                     )
                     continue
+                # NOTE: title-based procedural detection moved AFTER the entry
+                # is built — a single batched LLM classification call runs
+                # over the surviving entries (`_llm_classify_factual_vs_procedural`)
+                # so any procedural phrasing the LLM emits — even with a
+                # benign eventType and unfamiliar wording — gets dropped by
+                # general semantic judgment, not a hardcoded keyword list.
                 # Drop strictly-future entries — list_of_dates is a record of
                 # what HAS HAPPENED. Future dates (deadlines, scheduled
                 # hearings, upcoming events) belong on procedural_timeline.
@@ -4266,6 +4276,23 @@ Example shape:
                         "List of dates: dropped future-dated entry "
                         "(date={}, today={}, title={!r}) — list_of_dates is past-only",
                         date_val, today_str, raw_title,
+                    )
+                    continue
+                # Drop fake YYYY-01-01 placeholders that the LLM synthesized
+                # from a relative phrase ("three years ago" → 2023-01-01)
+                # when the source does not actually contain that 4-digit year
+                # as a year reference. Source-grounded "YYYY-01-01" entries
+                # (e.g. a contract dated 1 January 2024) are kept because the
+                # year IS in the source.
+                if (
+                    date_val.endswith("-01-01")
+                    and re.search(rf"\b{date_val[:4]}\b", source_content or "") is None
+                ):
+                    logger.info(
+                        "List of dates: dropped fake YYYY-01-01 placeholder "
+                        "(date={}, title={!r}) — relative phrase only, no concrete "
+                        "day/month and year not in source",
+                        date_val, raw_title,
                     )
                     continue
                 entry = {
@@ -4368,6 +4395,30 @@ Example shape:
                 seen_keys.add(key)
                 deduped.append(entry)
             result = deduped
+
+            # Semantic factual-vs-procedural classification — single batched
+            # LLM call that judges each entry as a factual case event or a
+            # procedural milestone, dropping the procedural ones. Replaces
+            # the earlier hardcoded title-keyword regex so the filter
+            # generalises to ANY case type and ANY procedural phrasing the
+            # LLM might emit.
+            before_class = len(result)
+            try:
+                result = await self._llm_classify_factual_vs_procedural(
+                    result, item_type="list of dates"
+                )
+                if len(result) < before_class:
+                    logger.info(
+                        "List of dates: LLM factual-vs-procedural classifier "
+                        "dropped {} entries (kept {})",
+                        before_class - len(result), len(result),
+                    )
+            except Exception as classify_err:
+                logger.warning(
+                    "List of dates: factual-vs-procedural classifier failed "
+                    "(non-fatal, keeping all entries): {}",
+                    classify_err,
+                )
 
             # Semantic same-date dedupe — runs UNCONDITIONALLY on the freshly
             # generated list, even on first emit (no prev cache yet). Catches
@@ -6266,6 +6317,145 @@ Return ONLY this JSON, no commentary:
                 if len(fallback) >= max_keep:
                     break
             return fallback[:max_keep]
+
+    async def _llm_classify_factual_vs_procedural(
+        self,
+        entries: List[Dict[str, Any]],
+        *,
+        item_type: str = "list of dates",
+        title_field: str = "title",
+        description_field: str = "description",
+        date_field: str = "date",
+    ) -> List[Dict[str, Any]]:
+        """LLM-based filter that drops procedural / lawyer-side entries from a
+        factual-events list, keeping only entries that describe what happened
+        in the real world to/between the parties.
+
+        Replaces the earlier hardcoded title-keyword regex. The LLM is given
+        a numbered list of entries (date + title + description) and asked to
+        classify each as 'factual' or 'procedural'. We keep only the
+        'factual' indexes. Generalises across any case type (matrimonial,
+        cyber-fraud, immigration, property, employment, etc.) and any
+        procedural phrasing the upstream LLM might emit.
+
+        On any LLM failure (no API key, parse error, count mismatch), returns
+        the input unchanged — the cheap deterministic filters upstream
+        (eventType, future-date, YYYY-01-01) still applied, so falling back
+        to the unfiltered list is safe.
+        """
+        if not entries:
+            return []
+        # Cheap exit: nothing to classify if all entries are already trivially
+        # factual by their normalized eventType (Incident / Agreement /
+        # Payment / Communication). The LLM only needs to weigh in on
+        # ambiguous types like "Other".
+        ambiguous_indexes = [
+            i for i, e in enumerate(entries)
+            if isinstance(e, dict)
+            and str(e.get("eventType") or "").strip() in ("Other", "")
+        ]
+        if not ambiguous_indexes:
+            return entries
+
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            lines: List[str] = []
+            for i, e in enumerate(entries):
+                d = str(e.get(date_field) or "").strip()
+                t = str(e.get(title_field) or "").strip()
+                desc = str(e.get(description_field) or "").strip()
+                lines.append(f"{i+1}. [{d}] {t} — {desc}")
+            numbered = "\n".join(lines)
+
+            prompt = f"""You are filtering a chronological list of dates extracted from a legal case file. Each entry has a date, a short title, and a one-sentence description.
+
+Classify each entry as ONE of:
+  - "factual"     : a real-world event that actually happened to or between
+                    the parties (incident, accident, agreement signed, payment
+                    made, marriage, separation, employment joining or quitting,
+                    document handed over, transaction, communication exchanged,
+                    medical examination, FIR registered as an event, site
+                    inspection, possession delay, fraud transaction, etc.).
+                    Anything a lawyer would mention when narrating "the story
+                    of what happened" to a colleague.
+  - "procedural"  : a lawyer-side / court-side / system-side milestone
+                    (court filing, hearing, adjournment, judgment, summons,
+                    legal / demand / statutory notice issuance, response
+                    deadline, filing deadline, evidence deadline, compliance
+                    deadline, limitation period, lawyer or client consultation,
+                    mediation session, scheduled meeting, "case initiation",
+                    report due, period of judicial inactivity, judge absent,
+                    document expiry as a deadline). Anything that belongs on
+                    a separate Procedural Timeline panel rather than the
+                    factual narrative.
+
+Apply general semantic judgment — do NOT rely on specific keywords. The same
+entry may be procedural in one case and factual in another:
+  - "Visa Expiry" is FACTUAL only when the dispute is itself about visa
+    overstay / immigration; otherwise it's procedural / metadata.
+  - "Notice Sent" is procedural; "Letter from employer demanding meeting"
+    is factual communication.
+  - "Marriage" is factual; "Marriage Certificate Filed in Court" is
+    procedural.
+  - "Application Submitted" is procedural (a filing).
+
+If the entry's title is a vague placeholder ("Date Mentioned", "Event",
+"Case Date") with no concrete event content, classify as "procedural" so it
+gets dropped.
+
+Return ONLY this JSON, no commentary:
+{{"classifications":["factual","procedural", ...]}}
+
+The array MUST have EXACTLY {len(entries)} entries, in the same order as
+the numbered list below.
+
+Entries:
+{numbered}
+"""
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=8000,
+                response_mime_type="application/json",
+            )
+            candidate = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            parsed = json.loads(candidate) if candidate else json.loads((raw or "").strip())
+            classifications = parsed.get("classifications") if isinstance(parsed, dict) else None
+            if not isinstance(classifications, list):
+                logger.warning(
+                    "{}: classifier response missing 'classifications' list (got {}); "
+                    "keeping all entries.",
+                    item_type, type(classifications).__name__,
+                )
+                return entries
+
+            kept: List[Dict[str, Any]] = []
+            for i, entry in enumerate(entries):
+                if i >= len(classifications):
+                    # LLM returned fewer items than expected — keep the rest
+                    # rather than discard.
+                    kept.append(entry)
+                    continue
+                verdict = str(classifications[i] or "").strip().lower()
+                if verdict == "procedural":
+                    logger.info(
+                        "List of dates: LLM classifier dropped procedural entry "
+                        "(title={!r}, eventType={!r}, date={})",
+                        str(entry.get(title_field) or ""),
+                        str(entry.get("eventType") or ""),
+                        str(entry.get(date_field) or ""),
+                    )
+                    continue
+                # "factual" or any unknown verdict → keep (conservative).
+                kept.append(entry)
+            return kept
+        except Exception as e:
+            logger.warning(
+                "{}: factual-vs-procedural classifier failed: {}; keeping all entries.",
+                item_type, e,
+            )
+            return entries
 
     async def _dedupe_dated_entries_semantically(
         self,
@@ -10400,6 +10590,87 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
     # Connection Events
     # ========================================================================
 
+    async def _heal_devanagari_in_document_assessments(
+        self, workspace_id: str
+    ) -> bool:
+        """Detect Devanagari Hindi text in cached audio transcripts and
+        transliterate to Hinglish in place. Idempotent — once a workspace's
+        cache is healed, subsequent calls become no-ops because no Devanagari
+        is detected. Used to retroactively fix workspaces processed before
+        the Hinglish transliteration step was added — without forcing the
+        user to re-upload the audio.
+
+        Returns True when at least one transcript was healed (cache updated),
+        False otherwise.
+        """
+        cached = self._workspace_document_assessments_payload.get(workspace_id)
+        if not isinstance(cached, dict):
+            return False
+        inner_payload = cached.get("payload")
+        if not isinstance(inner_payload, dict):
+            return False
+        assessments = inner_payload.get("documentAssessments")
+        if not isinstance(assessments, list) or not assessments:
+            return False
+
+        # Cheap pre-check: does any audio entry actually carry Devanagari?
+        # Skip the LLM round-trip entirely when nothing needs healing.
+        candidates_idx: List[int] = []
+        for i, entry in enumerate(assessments):
+            if not isinstance(entry, dict):
+                continue
+            transcript_text = entry.get("transcript")
+            if (
+                isinstance(transcript_text, str)
+                and transcript_text.strip()
+                and _audio_has_devanagari(transcript_text)
+            ):
+                candidates_idx.append(i)
+        if not candidates_idx:
+            return False
+
+        logger.info(
+            "Devanagari heal: workspace {} has {} cached audio transcript(s) "
+            "with Devanagari; running one-shot Hinglish transliteration",
+            workspace_id[:12] if workspace_id else "",
+            len(candidates_idx),
+        )
+
+        healed_count = 0
+        for i in candidates_idx:
+            entry = assessments[i]
+            original = entry.get("transcript", "")
+            try:
+                new_text = await asyncio.to_thread(
+                    transliterate_formatted_transcript_to_hinglish, original
+                )
+            except Exception as e:
+                logger.warning(
+                    "Devanagari heal: failed for entry {!r}: {}",
+                    entry.get("fileName") or entry.get("documentId") or i, e,
+                )
+                continue
+            if not isinstance(new_text, str) or not new_text.strip():
+                continue
+            if new_text == original:
+                continue  # Heal returned same string — likely failure.
+            entry["transcript"] = new_text
+            healed_count += 1
+
+        if healed_count == 0:
+            return False
+
+        # Re-assign so the PersistentWorkspaceDict notices the write and
+        # mirrors it to Qdrant — subsequent process restarts won't re-heal.
+        self._workspace_document_assessments_payload[workspace_id] = cached
+        logger.success(
+            "✅ Devanagari heal: workspace {} — healed {} cached transcript(s) "
+            "to Hinglish; cache updated.",
+            workspace_id[:12] if workspace_id else "",
+            healed_count,
+        )
+        return True
+
     async def _do_reemit_after_reconnect(self) -> None:
         """Re-emit cached document_feature_response payloads for the pending workspace after reconnect.
         This covers: document_assessments, workspace_metadata, strategy_objective, analysis_report, list_of_dates.
@@ -10416,7 +10687,18 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
         self._pending_reemit_workspace_id = None
         self._pending_reemit_user_id = None
         try:
-            # 1) Document assessments (if available)
+            # 1) Document assessments (if available). Heal any cached
+            # Devanagari transcripts to Hinglish first so workspaces processed
+            # before the Hinglish step was added auto-upgrade on the next
+            # re-emit. Idempotent — once healed, subsequent calls are no-ops.
+            try:
+                await self._heal_devanagari_in_document_assessments(workspace_id)
+            except Exception as heal_err:
+                logger.warning(
+                    "Devanagari heal failed for workspace {} (non-fatal): {}",
+                    workspace_id[:12] if workspace_id else "",
+                    heal_err,
+                )
             doc_assess = self._workspace_document_assessments_payload.get(workspace_id)
             if doc_assess:
                 await self._socket_client.emit(

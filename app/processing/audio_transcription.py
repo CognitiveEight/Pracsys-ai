@@ -1784,6 +1784,73 @@ Utterances:
     return segments
 
 
+def transliterate_formatted_transcript_to_hinglish(formatted: str) -> str:
+    """Convert Devanagari Hindi text inside an already-formatted transcript
+    to Roman / Hinglish, preserving timestamps (``[MM:SS]``), speaker labels
+    (``Lawyer:`` / ``Caller:`` / ``Speaker A:``), punctuation and line
+    breaks. Used to retroactively heal cached transcripts that were generated
+    before Hinglish output was supported.
+
+    Returns the (possibly-transliterated) string. Returns the input unchanged
+    on any failure (no API key, parse error, empty response) — Devanagari is
+    still readable so this is lossless.
+    """
+    if not formatted or not _has_devanagari(formatted):
+        return formatted
+    if not _gemini_configured():
+        logger.warning(
+            "Audio: cannot heal cached Devanagari transcript — Gemini not "
+            "configured; transcript stays in Devanagari."
+        )
+        return formatted
+
+    prompt = f"""Convert the Devanagari (Hindi) portions of this transcript to Roman / Hinglish script. The transcript is a multi-line audio dialogue with timestamps and speaker labels.
+
+RULES (apply strictly):
+1. Preserve ALL timestamps in their original ``[MM:SS]`` form — do not change any digit.
+2. Preserve speaker labels exactly as they appear (e.g. ``Lawyer:``, ``Caller:``, ``Speaker A:``, ``Speaker B:``) — do not translate or alter.
+3. Preserve line breaks and order of utterances exactly — one input line maps to one output line.
+4. Inside each utterance, transliterate Devanagari Hindi words phonetically to Roman as a Hindi speaker would casually type on a phone (e.g. मैं → main, हूं → hoon, बात → baat, ठीक है → theek hai, क्या → kya, नहीं → nahi, मेरी → meri, मतलब → matlab).
+5. English words already in the source (WhatsApp, yes, ok, company, consultation, policy, etc.) MUST stay in their original English spelling. Do NOT translate them.
+6. Numbers, currency (₹2000, ₹7000), and dates stay verbatim.
+7. Do NOT translate Hindi to English. The output must be the same Hindi (or Hinglish) words, just typed in Roman letters.
+
+Return ONLY this JSON, no commentary:
+{{"transcript":"<entire transliterated transcript with original timestamps and labels>"}}
+
+Transcript to transliterate:
+{formatted}
+"""
+    data = _generate_gemini_json(prompt, max_output_tokens=_GEMINI_MAX_OUTPUT_TOKENS)
+    if not data:
+        logger.warning(
+            "Audio: cached transcript heal — Gemini returned no data; "
+            "transcript stays in Devanagari."
+        )
+        return formatted
+    new_text = data.get("transcript")
+    if not isinstance(new_text, str) or not new_text.strip():
+        logger.warning(
+            "Audio: cached transcript heal — response missing 'transcript' "
+            "string; transcript stays in Devanagari."
+        )
+        return formatted
+    new_text = new_text.strip()
+    # Sanity guard: if the model returned the original verbatim, treat as failure.
+    if _has_devanagari(new_text) and new_text == formatted.strip():
+        logger.warning(
+            "Audio: cached transcript heal — model returned unchanged Devanagari; "
+            "no heal applied."
+        )
+        return formatted
+    logger.info(
+        "Audio: cached transcript healed — Devanagari converted to Hinglish "
+        "({} chars → {} chars)",
+        len(formatted), len(new_text),
+    )
+    return new_text
+
+
 def _format_transcript_with_speakers(segments: list[SpeakerSegment]) -> str:
     """Produce ``[MM:SS] <label>: text`` lines for the document_assessments transcript.
 

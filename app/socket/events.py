@@ -3508,30 +3508,76 @@ Rules:
 
 Each entry MUST have:
 - "date": string in YYYY-MM-DD format only
-- "title": string, 3-5 word title for the event (e.g. "FIR Filed", "Notice Sent", "Possession Deadline")
+- "title": string, 3-5 word title for the event (e.g. "FIR Registered", "Salary Deducted", "Marriage Ceremony", "Possession Delay")
 - "description": string, one concise sentence describing what happened (max 12 words, no raw text dumps)
 - "sourceDocumentIndex": integer (1-based), which document (1, 2, 3...) the event comes from
 - "pageNumber": integer (mandatory, default 1 if unclear)
 - "isIncident": boolean (optional, default true)
-- "eventType": one of "Court Hearing" | "Deadline" | "Meeting" | "Filing" | "Other"
+- "eventType": one of "Incident" | "Agreement" | "Payment" | "Communication" | "Other"
+  (procedural event types — Court Hearing, Filing, Deadline, Meeting — belong
+  to the Procedural Timeline panel and MUST NOT be used here)
 - "relevance": one of "High" | "Medium" | "Low"
 
-INCLUDE:
-- Actual incidents (accidents, crimes, disputes, possession delays)
-- Agreement/contract signings and key clauses
-- Payments made or demanded
-- Notices, replies, and formal communications
-- Court/tribunal filings, hearings where orders were passed, and judgments
-- Deadlines (possession, refund, compliance)
-- Site inspections and compliance reports
+This panel records the FACTUAL NARRATIVE of the dispute — the chain of
+real-world events that, taken together, explain how the dispute arose, what
+each party did, and what concrete consequences followed. The dispute can be
+of ANY type (civil, criminal, matrimonial, employment, property, immigration,
+consumer, cyber-fraud, IPR, tax, regulatory, etc.) — the same principles apply
+across all of them.
 
-EXCLUDE (do NOT include these):
-- Every row of a court listing/hearing table — include at most 3 key dates from such tables (filing date, registration date, most recent hearing with an order)
-- Dates appearing only in "Date of Listing / Date of Upload / Order/Judgement" table columns with no substantive context
-- Dates alongside "View PDF", "IA/MA", "Connected Matters", "Contact Us", "Feedback", "Sitemap" or other website navigation text
-- Placeholder dates like 11-11-1111 or 9999-99-99
-- Background/historical company information unrelated to this dispute
-- Duplicate entries (same date + title + document)
+CORE TEST FOR EACH CANDIDATE DATE — keep the entry only if ALL three are true:
+  (a) The date marks something that ACTUALLY HAPPENED in the past — not a
+      future scheduled event, not a deadline, not a planned step. The date
+      must be on or before today ({today_str}).
+  (b) The event is CASE-RELEVANT — i.e. it directly contributes to the chain
+      of cause-and-effect that gave rise to this dispute. Identity-document
+      metadata (passport / visa / licence issue or expiry, ID generation
+      timestamps, system-generated certificate numbers) is case-relevant
+      ONLY when the dispute is ABOUT that document itself (e.g. an immigration
+      overstay matter, a passport-fraud case, a visa-revocation challenge).
+      In every other dispute, those dates are biographical / administrative
+      noise and MUST be dropped.
+  (c) The event is FACTUAL, not procedural. Court filings, hearings,
+      adjournments, next-date orders, judgments, legal notices, demand
+      notices, statutory notices, response deadlines, filing deadlines,
+      evidence deadlines, compliance deadlines, limitation-period endings,
+      lawyer consultations, and mediation sessions are PROCEDURAL — they
+      belong to a separate Procedural Timeline panel, not this one.
+
+ASK YOURSELF before keeping each date:
+  - "If a lawyer were narrating the story of this dispute to a colleague,
+     would they mention this event?" If no → drop.
+  - "Is this date the kind of thing a court would care about because it
+     describes the underlying conduct, harm, or transaction?" If yes → keep.
+  - "Is this date about WHEN the parties did something to each other (or to
+     the case property / instrument)?" If yes → keep.
+  - "Is this date about WHEN a court / tribunal / regulator / lawyer scheduled
+     or required something?" If yes → drop, it belongs on procedural_timeline.
+  - "Would removing this date from the narrative leave a gap, or is it
+     orphan metadata?" Drop if it is orphan metadata.
+
+DEDUPLICATION — output ONE entry per real-world event:
+  - If multiple parts of the source describe the same underlying event with
+    slightly different wording (e.g. "Arrival in India" and "New Delhi
+    Arrival" on the same date), emit ONE entry, not two.
+  - If the same event is mentioned across multiple annexures, still ONE
+    entry. Pick the most specific, factually clearest title and description.
+  - Never emit two entries that share the same date AND describe the same
+    underlying real-world action.
+
+ALSO EXCLUDE:
+- Future / upcoming dates of any kind (planned hearings, expiry deadlines,
+  scheduled meetings, requested departure dates).
+- Every row of a court listing / hearing table — those are procedural.
+- Dates appearing only in "Date of Listing / Date of Upload / Order/Judgement"
+  table columns with no substantive context.
+- Dates alongside "View PDF", "IA/MA", "Connected Matters", "Contact Us",
+  "Feedback", "Sitemap" or other website navigation text.
+- Placeholder dates like 11-11-1111 or 9999-99-99.
+- Background / historical company information unrelated to this dispute.
+- Document-system metadata: "ETA Generation Date", "Document Generation Date",
+  certificate creation timestamps, system audit timestamps, etc., unless that
+  exact date is a load-bearing fact of the dispute.
 
 Rules:
 - Output ONLY a single valid JSON array. No markdown, no code fences, no other text.
@@ -3551,7 +3597,7 @@ Rules:
 - Escape quotes inside strings with \\". Keep title ≤ 5 words, description ≤ 12 words.
 
 Example shape:
-[{{"date":"{current_year}-01-15","title":"Notice Sent","description":"Complainant issued legal notice to respondent.","sourceDocumentIndex":1,"pageNumber":3,"isIncident":true,"eventType":"Filing","relevance":"High"}}]
+[{{"date":"{current_year}-01-15","title":"FIR Registered","description":"FIR was lodged at the local police station regarding the incident.","sourceDocumentIndex":1,"pageNumber":3,"isIncident":true,"eventType":"Incident","relevance":"High"}}]
 """
             # Keep deterministic JSON extraction for timeline completeness.
             raw = await gemini_client.generate(
@@ -3701,47 +3747,90 @@ Example shape:
                 )
             )
 
+            # list_of_dates is a FACTUAL panel only — procedural event types
+            # (Court Hearing / Filing / Deadline / Meeting / legal Notice) live
+            # exclusively on the procedural_timeline panel. The factual types
+            # below are the only ones allowed here. Procedural variants are
+            # mapped to a sentinel "__PROCEDURAL__" so the entry-loop can drop
+            # the entry entirely instead of mis-classifying it as "Other".
             _ALLOWED_EVENT_TYPES = frozenset(
-                ("Court Hearing", "Deadline", "Meeting", "Filing", "Incident", "Other")
+                ("Incident", "Agreement", "Payment", "Communication", "Other")
             )
-            # Map common LLM-invented variants to the canonical allowed values
+            _PROCEDURAL_SENTINEL = "__PROCEDURAL__"
+            # Map every variant the model might emit (lowercased) to either a
+            # canonical factual type or the procedural sentinel.
             _EVENT_TYPE_ALIASES: Dict[str, str] = {
-                "hearing": "Court Hearing",
-                "court hearing": "Court Hearing",
-                "tribunal hearing": "Court Hearing",
-                "hearing date": "Court Hearing",
-                "judgment": "Court Hearing",
-                "judgement": "Court Hearing",
-                "judgment or order": "Court Hearing",
-                "judgement or order": "Court Hearing",
-                "order": "Court Hearing",
-                "court order": "Court Hearing",
-                "tribunal order": "Court Hearing",
-                "final order": "Court Hearing",
-                "interim order": "Court Hearing",
-                "filing": "Filing",
-                "court filing": "Filing",
-                "complaint": "Filing",
-                "application": "Filing",
-                "appeal": "Filing",
-                "deadline": "Deadline",
-                "due date": "Deadline",
-                "possession deadline": "Deadline",
-                "meeting": "Meeting",
+                # ----- Procedural (drop these entries) -----
+                "court hearing": _PROCEDURAL_SENTINEL,
+                "hearing": _PROCEDURAL_SENTINEL,
+                "tribunal hearing": _PROCEDURAL_SENTINEL,
+                "hearing date": _PROCEDURAL_SENTINEL,
+                "next date": _PROCEDURAL_SENTINEL,
+                "adjournment": _PROCEDURAL_SENTINEL,
+                "judgment": _PROCEDURAL_SENTINEL,
+                "judgement": _PROCEDURAL_SENTINEL,
+                "judgment or order": _PROCEDURAL_SENTINEL,
+                "judgement or order": _PROCEDURAL_SENTINEL,
+                "order": _PROCEDURAL_SENTINEL,
+                "court order": _PROCEDURAL_SENTINEL,
+                "tribunal order": _PROCEDURAL_SENTINEL,
+                "final order": _PROCEDURAL_SENTINEL,
+                "interim order": _PROCEDURAL_SENTINEL,
+                "filing": _PROCEDURAL_SENTINEL,
+                "court filing": _PROCEDURAL_SENTINEL,
+                "complaint": _PROCEDURAL_SENTINEL,
+                "application": _PROCEDURAL_SENTINEL,
+                "appeal": _PROCEDURAL_SENTINEL,
+                "deadline": _PROCEDURAL_SENTINEL,
+                "due date": _PROCEDURAL_SENTINEL,
+                "response deadline": _PROCEDURAL_SENTINEL,
+                "filing deadline": _PROCEDURAL_SENTINEL,
+                "compliance deadline": _PROCEDURAL_SENTINEL,
+                "compliance": _PROCEDURAL_SENTINEL,
+                "evidence deadline": _PROCEDURAL_SENTINEL,
+                "limitation": _PROCEDURAL_SENTINEL,
+                "meeting": _PROCEDURAL_SENTINEL,
+                "consultation": _PROCEDURAL_SENTINEL,
+                "mediation": _PROCEDURAL_SENTINEL,
+                "notice": _PROCEDURAL_SENTINEL,
+                "legal notice": _PROCEDURAL_SENTINEL,
+                "demand notice": _PROCEDURAL_SENTINEL,
+                "statutory notice": _PROCEDURAL_SENTINEL,
+                "notice issuance": _PROCEDURAL_SENTINEL,
+                "reply": _PROCEDURAL_SENTINEL,
+                # ----- Factual (keep) -----
                 "incident": "Incident",
+                "accident": "Incident",
+                "assault": "Incident",
+                "fraud": "Incident",
+                "dispute": "Incident",
+                "agreement": "Agreement",
+                "contract": "Agreement",
+                "signing": "Agreement",
+                "marriage": "Agreement",
+                "payment": "Payment",
+                "transaction": "Payment",
+                "communication": "Communication",
+                "email": "Communication",
+                "whatsapp": "Communication",
+                "letter": "Communication",
+                "phone call": "Communication",
                 "other": "Other",
-                "payment": "Other",
-                "communication": "Other",
-                "notice": "Filing",
-                "reply": "Filing",
+                "event": "Other",
+                "date": "Other",
             }
 
             def _normalize_event_type(raw: str) -> str:
-                """Map any LLM-returned eventType to one of the allowed canonical values."""
+                """Map any LLM-returned eventType to one of the allowed canonical
+                values OR to ``_PROCEDURAL_SENTINEL`` when the type belongs on
+                the procedural_timeline panel and the entry should be dropped."""
                 if not raw:
                     return "Other"
                 if raw in _ALLOWED_EVENT_TYPES:
                     return raw
+                # Procedural Title-Cased values that aren't in the allowed set.
+                if raw in {"Court Hearing", "Filing", "Deadline", "Meeting"}:
+                    return _PROCEDURAL_SENTINEL
                 return _EVENT_TYPE_ALIASES.get(raw.lower(), "Other")
 
             def _is_garbage_text_local(text: str) -> bool:
@@ -4144,6 +4233,28 @@ Example shape:
                     continue
 
                 raw_event_type = (item.get("eventType") or "").strip()
+                normalized_event_type = _normalize_event_type(raw_event_type)
+                # Drop entries that map to a procedural type — those belong
+                # exclusively on the procedural_timeline panel and must not
+                # appear on list_of_dates (this is the user-visible "factual
+                # narrative" panel).
+                if normalized_event_type == _PROCEDURAL_SENTINEL:
+                    logger.info(
+                        "List of dates: dropped procedural-type entry "
+                        "(eventType={!r}, title={!r}) — belongs in procedural_timeline",
+                        raw_event_type, raw_title,
+                    )
+                    continue
+                # Drop strictly-future entries — list_of_dates is a record of
+                # what HAS HAPPENED. Future dates (deadlines, scheduled
+                # hearings, upcoming events) belong on procedural_timeline.
+                if date_val > today_str:
+                    logger.info(
+                        "List of dates: dropped future-dated entry "
+                        "(date={}, today={}, title={!r}) — list_of_dates is past-only",
+                        date_val, today_str, raw_title,
+                    )
+                    continue
                 entry = {
                     "date": date_val,
                     "title": raw_title or "Event",
@@ -4152,7 +4263,7 @@ Example shape:
                     "sourceDocName": source_doc_name or None,
                     "pageNumber": page_number,
                     "isIncident": item.get("isIncident", True),
-                    "eventType": _normalize_event_type(raw_event_type),
+                    "eventType": normalized_event_type,
                     "relevance": (item.get("relevance") or "").strip() or None,
                 }
                 # For frontend compatibility: many UIs expect a generic 'source'/'sourceAnswer' field.
@@ -4244,6 +4355,30 @@ Example shape:
                 seen_keys.add(key)
                 deduped.append(entry)
             result = deduped
+
+            # Semantic same-date dedupe — runs UNCONDITIONALLY on the freshly
+            # generated list, even on first emit (no prev cache yet). Catches
+            # the LLM emitting two paraphrased entries on the same date that
+            # describe the same real-world event ("Arrival in India" vs
+            # "New Delhi Arrival" on 17-07-2023; "Visa Issued" vs "Visa
+            # Issuance" on 25-06-2025; etc.). Per-date scope means genuinely
+            # distinct events that share a date are preserved.
+            before_semantic = len(result)
+            try:
+                result = await self._dedupe_dated_entries_semantically(
+                    result, item_type="list of dates"
+                )
+                if len(result) < before_semantic:
+                    logger.info(
+                        "List of dates: per-date semantic dedupe collapsed "
+                        "{} entries → {}",
+                        before_semantic, len(result),
+                    )
+            except Exception as dedupe_err:
+                logger.warning(
+                    "List of dates: per-date semantic dedupe failed (non-fatal): {}",
+                    dedupe_err,
+                )
 
             logger.info(
                 "List of dates: generated {} entries for workspace {}",

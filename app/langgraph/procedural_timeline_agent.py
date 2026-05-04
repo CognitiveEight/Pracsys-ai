@@ -279,6 +279,19 @@ RULES
 
   1. Always convert dates to YYYY-MM-DD. For relative periods ("within N days"),
      compute anchor_date + N days.
+  1z. **Indian DD/MM/YYYY convention** — when the source contains a slash- or
+      dash-separated numeric date like ``01/05/2026``, ``01-05-2026``, or
+      ``01.05.2026``, the FIRST number is the DAY and the SECOND is the
+      MONTH (Indian convention). Do NOT interpret it as US MM/DD/YYYY.
+        • ``01/05/2026`` → DAY 1, MONTH 5 → ``2026-05-01`` (1 May 2026), NOT
+          ``2026-01-05`` (5 January 2026).
+        • ``13/04/2026`` → DAY 13, MONTH 4 → ``2026-04-13``.
+        • Whenever the first number is > 12 that already proves DD/MM/YYYY
+          (e.g. ``25/03/2026`` can only be 25 March). Apply the same rule
+          even when both numbers are ≤ 12 — DAY first, MONTH second.
+        • Only switch to MM/DD/YYYY if the source EXPLICITLY identifies the
+          format (e.g. a label like "Date (MM/DD/YYYY): 01/05/2026") or the
+          document is clearly from a US/foreign jurisdiction.
   1a. **YEAR RESOLUTION when the source mentions a date without an explicit year**
      (e.g. "2 February", "21 तारीख", "the 15th of March", "last Tuesday"):
        • Default to the year of today's date ({today_str}). These events are

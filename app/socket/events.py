@@ -10717,7 +10717,8 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         # 3–4) Strategy, analysis, list_of_dates, applicable_laws: background so chat events are not blocked
                         if batch_result.get("successful", 0) > 0:
                             logger.info(
-                                "🎯 Scheduling strategy + analysis + timeline/laws (background)…"
+                                "🎯 Scheduling strategy + analysis + list_of_dates + "
+                                "applicable_laws + procedural_timeline (background)…"
                             )
                             self._schedule_strategy_analysis_pipeline(
                                 workspace_id=str(payload.workspaceId),
@@ -10767,10 +10768,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                     self._workspace_list_of_dates_payload[
                                         payload.workspaceId
                                     ] = []
-                                    self._schedule_applicable_laws_only(
+                                    self._schedule_list_of_dates_and_applicable_laws(
                                         workspace_id=str(payload.workspaceId),
                                         user_id=str(payload.userId),
                                         workspace_role=workspace_role,
+                                        batch_result=None,
                                         log_context=" (created, 0 docs success)",
                                     )
                                 except Exception as e:
@@ -10835,10 +10837,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     )
                     self._workspace_list_of_dates_payload[payload.workspaceId] = []
                     logger.info("✅ List of dates (empty, no docs) sent to backend")
-                    self._schedule_applicable_laws_only(
+                    self._schedule_list_of_dates_and_applicable_laws(
                         workspace_id=str(payload.workspaceId),
                         user_id=str(payload.userId),
                         workspace_role=workspace_role,
+                        batch_result=None,
                         log_context=" (created, no docs)",
                     )
                 except Exception as e:
@@ -11163,6 +11166,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                             "analysis_report",
                             "list_of_dates",
                             "applicable_laws",
+                            "procedural_timeline",
                         ],
                     )
 
@@ -11368,6 +11372,40 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         "Processing {} new/updated evidence files",
                         len(files_to_process),
                     )
+                    # Fire workspace:refresh IMMEDIATELY — before document
+                    # processing, strategy generation, analysis report, etc.
+                    # — so the FE shows the loading state on every panel as
+                    # soon as the new doc is detected, instead of waiting for
+                    # the heavy pipeline to start ~10–20s later. Gated on
+                    # has_prior_panels so first-time uploads don't show a
+                    # spurious "refreshing" badge for panels that don't exist
+                    # yet.
+                    has_prior_panels = bool(
+                        self._workspace_strategy_payload.get(payload.workspaceId)
+                        or self._workspace_analysis_payload.get(payload.workspaceId)
+                        or self._workspace_list_of_dates_payload.get(payload.workspaceId)
+                        or self._workspace_applicable_laws_payload.get(payload.workspaceId)
+                        or self._workspace_procedural_timeline_payload.get(payload.workspaceId)
+                    )
+                    if has_prior_panels and self._socket_client:
+                        try:
+                            await self._emit_workspace_refresh(
+                                workspace_id=str(payload.workspaceId),
+                                user_id=str(payload.userId),
+                                reason="ai_update_started",
+                                feature_types=[
+                                    "strategy_objective",
+                                    "analysis_report",
+                                    "list_of_dates",
+                                    "applicable_laws",
+                                    "procedural_timeline",
+                                ],
+                            )
+                        except Exception as refresh_err:
+                            logger.warning(
+                                "Early workspace:refresh emit failed (non-fatal): {}",
+                                refresh_err,
+                            )
 
             # Skip re-processing if nothing was deleted and all current files are already in the vector store
             # (e.g. backend sent workspace_sync right after workspace_created with same files)
@@ -11538,26 +11576,14 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                     workspace_role,
                                 )
                                 logger.info(
-                                    "🎯 Scheduling strategy + analysis + timeline/laws on sync (background)…"
+                                    "🎯 Scheduling strategy + analysis + list_of_dates + "
+                                    "applicable_laws + procedural_timeline on sync (background)…"
                                 )
-                                has_prior_panels = bool(
-                                    self._workspace_strategy_payload.get(payload.workspaceId)
-                                    or self._workspace_analysis_payload.get(payload.workspaceId)
-                                    or self._workspace_list_of_dates_payload.get(payload.workspaceId)
-                                    or self._workspace_applicable_laws_payload.get(payload.workspaceId)
-                                )
-                                if has_prior_panels:
-                                    await self._emit_workspace_refresh(
-                                        workspace_id=str(payload.workspaceId),
-                                        user_id=str(payload.userId),
-                                        reason="ai_update_started",
-                                        feature_types=[
-                                            "strategy_objective",
-                                            "analysis_report",
-                                            "list_of_dates",
-                                            "applicable_laws",
-                                        ],
-                                    )
+                                # NOTE: workspace:refresh is now emitted earlier
+                                # in this handler — right after detecting new
+                                # files to process — so the FE loader fires
+                                # immediately instead of after document
+                                # processing completes here.
                                 self._schedule_strategy_analysis_pipeline(
                                     workspace_id=str(payload.workspaceId),
                                     user_id=str(payload.userId),
@@ -11605,10 +11631,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                         self._workspace_list_of_dates_payload[
                                             payload.workspaceId
                                         ] = []
-                                        self._schedule_applicable_laws_only(
+                                        self._schedule_list_of_dates_and_applicable_laws(
                                             workspace_id=str(payload.workspaceId),
                                             user_id=str(payload.userId),
                                             workspace_role=workspace_role,
+                                            batch_result=None,
                                             log_context=" (sync, 0 docs success)",
                                         )
                                     except Exception as e:
@@ -11732,6 +11759,37 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         logger.success(
                             "✅ Applicable laws re-emitted to backend (from cache)"
                         )
+                    # Procedural timeline ("Upcoming Dates"): re-emit from
+                    # cache if present, then schedule a refresh so the FE
+                    # reflects any newly-uploaded docs even when the
+                    # vector-store said "no new content". Without this the
+                    # user saw the four other panels refresh and "Upcoming
+                    # Dates" stayed stale or empty.
+                    procedural_timeline = (
+                        self._workspace_procedural_timeline_payload.get(workspace_id)
+                    )
+                    if procedural_timeline is not None:
+                        await self._socket_client.emit(
+                            "document_feature_response",
+                            {
+                                "featureType": "procedural_timeline",
+                                "workspaceId": workspace_id,
+                                "userId": user_id,
+                                "payload": {
+                                    "proceduralTimeline": procedural_timeline,
+                                },
+                            },
+                        )
+                        logger.success(
+                            "✅ Procedural timeline re-emitted to backend (from cache)"
+                        )
+                    self._schedule_list_of_dates_and_applicable_laws(
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        workspace_role=workspace_role,
+                        batch_result=None,
+                        log_context=" (skip_reprocess full-refresh)",
+                    )
                 else:
                     await self._emit_analysis_report(
                         workspace_id,
@@ -11810,10 +11868,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         },
                     )
                     self._workspace_list_of_dates_payload[workspace_id] = []
-                    self._schedule_applicable_laws_only(
+                    self._schedule_list_of_dates_and_applicable_laws(
                         workspace_id=workspace_id,
                         user_id=user_id,
                         workspace_role=workspace_role,
+                        batch_result=None,
                         log_context=" (sync, no documents)",
                     )
                     logger.success(

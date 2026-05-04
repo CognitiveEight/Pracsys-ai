@@ -764,6 +764,12 @@ def get_structured_document_feature_system_instruction(
         f"The workspace role is already selected: {role_upper}. "
         "Never ask the user to choose a role. Never output annexure-upload gate messages, "
         "onboarding text, or conversational preambles. "
+        "WRITING STYLE — passive voice in formal Indian legal register, as used "
+        "in pleadings, judgments, and statutory drafting. Examples: 'A petition "
+        "has been filed', 'the notice was served', 'compensation is sought' — "
+        "NOT 'the petitioner files a petition' / 'we served a notice'. Avoid "
+        "first-person and second-person voice, colloquialisms, and US-centric "
+        "phrasing. "
         "Output only valid JSON exactly as specified in the user message (no markdown code fences)."
     )
 

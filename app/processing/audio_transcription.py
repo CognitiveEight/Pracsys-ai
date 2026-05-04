@@ -1671,6 +1671,119 @@ def _build_role_label_map(
     return label_map
 
 
+# ── Hinglish transliteration ──────────────────────────────────────────────────
+# Devanagari Unicode block (Hindi, Marathi, etc. write here). Detecting any
+# code-point in this range tells us the segment carries native-script content
+# we should transliterate to Roman/Hinglish.
+_DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
+
+
+def _has_devanagari(text: str) -> bool:
+    return bool(text) and bool(_DEVANAGARI_RE.search(text))
+
+
+def _transliterate_segments_to_hinglish(
+    segments: list[SpeakerSegment],
+) -> list[SpeakerSegment]:
+    """Convert Devanagari Hindi text in each segment to Roman / Hinglish.
+
+    Chirp 3 transcribes Hindi audio in Devanagari script ("मैम, मैं बात कर
+    रहा हूं"). The product wants Hinglish output ("Maam, main baat kar raha
+    hoon") so a lawyer reading the transcript can scan the spoken content
+    without needing Devanagari literacy. Already-Roman / English / mixed
+    code-switched portions are preserved verbatim — only the Devanagari runs
+    are transliterated.
+
+    Implementation: one batched Gemini call over all segments at once.
+    Segments are submitted with stable indexes; the model returns the
+    transliterated text per index. Falls back to leaving segments as-is on
+    any parse / API failure (Devanagari is still readable, so no data loss).
+
+    Mutates the segments in place AND returns them for convenience.
+    """
+    if not segments:
+        return segments
+
+    # Skip the round-trip entirely when no segment carries Devanagari (audio
+    # was English-only, or the transcript was already in Roman script).
+    if not any(_has_devanagari(seg.text or "") for seg in segments):
+        return segments
+
+    if not _gemini_configured():
+        logger.warning(
+            "Audio: Hinglish transliteration skipped — Gemini not configured; "
+            "transcript will retain Devanagari script."
+        )
+        return segments
+
+    numbered = "\n".join(
+        f"{i+1}. {(seg.text or '').strip()}" for i, seg in enumerate(segments)
+    )
+    prompt = f"""Convert the following spoken-language utterances from Devanagari (Hindi) script to Roman / Hinglish script.
+
+RULES (apply strictly):
+1. Preserve MEANING and SPOKEN SOUND — write Hindi words the way they are pronounced, using Roman letters as a Hindi speaker would casually type on a phone (e.g. मैं → main, हूं → hoon, बात → baat, कर रहा → kar raha, ठीक है → theek hai, क्या → kya, नहीं → nahi, मेरी → meri, मतलब → matlab).
+2. Words that the speaker said in ENGLISH (already in the source as-is, like "WhatsApp", "yes", "ok", "company", "WhatsApp pe", "consultation", "yes sir", "policy") MUST stay in their original English spelling. Do NOT translate them.
+3. Code-switched / Hinglish phrases stay code-switched (e.g. "Within 24 hours" stays as "Within 24 hours"; "ये एंप्लॉयमेंट एग्रीमेंट को" → "yeh employment agreement ko").
+4. Numbers, currency (₹2000, ₹7000), and dates stay verbatim — do not translate or rewrite them.
+5. Do NOT translate Hindi to English. The output must be the same Hindi (or Hinglish) words, just typed in Roman letters.
+6. Preserve punctuation, line breaks, and the order of utterances exactly.
+
+Return ONLY this JSON:
+{{"transliterated":["<utterance 1 in Hinglish>","<utterance 2 in Hinglish>", ...]}}
+
+The output array MUST have exactly {len(segments)} entries, in the same order as the numbered list below. If an utterance is already fully in Roman script, return it unchanged.
+
+Utterances:
+{numbered}
+"""
+    data = _generate_gemini_json(prompt, max_output_tokens=_GEMINI_MAX_OUTPUT_TOKENS)
+    if not data:
+        logger.warning(
+            "Audio: Hinglish transliteration Gemini call returned no data; "
+            "transcript will retain Devanagari script."
+        )
+        return segments
+
+    arr = data.get("transliterated")
+    if not isinstance(arr, list):
+        logger.warning(
+            "Audio: Hinglish transliteration response missing 'transliterated' "
+            "list (got {}); transcript will retain Devanagari script.",
+            type(arr).__name__,
+        )
+        return segments
+
+    if len(arr) != len(segments):
+        logger.warning(
+            "Audio: Hinglish transliteration count mismatch (got {} vs {} "
+            "segments); applying as much as possible.",
+            len(arr), len(segments),
+        )
+
+    converted = 0
+    for i, seg in enumerate(segments):
+        if i >= len(arr):
+            break
+        new_text = arr[i]
+        if not isinstance(new_text, str):
+            continue
+        new_text = new_text.strip()
+        if not new_text:
+            continue
+        # Sanity guard: if the model returned the original Devanagari, skip
+        # so we don't pretend success when nothing changed.
+        if _has_devanagari(new_text) and new_text == (seg.text or "").strip():
+            continue
+        seg.text = new_text
+        converted += 1
+    logger.info(
+        "Audio: Hinglish transliteration applied to {}/{} segments",
+        converted, len(segments),
+    )
+    return segments
+
+
 def _format_transcript_with_speakers(segments: list[SpeakerSegment]) -> str:
     """Produce ``[MM:SS] <label>: text`` lines for the document_assessments transcript.
 
@@ -1852,6 +1965,16 @@ def _sync_transcribe(
                 transcript_result.speaker_source,
             )
 
+    # Devanagari → Hinglish: convert Hindi script to Roman so the transcript
+    # is readable for users not literate in Devanagari. English / code-switched
+    # portions are preserved verbatim. Runs in-place; on any failure the
+    # segments stay in their original script (lossless). Track whether the
+    # source had Devanagari so we know to rebuild raw_transcript afterwards.
+    original_had_devanagari = _has_devanagari(raw_transcript) or any(
+        _has_devanagari(s.text or "") for s in segments
+    )
+    segments = _transliterate_segments_to_hinglish(segments)
+
     formatted = _format_transcript_with_speakers(segments)
 
     seg_dicts: list[dict[str, Any]] = []
@@ -1862,6 +1985,19 @@ def _sync_transcribe(
         tag = int(seg.speaker_tag or 0)
         d["speaker_label"] = label_map.get(tag, f"Speaker {letter_map.get(tag, '?')}")
         seg_dicts.append(d)
+
+    # If the source had Devanagari, rebuild raw_transcript from the
+    # (now-transliterated) segments so downstream consumers — vector store
+    # ingestion, Gemini analysis on raw_transcript, summary/strength
+    # generation — see the same Hinglish script the FE renders. If
+    # transliteration partially failed, the leftover Devanagari segments are
+    # carried through verbatim (still readable, no data loss).
+    if original_had_devanagari:
+        rebuilt_raw = " ".join(
+            (s.text or "").strip() for s in segments if (s.text or "").strip()
+        ).strip()
+        if rebuilt_raw:
+            raw_transcript = rebuilt_raw
 
     return AudioTranscriptionResult(
         success=True,

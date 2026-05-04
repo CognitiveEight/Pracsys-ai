@@ -120,17 +120,17 @@ def _coerce_analysis_text_item(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
-        return value.strip()
+        return _strip_enum_prefix(value.strip())
     if isinstance(value, dict):
         for key in ("point", "text", "description", "value", "title"):
             candidate = value.get(key) if hasattr(value, "get") else None
             if isinstance(candidate, str) and candidate.strip():
-                return candidate.strip()
+                return _strip_enum_prefix(candidate.strip())
         # Fall back to the first non-empty string value (e.g. nested
         # custom keys) before giving up.
         for v in value.values():
             if isinstance(v, str) and v.strip():
-                return v.strip()
+                return _strip_enum_prefix(v.strip())
         return ""
     if isinstance(value, (list, tuple, set)):
         # Defensive: surface the first text-like element.
@@ -139,7 +139,35 @@ def _coerce_analysis_text_item(value: Any) -> str:
             if coerced:
                 return coerced
         return ""
-    return str(value).strip()
+    return _strip_enum_prefix(str(value).strip())
+
+
+# Enumeration / bullet prefixes that the LLM sometimes prepends to list items
+# in regenerations even though we asked for plain strings. Stripping them at
+# the coercion boundary guarantees that "1. Bank statement" (new) and
+# "Bank statement" (prev) are treated as the same item by every downstream
+# merge / dedup pass — without it, the prev-vs-new LLM merge sees two visibly
+# different strings and lets the duplicate through.
+_ENUM_PREFIX_RE = re.compile(
+    r"^\s*(?:"
+    r"\(\d+\)"                       # (1) (12)
+    r"|\d+[.):\-]"                   # 1.  1)  1:  1-
+    r"|[a-zA-Z][.):]"                # a.  a)  a:
+    r"|[ivxlcdmIVXLCDM]+[.)]"        # i.  ii)  iii.
+    r"|[•·\*—–]"                     # • · * — –
+    r"|-(?=\s)"                      # leading hyphen as a bullet, only when
+                                      # followed by whitespace (avoids
+                                      # eating the hyphen in "9-7000")
+    r")\s+"
+)
+
+
+def _strip_enum_prefix(text: str) -> str:
+    """Strip a single leading enumeration / bullet prefix from a list item."""
+    if not text:
+        return text
+    stripped = _ENUM_PREFIX_RE.sub("", text, count=1)
+    return stripped.strip() or text
 
 
 def _coerce_analysis_text_list(items: Any) -> List[str]:
@@ -7217,6 +7245,19 @@ Return ONLY this JSON, no commentary:
             report["missing_info"] = _coerce_analysis_text_list(
                 report.get("missing_info")
             )
+        # Strengths: List[Dict{point, laws}]. We don't flatten it (the laws
+        # list is meaningful) but we do strip stray "1. " / "2. " enumeration
+        # prefixes from the `point` so a regenerated "1. Hairline fracture
+        # documented" doesn't escape the prev-vs-new merge as different from
+        # a previously-emitted "Hairline fracture documented".
+        strengths = report.get("strengths")
+        if isinstance(strengths, list):
+            for s in strengths:
+                if not isinstance(s, dict):
+                    continue
+                point = s.get("point")
+                if isinstance(point, str) and point.strip():
+                    s["point"] = _strip_enum_prefix(point.strip())
         return report
 
     def _record_rejected_analysis_item(

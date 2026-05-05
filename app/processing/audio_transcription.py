@@ -289,6 +289,41 @@ def _generate_gemini_json(prompt: str, *, max_output_tokens: int = 2048) -> Opti
     return obj
 
 
+def _generate_gemini_plaintext_raw(
+    prompt: str, *, max_output_tokens: int = 4096
+) -> Optional[str]:
+    """Run a Gemini call WITHOUT response_mime_type='application/json' and
+    return the raw text response.
+
+    Used by the Hinglish backstop. Plain-text mode has two advantages over
+    JSON mode for guaranteed transliteration coverage:
+      1. No JSON wrapper to truncate. The response is just the converted
+         text — even if the stream cuts off mid-sentence, the part that
+         arrived is USABLE Hinglish (not invalid syntax we throw away).
+      2. Smaller response footprint per token — the model spends every
+         token on actual content, not on structural punctuation.
+
+    Returns None only when the API call itself errors or yields no text.
+    """
+    if not _gemini_configured():
+        return None
+    try:
+        model = _genai.GenerativeModel(_gemini_model_name())
+        config = _genai.types.GenerationConfig(
+            temperature=0.0, max_output_tokens=max_output_tokens
+        )
+        response = model.generate_content(
+            prompt,
+            generation_config=config,
+            safety_settings=_PERMISSIVE_SAFETY_SETTINGS,
+        )
+    except Exception as e:
+        logger.warning("Audio Gemini plain-text call failed: {}", e)
+        return None
+    text = (getattr(response, "text", "") or "").strip()
+    return text or None
+
+
 def _generate_gemini_text(prompt: str, *, max_output_tokens: int = 128) -> Optional[str]:
     if not _gemini_configured():
         return None
@@ -1710,6 +1745,14 @@ _HINGLISH_BATCH_SIZE = 10
 # one-utterance calls only as a last resort for stragglers.
 _HINGLISH_RETRY_BATCH_SIZES = (5, 1)
 
+# Number of plain-text Gemini retries to attempt for any segment that
+# survives the JSON-mode multi-pass pipeline. Each retry is a single
+# one-segment call with no JSON wrapper, so even truncated responses
+# return USABLE Hinglish (we just take whatever streamed in). 4 attempts
+# with brief sleeps between covers transient infrastructure failures
+# without becoming pathological.
+_HINGLISH_PLAINTEXT_RETRY_ATTEMPTS = 4
+
 
 def _try_repair_truncated_json_array(text: str, key: Optional[str] = None) -> Optional[list]:
     """Salvage a partial JSON response that streamed in either shape:
@@ -1800,6 +1843,76 @@ def _try_repair_truncated_json_array(text: str, key: Optional[str] = None) -> Op
     return items
 
 
+# Max characters per utterance sent to Gemini in a single transliteration
+# request. A single speaker turn can be a multi-paragraph monologue (40+s of
+# uninterrupted speech); when the Hindi response for that turn alone exceeds
+# the server's effective output cap, even a batch-of-1 call fails. We split
+# such utterances on sentence boundaries before the Gemini call and re-join
+# the Hinglish parts after — each sub-call's response is small and reliable.
+_HINGLISH_MAX_CHARS_PER_UTTERANCE = 600
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[।!?\.])\s+")
+_COMMA_SPLIT_RE = re.compile(r"(?<=[,;])\s+")
+
+
+def _greedy_pack(parts: list[str], max_chars: int) -> list[str]:
+    """Pack already-split tokens into chunks of at most ``max_chars`` chars."""
+    chunks: list[str] = []
+    cur = ""
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if not cur:
+            cur = p
+        elif len(cur) + 1 + len(p) <= max_chars:
+            cur = f"{cur} {p}"
+        else:
+            chunks.append(cur)
+            cur = p
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _split_long_utterance_for_translit(text: str, max_chars: int = _HINGLISH_MAX_CHARS_PER_UTTERANCE) -> list[str]:
+    """Split a long utterance into sub-utterance chunks for transliteration.
+
+    Tries split granularities in order — sentence terminators (। ! ? .) →
+    comma/semicolon → whitespace word boundaries — and stops at the first
+    one that actually produces multiple chunks under ``max_chars``. Spoken
+    Hindi often arrives as one long run-on without sentence terminators,
+    so the comma + whitespace fallbacks are essential. If even
+    word-boundary splitting can't fit (single huge token), returns the
+    whole text untouched — better to send it whole than to slice mid-word.
+    """
+    s = (text or "").strip()
+    if not s or len(s) <= max_chars:
+        return [s] if s else []
+
+    # Try each granularity in turn.
+    for splitter in (
+        lambda t: [p for p in _SENTENCE_SPLIT_RE.split(t) if p.strip()],
+        lambda t: [p for p in _COMMA_SPLIT_RE.split(t) if p.strip()],
+        lambda t: t.split(),  # word-level fallback
+    ):
+        parts = splitter(s)
+        if len(parts) <= 1:
+            continue
+        # Bail out if any single token already exceeds max_chars — this
+        # splitter can't help us. Fall through to the next granularity.
+        if any(len(p) > max_chars for p in parts):
+            # Word-level fallback can't have tokens longer than max_chars
+            # except for single-word giants — accept those.
+            if splitter.__name__ == "<lambda>" and parts == s.split():
+                pass
+            else:
+                continue
+        chunks = _greedy_pack(parts, max_chars)
+        if len(chunks) > 1:
+            return chunks
+    return [s]
+
+
 def _transliterate_one_batch_to_hinglish(
     batch_texts: list[str],
     *,
@@ -1810,12 +1923,35 @@ def _transliterate_one_batch_to_hinglish(
     (may contain ``None`` for items where the model didn't emit a useful
     string). Returns ``None`` on total failure (no data from Gemini AND no
     salvage from JSON repair).
+
+    Long single utterances (multi-paragraph monologues) are split on sentence
+    boundaries before the Gemini call and re-joined after, so a single very
+    long turn never has to fit into one streaming response.
     """
     if not batch_texts:
         return []
 
+    # Expand any over-long utterance into smaller sentence chunks. Keep a
+    # mapping from original index → range of expanded indices so we can
+    # rejoin the Hinglish parts after the call returns.
+    expanded_texts: list[str] = []
+    expansion_map: list[tuple[int, int]] = []  # (start_in_expanded, count)
+    for t in batch_texts:
+        parts = _split_long_utterance_for_translit(t or "")
+        if not parts:
+            parts = [(t or "").strip()]
+        expansion_map.append((len(expanded_texts), len(parts)))
+        expanded_texts.extend(parts)
+    expanded_was_split = len(expanded_texts) != len(batch_texts)
+    if expanded_was_split:
+        logger.info(
+            "Audio: Hinglish batch{} — expanded {} utterance(s) into {} "
+            "sentence-chunks (long-turn split)",
+            batch_label, len(batch_texts), len(expanded_texts),
+        )
+
     numbered = "\n".join(
-        f"{i+1}. {(t or '').strip()}" for i, t in enumerate(batch_texts)
+        f"{i+1}. {(t or '').strip()}" for i, t in enumerate(expanded_texts)
     )
     prompt = f"""Convert the following spoken-language utterances from Devanagari (Hindi) script to Roman / Hinglish script.
 
@@ -1830,7 +1966,7 @@ RULES (apply strictly):
 Return ONLY this JSON:
 {{"transliterated":["<utterance 1 in Hinglish>","<utterance 2 in Hinglish>", ...]}}
 
-The output array MUST have exactly {len(batch_texts)} entries, in the same order as the numbered list below. If an utterance is already fully in Roman script, return it unchanged.
+The output array MUST have exactly {len(expanded_texts)} entries, in the same order as the numbered list below. If an utterance is already fully in Roman script, return it unchanged.
 
 Utterances:
 {numbered}
@@ -1859,7 +1995,7 @@ Utterances:
                 logger.warning(
                     "Audio: Hinglish batch{} — primary response truncated; "
                     "JSON repair recovered {}/{} utterances",
-                    batch_label, len(salvaged), len(batch_texts),
+                    batch_label, len(salvaged), len(expanded_texts),
                 )
                 arr = salvaged
 
@@ -1877,7 +2013,7 @@ Utterances:
             "Keep English words verbatim. Numbers and ₹ amounts unchanged. "
             "Reply ONLY with a JSON array of strings, no object wrapper, no "
             "commentary. Array length must be exactly "
-            f"{len(batch_texts)}.\n\nUtterances:\n{numbered}"
+            f"{len(expanded_texts)}.\n\nUtterances:\n{numbered}"
         )
         retry_raw = _generate_gemini_json_raw(terse_prompt, max_output_tokens=8000)
         if retry_raw:
@@ -1897,20 +2033,155 @@ Utterances:
                     logger.warning(
                         "Audio: Hinglish batch{} — terse retry truncated; "
                         "JSON repair recovered {}/{} utterances",
-                        batch_label, len(salvaged), len(batch_texts),
+                        batch_label, len(salvaged), len(expanded_texts),
                     )
                     arr = salvaged
 
     if arr is None:
         return None
 
-    # Pad / truncate to expected length.
-    out: list[Optional[str]] = [None] * len(batch_texts)
-    for i in range(min(len(arr), len(batch_texts))):
+    # Build the per-expanded-utterance result list, then collapse it back to
+    # one entry per original utterance by joining the consecutive parts of
+    # any utterance we split earlier.
+    expanded_out: list[Optional[str]] = [None] * len(expanded_texts)
+    for i in range(min(len(arr), len(expanded_texts))):
         v = arr[i]
         if isinstance(v, str) and v.strip():
-            out[i] = v.strip()
+            expanded_out[i] = v.strip()
+
+    out: list[Optional[str]] = [None] * len(batch_texts)
+    for orig_idx, (start, count) in enumerate(expansion_map):
+        parts = expanded_out[start:start + count]
+        # Some sub-chunks may have failed (Gemini returned None for them).
+        # Don't reject the whole segment — the segment-level backstop pass
+        # (`_run_hinglish_plaintext_backstop_on_segments`) runs after every
+        # JSON-mode pass and will fix any segment that still has Devanagari.
+        # For now: emit a string when at least one sub-chunk came back; emit
+        # None only when every sub-chunk failed (segment stays Devanagari and
+        # the backstop catches it).
+        if not parts or all(p is None for p in parts):
+            out[orig_idx] = None
+            continue
+        joined_parts: list[str] = []
+        original_parts = expanded_texts[start:start + count]
+        for sub_i, p in enumerate(parts):
+            if isinstance(p, str) and p.strip():
+                joined_parts.append(p.strip())
+            else:
+                # Sub-chunk Gemini failed on → keep the original Devanagari
+                # for that part; the plain-text backstop later will catch
+                # any segment text that still contains Devanagari.
+                joined_parts.append(original_parts[sub_i])
+        out[orig_idx] = " ".join(joined_parts)
     return out
+
+
+def _gemini_plaintext_transliterate_one(
+    devanagari_text: str, *, attempts: int = _HINGLISH_PLAINTEXT_RETRY_ATTEMPTS,
+) -> Optional[str]:
+    """Final-backstop Gemini call for ONE Devanagari utterance, in plain-text
+    mode (no JSON wrapper). Retries up to ``attempts`` times.
+
+    Used only for segments that survived the JSON-mode multi-pass pipeline —
+    these are typically long monologues whose JSON response truncated mid-
+    array. By dropping the JSON envelope we eliminate the failure mode where
+    the entire batch gets discarded over a missing closing ``]``.
+
+    Returns the transliterated string the first time the response comes back
+    fully Roman (no Devanagari) and non-trivially different from the input.
+    Returns the longest partial Hinglish result we got from any attempt as a
+    last resort. Returns None only when EVERY attempt failed to return text
+    AND the input is still entirely Devanagari (nothing usable).
+    """
+    src = (devanagari_text or "").strip()
+    if not src or not _has_devanagari(src):
+        return src or None
+
+    prompt = (
+        "Transliterate the following Devanagari (Hindi) utterance into Roman "
+        "/ Hinglish script. Write Hindi words the way a native speaker would "
+        "casually type them on a phone (e.g. मैं → main, हूं → hoon, बात → "
+        "baat, ठीक है → theek hai, क्या → kya, नहीं → nahi). Keep English "
+        "words, numbers, and currency amounts unchanged. Reply with ONLY the "
+        "transliterated text — no quotes, no JSON, no commentary, no labels. "
+        "Preserve punctuation order.\n\n"
+        f"Devanagari utterance:\n{src}\n\n"
+        "Hinglish:"
+    )
+
+    best_partial: Optional[str] = None
+    for attempt in range(1, attempts + 1):
+        raw = _generate_gemini_plaintext_raw(prompt, max_output_tokens=4096)
+        if not raw:
+            continue
+        candidate = raw.strip()
+        # Strip any model-emitted preamble like "Hinglish:" or surrounding quotes.
+        candidate = re.sub(r'^(Hinglish|Roman|Output)\s*:\s*', '', candidate, flags=re.I)
+        candidate = candidate.strip().strip('"').strip("'").strip()
+        if not candidate:
+            continue
+        if not _has_devanagari(candidate):
+            # Clean Hinglish — accept on first success.
+            return candidate
+        # Partial conversion (some Devanagari remains) — keep the longest
+        # partial as a fallback if every attempt fails to fully convert.
+        if best_partial is None or len(candidate) > len(best_partial):
+            best_partial = candidate
+
+    if best_partial is not None:
+        logger.warning(
+            "Audio: Hinglish plain-text retry returned partial conversion after "
+            "{} attempts ({} chars in, {} chars out)",
+            attempts, len(src), len(best_partial),
+        )
+        return best_partial
+    return None
+
+
+def _run_hinglish_plaintext_backstop_on_segments(
+    segments: list[SpeakerSegment],
+) -> int:
+    """Walk every segment that still carries Devanagari and replace its
+    text with the plain-text Gemini retry's output. Returns count of
+    segments converted. Mutates segments in place.
+    """
+    converted = 0
+    for seg in segments:
+        text = seg.text or ""
+        if not _has_devanagari(text):
+            continue
+        new_text = _gemini_plaintext_transliterate_one(text)
+        if new_text and new_text.strip() and not _has_devanagari(new_text):
+            seg.text = new_text.strip()
+            converted += 1
+        elif new_text and new_text.strip() and len(new_text) >= len(text) * 0.5:
+            # Partial conversion — better than leaving the whole thing in
+            # Devanagari script for the FE, accept the partial Hinglish.
+            seg.text = new_text.strip()
+            converted += 1
+    return converted
+
+
+def _run_hinglish_plaintext_backstop_on_lines(
+    texts: list[str], pending_idx: list[int],
+) -> int:
+    """Heal-path counterpart of ``_run_hinglish_plaintext_backstop_on_segments``.
+    Operates on a parallel list of strings indexed by ``pending_idx``.
+    Mutates ``texts`` in place. Returns count of lines converted.
+    """
+    converted = 0
+    for i in pending_idx:
+        text = texts[i]
+        if not _has_devanagari(text):
+            continue
+        new_text = _gemini_plaintext_transliterate_one(text)
+        if new_text and new_text.strip() and not _has_devanagari(new_text):
+            texts[i] = new_text.strip()
+            converted += 1
+        elif new_text and new_text.strip() and len(new_text) >= len(text) * 0.5:
+            texts[i] = new_text.strip()
+            converted += 1
+    return converted
 
 
 def _run_hinglish_pass_on_indices(
@@ -2042,10 +2313,30 @@ def _transliterate_segments_to_hinglish(
             batch_size=retry_size, pass_label=f"P{pass_idx}",
         )
 
+    # Final guaranteed-clean backstop: any segment still carrying Devanagari
+    # after every JSON-mode retry exhausted gets one more pass through Gemini
+    # in PLAIN-TEXT mode (no JSON wrapper). Plain-text responses are immune
+    # to the JSON-truncation failure mode that bit the JSON-mode passes —
+    # whatever streamed in is usable Hinglish, not invalid syntax we discard.
+    backstop_pending = sum(1 for s in segments if _has_devanagari(s.text or ""))
+    if backstop_pending:
+        logger.info(
+            "Audio: Hinglish plain-text backstop running for {} residual segment(s) "
+            "that survived all JSON-mode retry passes",
+            backstop_pending,
+        )
+        backstop_converted = _run_hinglish_plaintext_backstop_on_segments(segments)
+        if backstop_converted:
+            logger.info(
+                "Audio: Hinglish plain-text backstop converted {}/{} residual segment(s)",
+                backstop_converted, backstop_pending,
+            )
+            converted += backstop_converted
+
     residual = sum(1 for s in segments if _has_devanagari(s.text or ""))
     logger.info(
         "Audio: Hinglish transliteration applied to {}/{} segments "
-        "({} still Devanagari after all retry passes)",
+        "({} still Devanagari after all passes including plain-text backstop)",
         converted, total, residual,
     )
     return segments
@@ -2171,6 +2462,25 @@ def transliterate_formatted_transcript_to_hinglish(formatted: str) -> str:
             residual_idx, batch_size=retry_size, label=f"P{pass_idx}"
         )
 
+    # Final guaranteed-clean backstop: any line still in Devanagari after
+    # the JSON-mode passes gets one more pass through Gemini in plain-text
+    # mode (no JSON envelope). Same rationale as the live-transcribe path.
+    backstop_idx = [i for i in needs_translit_idx if _has_devanagari(texts[i])]
+    if backstop_idx:
+        logger.info(
+            "Audio: cached heal plain-text backstop running for {} residual line(s)",
+            len(backstop_idx),
+        )
+        backstop_converted = _run_hinglish_plaintext_backstop_on_lines(
+            texts, backstop_idx
+        )
+        if backstop_converted:
+            logger.info(
+                "Audio: cached heal plain-text backstop converted {}/{} residual line(s)",
+                backstop_converted, len(backstop_idx),
+            )
+            healed_count += backstop_converted
+
     if healed_count == 0:
         return formatted
 
@@ -2178,7 +2488,7 @@ def transliterate_formatted_transcript_to_hinglish(formatted: str) -> str:
     residual = sum(1 for i in needs_translit_idx if _has_devanagari(texts[i]))
     logger.info(
         "Audio: cached transcript healed — {}/{} lines converted "
-        "({} still Devanagari) ({} chars → {} chars)",
+        "({} still Devanagari after plain-text backstop) ({} chars → {} chars)",
         healed_count, total_to_translit, residual, len(formatted), len(rebuilt),
     )
     return rebuilt

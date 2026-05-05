@@ -342,6 +342,17 @@ Return ONLY a JSON array. Each entry must have exactly these fields:
                     "Other"         — pre-litigation milestones, legal-notice issuance,
                                        service registrations, formal grievances, anything
                                        that does not clearly fit the other four buckets
+  "pageNumber"  : OPTIONAL integer — when the document contains page markers
+                   ("--- Page N ---" or "-- N of M --"), set this to the page
+                   on which the supporting text for this entry appears. Omit
+                   if the document has no page markers (e.g. an audio
+                   transcript or a single-page note).
+  "isIncident"  : OPTIONAL boolean — true ONLY when this entry describes a
+                   factual past wrongdoing/incident (rare on a procedural
+                   timeline; usually false). Default false when omitted.
+  "relevance"   : OPTIONAL one of "High" | "Medium" | "Low" — High for
+                   imminent deadlines, hearings and notice issuance; Medium
+                   for general milestones; Low for ancillary steps.
 
 If no qualifying entries exist in this document, return [].
 Output ONLY the JSON array — no markdown fences, no commentary."""
@@ -468,12 +479,18 @@ class ProceduralTimelineAgent:
                 entries = []
             break
 
-        # Tag entries with source metadata for debugging
+        # Tag entries with source metadata so the consolidation + validation
+        # passes can carry sourceDocId / sourceDocName / pageNumber through to
+        # the final emit payload (the FE renders "Source: <name>, page N").
         tagged: List[Dict[str, Any]] = []
+        # `excerpt` is the (possibly-truncated) text the LLM actually saw — use
+        # it for page-marker resolution rather than the full document content.
+        source_excerpt = excerpt
         for entry in entries:
             if isinstance(entry, dict):
                 entry["_source_doc_id"] = doc.get("document_id", "")
                 entry["_source_doc_name"] = doc_name
+                entry["_source_doc_text"] = source_excerpt
                 tagged.append(entry)
         return tagged
 
@@ -665,11 +682,80 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
             )
             return {"consolidated_entries": raw_entries}
 
+        # Re-attach source-doc metadata. The consolidation prompt only emits
+        # title/date/description/type, so we have to look up which raw entry
+        # each consolidated entry came from to recover sourceDocId / Name /
+        # excerpt / pageNumber. Best-match by (date proximity, title overlap).
+        consolidated = self._reattach_source_metadata(consolidated, raw_entries)
+
         logger.info(
             "Procedural timeline consolidate: {} raw → {} consolidated",
             len(raw_entries), len(consolidated),
         )
         return {"consolidated_entries": consolidated}
+
+    @staticmethod
+    def _reattach_source_metadata(
+        consolidated: List[Dict[str, Any]],
+        raw_entries: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """For each consolidated entry, find the raw entry it most likely came
+        from and copy the underscore-prefixed source fields onto it.
+
+        Match score = (token-overlap of title) * 10 - (abs date difference in days).
+        Same-date and high-overlap raw entries win. Ties → first match.
+        """
+        from datetime import datetime as _dt
+
+        def _parse_date(s: str) -> Optional[_dt]:
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%B %d, %Y", "%d %B %Y"):
+                try:
+                    return _dt.strptime(s, fmt)
+                except ValueError:
+                    continue
+            return None
+
+        def _tok(s: str) -> set[str]:
+            return {w for w in re.findall(r"[A-Za-z]+", (s or "").lower()) if len(w) > 2}
+
+        def _score(c: Dict[str, Any], r: Dict[str, Any]) -> float:
+            ct = _tok(c.get("title", ""))
+            rt = _tok(r.get("title", ""))
+            overlap = len(ct & rt)
+            cd = _parse_date(str(c.get("date") or "").strip())
+            rd = _parse_date(str(r.get("date") or "").strip())
+            if cd is None or rd is None:
+                date_penalty = 999
+            else:
+                date_penalty = abs((cd - rd).days)
+            # Description token overlap as a tiebreaker.
+            desc_overlap = len(_tok(c.get("description", "")) & _tok(r.get("description", "")))
+            return overlap * 10 + desc_overlap - date_penalty * 0.5
+
+        out: List[Dict[str, Any]] = []
+        for c in consolidated:
+            if not isinstance(c, dict):
+                continue
+            best: Optional[Dict[str, Any]] = None
+            best_score = float("-inf")
+            for r in raw_entries:
+                if not isinstance(r, dict):
+                    continue
+                sc = _score(c, r)
+                if sc > best_score:
+                    best_score = sc
+                    best = r
+            enriched = dict(c)
+            if best:
+                # Copy underscore-prefixed metadata; preserve any explicit
+                # pageNumber the consolidation step already produced.
+                for k in ("_source_doc_id", "_source_doc_name", "_source_doc_text"):
+                    if k in best and k not in enriched:
+                        enriched[k] = best[k]
+                if "pageNumber" not in enriched and "pageNumber" in best:
+                    enriched["pageNumber"] = best["pageNumber"]
+            out.append(enriched)
+        return out
 
     async def _node_validate_and_merge(
         self, state: ProceduralTimelineState
@@ -901,21 +987,111 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
                 continue
             seen_keys.add(key)
 
+            # Resolve source-doc fields & page number from the underscore-
+            # prefixed metadata that survived the consolidation re-attach.
+            source_doc_id = str(item.get("_source_doc_id") or "").strip()
+            source_doc_name = str(item.get("_source_doc_name") or "").strip()
+            page_number = self._resolve_page_number(item, entry_source_text)
+
+            # Optional FE-display fields with sensible defaults.
+            is_incident = bool(item.get("isIncident", False))
+            relevance_in = str(item.get("relevance") or "").strip()
+            if relevance_in not in ("High", "Medium", "Low"):
+                # Heuristic default: hearings/deadlines → High, everything else → Medium.
+                relevance_in = (
+                    "High" if raw_type in ("Court Hearing", "Deadline") else "Medium"
+                )
+
+            entry: Dict[str, Any] = {
+                "title": title,
+                "date": date_val,
+                "description": description,
+                "eventType": raw_type,
+                "isIncident": is_incident,
+                "relevance": relevance_in,
+            }
+            if source_doc_id:
+                entry["sourceDocId"] = source_doc_id
+            if source_doc_name:
+                entry["sourceDocName"] = source_doc_name
+                # FE compat aliases used elsewhere in the product.
+                entry["source"] = source_doc_name
+                entry["sourceAnswer"] = source_doc_name
+            if page_number and page_number > 0:
+                entry["pageNumber"] = page_number
+
             logger.info(
-                "Procedural timeline: ✅ keeping title='{}' date={} type={}",
-                title, date_val, raw_type,
+                "Procedural timeline: ✅ keeping title='{}' date={} eventType={} "
+                "source='{}' page={}",
+                title, date_val, raw_type, source_doc_name or "—",
+                page_number if page_number else "—",
             )
-            result.append(
-                {
-                    "title": title,
-                    "date": date_val,
-                    "description": description,
-                    "type": raw_type,
-                }
-            )
+            result.append(entry)
 
         result.sort(key=lambda x: str(x.get("date") or ""))
         return {"timeline": result}
+
+    @staticmethod
+    def _resolve_page_number(item: Dict[str, Any], document_text: str) -> int:
+        """Resolve a page number for a procedural-timeline entry.
+
+        Order of preference:
+          1. Explicit ``pageNumber`` on the entry (set by the LLM or copied
+             from the matching raw entry).
+          2. ``--- Page N ---`` / ``-- N of M --`` markers in ``document_text``,
+             choosing the marker that precedes the entry's evidence anchors
+             (title/description/date) closest in the text.
+          3. ``0`` when no page information is recoverable (the caller will
+             omit the field from the emit payload — audio transcripts and
+             single-page notes legitimately have no page number).
+        """
+        raw_page = item.get("pageNumber")
+        if isinstance(raw_page, int) and raw_page > 0:
+            return raw_page
+        if isinstance(raw_page, str):
+            p = raw_page.strip()
+            if p.isdigit() and int(p) > 0:
+                return int(p)
+
+        text = document_text or ""
+        markers: List[tuple[int, int]] = []
+        for m in re.finditer(r"---\s*Page\s+(\d+)\s*---", text, flags=re.I):
+            try:
+                markers.append((m.start(), int(m.group(1))))
+            except (TypeError, ValueError):
+                continue
+        for m in re.finditer(r"--\s*(\d+)\s+of\s+\d+\s*--", text, flags=re.I):
+            try:
+                markers.append((m.start(), int(m.group(1))))
+            except (TypeError, ValueError):
+                continue
+        if not markers:
+            return 0
+        markers.sort(key=lambda x: x[0])
+
+        anchors = [
+            str(item.get("title") or "").strip(),
+            str(item.get("description") or "").strip(),
+            str(item.get("date") or "").strip(),
+        ]
+        haystack = text.lower()
+        pos = -1
+        for anchor in anchors:
+            if len(anchor) < 4:
+                continue
+            pos = haystack.find(anchor.lower())
+            if pos >= 0:
+                break
+        if pos < 0:
+            return markers[0][1] if markers and markers[0][1] > 0 else 0
+
+        page = 0
+        for marker_pos, marker_page in markers:
+            if marker_pos <= pos and marker_page > 0:
+                page = marker_page
+            else:
+                break
+        return page
 
     # ------------------------------------------------------------------ public
 

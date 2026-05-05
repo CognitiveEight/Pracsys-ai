@@ -1699,7 +1699,16 @@ def _has_devanagari(text: str) -> bool:
 
 # Number of utterances per Gemini call. Small enough that the JSON response
 # fits comfortably even when server-side streaming truncates aggressively.
-_HINGLISH_BATCH_SIZE = 25
+# Empirically, batches of 25 still hit truncation on a server with strict
+# streaming caps when the late utterances run long; 10 keeps each response
+# well below the cliff. Stragglers that survive Pass 1 are caught by smaller
+# retry passes inside `_transliterate_segments_to_hinglish`.
+_HINGLISH_BATCH_SIZE = 10
+# Retry-pass batch sizes applied to whatever segments STILL carry Devanagari
+# after the previous pass. Each pass shrinks the per-call response further so
+# the truncation boundary becomes irrelevant. The final 1 means we'll send
+# one-utterance calls only as a last resort for stragglers.
+_HINGLISH_RETRY_BATCH_SIZES = (5, 1)
 
 
 def _try_repair_truncated_json_array(text: str, key: Optional[str] = None) -> Optional[list]:
@@ -1904,6 +1913,63 @@ Utterances:
     return out
 
 
+def _run_hinglish_pass_on_indices(
+    segments: list[SpeakerSegment],
+    indices: list[int],
+    *,
+    batch_size: int,
+    pass_label: str,
+) -> int:
+    """Run one transliteration pass over a list of segment indices.
+
+    Splits the indices into chunks of ``batch_size``, calls Gemini per chunk,
+    and applies any returned Hinglish strings IN PLACE on the segments. Returns
+    the number of segments actually converted in this pass.
+
+    The retry-pass-on-stragglers loop in ``_transliterate_segments_to_hinglish``
+    calls this helper repeatedly with shrinking ``batch_size`` to chase down
+    utterances that an earlier pass lost to server-side stream truncation.
+    """
+    if not indices:
+        return 0
+    chunks: list[list[int]] = [
+        indices[i:i + batch_size] for i in range(0, len(indices), batch_size)
+    ]
+    pass_converted = 0
+    for ci, chunk in enumerate(chunks, 1):
+        chunk_segs = [segments[i] for i in chunk]
+        chunk_texts = [(s.text or "").strip() for s in chunk_segs]
+        batch_label = f" {pass_label} {ci}/{len(chunks)} (size {len(chunk)})"
+        result = _transliterate_one_batch_to_hinglish(
+            chunk_texts, batch_label=batch_label
+        )
+        if result is None:
+            logger.warning(
+                "Audio: Hinglish batch{} failed; {} segments stay Devanagari",
+                batch_label, len(chunk_segs),
+            )
+            continue
+
+        chunk_converted = 0
+        for i, seg in enumerate(chunk_segs):
+            if i >= len(result):
+                break
+            new_text = result[i]
+            if not isinstance(new_text, str) or not new_text.strip():
+                continue
+            new_text = new_text.strip()
+            if _has_devanagari(new_text) and new_text == (seg.text or "").strip():
+                continue
+            seg.text = new_text
+            chunk_converted += 1
+        pass_converted += chunk_converted
+        logger.info(
+            "Audio: Hinglish batch{} — {}/{} segments converted",
+            batch_label, chunk_converted, len(chunk_segs),
+        )
+    return pass_converted
+
+
 def _transliterate_segments_to_hinglish(
     segments: list[SpeakerSegment],
 ) -> list[SpeakerSegment]:
@@ -1916,14 +1982,20 @@ def _transliterate_segments_to_hinglish(
     code-switched portions are preserved verbatim — only the Devanagari runs
     are transliterated.
 
-    Implementation: split the segments into batches of `_HINGLISH_BATCH_SIZE`
-    (default 25) and run a Gemini call per batch. Each call's JSON response
-    is small enough to avoid stream-truncation on environments with shorter
-    output budgets (this was the server-side failure mode that left
-    transcripts in Devanagari). A failed batch leaves THAT batch's segments
-    in Devanagari and the other batches still get Hinglish.
+    Implementation: a multi-pass pipeline that progressively shrinks the
+    per-call batch size to defeat server-side stream truncation:
 
-    Mutates the segments in place AND returns them for convenience.
+      1. **Pass 1** — batches of ``_HINGLISH_BATCH_SIZE`` (10) over every
+         segment that contains Devanagari.
+      2. **Pass 2** — if any segments STILL carry Devanagari (e.g. because
+         a Pass 1 batch's response truncated mid-array), retry just those
+         segments with a smaller batch size.
+      3. **Pass 3** — last-ditch one-utterance-per-call retries for the
+         residual stragglers.
+
+    The smaller each call's response is, the less surface area there is for
+    truncation, so each pass strictly outperforms the previous one on
+    coverage. Mutates segments in place AND returns them.
     """
     if not segments:
         return segments
@@ -1941,50 +2013,40 @@ def _transliterate_segments_to_hinglish(
         return segments
 
     total = len(segments)
-    batches: list[tuple[int, int]] = [
-        (start, min(start + _HINGLISH_BATCH_SIZE, total))
-        for start in range(0, total, _HINGLISH_BATCH_SIZE)
-    ]
+    pending = [i for i, s in enumerate(segments) if _has_devanagari(s.text or "")]
     logger.info(
-        "Audio: Hinglish transliteration starting — {} segments split into "
-        "{} batch(es) of up to {}",
-        total, len(batches), _HINGLISH_BATCH_SIZE,
+        "Audio: Hinglish transliteration starting — {} of {} segments need "
+        "conversion (initial batch size {})",
+        len(pending), total, _HINGLISH_BATCH_SIZE,
     )
 
-    converted_total = 0
-    for batch_idx, (start, end) in enumerate(batches, 1):
-        batch_segs = segments[start:end]
-        batch_texts = [(s.text or "").strip() for s in batch_segs]
-        batch_label = f" {batch_idx}/{len(batches)}"
-        result = _transliterate_one_batch_to_hinglish(batch_texts, batch_label=batch_label)
-        if result is None:
-            logger.warning(
-                "Audio: Hinglish batch{} failed; {} segments stay Devanagari",
-                batch_label, len(batch_segs),
-            )
-            continue
+    # Pass 1 — primary batch size.
+    converted = _run_hinglish_pass_on_indices(
+        segments, pending,
+        batch_size=_HINGLISH_BATCH_SIZE, pass_label="P1",
+    )
 
-        batch_converted = 0
-        for i, seg in enumerate(batch_segs):
-            if i >= len(result):
-                break
-            new_text = result[i]
-            if not isinstance(new_text, str) or not new_text.strip():
-                continue
-            new_text = new_text.strip()
-            if _has_devanagari(new_text) and new_text == (seg.text or "").strip():
-                continue
-            seg.text = new_text
-            batch_converted += 1
-        converted_total += batch_converted
+    # Retry passes — chase down whatever the primary pass left in Devanagari.
+    for pass_idx, retry_size in enumerate(_HINGLISH_RETRY_BATCH_SIZES, 2):
+        pending = [
+            i for i, s in enumerate(segments) if _has_devanagari(s.text or "")
+        ]
+        if not pending:
+            break
         logger.info(
-            "Audio: Hinglish batch{} — {}/{} segments converted",
-            batch_label, batch_converted, len(batch_segs),
+            "Audio: Hinglish retry pass P{} — {} stragglers, batch size {}",
+            pass_idx, len(pending), retry_size,
+        )
+        converted += _run_hinglish_pass_on_indices(
+            segments, pending,
+            batch_size=retry_size, pass_label=f"P{pass_idx}",
         )
 
+    residual = sum(1 for s in segments if _has_devanagari(s.text or ""))
     logger.info(
-        "Audio: Hinglish transliteration applied to {}/{} segments",
-        converted_total, total,
+        "Audio: Hinglish transliteration applied to {}/{} segments "
+        "({} still Devanagari after all retry passes)",
+        converted, total, residual,
     )
     return segments
 
@@ -2043,56 +2105,81 @@ def transliterate_formatted_transcript_to_hinglish(formatted: str) -> str:
     if not needs_translit_idx:
         return formatted  # Nothing to transliterate after parsing.
 
-    # Build batched calls only over the lines that need transliteration.
     total_to_translit = len(needs_translit_idx)
-    batches: list[tuple[int, int]] = [
-        (start, min(start + _HINGLISH_BATCH_SIZE, total_to_translit))
-        for start in range(0, total_to_translit, _HINGLISH_BATCH_SIZE)
-    ]
     logger.info(
         "Audio: cached transcript heal starting — {} of {} lines need "
-        "transliteration, split into {} batch(es)",
-        total_to_translit, len(lines), len(batches),
+        "transliteration (initial batch size {})",
+        total_to_translit, len(lines), _HINGLISH_BATCH_SIZE,
     )
 
-    healed_count = 0
-    for batch_idx, (b_start, b_end) in enumerate(batches, 1):
-        batch_indexes_in_lines = needs_translit_idx[b_start:b_end]
-        batch_texts = [texts[i] for i in batch_indexes_in_lines]
-        batch_label = f" heal {batch_idx}/{len(batches)}"
-        result = _transliterate_one_batch_to_hinglish(
-            batch_texts, batch_label=batch_label
-        )
-        if result is None:
-            logger.warning(
-                "Audio: cached heal batch{} failed; those {} lines stay Devanagari",
-                batch_label, len(batch_texts),
+    def _run_heal_pass(pending_line_idx: list[int], *, batch_size: int, label: str) -> int:
+        """Run one heal pass over the given line indices. Mutates ``texts``
+        in place and returns the count of lines successfully converted."""
+        if not pending_line_idx:
+            return 0
+        chunks = [
+            pending_line_idx[i:i + batch_size]
+            for i in range(0, len(pending_line_idx), batch_size)
+        ]
+        converted = 0
+        for ci, chunk in enumerate(chunks, 1):
+            chunk_texts = [texts[i] for i in chunk]
+            batch_label = f" heal {label} {ci}/{len(chunks)} (size {len(chunk)})"
+            result = _transliterate_one_batch_to_hinglish(
+                chunk_texts, batch_label=batch_label
             )
-            continue
-        for j, line_idx in enumerate(batch_indexes_in_lines):
-            if j >= len(result):
-                break
-            new_text = result[j]
-            if not isinstance(new_text, str) or not new_text.strip():
+            if result is None:
+                logger.warning(
+                    "Audio: cached heal batch{} failed; {} lines stay Devanagari",
+                    batch_label, len(chunk_texts),
+                )
                 continue
-            new_text = new_text.strip()
-            if _has_devanagari(new_text) and new_text == texts[line_idx].strip():
-                continue
-            texts[line_idx] = new_text
-            healed_count += 1
+            chunk_converted = 0
+            for j, line_idx in enumerate(chunk):
+                if j >= len(result):
+                    break
+                new_text = result[j]
+                if not isinstance(new_text, str) or not new_text.strip():
+                    continue
+                new_text = new_text.strip()
+                if _has_devanagari(new_text) and new_text == texts[line_idx].strip():
+                    continue
+                texts[line_idx] = new_text
+                chunk_converted += 1
+            converted += chunk_converted
+            logger.info(
+                "Audio: cached heal batch{} — {}/{} lines converted",
+                batch_label, chunk_converted, len(chunk_texts),
+            )
+        return converted
+
+    # Pass 1 — primary batch size.
+    healed_count = _run_heal_pass(
+        needs_translit_idx, batch_size=_HINGLISH_BATCH_SIZE, label="P1"
+    )
+
+    # Retry passes — chase down stragglers with shrinking batch sizes.
+    for pass_idx, retry_size in enumerate(_HINGLISH_RETRY_BATCH_SIZES, 2):
+        residual_idx = [i for i in needs_translit_idx if _has_devanagari(texts[i])]
+        if not residual_idx:
+            break
         logger.info(
-            "Audio: cached heal batch{} — converted {} lines",
-            batch_label, healed_count,
+            "Audio: cached heal retry P{} — {} stragglers, batch size {}",
+            pass_idx, len(residual_idx), retry_size,
+        )
+        healed_count += _run_heal_pass(
+            residual_idx, batch_size=retry_size, label=f"P{pass_idx}"
         )
 
     if healed_count == 0:
         return formatted
 
     rebuilt = "\n".join(prefixes[i] + texts[i] for i in range(len(lines)))
+    residual = sum(1 for i in needs_translit_idx if _has_devanagari(texts[i]))
     logger.info(
-        "Audio: cached transcript healed — {} of {} lines converted "
-        "({} chars → {} chars)",
-        healed_count, len(lines), len(formatted), len(rebuilt),
+        "Audio: cached transcript healed — {}/{} lines converted "
+        "({} still Devanagari) ({} chars → {} chars)",
+        healed_count, total_to_translit, residual, len(formatted), len(rebuilt),
     )
     return rebuilt
 

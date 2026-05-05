@@ -235,8 +235,15 @@ def _coerce_valid_json_text(raw: str) -> Optional[str]:
         return None
 
 
-def _generate_gemini_json(prompt: str, *, max_output_tokens: int = 2048) -> Optional[dict]:
-    """Run a JSON-mode Gemini call. Returns None on any failure."""
+def _generate_gemini_json_raw(
+    prompt: str, *, max_output_tokens: int = 2048
+) -> Optional[str]:
+    """Run a JSON-mode Gemini call and return the RAW response text (no parse).
+    Returns None only when the API call itself fails or yields no text.
+
+    Use this when callers want a chance to repair a truncated streaming
+    response that ``_generate_gemini_json`` would discard wholesale.
+    """
     if not _gemini_configured():
         logger.warning("Audio Gemini JSON call skipped: GOOGLE_API_KEY not configured")
         return None
@@ -258,6 +265,14 @@ def _generate_gemini_json(prompt: str, *, max_output_tokens: int = 2048) -> Opti
     text = getattr(response, "text", "") or ""
     if not text:
         logger.warning("Audio Gemini JSON call returned empty text")
+        return None
+    return text
+
+
+def _generate_gemini_json(prompt: str, *, max_output_tokens: int = 2048) -> Optional[dict]:
+    """Run a JSON-mode Gemini call. Returns None on any failure."""
+    text = _generate_gemini_json_raw(prompt, max_output_tokens=max_output_tokens)
+    if not text:
         return None
     valid = _coerce_valid_json_text(text)
     if not valid:
@@ -1684,20 +1699,33 @@ def _has_devanagari(text: str) -> bool:
 
 # Number of utterances per Gemini call. Small enough that the JSON response
 # fits comfortably even when server-side streaming truncates aggressively.
-_HINGLISH_BATCH_SIZE = 25
+# Empirically, batches of 25 still hit truncation on a server with strict
+# streaming caps when the late utterances run long; 10 keeps each response
+# well below the cliff. Stragglers that survive Pass 1 are caught by smaller
+# retry passes inside `_transliterate_segments_to_hinglish`.
+_HINGLISH_BATCH_SIZE = 10
+# Retry-pass batch sizes applied to whatever segments STILL carry Devanagari
+# after the previous pass. Each pass shrinks the per-call response further so
+# the truncation boundary becomes irrelevant. The final 1 means we'll send
+# one-utterance calls only as a last resort for stragglers.
+_HINGLISH_RETRY_BATCH_SIZES = (5, 1)
 
 
-def _try_repair_truncated_json_array(text: str, key: str) -> Optional[list]:
-    """Salvage a partial JSON response that streamed in shape
-    ``{"<key>": [ "...", "...", ...`` but got cut off before the closing ``]}``.
+def _try_repair_truncated_json_array(text: str, key: Optional[str] = None) -> Optional[list]:
+    """Salvage a partial JSON response that streamed in either shape:
 
-    Strategy: find the array opening, walk back from the end of the text to
-    the last complete string token (closing ``"`` followed only by whitespace
-    or trailing comma), drop any trailing comma, append ``]}``. Then JSON-load
-    and return the inner list.
+    1. ``{"<key>": [ "...", "...", ...`` — wrapped object form
+    2. ``[ "...", "...", ...`` — bare array form (when prompt asked for one)
 
-    Returns the list of recovered items on success, ``None`` when the text is
-    not a recognisable partial of the expected shape.
+    that got cut off before the closing ``]`` (or ``]}``).
+
+    Strategy: locate the array opening (either via ``"<key>": [`` if a key is
+    provided AND found, or via the first top-level ``[``). Walk forward
+    collecting complete ``"..."`` string tokens at depth 1 (skipping nested
+    objects/arrays). Stop at the last complete string. Re-parse a tidy
+    ``[ ... ]`` synthesised from the recovered items.
+
+    Returns the list of recovered string items on success, ``None`` otherwise.
     """
     if not isinstance(text, str) or not text.strip():
         return None
@@ -1708,52 +1736,68 @@ def _try_repair_truncated_json_array(text: str, key: str) -> Optional[list]:
         if m:
             s = m.group(1).strip()
 
-    # Locate the start of the array. The prompt always emits
-    # `{"<key>": [ ... ]}` so we search for `"<key>"` followed by `[`.
-    pat = re.compile(rf'"{re.escape(key)}"\s*:\s*\[', re.DOTALL)
-    m = pat.search(s)
-    if not m:
-        return None
-    array_open = m.end()  # position right after the `[`
+    # Locate the start of the array.
+    array_open = -1
+    if key:
+        pat = re.compile(rf'"{re.escape(key)}"\s*:\s*\[', re.DOTALL)
+        m = pat.search(s)
+        if m:
+            array_open = m.end()
+    if array_open < 0:
+        # Fallback: first top-level `[` in the response.
+        idx = s.find("[")
+        if idx < 0:
+            return None
+        array_open = idx + 1
+
     body = s[array_open:]
 
-    # Walk back to the last complete `"..."` token. A complete token ends with
-    # a closing double-quote that is NOT escaped, optionally followed by
-    # whitespace and/or a comma.
-    # Find the last unescaped closing double-quote.
-    last_close = -1
+    # Walk through the array body, collecting complete top-level string items.
+    # A "top-level" item here means depth 1 inside the array we just opened —
+    # we ignore content inside nested objects/arrays.
+    items: list[str] = []
     i = 0
-    in_str = False
-    escape = False
-    while i < len(body):
+    n = len(body)
+    depth = 0  # depth of nested {} or [] inside the array body
+    while i < n:
         ch = body[i]
-        if in_str:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_str = False
-                last_close = i  # remember last completed string
-        else:
-            if ch == '"':
-                in_str = True
+        if depth == 0 and ch == ']':
+            break  # the model actually closed the array — fine
+        if depth == 0 and ch == '"':
+            # Capture this string token (depth-1 string item).
+            j = i + 1
+            buf: list[str] = []
+            closed = False
+            while j < n:
+                cj = body[j]
+                if cj == "\\" and j + 1 < n:
+                    buf.append(body[j:j + 2])
+                    j += 2
+                    continue
+                if cj == '"':
+                    closed = True
+                    break
+                buf.append(cj)
+                j += 1
+            if not closed:
+                # Truncated mid-string → stop collecting; what we have so far
+                # is the salvageable subset.
+                break
+            try:
+                items.append(json.loads('"' + "".join(buf) + '"'))
+            except json.JSONDecodeError:
+                pass
+            i = j + 1
+            continue
+        if ch == '{' or ch == '[':
+            depth += 1
+        elif ch == '}' or ch == ']':
+            if depth > 0:
+                depth -= 1
         i += 1
-    if last_close < 0:
+    if not items:
         return None
-    truncated = body[: last_close + 1]
-    # Strip any trailing comma + whitespace (we don't want a dangling `,`).
-    truncated = re.sub(r",\s*$", "", truncated.rstrip())
-    # Reconstruct the full JSON object and parse.
-    repaired = '{"' + key + '":[' + truncated + ']}'
-    try:
-        obj = json.loads(repaired)
-    except json.JSONDecodeError:
-        return None
-    arr = obj.get(key)
-    if isinstance(arr, list):
-        return arr
-    return None
+    return items
 
 
 def _transliterate_one_batch_to_hinglish(
@@ -1794,33 +1838,40 @@ Utterances:
     # Smaller per-batch budget — the response is just N short strings, so we
     # don't need 65k tokens (which on some preview models silently downgrades
     # the actual cap). 8000 is plenty for 25 utterances of typical length.
-    data = _generate_gemini_json(prompt, max_output_tokens=8000)
+    raw = _generate_gemini_json_raw(prompt, max_output_tokens=8000)
 
     arr: Optional[list] = None
-    if isinstance(data, dict):
-        candidate = data.get("transliterated")
-        if isinstance(candidate, list):
-            arr = candidate
-        else:
-            logger.warning(
-                "Audio: Hinglish batch{} response missing 'transliterated' list "
-                "(got {})",
-                batch_label, type(candidate).__name__,
-            )
+    if raw:
+        # Try the strict parse first.
+        valid = _coerce_valid_json_text(raw)
+        if valid:
+            obj = _extract_json_object(valid)
+            if isinstance(obj, dict):
+                cand = obj.get("transliterated")
+                if isinstance(cand, list):
+                    arr = cand
+            elif isinstance(obj, list):
+                arr = obj
+        # Strict parse failed → try to salvage whatever streamed in.
+        if arr is None:
+            salvaged = _try_repair_truncated_json_array(raw, key="transliterated")
+            if salvaged:
+                logger.warning(
+                    "Audio: Hinglish batch{} — primary response truncated; "
+                    "JSON repair recovered {}/{} utterances",
+                    batch_label, len(salvaged), len(batch_texts),
+                )
+                arr = salvaged
 
-    # If the validator rejected the response wholesale, try a JSON-repair on
-    # the raw text by re-running the call and extracting whatever streamed.
-    # We can't get the raw text from `_generate_gemini_json` (it returns None
-    # on parse failure), so as a fallback we repeat the call asking the model
-    # to keep its response very short. Cheap and only fires on total failure.
+    # If we still have nothing, retry with a terser prompt (smaller schema,
+    # less likely to hit the truncation boundary). Apply repair to that
+    # response too.
     if arr is None:
         logger.warning(
-            "Audio: Hinglish batch{} — full JSON parse failed; attempting "
-            "repaired single-shot retry with terse prompt",
+            "Audio: Hinglish batch{} — primary attempt produced no usable "
+            "output; retrying with terse prompt",
             batch_label,
         )
-        # Re-issue the call but ask for a SHORTER output schema, which is
-        # less likely to truncate.
         terse_prompt = (
             "Transliterate each Devanagari Hindi utterance to Roman/Hinglish. "
             "Keep English words verbatim. Numbers and ₹ amounts unchanged. "
@@ -1828,15 +1879,30 @@ Utterances:
             "commentary. Array length must be exactly "
             f"{len(batch_texts)}.\n\nUtterances:\n{numbered}"
         )
-        retry = _generate_gemini_json(terse_prompt, max_output_tokens=8000)
-        # The terse retry may return a dict (Gemini auto-wraps) or fail.
-        if isinstance(retry, dict):
-            for v in retry.values():
-                if isinstance(v, list):
-                    arr = v
-                    break
-        if arr is None:
-            return None
+        retry_raw = _generate_gemini_json_raw(terse_prompt, max_output_tokens=8000)
+        if retry_raw:
+            valid = _coerce_valid_json_text(retry_raw)
+            if valid:
+                obj = _extract_json_object(valid)
+                if isinstance(obj, list):
+                    arr = obj
+                elif isinstance(obj, dict):
+                    for v in obj.values():
+                        if isinstance(v, list):
+                            arr = v
+                            break
+            if arr is None:
+                salvaged = _try_repair_truncated_json_array(retry_raw, key="transliterated")
+                if salvaged:
+                    logger.warning(
+                        "Audio: Hinglish batch{} — terse retry truncated; "
+                        "JSON repair recovered {}/{} utterances",
+                        batch_label, len(salvaged), len(batch_texts),
+                    )
+                    arr = salvaged
+
+    if arr is None:
+        return None
 
     # Pad / truncate to expected length.
     out: list[Optional[str]] = [None] * len(batch_texts)
@@ -1845,6 +1911,63 @@ Utterances:
         if isinstance(v, str) and v.strip():
             out[i] = v.strip()
     return out
+
+
+def _run_hinglish_pass_on_indices(
+    segments: list[SpeakerSegment],
+    indices: list[int],
+    *,
+    batch_size: int,
+    pass_label: str,
+) -> int:
+    """Run one transliteration pass over a list of segment indices.
+
+    Splits the indices into chunks of ``batch_size``, calls Gemini per chunk,
+    and applies any returned Hinglish strings IN PLACE on the segments. Returns
+    the number of segments actually converted in this pass.
+
+    The retry-pass-on-stragglers loop in ``_transliterate_segments_to_hinglish``
+    calls this helper repeatedly with shrinking ``batch_size`` to chase down
+    utterances that an earlier pass lost to server-side stream truncation.
+    """
+    if not indices:
+        return 0
+    chunks: list[list[int]] = [
+        indices[i:i + batch_size] for i in range(0, len(indices), batch_size)
+    ]
+    pass_converted = 0
+    for ci, chunk in enumerate(chunks, 1):
+        chunk_segs = [segments[i] for i in chunk]
+        chunk_texts = [(s.text or "").strip() for s in chunk_segs]
+        batch_label = f" {pass_label} {ci}/{len(chunks)} (size {len(chunk)})"
+        result = _transliterate_one_batch_to_hinglish(
+            chunk_texts, batch_label=batch_label
+        )
+        if result is None:
+            logger.warning(
+                "Audio: Hinglish batch{} failed; {} segments stay Devanagari",
+                batch_label, len(chunk_segs),
+            )
+            continue
+
+        chunk_converted = 0
+        for i, seg in enumerate(chunk_segs):
+            if i >= len(result):
+                break
+            new_text = result[i]
+            if not isinstance(new_text, str) or not new_text.strip():
+                continue
+            new_text = new_text.strip()
+            if _has_devanagari(new_text) and new_text == (seg.text or "").strip():
+                continue
+            seg.text = new_text
+            chunk_converted += 1
+        pass_converted += chunk_converted
+        logger.info(
+            "Audio: Hinglish batch{} — {}/{} segments converted",
+            batch_label, chunk_converted, len(chunk_segs),
+        )
+    return pass_converted
 
 
 def _transliterate_segments_to_hinglish(
@@ -1859,14 +1982,20 @@ def _transliterate_segments_to_hinglish(
     code-switched portions are preserved verbatim — only the Devanagari runs
     are transliterated.
 
-    Implementation: split the segments into batches of `_HINGLISH_BATCH_SIZE`
-    (default 25) and run a Gemini call per batch. Each call's JSON response
-    is small enough to avoid stream-truncation on environments with shorter
-    output budgets (this was the server-side failure mode that left
-    transcripts in Devanagari). A failed batch leaves THAT batch's segments
-    in Devanagari and the other batches still get Hinglish.
+    Implementation: a multi-pass pipeline that progressively shrinks the
+    per-call batch size to defeat server-side stream truncation:
 
-    Mutates the segments in place AND returns them for convenience.
+      1. **Pass 1** — batches of ``_HINGLISH_BATCH_SIZE`` (10) over every
+         segment that contains Devanagari.
+      2. **Pass 2** — if any segments STILL carry Devanagari (e.g. because
+         a Pass 1 batch's response truncated mid-array), retry just those
+         segments with a smaller batch size.
+      3. **Pass 3** — last-ditch one-utterance-per-call retries for the
+         residual stragglers.
+
+    The smaller each call's response is, the less surface area there is for
+    truncation, so each pass strictly outperforms the previous one on
+    coverage. Mutates segments in place AND returns them.
     """
     if not segments:
         return segments
@@ -1884,50 +2013,40 @@ def _transliterate_segments_to_hinglish(
         return segments
 
     total = len(segments)
-    batches: list[tuple[int, int]] = [
-        (start, min(start + _HINGLISH_BATCH_SIZE, total))
-        for start in range(0, total, _HINGLISH_BATCH_SIZE)
-    ]
+    pending = [i for i, s in enumerate(segments) if _has_devanagari(s.text or "")]
     logger.info(
-        "Audio: Hinglish transliteration starting — {} segments split into "
-        "{} batch(es) of up to {}",
-        total, len(batches), _HINGLISH_BATCH_SIZE,
+        "Audio: Hinglish transliteration starting — {} of {} segments need "
+        "conversion (initial batch size {})",
+        len(pending), total, _HINGLISH_BATCH_SIZE,
     )
 
-    converted_total = 0
-    for batch_idx, (start, end) in enumerate(batches, 1):
-        batch_segs = segments[start:end]
-        batch_texts = [(s.text or "").strip() for s in batch_segs]
-        batch_label = f" {batch_idx}/{len(batches)}"
-        result = _transliterate_one_batch_to_hinglish(batch_texts, batch_label=batch_label)
-        if result is None:
-            logger.warning(
-                "Audio: Hinglish batch{} failed; {} segments stay Devanagari",
-                batch_label, len(batch_segs),
-            )
-            continue
+    # Pass 1 — primary batch size.
+    converted = _run_hinglish_pass_on_indices(
+        segments, pending,
+        batch_size=_HINGLISH_BATCH_SIZE, pass_label="P1",
+    )
 
-        batch_converted = 0
-        for i, seg in enumerate(batch_segs):
-            if i >= len(result):
-                break
-            new_text = result[i]
-            if not isinstance(new_text, str) or not new_text.strip():
-                continue
-            new_text = new_text.strip()
-            if _has_devanagari(new_text) and new_text == (seg.text or "").strip():
-                continue
-            seg.text = new_text
-            batch_converted += 1
-        converted_total += batch_converted
+    # Retry passes — chase down whatever the primary pass left in Devanagari.
+    for pass_idx, retry_size in enumerate(_HINGLISH_RETRY_BATCH_SIZES, 2):
+        pending = [
+            i for i, s in enumerate(segments) if _has_devanagari(s.text or "")
+        ]
+        if not pending:
+            break
         logger.info(
-            "Audio: Hinglish batch{} — {}/{} segments converted",
-            batch_label, batch_converted, len(batch_segs),
+            "Audio: Hinglish retry pass P{} — {} stragglers, batch size {}",
+            pass_idx, len(pending), retry_size,
+        )
+        converted += _run_hinglish_pass_on_indices(
+            segments, pending,
+            batch_size=retry_size, pass_label=f"P{pass_idx}",
         )
 
+    residual = sum(1 for s in segments if _has_devanagari(s.text or ""))
     logger.info(
-        "Audio: Hinglish transliteration applied to {}/{} segments",
-        converted_total, total,
+        "Audio: Hinglish transliteration applied to {}/{} segments "
+        "({} still Devanagari after all retry passes)",
+        converted, total, residual,
     )
     return segments
 
@@ -1986,56 +2105,81 @@ def transliterate_formatted_transcript_to_hinglish(formatted: str) -> str:
     if not needs_translit_idx:
         return formatted  # Nothing to transliterate after parsing.
 
-    # Build batched calls only over the lines that need transliteration.
     total_to_translit = len(needs_translit_idx)
-    batches: list[tuple[int, int]] = [
-        (start, min(start + _HINGLISH_BATCH_SIZE, total_to_translit))
-        for start in range(0, total_to_translit, _HINGLISH_BATCH_SIZE)
-    ]
     logger.info(
         "Audio: cached transcript heal starting — {} of {} lines need "
-        "transliteration, split into {} batch(es)",
-        total_to_translit, len(lines), len(batches),
+        "transliteration (initial batch size {})",
+        total_to_translit, len(lines), _HINGLISH_BATCH_SIZE,
     )
 
-    healed_count = 0
-    for batch_idx, (b_start, b_end) in enumerate(batches, 1):
-        batch_indexes_in_lines = needs_translit_idx[b_start:b_end]
-        batch_texts = [texts[i] for i in batch_indexes_in_lines]
-        batch_label = f" heal {batch_idx}/{len(batches)}"
-        result = _transliterate_one_batch_to_hinglish(
-            batch_texts, batch_label=batch_label
-        )
-        if result is None:
-            logger.warning(
-                "Audio: cached heal batch{} failed; those {} lines stay Devanagari",
-                batch_label, len(batch_texts),
+    def _run_heal_pass(pending_line_idx: list[int], *, batch_size: int, label: str) -> int:
+        """Run one heal pass over the given line indices. Mutates ``texts``
+        in place and returns the count of lines successfully converted."""
+        if not pending_line_idx:
+            return 0
+        chunks = [
+            pending_line_idx[i:i + batch_size]
+            for i in range(0, len(pending_line_idx), batch_size)
+        ]
+        converted = 0
+        for ci, chunk in enumerate(chunks, 1):
+            chunk_texts = [texts[i] for i in chunk]
+            batch_label = f" heal {label} {ci}/{len(chunks)} (size {len(chunk)})"
+            result = _transliterate_one_batch_to_hinglish(
+                chunk_texts, batch_label=batch_label
             )
-            continue
-        for j, line_idx in enumerate(batch_indexes_in_lines):
-            if j >= len(result):
-                break
-            new_text = result[j]
-            if not isinstance(new_text, str) or not new_text.strip():
+            if result is None:
+                logger.warning(
+                    "Audio: cached heal batch{} failed; {} lines stay Devanagari",
+                    batch_label, len(chunk_texts),
+                )
                 continue
-            new_text = new_text.strip()
-            if _has_devanagari(new_text) and new_text == texts[line_idx].strip():
-                continue
-            texts[line_idx] = new_text
-            healed_count += 1
+            chunk_converted = 0
+            for j, line_idx in enumerate(chunk):
+                if j >= len(result):
+                    break
+                new_text = result[j]
+                if not isinstance(new_text, str) or not new_text.strip():
+                    continue
+                new_text = new_text.strip()
+                if _has_devanagari(new_text) and new_text == texts[line_idx].strip():
+                    continue
+                texts[line_idx] = new_text
+                chunk_converted += 1
+            converted += chunk_converted
+            logger.info(
+                "Audio: cached heal batch{} — {}/{} lines converted",
+                batch_label, chunk_converted, len(chunk_texts),
+            )
+        return converted
+
+    # Pass 1 — primary batch size.
+    healed_count = _run_heal_pass(
+        needs_translit_idx, batch_size=_HINGLISH_BATCH_SIZE, label="P1"
+    )
+
+    # Retry passes — chase down stragglers with shrinking batch sizes.
+    for pass_idx, retry_size in enumerate(_HINGLISH_RETRY_BATCH_SIZES, 2):
+        residual_idx = [i for i in needs_translit_idx if _has_devanagari(texts[i])]
+        if not residual_idx:
+            break
         logger.info(
-            "Audio: cached heal batch{} — converted {} lines",
-            batch_label, healed_count,
+            "Audio: cached heal retry P{} — {} stragglers, batch size {}",
+            pass_idx, len(residual_idx), retry_size,
+        )
+        healed_count += _run_heal_pass(
+            residual_idx, batch_size=retry_size, label=f"P{pass_idx}"
         )
 
     if healed_count == 0:
         return formatted
 
     rebuilt = "\n".join(prefixes[i] + texts[i] for i in range(len(lines)))
+    residual = sum(1 for i in needs_translit_idx if _has_devanagari(texts[i]))
     logger.info(
-        "Audio: cached transcript healed — {} of {} lines converted "
-        "({} chars → {} chars)",
-        healed_count, len(lines), len(formatted), len(rebuilt),
+        "Audio: cached transcript healed — {}/{} lines converted "
+        "({} still Devanagari) ({} chars → {} chars)",
+        healed_count, total_to_translit, residual, len(formatted), len(rebuilt),
     )
     return rebuilt
 

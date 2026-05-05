@@ -235,8 +235,15 @@ def _coerce_valid_json_text(raw: str) -> Optional[str]:
         return None
 
 
-def _generate_gemini_json(prompt: str, *, max_output_tokens: int = 2048) -> Optional[dict]:
-    """Run a JSON-mode Gemini call. Returns None on any failure."""
+def _generate_gemini_json_raw(
+    prompt: str, *, max_output_tokens: int = 2048
+) -> Optional[str]:
+    """Run a JSON-mode Gemini call and return the RAW response text (no parse).
+    Returns None only when the API call itself fails or yields no text.
+
+    Use this when callers want a chance to repair a truncated streaming
+    response that ``_generate_gemini_json`` would discard wholesale.
+    """
     if not _gemini_configured():
         logger.warning("Audio Gemini JSON call skipped: GOOGLE_API_KEY not configured")
         return None
@@ -258,6 +265,14 @@ def _generate_gemini_json(prompt: str, *, max_output_tokens: int = 2048) -> Opti
     text = getattr(response, "text", "") or ""
     if not text:
         logger.warning("Audio Gemini JSON call returned empty text")
+        return None
+    return text
+
+
+def _generate_gemini_json(prompt: str, *, max_output_tokens: int = 2048) -> Optional[dict]:
+    """Run a JSON-mode Gemini call. Returns None on any failure."""
+    text = _generate_gemini_json_raw(prompt, max_output_tokens=max_output_tokens)
+    if not text:
         return None
     valid = _coerce_valid_json_text(text)
     if not valid:
@@ -1687,17 +1702,21 @@ def _has_devanagari(text: str) -> bool:
 _HINGLISH_BATCH_SIZE = 25
 
 
-def _try_repair_truncated_json_array(text: str, key: str) -> Optional[list]:
-    """Salvage a partial JSON response that streamed in shape
-    ``{"<key>": [ "...", "...", ...`` but got cut off before the closing ``]}``.
+def _try_repair_truncated_json_array(text: str, key: Optional[str] = None) -> Optional[list]:
+    """Salvage a partial JSON response that streamed in either shape:
 
-    Strategy: find the array opening, walk back from the end of the text to
-    the last complete string token (closing ``"`` followed only by whitespace
-    or trailing comma), drop any trailing comma, append ``]}``. Then JSON-load
-    and return the inner list.
+    1. ``{"<key>": [ "...", "...", ...`` — wrapped object form
+    2. ``[ "...", "...", ...`` — bare array form (when prompt asked for one)
 
-    Returns the list of recovered items on success, ``None`` when the text is
-    not a recognisable partial of the expected shape.
+    that got cut off before the closing ``]`` (or ``]}``).
+
+    Strategy: locate the array opening (either via ``"<key>": [`` if a key is
+    provided AND found, or via the first top-level ``[``). Walk forward
+    collecting complete ``"..."`` string tokens at depth 1 (skipping nested
+    objects/arrays). Stop at the last complete string. Re-parse a tidy
+    ``[ ... ]`` synthesised from the recovered items.
+
+    Returns the list of recovered string items on success, ``None`` otherwise.
     """
     if not isinstance(text, str) or not text.strip():
         return None
@@ -1708,52 +1727,68 @@ def _try_repair_truncated_json_array(text: str, key: str) -> Optional[list]:
         if m:
             s = m.group(1).strip()
 
-    # Locate the start of the array. The prompt always emits
-    # `{"<key>": [ ... ]}` so we search for `"<key>"` followed by `[`.
-    pat = re.compile(rf'"{re.escape(key)}"\s*:\s*\[', re.DOTALL)
-    m = pat.search(s)
-    if not m:
-        return None
-    array_open = m.end()  # position right after the `[`
+    # Locate the start of the array.
+    array_open = -1
+    if key:
+        pat = re.compile(rf'"{re.escape(key)}"\s*:\s*\[', re.DOTALL)
+        m = pat.search(s)
+        if m:
+            array_open = m.end()
+    if array_open < 0:
+        # Fallback: first top-level `[` in the response.
+        idx = s.find("[")
+        if idx < 0:
+            return None
+        array_open = idx + 1
+
     body = s[array_open:]
 
-    # Walk back to the last complete `"..."` token. A complete token ends with
-    # a closing double-quote that is NOT escaped, optionally followed by
-    # whitespace and/or a comma.
-    # Find the last unescaped closing double-quote.
-    last_close = -1
+    # Walk through the array body, collecting complete top-level string items.
+    # A "top-level" item here means depth 1 inside the array we just opened —
+    # we ignore content inside nested objects/arrays.
+    items: list[str] = []
     i = 0
-    in_str = False
-    escape = False
-    while i < len(body):
+    n = len(body)
+    depth = 0  # depth of nested {} or [] inside the array body
+    while i < n:
         ch = body[i]
-        if in_str:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_str = False
-                last_close = i  # remember last completed string
-        else:
-            if ch == '"':
-                in_str = True
+        if depth == 0 and ch == ']':
+            break  # the model actually closed the array — fine
+        if depth == 0 and ch == '"':
+            # Capture this string token (depth-1 string item).
+            j = i + 1
+            buf: list[str] = []
+            closed = False
+            while j < n:
+                cj = body[j]
+                if cj == "\\" and j + 1 < n:
+                    buf.append(body[j:j + 2])
+                    j += 2
+                    continue
+                if cj == '"':
+                    closed = True
+                    break
+                buf.append(cj)
+                j += 1
+            if not closed:
+                # Truncated mid-string → stop collecting; what we have so far
+                # is the salvageable subset.
+                break
+            try:
+                items.append(json.loads('"' + "".join(buf) + '"'))
+            except json.JSONDecodeError:
+                pass
+            i = j + 1
+            continue
+        if ch == '{' or ch == '[':
+            depth += 1
+        elif ch == '}' or ch == ']':
+            if depth > 0:
+                depth -= 1
         i += 1
-    if last_close < 0:
+    if not items:
         return None
-    truncated = body[: last_close + 1]
-    # Strip any trailing comma + whitespace (we don't want a dangling `,`).
-    truncated = re.sub(r",\s*$", "", truncated.rstrip())
-    # Reconstruct the full JSON object and parse.
-    repaired = '{"' + key + '":[' + truncated + ']}'
-    try:
-        obj = json.loads(repaired)
-    except json.JSONDecodeError:
-        return None
-    arr = obj.get(key)
-    if isinstance(arr, list):
-        return arr
-    return None
+    return items
 
 
 def _transliterate_one_batch_to_hinglish(
@@ -1794,33 +1829,40 @@ Utterances:
     # Smaller per-batch budget — the response is just N short strings, so we
     # don't need 65k tokens (which on some preview models silently downgrades
     # the actual cap). 8000 is plenty for 25 utterances of typical length.
-    data = _generate_gemini_json(prompt, max_output_tokens=8000)
+    raw = _generate_gemini_json_raw(prompt, max_output_tokens=8000)
 
     arr: Optional[list] = None
-    if isinstance(data, dict):
-        candidate = data.get("transliterated")
-        if isinstance(candidate, list):
-            arr = candidate
-        else:
-            logger.warning(
-                "Audio: Hinglish batch{} response missing 'transliterated' list "
-                "(got {})",
-                batch_label, type(candidate).__name__,
-            )
+    if raw:
+        # Try the strict parse first.
+        valid = _coerce_valid_json_text(raw)
+        if valid:
+            obj = _extract_json_object(valid)
+            if isinstance(obj, dict):
+                cand = obj.get("transliterated")
+                if isinstance(cand, list):
+                    arr = cand
+            elif isinstance(obj, list):
+                arr = obj
+        # Strict parse failed → try to salvage whatever streamed in.
+        if arr is None:
+            salvaged = _try_repair_truncated_json_array(raw, key="transliterated")
+            if salvaged:
+                logger.warning(
+                    "Audio: Hinglish batch{} — primary response truncated; "
+                    "JSON repair recovered {}/{} utterances",
+                    batch_label, len(salvaged), len(batch_texts),
+                )
+                arr = salvaged
 
-    # If the validator rejected the response wholesale, try a JSON-repair on
-    # the raw text by re-running the call and extracting whatever streamed.
-    # We can't get the raw text from `_generate_gemini_json` (it returns None
-    # on parse failure), so as a fallback we repeat the call asking the model
-    # to keep its response very short. Cheap and only fires on total failure.
+    # If we still have nothing, retry with a terser prompt (smaller schema,
+    # less likely to hit the truncation boundary). Apply repair to that
+    # response too.
     if arr is None:
         logger.warning(
-            "Audio: Hinglish batch{} — full JSON parse failed; attempting "
-            "repaired single-shot retry with terse prompt",
+            "Audio: Hinglish batch{} — primary attempt produced no usable "
+            "output; retrying with terse prompt",
             batch_label,
         )
-        # Re-issue the call but ask for a SHORTER output schema, which is
-        # less likely to truncate.
         terse_prompt = (
             "Transliterate each Devanagari Hindi utterance to Roman/Hinglish. "
             "Keep English words verbatim. Numbers and ₹ amounts unchanged. "
@@ -1828,15 +1870,30 @@ Utterances:
             "commentary. Array length must be exactly "
             f"{len(batch_texts)}.\n\nUtterances:\n{numbered}"
         )
-        retry = _generate_gemini_json(terse_prompt, max_output_tokens=8000)
-        # The terse retry may return a dict (Gemini auto-wraps) or fail.
-        if isinstance(retry, dict):
-            for v in retry.values():
-                if isinstance(v, list):
-                    arr = v
-                    break
-        if arr is None:
-            return None
+        retry_raw = _generate_gemini_json_raw(terse_prompt, max_output_tokens=8000)
+        if retry_raw:
+            valid = _coerce_valid_json_text(retry_raw)
+            if valid:
+                obj = _extract_json_object(valid)
+                if isinstance(obj, list):
+                    arr = obj
+                elif isinstance(obj, dict):
+                    for v in obj.values():
+                        if isinstance(v, list):
+                            arr = v
+                            break
+            if arr is None:
+                salvaged = _try_repair_truncated_json_array(retry_raw, key="transliterated")
+                if salvaged:
+                    logger.warning(
+                        "Audio: Hinglish batch{} — terse retry truncated; "
+                        "JSON repair recovered {}/{} utterances",
+                        batch_label, len(salvaged), len(batch_texts),
+                    )
+                    arr = salvaged
+
+    if arr is None:
+        return None
 
     # Pad / truncate to expected length.
     out: list[Optional[str]] = [None] * len(batch_texts)

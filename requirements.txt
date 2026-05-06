@@ -26,6 +26,10 @@ langchain>=0.1.6
 langchain-google-genai>=0.0.11
 langchain-core>=0.1.52
 
+# Vertex AI Search retriever (replaces deprecated Google Custom Search / CSE)
+langchain-google-community>=2.0.0
+google-cloud-discoveryengine>=0.11.0
+
 # LangGraph (compatible with langchain-core>=0.1.25)
 langgraph>=0.0.62
 

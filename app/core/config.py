@@ -66,8 +66,15 @@ class Settings(BaseSettings):
     # Optional: use an API key for Vision OCR instead of service-account credentials.
     # Environment variable supported: GOOGLE_CLOUD_VISION_API_KEY
     google_cloud_vision_api_key: Optional[str] = None
-    google_cse_id: Optional[str] = None
-    google_cse_base_url: str = "https://www.googleapis.com/customsearch/v1"
+
+    # Vertex AI Search (replaces the deprecated Google Custom Search / CSE flow).
+    # Used as the Indian Kanoon fallback search source. ``gcp_project_id``
+    # above is reused for the project field.
+    vertex_search_data_store_id: Optional[str] = None
+    vertex_search_location_id: str = "global"  # global | us | eu
+    # 0 = unstructured, 1 = structured, 2 = website, 3 = blended
+    vertex_search_engine_data_type: int = 2
+    vertex_search_max_documents: int = 8
 
     # Vector Store (Qdrant)
     qdrant_url: str = "http://localhost:6333"

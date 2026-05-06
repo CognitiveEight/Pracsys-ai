@@ -25,6 +25,7 @@ from app.processing.audio_transcription import (
     transliterate_formatted_transcript_to_hinglish,
 )
 from app.processing.document_processor import document_processor
+from app.search.vertex_ai_search import search_indiankanoon as vertex_search_indiankanoon
 from app.prompts.applicable_acts import (
     TARGETED_INDIAN_ACTS,
     format_targeted_acts_for_prompt,
@@ -5077,60 +5078,6 @@ Example shape:
             logger.info("Applicable laws: Indian Kanoon returned no results")
         return results
 
-    async def _search_google_cse_for_indiankanoon(
-        self, query: str
-    ) -> List[Dict[str, str]]:
-        """Fallback search via Google CSE, constrained to Indian Kanoon domain."""
-        if (
-            not query.strip()
-            or not settings.google_api_key
-            or not settings.google_cse_id
-        ):
-            return []
-        endpoint = getattr(
-            settings,
-            "google_cse_base_url",
-            "https://www.googleapis.com/customsearch/v1",
-        )
-        params = {
-            "key": settings.google_api_key,
-            "cx": settings.google_cse_id,
-            "q": f"site:indiankanoon.org {query}",
-            "num": 8,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                res = await client.get(endpoint, params=params)
-                res.raise_for_status()
-                data = res.json() if res.text else {}
-        except Exception as e:
-            logger.warning("Applicable laws: Google CSE fallback failed: {}", e)
-            return []
-
-        out: List[Dict[str, str]] = []
-        for item in data.get("items", []) or []:
-            link = str(item.get("link") or "").strip()
-            if "indiankanoon.org" not in link:
-                continue
-            out.append(
-                {
-                    "title": str(item.get("title") or "").strip(),
-                    "url": link,
-                    "snippet": str(item.get("snippet") or "").strip(),
-                }
-            )
-            if len(out) >= 8:
-                break
-        if out:
-            preview = [
-                {"title": r.get("title", "")[:120], "url": r.get("url", "")}
-                for r in out[:5]
-            ]
-            logger.info("Applicable laws: Google CSE results preview={}", preview)
-        else:
-            logger.info("Applicable laws: Google CSE returned no results")
-        return out
-
     async def _generate_applicable_laws_from_sources(
         self,
         workspace_id: str,
@@ -5293,7 +5240,7 @@ Indian Kanoon / case-law search results:
         signals = await self._extract_case_signals_from_documents(workspace_id, user_id)
         search_results = await self._search_indiankanoon(signals.get("query", ""))
         if not search_results:
-            search_results = await self._search_google_cse_for_indiankanoon(
+            search_results = await vertex_search_indiankanoon(
                 signals.get("query", "")
             )
         logger.info(
@@ -9226,8 +9173,8 @@ Output ONLY valid JSON, no markdown, no code block:
             if merged:
                 return merged
         fallback_q = queries[0] if queries and queries[0] else f"{act} {section}"
-        cse = await self._search_google_cse_for_indiankanoon(fallback_q)
-        for row in cse:
+        vertex_rows = await vertex_search_indiankanoon(fallback_q)
+        for row in vertex_rows:
             u = row.get("url") or ""
             if u and u not in seen_urls:
                 seen_urls.add(u)
@@ -9235,7 +9182,7 @@ Output ONLY valid JSON, no markdown, no code block:
                 if len(merged) >= 10:
                     break
         logger.info(
-            "law_relevance: total search rows after Kanoon/CSE={}",
+            "law_relevance: total search rows after Kanoon/Vertex={}",
             len(merged),
         )
         return merged

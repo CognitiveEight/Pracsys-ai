@@ -1662,7 +1662,13 @@ def _build_speaker_letter_map(segments: list[SpeakerSegment]) -> dict[int, str]:
 
 
 # `inferred_role` values → user-facing label. Caller = client/victim seeking
-# help; Lawyer = legal advisor on the receiving side.
+# help; Receiver = the party on the receiving side of the call (typically a
+# legal advisor, but the user-visible label stays generic).
+#
+# Note: the internal `lawyer` enum value is preserved across the codebase
+# (it is the semantic anchor the diarization / role-inference prompts use to
+# reason about which speaker is asking the clarifying questions). Only the
+# display label is rewritten to "Receiver" here.
 #
 # IMPORTANT — role assignment contract:
 # When `transcript_result.speaker_source == "gemini_diarization"` the speaker
@@ -1675,7 +1681,7 @@ def _build_speaker_letter_map(segments: list[SpeakerSegment]) -> dict[int, str]:
 # `_infer_speaker_roles_with_gemini`, with a heuristic fallback if Gemini fails.
 _ROLE_TO_LABEL = {
     "victim_party": "Caller",
-    "lawyer": "Lawyer",
+    "lawyer": "Receiver",
 }
 
 
@@ -2351,7 +2357,7 @@ _TRANSCRIPT_LINE_RE = re.compile(
 def transliterate_formatted_transcript_to_hinglish(formatted: str) -> str:
     """Convert Devanagari Hindi text inside an already-formatted transcript
     to Roman / Hinglish, preserving timestamps (``[MM:SS]``), speaker labels
-    (``Lawyer:`` / ``Caller:`` / ``Speaker A:``), punctuation and line
+    (``Receiver:`` / ``Caller:`` / ``Speaker A:``), punctuation and line
     breaks. Used to retroactively heal cached transcripts that were generated
     before Hinglish output was supported.
 
@@ -2497,7 +2503,7 @@ def transliterate_formatted_transcript_to_hinglish(formatted: str) -> str:
 def _format_transcript_with_speakers(segments: list[SpeakerSegment]) -> str:
     """Produce ``[MM:SS] <label>: text`` lines for the document_assessments transcript.
 
-    ``<label>`` is ``Caller`` / ``Lawyer`` when role inference succeeded, and
+    ``<label>`` is ``Caller`` / ``Receiver`` when role inference succeeded, and
     falls back to ``Speaker A`` / ``Speaker B`` otherwise.
     """
     if not segments:

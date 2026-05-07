@@ -2334,6 +2334,63 @@ USER MESSAGE
                 "updateRequestedNow": False,
             }
 
+    @staticmethod
+    def _drop_entries_for_deleted_docs(
+        entries: List[Dict[str, Any]],
+        live_doc_ids: set,
+        *,
+        drop_unattributed: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Filter cached timeline/date entries against the current set of
+        document IDs in the vector store, dropping any entry whose
+        ``sourceDocId`` is set but no longer present.
+
+        Used by ``_generate_and_emit_list_of_dates`` and
+        ``_generate_and_emit_procedural_timeline`` before they merge new
+        regenerations against their prior cached payload. Without this
+        filter, deleting a document leaves its dated entries in the cache
+        forever — the merge helper preserves prev verbatim, so stale rows
+        survive every subsequent regeneration.
+
+        ``drop_unattributed`` widens the filter for *deletion* contexts:
+        when True, also drop entries whose ``sourceDocId`` is missing or
+        empty. Such rows can arise when an older code path emitted entries
+        with no source attribution (e.g. the LLM returned a
+        ``sourceDocumentIndex`` outside the doc range and the empty value
+        was stripped at events.py:4446). On uploads we keep these rows for
+        backward compat; on deletions we conservatively drop them because
+        we cannot rule out that they originated from the doc being deleted.
+        Anything genuinely attributable to a still-live doc will be
+        re-emitted by the regeneration that runs immediately after.
+        """
+        if not isinstance(entries, list) or not entries:
+            return list(entries or [])
+        kept: List[Dict[str, Any]] = []
+        dropped_orphans = 0
+        dropped_unattributed = 0
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            src = str(e.get("sourceDocId") or "").strip()
+            if src:
+                if src not in live_doc_ids:
+                    dropped_orphans += 1
+                    continue
+            else:
+                if drop_unattributed:
+                    dropped_unattributed += 1
+                    continue
+            kept.append(e)
+        if dropped_orphans or dropped_unattributed:
+            logger.info(
+                "Dropped {} orphan + {} unattributed cached entry/entries "
+                "(drop_unattributed={})",
+                dropped_orphans,
+                dropped_unattributed,
+                drop_unattributed,
+            )
+        return kept
+
     def _build_document_inventory(self, workspace_id: str) -> str:
         """Build a deterministic, prompt-ready inventory of documents the
         user has uploaded, drawn from the cached document_assessments
@@ -4584,10 +4641,21 @@ Example shape:
         user_id: str,
         workspace_role: Optional[str] = None,
         batch_result: Optional[Dict[str, Any]] = None,
+        deleted_doc_ids: Optional[List[str]] = None,
     ) -> None:
         """
         Fetch workspace documents, generate list of dates from them, emit to backend and cache.
         Emits document_feature_response with featureType "list_of_dates" and payload.listOfDates.
+
+        ``deleted_doc_ids`` is set when this regeneration was triggered by a
+        document deletion (see workspace_sync handler). When deletion is the
+        only change (``batch_result is None`` and ``deleted_doc_ids`` is
+        non-empty), this method takes a FAST PATH: it skips the Gemini
+        regeneration entirely and just filters the cached prior list to
+        drop entries that came from the deleted document(s), then emits.
+        Rationale: the remaining documents have not changed, so their dates
+        are already in the cache; running another LLM call would only
+        introduce paraphrased duplicates that have to be merged back.
         """
         if not self._socket_client:
             return
@@ -4598,6 +4666,76 @@ Example shape:
         except Exception as e:
             logger.warning("List of dates: could not fetch documents: {}", e)
             all_docs = []
+
+        # ------------------------------------------------------------------
+        # FAST PATH: pure-deletion regeneration.
+        # When the caller passed deleted_doc_ids and no batch_result (i.e.
+        # nothing was newly uploaded — the only change is a deletion), there
+        # is nothing for the LLM to add. Filter the cached prior list to
+        # remove entries from the deleted docs and emit. This saves a Gemini
+        # call per deletion and avoids paraphrased-duplicate noise in the
+        # subsequent merge.
+        # ------------------------------------------------------------------
+        deleted_set_fast = {str(x).strip() for x in (deleted_doc_ids or []) if x}
+        if deleted_set_fast and not isinstance(batch_result, dict):
+            live_doc_ids_fast = {
+                str(d.get("document_id") or "").strip()
+                for d in (all_docs or [])
+                if d.get("document_id")
+            }
+            prior_fast = self._workspace_list_of_dates_payload.get(workspace_id) or []
+            if not isinstance(prior_fast, list):
+                prior_fast = []
+            before_count = len(prior_fast)
+            prior_fast = [
+                e
+                for e in prior_fast
+                if isinstance(e, dict)
+                and str(e.get("sourceDocId") or "").strip() not in deleted_set_fast
+            ]
+            prior_fast = self._drop_entries_for_deleted_docs(
+                prior_fast,
+                live_doc_ids_fast,
+                drop_unattributed=True,
+            )
+            prior_fast.sort(
+                key=lambda x: (
+                    str(x.get("date") or ""),
+                    str(x.get("title") or ""),
+                    str(x.get("sourceDocName") or ""),
+                )
+            )
+            self._workspace_list_of_dates_payload[workspace_id] = prior_fast
+            payload_fast = {
+                "workspaceId": workspace_id,
+                "userId": user_id,
+                "listOfDates": prior_fast,
+            }
+            await self._socket_client.emit(
+                "document_feature_response",
+                {
+                    "featureType": "list_of_dates",
+                    "workspaceId": workspace_id,
+                    "userId": user_id,
+                    "payload": payload_fast,
+                },
+            )
+            logger.success(
+                "✅ List of dates filtered+emitted after deletion (no LLM regen): "
+                "{} → {} entries (dropped {})",
+                before_count,
+                len(prior_fast),
+                before_count - len(prior_fast),
+            )
+            self._log_list_of_dates_outbound(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                list_of_dates=prior_fast,
+                context="post-deletion-filtered",
+            )
+            await asyncio.sleep(0.2)
+            return
+
         processed_doc_ids: set[str] = set()
         if isinstance(batch_result, dict):
             for r in batch_result.get("results") or []:
@@ -4635,9 +4773,43 @@ Example shape:
         # safe for the sync case too: entries from non-changed docs stay as-is
         # and only the LLM decides whether new entries are duplicates of ANY
         # prior entry.
+        #
+        # IMPORTANT: filter the cached `prior` against the LIVE document ids
+        # before merging. The merge preserves prev verbatim, so without this
+        # filter, entries from a deleted document would persist forever in
+        # the cache (and keep being re-emitted) — that is the bug the user
+        # reported when documents are deleted via workspace_sync.
+        live_doc_ids = {
+            str(d.get("document_id") or "").strip()
+            for d in (all_docs or [])
+            if d.get("document_id")
+        }
         prior = self._workspace_list_of_dates_payload.get(workspace_id) or []
         if not isinstance(prior, list):
             prior = []
+        # Deletion context: do an explicit, deterministic pre-pass first so
+        # rows from freshly-deleted IDs are killed even if the vector_store
+        # delete hasn't fully propagated yet (live_doc_ids would otherwise
+        # still include them and the live-set filter would keep them).
+        deleted_set = {str(x).strip() for x in (deleted_doc_ids or []) if x}
+        if deleted_set:
+            before = len(prior)
+            prior = [
+                e
+                for e in prior
+                if isinstance(e, dict)
+                and str(e.get("sourceDocId") or "").strip() not in deleted_set
+            ]
+            if before != len(prior):
+                logger.info(
+                    "list_of_dates: explicit-delete pre-pass dropped {} cached entry/entries",
+                    before - len(prior),
+                )
+        prior = self._drop_entries_for_deleted_docs(
+            prior,
+            live_doc_ids,
+            drop_unattributed=bool(deleted_set),
+        )
         if prior:
             merged = await self._llm_merge_dated_entries_against_previous(
                 prior, list_of_dates or [],
@@ -5470,10 +5642,19 @@ Indian Kanoon / case-law search results:
         user_id: str,
         workspace_role: Optional[str] = None,
         batch_result: Optional[Dict[str, Any]] = None,
+        deleted_doc_ids: Optional[List[str]] = None,
     ) -> None:
         """
         Fetch workspace documents, generate procedural/upcoming dates, emit to backend and cache.
         Emits document_feature_response with featureType "procedural_timeline".
+
+        ``deleted_doc_ids`` mirrors the parameter on
+        ``_generate_and_emit_list_of_dates``. When deletion is the only
+        change (``batch_result is None`` and ``deleted_doc_ids`` is
+        non-empty), a fast path is taken: the cached prior list is filtered
+        to remove entries from deleted documents and emitted, with no LLM
+        regeneration. The remaining documents have not changed, so their
+        timeline entries are already in the cache.
         """
         if not self._socket_client:
             return
@@ -5484,6 +5665,55 @@ Indian Kanoon / case-law search results:
         except Exception as e:
             logger.warning("Procedural timeline: could not fetch documents: {}", e)
             all_docs = []
+
+        # ------------------------------------------------------------------
+        # FAST PATH: pure-deletion regeneration. See the same block in
+        # _generate_and_emit_list_of_dates for rationale.
+        # ------------------------------------------------------------------
+        deleted_set_fast = {str(x).strip() for x in (deleted_doc_ids or []) if x}
+        if deleted_set_fast and not isinstance(batch_result, dict):
+            live_doc_ids_fast = {
+                str(d.get("document_id") or "").strip()
+                for d in (all_docs or [])
+                if d.get("document_id")
+            }
+            prior_fast = (
+                self._workspace_procedural_timeline_payload.get(workspace_id) or []
+            )
+            if not isinstance(prior_fast, list):
+                prior_fast = []
+            before_count = len(prior_fast)
+            prior_fast = [
+                e
+                for e in prior_fast
+                if isinstance(e, dict)
+                and str(e.get("sourceDocId") or "").strip() not in deleted_set_fast
+            ]
+            prior_fast = self._drop_entries_for_deleted_docs(
+                prior_fast,
+                live_doc_ids_fast,
+                drop_unattributed=True,
+            )
+            prior_fast.sort(key=lambda x: str(x.get("date") or ""))
+            self._workspace_procedural_timeline_payload[workspace_id] = prior_fast
+            await self._socket_client.emit(
+                "document_feature_response",
+                {
+                    "featureType": "procedural_timeline",
+                    "workspaceId": workspace_id,
+                    "userId": user_id,
+                    "payload": {"proceduralTimeline": prior_fast},
+                },
+            )
+            logger.success(
+                "✅ Procedural timeline filtered+emitted after deletion (no LLM regen): "
+                "{} → {} entries (dropped {})",
+                before_count,
+                len(prior_fast),
+                before_count - len(prior_fast),
+            )
+            await asyncio.sleep(0.1)
+            return
 
         processed_doc_ids: set = set()
         if isinstance(batch_result, dict):
@@ -5509,9 +5739,40 @@ Indian Kanoon / case-law search results:
         # Same full-prior merge pattern as list_of_dates: feed the entire prior
         # cache to the LLM merge so cross-document paraphrases get caught,
         # regardless of which docs were re-processed in this regeneration.
+        #
+        # IMPORTANT: filter the cached `prior` against the LIVE document ids
+        # before merging — the merge preserves prev verbatim, so otherwise
+        # entries from deleted documents survive every regeneration. Same
+        # bug shape as list_of_dates; same self-healing fix.
+        live_doc_ids = {
+            str(d.get("document_id") or "").strip()
+            for d in (all_docs or [])
+            if d.get("document_id")
+        }
         prior = self._workspace_procedural_timeline_payload.get(workspace_id) or []
         if not isinstance(prior, list):
             prior = []
+        # Deletion context: deterministic pre-pass mirroring the
+        # list_of_dates path; see comment there for rationale.
+        deleted_set = {str(x).strip() for x in (deleted_doc_ids or []) if x}
+        if deleted_set:
+            before = len(prior)
+            prior = [
+                e
+                for e in prior
+                if isinstance(e, dict)
+                and str(e.get("sourceDocId") or "").strip() not in deleted_set
+            ]
+            if before != len(prior):
+                logger.info(
+                    "procedural_timeline: explicit-delete pre-pass dropped {} cached entry/entries",
+                    before - len(prior),
+                )
+        prior = self._drop_entries_for_deleted_docs(
+            prior,
+            live_doc_ids,
+            drop_unattributed=bool(deleted_set),
+        )
         if prior:
             merged = await self._llm_merge_dated_entries_against_previous(
                 prior, timeline or [],
@@ -5579,11 +5840,18 @@ Indian Kanoon / case-law search results:
         batch_result: Optional[Dict[str, Any]],
         *,
         log_context: str = "",
+        deleted_doc_ids: Optional[List[str]] = None,
     ) -> None:
         """
         Run list_of_dates → applicable_laws → procedural_timeline without blocking the
         active socket handler, so user_message_request (intelligence chat) can be
         processed while these emit.
+
+        ``deleted_doc_ids`` is forwarded to the dated-feature regeneration
+        helpers so they can purge cached entries that came from documents
+        the user just removed (see workspace_sync deletion path). When
+        omitted (e.g. upload-driven regeneration) the helpers run in their
+        existing lenient mode.
         """
         ctx = log_context or ""
 
@@ -5594,6 +5862,7 @@ Indian Kanoon / case-law search results:
                     user_id=user_id,
                     workspace_role=workspace_role,
                     batch_result=batch_result,
+                    deleted_doc_ids=deleted_doc_ids,
                 )
             except Exception as lod_err:
                 logger.warning(
@@ -5629,6 +5898,7 @@ Indian Kanoon / case-law search results:
                     user_id=user_id,
                     workspace_role=workspace_role,
                     batch_result=batch_result,
+                    deleted_doc_ids=deleted_doc_ids,
                 )
             except Exception as pt_err:
                 logger.warning(
@@ -11798,6 +12068,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         workspace_role=workspace_role,
                         batch_result=None,
                         log_context=" (after document deletion)",
+                        deleted_doc_ids=list(deleted_ids),
                     )
 
             # Process new evidence files if any (skip files that are deleted: isDeleted true or in deleted_ids)

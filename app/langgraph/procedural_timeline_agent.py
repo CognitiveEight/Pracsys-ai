@@ -136,6 +136,11 @@ class ProceduralTimelineState(TypedDict, total=False):
     today_str: str
     # Input documents: list of {document_id, name, content}
     documents: List[Dict[str, Any]]
+    # Optional deterministic document inventory (built by the caller from
+    # cached document_assessments — see EventHandler._build_document_inventory)
+    # which the consolidation step uses to ground reasoning on the document
+    # mix without re-inferring types from OCR text.
+    document_inventory: str
     # Raw per-document extractions (may have cross-document duplicates)
     raw_entries: List[Dict[str, Any]]
     # After semantic consolidation across documents
@@ -582,13 +587,20 @@ class ProceduralTimelineAgent:
         except Exception:
             return {"consolidated_entries": raw_entries}
 
+        document_inventory = state.get("document_inventory") or ""
+        inventory_block = (
+            f"{document_inventory}\n\n"
+            if document_inventory.strip()
+            else "DOCUMENT INVENTORY: (no classified inventory available)\n\n"
+        )
+
         prompt = f"""You are consolidating a legal case timeline. Below is a RAW list of
 timeline entries extracted from multiple documents of the SAME legal matter. Many entries
 describe the SAME underlying event but were phrased differently across documents.
 
 Today's date: {today_str}
 
-TASK — produce the CLEAN legal timeline by:
+{inventory_block}TASK — produce the CLEAN legal timeline by:
   1. MERGING near-duplicates: if two or more entries describe the same real-world event
      (within ~10 days of each other AND semantically equivalent — e.g. "Service
      Registration" vs "Formal Service Request Registered"), KEEP ONLY ONE. Pick the
@@ -1101,6 +1113,7 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
         workspace_id: str,
         documents: List[Dict[str, Any]],
         today_str: Optional[str] = None,
+        document_inventory: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Run the full procedural timeline extraction pipeline.
@@ -1109,6 +1122,10 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
             workspace_id: workspace identifier (for logging)
             documents: list of {document_id, name, content} dicts
             today_str: today's date as YYYY-MM-DD (defaults to UTC now)
+            document_inventory: optional pre-built inventory string from
+                EventHandler._build_document_inventory(). When supplied, the
+                consolidation prompt cites it as ground truth for which
+                document types are present.
 
         Returns:
             Sorted list of {title, date, description, type} procedural entries.
@@ -1120,6 +1137,7 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
             "workspace_id": workspace_id,
             "today_str": today_str,
             "documents": documents,
+            "document_inventory": document_inventory or "",
         }
         result = await self._workflow.ainvoke(state)
         timeline = result.get("timeline") if isinstance(result, dict) else []

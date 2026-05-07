@@ -4,9 +4,7 @@ and vector storage.
 """
 
 import asyncio
-import json
 import os
-import re
 import socket
 import tempfile
 from pathlib import Path
@@ -17,7 +15,9 @@ from loguru import logger
 
 from app.observability.audit import audit_logger
 from app.observability.trace import tracer
+from app.processing.document_classifier import classify_and_extract
 from app.processing.file_handlers import file_processor
+from app.processing.pii_detector import PIIScanResult, scan_text
 from app.processing.readability import readability_scorer
 from app.utils.exceptions import FileProcessingError
 from app.vectorstore.qdrant import vector_store
@@ -75,31 +75,6 @@ class DocumentProcessor:
                     return first[: max_chars - 1].rsplit(" ", 1)[0] + "…"
         return text[: max_chars - 1] + "…" if len(text) > max_chars else text
 
-    def _salvage_summary_from_truncated_json(self, raw: str) -> str:
-        """If Gemini returned truncated JSON (e.g. Unterminated string), extract the summary value."""
-        if not raw or "summary" not in raw:
-            return ""
-        idx = raw.find('"summary"')
-        if idx < 0:
-            return ""
-        # Find the opening quote of the value (after ": or ": )
-        colon = raw.find(":", idx + 9)
-        if colon < 0:
-            return ""
-        start_quote = raw.find('"', colon + 1)
-        if start_quote < 0:
-            return ""
-        start = start_quote + 1
-        end = start
-        while end < len(raw):
-            if raw[end] == "\\" and end + 1 < len(raw):
-                end += 2
-                continue
-            if raw[end] == '"':
-                return raw[start:end].strip()
-            end += 1
-        return raw[start:].strip()
-
     async def _get_english_summary_fallback(self, extracted_text: str) -> str:
         """Get a one-sentence English summary from Gemini when main JSON fails (avoids Hindi/extractive)."""
         if not extracted_text or len(extracted_text.strip()) < 20:
@@ -125,109 +100,30 @@ Document excerpt:
             logger.debug("English summary fallback failed: {}", str(e))
         return self._extractive_summary_fallback(extracted_text)
 
-    async def _get_summary_and_evidentiary_strength(
-        self, extracted_text: str, filename: str
-    ) -> Dict[str, str]:
+    async def _classify_document(
+        self, redacted_text: str, filename: str
+    ) -> Dict[str, Any]:
+        """Run the unified classifier on PII-redacted text and fall back to
+        an English summary if the classifier returns nothing usable.
+
+        Returns a dict with keys:
+            summary, evidentiary_strength, document_type, extracted_fields.
         """
-        Generate a short summary and evidentiary strength for the document using AI.
-        Summary is always requested in English. Returns {"summary": str, "evidentiary_strength": "Low"|"Medium"|"High"}.
-        """
-        fallback_extractive = self._extractive_summary_fallback(extracted_text)
-        if not extracted_text or len(extracted_text.strip()) < 30:
-            english_fallback = await self._get_english_summary_fallback(extracted_text)
-            return {"summary": english_fallback, "evidentiary_strength": "Low"}
-        try:
-            from app.ai.gemini_client import gemini_client
+        if not redacted_text or len(redacted_text.strip()) < 30:
+            english_fallback = await self._get_english_summary_fallback(redacted_text)
+            return {
+                "summary": english_fallback,
+                "evidentiary_strength": "Low",
+                "document_type": "other",
+                "extracted_fields": {},
+            }
 
-            gemini_client.initialize()
-            text_snippet = (
-                (extracted_text.strip()[:4000] + "...")
-                if len(extracted_text) > 4000
-                else extracted_text.strip()
+        result = await classify_and_extract(redacted_text, filename)
+        if not result.get("summary"):
+            result["summary"] = await self._get_english_summary_fallback(
+                redacted_text
             )
-            prompt = f"""You are a legal document analyst. For the document excerpt below, output a single JSON object with two keys:
-- "summary": 2-3 short sentences in English only summarizing what the document is about and its relevance. Keep the summary under 250 characters. Write in English regardless of the document language.
-- "evidentiaryStrength": exactly one of "Low", "Medium", or "High" (how useful as evidence).
-
-Document excerpt:
-{text_snippet}
-
-Output only the JSON object, no markdown, no code block, no other text. Example:
-{{"summary": "This document is a complaint letter to the police regarding a hacked social media account.", "evidentiaryStrength": "High"}}"""
-            raw = await gemini_client.generate(prompt, temperature=0.2, max_tokens=12000)
-            if not raw or "Error" in (raw[:80] or ""):
-                english_fallback = await self._get_english_summary_fallback(
-                    extracted_text
-                )
-                return {"summary": english_fallback, "evidentiary_strength": "Medium"}
-            raw_clean = raw.strip()
-            if "```" in raw_clean:
-                code = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw_clean)
-                if code:
-                    raw_clean = (code.group(1) or "").strip()
-            start = raw_clean.find("{")
-            if start >= 0:
-                depth = 0
-                for i in range(start, len(raw_clean)):
-                    if raw_clean[i] == "{":
-                        depth += 1
-                    elif raw_clean[i] == "}":
-                        depth -= 1
-                        if depth == 0:
-                            raw_clean = raw_clean[start : i + 1]
-                            break
-            if not raw_clean or not raw_clean.strip().startswith("{"):
-                logger.debug(
-                    "Summary JSON not found (response len={}). First 300 chars: {}",
-                    len(raw),
-                    (raw[:300] if raw else ""),
-                )
-                english_fallback = await self._get_english_summary_fallback(
-                    extracted_text
-                )
-                return {"summary": english_fallback, "evidentiary_strength": "Medium"}
-            data = json.loads(raw_clean)
-            summary = (data.get("summary") or "").strip()
-            if not summary:
-                summary = await self._get_english_summary_fallback(extracted_text)
-            strength = (
-                data.get("evidentiaryStrength")
-                or data.get("evidentiary_strength")
-                or "Medium"
-            ).strip()
-            if strength not in ("Low", "Medium", "High"):
-                strength = "Medium"
-            return {"summary": summary, "evidentiary_strength": strength}
-        except json.JSONDecodeError as e:
-            logger.warning(
-                "Summary JSON parse failed: {}; raw (first 400 chars): {}",
-                str(e),
-                (raw[:400] if raw else ""),
-            )
-            # Try to repair truncated JSON (Unterminated string: close the value string and object)
-            if raw and "Unterminated string" in str(e):
-                try:
-                    # Append closing quote for the summary value and the rest of the object
-                    repaired = raw.rstrip() + '", "evidentiaryStrength": "Medium"}'
-                    data = json.loads(repaired)
-                    summary = (data.get("summary") or "").strip()
-                    if summary and len(summary) >= 10:
-                        strength = (data.get("evidentiaryStrength") or "Medium").strip()
-                        if strength not in ("Low", "Medium", "High"):
-                            strength = "Medium"
-                        return {"summary": summary, "evidentiary_strength": strength}
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            # Try to salvage partial summary from truncated JSON
-            salvaged = self._salvage_summary_from_truncated_json(raw)
-            if salvaged and len(salvaged) >= 25:
-                return {"summary": salvaged, "evidentiary_strength": "Medium"}
-            english_fallback = await self._get_english_summary_fallback(extracted_text)
-            return {"summary": english_fallback, "evidentiary_strength": "Medium"}
-        except Exception as e:
-            logger.warning("Summary/evidentiary strength generation failed: {}", str(e))
-            english_fallback = await self._get_english_summary_fallback(extracted_text)
-            return {"summary": english_fallback, "evidentiary_strength": "Medium"}
+        return result
 
     def _infer_format_from_filename(self, filename: str) -> str:
         """Infer a coarse format type used by readability scoring."""
@@ -334,26 +230,67 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
                 "format": self._infer_format_from_filename(filename),
             }
 
-            # Calculate readability score
+            # Calculate readability score (uses raw text length, not redacted)
             readability_result = readability_scorer.calculate_score(
                 extracted_text, extraction_metadata, file_size
             )
 
-            # Store in vector database (user-scoped)
+            # PII redaction: scan the raw extracted text for Indian
+            # identifier patterns (Aadhaar, PAN, GSTIN, Udyam, passport,
+            # EPIC, DL, bank account, mobile). The redacted copy is what
+            # leaves this function — vector DB, Gemini calls, logs, and
+            # the public ``summary`` / ``extracted_fields`` payload all
+            # use ``redacted_text``. Full values stay only in ``sensitive_fields``
+            # which downstream is expected to encrypt at rest.
+            pii_scan: PIIScanResult = scan_text(extracted_text)
+            redacted_text = pii_scan.redacted_text
+            sensitive_fields = pii_scan.sensitive_fields()
+            masked_pii_fields = pii_scan.masked_fields()
+
+            # Classify document type, extract structured fields, and produce
+            # the legal-analyst summary in a single Gemini call. Runs on the
+            # REDACTED text so PII never reaches the LLM. We classify BEFORE
+            # vector storage so document_type / extracted_fields can be
+            # persisted in chunk metadata — downstream feature agents can
+            # then ground their reasoning on a deterministic document
+            # inventory rather than re-inferring type from OCR text.
+            classification = await self._classify_document(redacted_text, filename)
+
+            # Merge identifier matches from regex extraction into the LLM's
+            # extracted_fields output. Regex wins on numeric IDs (deterministic);
+            # LLM provides names, dates, addresses, and free-form fields.
+            extracted_fields: Dict[str, Any] = dict(
+                classification.get("extracted_fields") or {}
+            )
+            for field_type, masked_values in masked_pii_fields.items():
+                # Single-value fields: take first match. List fields kept as-is.
+                if field_type in ("aadhaar_number", "pan_number",
+                                   "udyam_number", "passport_number",
+                                   "voter_id_number", "driving_licence_number"):
+                    extracted_fields.setdefault(field_type, masked_values[0])
+                else:
+                    extracted_fields.setdefault(field_type, masked_values)
+
+            # Store in vector database (user-scoped). Use REDACTED text so
+            # raw IDs never land in chunk content. Persist document_type and
+            # the masked extracted_fields in chunk metadata so retrievers
+            # downstream see the structured signal alongside the OCR content.
             stored_in_vector_db = False
-            if extracted_text and readability_result["readable"]:
+            if redacted_text and readability_result["readable"]:
                 try:
                     await self._store_in_vector_db(
                         workspace_id=workspace_id,
                         user_id=user_id,
                         document_id=document_id,
-                        text=extracted_text,
+                        text=redacted_text,
                         filename=filename,
                         metadata={
                             **(metadata or {}),
                             **extraction_metadata,
                             "readability": readability_result,
                             "file_size": file_size,
+                            "document_type": classification["document_type"],
+                            "extracted_fields": extracted_fields,
                         },
                     )
                     stored_in_vector_db = True
@@ -361,11 +298,6 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
                     logger.warning(f"Could not store in vector DB: {vector_error}")
                     # Continue processing even if vector storage fails
                     stored_in_vector_db = False
-
-            # Generate summary and evidentiary strength for the document
-            summary_strength = await self._get_summary_and_evidentiary_strength(
-                extracted_text, filename
-            )
 
             # Prepare result
             result = {
@@ -380,16 +312,31 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
                 "metadata": extraction_metadata,
                 "readability_breakdown": readability_result,
                 "stored_in_vector_db": stored_in_vector_db,
-                "summary": summary_strength["summary"],
-                "evidentiary_strength": summary_strength["evidentiary_strength"],
+                "summary": classification["summary"],
+                "evidentiary_strength": classification["evidentiary_strength"],
+                "document_type": classification["document_type"],
+                "extracted_fields": extracted_fields,
+                "sensitive_fields": sensitive_fields,
             }
             if audio_extras:
+                # Replace raw transcript with the redacted copy so cached /
+                # re-emitted transcripts do not leak IDs spoken on a call.
+                if audio_extras.get("transcript"):
+                    audio_extras["transcript"] = redacted_text
                 result.update(audio_extras)
 
-            # Log audit event
+            # Log audit event — strip sensitive_fields so raw IDs never reach
+            # the audit sink. Audit is allowed to know *that* PII was found
+            # (counts per type), not the values.
+            audit_safe = {
+                k: v for k, v in result.items() if k != "sensitive_fields"
+            }
+            audit_safe["sensitive_field_counts"] = {
+                ftype: len(values) for ftype, values in sensitive_fields.items()
+            }
             audit_logger.log_event(
                 event_type="document_processed",
-                data=result,
+                data=audit_safe,
                 workspace_id=workspace_id,
                 user_id=user_id,
             )
@@ -424,6 +371,9 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
                 "readable": False,
                 "summary": "",
                 "evidentiary_strength": "N/A",
+                "document_type": "other",
+                "extracted_fields": {},
+                "sensitive_fields": {},
             }
             if file_processor.is_audio_file(filename):
                 failure_result["is_audio"] = True
@@ -709,14 +659,16 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
         """
         Download a file from URL and extract text only (no vector store, no scoring).
         Used for chat attachments so the user can ask questions about the uploaded document.
-        Returns extracted text, truncated to max_text_chars; empty string on failure.
+        Returns PII-redacted extracted text, truncated to max_text_chars; empty
+        string on failure. Redaction matches the workspace evidence path so
+        chat context never carries raw Aadhaar/PAN/etc. into the LLM prompt.
         """
         try:
             file_content, _ = await self._download_file(url, filename)
             text = file_processor.process_file_by_extension(file_content, filename)
             if not text or not isinstance(text, str):
                 return ""
-            text = text.strip()
+            text = scan_text(text.strip()).redacted_text
             if len(text) > max_text_chars:
                 text = (
                     text[:max_text_chars]

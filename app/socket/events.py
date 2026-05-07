@@ -965,8 +965,11 @@ class SocketEventHandler:
 - **No bracket tags in user-facing output.** Do NOT prefix or label items with "(criminal angle)", "(civil angle)", "(criminal-law angle)", "(civil-law angle)", or any similar bracketed tag. Weave the criminal-law and civil-law content naturally into the prose of `caseSummary` / `reportCaseSummary` / `strategicObjective` and into the plain text of each `possibleNextSteps` bullet, the same way a lawyer would draft them in a memo."""
 
             try:
+                strategy_inventory = self._build_document_inventory(workspace_id)
                 # Improved prompt for better JSON generation
                 structured_prompt = f"""Analyze these legal documents and provide a JSON response.
+
+{strategy_inventory or "DOCUMENT INVENTORY: (no classified inventory available)"}
 
 DOCUMENT CONTENT:
 {combined_document_content}
@@ -2331,6 +2334,96 @@ USER MESSAGE
                 "updateRequestedNow": False,
             }
 
+    def _build_document_inventory(self, workspace_id: str) -> str:
+        """Build a deterministic, prompt-ready inventory of documents the
+        user has uploaded, drawn from the cached document_assessments
+        payload (which includes ``documentType`` and ``extractedFields``
+        produced by ``app.processing.document_classifier``).
+
+        Feature agents (analysis_report, strategy, list_of_dates,
+        applicable_laws, procedural_timeline) inject this string into
+        their prompts so the LLM has a non-OCR signal of which documents
+        are present. This is the structural fix for the bug where the
+        analysis_report flagged identity / financial documents as
+        ``missingInfo`` even though the user had already uploaded them —
+        OCR noise made the agent unable to recognise an Aadhaar / PAN /
+        bank statement from text alone.
+
+        Returns an empty string if the cache is missing so callers can
+        no-op cleanly. Output shape (one line per document):
+
+            DOCUMENT INVENTORY (user-provided uploads, classified):
+            - Annexure 1: aadhaar_card | name=Ramesh Kumar; dob=1985-05-12; address=present; aadhaar_number=XXXX-XXXX-1234
+            - Annexure 2: pan_card | name=Ramesh Kumar; dob=1985-05-12; pan_number=ABCXX1234X
+            - Annexure 3: bank_statement | period_from=2024-01-01; period_to=2024-03-31; closing_balance=present
+        """
+        cached = self._workspace_document_assessments_payload.get(workspace_id)
+        if not isinstance(cached, dict):
+            return ""
+        inner = cached.get("payload") or {}
+        assessments = inner.get("documentAssessments")
+        if not isinstance(assessments, list) or not assessments:
+            return ""
+
+        lines: List[str] = []
+        for idx, item in enumerate(assessments, 1):
+            if not isinstance(item, dict):
+                continue
+            # Audio entries with transcriptStatus only (no documentType) are
+            # represented as their transcript-status so the agent sees them.
+            doc_type = (item.get("documentType") or "other").strip()
+            transcript_status = item.get("transcriptStatus")
+            extracted = item.get("extractedFields") or {}
+
+            field_pairs: List[str] = []
+            if isinstance(extracted, dict):
+                for key, value in extracted.items():
+                    if value is None or value == "":
+                        continue
+                    if isinstance(value, list):
+                        # collapse short lists, summarise long ones
+                        if not value:
+                            continue
+                        if len(value) <= 3:
+                            field_pairs.append(
+                                f"{key}=" + ", ".join(str(v) for v in value)
+                            )
+                        else:
+                            field_pairs.append(
+                                f"{key}=present ({len(value)} entries)"
+                            )
+                    elif isinstance(value, (str, int, float, bool)):
+                        s_val = str(value).strip()
+                        if not s_val:
+                            continue
+                        # Cap very long values so the inventory stays compact.
+                        if len(s_val) > 80:
+                            s_val = s_val[:77] + "…"
+                        field_pairs.append(f"{key}={s_val}")
+            fields_repr = "; ".join(field_pairs) if field_pairs else "(no structured fields extracted)"
+
+            label = f"Annexure {idx}: {doc_type}"
+            if transcript_status and transcript_status != "ready":
+                label += f" [transcript {transcript_status}]"
+            lines.append(f"- {label} | {fields_repr}")
+
+        if not lines:
+            return ""
+
+        header = (
+            "DOCUMENT INVENTORY (user-provided uploads, classified by the "
+            "ingestion pipeline — TREAT AS GROUND TRUTH for which documents "
+            "are present):"
+        )
+        guard = (
+            "INVENTORY USE RULES:\n"
+            "- Any documentType listed above MUST be treated as PRESENT in evidence.\n"
+            "- Identifier numbers in fields (aadhaar_number, pan_number, gstin, etc.) appear MASKED (e.g. XXXX-XXXX-1234); the unmasked value is sealed and not shown — do NOT report a number as 'missing' merely because it is masked.\n"
+            "- Field values shown as 'present' indicate the field exists in the document but its value is omitted; treat the field as available.\n"
+            "- Before flagging any item as missing or absent in your output, cross-check this inventory; if the item or an evidentiary equivalent is listed here, do NOT flag it."
+        )
+        return header + "\n" + "\n".join(lines) + "\n\n" + guard
+
     async def _generate_analysis_report_from_documents(
         self,
         workspace_id: str,
@@ -2473,6 +2566,8 @@ USER MESSAGE
             if not current_strategic_objective:
                 current_strategic_objective = "(not provided)"
 
+            document_inventory = self._build_document_inventory(workspace_id)
+
             analysis_prompt = (
                 """You are a senior legal analyst specializing in Indian law. Your task is to produce a structured legal analysis based ONLY on the uploaded documents.
 
@@ -2489,6 +2584,8 @@ ROLE INSTRUCTION: {}
 CURRENT CASE SUMMARY (from strategy panel):
 {}
 CURRENT STRATEGIC OBJECTIVE (from strategy panel):
+{}
+
 {}
 
 DOCUMENTS (in upload order; last document is most recent):
@@ -2591,12 +2688,33 @@ Only treat something as "present" if it is explicitly stated in the documents.
 STEP 2 — MISSING INFORMATION VERIFICATION
 --------------------------------------------------
 
-Before listing an item in missingInfo, verify BOTH conditions:
+Before listing an item in missingInfo, verify ALL THREE conditions:
 
 1. The information is NOT present anywhere in the documents.
-2. The information is CRITICAL to prove the case or defend the case.
+2. The information is NOT covered by any documentType listed in DOCUMENT INVENTORY (e.g. if inventory shows aadhaar_card, do NOT add "Aadhaar / identity proof missing"; if inventory shows bank_statement, do NOT add "bank statement / account proof missing"; if inventory shows pan_card, do NOT add "PAN / tax identity missing").
+3. The information is CRITICAL to prove the case or defend the case.
 
-If either condition fails, DO NOT include it.
+If ANY condition fails, DO NOT include it.
+
+DOCUMENT-TYPE COVERAGE TABLE (use to map inventory entries to common missingInfo phrasings — if the type is in inventory, the listed missingInfo phrasings are FORBIDDEN):
+- aadhaar_card → identity proof, Aadhaar, UID
+- pan_card → PAN, tax ID, Income Tax identifier
+- passport → passport, foreign travel proof
+- voter_id → voter ID, EPIC, electoral identity
+- driving_licence → driving licence, DL, address proof
+- msme_certificate → MSME registration, Udyam certificate, enterprise registration
+- gst_certificate → GST registration, GSTIN
+- bank_statement → bank statement, account statement, financial transactions proof
+- itr_return → income tax return, ITR, income proof
+- salary_slip / form_16 → salary proof, employment proof, income evidence
+- electricity_bill / water_bill / gas_bill / telecom_bill → address proof, utility bill
+- sale_deed / rental_agreement / loan_agreement → property documents, agreement, written contract
+- fir / complaint → FIR, police complaint, criminal complaint
+- court_order / judgment → court order, judgment, prior decision
+- notice / affidavit → notice, sworn statement
+- marriage_certificate → marriage proof
+- birth_certificate → birth proof, age proof
+- death_certificate → death proof
 
 STRICT EXCLUSIONS:
 Do NOT list these as missing if they appear anywhere in the documents:
@@ -2727,6 +2845,7 @@ No extra text.
                 role_instruction,
                 current_case_summary,
                 current_strategic_objective,
+                document_inventory or "DOCUMENT INVENTORY: (no classified inventory available — reason from DOCUMENTS text below)",
                 combined_document_content,
             )
 
@@ -3499,9 +3618,12 @@ Rules:
             tomorrow_str = (today_dt + _timedelta(days=1)).strftime("%Y-%m-%d")
             next_week_str = (today_dt + _timedelta(days=7)).strftime("%Y-%m-%d")
             current_year = today_str[:4]
+            list_of_dates_inventory = self._build_document_inventory(workspace_id)
             prompt = f"""You are a legal case analyst. From the following annexures, extract a chronological list of FACTUAL, CASE-RELEVANT dates and events.
 
 **Today's date**: {today_str} (current year is {current_year}). Anchor every relative or partial date against this.
+
+{list_of_dates_inventory or "DOCUMENT INVENTORY: (no classified inventory available)"}
 
 **Annexure content** (each file is labeled Annexure 1, Annexure 2, etc. with id and name):
 {combined}
@@ -5167,6 +5289,8 @@ If — and only if — a fact in the documents is clearly governed by an Indian 
 
 {targeted_acts_block}
 
+{self._build_document_inventory(workspace_id) or "DOCUMENT INVENTORY: (no classified inventory available)"}
+
 Workspace role: {workspace_role}
 Workspace title: {signals.get("workspaceTitle","")}
 Search query: {signals.get("query","")}
@@ -5328,6 +5452,7 @@ Indian Kanoon / case-law search results:
                 workspace_id=workspace_id,
                 documents=documents,
                 today_str=_dt.utcnow().strftime("%Y-%m-%d"),
+                document_inventory=self._build_document_inventory(workspace_id),
             )
             logger.info(
                 "Procedural timeline: generated {} entries for workspace {}",
@@ -10992,6 +11117,21 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                     "evidentiaryStrength": result.get(
                                         "evidentiary_strength", "N/A"
                                     ),
+                                    # Document classification + structured fields.
+                                    # documentType: snake_case enum (e.g. aadhaar_card,
+                                    # bank_statement, fir, court_order, other).
+                                    # extractedFields: masked / safe values for display.
+                                    # sensitiveFields: full raw IDs for sealed encrypted
+                                    # storage on the backend — must NOT be displayed.
+                                    "documentType": result.get(
+                                        "document_type", "other"
+                                    ),
+                                    "extractedFields": result.get(
+                                        "extracted_fields", {}
+                                    ),
+                                    "sensitiveFields": result.get(
+                                        "sensitive_fields", {}
+                                    ),
                                 }
                                 # Audio: attach transcript + transcriptStatus.
                                 # When transcription has not produced text yet ("pending")
@@ -11857,6 +11997,15 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                     "summary": result.get("summary", ""),
                                     "evidentiaryStrength": result.get(
                                         "evidentiary_strength", "N/A"
+                                    ),
+                                    "documentType": result.get(
+                                        "document_type", "other"
+                                    ),
+                                    "extractedFields": result.get(
+                                        "extracted_fields", {}
+                                    ),
+                                    "sensitiveFields": result.get(
+                                        "sensitive_fields", {}
                                     ),
                                 }
                                 # Audio: attach transcript + transcriptStatus.

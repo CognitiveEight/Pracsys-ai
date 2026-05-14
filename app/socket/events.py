@@ -470,6 +470,7 @@ class SocketEventHandler:
             and bool(self._workspace_analysis_payload.get(workspace_id))
             and bool(self._workspace_applicable_laws_payload.get(workspace_id))
             and bool(self._workspace_procedural_timeline_payload.get(workspace_id))
+            and bool(self._workspace_list_of_dates_payload.get(workspace_id))
         )
         if all_warm:
             return
@@ -11894,6 +11895,19 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 evidence_files=evidence_for_context,
                 updated_at=updated_at,
             )
+            # Capture the previously-stored role BEFORE _remember_workspace_role
+            # overwrites the cache, so we can detect a role-only change below.
+            previous_role: Optional[str] = None
+            if payload.workspaceRole:
+                try:
+                    previous_role = await self._restore_workspace_role(
+                        workspace_id=str(payload.workspaceId),
+                        user_id=str(payload.userId),
+                    )
+                except Exception as prev_err:
+                    logger.debug(
+                        "Could not load previous workspace role: {}", prev_err
+                    )
             if payload.workspaceRole:
                 await self._remember_workspace_role(
                     str(payload.workspaceId),
@@ -11909,6 +11923,44 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 "Resolved workspace role for sync generation: {}",
                 resolved_workspace_role,
             )
+            _valid_roles_for_change = {"ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"}
+            _prev_upper = (previous_role or "").strip().upper()
+            _new_upper = (resolved_workspace_role or "").strip().upper()
+            role_changed = (
+                _prev_upper in _valid_roles_for_change
+                and _new_upper in _valid_roles_for_change
+                and _prev_upper != _new_upper
+            )
+            if role_changed:
+                logger.info(
+                    "🔁 Workspace role changed: {} → {} (workspace {})",
+                    _prev_upper,
+                    _new_upper,
+                    str(payload.workspaceId)[:12],
+                )
+                # Early workspace:refresh — mirrors the objective-change pattern
+                # (see _on_user_message_request, "objective_change_regeneration_started").
+                # Fires BEFORE the deletion / files / skip_reprocess / role-change
+                # branches below so the FE shows loading state on role-dependent
+                # panels immediately. feature_types matches objective-change exactly.
+                if self._socket_client:
+                    try:
+                        await self._emit_workspace_refresh(
+                            workspace_id=str(payload.workspaceId),
+                            user_id=str(payload.userId),
+                            reason="role_change_regeneration_started",
+                            feature_types=[
+                                "strategy_objective",
+                                "analysis_report",
+                                "list_of_dates",
+                                "applicable_laws",
+                            ],
+                        )
+                    except Exception as refresh_err:
+                        logger.warning(
+                            "workspace:refresh emit on role-change (early) failed (non-fatal): {}",
+                            refresh_err,
+                        )
 
             # Update workspace metadata (for logging)
             updates = {}
@@ -12596,6 +12648,226 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         is_update=True,
                         log_context=" (skip_reprocess)",
                     )
+
+            # Role-only change (no new files, no deletions): regenerate role-dependent
+            # features (strategy, analysis, applicable_laws) and re-emit role-independent
+            # features (list_of_dates, procedural_timeline, document_assessments,
+            # workspace_metadata) from cache. CLAUDE.md L39: "role changes invalidate
+            # all derived intelligence" — this branch implements that contract for
+            # the socket path. Reached only when none of the file/delete/skip_reprocess
+            # branches above ran, but the user changed the role on Edit Workspace.
+            elif role_changed and self._socket_client:
+                workspace_id = payload.workspaceId
+                user_id = payload.userId
+                workspace_role = resolved_workspace_role
+                log_ctx = " (role change)"
+
+                # Hydrate in-memory caches from Qdrant before the re-emit guards
+                # below check `.get(workspace_id)`. Without this, a process
+                # restart between workspace_created and the role-change sync
+                # leaves _workspace_list_of_dates_payload and
+                # _workspace_procedural_timeline_payload empty in memory, so the
+                # `if cached_X is not None` checks silently skip the re-emits.
+                # The helper is idempotent (warm-cache short-circuit).
+                try:
+                    await self._hydrate_workspace_caches(
+                        str(workspace_id), user_id=str(user_id)
+                    )
+                except Exception as hydrate_err:
+                    logger.debug(
+                        "Role-change branch: cache hydration failed (non-fatal): {}",
+                        hydrate_err,
+                    )
+
+                # workspace:refresh was already emitted early (right after
+                # role-change detection) to mirror the objective-change pattern;
+                # don't re-emit here.
+
+                # Re-emit role-independent panels from cache so the UI stays
+                # populated while role-dependent panels regenerate.
+                cached_assessments = self._workspace_document_assessments_payload.get(
+                    workspace_id
+                )
+                if cached_assessments:
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "document_assessments",
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "payload": cached_assessments,
+                        },
+                    )
+                    logger.success(
+                        "✅ Document assessments re-emitted{} (from cache)", log_ctx
+                    )
+
+                cached_metadata = self._workspace_metadata_payload.get(workspace_id)
+                if cached_metadata:
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "workspace_metadata",
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "payload": cached_metadata,
+                        },
+                    )
+                    logger.success(
+                        "✅ Workspace metadata re-emitted{} (from cache)", log_ctx
+                    )
+
+                # NOTE: list_of_dates and procedural_timeline are re-emitted
+                # from cache AFTER analysis_report (below) to mirror the
+                # skip_reprocess branch (L12506+) and the objective-change flow's
+                # order: workspace:refresh → strategy → analysis → list_of_dates
+                # → procedural_timeline. Emitting them up here (before the
+                # strategy/analysis regens) caused the FE to drop the
+                # list_of_dates payload, because the early workspace:refresh
+                # told the FE to expect a fresh list_of_dates AFTER the
+                # role-dependent panels finished regenerating.
+
+                # 3) Regenerate strategy_objective for the new role, emit + cache.
+                strategies_result = None
+                try:
+                    strategies_result = await self._generate_strategies_from_documents(
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        workspace_role=workspace_role,
+                        batch_result=None,
+                        is_update=True,
+                    )
+                except Exception as strategy_err:
+                    logger.warning(
+                        "Strategy regeneration{} failed: {}", log_ctx, strategy_err
+                    )
+                if not strategies_result:
+                    strategies_result = self._strategy_objective_fallback(
+                        workspace_id, user_id, workspace_role, is_update=True
+                    )
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "strategy_objective",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": strategies_result,
+                    },
+                )
+                self._workspace_strategy_payload[workspace_id] = strategies_result
+                logger.success("🎉 Strategy & Objectives regenerated{}", log_ctx)
+                await asyncio.sleep(0.15)
+
+                # 4) Regenerate analysis_report for the new role, emit + cache.
+                # Do NOT use self._emit_analysis_report — it auto-schedules
+                # list_of_dates/applicable_laws/procedural_timeline regeneration,
+                # which would re-run the role-independent features we just
+                # re-emitted from cache. Mirror the deletion-path pattern instead.
+                analysis_report = None
+                try:
+                    analysis_report = (
+                        await self._generate_analysis_report_from_documents(
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            workspace_role=workspace_role,
+                            batch_result=None,
+                            is_update=True,
+                        )
+                    )
+                except Exception as ar_err:
+                    logger.warning(
+                        "Analysis report regeneration{} failed: {}",
+                        log_ctx,
+                        ar_err,
+                    )
+                if not analysis_report or not isinstance(analysis_report, dict):
+                    analysis_report = self._analysis_report_fallback(
+                        (workspace_role or "ADJUDICATOR").strip().upper()
+                    )
+                if isinstance(analysis_report, dict):
+                    try:
+                        analysis_report = (
+                            await self._merge_analysis_report_with_previous(
+                                workspace_id=str(workspace_id),
+                                workspace_role=workspace_role,
+                                new_analysis=analysis_report,
+                                log_context=log_ctx,
+                            )
+                        )
+                    except Exception as merge_err:
+                        logger.warning(
+                            "Analysis report merge{} failed: {}; emitting unmerged",
+                            log_ctx,
+                            merge_err,
+                        )
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "analysis_report",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": analysis_report,
+                    },
+                )
+                self._workspace_analysis_payload[workspace_id] = analysis_report
+                logger.success("✅ Analysis report regenerated{}", log_ctx)
+                # Allow socket to flush analysis_report before the next emit
+                # (mirrors skip_reprocess branch pattern).
+                await asyncio.sleep(0.15)
+
+                # 5) Re-emit list_of_dates from cache (role-independent).
+                #    Placed AFTER analysis_report so the FE state machine
+                #    accepts it — matches the order used by the skip_reprocess
+                #    branch (L12506+) and the objective-change flow.
+                cached_list_of_dates = self._workspace_list_of_dates_payload.get(
+                    workspace_id
+                )
+                if cached_list_of_dates is not None:
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "list_of_dates",
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "payload": {
+                                "workspaceId": workspace_id,
+                                "userId": user_id,
+                                "listOfDates": cached_list_of_dates,
+                            },
+                        },
+                    )
+                    logger.success(
+                        "✅ List of dates re-emitted{} (from cache)", log_ctx
+                    )
+
+                # 6) Re-emit procedural_timeline from cache (role-independent).
+                cached_procedural_timeline = (
+                    self._workspace_procedural_timeline_payload.get(workspace_id)
+                )
+                if cached_procedural_timeline is not None:
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "procedural_timeline",
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "payload": {
+                                "proceduralTimeline": cached_procedural_timeline,
+                            },
+                        },
+                    )
+                    logger.success(
+                        "✅ Procedural timeline re-emitted{} (from cache)", log_ctx
+                    )
+
+                # 7) Regenerate applicable_laws only (do not touch list_of_dates
+                #    or procedural_timeline — they are role-independent).
+                self._schedule_applicable_laws_only(
+                    workspace_id=str(workspace_id),
+                    user_id=str(user_id),
+                    workspace_role=workspace_role,
+                    log_context=log_ctx,
+                )
 
             # When sync has no evidence files (e.g. user deleted all docs), emit both strategy and analysis
             # with empty/fallback payload so backend receives both and can show empty state (not null).

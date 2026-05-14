@@ -21,6 +21,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.0.0] - 2026-04-27
+
+### Added
+
+- Added a new **Procedural Timeline Agent** (`app/langgraph/procedural_timeline_agent.py`) that extracts, consolidates, validates, and emits a legal-journey timeline across uploaded case documents.
+- Added a new socket feature payload type: **`procedural_timeline`** (via `document_feature_response`) with reconnect-safe cache and merge behavior.
+- Added `app/prompts/applicable_acts.py` to strengthen Indian-law grounding used in timeline and law-relevance reasoning.
+
+### Changed
+
+- Updated strategy, analysis, chat, and applicable-laws behavior to apply a **dual legal lens**: evaluate both **criminal-law** and **civil-law** tracks when facts support both.
+- Improved role-conditioned legal prompting so outputs remain role-consistent while still covering both legal branches where relevant.
+- Expanded scheduled feature generation flow to include `list_of_dates` → `applicable_laws` → `procedural_timeline` without blocking chat handling.
+
+### Fixed
+
+- Fixed procedural timeline event typing/normalization and downstream payload consistency in socket emission flow.
+- Fixed prompt-level behavior drift so criminal/civil coverage is consistently applied across generated legal outputs.
+
+---
+
 ## [2.0.1] - 2026-04-23 — Hotfix
 
 ### Fixed
@@ -83,7 +104,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/viitoradmin/law-firm-simplertoday-ai/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/viitoradmin/law-firm-simplertoday-ai/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/viitoradmin/law-firm-simplertoday-ai/compare/v2.0.1...v3.0.0
 [2.0.1]: https://github.com/viitoradmin/law-firm-simplertoday-ai/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/viitoradmin/law-firm-simplertoday-ai/releases/tag/v2.0.0
 [1.0.0]: https://github.com/viitoradmin/law-firm-simplertoday-ai/releases/tag/v1.0.0

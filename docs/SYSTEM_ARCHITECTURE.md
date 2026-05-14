@@ -42,7 +42,8 @@ This document describes the **current system architecture** and **multi-agent fl
                                             ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │  Emits: document_feature_response (strategy_objective, document_assessments,     │
-│         analysis_report, list_of_dates, applicable_laws) | ai_response (chat)    │
+│         analysis_report, list_of_dates, procedural_timeline, applicable_laws) |  │
+│         ai_response (chat)                                                        │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -66,6 +67,8 @@ The AI service is driven by **Socket.IO** events from the backend. Main events:
 |----------------------------|------|
 | `document_feature_response` | After document assessments, strategy/objective, analysis report, list_of_dates, or applicable_laws |
 | `ai_response`              | After processing a user chat message |
+
+`document_feature_response` now also includes `procedural_timeline` as a first-class feature payload type.
 
 ---
 
@@ -177,6 +180,26 @@ context_builder → intent_classifier → explain_why → action_dispatcher → 
 **Intelligence Chat:**
 
 - When the workspace stores `applicable_laws` in metadata, **`ChatContext`** can include that list; **`chat_context_builder_node`** surfaces titles into the prompt so answers can align with the panel (`app/langgraph/chat_nodes.py`, `app/langgraph/chat_integration.py`).
+
+---
+
+### 3.5 Procedural Timeline Generation
+
+**Location:** `app/langgraph/procedural_timeline_agent.py` + `app/socket/events.py` (`_generate_procedural_timeline_from_documents`, `_generate_and_emit_procedural_timeline`).
+
+**Role:** Generate a lawyer-usable **procedural journey timeline** from workspace documents, then emit and cache it as `featureType: "procedural_timeline"`.
+
+**Flow:**
+
+1. Extract timeline candidates per document (date, title, type, source evidence).
+2. Consolidate overlapping/duplicate items into one cleaned sequence.
+3. Validate and normalize event type/date quality.
+4. Emit via `document_feature_response` with payload `{ "proceduralTimeline": [...] }`.
+
+**Scheduling and caching:**
+
+- Procedural timeline generation runs in the scheduled chain after `list_of_dates` and `applicable_laws`.
+- In-memory cache (`_workspace_procedural_timeline_payload`) supports reconnect/re-emit behavior, aligned with other feature payload caches.
 
 ---
 

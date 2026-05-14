@@ -379,6 +379,7 @@ class SocketClient:
             logger.info("   - user_message_request")
             logger.info("   - probing_prompts_request")
             logger.info("   - analysis_report_feedback")
+            logger.info("   - added_missing_information")
             logger.info("   - applicable_law_relevance_request")
             logger.info("   - analysis_docx_generate_request")
             logger.info("   - ai_heartbeat_ping")
@@ -504,6 +505,27 @@ class SocketClient:
             """
             logger.info("📋 Received analysis_report_feedback event")
             await event_handler.handle("analysis_report_feedback", data)
+
+        @self.sio.event
+        async def added_missing_information(data):
+            """
+            Handle added_missing_information (App → Backend → AI_Maverick).
+            User manually supplied a title+description to address previously-flagged
+            missingInfo. AI assesses case relevance; if related, the analysis score
+            is decreased and qualityScoreExplanation is regenerated, then re-emitted.
+            """
+            logger.info("📝 Received added_missing_information event")
+            try:
+                raw = json.dumps(data, default=str) if data is not None else "null"
+                logger.info(
+                    "added_missing_information payload (preview): {}",
+                    raw[:1800] + ("..." if len(raw) > 1800 else ""),
+                )
+            except Exception:
+                logger.info(
+                    "added_missing_information payload (repr): {}", repr(data)
+                )
+            await event_handler.handle("added_missing_information", data)
 
         @self.sio.event
         async def applicable_law_relevance_request(data):

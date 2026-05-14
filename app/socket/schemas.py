@@ -111,6 +111,26 @@ class AnalysisReportFeedbackPayload(BaseModel):
         populate_by_name = True
 
 
+class AddedMissingInformationPayload(BaseModel):
+    """
+    Payload for added_missing_information event (App → Backend → AI service).
+    User manually supplies additional information to address previously-flagged
+    missingInfo items. Free-form title + description (no specific item id).
+    AI assesses relevance against the case; if related, the quality score is
+    decreased and qualityScoreExplanation is regenerated.
+    """
+
+    workspaceId: str
+    userId: str
+    title: str
+    description: str
+    workspaceRole: Optional[str] = None
+    timestamp: str  # ISO timestamp
+
+    class Config:
+        populate_by_name = True
+
+
 class ApplicableLawItemInRequest(BaseModel):
     """Law object inside applicable_law_relevance_request (Server → AI)."""
 

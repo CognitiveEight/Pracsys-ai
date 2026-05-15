@@ -373,6 +373,11 @@ class SocketEventHandler:
         self._workspace_analysis_payload: Dict[str, Any] = PersistentWorkspaceDict(
             CacheKinds.ANALYSIS_REPORT
         )
+        # Per-workspace cache of the extracted case_entities dict so a single
+        # generation cycle that runs strategy → analysis_report extracts the
+        # entities ONCE. Keyed by workspace_id, value is (content_sha1, entities).
+        # The content hash automatically busts the cache when documents change.
+        self._workspace_case_entities_cache: Dict[str, Tuple[str, Dict[str, Any]]] = {}
         # Per-workspace memory of rejected analysis-report items so that an
         # objective-change regeneration does not silently re-introduce a
         # missingInfo / weakness / risk the user already dismissed via
@@ -772,6 +777,413 @@ class SocketEventHandler:
     # Helper Methods
     # ========================================================================
 
+    # Empty case-entities scaffold used by the strategy "deep agents" pipeline.
+    # Sub-extractors that fail or time out fall back to this so synthesis never
+    # crashes on a missing key.
+    _EMPTY_CASE_ENTITIES: Dict[str, List[Any]] = {
+        "parties": [],
+        "dates": [],
+        "properties": [],
+        "amounts": [],
+        "suit_numbers": [],
+        "statutes": [],
+        "annexures": [],
+    }
+
+    async def _run_extraction_subagent(
+        self,
+        workspace_id: str,
+        prompt: str,
+        sub_name: str,
+        expected_keys: List[str],
+    ) -> Dict[str, Any]:
+        """
+        Shared driver for the three parallel extraction sub-agents.
+
+        Runs ONE Gemini call (temperature 0.0, JSON mode, max_tokens 12000),
+        parses the response, and returns a dict with every ``expected_keys``
+        entry populated to a list. Failures are non-fatal: returns
+        ``{key: [] for key in expected_keys}`` so other sub-agents and
+        downstream synthesis still proceed.
+        """
+        scaffold: Dict[str, Any] = {k: [] for k in expected_keys}
+        from app.ai.gemini_client import gemini_client
+        try:
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+        except Exception as e:
+            logger.warning(
+                "Strategy sub-extractor '{}' failed for workspace {}: {}",
+                sub_name,
+                workspace_id[:12] if workspace_id else "",
+                e,
+            )
+            return scaffold
+        if not raw:
+            return scaffold
+        try:
+            json_str = self._prepare_json_candidate(raw.strip(), prefer="object")
+            if not json_str:
+                return scaffold
+            import json as _json
+            parsed = _json.loads(json_str)
+            if not isinstance(parsed, dict):
+                return scaffold
+            for k in expected_keys:
+                if not isinstance(parsed.get(k), list):
+                    parsed[k] = []
+            return parsed
+        except Exception as parse_err:
+            logger.warning(
+                "Strategy sub-extractor '{}' JSON parse failed for workspace {}: {}",
+                sub_name,
+                workspace_id[:12] if workspace_id else "",
+                parse_err,
+            )
+            return scaffold
+
+    async def _extract_parties_subagent(
+        self,
+        workspace_id: str,
+        combined_document_content: str,
+    ) -> Dict[str, Any]:
+        """Sub-extractor A: parties + designations (people and organisations)."""
+        prompt = (
+            "You are a focused entity extractor for legal documents. Your ONLY "
+            "job is to list every PARTY (person, firm, company, government "
+            "office) that appears in the documents below.\n\n"
+            "Return ONE JSON object with this shape (no commentary, no markdown):\n\n"
+            "{\n"
+            '  "parties": [\n'
+            '    { "name": "exact name as written in the documents", '
+            '"designation": "role / community / status as written (e.g. plaintiff, defendant, vendor, vendee, complainant, M/s ..., advocate, SDM, Sub-Registrar, member of Scheduled Caste community)", '
+            '"role_in_matter": "short description of why this party matters (e.g. original owner, registered purchaser, civil-suit plaintiff)", '
+            '"first_mention_doc": "Annexure N or document filename" }\n'
+            "  ]\n"
+            "}\n\n"
+            "STRICT RULES:\n"
+            "- Use names EXACTLY as written. Do NOT collapse 'Smt. Premlata' "
+            "to 'Premlata' or 'Munna Lal' to 'Munnalal'. Write what the "
+            "documents write, including honorifics (Smt., Shri, Dr., M/s).\n"
+            "- Include every distinct party — original owners, current owners, "
+            "purchasers, advocates, court officials, witnesses, official "
+            "signatories — if they are named in the documents.\n"
+            "- Never write 'Party No. 1' / 'Party No. 2' / 'the plaintiff' / "
+            "'the petitioner' / 'the respondent' placeholders. If you cannot "
+            "find a real name for an entry, DROP the entry.\n"
+            "- Reference uploaded files only as Annexure N.\n"
+            "- Return ONLY valid JSON. No commentary, no markdown fences.\n\n"
+            "DOCUMENTS:\n"
+            f"{combined_document_content}"
+        )
+        return await self._run_extraction_subagent(
+            workspace_id, prompt, "parties", ["parties"]
+        )
+
+    async def _extract_timeline_subagent(
+        self,
+        workspace_id: str,
+        combined_document_content: str,
+    ) -> Dict[str, Any]:
+        """Sub-extractor B: dated events + suit/case/FIR numbers."""
+        prompt = (
+            "You are a focused timeline extractor for legal documents. Your "
+            "ONLY job is to extract every DATED EVENT and every SUIT/CASE/FIR "
+            "number that appears in the documents below.\n\n"
+            "Return ONE JSON object with this shape (no commentary, no markdown):\n\n"
+            "{\n"
+            '  "dates": [\n'
+            '    { "date_iso": "YYYY-MM-DD", '
+            '"event": "what happened on this date — name the actor, the counterparty, the action (e.g. \\"Sitaram executed a registered agreement to sell Arazi No. 262 to M/s Srinet & Sandhilya Construction Pvt. Ltd.\\")", '
+            '"actors": ["names exactly as written"], '
+            '"source_doc": "Annexure N or document filename" }\n'
+            "  ],\n"
+            '  "suit_numbers": [\n'
+            '    { "number": "exact case/suit/FIR identifier as written (e.g. O.S. No. 827/2019, Case No. 13779, FIR No. 145/2024)", '
+            '"court": "court / forum where filed", '
+            '"filed_by": "name exactly as written", '
+            '"against": ["names"], '
+            '"filed_on": "YYYY-MM-DD or null", '
+            '"subject_matter": "what the suit is about" }\n'
+            "  ]\n"
+            "}\n\n"
+            "STRICT RULES:\n"
+            "- Walk the documents chronologically. Include EVERY dated event "
+            "with a clear actor and action — agreements, notices, registrations, "
+            "sale deeds, FIRs, filings, hearings, orders, judgments, payments.\n"
+            "- Use Indian DD/MM/YYYY convention when parsing dates: '02/12/2008' "
+            "is 2 December 2008 (date_iso = '2008-12-02').\n"
+            "- For suit/case/FIR numbers: include EVERY one you can find with "
+            "its exact identifier verbatim. Do not normalise 'O.S. No. 827/2019' "
+            "to 'OS 827 2019' — keep the source punctuation.\n"
+            "- Use names EXACTLY as written. Never invent or generalise.\n"
+            "- Reference uploaded files only as Annexure N.\n"
+            "- Return ONLY valid JSON.\n\n"
+            "DOCUMENTS:\n"
+            f"{combined_document_content}"
+        )
+        return await self._run_extraction_subagent(
+            workspace_id, prompt, "timeline", ["dates", "suit_numbers"]
+        )
+
+    async def _extract_assets_and_law_subagent(
+        self,
+        workspace_id: str,
+        combined_document_content: str,
+    ) -> Dict[str, Any]:
+        """Sub-extractor C: properties + amounts + statutes + annexures."""
+        prompt = (
+            "You are a focused asset and legal-framework extractor for legal "
+            "documents. Your ONLY job is to extract every PROPERTY / ASSET, "
+            "every MONETARY AMOUNT, every STATUTE referenced, and every "
+            "ANNEXURE described in the documents below.\n\n"
+            "Return ONE JSON object with this shape (no commentary, no markdown):\n\n"
+            "{\n"
+            '  "properties": [\n'
+            '    { "identifier": "Arazi No. X / Khasra No. Y / Plot N / Survey No. N etc., exactly as written", '
+            '"area": "area exactly as written (e.g. 0.263 Hectares, 2400 sq.ft.)", '
+            '"location": "most specific location written in the docs (Mauza / Village -> Block / Tehsil -> District -> State)", '
+            '"current_owner_per_docs": "name as written, if stated" }\n'
+            "  ],\n"
+            '  "amounts": [\n'
+            '    { "amount": "in source notation (e.g. Rs. 11,64,000)", '
+            '"context": "advance / total consideration / balance / payment / loan / fine / etc.", '
+            '"from": "name as written", '
+            '"to": "name as written", '
+            '"date_iso": "YYYY-MM-DD if a date attaches to the amount, else null" }\n'
+            "  ],\n"
+            '  "statutes": [\n'
+            '    { "name": "exact statute name as written (e.g. Specific Relief Act, 1963; Bharatiya Nyaya Sanhita, 2023; UP Zamindari Abolition & Land Reforms Act)", '
+            '"sections": ["section numbers as written, e.g. 10, 12, 143"], '
+            '"applies_to": "short reason why this statute is relevant per the documents" }\n'
+            "  ],\n"
+            '  "annexures": [\n'
+            '    { "label": "Annexure 1", '
+            '"type": "Sale Deed / Affidavit / Notice / Khatauni / Written Statement / etc.", '
+            '"date_iso": "YYYY-MM-DD or null", '
+            '"parties": ["names exactly as written"] }\n'
+            "  ]\n"
+            "}\n\n"
+            "STRICT RULES:\n"
+            "- Use values EXACTLY as written. Preserve Indian numerical "
+            "notation for amounts (Rs. 11,64,000 stays that way; do NOT "
+            "convert to '11.64 lakh' or '1,164,000').\n"
+            "- Include every distinct property mention, even when the same "
+            "plot is referenced by different identifiers in different docs.\n"
+            "- For statutes: use names as written. Include both BNS / BNSS / "
+            "BSA / IT Act / etc. and any state-level land-revenue / property "
+            "statutes referenced.\n"
+            "- Reference uploaded files only as Annexure N.\n"
+            "- Return ONLY valid JSON.\n\n"
+            "DOCUMENTS:\n"
+            f"{combined_document_content}"
+        )
+        return await self._run_extraction_subagent(
+            workspace_id,
+            prompt,
+            "assets_and_law",
+            ["properties", "amounts", "statutes", "annexures"],
+        )
+
+    def _merge_case_entities(
+        self,
+        parties_result: Dict[str, Any],
+        timeline_result: Dict[str, Any],
+        assets_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Combine three sub-extractor results into the unified case_entities dict."""
+        merged: Dict[str, Any] = {k: [] for k in self._EMPTY_CASE_ENTITIES.keys()}
+        if isinstance(parties_result, dict):
+            merged["parties"] = list(parties_result.get("parties") or [])
+        if isinstance(timeline_result, dict):
+            merged["dates"] = list(timeline_result.get("dates") or [])
+            merged["suit_numbers"] = list(timeline_result.get("suit_numbers") or [])
+        if isinstance(assets_result, dict):
+            merged["properties"] = list(assets_result.get("properties") or [])
+            merged["amounts"] = list(assets_result.get("amounts") or [])
+            merged["statutes"] = list(assets_result.get("statutes") or [])
+            merged["annexures"] = list(assets_result.get("annexures") or [])
+        return merged
+
+    async def _extract_case_entities(
+        self,
+        workspace_id: str,
+        combined_document_content: str,
+    ) -> Dict[str, Any]:
+        """
+        Pass 1 of the strategy pipeline — "deep agents in spirit".
+
+        Runs three focused sub-extractors in parallel via ``asyncio.gather`` so
+        each entity family gets the full 12000-token budget for its slice:
+
+        - parties (people + organisations + designations)
+        - timeline (dated events + suit/case/FIR numbers)
+        - assets_and_law (properties + amounts + statutes + annexures)
+
+        Combines into the unified ``case_entities`` dict that the synthesis
+        pass anchors to. Any sub-extractor that fails contributes empty arrays
+        so a single sub-failure never blocks the whole strategy generation.
+        """
+        if not combined_document_content or not combined_document_content.strip():
+            return dict(self._EMPTY_CASE_ENTITIES)
+        if combined_document_content.strip() == "No document content available.":
+            return dict(self._EMPTY_CASE_ENTITIES)
+
+        # Content-hash short-circuit. Strategy and analysis_report both call this
+        # helper inside the same generation pipeline; without the cache we would
+        # pay for the 3-parallel-sub-extractor pass twice for the same content.
+        import hashlib as _hashlib
+        try:
+            _content_hash = _hashlib.sha1(
+                combined_document_content[:80000].encode("utf-8", errors="ignore")
+            ).hexdigest()
+        except Exception:
+            _content_hash = ""
+        if _content_hash and workspace_id:
+            _cached = self._workspace_case_entities_cache.get(workspace_id)
+            if _cached and _cached[0] == _content_hash:
+                logger.info(
+                    "🧠 case_entities cache HIT for workspace {} (skipping 3 sub-extractors)",
+                    workspace_id[:12],
+                )
+                return _cached[1]
+
+        try:
+            parties_result, timeline_result, assets_result = await asyncio.gather(
+                self._extract_parties_subagent(
+                    workspace_id, combined_document_content
+                ),
+                self._extract_timeline_subagent(
+                    workspace_id, combined_document_content
+                ),
+                self._extract_assets_and_law_subagent(
+                    workspace_id, combined_document_content
+                ),
+            )
+        except Exception as gather_err:
+            logger.warning(
+                "Strategy extraction (parallel sub-agents) failed for workspace {}: {}",
+                workspace_id[:12] if workspace_id else "",
+                gather_err,
+            )
+            return dict(self._EMPTY_CASE_ENTITIES)
+
+        merged = self._merge_case_entities(
+            parties_result, timeline_result, assets_result
+        )
+        # Per-sub-agent diagnostic logs so future thin-summary failures can be
+        # traced to whichever sub-agent came back empty.
+        logger.info(
+            "🔎 Strategy sub-extractor PARTIES: {} party/entity record(s) for workspace {}",
+            len(merged.get("parties") or []),
+            workspace_id[:12] if workspace_id else "",
+        )
+        logger.info(
+            "🔎 Strategy sub-extractor TIMELINE: {} dated event(s), {} suit/case number(s) for workspace {}",
+            len(merged.get("dates") or []),
+            len(merged.get("suit_numbers") or []),
+            workspace_id[:12] if workspace_id else "",
+        )
+        logger.info(
+            "🔎 Strategy sub-extractor ASSETS+LAW: {} property/ies, {} amount(s), {} statute(s), {} annexure(s) for workspace {}",
+            len(merged.get("properties") or []),
+            len(merged.get("amounts") or []),
+            len(merged.get("statutes") or []),
+            len(merged.get("annexures") or []),
+            workspace_id[:12] if workspace_id else "",
+        )
+        # Populate cache so a sibling caller (e.g. analysis_report after
+        # strategy) sees the same entities without re-running extraction.
+        if _content_hash and workspace_id:
+            self._workspace_case_entities_cache[workspace_id] = (_content_hash, merged)
+        return merged
+
+    @staticmethod
+    def _verify_entities_in_summary(
+        summary_text: str,
+        entities: Dict[str, Any],
+    ) -> Dict[str, List[str]]:
+        """
+        Programmatic coverage check after synthesis. Returns a dict with three
+        buckets of missing items so the caller can issue one consolidated
+        retry prompt:
+
+        - ``missing_parties``: party names whose full form OR primary surname
+          token does not appear in ``summary_text``.
+        - ``missing_suit_numbers``: every ``suit_numbers[i]["number"]`` that
+          does not appear verbatim in ``summary_text``.
+        - ``missing_key_dates``: up to 8 of the most legally material dates
+          (suit filings, registered deeds, notices, court orders) that do not
+          appear in either ISO or DD/MM/YYYY form in ``summary_text``.
+        """
+        result: Dict[str, List[str]] = {
+            "missing_parties": [],
+            "missing_suit_numbers": [],
+            "missing_key_dates": [],
+        }
+        if not isinstance(summary_text, str) or not summary_text:
+            return result
+        if not isinstance(entities, dict):
+            return result
+
+        # Parties: full name OR primary surname token.
+        for party in entities.get("parties", []) or []:
+            if not isinstance(party, dict):
+                continue
+            name = (party.get("name") or "").strip()
+            if not name:
+                continue
+            primary_token = name.split()[-1] if " " in name else name
+            if name not in summary_text and primary_token not in summary_text:
+                result["missing_parties"].append(name)
+
+        # Suit numbers: verbatim.
+        for suit in entities.get("suit_numbers", []) or []:
+            if not isinstance(suit, dict):
+                continue
+            number = (suit.get("number") or "").strip()
+            if number and number not in summary_text:
+                result["missing_suit_numbers"].append(number)
+
+        # Key dates: pick the top-N most legally material entries.
+        _KEY_DATE_TOKENS = (
+            "suit", "civil suit", "fir", "complaint", "registered", "sale deed",
+            "notice", "legal notice", "order", "judgment", "decree", "writ",
+            "filed", "execution", "agreement", "registration",
+        )
+        key_date_candidates: List[Dict[str, Any]] = []
+        for entry in entities.get("dates", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            date_iso = (entry.get("date_iso") or "").strip()
+            event = (entry.get("event") or "").strip().lower()
+            if not date_iso or not event:
+                continue
+            if any(tok in event for tok in _KEY_DATE_TOKENS):
+                key_date_candidates.append(entry)
+        for entry in key_date_candidates[:8]:
+            date_iso = (entry.get("date_iso") or "").strip()
+            if not date_iso:
+                continue
+            # Build DD/MM/YYYY alternative for matching.
+            dmy = ""
+            try:
+                y, m, d = date_iso.split("-")
+                if len(y) == 4 and len(m) == 2 and len(d) == 2:
+                    dmy = f"{d}/{m}/{y}"
+            except Exception:
+                dmy = ""
+            if date_iso not in summary_text and (
+                not dmy or dmy not in summary_text
+            ):
+                result["missing_key_dates"].append(dmy or date_iso)
+
+        return result
+
     async def _generate_strategies_from_documents(
         self,
         workspace_id: str,
@@ -881,6 +1293,32 @@ class SocketEventHandler:
                     per_doc_cap,
                 )
 
+            # Pass 1: "deep agents" extraction — three focused sub-agents run
+            # in parallel (parties, timeline, assets+law). Each sub-agent logs
+            # its own counts; here we add one final summary line listing the
+            # actual party names so the synthesis output can be quickly audited.
+            case_entities: Dict[str, Any] = await self._extract_case_entities(
+                workspace_id=workspace_id,
+                combined_document_content=combined_document_content,
+            )
+            _extracted_party_names = [
+                (p.get("name") or "").strip()
+                for p in (case_entities.get("parties") or [])
+                if isinstance(p, dict) and (p.get("name") or "").strip()
+            ]
+            logger.info(
+                "🧠 Strategy deep-extraction complete for workspace {}: parties=[{}]",
+                workspace_id[:12] if workspace_id else "",
+                ", ".join(_extracted_party_names) if _extracted_party_names else "(none)",
+            )
+            # Diagnostic: dump first 1500 chars of combined_document_content so
+            # we can tell at a glance whether names ARE present in what we send
+            # to Gemini when the extracted parties list comes back empty.
+            logger.debug(
+                "Strategy pass 1 combined_document_content preview (first 1500 chars): {}",
+                (combined_document_content or "")[:1500],
+            )
+
             # When no documents (e.g. all deleted), return fallback so backend can clear strategy / show empty state
             doc_count = len(all_docs)
             report_mobile, report_contact_date = (
@@ -927,11 +1365,11 @@ class SocketEventHandler:
 
 **Task**: Based on the document content above, provide:
 
-1. **Case Summary** (5-6 sentences): Start EXACTLY with the phrase: **"This case is about..."**. Include the parties (as named in documents), core legal issues, and 2-4 case-specific facts (dates/events/agreements/communications). Keep it scannable for a lawyer.
+1. **Case Summary** (10-20 sentences): Start EXACTLY with the phrase: **"This case is about..."**. Write a fact-rich narrative that NAMES the parties exactly as written in the documents (full names + designations / roles such as plaintiff, defendant, complainant, vendor, vendee). When the documents contain them, you MUST include: property/land/document identifiers (e.g. *Arazi No. 262, area 0.263 Hectares*, *Khasra No. 285*), location to the most specific level supported by the documents (Mauza/Village → Block/Tehsil → District/State), exact monetary amounts in the same notation as the source (*Rs. 11,64,000*, *Rs. 10,00,000*), specific dates of agreements/notices/filings (DD/MM/YYYY), and any suit/case numbers (e.g. *O.S. No. 827/2019*). Reference uploaded files only as **Annexure N**. Do not generalise — extract.
 
-2. **Report Case Summary** (5-6 sentences): MUST start EXACTLY with **"This matter is about..."**. Mirror the same facts, structure, and coverage as the case summary but as a neutral, expanded, polished narrative for formal reports and filings. **Strictly do not** use: Petitioner, Respondent, Client, Case, Adjudicator, Mediator, or role-style labels; describe parties only by names, designations, or factual identifiers from the documents.
+2. **Report Case Summary** (10-20 sentences): MUST start EXACTLY with **"This matter is about..."**. Mirror the same facts, structure, and coverage as the case summary but as a neutral, expanded, polished narrative for formal reports and filings. Apply the SAME fact-extraction checklist: named parties (full names + designations), property/document identifiers, full location, exact amounts as written, specific dates, suit/case numbers, named statutes. **Strictly do not** use: Petitioner, Respondent, Client, Case, Adjudicator, Mediator, or role-style labels; describe parties only by names, designations, or factual identifiers from the documents.
 
-3. **Strategic Objective** (5-6 sentences): Write a role-tailored strategic objective for the **{workspace_role}** perspective. It must reference: (a) the strongest facts from the documents, (b) the legal issues, (c) practical priority order (what to do first), and (d) how evidence/timeline supports or limits the objective.
+3. **Strategic Objective** (10-20 sentences): Write a role-tailored strategic objective for the **{workspace_role}** perspective. It MUST anchor on the actual strongest facts (named parties, specific dates, named documents/Annexures, exact amounts, suit numbers) — never generic categories. Cover: (a) the strongest facts from the documents (named), (b) the legal issues (with named statutes such as BNS / BNSS / BSA / IT Act / Specific Relief Act etc. as relevant), (c) practical priority order (what to do first), and (d) how evidence/timeline supports or limits the objective.
 
 4. **Possible Next Steps** (3-5 bullet points): Immediate, executable actions for right away. Keep them concrete (who/what to do). Prefer steps that preserve evidence, clarify missing facts, and move the case forward procedurally for the selected role. When citing an uploaded file by its order in the bundle, write **Annexure N** (same order as above); **never** write "Document N" or "document" for an upload—use **annexure / annexures** only.
 
@@ -967,8 +1405,27 @@ class SocketEventHandler:
 
             try:
                 strategy_inventory = self._build_document_inventory(workspace_id)
+                import json as _json_strategy
+                try:
+                    _entities_block = _json_strategy.dumps(
+                        case_entities, indent=2, ensure_ascii=False
+                    )
+                except Exception:
+                    _entities_block = "{}"
                 # Improved prompt for better JSON generation
                 structured_prompt = f"""Analyze these legal documents and provide a JSON response.
+
+EXTRACTED FACTS (these entities were already pulled from the documents by a
+focused extraction step — treat them as authoritative ground truth. Anchor
+every named reference in your output to these. Do NOT rename, abbreviate,
+or modify any of these names. Do NOT introduce 'Party No. 1' / 'Party No. 2'
+/ 'the plaintiff' / 'the respondent' / 'the petitioner' style placeholders —
+EVERY reference to a person, entity, property, suit, or amount in your
+output MUST use the exact form listed below. If a relevant fact is missing
+from this block but is clearly present in the DOCUMENT CONTENT below, you
+may add it, but never invent.):
+
+{_entities_block}
 
 {strategy_inventory or "DOCUMENT INVENTORY: (no classified inventory available)"}
 
@@ -978,9 +1435,9 @@ DOCUMENT CONTENT:
 YOUR ROLE: {workspace_role}
 
 TASK:
-1. Case summary (5-6 sentences ; MUST start with "This case is about...")
-2. Report case summary (5-6 sentences ; MUST start EXACTLY with "This matter is about..." ; MUST mirror the same facts, structure, and coverage as the case summary BUT rewritten as a neutral, expanded, and polished narrative suitable for formal reports and filings ; STRICTLY DO NOT use the words: Petitioner, Respondent, Client, Case, Adjudicator, Mediator, or any role-based labels ; avoid even generic role references ; describe parties only by their names, designations, or factual identifiers from the documents ; maintain an advanced, professional tone while keeping it clear and easy to read)
-3. Strategic objective (5-6 sentences ; role-specific for {workspace_role})
+1. Case summary (10-20 sentences — write the FULL chronological narrative, do NOT compress ; MUST start with "This case is about..." ; MUST name every party exactly as written, include every property/land/document identifier, exact amounts in source notation, every significant date in DD/MM/YYYY, every suit/case/FIR number, and named statutes when present in the documents — never generic categories)
+2. Report case summary (10-20 sentences — write the FULL narrative, do NOT compress ; MUST start EXACTLY with "This matter is about..." ; MUST mirror the same facts, structure, and coverage as the case summary BUT rewritten as a neutral, expanded, and polished narrative suitable for formal reports and filings ; same fact-extraction checklist as the case summary — named parties, property/document IDs, exact amounts, every significant date, suit numbers, named statutes ; STRICTLY DO NOT use the words: Petitioner, Respondent, Client, Case, Adjudicator, Mediator, or any role-based labels ; avoid even generic role references ; describe parties only by their names, designations, or factual identifiers from the documents ; maintain an advanced, professional tone while keeping it clear and easy to read)
+3. Strategic objective (10-20 sentences — write the FULL plan, do NOT compress ; role-specific for {workspace_role} ; MUST anchor on named parties, specific dates, exact amounts, suit numbers, and named statutes from the documents — never generic categories)
 4. Possible next steps (3-5 immediate, concrete actions that should be taken right away). When referring to an uploaded file by index, use **Annexure 1**, **Annexure 2**, etc. (upload order). Never use the word **Document** or **document** for an upload—use **annexure** / **annexures** only.
 
 LEGAL FRAMEWORK (CRITICAL - USE CORRECT INDIAN LAWS):
@@ -1052,7 +1509,7 @@ OUTPUT (JSON only, complete all fields):
 
 suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words each) specific to this case and role. Examples: "Review Title Deeds", "Map Legal Heirs", "Draft Demand Notice", "File FIR", "Preserve Digital Evidence". No full sentences. Provide 15-16 varied chips.
 
-CRITICAL: Output complete, valid JSON only. Do not truncate; close every string with \", close every array with ], and make sure the root JSON object is fully closed. Keep caseSummary, reportCaseSummary, and strategicObjective under 1200 characters each so the full JSON fits in one response. Ensure caseSummary starts exactly with "This case is about..." and reportCaseSummary starts exactly with "This matter is about...". In possibleNextSteps strings, never use "Document" or "document" to mean an uploaded file—use Annexure N or annexure/annexures."""
+CRITICAL: Output complete, valid JSON only. Do not truncate; close every string with \", close every array with ], and make sure the root JSON object is fully closed. Keep caseSummary, reportCaseSummary, and strategicObjective under 4500 characters each AND target 10-20 sentences each — use the full budget to include every named party, every suit/document/property identifier, every exact amount (in the same notation as the documents), every significant date, and every named statute reference. Do NOT compress to a short summary; do NOT pad with generic boilerplate. Ensure caseSummary starts exactly with "This case is about..." and reportCaseSummary starts exactly with "This matter is about...". In possibleNextSteps strings, never use "Document" or "document" to mean an uploaded file—use Annexure N or annexure/annexures."""
                 custom_suffix = build_custom_instruction_suffix(workspace_id)
                 if custom_suffix:
                     structured_prompt = (
@@ -1095,6 +1552,159 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                         strategic_objective = analysis_data.get(
                             "strategicObjective", ""
                         )
+
+                        # Pass 3 (verifier): if the synthesis dropped any
+                        # extracted party name from caseSummary or
+                        # strategicObjective, ask Gemini to rewrite all three
+                        # fields preserving every missing item. One retry only.
+                        try:
+                            _missing_report = self._verify_entities_in_summary(
+                                f"{case_summary}\n{strategic_objective}",
+                                case_entities,
+                            )
+                        except Exception as ver_err:
+                            logger.debug(
+                                "Entity verifier failed (non-fatal): {}", ver_err
+                            )
+                            _missing_report = {
+                                "missing_parties": [],
+                                "missing_suit_numbers": [],
+                                "missing_key_dates": [],
+                            }
+                        _missing_parties = _missing_report.get("missing_parties") or []
+                        _missing_suits = _missing_report.get("missing_suit_numbers") or []
+                        _missing_dates = _missing_report.get("missing_key_dates") or []
+                        _any_missing = bool(_missing_parties or _missing_suits or _missing_dates)
+                        if _any_missing and (
+                            case_entities.get("parties")
+                            or case_entities.get("suit_numbers")
+                            or case_entities.get("dates")
+                        ):
+                            logger.warning(
+                                "Strategy synthesis dropped items for workspace {}: "
+                                "parties={} suits={} dates={}; retrying once with explicit directive",
+                                workspace_id[:12] if workspace_id else "",
+                                _missing_parties,
+                                _missing_suits,
+                                _missing_dates,
+                            )
+                            try:
+                                _report_case_summary = analysis_data.get(
+                                    "reportCaseSummary", ""
+                                )
+                                _missing_blocks: List[str] = []
+                                if _missing_parties:
+                                    _missing_blocks.append(
+                                        "PARTY NAMES you omitted (use verbatim, exact spellings):\n- "
+                                        + "\n- ".join(_missing_parties)
+                                    )
+                                if _missing_suits:
+                                    _missing_blocks.append(
+                                        "SUIT / CASE / FIR NUMBERS you omitted (must appear verbatim):\n- "
+                                        + "\n- ".join(_missing_suits)
+                                    )
+                                if _missing_dates:
+                                    _missing_blocks.append(
+                                        "KEY DATES you omitted (use DD/MM/YYYY):\n- "
+                                        + "\n- ".join(_missing_dates)
+                                    )
+                                _verify_prompt = (
+                                    "You produced the following caseSummary, "
+                                    "reportCaseSummary, and strategicObjective for a "
+                                    "legal matter, but you OMITTED these load-bearing "
+                                    "facts from the extracted ground-truth:\n\n"
+                                    + "\n\n".join(_missing_blocks)
+                                    + "\n\nRewrite all THREE fields so EVERY missing "
+                                    "item above appears in the prose. Do NOT introduce "
+                                    "new facts beyond what is needed to incorporate "
+                                    "these. Do NOT delete any existing facts. Keep the "
+                                    "length budget (under 4500 characters each). Keep "
+                                    "the openers EXACTLY: caseSummary must start with "
+                                    "'This case is about...'; reportCaseSummary must "
+                                    "start with 'This matter is about...'.\n\n"
+                                    "Return ONE JSON object with exactly these three "
+                                    "keys: caseSummary, reportCaseSummary, "
+                                    "strategicObjective. No other keys, no "
+                                    "commentary, no markdown.\n\n"
+                                    "ORIGINAL caseSummary:\n"
+                                    f"{case_summary}\n\n"
+                                    "ORIGINAL reportCaseSummary:\n"
+                                    f"{_report_case_summary}\n\n"
+                                    "ORIGINAL strategicObjective:\n"
+                                    f"{strategic_objective}\n"
+                                )
+                                _verify_raw = await gemini_client.generate(
+                                    prompt=_verify_prompt,
+                                    system_instruction=get_structured_document_feature_system_instruction(
+                                        workspace_role
+                                    ),
+                                    temperature=0.1,
+                                    max_tokens=12000,
+                                    response_mime_type="application/json",
+                                )
+                                _verify_json = self._prepare_json_candidate(
+                                    (_verify_raw or "").strip(), prefer="object"
+                                )
+                                if _verify_json:
+                                    _verify_parsed = json.loads(_verify_json)
+                                    if isinstance(_verify_parsed, dict):
+                                        _new_cs = (
+                                            _verify_parsed.get("caseSummary") or ""
+                                        ).strip()
+                                        _new_rcs = (
+                                            _verify_parsed.get("reportCaseSummary")
+                                            or ""
+                                        ).strip()
+                                        _new_so = (
+                                            _verify_parsed.get("strategicObjective")
+                                            or ""
+                                        ).strip()
+                                        if _new_cs:
+                                            analysis_data["caseSummary"] = _new_cs
+                                            case_summary = _new_cs
+                                        if _new_rcs:
+                                            analysis_data["reportCaseSummary"] = _new_rcs
+                                        if _new_so:
+                                            analysis_data[
+                                                "strategicObjective"
+                                            ] = _new_so
+                                            strategic_objective = _new_so
+                                        # Re-check after retry so we can tell at a
+                                        # glance whether the retry actually closed
+                                        # the gap.
+                                        _still = self._verify_entities_in_summary(
+                                            f"{case_summary}\n{strategic_objective}",
+                                            case_entities,
+                                        )
+                                        _still_any = bool(
+                                            (_still.get("missing_parties") or [])
+                                            or (_still.get("missing_suit_numbers") or [])
+                                            or (_still.get("missing_key_dates") or [])
+                                        )
+                                        if _still_any:
+                                            logger.warning(
+                                                "Entity verifier retry STILL missing for "
+                                                "workspace {}: parties={} suits={} dates={}",
+                                                workspace_id[:12] if workspace_id else "",
+                                                _still.get("missing_parties") or [],
+                                                _still.get("missing_suit_numbers") or [],
+                                                _still.get("missing_key_dates") or [],
+                                            )
+                                        else:
+                                            logger.success(
+                                                "Entity verifier retry recovered all missing items "
+                                                "(parties={} suits={} dates={}) for workspace {}",
+                                                len(_missing_parties),
+                                                len(_missing_suits),
+                                                len(_missing_dates),
+                                                workspace_id[:12] if workspace_id else "",
+                                            )
+                            except Exception as retry_err:
+                                logger.warning(
+                                    "Entity verifier retry failed (non-fatal): {}",
+                                    retry_err,
+                                )
+
                         possible_next_steps = (
                             analysis_data.get("possibleNextSteps")
                             or analysis_data.get("possible_next_steps")
@@ -2626,8 +3236,48 @@ USER MESSAGE
 
             document_inventory = self._build_document_inventory(workspace_id)
 
+            # Deep-extraction pre-pass: pull structured entities (parties,
+            # dates, suits, properties, amounts, statutes, annexures) so the
+            # analysis_report synthesis below can anchor strengths /
+            # weaknesses / risks / missingInfo to named facts instead of
+            # generic phrasing. Shares the content-hash cache with the strategy
+            # pipeline — when strategy already ran for this content this is a
+            # cache hit, no extra Gemini calls.
+            case_entities = await self._extract_case_entities(
+                workspace_id=workspace_id,
+                combined_document_content=combined_document_content,
+            )
+            _ar_party_names = [
+                (p.get("name") or "").strip()
+                for p in (case_entities.get("parties") or [])
+                if isinstance(p, dict) and (p.get("name") or "").strip()
+            ]
+            logger.info(
+                "🧠 Analysis-report extraction complete for workspace {}: parties=[{}]",
+                workspace_id[:12] if workspace_id else "",
+                ", ".join(_ar_party_names) if _ar_party_names else "(none)",
+            )
+            import json as _json_ar
+            try:
+                _entities_block_ar = _json_ar.dumps(
+                    case_entities, indent=2, ensure_ascii=False
+                )
+            except Exception:
+                _entities_block_ar = "{}"
+
             analysis_prompt = (
                 """You are a senior legal analyst specializing in Indian law. Your task is to produce a structured legal analysis based ONLY on the uploaded documents.
+
+EXTRACTED FACTS (these entities were already pulled from the documents by a
+focused extraction step — treat them as authoritative ground truth. Anchor
+every reference in strengths / weaknesses / risks / missingInfo to these.
+Do NOT introduce 'Party No. 1' / 'the plaintiff' / 'the petitioner' /
+'the respondent' style placeholders — EVERY reference to a person, entity,
+property, suit, amount, or statute MUST use the exact form listed below.
+relevantJurisdiction is governed by the strict FORMAT block below and is
+NOT subject to this entity-grounding directive.):
+
+{entities_block_ar}
 
 CRITICAL OUTPUT RULES:
 - Your entire response MUST be exactly one valid JSON object.
@@ -2807,11 +3457,20 @@ STEP 3 — LEGAL ANALYSIS
 All strengths and weaknesses MUST be based on facts from the documents.
 
 Strength rules:
-- 2–6 items
-- Each `point` must state the factual and legal reasoning in plain prose (clear, specific to the annexures)
-- Put **statutes and sections only** in the `laws` array (e.g. "BSA", "BNS Section 318", "IT Act 2000")
-- **Forbidden in `point` text:** do not end (or pad) a strength with boilerplate such as "which is a relevant fact under [Act]" or "admissible under [Act(s)]" — no trailing "under the Bharatiya Sakshya Adhiniyam" / "under the IT Act" restatements; the `laws` field carries citations
-- Must be supported by the annexure facts
+- **MANDATORY: minimum 2 strengths, maximum 6.** Returning 0 or 1 is a schema violation. Every matter has at least two facts that help the client's position — find them.
+- Each `point` must state the factual and legal reasoning in plain prose as 2-4 sentences (clear, specific to the annexures), naming the party / date / document / amount it relies on (from EXTRACTED FACTS).
+- Put **statutes and sections only** in the `laws` array (e.g. "BSA", "BNS Section 318", "IT Act 2000").
+- **Forbidden in `point` text:** do not end (or pad) a strength with boilerplate such as "which is a relevant fact under [Act]" or "admissible under [Act(s)]" — no trailing "under the Bharatiya Sakshya Adhiniyam" / "under the IT Act" restatements; the `laws` field carries citations.
+- Must be supported by the annexure facts.
+
+What COUNTS as a strength (use these categories when evidence feels thin — at least 2 of these almost always apply):
+1. **Documentary evidence** preserved in an annexure — e.g. a registered sale deed, MLC / medico-legal certificate, hospital record, FIR, charge-sheet, written notice, audio/video transcript, bank statement, signed contract, photograph, official certificate.
+2. **Party admissions** — anything the opposing side stated, signed, or did that supports the client's position (e.g. partial payment, written reply admitting a fact, official detention record).
+3. **Procedural advantage** — favourable forum / jurisdiction, limitation period still open, statutory presumption in client's favour (e.g. presumption of cruelty under §498A successor, presumption under BSA §85B for electronic records).
+4. **Statutory framework support** — a named provision under BNS / BNSS / BSA / IT Act / Specific Relief Act / Hindu Marriage Act / Domestic Violence Act / etc. that, on the recorded facts, points to relief for the client.
+5. **Corroboration across annexures** — two or more annexures that independently support the same fact, increasing evidentiary weight.
+
+If the documents are genuinely sparse, still produce 2 strengths by anchoring to the strongest annexure available and the most credible statutory provision. Do NOT skip the field. Do NOT replace it with empty `[]`.
 
 Weakness rules:
 - Only list weaknesses supported by document facts
@@ -2849,17 +3508,17 @@ Output keys in this exact order (score and explanations FIRST so they are not tr
 
 {{
   "caseResolutionScore": 72,
-  "qualityScoreExplanation": "Required: 2-4 sentences explaining how this score follows from missing info, weaknesses, risks, and strengths. Non-empty. Example: Score reflects gaps in annexures and procedural risks.",
-  "reportQualityScoreExplanation": "Required: 2-4 sentences with the same scoring logic as qualityScoreExplanation, written for external or report-facing use. Do not use the words legal or respondent (any casing). Use neutral wording (e.g. procedural risk, parties, case file). Non-empty.",
-  "missingInfo": ["item1","item2"],
+  "qualityScoreExplanation": "Required: 3-5 sentences explaining how this score follows from THIS case's specific missing info, weaknesses, risks, and strengths. MUST start with 'The current score is <N>% because'. MUST name at least one specific missing item, one specific weakness/risk, and one specific strength using named parties (from EXTRACTED FACTS), specific dates (DD/MM/YYYY), exact amounts (Rs. notation), and Annexure/suit references — never generic phrasing like 'Score reflects gaps in annexures and procedural risks'. Non-empty.",
+  "reportQualityScoreExplanation": "Required: 3-5 sentences with the same scoring logic as qualityScoreExplanation, written for external or report-facing use. MUST start with 'The current score is <N>% because'. Same entity-grounding rule — name at least one specific missing item, one specific weakness/risk, and one specific strength using named parties, dates, amounts, and Annexure/suit references. Do not use the words 'legal' or 'respondent' (any casing). Use neutral wording (e.g. procedural risk, parties, case file). Non-empty.",
+  "missingInfo": ["Each missing-info entry is a 2-4 sentence string naming WHAT is missing, FROM WHOM (the named party/document/Annexure it should come from), WHY it matters for the strategic objective, and which existing Annexure (if any) currently approximates it. Use exact names and identifiers from EXTRACTED FACTS — never one-word labels like 'address' or 'medical report'."],
   "strengths": [
     {{
-      "point": "Factual strength stated clearly without repeating statute boilerplate in the sentence",
+      "point": "Factual strength written as 2-4 sentences naming the specific parties (use exact names from EXTRACTED FACTS), dated events (DD/MM/YYYY), exact amounts in source notation (Rs. 11,64,000), suit/document references (O.S. No. 827/2019), and Annexures that establish this strength. Do not pad with statute boilerplate; statutes belong in the laws array. Anchor every claim in named facts.",
       "laws": ["BNS Section 318", "BSA"]
     }}
   ],
-  "weaknesses": ["weakness1"],
-  "risks": ["risk1"],
+  "weaknesses": ["Each weakness is a 2-4 sentence string naming the SPECIFIC party (exact name), the dated event, the exact amount or document/annexure, and the statute or principle that makes this a weakness for the client's case. Never generic phrasing like 'limitation may apply' — say which party's claim is exposed under which Act and why."],
+  "risks": ["Each risk is a 2-4 sentence string explaining the SPECIFIC procedural / evidentiary / limitation / contradiction risk, with the named party + date + document/annexure that triggers it, and the named rule (e.g. Limitation Act 1963 §54, BNSS §187, BSA §65B) that is exposed. Use exact names and amounts from EXTRACTED FACTS."],
   "relevantJurisdiction": ["District Court, City"],
   "pendingActions": ["action1"],
   "nextSteps": ["step1","step2"],
@@ -2873,7 +3532,7 @@ missingInfo:
 ONLY information absent from documents and legally required.
 
 strengths:
-2–6 items; each has factual `point` prose plus `laws` for citations — **no** "relevant fact under …" / "admissible under …" sentences in `point`.
+**MANDATORY 2-6 items (never 0, never 1).** Each has factual `point` prose (2-4 sentences, named entities, see Strength rules) plus `laws` for citations — **no** "relevant fact under …" / "admissible under …" sentences in `point`.
 
 weaknesses:
 0–6 factual weaknesses.
@@ -2888,15 +3547,26 @@ pendingActions / nextSteps / suggestedDrafts:
 0–5 items each.
 
 qualityScoreExplanation RULE:
-- MANDATORY non-empty string. If the score is below 100, say why (missing info / weaknesses / risks). If 100, say that no gaps, weaknesses, or risks were flagged.
+- MANDATORY non-empty string of 3-5 sentences.
+- MUST start with "The current score is <N>% because" (where N is the integer caseResolutionScore).
+- MUST cite the SPECIFIC facts driving the score: name at least one missingInfo item by what is missing and from whom (using EXTRACTED FACTS names), one weakness or risk by the named party/date/amount/annexure that triggers it, and one strength by the named fact (party + date + Annexure) that supports it.
+- If the score is 100, say specifically that no missingInfo, weaknesses, or risks were flagged, and name the top 1-2 strengths (parties + dates + Annexures) that justify it.
+- Never use generic phrasing like "gaps in annexures" or "procedural risks identified" without naming WHICH gap, WHICH risk, and FOR WHOM.
 
 reportQualityScoreExplanation RULE:
-- MANDATORY non-empty string. Same substance as qualityScoreExplanation (tie the score to missing info, weaknesses, risks, and strengths).
+- MANDATORY non-empty string of 3-5 sentences.
+- MUST start with "The current score is <N>% because" (same N as above).
+- Same entity-grounding obligation as qualityScoreExplanation — name specific missingInfo / weakness / risk / strength items with parties, dates, amounts, and Annexure/suit references from EXTRACTED FACTS.
 - MUST NOT contain the words "legal" or "respondent" in any form—including compounds where they appear as standalone words (rewrite to neutral alternatives: e.g. procedural risk, parties, opposing side, case file, annexures).
 
 FINAL RULE:
 Output ONLY the JSON object.
 No extra text.
+
+ENTITY-GROUNDING RULE (CRITICAL):
+- Every entry in `strengths` (the `point` field), `weaknesses`, `risks`, and `missingInfo` MUST cite at least one named party, specific date (DD/MM/YYYY), exact amount, suit/case/FIR number, or Annexure reference taken from EXTRACTED FACTS — never generic categories.
+- Do NOT use "Party No. 1" / "Party No. 2" / "the plaintiff" / "the respondent" / "the petitioner" anywhere in `strengths`, `weaknesses`, `risks`, `missingInfo`, `pendingActions`, `nextSteps`, `suggestedDrafts`, or the explanation strings. Always use the exact names listed in EXTRACTED FACTS.
+- The `relevantJurisdiction` array is EXEMPT from this rule: it follows the strict COURT/FORUM-by-location format defined above and lists only jurisdiction/forum names — no party names, no dates, no amounts.
 """
             ).format(
                 role,
@@ -2905,6 +3575,7 @@ No extra text.
                 current_strategic_objective,
                 document_inventory or "DOCUMENT INVENTORY: (no classified inventory available — reason from DOCUMENTS text below)",
                 combined_document_content,
+                entities_block_ar=_entities_block_ar,
             )
 
             custom_suffix = build_custom_instruction_suffix(workspace_id)
@@ -3167,6 +3838,129 @@ Rules:
                     if not point:
                         continue
                     strengths.append({"point": point, "laws": []})
+
+            # Guard: the schema mandates 2-6 strengths. The model occasionally
+            # returns an empty array — usually because the entity-grounding
+            # rules made it over-cautious on cases with thin documentary
+            # evidence. Fire ONE focused retry that returns only a strengths
+            # array of 2-6 entity-grounded items.
+            if len(strengths) < 2 and (
+                isinstance(combined_document_content, str)
+                and combined_document_content.strip()
+                and combined_document_content.strip() != "No document content available."
+            ):
+                logger.warning(
+                    "Analysis report returned only {} strength(s) for workspace {}; "
+                    "firing focused retry to recover minimum 2.",
+                    len(strengths),
+                    workspace_id[:12] if workspace_id else "",
+                )
+                try:
+                    _strengths_retry_prompt = (
+                        "You produced an analysis report for an Indian-law matter but "
+                        "left the strengths array nearly empty. The schema MANDATES "
+                        "2-6 strengths. Every matter has at least two facts that help "
+                        "the client's position.\n\n"
+                        "Return ONE JSON object with exactly this shape (no commentary, "
+                        "no markdown):\n\n"
+                        "{\n"
+                        '  "strengths": [\n'
+                        '    { "point": "2-4 sentence factual strength naming the specific '
+                        'party / date / Annexure / amount from EXTRACTED FACTS that '
+                        'establishes it. Do NOT pad with statute boilerplate. Do NOT use '
+                        '\'Party No. X\' placeholders.", "laws": ["BNS Section 318", '
+                        '"BSA"] }\n'
+                        "  ]\n"
+                        "}\n\n"
+                        "Anchor every strength to EXTRACTED FACTS. Valid strength "
+                        "categories (use at least 2):\n"
+                        "1. Documentary evidence preserved in an annexure (MLC, FIR, "
+                        "registered deed, hospital record, signed contract, "
+                        "audio/video transcript, bank statement, photograph, official "
+                        "certificate).\n"
+                        "2. Party admissions (opposing side stated, signed, or did "
+                        "something supporting the client — partial payment, written "
+                        "reply admitting a fact, official detention record).\n"
+                        "3. Procedural advantage (favourable forum / jurisdiction, "
+                        "limitation period still open, statutory presumption in "
+                        "client's favour).\n"
+                        "4. Statutory framework support (a named provision under BNS / "
+                        "BNSS / BSA / IT Act / Specific Relief Act / Hindu Marriage "
+                        "Act / Domestic Violence Act / etc. that on the recorded facts "
+                        "points to relief for the client).\n"
+                        "5. Corroboration across annexures (two or more annexures that "
+                        "independently support the same fact).\n\n"
+                        f"EXTRACTED FACTS:\n{_entities_block_ar}\n\n"
+                        "CONTEXT — items you already produced for this report:\n"
+                        f"- missingInfo: {(missing_info or [])[:8]}\n"
+                        f"- weaknesses: {(data.get('weaknesses') or [])[:6] if isinstance(data.get('weaknesses'), list) else []}\n"
+                        f"- risks: {(data.get('risks') or [])[:6] if isinstance(data.get('risks'), list) else []}\n\n"
+                        "DOCUMENTS (in upload order):\n"
+                        f"{combined_document_content[:60000]}\n"
+                    )
+                    _strengths_retry_raw = await gemini_client.generate(
+                        prompt=_strengths_retry_prompt,
+                        system_instruction=get_structured_document_feature_system_instruction(
+                            workspace_role
+                        ),
+                        temperature=0.2,
+                        max_tokens=12000,
+                        response_mime_type="application/json",
+                    )
+                    _strengths_retry_json = self._prepare_json_candidate(
+                        (_strengths_retry_raw or "").strip(), prefer="object"
+                    )
+                    if _strengths_retry_json:
+                        import json as _json_sr
+                        _retry_parsed = _json_sr.loads(_strengths_retry_json)
+                        if isinstance(_retry_parsed, dict):
+                            _retry_strengths = _retry_parsed.get("strengths") or []
+                            if isinstance(_retry_strengths, list) and _retry_strengths:
+                                _rebuilt: List[Dict[str, Any]] = []
+                                for s in _retry_strengths[:6]:
+                                    if isinstance(s, dict):
+                                        point = (s.get("point") or s.get("text") or "").strip()
+                                        laws = s.get("laws") or s.get("law") or []
+                                        if not isinstance(laws, list):
+                                            laws = [laws] if laws else []
+                                        laws = [str(l).strip() for l in laws if l][:5]
+                                        if point:
+                                            point = re.sub(
+                                                r"\bdocuments\b",
+                                                "annexures",
+                                                re.sub(
+                                                    r"\bdocument\b",
+                                                    "annexure",
+                                                    point,
+                                                    flags=re.IGNORECASE,
+                                                ),
+                                                flags=re.IGNORECASE,
+                                            )
+                                            point = _strip_strength_point_statute_boilerplate(
+                                                point
+                                            )
+                                            if point:
+                                                _rebuilt.append(
+                                                    {"point": point, "laws": laws}
+                                                )
+                                if len(_rebuilt) >= 2:
+                                    logger.success(
+                                        "Strengths retry recovered {} item(s) for workspace {}",
+                                        len(_rebuilt),
+                                        workspace_id[:12] if workspace_id else "",
+                                    )
+                                    strengths = _rebuilt
+                                else:
+                                    logger.warning(
+                                        "Strengths retry only produced {} item(s) for "
+                                        "workspace {}; keeping original list",
+                                        len(_rebuilt),
+                                        workspace_id[:12] if workspace_id else "",
+                                    )
+                except Exception as _sr_err:
+                    logger.warning(
+                        "Strengths retry failed (non-fatal): {}", _sr_err
+                    )
 
             weaknesses = data.get("weaknesses") or []
             # Coerce off-schema shapes (the model sometimes returns
@@ -7840,9 +8634,16 @@ Return ONLY this JSON, no commentary:
             )
             prompt = (
                 f"You are a senior legal analyst. Given this case analysis summary (JSON only), "
-                f"write exactly 2-3 short sentences for an Indian-law workspace. "
+                f"write exactly 3-5 sentences for an Indian-law workspace. "
                 f'Start with "The current score is {case_resolution_score}% because". '
-                "Explain the score using only the listed gaps, weaknesses, risks, and strengths—do not invent facts.\n\n"
+                "Then anchor the explanation to SPECIFIC items from the summary — quote (do not paraphrase generically) "
+                "at least one missingInfo item by what is missing and from whom, one weakness or risk by the "
+                "named party / date / amount / annexure that triggers it, and one strength by the named fact "
+                "(party + date + Annexure) that supports it. If the score is 100, name the top 1-2 strengths "
+                "instead and state that no missingInfo / weaknesses / risks were flagged. "
+                "Never use generic phrasing like 'gaps in annexures' or 'procedural risks identified' without naming "
+                "WHICH gap, WHICH risk, and FOR WHOM. Use names exactly as they appear in the summary; do NOT "
+                "invent facts not present in the summary.\n\n"
                 f"{summary}"
             )
             txt = await gemini_client.generate(

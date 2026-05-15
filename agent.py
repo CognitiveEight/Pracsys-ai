@@ -246,6 +246,141 @@ def filter_structure(x: Any) -> Any:
     return x
 
 
+# ---------------------------------------------------------------------------
+# Law-citation stripping (analysis_docx_generate_request post-processing)
+# ---------------------------------------------------------------------------
+# When the backend asks for a DOCX export, narrative fields (caseSummary,
+# strategicObjective, etc.) often contain inline law citations like
+# "In accordance with Section 27 of the Protection of Women from Domestic
+# Violence Act, 2005,". The exported report should keep those citations only
+# inside the dedicated "Applicable Laws" section. This pass surgically removes
+# law citations from every other field, preserving the rest of the wording
+# verbatim (no rephrasing, no recapitalisation).
+
+LAW_STRIP_SYSTEM = """You are a strict text editor.
+
+Your ONLY job is to REMOVE law citations from the text. Do NOT rephrase, restructure, summarize, paraphrase, or rewrite any sentence. Do NOT change the capitalization of words that survive.
+
+REMOVE these patterns:
+1. Statute / section citations (with or without year):
+   - "Section X of the <Act Name>, <Year>"
+   - "Section X of the <Act Name>"
+   - "Section X of <Act Name>"
+   - "under the <Act Name>, <Year>"
+   - "under <Act Name>"
+   - "<Act Name>, <Year>" used as a citation (e.g. "Bharatiya Nyaya Sanhita, 2023")
+   - "Section X" / "Sections X and Y" used as a legal citation
+   - Acronym citations: "BNS", "BNSS", "BSA", "IPC", "CrPC", "CPC", "IT Act"
+   - Named acts: "Bharatiya Nyaya Sanhita", "Bharatiya Nagarik Suraksha Sanhita", "Bharatiya Sakshya Adhiniyam", "Indian Penal Code", "Code of Criminal Procedure", "Information Technology Act", "Protection of Women from Domestic Violence Act", "Indian Contract Act", "Immoral Traffic (Prevention) Act", etc.
+2. Connective introducer phrases that lead INTO a citation being removed — strip them with the citation:
+   - "In accordance with …,"
+   - "under …,"
+   - "as per …,"
+   - "pursuant to …,"
+   - "according to …,"
+3. Trailing qualifiers that hang off the removed citation: ", where permissible", ", as applicable", ", subject to law", etc. — remove with the citation.
+
+STRICT RULES:
+- Preserve the original wording and capitalization of every surviving word. If removing a prefix leaves a sentence starting with a lowercase letter, KEEP IT LOWERCASE — do not retitle-case.
+- KEEP document references like "Annexure 1", "Annexure 2", and similar — they are not laws.
+- KEEP party names, place names, dates that are not part of a citation.
+- Collapse double spaces left behind into a single space. Remove leftover ", ," sequences (turn into ","). Preserve sentence-ending punctuation (".", "?", "!").
+- If a sentence becomes empty after removal, drop the sentence and its trailing space.
+- Return ONLY the cleaned text. No commentary, no quotes, no explanation.
+- If no law citations are present, return the input EXACTLY unchanged."""
+
+
+# Quick pre-filter so we don't pay for an LLM call on text that obviously has
+# no law citations. Matches the broad shape of an Indian-law reference.
+_LAW_KEYWORD_RE = re.compile(
+    r"(?:\bSection\s+\d+|\bSections\s+\d+|"
+    r"Act,?\s*\d{4}|Adhiniyam|Sanhita|"
+    r"Bharatiya|Nyaya|Suraksha|Sakshya|"
+    r"\bIPC\b|\bCrPC\b|\bCPC\b|\bBNS\b|\bBNSS\b|\bBSA\b|"
+    r"Indian Penal Code|Code of Criminal Procedure|"
+    r"Code of Civil Procedure|Evidence Act|IT Act|"
+    r"Information Technology Act|Protection of Women|"
+    r"Domestic Violence Act|Indian Contract Act|"
+    r"Immoral Traffic|"
+    r"In accordance with Section|under the.*Act|pursuant to)",
+    re.IGNORECASE,
+)
+
+
+def has_potential_law_citation(text: str) -> bool:
+    return bool(text) and _LAW_KEYWORD_RE.search(text) is not None
+
+
+def _law_strip_via_llm(text: str) -> str:
+    """Surgical removal of law citations via Gemini. Returns input unchanged on any failure."""
+    global _LLM_FILTER_DISABLED
+    if not isinstance(text, str) or not text.strip():
+        return text
+    if not has_potential_law_citation(text):
+        return text
+    if _LLM_FILTER_DISABLED:
+        return text
+
+    try:
+        gemini_client.initialize()
+        if not gemini_client.model:
+            return text
+
+        model_name = os.environ.get("GEMINI_MODEL") or settings.gemini_model
+        if model_name and model_name != gemini_client.model_name:
+            gemini_client.model_name = model_name
+            gemini_client.model = genai.GenerativeModel(model_name)
+
+        full_prompt = f"{LAW_STRIP_SYSTEM}\n\nINPUT:\n{text}\n\nOUTPUT:"
+        future = _LLM_EXECUTOR.submit(
+            lambda: gemini_client.model.generate_content(
+                full_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.0, max_output_tokens=8000
+                ),
+            )
+        )
+        try:
+            response = future.result(timeout=15)
+        except FuturesTimeoutError:
+            return text
+        out = getattr(response, "text", "") or ""
+        if not isinstance(out, str) or not out.strip():
+            return text
+        return out.strip()
+    except Exception as e:
+        emsg = str(e)
+        if "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in emsg or "PermissionDenied" in emsg:
+            _LLM_FILTER_DISABLED = True
+        return text
+
+
+def _is_applicable_laws_key(key: Any) -> bool:
+    """True when the dict key names the 'Applicable Laws' section (any casing/separator)."""
+    if not isinstance(key, str):
+        return False
+    k = key.lower()
+    return "applicable" in k and "law" in k
+
+
+def strip_laws_in_structure(data: Any) -> Any:
+    """Recursively strip law citations from every string field, except inside
+    any subtree keyed by an 'applicable laws' key (which stays untouched)."""
+    if isinstance(data, str):
+        return _law_strip_via_llm(data)
+    if isinstance(data, dict):
+        out: Dict[str, Any] = {}
+        for k, v in data.items():
+            if _is_applicable_laws_key(k):
+                out[k] = v
+            else:
+                out[k] = strip_laws_in_structure(v)
+        return out
+    if isinstance(data, list):
+        return [strip_laws_in_structure(i) for i in data]
+    return data
+
+
 class WorkflowState(TypedDict, total=False):
     raw_input: str
     data: Any
@@ -406,6 +541,10 @@ def process_analysis_docx_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     if "risks" not in document_payload:
         document_payload["risks"] = []
     document_payload["risks"] = filter_structure(document_payload.get("risks") or [])
+
+    # Strip law citations from every narrative field; keep them ONLY inside the
+    # dedicated "Applicable Laws" subtree (which is skipped by key).
+    document_payload = strip_laws_in_structure(document_payload)
 
     return {
         "requestId": request_id,

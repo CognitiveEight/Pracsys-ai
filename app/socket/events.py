@@ -249,6 +249,58 @@ def _annexure_wording_for_next_steps(text: str) -> str:
     return t
 
 
+_ANNEXURE_SINGLE_RE = re.compile(r"\bAnnexure\s+(\d+)\b", re.IGNORECASE)
+_ANNEXURE_PLURAL_RE = re.compile(
+    r"\bAnnexures\s+(\d+(?:\s*(?:,\s*(?:and\s+)?|and\s+|&\s+)\d+)*)\b",
+    re.IGNORECASE,
+)
+
+
+def _clamp_annexure_references(text: Any, max_annexure: int) -> Any:
+    """
+    Rewrite any "Annexure N" / "Annexures N, M" reference where N > max_annexure
+    down to the highest valid index (1..max_annexure). When max_annexure <= 0,
+    strip the phrase entirely so the output never falsely attributes facts to
+    annexures that were never uploaded.
+
+    Non-string inputs are returned unchanged (callers may pass through
+    arbitrary JSON values from the model).
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    if max_annexure <= 0:
+        text = _ANNEXURE_PLURAL_RE.sub("", text)
+        text = _ANNEXURE_SINGLE_RE.sub("", text)
+        return re.sub(r"\s{2,}", " ", text).strip()
+
+    def _clamp_plural(match: re.Match) -> str:
+        nums = [int(x) for x in re.findall(r"\d+", match.group(1))]
+        clamped: List[int] = []
+        for n in nums:
+            v = min(n, max_annexure)
+            if v not in clamped:
+                clamped.append(v)
+        if not clamped:
+            return ""
+        if len(clamped) == 1:
+            return f"Annexure {clamped[0]}"
+        if len(clamped) == 2:
+            return f"Annexures {clamped[0]} and {clamped[1]}"
+        return (
+            "Annexures "
+            + ", ".join(str(v) for v in clamped[:-1])
+            + f" and {clamped[-1]}"
+        )
+
+    def _clamp_single(match: re.Match) -> str:
+        n = int(match.group(1))
+        return f"Annexure {min(n, max_annexure)}"
+
+    text = _ANNEXURE_PLURAL_RE.sub(_clamp_plural, text)
+    text = _ANNEXURE_SINGLE_RE.sub(_clamp_single, text)
+    return text
+
+
 _OVERVIEW_CONTACTED_DATE_RE = re.compile(
     r"Contacted\s+SimplerToday(?:\.ai)?\s+on:\s*"
     r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})",
@@ -535,7 +587,10 @@ class SocketEventHandler:
             # cache (and every downstream emit) stays well-formed.
             if kind == CacheKinds.ANALYSIS_REPORT and isinstance(payload, dict):
                 try:
-                    self._normalize_analysis_report_lists(payload)
+                    self._normalize_analysis_report_lists(
+                        payload,
+                        max_annexure=self._get_annexure_count(workspace_id),
+                    )
                 except Exception as norm_err:
                     logger.debug(
                         "Analysis report hydration normalization skipped "
@@ -1269,9 +1324,9 @@ class SocketEventHandler:
                     if not content or len(content) < 20:
                         continue
                     label = (
-                        f"Document {i} (most recently uploaded)"
+                        f"Annexure {i} (most recently uploaded)"
                         if i == len(all_docs)
-                        else f"Document {i}"
+                        else f"Annexure {i}"
                     )
                     if len(content) > per_doc_cap:
                         content = (
@@ -1291,6 +1346,29 @@ class SocketEventHandler:
                     max_total_content,
                     len(valid_docs),
                     per_doc_cap,
+                )
+            num_annexures = len(valid_docs)
+            if num_annexures <= 0:
+                annexure_limit_block = (
+                    "AVAILABLE ANNEXURES (HARD LIMIT — do not violate):\n"
+                    "- No annexures have been uploaded.\n"
+                    "- Do NOT reference any 'Annexure N' anywhere in the output."
+                )
+            elif num_annexures == 1:
+                annexure_limit_block = (
+                    "AVAILABLE ANNEXURES (HARD LIMIT — do not violate):\n"
+                    "- The user has uploaded exactly 1 annexure.\n"
+                    "- The ONLY valid annexure reference is: Annexure 1.\n"
+                    "- You MUST NOT reference Annexure 2 or any higher number.\n"
+                    "- Do NOT invent additional annexures. Do NOT use the plural form \"annexures\"."
+                )
+            else:
+                annexure_limit_block = (
+                    "AVAILABLE ANNEXURES (HARD LIMIT — do not violate):\n"
+                    f"- The user has uploaded exactly {num_annexures} annexures.\n"
+                    f"- The ONLY valid annexure references are: Annexure 1 through Annexure {num_annexures}.\n"
+                    f"- You MUST NOT reference Annexure {num_annexures + 1} or any higher number.\n"
+                    "- Do NOT invent additional annexures."
                 )
 
             # Pass 1: "deep agents" extraction — three focused sub-agents run
@@ -1429,6 +1507,8 @@ may add it, but never invent.):
 
 {strategy_inventory or "DOCUMENT INVENTORY: (no classified inventory available)"}
 
+{annexure_limit_block}
+
 DOCUMENT CONTENT:
 {combined_document_content}
 
@@ -1438,7 +1518,7 @@ TASK:
 1. Case summary (10-20 sentences — write the FULL chronological narrative, do NOT compress ; MUST start with "This case is about..." ; MUST name every party exactly as written, include every property/land/document identifier, exact amounts in source notation, every significant date in DD/MM/YYYY, every suit/case/FIR number, and named statutes when present in the documents — never generic categories)
 2. Report case summary (10-20 sentences — write the FULL narrative, do NOT compress ; MUST start EXACTLY with "This matter is about..." ; MUST mirror the same facts, structure, and coverage as the case summary BUT rewritten as a neutral, expanded, and polished narrative suitable for formal reports and filings ; same fact-extraction checklist as the case summary — named parties, property/document IDs, exact amounts, every significant date, suit numbers, named statutes ; STRICTLY DO NOT use the words: Petitioner, Respondent, Client, Case, Adjudicator, Mediator, or any role-based labels ; avoid even generic role references ; describe parties only by their names, designations, or factual identifiers from the documents ; maintain an advanced, professional tone while keeping it clear and easy to read)
 3. Strategic objective (10-20 sentences — write the FULL plan, do NOT compress ; role-specific for {workspace_role} ; MUST anchor on named parties, specific dates, exact amounts, suit numbers, and named statutes from the documents — never generic categories)
-4. Possible next steps (3-5 immediate, concrete actions that should be taken right away). When referring to an uploaded file by index, use **Annexure 1**, **Annexure 2**, etc. (upload order). Never use the word **Document** or **document** for an upload—use **annexure** / **annexures** only.
+4. Possible next steps (3-5 immediate, concrete actions that should be taken right away). When referring to an uploaded file by index, use **Annexure N** where N is the upload-order index within the hard limit specified in AVAILABLE ANNEXURES above. Never use the word **Document** or **document** for an upload—use **annexure** / **annexures** only.
 
 LEGAL FRAMEWORK (CRITICAL - USE CORRECT INDIAN LAWS):
 - Always reference applicable and **most relevant Indian statutes/sections based on the case facts**, including but not limited to:
@@ -2030,6 +2110,26 @@ Rules:
                 t = _annexure_wording_for_next_steps(str(s).strip())
                 if t:
                     possible_next_steps.append(t)
+
+            # Clamp any "Annexure N" reference where N exceeds the number of
+            # uploaded annexures. The strategy prompt asks the model to use
+            # Annexure-N wording, but with a single upload the model has
+            # historically hallucinated Annexure 2 / Annexure 3 — this is the
+            # safety net that guarantees no such reference reaches the client.
+            case_summary = _clamp_annexure_references(case_summary, num_annexures)
+            report_case_summary = _clamp_annexure_references(
+                report_case_summary, num_annexures
+            )
+            strategic_objective = _clamp_annexure_references(
+                strategic_objective, num_annexures
+            )
+            possible_next_steps = [
+                _clamp_annexure_references(s, num_annexures) for s in possible_next_steps
+            ]
+            suggestion_chips = [
+                _clamp_annexure_references(s, num_annexures)
+                for s in (suggestion_chips or [])
+            ]
 
             # Format the response (use doc_count from vector store when batch_result not provided, e.g. after delete)
             strategies_payload = {
@@ -3165,9 +3265,9 @@ USER MESSAGE
                 if not content or len(content) < 20:
                     continue
                 label = (
-                    "Document {} (most recently uploaded)".format(i)
+                    "Annexure {} (most recently uploaded)".format(i)
                     if i == len(all_docs)
-                    else "Document {}".format(i)
+                    else "Annexure {}".format(i)
                 )
                 if len(content) > per_doc_cap:
                     content = content[:per_doc_cap] + "\n[... truncated for length ...]"
@@ -3236,6 +3336,35 @@ USER MESSAGE
 
             document_inventory = self._build_document_inventory(workspace_id)
 
+            # Tell the model exactly how many annexures exist so it cannot
+            # invent "Annexure 2", "Annexure 3", ... when only one upload
+            # is present. The post-processing clamp in
+            # _normalize_analysis_report_lists is the safety net; this is
+            # the prevention layer.
+            num_user_uploads = num_docs
+            if num_user_uploads <= 0:
+                annexure_limit_block = (
+                    "AVAILABLE ANNEXURES (HARD LIMIT — do not violate):\n"
+                    "- No annexures have been uploaded.\n"
+                    "- Do NOT reference any 'Annexure N' anywhere in the output."
+                )
+            elif num_user_uploads == 1:
+                annexure_limit_block = (
+                    "AVAILABLE ANNEXURES (HARD LIMIT — do not violate):\n"
+                    "- The user has uploaded exactly 1 annexure.\n"
+                    "- The ONLY valid annexure reference is: Annexure 1.\n"
+                    "- You MUST NOT reference Annexure 2 or any higher number.\n"
+                    "- Do NOT invent additional annexures. Do NOT use the plural form \"annexures\"."
+                )
+            else:
+                annexure_limit_block = (
+                    "AVAILABLE ANNEXURES (HARD LIMIT — do not violate):\n"
+                    f"- The user has uploaded exactly {num_user_uploads} annexures.\n"
+                    f"- The ONLY valid annexure references are: Annexure 1 through Annexure {num_user_uploads}.\n"
+                    f"- You MUST NOT reference Annexure {num_user_uploads + 1} or any higher number.\n"
+                    "- Do NOT invent additional annexures."
+                )
+
             # Deep-extraction pre-pass: pull structured entities (parties,
             # dates, suits, properties, amounts, statutes, annexures) so the
             # analysis_report synthesis below can anchor strengths /
@@ -3295,6 +3424,8 @@ CURRENT STRATEGIC OBJECTIVE (from strategy panel):
 {}
 
 {}
+
+{annexure_limit_block}
 
 DOCUMENTS (in upload order; last document is most recent):
 {}
@@ -3468,9 +3599,9 @@ What COUNTS as a strength (use these categories when evidence feels thin — at 
 2. **Party admissions** — anything the opposing side stated, signed, or did that supports the client's position (e.g. partial payment, written reply admitting a fact, official detention record).
 3. **Procedural advantage** — favourable forum / jurisdiction, limitation period still open, statutory presumption in client's favour (e.g. presumption of cruelty under §498A successor, presumption under BSA §85B for electronic records).
 4. **Statutory framework support** — a named provision under BNS / BNSS / BSA / IT Act / Specific Relief Act / Hindu Marriage Act / Domestic Violence Act / etc. that, on the recorded facts, points to relief for the client.
-5. **Corroboration across annexures** — two or more annexures that independently support the same fact, increasing evidentiary weight.
+5. **Corroboration across annexures** — two or more annexures that independently support the same fact, increasing evidentiary weight. ONLY apply this category when AVAILABLE ANNEXURES shows multiple annexures are present; when only a single annexure exists, do NOT invent corroboration.
 
-If the documents are genuinely sparse, still produce 2 strengths by anchoring to the strongest annexure available and the most credible statutory provision. Do NOT skip the field. Do NOT replace it with empty `[]`.
+If the documents are genuinely sparse, still produce 2 strengths by anchoring to the annexure(s) actually uploaded (within the hard limit in AVAILABLE ANNEXURES) and the most credible statutory provision. Do NOT skip the field. Do NOT replace it with empty `[]`.
 
 Weakness rules:
 - Only list weaknesses supported by document facts
@@ -3576,6 +3707,7 @@ ENTITY-GROUNDING RULE (CRITICAL):
                 document_inventory or "DOCUMENT INVENTORY: (no classified inventory available — reason from DOCUMENTS text below)",
                 combined_document_content,
                 entities_block_ar=_entities_block_ar,
+                annexure_limit_block=annexure_limit_block,
             )
 
             custom_suffix = build_custom_instruction_suffix(workspace_id)
@@ -4273,6 +4405,13 @@ Rules:
                 len(strengths),
                 len(missing_info),
             )
+            # Clamp "Annexure N" references in the freshly generated payload
+            # against the real upload count so a single-doc workspace never
+            # sees hallucinated Annexure 2 / Annexure 3 / ... in the first
+            # emit. Downstream merge and feedback paths re-apply the clamp
+            # via _normalize_analysis_report_lists, so this is defence in
+            # depth.
+            self._normalize_analysis_report_lists(payload, max_annexure=num_docs)
             return payload
 
         except Exception as e:
@@ -8004,7 +8143,9 @@ Return ONLY this JSON, no commentary:
             ).strip()
 
         merged["timestamp"] = datetime.utcnow().isoformat() + "Z"
-        self._normalize_analysis_report_lists(merged)
+        self._normalize_analysis_report_lists(
+            merged, max_annexure=self._get_annexure_count(workspace_id)
+        )
 
         logger.info(
             "Analysis sync merge{}: prev_missing={} new_missing={} merged_missing={}; "
@@ -8691,8 +8832,29 @@ Return ONLY this JSON, no commentary:
             strengths,
         )
 
+    def _get_annexure_count(self, workspace_id: str) -> int:
+        """
+        Return the number of annexures the user has actually uploaded for a
+        workspace. Backs the analysis-report / strategy clamp so the model
+        cannot emit "Annexure N" where N exceeds the real upload count.
+        Falls back to 0 when the workspace has no cached assessments yet
+        (e.g. cold reconnect with no documents).
+        """
+        if not workspace_id:
+            return 0
+        cached = self._workspace_document_assessments_payload.get(workspace_id)
+        if not isinstance(cached, dict):
+            return 0
+        inner = cached.get("payload") or {}
+        assessments = inner.get("documentAssessments")
+        if isinstance(assessments, list):
+            return len(assessments)
+        return 0
+
     def _normalize_analysis_report_lists(
-        self, report: Optional[Dict[str, Any]]
+        self,
+        report: Optional[Dict[str, Any]],
+        max_annexure: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Defense-in-depth sanitizer: ensures the user-facing list fields of an
@@ -8704,6 +8866,12 @@ Return ONLY this JSON, no commentary:
         would render in the FE as Python dict literals like
         ``"{'point': '...', 'laws': [...]}"``. Strengths are intentionally
         left untouched because they are a typed `List[Dict{point, laws}]`.
+
+        When ``max_annexure`` is provided, also clamps any "Annexure N"
+        reference in the user-facing fields down to the highest valid index,
+        so the model cannot emit "Annexure 2 / 3 / N" when fewer documents
+        are actually uploaded. ``relevantJurisdiction`` is exempt — the
+        prompt enforces a forum-only format there.
 
         Mutates the dict in place and returns it for convenience. Returns
         the input unchanged when it is not a dict.
@@ -8740,6 +8908,37 @@ Return ONLY this JSON, no commentary:
                 point = s.get("point")
                 if isinstance(point, str) and point.strip():
                     s["point"] = _strip_enum_prefix(point.strip())
+
+        if max_annexure is not None:
+            for key in (
+                "missingInfo",
+                "missing_info",
+                "weaknesses",
+                "risks",
+                "pendingActions",
+                "nextSteps",
+                "suggestedDrafts",
+            ):
+                values = report.get(key)
+                if isinstance(values, list):
+                    report[key] = [
+                        _clamp_annexure_references(v, max_annexure) for v in values
+                    ]
+            for scalar_key in (
+                "qualityScoreExplanation",
+                "reportQualityScoreExplanation",
+            ):
+                if scalar_key in report:
+                    report[scalar_key] = _clamp_annexure_references(
+                        report.get(scalar_key), max_annexure
+                    )
+            if isinstance(strengths, list):
+                for s in strengths:
+                    if not isinstance(s, dict):
+                        continue
+                    point = s.get("point")
+                    if isinstance(point, str) and point:
+                        s["point"] = _clamp_annexure_references(point, max_annexure)
         return report
 
     def _record_rejected_analysis_item(
@@ -9718,7 +9917,9 @@ Output ONLY valid JSON, no markdown, no code block:
             return
 
         report = copy.deepcopy(current)
-        self._normalize_analysis_report_lists(report)
+        self._normalize_analysis_report_lists(
+            report, max_annexure=self._get_annexure_count(workspace_id)
+        )
         old_score = int(
             report.get("caseResolutionScore")
             or report.get("case_resolution_score")
@@ -10146,7 +10347,9 @@ Output ONLY valid JSON, no markdown, no code block:
         report = copy.deepcopy(current)
         # Self-heal any dict-shaped list entries that may already be sitting
         # in the cached report from before the dict→string coercion fix.
-        self._normalize_analysis_report_lists(report)
+        self._normalize_analysis_report_lists(
+            report, max_annexure=self._get_annexure_count(workspace_id)
+        )
         old_score = int(
             report.get("caseResolutionScore")
             or report.get("case_resolution_score")
@@ -10776,7 +10979,9 @@ Indian Kanoon / search results (titles and snippets):
             logger.warning("analysis_docx_generate_request: invalid payload: {}", e)
             normalized_request = payload_in
 
-        response_body = process_analysis_docx_request(normalized_request)
+        response_body = await asyncio.to_thread(
+            process_analysis_docx_request, normalized_request
+        )
         try:
             preview = json.dumps(response_body, default=str)
         except Exception:

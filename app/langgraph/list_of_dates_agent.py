@@ -135,6 +135,111 @@ class ListOfDatesTemporalAgent:
         g.add_edge("validate_and_normalize", END)
         return g.compile()
 
+    async def _extract_doc_entities(
+        self, document_text: str
+    ) -> Dict[str, Any]:
+        """
+        Pre-pass for list_of_dates: extract the named entities present in this
+        single document so the date-generation prompt can anchor each entry's
+        description to actors + counterparties + amounts + suits + identifiers
+        as written, instead of producing generic "A document was executed"
+        descriptions.
+
+        Returns an empty dict on any failure; the caller falls back to the
+        existing prompt-only behavior in that case.
+        """
+        empty: Dict[str, Any] = {
+            "parties": [],
+            "amounts": [],
+            "suit_numbers": [],
+            "properties": [],
+            "statutes": [],
+        }
+        if not document_text or not document_text.strip():
+            return empty
+
+        from app.ai.gemini_client import gemini_client
+
+        prompt = (
+            "You are a focused entity extractor for a single legal document. "
+            "Your ONLY job is to list every named PARTY, every MONETARY "
+            "AMOUNT, every SUIT/CASE/FIR number, every PROPERTY identifier, "
+            "and every STATUTE referenced in the document text below.\n\n"
+            "Return ONE JSON object with this shape (no commentary, no markdown):\n\n"
+            "{\n"
+            '  "parties": [\n'
+            '    { "name": "exact name as written (Smt./Shri/Dr./M/s preserved)", '
+            '"designation": "role / community / status as written (e.g. plaintiff, defendant, vendor, vendee, advocate, SDM)" }\n'
+            "  ],\n"
+            '  "amounts": [\n'
+            '    { "amount": "in source notation (e.g. Rs. 11,64,000)", '
+            '"context": "advance / total consideration / balance / payment / fine / etc.", '
+            '"from": "name as written or null", "to": "name as written or null" }\n'
+            "  ],\n"
+            '  "suit_numbers": [\n'
+            '    { "number": "exact identifier (e.g. O.S. No. 827/2019, FIR No. 145/2024)", '
+            '"court": "court / forum as written or null", '
+            '"filed_by": "name as written or null", '
+            '"against": ["names as written"] }\n'
+            "  ],\n"
+            '  "properties": [\n'
+            '    { "identifier": "Arazi No. X / Khasra No. Y / Plot N / Survey No. N etc., exactly as written", '
+            '"area": "area exactly as written or null", '
+            '"location": "most specific location written or null" }\n'
+            "  ],\n"
+            '  "statutes": [\n'
+            '    { "name": "exact statute name as written (e.g. Specific Relief Act, 1963; BNS, 2023)", '
+            '"sections": ["section numbers as written"] }\n'
+            "  ]\n"
+            "}\n\n"
+            "STRICT RULES:\n"
+            "- Use names EXACTLY as written; preserve honorifics and "
+            "punctuation (do NOT collapse 'Smt. Premlata' to 'Premlata').\n"
+            "- Never write 'Party No. 1' / 'the plaintiff' placeholders. Drop "
+            "any entry where you cannot find a real name in the document.\n"
+            "- Preserve Indian numerical notation for amounts (Rs. 11,64,000 "
+            "stays that way; do NOT convert to '11.64 lakh' or '1,164,000').\n"
+            "- Use [] for any bucket with no matches.\n"
+            "- Return ONLY valid JSON. No commentary, no markdown fences.\n\n"
+            "DOCUMENT:\n"
+            f"{document_text[:20000]}"
+        )
+
+        try:
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+        except Exception as e:
+            logger.debug(
+                "list_of_dates per-doc entity extraction failed (non-fatal): {}", e
+            )
+            return empty
+        if not raw:
+            return empty
+        try:
+            import re as _re
+            import json as _json
+            # Trim ```json ... ``` fences if the model added them.
+            cleaned = raw.strip()
+            cleaned = _re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = _re.sub(r"\s*```\s*$", "", cleaned)
+            parsed = _json.loads(cleaned)
+            if not isinstance(parsed, dict):
+                return empty
+            for k in empty.keys():
+                if not isinstance(parsed.get(k), list):
+                    parsed[k] = []
+            return parsed
+        except Exception as parse_err:
+            logger.debug(
+                "list_of_dates per-doc entity extraction JSON parse failed (non-fatal): {}",
+                parse_err,
+            )
+            return empty
+
     async def _node_infer_temporal_events(
         self, state: TemporalInferenceState
     ) -> Dict[str, Any]:
@@ -147,6 +252,32 @@ class ListOfDatesTemporalAgent:
         gemini_client.initialize()
         if not gemini_client.model:
             return {"raw_response": "[]"}
+
+        # "Deep agents" pre-pass: extract the named entities in this document
+        # first, so the date-generation prompt below can anchor every entry's
+        # description to actors + counterparties + amounts + suits + identifiers
+        # as written. Best-effort: empty dict on failure, prompt falls back to
+        # original behavior.
+        doc_entities = await self._extract_doc_entities(document_text)
+        try:
+            import json as _json_dye
+            doc_entities_block = _json_dye.dumps(
+                doc_entities, indent=2, ensure_ascii=False
+            )
+        except Exception:
+            doc_entities_block = "{}"
+        _ents_party_count = len(doc_entities.get("parties") or [])
+        _ents_amount_count = len(doc_entities.get("amounts") or [])
+        _ents_suit_count = len(doc_entities.get("suit_numbers") or [])
+        _ents_prop_count = len(doc_entities.get("properties") or [])
+        logger.info(
+            "🧠 list_of_dates pre-extraction for doc '{}': parties={} amounts={} suits={} properties={}",
+            (state.get("source_doc_name") or state.get("source_doc_id") or "?")[:60],
+            _ents_party_count,
+            _ents_amount_count,
+            _ents_suit_count,
+            _ents_prop_count,
+        )
 
         from datetime import timedelta as _timedelta
         anchor_year = state.get("anchor_year")
@@ -165,6 +296,10 @@ class ListOfDatesTemporalAgent:
             previous_year = current_year
 
         prompt = f"""You are a legal timeline extractor. Extract only factual, case-relevant dates from the legal text below.
+
+EXTRACTED FACTS (these entities were already pulled from this document by a focused extraction step — treat them as authoritative ground truth. When you write each date entry's "description", you MUST use these exact names, amounts, suit numbers, and identifiers verbatim. Do NOT introduce "Party No. 1" / "the plaintiff" / "the petitioner" / "the respondent" placeholders. Every actor in a description must come from this list.):
+
+{doc_entities_block}
 
 **Today's date**: {today_str} (current year is {current_year}). Anchor every relative or partial date against this — these documents describe RECENT events.
 
@@ -232,7 +367,7 @@ Rules:
       • Only switch to MM/DD/YYYY if the source EXPLICITLY identifies the
         format (e.g. a label like "Date (MM/DD/YYYY): 01/05/2026") or the
         document is clearly from a US/foreign jurisdiction.
-4) "description" must be ONE short factual sentence (max 12 words) describing what happened on that date. It must be human-readable and meaningful — never paste raw document fragments.
+4) "description" must be 1-2 short factual sentences (target 25-50 words, max ~350 characters) describing what happened on that date. Name the ACTOR and the COUNTERPARTY using the names as written in the documents (full names + designations / roles when present). Include specific amounts (in the source notation, e.g. Rs. 11,64,000), document/property identifiers (e.g. Arazi No. 262, Khasra No. 285), and suit numbers (e.g. O.S. No. 827/2019) when they appear in the source. Explicitly say WHAT ACTION was taken (e.g. "executed a registered agreement to sell", "filed a Civil Suit", "issued a legal notice", "granted conditional permission"). Reference uploaded files only as Annexure N. Never paste raw document fragments — rewrite into clean prose.
 5) "evidenceSnippet" must be a clean, readable excerpt from the source text — never paste a list of dates or PDF links.
 6) Output ONLY a JSON array. No extra text.
 
@@ -240,7 +375,7 @@ Rules:
   {{
     "date": "YYYY-MM-DD",
     "title": "short event title (5 words max)",
-    "description": "one factual sentence, max 12 words",
+    "description": "1-2 short factual sentences, ~350 chars max, naming actor + counterparty + amounts + identifiers + suit numbers when present",
     "evidenceSnippet": "clean readable source excerpt proving this date (max 200 chars)",
     "pageNumber": integer (if inferable from page markers in text),
     "isIncident": true|false,
@@ -481,10 +616,13 @@ Legal text:
             ):
                 continue
 
-            # Trim description to a single concise sentence (hard cap 120 chars)
+            # Keep the first two sentences and hard-cap at 350 chars so rich
+            # descriptions ("Sitaram executed a registered agreement to sell
+            # Arazi No. 262 ... for Rs. 11,64,000, taking an advance of
+            # Rs. 10,00,000.") survive without being truncated mid-clause.
             if raw_desc:
-                first_sentence = re.split(r"(?<=[.!?])\s", raw_desc)[0]
-                description = first_sentence[:120]
+                sentences = re.split(r"(?<=[.!?])\s", raw_desc)
+                description = " ".join(sentences[:2]).strip()[:350]
             else:
                 description = ""
 

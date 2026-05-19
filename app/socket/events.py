@@ -49,6 +49,7 @@ from app.socket.schemas import (
     AIResponsePayload,
     AnalysisDocxGenerateRequestPayload,
     ApplicableLawRelevanceRequestPayload,
+    TemplateSyncPayload,
     UserMessageRequestPayload,
     WorkspaceCreatedPayload,
     WorkspaceSyncPayload,
@@ -467,6 +468,11 @@ class SocketEventHandler:
         self._workspace_procedural_timeline_payload: Dict[
             str, List[Dict[str, Any]]
         ] = PersistentWorkspaceDict(CacheKinds.PROCEDURAL_TIMELINE)
+        # Drafting Assistant — proactive suggested drafts panel per workspace.
+        # Shape: {"suggestedDrafts": [{"title","relevance","description"}, ...]}
+        self._workspace_drafting_payload: Dict[str, Dict[str, Any]] = (
+            PersistentWorkspaceDict(CacheKinds.DRAFTING_SUGGESTIONS)
+        )
         # Re-emit after reconnect when socket dropped right after analysis report (so backend gets the update)
         self._had_disconnect: bool = False
         self._pending_reemit_workspace_id: Optional[str] = None
@@ -590,6 +596,7 @@ class SocketEventHandler:
             CacheKinds.DOCUMENT_ASSESSMENTS: self._workspace_document_assessments_payload,
             CacheKinds.STRATEGY_PAYLOAD: self._workspace_strategy_payload,
             CacheKinds.REJECTED_ANALYSIS_ITEMS: self._workspace_rejected_analysis_items,
+            CacheKinds.DRAFTING_SUGGESTIONS: self._workspace_drafting_payload,
         }
         for kind, target in kind_to_dict.items():
             payload = cached_kinds.get(kind)
@@ -803,6 +810,8 @@ class SocketEventHandler:
             "analysis_docx_generate_request",
             self.on_analysis_docx_generate_request,
         )
+        # Drafting Assistant — template library sync from BE.
+        self.register("template_sync", self.on_template_sync)
 
         # Legacy event handlers
         self.register("workspace_updated", self.on_workspace_updated)
@@ -6760,6 +6769,170 @@ Indian Kanoon / case-law search results:
         )
         await asyncio.sleep(0.1)
 
+    # ------------------------------------------------------------------
+    # Drafting Assistant — suggested drafts panel
+    # ------------------------------------------------------------------
+
+    def _build_case_brief_for_drafting(
+        self, workspace_id: str
+    ) -> Dict[str, str]:
+        """Compose the case-context strings the drafting agent needs.
+
+        Pulled from already-cached panels (analysis_report, strategy, etc.)
+        so a single LLM call generates focused, grounded suggestions.
+        """
+        case_summary = ""
+        applicable_laws_brief = ""
+        strategy_brief = ""
+        analysis_brief = ""
+        list_of_dates_brief = ""
+
+        try:
+            strat = self._workspace_strategy_payload.get(workspace_id) or {}
+            if isinstance(strat, dict):
+                case_summary = (strat.get("caseSummary") or "").strip()
+                strategic = (strat.get("strategicObjective") or "").strip()
+                next_steps = strat.get("possibleNextSteps") or []
+                if isinstance(next_steps, list):
+                    next_steps_text = "; ".join(
+                        str(s).strip() for s in next_steps[:5] if s
+                    )
+                else:
+                    next_steps_text = ""
+                strategy_brief = "\n".join(
+                    line for line in [
+                        f"Strategic objective: {strategic}" if strategic else "",
+                        f"Possible next steps: {next_steps_text}" if next_steps_text else "",
+                    ] if line
+                )
+        except Exception:
+            pass
+
+        try:
+            analysis = self._workspace_analysis_payload.get(workspace_id) or {}
+            if isinstance(analysis, dict):
+                weaknesses = analysis.get("weaknesses") or []
+                missing = analysis.get("missingInfo") or []
+                pending = analysis.get("pendingActions") or []
+                strengths = analysis.get("strengths") or []
+                lines: List[str] = []
+                if isinstance(strengths, list) and strengths:
+                    strength_pts = [
+                        (s.get("point") or s.get("text") or "") if isinstance(s, dict) else str(s)
+                        for s in strengths[:4]
+                    ]
+                    strength_pts = [p.strip() for p in strength_pts if p and p.strip()]
+                    if strength_pts:
+                        lines.append("Strengths: " + " | ".join(strength_pts))
+                if isinstance(weaknesses, list) and weaknesses:
+                    weak_pts = [str(w).strip() for w in weaknesses[:4] if w]
+                    if weak_pts:
+                        lines.append("Weaknesses: " + " | ".join(weak_pts))
+                if isinstance(missing, list) and missing:
+                    miss_pts = [str(m).strip() for m in missing[:4] if m]
+                    if miss_pts:
+                        lines.append("Missing info: " + " | ".join(miss_pts))
+                if isinstance(pending, list) and pending:
+                    pend_pts = [str(p).strip() for p in pending[:4] if p]
+                    if pend_pts:
+                        lines.append("Pending actions: " + " | ".join(pend_pts))
+                analysis_brief = "\n".join(lines)
+        except Exception:
+            pass
+
+        try:
+            laws_payload = (
+                self._workspace_applicable_laws_payload.get(workspace_id) or {}
+            )
+            if isinstance(laws_payload, dict):
+                laws = laws_payload.get("applicableLaws") or laws_payload.get("laws") or []
+                if isinstance(laws, list) and laws:
+                    parts: List[str] = []
+                    for law in laws[:8]:
+                        if not isinstance(law, dict):
+                            continue
+                        act = (law.get("act") or "").strip()
+                        section = (law.get("section") or "").strip()
+                        if act and section:
+                            parts.append(f"{act} §{section}")
+                        elif act:
+                            parts.append(act)
+                    if parts:
+                        applicable_laws_brief = "; ".join(parts)
+        except Exception:
+            pass
+
+        try:
+            dates = self._workspace_list_of_dates_payload.get(workspace_id) or []
+            if isinstance(dates, list) and dates:
+                lines = []
+                for d in dates[:6]:
+                    if not isinstance(d, dict):
+                        continue
+                    dt = (d.get("date") or "").strip()
+                    title = (d.get("title") or d.get("eventType") or "").strip()
+                    if dt and title:
+                        lines.append(f"{dt} — {title}")
+                if lines:
+                    list_of_dates_brief = "\n".join(lines)
+        except Exception:
+            pass
+
+        return {
+            "case_summary": case_summary,
+            "applicable_laws_brief": applicable_laws_brief,
+            "strategy_brief": strategy_brief,
+            "analysis_brief": analysis_brief,
+            "list_of_dates_brief": list_of_dates_brief,
+        }
+
+    async def _generate_and_emit_drafting_suggestions(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: Optional[str] = None,
+    ) -> None:
+        """
+        Generate the proactive Drafting Assistant panel suggestions and emit
+        them as a document_feature_response (featureType="drafting_assistant").
+
+        Cached in `_workspace_drafting_payload` for reconnect re-emit.
+        """
+        if not self._socket_client:
+            return
+        try:
+            from app.langgraph.drafting_agent import drafting_agent
+
+            role_upper = (workspace_role or "ADJUDICATOR").strip().upper() or "ADJUDICATOR"
+            brief = self._build_case_brief_for_drafting(workspace_id)
+            suggestions = await drafting_agent.suggest(
+                role=role_upper,
+                case_summary=brief["case_summary"],
+                applicable_laws_brief=brief["applicable_laws_brief"],
+                strategy_brief=brief["strategy_brief"],
+                analysis_brief=brief["analysis_brief"],
+                list_of_dates_brief=brief["list_of_dates_brief"],
+            )
+
+            payload = {"suggestedDrafts": suggestions or []}
+            self._workspace_drafting_payload[workspace_id] = payload
+            await self._socket_client.emit(
+                "document_feature_response",
+                {
+                    "featureType": "drafting_assistant",
+                    "workspaceId": workspace_id,
+                    "userId": user_id,
+                    "payload": payload,
+                },
+            )
+            logger.success(
+                "✅ Drafting suggestions sent to backend ({} item(s))",
+                len(payload["suggestedDrafts"]),
+            )
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.warning("Drafting suggestions emit failed: {}", e)
+
     def _strategy_objective_fallback(
         self,
         workspace_id: str,
@@ -6865,11 +7038,28 @@ Indian Kanoon / case-law search results:
                     ctx,
                     pt_err,
                 )
+            try:
+                logger.info(
+                    "Drafting suggestions: invoking (background{}) for workspace {}",
+                    ctx,
+                    workspace_id[:12] if workspace_id else "",
+                )
+                await self._generate_and_emit_drafting_suggestions(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=workspace_role,
+                )
+            except Exception as draft_err:
+                logger.warning(
+                    "Drafting suggestions (background{}) failed: {}",
+                    ctx,
+                    draft_err,
+                )
 
         try:
             asyncio.create_task(_runner())
             logger.debug(
-                "Scheduled list_of_dates + applicable_laws + procedural_timeline{} for workspace {}",
+                "Scheduled list_of_dates + applicable_laws + procedural_timeline + drafting_suggestions{} for workspace {}",
                 ctx,
                 workspace_id[:12] if workspace_id else "",
             )
@@ -11021,6 +11211,105 @@ Indian Kanoon / search results (titles and snippets):
             response_body.get("requestId"),
         )
 
+    async def on_template_sync(self, data: Dict[str, Any]) -> None:
+        """
+        Handle template_sync event (Server → AI_Maverick).
+
+        Payload:
+        {
+            action: "uploaded" | "renamed" | "deleted",
+            userId: str,
+            templates: [ {id, name, previousName?, category, extension,
+                          mimeType?, size?, fileHash?, fileUrl?, path?} ],
+            timestamp: str (ISO)
+        }
+
+        For "uploaded" the AI downloads each template, extracts its text via
+        `file_handlers.process_file_by_extension`, and stores the result in a
+        lawyer-scoped Qdrant cache keyed by (userId, template_id). "renamed"
+        only patches cached metadata (content unchanged). "deleted" removes
+        the cache entry.
+        """
+        payload_in = data if isinstance(data, dict) else {}
+        try:
+            payload = TemplateSyncPayload(**payload_in)
+        except Exception as e:
+            logger.warning(
+                "template_sync: invalid payload (action={}, keys={}): {}",
+                (payload_in or {}).get("action"),
+                list((payload_in or {}).keys()),
+                e,
+            )
+            return
+
+        action = (payload.action or "").strip().lower()
+        user_id = (payload.userId or "").strip()
+        if not user_id:
+            logger.warning("template_sync: missing userId — dropping event")
+            return
+
+        templates = list(payload.templates or [])
+        logger.info(
+            "📚 template_sync action={} user={} count={}",
+            action,
+            user_id[:12],
+            len(templates),
+        )
+
+        try:
+            from app.langgraph.drafting_agent import drafting_agent
+        except Exception as e:
+            logger.error("template_sync: drafting agent unavailable: {}", e)
+            return
+
+        if action == "uploaded":
+            for tpl in templates:
+                if not tpl.id or not tpl.fileUrl:
+                    logger.warning(
+                        "template_sync uploaded: skipping item with missing id/fileUrl ({!r})",
+                        tpl.id,
+                    )
+                    continue
+                # Reuse existing cached payload to skip re-extraction when the
+                # file hash hasn't changed (BE may re-send on reconnect).
+                try:
+                    previous = await drafting_agent.get_template(
+                        user_id=user_id, template_id=tpl.id
+                    )
+                except Exception:
+                    previous = None
+                await drafting_agent.ingest_template(
+                    user_id=user_id,
+                    template_id=tpl.id,
+                    name=tpl.name or tpl.id,
+                    category=tpl.category or "Document Draft",
+                    extension=tpl.extension or "",
+                    mime_type=tpl.mimeType,
+                    file_url=tpl.fileUrl,
+                    path=tpl.path,
+                    file_hash=tpl.fileHash,
+                    previous_payload=previous if isinstance(previous, dict) else None,
+                )
+        elif action == "renamed":
+            for tpl in templates:
+                if not tpl.id or not tpl.name:
+                    continue
+                await drafting_agent.rename_template(
+                    user_id=user_id,
+                    template_id=tpl.id,
+                    new_name=tpl.name,
+                    previous_name=tpl.previousName,
+                )
+        elif action == "deleted":
+            for tpl in templates:
+                if not tpl.id:
+                    continue
+                await drafting_agent.delete_template(
+                    user_id=user_id, template_id=tpl.id
+                )
+        else:
+            logger.warning("template_sync: unknown action {!r}", action)
+
     def _normalize_case_title(self, title: str) -> str:
         """
         Normalize a case title to "Petitioner vs Respondent" style with
@@ -12175,6 +12464,21 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 )
                 logger.success(
                     "✅ Procedural timeline re-emitted to backend after reconnect"
+                )
+            # 8) Drafting Assistant — proactive suggestions panel
+            drafting_payload = self._workspace_drafting_payload.get(workspace_id)
+            if drafting_payload is not None:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "drafting_assistant",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": drafting_payload,
+                    },
+                )
+                logger.success(
+                    "✅ Drafting suggestions re-emitted to backend after reconnect"
                 )
         except Exception as e:
             logger.warning("Failed to re-emit after reconnect: {}", e)
@@ -14005,6 +14309,162 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
             logger.exception(e)
             raise
 
+    async def _handle_drafting_assistant_message(
+        self,
+        *,
+        payload: UserMessageRequestPayload,
+        workspace_id: str,
+        user_id: str,
+        chat_id: str,
+    ) -> None:
+        """Drive one turn of the Drafting Assistant conversation.
+
+        Builds a lightweight case-context dict from already-cached panels,
+        invokes the drafting agent, and emits an augmented `ai_response`
+        with `draftStatus`, `openQuestions`, and (when ready) `draftDocument`.
+        """
+        actionable_id = (payload.actionableId or "").strip()
+        if not actionable_id:
+            # Without an actionableId we cannot keep session state coherent.
+            # Generate a stable fallback so the conversation can still run
+            # within the same chat.
+            actionable_id = f"user_draft_chat_{chat_id}"
+
+        # Resolve role from workspace context (same logic as the main chat
+        # path, but minimised because drafting is role-aware not gated).
+        role = "ADJUDICATOR"
+        try:
+            from app.workspace.manager import workspace_manager
+
+            ctx = workspace_manager.get_workspace(workspace_id)
+            if ctx and getattr(ctx, "workspace_role", None):
+                role = (ctx.workspace_role or "ADJUDICATOR").upper()
+        except Exception:
+            pass
+        cached_role = await self._restore_workspace_role(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+        if cached_role:
+            role = cached_role
+
+        # Compose case context for the drafting agent.
+        brief = self._build_case_brief_for_drafting(workspace_id)
+        case_context = {
+            "role": role,
+            "workspace_id": workspace_id,
+            "user_id": user_id,
+            "case_summary": brief.get("case_summary") or "",
+            "case_facts_brief": "\n".join(
+                line for line in [
+                    brief.get("analysis_brief") or "",
+                    brief.get("list_of_dates_brief") or "",
+                ] if line
+            ),
+            "applicable_laws_brief": brief.get("applicable_laws_brief") or "",
+            "strategy_brief": brief.get("strategy_brief") or "",
+        }
+
+        conversation_history: List[Dict[str, Any]] = []
+        for item in payload.conversation_history or []:
+            role_str = getattr(item, "role", None) or (
+                item.get("role") if isinstance(item, dict) else None
+            )
+            content_str = getattr(item, "content", None) or (
+                item.get("content") if isinstance(item, dict) else None
+            )
+            if role_str and content_str is not None:
+                conversation_history.append(
+                    {"role": str(role_str).upper(), "content": str(content_str)}
+                )
+
+        request_fields = {
+            "actionableId": actionable_id,
+            "userId": user_id,
+            "workspaceId": workspace_id,
+            "chatId": chat_id,
+            "source": (payload.source or "").strip() or None,
+            "suggestedDraftId": payload.suggestedDraftId,
+            "templateId": payload.templateId,
+            "templateUrl": payload.templateUrl,
+            "templateOriginalName": payload.templateOriginalName,
+            "templateMimeType": payload.templateMimeType,
+        }
+
+        try:
+            from app.langgraph.drafting_agent import drafting_agent
+
+            turn = await drafting_agent.handle_turn(
+                user_message=payload.content or "",
+                case_context=case_context,
+                request_fields=request_fields,
+                conversation_history=conversation_history,
+            )
+        except Exception as e:
+            logger.error("Drafting agent failed: {}", e)
+            logger.exception(e)
+            turn = {
+                "content": (
+                    "I ran into an issue while preparing the draft. "
+                    "Please retry, or share any additional details that may help."
+                ),
+                "draftStatus": "gathering_info",
+                "openQuestions": [],
+                "draftDocument": None,
+            }
+
+        # Emit the augmented ai_response.
+        if not self._socket_client:
+            logger.error("Socket client unavailable; cannot emit drafting ai_response")
+            return
+
+        ai_response_payload: Dict[str, Any] = {
+            "chatId": chat_id,
+            "workspaceId": workspace_id,
+            "userId": user_id,
+            "chat_type": "DRAFTING_ASSISTANT",
+            "actionableId": actionable_id,
+            "content": (turn.get("content") or "").strip(),
+            "draftStatus": turn.get("draftStatus"),
+            "openQuestions": turn.get("openQuestions") or [],
+            "draftDocument": turn.get("draftDocument"),
+            "metadata": {
+                "messageId": chat_id,
+                "aiModel": settings.gemini_model,
+            },
+        }
+        if ai_response_payload["draftDocument"] is None:
+            ai_response_payload.pop("draftDocument", None)
+        # Cache the assistant text so a short "yes" follow-up resolves correctly.
+        if ai_response_payload["content"]:
+            self._intelligence_last_ai_by_chat[chat_id] = ai_response_payload[
+                "content"
+            ]
+        self._pending_ai_response = ai_response_payload
+        try:
+            await self._socket_client.emit_ai_response(ai_response_payload)
+            logger.success(
+                "✅ Drafting ai_response emitted (status={}, version={})",
+                ai_response_payload.get("draftStatus"),
+                (turn.get("draftDocument") or {}).get("version"),
+            )
+        except Exception as e:
+            logger.error("Failed to emit drafting ai_response: {}", e)
+
+        audit_logger.log_event(
+            "user_drafting_message_processed",
+            {
+                "workspace_id": workspace_id,
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "actionable_id": actionable_id,
+                "draft_status": turn.get("draftStatus"),
+                "open_questions": len(turn.get("openQuestions") or []),
+                "draft_ready": bool(turn.get("draftDocument")),
+            },
+        )
+
     async def on_user_message_request(self, data: Dict[str, Any]) -> None:
         """
         Handle user_message_request event (Server → AI_Maverick).
@@ -14057,6 +14517,21 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
             # No-op if the cache is already warm or workspace_id is missing.
             if workspace_id and workspace_id != "unknown":
                 await self._hydrate_workspace_caches(workspace_id, user_id=user_id)
+
+            # Drafting Assistant short-circuit: when chat_type is
+            # DRAFTING_ASSISTANT we hand the turn to the drafting agent
+            # instead of running it through the general intelligence chat.
+            # The drafting agent owns its own session state keyed by
+            # `actionableId` and emits the augmented `ai_response` payload
+            # (draftStatus / openQuestions / draftDocument).
+            if (payload.chat_type or "").strip().upper() == "DRAFTING_ASSISTANT":
+                await self._handle_drafting_assistant_message(
+                    payload=payload,
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                )
+                return
 
             role_context = {
                 "role": "ADJUDICATOR",

@@ -213,9 +213,12 @@ class UserMessageRequestPayload(BaseModel):
 
     Note: Backend sends 'content' field, not 'message'.
     When user uploads a document in chat, attachment has url, fileName, mimeType.
+
+    For DRAFTING_ASSISTANT chats, additional optional fields identify the draft
+    session and (on the kick-off turn) the template/suggestion the lawyer picked.
     """
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     content: str  # User message content (backend sends 'content', not 'message')
     chat_type: str = Field(validation_alias=AliasChoices("chat_type", "chatType"))
@@ -227,6 +230,83 @@ class UserMessageRequestPayload(BaseModel):
     attachment: Optional[ChatAttachmentPayload] = (
         None  # Document uploaded with this message (e.g. ANALYSIS_REPORT chat)
     )
+
+    # Drafting Assistant fields. Optional; present on the kick-off turn when
+    # the lawyer starts a draft from a template / suggestion / blank.
+    actionableId: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("actionableId", "actionable_id"),
+    )  # One per draft session; AI caches state keyed by this.
+    source: Optional[str] = None  # "template" | "suggestedDraft" | "blank"
+    suggestedDraftId: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("suggestedDraftId", "suggested_draft_id"),
+    )
+    templateId: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("templateId", "template_id"),
+    )
+    templateUrl: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("templateUrl", "template_url"),
+    )  # Lazy-fetch fallback when AI's template cache is cold.
+    templateOriginalName: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "templateOriginalName", "template_original_name"
+        ),
+    )
+    templateMimeType: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("templateMimeType", "template_mime_type"),
+    )
+
+
+# ============================================================================
+# Drafting Assistant — template_sync (Server → AI)
+# ============================================================================
+
+
+class TemplateSyncItem(BaseModel):
+    """
+    One template row inside a template_sync payload.
+
+    Fields are populated based on the parent payload's `action`:
+      - uploaded: id, name, category, extension, mimeType, size, fileHash,
+        fileUrl, path all present.
+      - renamed: id, name, previousName, category, extension, mimeType,
+        fileHash, path present; size / fileUrl omitted (content unchanged).
+      - deleted: id, name, category, extension, mimeType, fileHash, path
+        present; size / fileUrl omitted.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: str
+    name: str
+    previousName: Optional[str] = None
+    category: str  # "Letterhead" | "Folder" | "Document Draft"
+    extension: str  # pdf | doc | docx | txt
+    mimeType: Optional[str] = None
+    size: Optional[int] = None
+    fileHash: Optional[str] = None
+    fileUrl: Optional[str] = None
+    path: Optional[str] = None
+
+
+class TemplateSyncPayload(BaseModel):
+    """
+    Schema for the template_sync event (Server → AI_Maverick).
+    Emitted when the lawyer uploads, renames, or deletes one or more
+    templates in the Template Library. Supports bulk operations.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    action: Literal["uploaded", "deleted", "renamed"]
+    userId: str = Field(validation_alias=AliasChoices("userId", "user_id"))
+    templates: List[TemplateSyncItem] = []
+    timestamp: Optional[str] = None
 
 
 # ============================================================================
@@ -254,11 +334,44 @@ class AIResponseMetadata(BaseModel):
         populate_by_name = True
 
 
+class DraftOpenQuestion(BaseModel):
+    """One open question the drafting agent still needs answered."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: str
+    label: str
+
+
+class DraftDocumentPayload(BaseModel):
+    """
+    Final (or revised) draft delivered by the drafting agent.
+    `content` is the full draft as a Markdown string — frontend renders it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    title: str
+    format: Literal["markdown"] = "markdown"
+    content: str
+    version: int = 1
+    sourceTemplateId: Optional[str] = None
+    sourceTemplateName: Optional[str] = None
+    sourceType: Optional[str] = None  # "template" | "suggestedDraft" | "blank"
+    wordCount: Optional[int] = None
+
+
 class AIResponsePayload(BaseModel):
     """
     Schema for ai_response event (AI_Maverick → Server).
     AI service sends response back to server.
     suggestionChips: optional follow-up prompts (clickable chips) - when user clicks, that text is sent as next message.
+
+    For DRAFTING_ASSISTANT chats, additional fields carry draft-flow state:
+      - draftStatus: analyzing | gathering_info | ready | revising
+      - openQuestions: slots the AI still needs the lawyer to fill
+      - draftDocument: final Markdown draft (populated only when status="ready")
+      - actionableId: echoes the draft session key from the request
     """
 
     chatId: str
@@ -270,8 +383,44 @@ class AIResponsePayload(BaseModel):
         None  # 3-4 contextual, role-based prompts for next turn
     )
 
+    # Drafting Assistant fields (omitted for other chat types).
+    actionableId: Optional[str] = None
+    chat_type: Optional[str] = None
+    draftStatus: Optional[
+        Literal["analyzing", "gathering_info", "ready", "revising"]
+    ] = None
+    openQuestions: Optional[List[DraftOpenQuestion]] = None
+    draftDocument: Optional[DraftDocumentPayload] = None
+
     class Config:
         populate_by_name = True
+
+
+# ============================================================================
+# Drafting Assistant — suggestions payload (AI → Server via document_feature_response)
+# ============================================================================
+
+
+class DraftingSuggestionItem(BaseModel):
+    """
+    One suggested draft in the proactive Drafting Assistant panel.
+
+    Emitted inside document_feature_response payload.suggestedDrafts[].
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    title: str
+    relevance: Literal["High", "Medium", "Low"] = "Medium"
+    description: Optional[str] = None  # one-line summary, <= 160 chars
+
+
+class DraftingSuggestionsPayload(BaseModel):
+    """Inner `payload` shape for featureType=drafting_assistant."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    suggestedDrafts: List[DraftingSuggestionItem] = []
 
 
 # ============================================================================

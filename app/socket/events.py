@@ -189,14 +189,25 @@ def _coerce_analysis_text_list(items: Any) -> List[str]:
     return out
 
 
+_STRENGTH_POINT_MIN_LEN = 60
+
+
 def _strip_strength_point_statute_boilerplate(text: str) -> str:
     """
     Remove trailing citation boilerplate from analysis strength points (statutes belong in `laws`, not prose).
     Strips phrases like 'which is a relevant fact under …' and 'admissible under …'.
+
+    Guard: if stripping would collapse the point below ``_STRENGTH_POINT_MIN_LEN``
+    characters (i.e. the model produced a label + boilerplate single-sentence form
+    like "Youth of the accused, which is a relevant fact under <Act>, YYYY."), we
+    return the ORIGINAL prose instead. The universal law-strip in ``agent.py`` will
+    then remove the citation in a context-aware way without collapsing the whole
+    point to a two-word fragment.
     """
     if not (text or "").strip():
         return ""
-    t = text.strip()
+    original = text.strip()
+    t = original
     for _ in range(5):
         prev = t
         t = re.sub(
@@ -227,7 +238,13 @@ def _strip_strength_point_statute_boilerplate(text: str) -> str:
             break
     t = re.sub(r"\s+", " ", t).strip()
     t = re.sub(r"\s*,\s*$", "", t)
-    return t.strip()
+    cleaned = t.strip()
+    # Preserve the original when stripping collapsed it to a sub-threshold label.
+    # The universal law-strip will neutralise the citation downstream without
+    # destroying the surrounding prose.
+    if len(cleaned) < _STRENGTH_POINT_MIN_LEN and len(cleaned) < len(original):
+        return original
+    return cleaned
 
 
 def _annexure_wording_for_next_steps(text: str) -> str:
@@ -3644,7 +3661,7 @@ Output keys in this exact order (score and explanations FIRST so they are not tr
   "missingInfo": ["Each missing-info entry is a 2-4 sentence string naming WHAT is missing, FROM WHOM (the named party/document/Annexure it should come from), WHY it matters for the strategic objective, and which existing Annexure (if any) currently approximates it. Use exact names and identifiers from EXTRACTED FACTS — never one-word labels like 'address' or 'medical report'."],
   "strengths": [
     {{
-      "point": "Factual strength written as 2-4 sentences naming the specific parties (use exact names from EXTRACTED FACTS), dated events (DD/MM/YYYY), exact amounts in source notation (Rs. 11,64,000), suit/document references (O.S. No. 827/2019), and Annexures that establish this strength. Do not pad with statute boilerplate; statutes belong in the laws array. Anchor every claim in named facts.",
+      "point": "MANDATORY 2-4 SENTENCES of factual prose (NOT a label, NOT a one-liner). Name the specific parties (use exact names from EXTRACTED FACTS), the dated events (DD/MM/YYYY), exact amounts in source notation (Rs. 11,64,000), suit/document references (O.S. No. 827/2019), and the Annexure(s) that establish this strength. Do NOT pad with statute boilerplate phrases such as 'which is a relevant fact under <Act>, YYYY' or 'admissible under <Act>'; statutes belong only in the laws array. Anchor every claim in named facts. The whole point string must be at least 120 characters.\n\nGOOD example (do this): 'Rohan Sharma was 20 years old at the time of the arrest on 18/04/2026, as recorded in Annexure 1. Youth at this scale is a recognised mitigating factor for bail and is supported by the contact log showing his sister approached counsel within five days of the remand to Tihar Jail.'\n\nBAD example (do NOT do this): 'Youth of the accused.' — that is a label, not a strength.\n\nBAD example (do NOT do this): 'Youth of the accused, which is a relevant fact under the Narcotic Drugs and Psychotropic Substances Act, 1985.' — single-sentence label padded with a citation; the citation belongs in the laws array, and the prose must be 2-4 sentences with named entities.",
       "laws": ["BNS Section 318", "BSA"]
     }}
   ],
@@ -3663,7 +3680,7 @@ missingInfo:
 ONLY information absent from documents and legally required.
 
 strengths:
-**MANDATORY 2-6 items (never 0, never 1).** Each has factual `point` prose (2-4 sentences, named entities, see Strength rules) plus `laws` for citations — **no** "relevant fact under …" / "admissible under …" sentences in `point`.
+**MANDATORY 2-6 items (never 0, never 1).** Each has factual `point` prose (2-4 FULL sentences with named parties, DD/MM/YYYY dates, exact amounts, and Annexure references — minimum 120 characters total) plus `laws` for citations. **NEVER emit a label-only `point` like "Youth of the accused" or "Duration of detention"** — that is a heading, not a strength. **NEVER pad a label with citation boilerplate like ", which is a relevant fact under <Act>, YYYY"** — statutes belong only in the `laws` array; the prose must stand on its own as 2-4 sentences of named facts.
 
 weaknesses:
 0–6 factual weaknesses.
@@ -3971,20 +3988,28 @@ Rules:
                         continue
                     strengths.append({"point": point, "laws": []})
 
-            # Guard: the schema mandates 2-6 strengths. The model occasionally
-            # returns an empty array — usually because the entity-grounding
-            # rules made it over-cautious on cases with thin documentary
-            # evidence. Fire ONE focused retry that returns only a strengths
-            # array of 2-6 entity-grounded items.
-            if len(strengths) < 2 and (
+            # Guard: the schema mandates 2-6 strengths, each with 2-4 sentence
+            # prose. The model occasionally returns an empty array OR emits
+            # label-only points like "Youth of the accused" — usually because
+            # the entity-grounding rules made it over-cautious on cases with
+            # thin documentary evidence. Fire ONE focused retry when either:
+            #   (a) fewer than 2 strengths were produced, OR
+            #   (b) any surviving strength has a point shorter than 40 chars
+            #       (a label, not a 2-4 sentence strength).
+            _has_short_strength_point = any(
+                isinstance(s, dict) and len((s.get("point") or "").strip()) < 40
+                for s in strengths
+            )
+            if (len(strengths) < 2 or _has_short_strength_point) and (
                 isinstance(combined_document_content, str)
                 and combined_document_content.strip()
                 and combined_document_content.strip() != "No document content available."
             ):
                 logger.warning(
-                    "Analysis report returned only {} strength(s) for workspace {}; "
-                    "firing focused retry to recover minimum 2.",
+                    "Analysis report returned {} strength(s) (short_label_present={}) "
+                    "for workspace {}; firing focused retry to recover full prose.",
                     len(strengths),
+                    _has_short_strength_point,
                     workspace_id[:12] if workspace_id else "",
                 )
                 try:

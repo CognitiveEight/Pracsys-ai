@@ -13,6 +13,7 @@ import google.generativeai as genai
 from langgraph.graph import END, START, StateGraph
 from app.ai.gemini_client import gemini_client
 from app.core.config import settings
+from app.prompts.applicable_acts import TARGETED_INDIAN_ACTS
 
 # Must match SYSTEM "Forbidden words" list (case-sensitive fast path = LLM path).
 FORBIDDEN = (
@@ -398,6 +399,25 @@ LAW_STRIP_SYSTEM = """You are a strict text editor.
 
 Your ONLY job is to REMOVE law citations from the text. Do NOT rephrase, restructure, summarize, paraphrase, or rewrite any sentence. Do NOT change the capitalization of words that survive.
 
+=== UNIVERSAL CITATION RULE — apply this FIRST, above every other rule below ===
+
+ANY sequence of one or more Capitalised words that ends in `Act`, `Acts`, `Adhiniyam`, `Sanhita`, `Code`, `Ordinance`, `Rules`, `Regulations`, or `Order` — optionally followed by `, YYYY` or ` YYYY` — IS a law citation and MUST be removed. This rule is universal: it applies to EVERY Indian law, KNOWN OR UNKNOWN to you, including but not at all limited to:
+
+- Narcotic Drugs and Psychotropic Substances Act, 1985 (the "NDPS Act" / "NDPS")
+- Prevention of Money Laundering Act, 2002 ("PMLA")
+- SEBI Act, 1992
+- Specific Relief Act, 1963
+- Companies Act, 2013
+- Real Estate (Regulation and Development) Act, 2016 ("RERA")
+- Foreign Exchange Management Act, 1999 ("FEMA")
+- Insolvency and Bankruptcy Code, 2016 ("IBC")
+- Information Technology Act, 2000 ("IT Act")
+- Negotiable Instruments Act, 1881 ("NI Act")
+- Bharatiya Nyaya Sanhita, 2023 / Bharatiya Nagarik Suraksha Sanhita, 2023 / Bharatiya Sakshya Adhiniyam, 2023
+- AND ANY OTHER act / sanhita / adhiniyam / code / ordinance / rules / regulations referenced in the text — even if you've never seen the name before. Do NOT preserve a citation simply because the act is unfamiliar.
+
+The Indian-act examples and patterns later in this prompt are ILLUSTRATIONS, not an exhaustive enumeration. If a phrase looks like a legal reference (any of the shapes below, or anything similar), treat it as a citation and strip it.
+
 === PRIMARY DIRECTIVE — apply this above every other rule below ===
 
 Any phrase that functions as a law, act, statute, section, article, code, sanhita, adhiniyam, ordinance, rule, regulation, or constitutional citation — KNOWN OR UNKNOWN to you — MUST be REMOVED from the text. The act lists, connective lists, and worked examples further down are ILLUSTRATIONS, not an exhaustive enumeration. If a phrase looks like a legal reference (any of the shapes below, or anything similar), treat it as a citation and strip it — do not skip it just because the act name is unfamiliar:
@@ -495,21 +515,43 @@ Ensure the conversion of the written complaint into a formal First Information R
 OUTPUT:
 Ensure the conversion of the written complaint into a formal First Information Report (FIR). Financial annexures are essential for quantifying maintenance.
 
+EXAMPLE 7 (NDPS Act — must be stripped exactly the same as BNS/IPC):
+INPUT:
+The FIR has been shared for review to determine the specific charges under the Narcotic Drugs and Psychotropic Substances Act, 1985. If the quantity of the substance is not of a commercial nature, the rigours of Section 37 of the NDPS Act may be avoided.
+OUTPUT:
+The FIR has been shared for review to determine the specific charges. If the quantity of the substance is not of a commercial nature, the rigours may be avoided.
+
+EXAMPLE 8 (acronym act + named act with year — PMLA, SEBI, RERA, FEMA, IBC patterns):
+INPUT:
+The complaint will be moved under the Prevention of Money Laundering Act, 2002 alongside parallel proceedings under SEBI Act, 1992 and the Insolvency and Bankruptcy Code, 2016. Pending RERA registration is to be confirmed.
+OUTPUT:
+The complaint will be moved alongside parallel proceedings. Pending registration is to be confirmed.
+
+EXAMPLE 9 (unfamiliar / fictional act name — the rule applies regardless of recognition):
+INPUT:
+The matter would be governed by the Sample Statutory Authority Act, 2031, which was invoked under Section 12 of that Act on 18/04/2026.
+OUTPUT:
+The matter would be governed. on 18/04/2026.
+
 General notes: "Annexure 1", place names ("Patna", "Delhi"), party words ("wife", "children", "husband"), and the standalone word "legal" (when not part of a citation) all stay verbatim. The rule applies to ANY Indian act, including ones not listed above — if a phrase looks like a statute citation ("Section N of <Capitalized Phrase> Act[, YYYY]", "<Capitalized Phrase> Act[, YYYY]", or "the <Capitalized Phrase> Adhiniyam/Sanhita[, YYYY]") treat it as one and remove it even if the act name is unfamiliar."""
 
 
 # Quick pre-filter so we don't pay for an LLM call on text that obviously has
 # no law citations. Matches the broad shape of an Indian-law reference.
 _LAW_KEYWORD_RE = re.compile(
-    r"(?:\bSection\s+\d+|\bSections\s+\d+|"
-    r"Act,?\s*\d{4}|Adhiniyam|Sanhita|"
+    r"(?:\bSection\s+\d+|\bSections\s+\d+|\bArticle\s+\d+|\bArticles\s+\d+|"
+    r"\bActs?,?\s*\d{4}|Adhiniyam|Sanhita|Ordinance|"
+    r"\bActs?\b|\bCode\b|\bRules\b|\bRegulations\b|"
     r"Bharatiya|Nyaya|Suraksha|Sakshya|"
     r"\bIPC\b|\bCrPC\b|\bCPC\b|\bBNS\b|\bBNSS\b|\bBSA\b|"
+    r"\bNDPS\b|\bPMLA\b|\bRERA\b|\bFEMA\b|\bSEBI\b|\bIBC\b|"
+    r"\bGST\b|\bCGST\b|\bIGST\b|\bSGST\b|\bPOCSO\b|\bUAPA\b|"
+    r"\bAFSPA\b|\bSARFAESI\b|\bMGNREGA\b|\bDPDP\b|\bRTI\b|"
     r"Indian Penal Code|Code of Criminal Procedure|"
     r"Code of Civil Procedure|Evidence Act|IT Act|"
     r"Information Technology Act|Protection of Women|"
     r"Domestic Violence Act|Indian Contract Act|"
-    r"Immoral Traffic|"
+    r"Immoral Traffic|Narcotic Drugs|"
     r"In accordance with Section|under the.*Act|pursuant to)",
     re.IGNORECASE,
 )
@@ -571,31 +613,82 @@ def _gemini_law_strip_call(text: str, extra_instruction: str = "") -> str | None
 # them. Patterns are surgical — they remove only citation phrases, not the
 # surrounding narrative.
 
-_KNOWN_ACT_NAMES = (
-    r"Bharatiya\s+Nagarik\s+Suraksha\s+Sanhita",
-    r"Bharatiya\s+Nyaya\s+Sanhita",
-    r"Bharatiya\s+Sakshya\s+Adhiniyam",
-    r"Protection\s+of\s+Women\s+from\s+Domestic\s+Violence\s+Act",
-    r"Domestic\s+Violence\s+Act",
-    r"Indian\s+Penal\s+Code",
-    r"Code\s+of\s+Criminal\s+Procedure",
-    r"Code\s+of\s+Civil\s+Procedure",
-    r"Indian\s+Evidence\s+Act",
-    r"Information\s+Technology\s+Act",
-    r"IT\s+Act",
-    r"Hindu\s+Marriage\s+Act",
-    r"Indian\s+Contract\s+Act",
-    r"Immoral\s+Traffic\s*\(Prevention\)\s+Act",
-    r"Negotiable\s+Instruments\s+Act",
-    r"Right\s+to\s+Information\s+Act",
-    r"Specific\s+Relief\s+Act",
-    r"Constitution\s+of\s+India",
-)
-_KNOWN_ACT_ACRONYMS = (r"BNSS", r"BNS", r"BSA", r"IPC", r"CrPC", r"CPC")
+def _act_name_to_regex(name: str) -> str:
+    """Convert a canonical act name from ``TARGETED_INDIAN_ACTS`` into a
+    case-insensitive regex fragment.
 
+    Strips trailing ``, YYYY`` (the year is matched separately by the
+    surrounding pattern so we accept ``Companies Act, 2013``,
+    ``Companies Act 2013``, and bare ``Companies Act`` alike). Whitespace
+    is collapsed to ``\\s+`` and punctuation is escaped so parenthesised
+    qualifiers, apostrophes, ampersands, etc. survive.
+    """
+    base = re.sub(r"\s*,\s*\d{4}\s*$", "", name).strip()
+    if not base:
+        return ""
+    parts = re.split(r"\s+", base)
+    return r"\s+".join(re.escape(p) for p in parts)
+
+
+# Canonical list of Indian-act names (single source of truth lives in
+# `app/prompts/applicable_acts.py`).  Longest names first so regex alternation
+# prefers the most specific match (e.g. "Foreign Exchange Management Act"
+# wins over a hypothetical generic "Foreign Act" suffix).
+_TARGETED_ACT_PATTERNS = tuple(
+    _act_name_to_regex(name)
+    for name in sorted(TARGETED_INDIAN_ACTS, key=len, reverse=True)
+    if _act_name_to_regex(name)
+)
+
+# Acronyms commonly used as standalone citations in Indian legal prose.
+# Order: longer acronyms first so "BNSS" wins over "BNS".
+_KNOWN_ACT_ACRONYMS = (
+    r"BNSS",
+    r"BNS",
+    r"BSA",
+    r"CrPC",
+    r"CPC",
+    r"IPC",
+    r"NDPS",
+    r"PMLA",
+    r"RERA",
+    r"FEMA",
+    r"SEBI",
+    r"CGST",
+    r"IGST",
+    r"SGST",
+    r"GST",
+    r"POCSO",
+    r"UAPA",
+    r"AFSPA",
+    r"SARFAESI",
+    r"MGNREGA",
+    r"PCPNDT",
+    r"DPDP",
+    r"NSA",
+    r"IBC",
+    r"RTI",
+    r"IT\s+Act",
+    r"NI\s+Act",
+    r"MV\s+Act",
+)
+
+# Structural-shape body for ANY Indian-law name not enumerated above.  One to
+# eight Capitalised words, allowing internal connectives ("and"/"of"/"the"
+# /"on"/"for"/"in"/"to"/"from"/"with") and parenthesised qualifiers, terminated
+# by Act/Acts/Adhiniyam/Sanhita/Code/Ordinance/Rules/Regulations/Order.
+_GENERIC_ACT_NAME_BODY = (
+    r"(?:[A-Z][A-Za-z'’()\-]+"
+    r"(?:\s+(?:and|of|the|on|for|in|to|from|with)\s+|\s+)"
+    r"){0,8}"
+    r"(?:Acts?|Adhiniyam|Sanhita|Code|Ordinance|Rules|Regulations|Order)"
+)
+
+# Combined act-name body: try the canonical list first (precise),
+# then acronyms, then the structural shape (catches anything unknown).
 _ACT_BODY = (
     r"(?:the\s+)?(?:"
-    + "|".join(_KNOWN_ACT_NAMES + _KNOWN_ACT_ACRONYMS)
+    + "|".join(_TARGETED_ACT_PATTERNS + _KNOWN_ACT_ACRONYMS + (_GENERIC_ACT_NAME_BODY,))
     + r")"
 )
 # "the X Act, 2005" or bare "BNSS 2023"
@@ -741,12 +834,37 @@ def _build_retry_hint(attempt: int) -> str:
     )
 
 
+def _gemini_returned_text_unchanged(original: str, candidate: str) -> bool:
+    """True when Gemini's output is structurally identical to the input.
+
+    Detects the silent-failure mode where the model returns the input verbatim
+    (or with only trivial whitespace differences). When this happens, more
+    retries with the same prompt will keep failing the same way, so the
+    caller should skip them and rely on the deterministic regex backstop.
+    """
+    if not isinstance(original, str) or not isinstance(candidate, str):
+        return False
+    if abs(len(original) - len(candidate)) > 2:
+        return False
+    return re.sub(r"\s+", " ", original).strip() == re.sub(r"\s+", " ", candidate).strip()
+
+
 def _law_strip_via_llm(text: str) -> str:
-    """Remove law citations primarily via Gemini. If the first pass still
-    leaves citation keywords detectable, retry up to twice with sharpened
-    self-critique prompts. Only when Gemini is fully unavailable do we fall
-    back to the deterministic `_regex_law_safety_net` so exports never ship
-    raw citations during a Gemini outage."""
+    """Remove law citations using a three-layer pipeline:
+
+    1. Gemini with the universal `LAW_STRIP_SYSTEM` prompt (handles any
+       Indian act, named or unnamed).
+    2. Up to two self-critique retries when the first pass leaves
+       detectable citation keywords behind (skipped when Gemini returns the
+       text unchanged — same prompt would fail the same way).
+    3. A deterministic regex safety net that runs UNCONDITIONALLY at the
+       end. The safety net knows the full `TARGETED_INDIAN_ACTS` list plus
+       a structural-shape pattern for any unknown act; it is idempotent on
+       already-clean prose, so running it always is safe.
+
+    Layer 3 is what guarantees an act like the NDPS Act is stripped even
+    when Gemini silently echoes the input.
+    """
     if not isinstance(text, str) or not text.strip():
         return text
     if not has_potential_law_citation(text):
@@ -754,21 +872,33 @@ def _law_strip_via_llm(text: str) -> str:
 
     candidate = _gemini_law_strip_call(text)
     if candidate is None:
+        # Gemini unavailable — go straight to the regex backstop.
+        return _regex_law_safety_net(text)
+
+    # Silent-failure detection: Gemini echoed the input. Skip retries (they
+    # use the same prompt and will fail the same way) and let the regex
+    # backstop below do the cleanup.
+    if _gemini_returned_text_unchanged(text, candidate):
         return _regex_law_safety_net(text)
 
     for attempt in range(2):
         if not has_potential_law_citation(candidate):
-            return candidate
+            break
         retry_out = _gemini_law_strip_call(
             text, extra_instruction=_build_retry_hint(attempt)
         )
         if retry_out is None:
             break
+        if _gemini_returned_text_unchanged(candidate, retry_out):
+            # Retry produced no change — further retries are pointless.
+            break
         candidate = retry_out
 
-    if has_potential_law_citation(candidate):
-        regex_alt = _regex_law_safety_net(text)
-        return regex_alt if len(regex_alt) <= len(candidate) else candidate
+    # Unconditional final pass through the regex backstop. Idempotent on
+    # already-clean text; ensures the canonical-list and structural-shape
+    # patterns catch anything Gemini missed (NDPS, PMLA, RERA, unknown
+    # acts, etc.).
+    return _regex_law_safety_net(candidate)
     return candidate
 
 

@@ -38,9 +38,11 @@ from app.prompts.drafting import (
     DRAFT_RENDER_INSTRUCTION,
     SUGGESTED_DRAFTS_INSTRUCTION,
     TEMPLATE_KICKOFF_INSTRUCTION,
+    TEMPLATE_MATCH_INSTRUCTION,
     build_draft_render_prompt,
     build_suggested_drafts_prompt,
     build_template_kickoff_prompt,
+    build_template_match_prompt,
 )
 
 
@@ -465,6 +467,338 @@ class DraftingAgent:
         return data if isinstance(data, dict) else None
 
     # ------------------------------------------------------------------
+    # 2b) Suggested-draft → lawyer's-library template matching
+    # ------------------------------------------------------------------
+
+    # Legally-meaningful tokens. Overlap on these counts toward a match;
+    # everything else (stop words, dates, numbers) is ignored. Keep the list
+    # focused on Indian-legal document-type signals — these reliably appear
+    # in both AI-generated suggestion titles and lawyer-named template files.
+    _MATCH_ANCHOR_TOKENS = frozenset(
+        {
+            # Document-type tokens (high discrimination — name a specific kind
+            # of pleading / instrument).
+            "bail", "anticipatory", "regular", "interim",
+            "divorce", "maintenance", "matrimonial", "dowry",
+            "domestic", "violence", "restitution", "custody",
+            # Pleading types.
+            "petition", "plaint", "writ", "appeal", "revision", "rejoinder",
+            "synopsis", "argument", "arguments",
+            # Notice / correspondence types.
+            "notice", "reply", "demand", "recovery", "termination",
+            # Instruments.
+            "affidavit", "undertaking", "vakalatnama", "vakalatname",
+            "mou", "agreement", "deed", "letterhead",
+            # Criminal-process tokens.
+            "complaint", "fir", "police",
+            "cheque", "bounce", "138", "ndps", "narcotic", "psychotropic",
+            # Regulatory / consumer.
+            "rti", "consumer", "deficiency",
+            # Procedural tokens.
+            "miscellaneous", "arbitration",
+            "summary", "interlocutory", "stay", "injunction",
+            # BNS / BNSS / BSA abbreviations (specific enough to keep).
+            "bns", "bnss", "bsa",
+            # NOTE: generic single-word tokens like "application", "section",
+            # "act", "legal", "service", "information", "statement", "letter",
+            # "it" are deliberately NOT here — they appear in nearly every
+            # Indian legal document body, so once we score on content (not
+            # just names), they would generate noise that drowns out the
+            # signal from discriminating tokens. The multi-word phrases below
+            # still catch combinations like "bail application", "legal
+            # notice", "written statement", "section 138" etc.
+        }
+    )
+
+    # Multi-word phrases that, if present in BOTH the suggestion text AND a
+    # template name, are strong evidence of a match even when single-token
+    # overlap is weak.
+    _MATCH_ANCHOR_PHRASES = (
+        "bail application",
+        "anticipatory bail",
+        "legal notice",
+        "reply notice",
+        "section 138",
+        "cheque bounce",
+        "consumer complaint",
+        "divorce petition",
+        "domestic violence",
+        "rti application",
+        "demand notice",
+        "recovery notice",
+        "criminal complaint",
+        "police complaint",
+        "written statement",
+        "miscellaneous application",
+        "anticipatory bail application",
+    )
+
+    # Common English stop words to drop from token scoring.
+    _MATCH_STOP_WORDS = frozenset(
+        {
+            "a", "an", "the", "of", "in", "on", "at", "for", "to", "by",
+            "and", "or", "with", "without", "under", "before", "this",
+            "that", "these", "those", "is", "are", "was", "were", "be",
+            "as", "from", "into", "upon", "no", "any", "all", "such",
+        }
+    )
+
+    @classmethod
+    def _normalise_for_match(cls, text: str) -> str:
+        """Lowercase, replace any non-letter/digit with whitespace, collapse runs.
+
+        IMPORTANT: explicitly include "_", "-", "." in the strip set so that
+        filename-style template names like "General_Bail_Application_Template_India"
+        tokenise into individual words. The previous regex used ``[^\\w\\s]``,
+        which preserves underscores (``\\w`` matches ``[A-Za-z0-9_]``) — that
+        kept multi-word names as a single token and silently broke matching
+        for every underscore- or dash-named template.
+        """
+        if not text:
+            return ""
+        # Replace anything that isn't an ASCII letter, digit, or whitespace
+        # with a space. This catches "_", "-", ".", "'", etc.
+        cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", text).lower()
+        # Drop standalone numbers (years / section numbers) — they create
+        # spurious matches across unrelated documents.
+        cleaned = re.sub(r"\b\d+\b", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    @classmethod
+    def _anchor_tokens(cls, text: str) -> set:
+        """Tokens from `text` that intersect with the anchor vocabulary."""
+        toks = [
+            t for t in cls._normalise_for_match(text).split()
+            if t and t not in cls._MATCH_STOP_WORDS
+        ]
+        return {t for t in toks if t in cls._MATCH_ANCHOR_TOKENS}
+
+    @classmethod
+    def _anchor_phrases_in(cls, text: str) -> set:
+        """Anchor phrases present (substring) in normalised text."""
+        n = " " + cls._normalise_for_match(text) + " "
+        out = set()
+        for phrase in cls._MATCH_ANCHOR_PHRASES:
+            if f" {phrase} " in n:
+                out.add(phrase)
+        return out
+
+    async def _find_matching_template_for_suggestion(
+        self,
+        *,
+        user_id: str,
+        suggestion_title: str,
+        suggestion_description: str,
+        fallback_text: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Pick a template from the lawyer's library that matches a clicked
+        suggestion, using a deterministic fast-path with an LLM tiebreaker.
+
+        `fallback_text` is folded into the search blob alongside
+        `suggestion_title` / `suggestion_description` so the matcher can still
+        find a template when BE hasn't yet shipped the suggestion fields on
+        `user_message_request` — the kickoff message body (user content) is
+        passed in as a fallback signal.
+
+        Returns the full cached template payload on success, or None when no
+        template is appropriate (falls back to AI generation downstream).
+        """
+        if not user_id:
+            return None
+        suggestion_text = " ".join(
+            s for s in (suggestion_title, suggestion_description, fallback_text) if s
+        ).strip()
+        if not suggestion_text:
+            logger.info(
+                "Template matcher: no suggestion / fallback text — skipping match "
+                "(user={})",
+                user_id[:12],
+            )
+            return None
+
+        try:
+            from app.vectorstore.qdrant import vector_store
+
+            entries = await vector_store.list_user_state_cache(
+                user_id=user_id, kind=TEMPLATE_CACHE_KIND
+            )
+        except Exception as e:
+            logger.warning("Template matcher: list_user_state_cache failed: {}", e)
+            return None
+        logger.info(
+            "Template matcher invoked (user={}, library_size={}, suggestion_text={!r})",
+            user_id[:12],
+            len(entries) if entries else 0,
+            suggestion_text[:160],
+        )
+        if not entries:
+            return None  # Empty library — fast-out, no LLM call.
+
+        # Filter to ready, text-bearing templates and project the bits we
+        # need for scoring. Crucially, the **match blob** now combines the
+        # template name (+ history) with the first ~1500 chars of the
+        # extracted body. The body's opening lines are where document-type
+        # signal is densest (cover-page headings, party blocks, "IN THE
+        # COURT OF…", "BAIL APPLICATION", "MOST RESPECTFULLY SHOWETH").
+        # This lets the matcher work even when the lawyer uploaded the
+        # template with an uninformative filename like `document.docx` or
+        # `Format_A.pdf`.
+        ready: List[Dict[str, Any]] = []
+        for ent in entries:
+            data = ent.get("data") if isinstance(ent, dict) else None
+            if not isinstance(data, dict):
+                continue
+            if (data.get("extraction_status") or "").lower() != "ready":
+                continue
+            extracted = (data.get("extracted_text") or "").strip()
+            if not extracted:
+                continue
+            tid = (data.get("template_id") or ent.get("scope_id") or "").strip()
+            if not tid:
+                continue
+            name = (data.get("name") or "").strip()
+            history = [str(x).strip() for x in (data.get("name_history") or []) if x]
+            content_head = extracted[:1500]
+            match_blob = " | ".join(
+                s for s in [name, *history, content_head] if s
+            )
+            ready.append(
+                {
+                    "templateId": tid,
+                    "name": name,
+                    "category": data.get("category") or "",
+                    "match_blob": match_blob,
+                    "content_head": content_head,
+                    "payload": data,
+                }
+            )
+        if not ready:
+            return None
+
+        suggestion_anchors = self._anchor_tokens(suggestion_text)
+        suggestion_phrases = self._anchor_phrases_in(suggestion_text)
+
+        # Deterministic fast-path: score each template by anchor overlap
+        # against the enriched match_blob (name + history + content head).
+        scored: List[Tuple[Dict[str, Any], int, int]] = []
+        for t in ready:
+            tpl_anchors = self._anchor_tokens(t["match_blob"])
+            tpl_phrases = self._anchor_phrases_in(t["match_blob"])
+            token_overlap = len(suggestion_anchors & tpl_anchors)
+            phrase_overlap = len(suggestion_phrases & tpl_phrases)
+            scored.append((t, token_overlap, phrase_overlap))
+
+        # Sort by phrase overlap then token overlap, both descending.
+        scored.sort(key=lambda r: (r[2], r[1]), reverse=True)
+
+        # Per-candidate trace at INFO level so production logs reveal
+        # exactly how each library template scored against the suggestion.
+        logger.info(
+            "Template matcher candidates (ready={}, suggestion_anchors={}, suggestion_phrases={}):",
+            len(ready),
+            sorted(suggestion_anchors),
+            sorted(suggestion_phrases),
+        )
+        for entry, tok, phr in scored[:10]:
+            logger.info(
+                "  template={} name={!r} token_overlap={} phrase_overlap={}",
+                entry["templateId"],
+                (entry.get("name") or "")[:80],
+                tok,
+                phr,
+            )
+
+        # Candidates with any anchor signal at all.
+        with_signal = [(t, tok, phr) for t, tok, phr in scored if (tok + phr) > 0]
+
+        if not with_signal:
+            # Zero anchor overlap with any template — save the LLM call.
+            logger.info(
+                "Drafting suggestion matcher: no anchor overlap with any of "
+                "{} template(s); falling back to AI generation",
+                len(ready),
+            )
+            return None
+
+        if len(with_signal) == 1:
+            # Single candidate with signal — confident deterministic match.
+            entry, tok, phr = with_signal[0]
+            logger.info(
+                "Drafting suggestion matched to template (user={}, template={}, "
+                "mode=fast-single, phrase_overlap={}, token_overlap={})",
+                user_id[:12],
+                entry["templateId"],
+                phr,
+                tok,
+            )
+            return entry["payload"]
+
+        # Multiple candidates with anchor signal — defer to the LLM tiebreaker,
+        # because deterministic counts cannot read modifiers like
+        # "anticipatory" vs "regular" or "reply" vs "demand" that distinguish
+        # otherwise similarly-named templates. We also pass a short content
+        # snippet per candidate so the LLM can disambiguate when filenames
+        # are uninformative (e.g. `document.docx`). Send up to the top 15
+        # by score.
+        shortlist: List[Dict[str, Any]] = []
+        for entry, tok, phr in with_signal:
+            shortlist.append(
+                {
+                    "templateId": entry["templateId"],
+                    "name": entry["name"],
+                    "category": entry["category"],
+                    "contentSnippet": (entry.get("content_head") or "")[:500],
+                }
+            )
+            if len(shortlist) >= 15:
+                break
+
+        prompt = build_template_match_prompt(
+            suggestion_title=suggestion_title,
+            suggestion_description=suggestion_description,
+            templates=shortlist,
+        )
+        try:
+            raw = await gemini_client.generate(
+                prompt,
+                system_instruction=TEMPLATE_MATCH_INSTRUCTION,
+                temperature=0.1,
+                max_tokens=800,
+                response_mime_type="application/json",
+            )
+        except Exception as e:
+            logger.warning("Template matcher LLM tiebreaker failed: {}", e)
+            return None
+
+        parsed = _parse_json_object(raw) or {}
+        chosen_id = (parsed.get("templateId") or "").strip()
+        if not chosen_id or chosen_id.lower() == "null":
+            logger.info(
+                "Drafting suggestion matcher: LLM returned no match (reason={!r})",
+                (parsed.get("reason") or "")[:120],
+            )
+            return None
+
+        # Defensive — only honour ids we showed the model.
+        chosen = next(
+            (t for t in scored if t[0]["templateId"] == chosen_id), None
+        )
+        if chosen is None:
+            logger.warning(
+                "Template matcher: LLM returned unknown templateId={!r} — ignoring",
+                chosen_id,
+            )
+            return None
+        logger.info(
+            "Drafting suggestion matched to template (user={}, template={}, mode=llm, reason={!r})",
+            user_id[:12],
+            chosen_id,
+            (parsed.get("reason") or "")[:120],
+        )
+        return chosen[0]["payload"]
+
+    # ------------------------------------------------------------------
     # 3) Multi-turn drafting conversation
     # ------------------------------------------------------------------
 
@@ -513,12 +847,26 @@ class DraftingAgent:
                 request_fields=request_fields,
             )
         elif (session_state or {}).get("draft_status") == "ready":
-            # Lawyer is asking for a revision after a delivered draft.
-            session_state = await self._handle_revision(
-                user_message=user_message,
-                case_context=case_context,
-                session_state=session_state or {},
-            )
+            # The lawyer's reply after a delivered draft is *usually* an
+            # acknowledgement ("ok", "thanks", "looks good"), not a real
+            # revision instruction. Re-rendering on those would emit a
+            # degenerate draft because the model has no actual edit to apply.
+            # Only call the revision path when the message carries genuine
+            # editing intent.
+            if self._is_post_draft_acknowledgement(user_message):
+                session_state["last_assistant_message"] = (
+                    "Glad the draft looks good. Let me know any time if you "
+                    "would like edits — for example, adjusting the prayer, "
+                    "tightening the grounds, or adding a clause."
+                )
+                # draft_status stays "ready"; last_draft_document untouched.
+                session_state["open_questions"] = []
+            else:
+                session_state = await self._handle_revision(
+                    user_message=user_message,
+                    case_context=case_context,
+                    session_state=session_state or {},
+                )
         else:
             session_state = await self._handle_followup(
                 user_message=user_message,
@@ -526,6 +874,10 @@ class DraftingAgent:
                 session_state=session_state or {},
                 request_fields=request_fields,
             )
+
+        # Consume the per-turn delivery flag so it does NOT persist into the
+        # next turn (BE only wants isDraft=true on the actual delivery turn).
+        is_draft_delivery = bool(session_state.pop("_draft_just_delivered", False))
 
         # Persist the updated session state (best-effort).
         await self._save_session_state(
@@ -540,6 +892,7 @@ class DraftingAgent:
             "draftStatus": session_state.get("draft_status") or "gathering_info",
             "openQuestions": list(session_state.get("open_questions") or []),
             "draftDocument": session_state.get("last_draft_document"),
+            "isDraft": is_draft_delivery,
             "session_state": session_state,
         }
 
@@ -644,13 +997,41 @@ class DraftingAgent:
         case_facts = case_context.get("case_facts_brief") or ""
         lawyer_instructions = (user_message or "").strip() or None
         suggestion_title = (request_fields.get("suggestionTitle") or "").strip() or None
+        suggestion_description = (
+            request_fields.get("suggestionDescription") or ""
+        ).strip()
 
-        # Resolve template if applicable.
+        # Resolve template — three paths:
+        #  - explicit template pick: honour `templateId` directly.
+        #  - suggested-draft click: scan the lawyer's Template Library for a
+        #    structural match; if found, use it; otherwise fall through to
+        #    AI-generated draft (current behaviour).
+        #  - blank: no template lookup.
         template_payload: Optional[Dict[str, Any]] = None
+        template_match_note: Optional[str] = None
         if source == "template" or request_fields.get("templateId"):
             template_payload = await self._resolve_template(
                 user_id=user_id, request_fields=request_fields
             )
+        elif source == "suggestedDraft":
+            # `fallback_text` covers the case where BE has not yet shipped
+            # `suggestionTitle` / `suggestionDescription` on
+            # `user_message_request` — the lawyer's kickoff content often
+            # still names the document type ("draft a bail application
+            # ...") and is enough to drive matching deterministically.
+            template_payload = await self._find_matching_template_for_suggestion(
+                user_id=user_id,
+                suggestion_title=suggestion_title or "",
+                suggestion_description=suggestion_description,
+                fallback_text=(user_message or "").strip(),
+            )
+            if template_payload:
+                matched_name = template_payload.get("name") or ""
+                template_match_note = (
+                    f"Matched the lawyer's template '{matched_name}' from the "
+                    f"library based on the suggested draft "
+                    f"'{suggestion_title or 'New Draft'}'."
+                )
 
         # Without a template / suggestion / instruction, we still kick off
         # but ask a broader scoping question.
@@ -669,6 +1050,7 @@ class DraftingAgent:
                 template_text=template_text,
                 lawyer_instructions=lawyer_instructions,
                 draft_title_hint=suggestion_title,
+                template_match_note=template_match_note,
             )
             raw = await self._safe_llm_json(
                 prompt=prompt,
@@ -977,12 +1359,23 @@ OUTPUT FORMAT:
                 "further changes are needed."
             )
 
+        # Embed the full draft Markdown inside the chat message body itself
+        # so it always renders inline in the chat surface (matches the
+        # reference UX in image (74).png — the bail-application body appears
+        # in the AI's chat bubble). `draftDocument` is still emitted as a
+        # structured payload for any dedicated editor surface that consumes
+        # it. Without this, frontends that only render `content` would show
+        # the lead-in but not the draft body.
         session_state["draft_status"] = "ready"
         session_state["current_draft_version"] = new_version
         session_state["last_draft_markdown"] = markdown
         session_state["last_draft_document"] = draft_document
-        session_state["last_assistant_message"] = lead_in
+        session_state["last_assistant_message"] = f"{lead_in}\n\n{markdown}"
         session_state["open_questions"] = []
+        # Transient flag — true ONLY on the turn that just produced a draft
+        # body, so BE can distinguish draft delivery from acknowledgements /
+        # follow-up question turns. Consumed (popped) in handle_turn.
+        session_state["_draft_just_delivered"] = True
         return session_state
 
     # ------------------------------------------------------------------ utils
@@ -1007,21 +1400,120 @@ OUTPUT FORMAT:
             out.append({"id": qid, "label": label})
         return out[:10]
 
+    # Acknowledgement vocabulary used to detect "ok" / "thanks" replies after
+    # a delivered draft so we do not spuriously re-render. Drafting-local on
+    # purpose; intelligence chat keeps its own `is_user_affirmation_to_continue`
+    # in `app/langgraph/chat_nodes.py` because that helper triggers continuation,
+    # not the opposite (no-op acknowledgement) behaviour we need here.
+    _ACK_PHRASES = frozenset(
+        {
+            # Pure affirmations
+            "ok", "okay", "k", "kk", "yes", "yeah", "yep", "yup", "sure",
+            "fine", "done", "right", "alright", "all right",
+            # Positive feedback
+            "thanks", "thank you", "thx", "ty", "tysm", "tq",
+            "great", "perfect", "nice", "cool", "awesome", "super",
+            "good", "good one", "well done",
+            "looks good", "looks fine", "looks great", "looks ok",
+            "all good", "that works", "works for me", "sounds good",
+            "this is good", "this looks good",
+            # Closing-out phrases
+            "no thanks", "no thank you", "nothing else", "thats it", "that's it",
+            "no changes", "no edits", "no more", "done thanks",
+        }
+    )
+
+    _ACK_TOKENS = frozenset(
+        {
+            "ok", "okay", "k", "kk", "yes", "yeah", "yep", "yup", "sure",
+            "fine", "done", "right", "alright",
+            "thanks", "thank", "you", "thx", "ty", "tysm", "tq",
+            "great", "perfect", "nice", "cool", "awesome", "super",
+            "good", "well",
+            "looks", "all", "that", "this", "is", "no", "more",
+            "works", "for", "me", "sounds", "changes", "edits",
+            "nothing", "else", "thats", "it",
+        }
+    )
+
+    @staticmethod
+    def _normalize_ack_text(text: str) -> str:
+        """Lowercase, collapse whitespace, strip surrounding punctuation/emoji."""
+        if not text:
+            return ""
+        # Drop emoji and most punctuation; keep letters, digits, apostrophes,
+        # and whitespace so phrases like "thank you" / "that's it" survive.
+        cleaned = re.sub(r"[^\w\s']", " ", text, flags=re.UNICODE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
+        # Strip leading/trailing punctuation residue.
+        return cleaned.strip(" \t.!?,;:")
+
+    @classmethod
+    def _is_post_draft_acknowledgement(cls, text: str) -> bool:
+        """Return True when the lawyer's reply is acknowledgement-only.
+
+        Used after `draft_status == "ready"` to short-circuit the revision
+        re-render when the user merely confirmed the draft looks good.
+        """
+        raw = (text or "").strip()
+        if not raw:
+            return True  # empty payloads are not edit instructions
+        normalised = cls._normalize_ack_text(raw)
+        if not normalised:
+            return True  # only punctuation / emoji
+        # Hard cap on length: anything substantive a lawyer would write to
+        # request a real edit will exceed this comfortably.
+        if len(normalised) > 60:
+            return False
+        # Exact-phrase match (covers multi-word fixed expressions).
+        if normalised in cls._ACK_PHRASES:
+            return True
+        # Token-by-token check: every word must belong to the ack vocab.
+        tokens = [t for t in normalised.split() if t]
+        if not tokens:
+            return True
+        return all(tok in cls._ACK_TOKENS for tok in tokens)
+
     def _compose_questions_message(
         self, open_questions: List[Dict[str, Any]], draft_title: str
     ) -> str:
+        """Fallback message used only when the model fails to emit `message`.
+
+        Mirrors the sectioned layout enforced by TEMPLATE_KICKOFF_INSTRUCTION
+        so the lawyer's chat stays consistent if the structured-output call
+        degrades. Each numbered question reuses the model-supplied label
+        (which already carries "Title: question").
+        """
         if not open_questions:
             return (
-                f"I have enough to proceed with the draft titled "
-                f"\"{draft_title}\". Generating it now."
+                f"I have initiated the drafting of {draft_title} based on the "
+                f"present case context.\n\n"
+                f"**Information Required to Complete the Draft:**\n"
+                f"All required details have been captured from the case file. "
+                f"Generating the draft now."
             )
-        bullets = "\n".join(
-            f"{i+1}. {q.get('label')}" for i, q in enumerate(open_questions)
-        )
+
+        # Each label is expected to be "Title: question". When present,
+        # split on the first colon so the title can be bolded inline.
+        numbered_lines: List[str] = []
+        for i, q in enumerate(open_questions, start=1):
+            label = (q.get("label") or "").strip()
+            if ":" in label:
+                title_part, question_part = label.split(":", 1)
+                numbered_lines.append(
+                    f"{i}. **{title_part.strip()}:** {question_part.strip()}"
+                )
+            else:
+                numbered_lines.append(f"{i}. {label}")
+        questions_block = "\n".join(numbered_lines)
+
         return (
-            f"To prepare \"{draft_title}\", please provide the following "
-            f"details so the document is complete and legally accurate:\n\n"
-            f"{bullets}"
+            f"I have initiated the drafting of {draft_title} based on the "
+            f"present case context.\n\n"
+            f"**Information Required to Complete the Draft:**\n"
+            f"To finalise the draft, please provide the following details so "
+            f"the document is complete and legally accurate:\n\n"
+            f"{questions_block}"
         )
 
     async def _safe_llm_json(

@@ -382,6 +382,7 @@ class SocketClient:
             logger.info("   - added_missing_information")
             logger.info("   - applicable_law_relevance_request")
             logger.info("   - analysis_docx_generate_request")
+            logger.info("   - template_sync")
             logger.info("   - ai_heartbeat_ping")
             logger.info(
                 "📤 Ready to emit: ai_response, probing_prompts_response, document_feature_response, applicable_law_relevance_response, analysis_docx_generate_response, ai_heartbeat_pong"
@@ -560,6 +561,26 @@ class SocketClient:
             except Exception:
                 logger.info("analysis_docx_generate_request payload (repr): {}", repr(data))
             await event_handler.handle("analysis_docx_generate_request", data)
+
+        @self.sio.event
+        async def template_sync(data):
+            """
+            Handle template_sync event (Server → AI_Maverick).
+            Lawyer-scoped Template Library sync — action ∈ uploaded|deleted|renamed.
+            Without this binding, python-socketio falls through to the catch-all
+            and the event is silently dropped (only logged at DEBUG level), so
+            deletions/renames/uploads never reach the drafting agent.
+            """
+            logger.info("📚 template_sync ← backend (socket received)")
+            try:
+                raw = json.dumps(data, default=str) if data is not None else "null"
+                logger.info(
+                    "template_sync payload (preview): {}",
+                    raw[:1800] + ("..." if len(raw) > 1800 else ""),
+                )
+            except Exception:
+                logger.info("template_sync payload (repr): {}", repr(data))
+            await event_handler.handle("template_sync", data)
 
         @self.sio.on(AI_HEARTBEAT_PING)
         async def ai_heartbeat_ping(data):

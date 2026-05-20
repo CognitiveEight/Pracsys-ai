@@ -242,6 +242,14 @@ class UserMessageRequestPayload(BaseModel):
         default=None,
         validation_alias=AliasChoices("suggestedDraftId", "suggested_draft_id"),
     )
+    suggestionTitle: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("suggestionTitle", "suggestion_title"),
+    )  # Echo of the clicked suggestion's title — drives template matching.
+    suggestionDescription: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("suggestionDescription", "suggestion_description"),
+    )  # Echo of the clicked suggestion's description — extra signal for matching.
     templateId: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("templateId", "template_id"),
@@ -386,6 +394,7 @@ class AIResponsePayload(BaseModel):
     # Drafting Assistant fields (omitted for other chat types).
     actionableId: Optional[str] = None
     chat_type: Optional[str] = None
+    isDraft: Optional[bool] = None  # True only on the turn that just delivered a draft body inline.
     draftStatus: Optional[
         Literal["analyzing", "gathering_info", "ready", "revising"]
     ] = None

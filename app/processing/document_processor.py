@@ -275,29 +275,51 @@ Document excerpt:
             # raw IDs never land in chunk content. Persist document_type and
             # the masked extracted_fields in chunk metadata so retrievers
             # downstream see the structured signal alongside the OCR content.
+            #
+            # Always store an entry — even when OCR yielded no readable text —
+            # so the workspace_sync dedup check (events.py:13593-13622) finds
+            # the document_id on subsequent syncs and skips reprocessing.
+            # Without this marker, image-only annexures fall through the
+            # vector-store presence check forever and trigger strategy /
+            # analysis / list_of_dates / applicable_laws regeneration on
+            # every backend sync (e.g. each "Download Analysis Report" click).
             stored_in_vector_db = False
-            if redacted_text and readability_result["readable"]:
-                try:
-                    await self._store_in_vector_db(
-                        workspace_id=workspace_id,
-                        user_id=user_id,
-                        document_id=document_id,
-                        text=redacted_text,
-                        filename=filename,
-                        metadata={
-                            **(metadata or {}),
-                            **extraction_metadata,
-                            "readability": readability_result,
-                            "file_size": file_size,
-                            "document_type": classification["document_type"],
-                            "extracted_fields": extracted_fields,
-                        },
-                    )
-                    stored_in_vector_db = True
-                except Exception as vector_error:
-                    logger.warning(f"Could not store in vector DB: {vector_error}")
-                    # Continue processing even if vector storage fails
-                    stored_in_vector_db = False
+            is_low_content_marker = not (
+                redacted_text and readability_result["readable"]
+            )
+            if is_low_content_marker:
+                # Marker text is deterministic and ≥ 20 chars, so it survives
+                # the content-length filter in qdrant.py get_all_documents.
+                text_for_store = (
+                    "[Low-content document marker — OCR produced no readable text] "
+                    f"filename: {filename} | "
+                    f"document_type: {classification.get('document_type') or 'other'} | "
+                    f"summary: {classification.get('summary') or 'no readable content extracted'}"
+                )
+            else:
+                text_for_store = redacted_text
+            try:
+                await self._store_in_vector_db(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    document_id=document_id,
+                    text=text_for_store,
+                    filename=filename,
+                    metadata={
+                        **(metadata or {}),
+                        **extraction_metadata,
+                        "readability": readability_result,
+                        "file_size": file_size,
+                        "document_type": classification["document_type"],
+                        "extracted_fields": extracted_fields,
+                        "is_low_content_marker": is_low_content_marker,
+                    },
+                )
+                stored_in_vector_db = True
+            except Exception as vector_error:
+                logger.warning(f"Could not store in vector DB: {vector_error}")
+                # Continue processing even if vector storage fails
+                stored_in_vector_db = False
 
             # Prepare result
             result = {

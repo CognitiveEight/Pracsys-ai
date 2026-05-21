@@ -36,10 +36,14 @@ from loguru import logger
 from app.ai.gemini_client import gemini_client
 from app.prompts.drafting import (
     DRAFT_RENDER_INSTRUCTION,
+    DRAFT_TRANSLATE_INSTRUCTION,
+    DRAFTING_CHAT_INSTRUCTION,
     SUGGESTED_DRAFTS_INSTRUCTION,
     TEMPLATE_KICKOFF_INSTRUCTION,
     TEMPLATE_MATCH_INSTRUCTION,
+    build_chat_reply_prompt,
     build_draft_render_prompt,
+    build_draft_translate_prompt,
     build_suggested_drafts_prompt,
     build_template_kickoff_prompt,
     build_template_match_prompt,
@@ -232,7 +236,7 @@ class DraftingAgent:
                 prompt,
                 system_instruction=SUGGESTED_DRAFTS_INSTRUCTION,
                 temperature=0.4,
-                max_tokens=2000,
+                max_tokens=12000,
                 response_mime_type="application/json",
             )
         except Exception as e:
@@ -764,7 +768,7 @@ class DraftingAgent:
                 prompt,
                 system_instruction=TEMPLATE_MATCH_INSTRUCTION,
                 temperature=0.1,
-                max_tokens=800,
+                max_tokens=12000,
                 response_mime_type="application/json",
             )
         except Exception as e:
@@ -830,50 +834,124 @@ class DraftingAgent:
         session_state = await self._load_session_state(
             workspace_id=workspace_id, actionable_id=actionable_id
         )
-        is_kickoff = (
-            not session_state
-            and (
-                not conversation_history
-                or source in _VALID_SOURCES
-                or request_fields.get("templateId")
-                or request_fields.get("suggestedDraftId")
-            )
-        )
 
-        if is_kickoff:
-            session_state = await self._handle_kickoff(
-                user_message=user_message,
-                case_context=case_context,
-                request_fields=request_fields,
-            )
-        elif (session_state or {}).get("draft_status") == "ready":
-            # The lawyer's reply after a delivered draft is *usually* an
-            # acknowledgement ("ok", "thanks", "looks good"), not a real
-            # revision instruction. Re-rendering on those would emit a
-            # degenerate draft because the model has no actual edit to apply.
-            # Only call the revision path when the message carries genuine
-            # editing intent.
-            if self._is_post_draft_acknowledgement(user_message):
-                session_state["last_assistant_message"] = (
-                    "Glad the draft looks good. Let me know any time if you "
-                    "would like edits — for example, adjusting the prayer, "
-                    "tightening the grounds, or adding a clause."
-                )
-                # draft_status stays "ready"; last_draft_document untouched.
-                session_state["open_questions"] = []
-            else:
-                session_state = await self._handle_revision(
-                    user_message=user_message,
-                    case_context=case_context,
-                    session_state=session_state or {},
-                )
-        else:
-            session_state = await self._handle_followup(
+        # Greeting fast-path — runs BEFORE any drafting-state branch.
+        # A bare "hi" / "hello" / "good morning" must always route to
+        # chat, regardless of session state, `source` signals, or
+        # workspace case context. The frontend has been observed
+        # auto-sending `source="blank"` whenever the drafting panel
+        # opens; without this guard a greeting would silently fire a
+        # full kickoff and the model would auto-infer a document type
+        # from case context (e.g. an NDPS-bail case would always
+        # produce a Bail Application scoping prompt for "hi"). The
+        # only exception is when the lawyer explicitly clicked a
+        # template or a suggested draft — `templateId` /
+        # `suggestedDraftId` is unambiguous drafting intent and is
+        # honoured even if the typed message looks like a greeting.
+        has_explicit_template = bool(
+            request_fields.get("templateId")
+            or request_fields.get("suggestedDraftId")
+        )
+        if self._is_greeting(user_message) and not has_explicit_template:
+            session_state = await self._handle_chat_question(
                 user_message=user_message,
                 case_context=case_context,
                 session_state=session_state or {},
-                request_fields=request_fields,
+                conversation_history=conversation_history,
             )
+        else:
+            # Explicit-action kickoff is only triggered by an unambiguous
+            # signal: a template upload (`templateId`) or a suggested-draft
+            # click (`suggestedDraftId`). `source="blank"` alone is too
+            # weak — the frontend may send it on panel open, which would
+            # otherwise force a kickoff on every fresh chat.
+            explicit_kickoff = not session_state and has_explicit_template
+
+            if explicit_kickoff:
+                session_state = await self._handle_kickoff(
+                    user_message=user_message,
+                    case_context=case_context,
+                    request_fields=request_fields,
+                )
+            elif (session_state or {}).get("incompatible"):
+                # Incompatible-template flow — _handle_followup routes to
+                # _handle_incompatible_reply at its top, where the
+                # deterministic option-letter pre-check runs first and the
+                # LLM intent classifier is the backstop. Keeping this
+                # branch explicit so the generic intent classifier below
+                # never overrides the incompatibility flow.
+                session_state = await self._handle_followup(
+                    user_message=user_message,
+                    case_context=case_context,
+                    session_state=session_state or {},
+                    request_fields=request_fields,
+                    conversation_history=conversation_history,
+                )
+            elif (session_state or {}).get("draft_status") == "gathering_info":
+                # Strict gathering_info short-circuit: route the turn
+                # directly to `_handle_followup`, bypassing the LLM
+                # intent classifier entirely. The classifier was
+                # observed mis-classifying structured scoping-answer
+                # replies as `chat_question` (because of formal text
+                # style), which then routed to `_handle_chat_question`
+                # and emitted a misleading "I have everything I need
+                # to finalize" reply without ever rendering the draft.
+                # In this state the followup handler is the single
+                # source of truth: it maps answers, renders when slots
+                # are filled, honours the render-now ack shortcut, and
+                # otherwise re-emits the structured remaining questions.
+                session_state = await self._handle_followup(
+                    user_message=user_message,
+                    case_context=case_context,
+                    session_state=session_state or {},
+                    request_fields=request_fields,
+                    conversation_history=conversation_history,
+                )
+            elif (
+                (session_state or {}).get("draft_status") == "ready"
+                and self._is_post_draft_acknowledgement(user_message)
+            ):
+                # Post-draft acknowledgement fast-path — deterministic,
+                # free, and stable. Skips the classifier so a bare "ok" /
+                # "thanks" never costs an LLM round-trip and never risks
+                # misroute.
+                session_state["last_assistant_message"] = (
+                    "Glad the draft looks good. Let me know any time if "
+                    "you would like edits — for example, adjusting the "
+                    "prayer, tightening the grounds, or adding a clause."
+                )
+                session_state["open_questions"] = []
+                # draft_status stays "ready"; last_draft_document untouched.
+            elif (
+                (session_state or {}).get("draft_status") == "ready"
+                and (session_state or {}).get("last_draft_markdown")
+                and self._extract_translate_target(user_message) is not None
+            ):
+                # Translate fast-path — the lawyer asked to translate the
+                # delivered draft into a target language. Routes directly
+                # to `_handle_translate_draft` which preserves every
+                # structural element and only swaps the natural-language
+                # text. The classifier never sees this turn, so it cannot
+                # mis-route to a chat reply or a side-suggestion.
+                target_language = self._extract_translate_target(user_message)
+                session_state = await self._handle_translate_draft(
+                    target_language=target_language or "Hindi",
+                    case_context=case_context,
+                    session_state=session_state or {},
+                )
+            else:
+                # Per-turn intent classifier: route everything else
+                # through a single Gemini call so free-form drafting
+                # requests, mid-flow draft switches, scoping answers,
+                # revisions, and plain chat / legal Q&A all reach the
+                # right handler.
+                session_state = await self._dispatch_classified_turn(
+                    user_message=user_message,
+                    case_context=case_context,
+                    session_state=session_state or {},
+                    request_fields=request_fields,
+                    conversation_history=conversation_history,
+                )
 
         # Consume the per-turn delivery flag so it does NOT persist into the
         # next turn (BE only wants isDraft=true on the actual delivery turn).
@@ -895,6 +973,147 @@ class DraftingAgent:
             "isDraft": is_draft_delivery,
             "session_state": session_state,
         }
+
+    async def _dispatch_classified_turn(
+        self,
+        *,
+        user_message: str,
+        case_context: Dict[str, Any],
+        session_state: Dict[str, Any],
+        request_fields: Dict[str, Any],
+        conversation_history: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Route a non-kickoff, non-incompatible, non-ack turn by intent.
+
+        Calls the per-turn intent classifier and dispatches to: the
+        kickoff helper (free-form draft request or mid-flow switch),
+        the revision/followup handlers (when the state matches), or the
+        soft chat-reply handler (default — never fires a draft).
+        """
+        # Deterministic greeting fast-path — runs BEFORE the LLM. A bare
+        # "hi" / "hello" / "good morning" should never trigger drafting,
+        # but the LLM was observed inferring `draft_request` from case
+        # context (workspace already had bail-application data, so it
+        # decided the lawyer must want a bail application). This regex
+        # check is free and instant; greetings always route to chat.
+        if self._is_greeting(user_message):
+            return await self._handle_chat_question(
+                user_message=user_message,
+                case_context=case_context,
+                session_state=session_state,
+                conversation_history=conversation_history,
+            )
+
+        # Deterministic ordinal-reference resolver — when the assistant's
+        # last list-bearing message offered a numbered/bulleted list of
+        # documents and the lawyer's reply is "do the third one" /
+        # "option 2" / "3rd please", short-circuit straight to the
+        # `draft_request` route with the resolved document type. The LLM
+        # classifier mis-routes these as `chat_question` because the
+        # message names no document explicitly.
+        resolved_doc_type = self._resolve_ordinal_reference(
+            user_message, conversation_history
+        )
+        if resolved_doc_type:
+            req = dict(request_fields)
+            req["source"] = "blank"
+            req["templateId"] = None
+            req["suggestedDraftId"] = None
+            req["suggestionTitle"] = resolved_doc_type
+            return await self._handle_kickoff(
+                user_message=user_message,
+                case_context=case_context,
+                request_fields=req,
+            )
+
+        # Affirmation-after-list auto-pick — when the assistant's most
+        # recent message listed draft options and the lawyer replies
+        # with a bare "yes" / "ok" / "sure" / "go ahead" (no ordinal,
+        # no doc name), default to picking option #1. This handles the
+        # observed flow where the AI lists 3 options, the lawyer says
+        # "ok", and we want drafting to actually start instead of
+        # falling through to chat. The lawyer can always correct with
+        # "the third one" on a later turn — the ordinal resolver
+        # catches that. `_is_render_now_reply` already covers the exact
+        # affirmation vocabulary we want ("ok" / "yes" / "sure" /
+        # "proceed" / "go ahead" / "do it" / "let's go" / …) so we
+        # reuse it rather than duplicating the phrase set.
+        if self._is_render_now_reply(user_message):
+            list_items = self._extract_list_items_from_history(
+                conversation_history
+            )
+            if list_items:
+                first_doc_type = self._clean_list_item_to_doc_type(
+                    list_items[0]
+                )
+                if first_doc_type:
+                    req = dict(request_fields)
+                    req["source"] = "blank"
+                    req["templateId"] = None
+                    req["suggestedDraftId"] = None
+                    req["suggestionTitle"] = first_doc_type
+                    return await self._handle_kickoff(
+                        user_message=user_message,
+                        case_context=case_context,
+                        request_fields=req,
+                    )
+
+        intent_info = await self._classify_drafting_turn_intent(
+            user_message=user_message,
+            session_state=session_state,
+            conversation_history=conversation_history,
+        )
+        label = intent_info.get("intent") or "chat_question"
+        doc_type = (intent_info.get("document_type") or "").strip()
+        current_status = (session_state.get("draft_status") or "").strip()
+
+        if label == "draft_request":
+            # Free-form drafting trigger (or mid-flow switch). Route via
+            # the existing kickoff path with `source="blank"` and the
+            # inferred document type as the suggestion title — this
+            # drives `_handle_kickoff` into the no-template branch which
+            # delegates to `_scope_blank_draft`. The lawyer's full
+            # message is passed as `lawyer_instructions` so the scoping
+            # call sees the raw intent verbatim.
+            req = dict(request_fields)
+            req["source"] = "blank"
+            req["templateId"] = None
+            req["suggestedDraftId"] = None
+            if doc_type:
+                req["suggestionTitle"] = doc_type
+            return await self._handle_kickoff(
+                user_message=user_message,
+                case_context=case_context,
+                request_fields=req,
+            )
+
+        if label == "revision_request" and current_status == "ready":
+            return await self._handle_revision(
+                user_message=user_message,
+                case_context=case_context,
+                session_state=session_state,
+            )
+
+        if label == "scoping_answer" and current_status == "gathering_info":
+            return await self._handle_followup(
+                user_message=user_message,
+                case_context=case_context,
+                session_state=session_state,
+                request_fields=request_fields,
+                conversation_history=conversation_history,
+            )
+
+        # Default — chat / Q&A / greeting / out-of-state intent / safe
+        # fallback when the classifier returned a label that does not
+        # match the current draft_status (e.g. "revision_request" while
+        # status is still "gathering_info"). Replying conversationally
+        # never costs the lawyer progress; a wrongly-fired draft would.
+        return await self._handle_chat_question(
+            user_message=user_message,
+            case_context=case_context,
+            session_state=session_state,
+            conversation_history=conversation_history,
+        )
 
     # ------------------------------------------------------------------ helpers
 
@@ -1056,7 +1275,7 @@ class DraftingAgent:
                 prompt=prompt,
                 system_instruction=TEMPLATE_KICKOFF_INSTRUCTION,
                 temperature=0.35,
-                max_tokens=3000,
+                max_tokens=12000,
             )
             parsed = _parse_json_object(raw) or {}
             message = (parsed.get("message") or "").strip()
@@ -1099,6 +1318,34 @@ class DraftingAgent:
             }
 
         # ---------- Suggested / blank kick-off (no template) ----------
+        return await self._scope_blank_draft(
+            role=role,
+            case_summary=case_summary,
+            case_facts=case_facts,
+            source=source,
+            lawyer_instructions=lawyer_instructions,
+            suggestion_title=suggestion_title,
+            suggested_draft_id=request_fields.get("suggestedDraftId"),
+        )
+
+    async def _scope_blank_draft(
+        self,
+        *,
+        role: str,
+        case_summary: str,
+        case_facts: str,
+        source: str,
+        lawyer_instructions: Optional[str],
+        suggestion_title: Optional[str],
+        suggested_draft_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Produce a fresh, template-less scoping session_state.
+
+        Used by the kickoff path when no template is in play AND by the
+        incompatible-template `proceed_from_scratch` recovery — the lawyer
+        chose to drop the incompatible template and draft from the case
+        context, so we generate scoping questions for the document type.
+        """
         draft_title = suggestion_title or "New Draft"
         if source == "blank" and lawyer_instructions:
             draft_title = lawyer_instructions[:80]
@@ -1108,8 +1355,21 @@ class DraftingAgent:
             case_facts_brief=case_facts,
             template_name="(no template — start from scratch)",
             template_text=(
-                "(no template was provided; produce open questions sufficient "
-                "to draft the document titled above based on the case context)"
+                "(no template was provided. You MUST still produce the "
+                "structured kickoff layout — the `message` field must "
+                "contain BOTH `**Key Case Details Automatically "
+                "Integrated:**` and `**Information Required to Complete "
+                "the Draft:**` headers verbatim, with the auto-filled "
+                "facts under the first header and AT LEAST THREE numbered "
+                "titled scoping questions under the second header. The "
+                "document type to draft is the DRAFT TITLE HINT above; "
+                "infer the standard Indian-advocate skeleton for that "
+                "document type — court heading, party array, grounds, "
+                "prayer, verification — and produce the open questions "
+                "needed to fill its case-variable slots. Do NOT reply "
+                "with a single open-ended question or a chat-style "
+                "paragraph; the structured layout is mandatory even "
+                "when the requested document type is unusual.)"
             ),
             lawyer_instructions=lawyer_instructions,
             draft_title_hint=suggestion_title,
@@ -1118,7 +1378,7 @@ class DraftingAgent:
             prompt=scoping_prompt,
             system_instruction=TEMPLATE_KICKOFF_INSTRUCTION,
             temperature=0.4,
-            max_tokens=2400,
+            max_tokens=12000,
         )
         parsed = _parse_json_object(raw) or {}
         message = (parsed.get("message") or "").strip()
@@ -1126,14 +1386,21 @@ class DraftingAgent:
         gathered = parsed.get("gatheredFacts")
         if not isinstance(gathered, dict):
             gathered = {}
-        if not message:
+        # Malformed-output guard: the prompt mandates the
+        # `**Information Required to Complete the Draft:**` header. If
+        # the LLM returned a non-empty `message` that does NOT contain
+        # that header (e.g. drifted to a single-question chat reply for
+        # an unusual doc type), fall back to the deterministic
+        # structured composer so the lawyer always sees a numbered
+        # question block.
+        if not message or "Information Required to Complete the Draft" not in message:
             message = self._compose_questions_message(open_qs, draft_title)
 
         return {
             "source": source or "blank",
             "template_id": None,
             "template_name": None,
-            "suggested_draft_id": request_fields.get("suggestedDraftId"),
+            "suggested_draft_id": suggested_draft_id,
             "suggestion_title": suggestion_title,
             "draft_title": (parsed.get("draftTitle") or "").strip() or draft_title,
             "gathered_facts": gathered,
@@ -1157,10 +1424,27 @@ class DraftingAgent:
         case_context: Dict[str, Any],
         session_state: Dict[str, Any],
         request_fields: Dict[str, Any],
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Update gathered facts from the user's message; ask remaining questions or render."""
+        # Incompatibility guard — when the kickoff flagged the chosen template
+        # as fundamentally incompatible with the case, the lawyer's next reply
+        # is a routing choice (proceed from scratch / change template /
+        # cancel) OR a clarifying question about the options. Either way it
+        # is NOT an answer to scoping questions, and falling through to the
+        # render path here would silently produce a draft on a bare "ok".
+        if session_state.get("incompatible"):
+            return await self._handle_incompatible_reply(
+                user_message=user_message,
+                case_context=case_context,
+                session_state=session_state,
+                request_fields=request_fields,
+                conversation_history=conversation_history,
+            )
+
         open_qs = list(session_state.get("open_questions") or [])
         gathered = dict(session_state.get("gathered_facts") or {})
+        gathered_before = dict(gathered)
         draft_title = session_state.get("draft_title") or "New Draft"
 
         # Map user's free-text response onto remaining open questions.
@@ -1174,10 +1458,30 @@ class DraftingAgent:
                     gathered[qid] = value
         # Remaining open questions are those not in `gathered`.
         remaining = [q for q in open_qs if not gathered.get(q.get("id"))]
+        gathered_anything_new = gathered != gathered_before
         session_state["gathered_facts"] = gathered
         session_state["open_questions"] = remaining
 
         if remaining:
+            # Render-now shortcut: when the lawyer's message is an ack /
+            # forward-action instruction ("ok", "proceed", "go ahead",
+            # "draft it") AND no new facts were extracted this turn,
+            # the lawyer is asking us to finalise with what we have.
+            # The render prompt already emits `<placeholder>` labels for
+            # any unanswered slots — see CONSTRAINTS in
+            # `build_draft_render_prompt`. This breaks the "static
+            # repeat" loop where the bot would re-ask the same scoping
+            # questions on every "ok" turn.
+            if (
+                not gathered_anything_new
+                and self._is_render_now_reply(user_message)
+            ):
+                return await self._render_and_attach(
+                    case_context=case_context,
+                    session_state=session_state,
+                    lawyer_instructions=(user_message or "").strip() or None,
+                    mode_override=None,
+                )
             message = self._compose_questions_message(remaining, draft_title)
             session_state["draft_status"] = "gathering_info"
             session_state["last_assistant_message"] = message
@@ -1189,6 +1493,1082 @@ class DraftingAgent:
             session_state=session_state,
             lawyer_instructions=(user_message or "").strip() or None,
             mode_override=None,
+        )
+
+    # Vocabulary used to detect "render now / proceed with what you
+    # have" intent mid-scoping. Reused inside `_handle_followup` so a
+    # bare "ok" / "proceed" / "go ahead" breaks the question-loop and
+    # emits the draft with `<placeholder>` labels for missing slots.
+    # The post-draft `_is_post_draft_acknowledgement` is also accepted
+    # so any of "ok", "thanks", "looks good" trigger the shortcut.
+    _RENDER_NOW_PHRASES = frozenset(
+        {
+            "proceed", "go ahead", "draft it", "draft it now",
+            "render it", "render now", "just do it", "do it",
+            "make it", "make the draft", "create the draft",
+            "finish", "finalize", "finalise", "wrap it up",
+            "go for it", "let's go", "lets go",
+        }
+    )
+
+    @classmethod
+    def _is_render_now_reply(cls, text: str) -> bool:
+        """True iff the message is "render now / proceed" intent.
+
+        Accepts:
+          - Any reply caught by `_is_post_draft_acknowledgement`
+            ("ok" / "thanks" / "looks good" / "yes" / ...).
+          - Any tight render-now phrase from `_RENDER_NOW_PHRASES`.
+        """
+        raw = (text or "").strip()
+        if not raw:
+            return False
+        if cls._is_post_draft_acknowledgement(raw):
+            return True
+        normalised = cls._normalize_ack_text(raw)
+        return normalised in cls._RENDER_NOW_PHRASES
+
+    async def _handle_incompatible_reply(
+        self,
+        *,
+        user_message: str,
+        case_context: Dict[str, Any],
+        session_state: Dict[str, Any],
+        request_fields: Dict[str, Any],
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Route the lawyer's reply after the kickoff flagged the template as incompatible.
+
+        The kickoff asked: (a) draft from a fresh structure, (b) upload a
+        different template, or (c) cancel. This handler classifies the reply
+        and dispatches. Drafting never renders from here — it only resumes
+        once the lawyer has chosen (a) AND answered the fresh scoping
+        questions on a subsequent turn.
+
+        When the lawyer asks a clarifying question or pushes back on a
+        suggestion ("what are the other options?", "no, not criminal
+        complaint"), the handler delegates to a contextual chat reply
+        instead of re-emitting the canned options block — robotic
+        repetition is what was making the bot feel like a static FAQ
+        rather than a real assistant.
+        """
+        history = conversation_history or []
+        text = (user_message or "").strip()
+        draft_title = session_state.get("draft_title") or "New Draft"
+
+        # Deterministic option-letter pre-check — runs FIRST. A bare "a" /
+        # "(a)" / "option a" reply is unambiguously a routing choice; the
+        # LLM classifier was observed mis-reading single-letter "a" as the
+        # English article and defaulting to acknowledge_only. This regex
+        # check is free, instant, and reliable for the common path.
+        inferred_doc_type = ""
+        option_intent = self._classify_option_letter_reply(text)
+        if option_intent is not None:
+            intent = option_intent
+        elif not text or self._is_post_draft_acknowledgement(text):
+            # Fast-path: pure acknowledgement (empty / "ok" / "thanks" / ...).
+            # Reuse the existing detector so the vocabulary stays consistent
+            # with the post-draft acknowledgement path and saves an LLM
+            # round-trip on the most common reply.
+            intent = "acknowledge_only"
+        else:
+            classifier_result = await self._classify_incompatible_intent(text)
+            intent = classifier_result.get("intent") or "clarifying_question"
+            inferred_doc_type = (classifier_result.get("document_type") or "").strip()
+
+        if intent == "proceed_from_scratch":
+            role = (case_context.get("role") or "ADJUDICATOR").upper()
+            case_summary = case_context.get("case_summary") or ""
+            case_facts = case_context.get("case_facts_brief") or ""
+            # If the lawyer named a specific document type (e.g. "draft
+            # the legal notice"), use that as the new suggestion title so
+            # the scoping flow produces questions for the right document.
+            # Otherwise fall back to the existing draft title (which came
+            # from the original kickoff suggestion / option-(a) path).
+            suggestion_title = (
+                inferred_doc_type
+                or session_state.get("suggestion_title")
+                or draft_title
+            )
+            # Pass the lawyer's free-text reply as `lawyer_instructions`
+            # only when they explicitly named the document — that way the
+            # scoping prompt sees the verbatim intent and tailors the
+            # questions to it. For option-letter / bare-affirmative paths,
+            # there is no useful free-text instruction to forward.
+            lawyer_instructions = text if inferred_doc_type else None
+            new_state = await self._scope_blank_draft(
+                role=role,
+                case_summary=case_summary,
+                case_facts=case_facts,
+                source="blank",
+                lawyer_instructions=lawyer_instructions,
+                suggestion_title=suggestion_title,
+                suggested_draft_id=session_state.get("suggested_draft_id"),
+            )
+            # Preserve session identity so persistence updates the same row.
+            for k in ("actionable_id", "user_id", "workspace_id", "created_at"):
+                if session_state.get(k):
+                    new_state[k] = session_state[k]
+            return new_state
+
+        if intent == "change_template":
+            session_state["template_id"] = None
+            session_state["template_name"] = None
+            session_state["incompatible"] = False
+            session_state["draft_status"] = "analyzing"
+            session_state["open_questions"] = []
+            session_state["last_assistant_message"] = (
+                "Understood. Please upload a template that fits this "
+                "matter (for example, a Bail Application format from your "
+                "library) and I will analyse it against the case context."
+            )
+            return session_state
+
+        if intent == "cancel":
+            session_state["template_id"] = None
+            session_state["template_name"] = None
+            session_state["incompatible"] = False
+            session_state["draft_status"] = "gathering_info"
+            session_state["open_questions"] = []
+            session_state["last_assistant_message"] = (
+                "Drafting session cancelled. Let me know any time when "
+                "you would like to start a new draft."
+            )
+            return session_state
+
+        if intent == "clarifying_question":
+            # The lawyer is engaging with the choice — asking what an
+            # option means, pushing back on a suggestion, exploring
+            # alternatives. Route to a contextual chat reply that
+            # actually responds to what they said and ends with a soft
+            # re-offer of (a)/(b)/(c). The deterministic letter pre-check
+            # still fires on their NEXT turn so picking an option remains
+            # instant.
+            return await self._handle_incompatible_clarification(
+                user_message=text,
+                case_context=case_context,
+                session_state=session_state,
+                conversation_history=history,
+            )
+
+        # acknowledge_only (fast-path only — pure "ok" / "thanks" etc.).
+        # The LLM no longer returns this label; the deterministic ack
+        # check is the sole route into this branch, so a one-line
+        # restatement is appropriate.
+        session_state["draft_status"] = "analyzing"
+        session_state["open_questions"] = []
+        session_state["last_assistant_message"] = (
+            self._build_incompatible_options_message(draft_title)
+        )
+        return session_state
+
+    async def _handle_incompatible_clarification(
+        self,
+        *,
+        user_message: str,
+        case_context: Dict[str, Any],
+        session_state: Dict[str, Any],
+        conversation_history: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Conversational reply when the lawyer asks about the options.
+
+        Uses `DRAFTING_CHAT_INSTRUCTION` so the reply is chat-shaped (no
+        court scaffolding) and uses `build_chat_reply_prompt` for the
+        case context + recent transcript. A task-block addendum tells
+        the model about the incompatible state, the three options, and
+        the template name, and asks it to engage with the lawyer's
+        message and close with a brief re-offer of choices — without
+        copy-pasting the canned options block.
+
+        State stays `incompatible=True` and `draft_status="analyzing"`
+        — drafting still requires the lawyer to pick (a)/(b)/(c) on a
+        later turn.
+        """
+        role = (case_context.get("role") or "ADJUDICATOR").upper()
+        case_summary = case_context.get("case_summary") or ""
+        case_facts = case_context.get("case_facts_brief") or ""
+        template_name = (session_state.get("template_name") or "(uploaded template)").strip()
+        draft_title = session_state.get("draft_title") or "this matter"
+
+        base_prompt = build_chat_reply_prompt(
+            role=role,
+            case_summary=case_summary,
+            case_facts_brief=case_facts,
+            conversation_history=conversation_history,
+            user_message=user_message,
+        )
+        addendum = (
+            "\n\nADDITIONAL CONTEXT FOR THIS REPLY:\n"
+            f"You previously diagnosed the uploaded template "
+            f"'{template_name}' as fundamentally incompatible with this "
+            f"matter (intended draft: {draft_title}) and offered three "
+            "options:\n"
+            "  (a) Draft from a fresh structure using the case context — "
+            "the uploaded template is set aside.\n"
+            "  (b) Upload a different template that fits this matter.\n"
+            "  (c) Cancel this drafting session.\n\n"
+            "The lawyer has now sent the message shown above. They have "
+            "NOT yet picked an option — they are asking a question, "
+            "exploring alternatives, pushing back on a suggestion, or "
+            "expressing some other concern.\n\n"
+            "Reply naturally, like a real assistant: \n"
+            "  - Address what they actually said. If they asked what an "
+            "option means, explain it. If they rejected a document type "
+            "(e.g. \"not a criminal complaint\"), suggest 2–3 concrete "
+            "document alternatives that fit the case (legal/demand "
+            "notice, civil plaint, affidavit, written statement, "
+            "anticipatory bail application, etc.).\n"
+            "  - Do NOT copy-paste the original options block verbatim. "
+            "Vary the wording. Keep it short and human.\n"
+            "  - END the reply with a brief, single-paragraph re-offer "
+            "of the choice — phrase it differently each time. For "
+            "example: \"Just tell me which of these you'd like and I'll "
+            "start — or upload a fitting template, or say 'cancel' if "
+            "you'd rather stop here.\"\n"
+            "  - Do NOT produce any court-filing scaffolding (no court "
+            "heading, no \"MOST RESPECTFULLY SHOWETH\", no signature "
+            "block). This is a chat turn, not a draft."
+        )
+        prompt = base_prompt + addendum
+
+        try:
+            raw = await gemini_client.generate(
+                prompt,
+                system_instruction=DRAFTING_CHAT_INSTRUCTION,
+                temperature=0.5,
+                max_tokens=12000,
+            )
+        except Exception as e:
+            logger.error("Incompatible-clarification LLM call failed: {}", e)
+            session_state["draft_status"] = "analyzing"
+            session_state["open_questions"] = []
+            session_state["last_assistant_message"] = (
+                self._build_incompatible_options_message(draft_title)
+            )
+            return session_state
+
+        reply = _strip_code_fences(raw).strip()
+        if not reply:
+            session_state["draft_status"] = "analyzing"
+            session_state["open_questions"] = []
+            session_state["last_assistant_message"] = (
+                self._build_incompatible_options_message(draft_title)
+            )
+            return session_state
+
+        # Stay in the incompatible/analyzing state — the lawyer has not
+        # yet chosen (a)/(b)/(c). The deterministic letter pre-check
+        # will fire instantly on their next turn if they pick one.
+        session_state["draft_status"] = "analyzing"
+        session_state["open_questions"] = []
+        session_state["last_assistant_message"] = reply
+        return session_state
+
+    _OPTION_INTENT_BY_LETTER = {
+        "a": "proceed_from_scratch",
+        "b": "change_template",
+        "c": "cancel",
+    }
+
+    @classmethod
+    def _classify_option_letter_reply(cls, text: str) -> Optional[str]:
+        """Deterministic match for the lawyer picking option (a) / (b) / (c).
+
+        Returns the corresponding intent, or None if the reply does not
+        look like an option-letter selection. Runs BEFORE the LLM
+        classifier in `_handle_incompatible_reply` because the LLM has
+        been observed to mis-read a bare "a" as the English article and
+        default to `acknowledge_only`. Matches:
+            "a"  "A"  "(a)"  "a)"  "a."  "a:"
+            "option a"  "choice a"  "select a"
+            "a - draft from scratch"  "a, draft from scratch"
+            "go with a"  "let's go with a"  "pick a"
+        Anything more complex is left to the LLM.
+        """
+        raw = (text or "").strip()
+        if not raw or len(raw) > 80:
+            return None
+        # Lowercase and strip surrounding punctuation / quotes / brackets.
+        t = re.sub(r"^[\s\"'`(\[{]+", "", raw.lower())
+        t = re.sub(r"[\s\"'`)\]}.,!?:;]+$", "", t)
+        if not t:
+            return None
+        # Pure single letter — most common path.
+        if t in cls._OPTION_INTENT_BY_LETTER:
+            return cls._OPTION_INTENT_BY_LETTER[t]
+        # "option a" / "choice a" / "select a" / "pick a" / "go with a" /
+        # "let's go with a" / "i pick a" — match a single trailing letter.
+        m = re.match(
+            r"^(?:option|choice|select|pick|go with|let's go with|i pick|"
+            r"i choose|i'll go with|go for)\s+\(?([abc])\)?$",
+            t,
+        )
+        if m:
+            return cls._OPTION_INTENT_BY_LETTER[m.group(1)]
+        # "a - draft from scratch" / "a) draft from scratch" / "a, draft" —
+        # the letter is the first token followed by a separator (`)`, `-`,
+        # `—`, `,`, or `:`) and then an explanatory phrase. The `)` is
+        # included in the separator class itself so the optional opening
+        # `(` (already stripped by the lead-strip above for the "(a) …"
+        # variant) does not need a matching closing `)`.
+        m = re.match(r"^\(?([abc])\s*[-—,:)]\s*\S", t)
+        if m:
+            return cls._OPTION_INTENT_BY_LETTER[m.group(1)]
+        return None
+
+    # Greeting vocabulary used to short-circuit the per-turn intent
+    # classifier. The LLM was observed mis-classifying a bare "hi" as a
+    # draft_request because the workspace case context contained
+    # drafting-relevant data — it inferred "they probably want to draft
+    # the case I see in context". A bare greeting must NEVER infer
+    # drafting intent; it routes straight to the chat handler.
+    _GREETING_TOKENS = frozenset(
+        {
+            "hi", "hii", "hiii", "hello", "hellow", "hey", "heyy", "hola",
+            "yo", "sup", "howdy", "namaste", "namaskar", "salaam",
+            "good", "morning", "afternoon", "evening", "night",
+            "greetings", "gm", "ga", "gn",
+        }
+    )
+
+    # Tokens that may legitimately appear alongside a greeting without
+    # turning it into a drafting request: "hi there", "hello team",
+    # "good morning ji", "hey assistant", etc. We do NOT include any
+    # verbs here — "hi draft" would NOT match.
+    _GREETING_ATTENDANTS = frozenset(
+        {
+            "there", "ji", "sir", "madam", "team", "assistant", "ai",
+            "bot", "all", "everyone", "folks", "buddy", "friend",
+        }
+    )
+
+    @classmethod
+    def _is_greeting(cls, text: str) -> bool:
+        """True iff the message is a bare greeting / salutation.
+
+        Matches "hi", "hello", "hey", "good morning", "namaste",
+        "hi there", "good evening ji", etc. Anything longer than a short
+        salutation, or containing tokens outside the greeting vocabulary,
+        is left to the LLM. This is intentionally narrow — when in doubt
+        return False; the LLM still has the safe default of
+        chat_question.
+        """
+        raw = (text or "").strip()
+        if not raw or len(raw) > 40:
+            return False
+        # Drop emoji and punctuation, keep letters / digits / whitespace.
+        cleaned = re.sub(r"[^\w\s']", " ", raw.lower(), flags=re.UNICODE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if not cleaned:
+            return False
+        tokens = [t for t in cleaned.split() if t]
+        if not tokens:
+            return False
+        # All tokens must be greetings or attendants. Anything else
+        # ("draft", "fir", "complaint", a question word) makes this not
+        # a pure greeting and falls through to the LLM.
+        return all(
+            tok in cls._GREETING_TOKENS or tok in cls._GREETING_ATTENDANTS
+            for tok in tokens
+        )
+
+    # ------------------------------------------------------------------
+    # Translate-intent detector — handles "translate in hindi" / "in
+    # marathi please" / "hindi" replies. Runs after a draft has been
+    # delivered (draft_status == "ready") so we can route them to the
+    # dedicated translation handler rather than a chat or revision turn.
+    # ------------------------------------------------------------------
+
+    _TRANSLATABLE_LANGUAGES: Dict[str, str] = {
+        # Indian languages (lowercase trigger -> canonical English name)
+        "hindi": "Hindi",
+        "marathi": "Marathi",
+        "bengali": "Bengali",
+        "bangla": "Bengali",
+        "tamil": "Tamil",
+        "telugu": "Telugu",
+        "gujarati": "Gujarati",
+        "punjabi": "Punjabi",
+        "kannada": "Kannada",
+        "malayalam": "Malayalam",
+        "urdu": "Urdu",
+        "odia": "Odia",
+        "oriya": "Odia",
+        "assamese": "Assamese",
+        "sanskrit": "Sanskrit",
+        "english": "English",
+        # Common international languages (kept small intentionally)
+        "french": "French",
+        "spanish": "Spanish",
+        "german": "German",
+        "arabic": "Arabic",
+        "mandarin": "Mandarin Chinese",
+        "chinese": "Mandarin Chinese",
+        "portuguese": "Portuguese",
+        "russian": "Russian",
+        "japanese": "Japanese",
+    }
+
+    # Verbs and nouns that signal a translation request.
+    _TRANSLATE_VERBS = frozenset(
+        {"translate", "translation", "convert", "render", "rewrite"}
+    )
+
+    @classmethod
+    def _extract_translate_target(cls, text: str) -> Optional[str]:
+        """Return canonical target-language name for a translate request.
+
+        Returns None when the message is not a translate request, or when
+        no language in `_TRANSLATABLE_LANGUAGES` is mentioned. Conservative
+        on length: longer messages without an explicit translate-verb are
+        rejected so phrases like "the hindi name of the accused is …"
+        do NOT trigger translation.
+
+        Matches:
+            "translate in hindi"           "translate to marathi"
+            "translate this to tamil"      "translate it into bengali"
+            "convert to hindi"             "rewrite in tamil"
+            "in hindi please"              "hindi translation"
+            "hindi version"                "hindi"  (short standalone)
+            "translate back to english"    "back to english"
+        """
+        raw = (text or "").strip()
+        if not raw or len(raw) > 120:
+            return None
+        # Lowercase + drop punctuation; keep letters/digits/whitespace.
+        cleaned = re.sub(r"[^\w\s'-]", " ", raw.lower(), flags=re.UNICODE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if not cleaned:
+            return None
+        tokens = [t for t in cleaned.split() if t]
+        if not tokens:
+            return None
+
+        # Find the first language mention.
+        lang_tokens = [t for t in tokens if t in cls._TRANSLATABLE_LANGUAGES]
+        if not lang_tokens:
+            return None
+        target = cls._TRANSLATABLE_LANGUAGES[lang_tokens[0]]
+
+        # Strict path: any explicit translate-verb anywhere → accept.
+        if any(t in cls._TRANSLATE_VERBS for t in tokens):
+            return target
+
+        # Short-message path: ≤ 4 tokens, all of them either the
+        # language, "in"/"to"/"into", "please"/"please"/"version"/
+        # "back"/"now". Catches "hindi", "in hindi", "hindi please",
+        # "back to english".
+        if len(tokens) <= 4:
+            allowed = (
+                set(cls._TRANSLATABLE_LANGUAGES.keys())
+                | {
+                    "in", "to", "into", "as", "please", "version",
+                    "back", "now", "the", "language", "translation",
+                }
+            )
+            if all(t in allowed for t in tokens):
+                return target
+
+        # Otherwise the language token appears inside a longer message
+        # without a translate verb — reject (e.g. "the hindi name of
+        # the accused is Ravi").
+        return None
+
+    # ------------------------------------------------------------------
+    # Ordinal-reference resolver — handles replies like "do the third
+    # one" / "option 2" / "3rd please" that pick an item from a numbered
+    # or bulleted list the assistant just produced. Runs BEFORE the LLM
+    # classifier so the common case never costs a round-trip and never
+    # mis-routes to chat_question.
+    # ------------------------------------------------------------------
+
+    # Only true ordinal forms here. Cardinals ("one", "two", ...) are
+    # deliberately omitted because they collide with positional uses of
+    # "one" ("the third one", "first one", "do the 2nd one") and
+    # generic uses ("any of them is fine, do one"). Cardinal-only
+    # picks like "ok 3" still route via the digit-only fallback below.
+    _ORDINAL_WORD_TO_INDEX = {
+        "first": 1, "1st": 1,
+        "second": 2, "2nd": 2,
+        "third": 3, "3rd": 3,
+        "fourth": 4, "4th": 4,
+        "fifth": 5, "5th": 5,
+        "sixth": 6, "6th": 6,
+        "seventh": 7, "7th": 7,
+        "eighth": 8, "8th": 8,
+        "ninth": 9, "9th": 9,
+        "tenth": 10, "10th": 10,
+    }
+
+    @classmethod
+    def _extract_ordinal_index(cls, text: str) -> Optional[int]:
+        """Return the 1-based list position the user is picking, or None.
+
+        Matches single-list-item picks like:
+            "do the third one"     "the 3rd one"      "3rd please"
+            "option 2"             "number 2"         "#3"
+            "let's do the third"   "go with #3"       "pick option 4"
+            "ok the second"        "yes, option 1"    "last one"
+        Anything more complex (multiple ordinals, or a sentence with
+        unrelated drafting verbs) is left to the LLM.
+        """
+        raw = (text or "").strip()
+        if not raw or len(raw) > 120:
+            return None
+        # Lowercase, strip outer quotes/brackets, collapse whitespace.
+        t = re.sub(r"^[\s\"'`(\[{]+", "", raw.lower())
+        t = re.sub(r"[\s\"'`)\]}.,!?:;]+$", "", t)
+        if not t:
+            return None
+        # Strip leading filler acknowledgements so "ok do the third one"
+        # reduces to "do the third one".
+        t = re.sub(
+            r"^(?:ok(?:ay)?|sure|yes|yeah|yep|alright|right)[\s,]+",
+            "",
+            t,
+        )
+
+        # "last" → the last item in the list. We resolve that against
+        # the actual list length at the call site (return a sentinel
+        # negative number that the caller maps to len(items)).
+        if re.fullmatch(r"(?:the\s+)?last(?:\s+one)?", t):
+            return -1  # sentinel: last
+        if re.fullmatch(r"(?:do|pick|select|take|use|go\s+with)?\s*(?:the\s+)?last(?:\s+one)?", t):
+            return -1
+
+        # "#3" / "no. 3" / "no 3" / "number 3" / "option 3" / "choice 3"
+        # Allow the keyword to appear anywhere — `#` does not produce a
+        # `\b` after whitespace, so use `(?:^|\s|\b)` instead.
+        m = re.search(
+            r"(?:^|\s|\b)(?:#|no\.?|number|option|choice|pick|item)\s*(\d{1,2})\b",
+            t,
+        )
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= 10:
+                return n
+
+        # Word/ordinal form anywhere in a short message:
+        # "third", "the third one", "let's do the third", "go for fifth".
+        for word, idx in cls._ORDINAL_WORD_TO_INDEX.items():
+            # Word-boundary match so "first" does not match inside
+            # "firstly". Already lowercase by this point.
+            if re.search(rf"\b{re.escape(word)}\b", t):
+                # Reject if the message also mentions an explicit
+                # alternative number — ambiguous.
+                if sum(
+                    1 for w in cls._ORDINAL_WORD_TO_INDEX
+                    if re.search(rf"\b{re.escape(w)}\b", t)
+                ) > 1:
+                    return None
+                return idx
+
+        # Bare standalone digit like "3" or "ok 3".
+        m = re.fullmatch(r"(?:do\s+|pick\s+|select\s+|take\s+)?(\d{1,2})", t)
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= 10:
+                return n
+        return None
+
+    # Numbered-list line patterns we recognise in assistant history:
+    #   "1. Item title — desc"   "1) Item title"   "*   **Title:** desc"
+    #   "- Title: desc"          "**1. Title:** desc"
+    _LIST_LINE_PATTERNS = [
+        # "**1. Title:** ..." (Markdown bold-numbered titles)
+        re.compile(r"^\s*\*\*(\d{1,2})\.\s+([^*]+?)\*\*\s*(.*)$"),
+        # "1. Title — ..."  "1. Title: ..."  "1) Title …"
+        re.compile(r"^\s*(\d{1,2})[.)]\s+(.+)$"),
+        # "* Title — ..." or "- Title — ..." (bulleted lists)
+        re.compile(r"^\s*[*\-]\s+(.+)$"),
+    ]
+
+    @classmethod
+    def _extract_list_items_from_history(
+        cls,
+        conversation_history: List[Dict[str, Any]],
+    ) -> List[str]:
+        """Return the bulleted / numbered items from the assistant's
+        most recent message that contains a list, in order.
+
+        Each item is the raw text after the list marker. Returns [] if
+        no recent assistant message contains a list.
+        """
+        if not conversation_history:
+            return []
+        # Walk backwards through history; the most recent assistant turn
+        # that contains a list wins.
+        for turn in reversed(conversation_history):
+            if not isinstance(turn, dict):
+                continue
+            who = (turn.get("role") or "").strip().lower()
+            if who not in {"assistant", "ai", "bot", "model"}:
+                continue
+            content = (turn.get("content") or "").strip()
+            if not content:
+                continue
+
+            numbered_items: List[Tuple[int, str]] = []
+            bulleted_items: List[str] = []
+            for raw_line in content.splitlines():
+                line = raw_line.rstrip()
+                if not line:
+                    continue
+
+                m_bold = cls._LIST_LINE_PATTERNS[0].match(line)
+                if m_bold:
+                    n = int(m_bold.group(1))
+                    title = m_bold.group(2).strip()
+                    rest = (m_bold.group(3) or "").strip()
+                    item = title if not rest else f"{title} {rest}"
+                    numbered_items.append((n, item))
+                    continue
+
+                m_num = cls._LIST_LINE_PATTERNS[1].match(line)
+                if m_num:
+                    n = int(m_num.group(1))
+                    numbered_items.append((n, m_num.group(2).strip()))
+                    continue
+
+                m_bul = cls._LIST_LINE_PATTERNS[2].match(line)
+                if m_bul:
+                    bulleted_items.append(m_bul.group(1).strip())
+                    continue
+
+            if numbered_items:
+                # Sort by the number the assistant emitted, in case the
+                # list is interleaved with prose. De-dupe positions.
+                seen: Dict[int, str] = {}
+                for n, item in numbered_items:
+                    seen.setdefault(n, item)
+                return [seen[k] for k in sorted(seen.keys())]
+            if bulleted_items and len(bulleted_items) >= 2:
+                return bulleted_items
+        return []
+
+    @staticmethod
+    def _clean_list_item_to_doc_type(item: str) -> str:
+        """Strip a leading bold/colon title prefix from a list item to a
+        canonical document-type label.
+
+        Examples:
+            "**Regular Bail Application:** A petition under …"
+                -> "Regular Bail Application"
+            "Regular Bail Application — A petition …"
+                -> "Regular Bail Application"
+            "Application for Production of Documents under Section 94"
+                -> "Application for Production of Documents under Section 94"
+        """
+        text = (item or "").strip()
+        if not text:
+            return ""
+        # Markdown bold prefix: "**Title:** rest" or "**Title** rest"
+        m = re.match(r"^\*\*([^*]+?)\*\*\s*[:—\-]?\s*(.*)$", text)
+        if m:
+            title = m.group(1).strip().rstrip(":").strip()
+            if title:
+                return title
+        # Plain "Title: rest" or "Title — rest" / "Title - rest"
+        m = re.match(r"^([^:—\-]{3,80})\s*[:—\-]\s+\S", text)
+        if m:
+            return m.group(1).strip()
+        # Otherwise return the first ~80 chars trimmed at a sentence
+        # boundary so the doc type is at least short.
+        sentence = re.split(r"[.!?]", text, maxsplit=1)[0]
+        return sentence.strip()[:80].rstrip()
+
+    @classmethod
+    def _resolve_ordinal_reference(
+        cls,
+        user_message: str,
+        conversation_history: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Detect "do the third one"-style picks; return resolved doc type.
+
+        Returns the canonical document-type string when the message is
+        an ordinal reference AND the recent assistant history contains a
+        list at that position. Returns None otherwise — the LLM
+        classifier is the backstop in that case.
+        """
+        idx = cls._extract_ordinal_index(user_message)
+        if idx is None:
+            return None
+        items = cls._extract_list_items_from_history(conversation_history)
+        if not items:
+            return None
+        if idx == -1:
+            chosen = items[-1]
+        elif 1 <= idx <= len(items):
+            chosen = items[idx - 1]
+        else:
+            return None
+        doc_type = cls._clean_list_item_to_doc_type(chosen)
+        return doc_type or None
+
+    _DRAFTING_TURN_INTENTS = {
+        "draft_request",
+        "revision_request",
+        "scoping_answer",
+        "acknowledgement",
+        "chat_question",
+    }
+
+    async def _classify_drafting_turn_intent(
+        self,
+        *,
+        user_message: str,
+        session_state: Dict[str, Any],
+        conversation_history: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Classify a per-turn message inside the drafting assistant.
+
+        Returns {"intent": <label>, "document_type": <short name or "">}.
+        On any failure / unrecognised value, returns
+        `{"intent": "chat_question", "document_type": ""}` — the safe
+        default never fires a draft unexpectedly.
+        """
+        snippet = (user_message or "")[:600]
+        current_status = (session_state.get("draft_status") or "").strip() or "(none)"
+        is_incompatible = bool(session_state.get("incompatible"))
+
+        # Compact transcript: last 4 turns is enough state for the classifier.
+        history_lines: List[str] = []
+        for turn in (conversation_history or [])[-4:]:
+            if not isinstance(turn, dict):
+                continue
+            who = (turn.get("role") or "").strip().lower()
+            content = (turn.get("content") or "").strip()
+            if not content:
+                continue
+            if who in {"user", "human", "lawyer"}:
+                history_lines.append(f"LAWYER: {content[:300]}")
+            elif who in {"assistant", "ai", "bot", "model"}:
+                history_lines.append(f"ASSISTANT: {content[:300]}")
+        history_block = "\n".join(history_lines) if history_lines else "(no prior turns)"
+
+        prompt = (
+            "You are a one-shot intent classifier for messages sent inside "
+            "an Indian legal drafting assistant chat. The assistant can "
+            "draft documents (FIR complaints, bail applications, legal "
+            "notices, affidavits, plaints, written statements, ...), "
+            "answer legal questions, and have conversational chat.\n\n"
+            "CRITICAL RULE — intent is determined SOLELY by what the "
+            "LAWYER MESSAGE says. The workspace's case context may "
+            "contain a fully developed matter (parties, FIR numbers, "
+            "applicable statutes, custody details), but THAT IS NOT "
+            "EVIDENCE OF DRAFTING INTENT. The lawyer can have a loaded "
+            "workspace and still be greeting, asking a question, or "
+            "just chatting. NEVER infer draft_request from the case "
+            "context — only from the actual message.\n\n"
+            "Classify the lawyer's CURRENT MESSAGE into exactly one label:\n"
+            "  - draft_request: the LAWYER MESSAGE must explicitly ask "
+            "the assistant to produce a draft. The message must contain "
+            "EITHER (a) a drafting verb directed at the assistant — "
+            "\"draft\", \"create\", \"make\", \"write\", \"prepare\", "
+            "\"generate\", \"give me\", \"start\", \"begin\" — OR (b) "
+            "the lawyer naming a document type as the subject of a "
+            "request — \"I need a bail application\", \"a legal notice "
+            "would help\". Pure topic mentions like \"bail\" or \"the "
+            "NDPS case\" are NOT draft_requests on their own.\n"
+            "    Positive examples: \"draft an FIR\", \"I want a legal "
+            "notice for recovery\", \"give me a bail application\", "
+            "\"prepare an anticipatory bail application\", \"actually "
+            "start an affidavit instead\".\n"
+            "    ORDINAL PICKS: when the assistant's RECENT CONVERSATION "
+            "contains a numbered or bulleted list of document types, a "
+            "reply that selects one by position is ALSO a draft_request. "
+            "Resolve the position against the assistant's list and put "
+            "the chosen item in document_type. Examples (assume the "
+            "assistant just listed \"1. Bail Application 2. Section 94 "
+            "Application 3. CCTV Preservation Application\"):\n"
+            "        \"ok do the third one\" → draft_request, document_type "
+            "= \"CCTV Preservation Application\".\n"
+            "        \"let's go with option 2\" → draft_request, "
+            "document_type = \"Section 94 Application\".\n"
+            "        \"3rd please\" / \"the third\" / \"#3\" → same as the "
+            "first example.\n"
+            "    Negative examples (NOT draft_request — these are "
+            "chat_question or acknowledgement): \"hi\", \"hello\", "
+            "\"good morning\", \"what can you do?\", \"explain section "
+            "483 BNSS\", \"what are my options here?\".\n"
+            "  - revision_request: the lawyer is asking for edits to a "
+            "draft that has already been delivered. ONLY valid when the "
+            "current draft_status is \"ready\". Examples: \"tighten the "
+            "prayer\", \"add a clause about ...\", \"remove paragraph 5\", "
+            "\"make the tone stronger\".\n"
+            "  - scoping_answer: the lawyer is answering open scoping "
+            "questions the assistant just asked. ONLY valid when "
+            "draft_status is \"gathering_info\". Examples: \"FIR 142 of 12 "
+            "May 2026, at PS Sec 14\", short factual replies matching the "
+            "questions in the recent conversation.\n"
+            "  - acknowledgement: bare acknowledgement of the assistant's "
+            "last message — \"ok\", \"thanks\", \"got it\", \"looks "
+            "good\". No actionable content.\n"
+            "  - chat_question: anything else — legal Q&A (\"what is "
+            "Section 318 BNS?\"), greeting (\"hi\", \"hello\", \"good "
+            "morning\", \"what can you do?\"), clarification about a "
+            "draft (\"why this clause?\"), free-form discussion. When "
+            "in doubt, choose THIS label — it is the safe default and "
+            "never fires a draft.\n\n"
+            "For `draft_request`, also produce `document_type`: the short "
+            "canonical name of the requested document (e.g. \"FIR "
+            "Complaint\", \"Bail Application\", \"Anticipatory Bail "
+            "Application\", \"Legal Notice\", \"Affidavit\", \"Plaint\", "
+            "\"Written Statement\", \"Reply Notice\"). Extract ONLY from "
+            "the lawyer's message or from a document type the assistant "
+            "recently offered in the visible conversation history. DO "
+            "NOT invent a document type from case-context details (e.g. "
+            "do not output \"Bail Application\" just because the case "
+            "context mentions an arrest). If the message does not name "
+            "or unambiguously imply a document, leave document_type as "
+            "an empty string. For every non-draft_request intent, leave "
+            "document_type empty.\n\n"
+            f"CURRENT draft_status: {current_status}\n"
+            f"INCOMPATIBLE-TEMPLATE flag: {is_incompatible}\n\n"
+            f"RECENT CONVERSATION (most recent last):\n{history_block}\n\n"
+            f"LAWYER MESSAGE:\n\"\"\"{snippet}\"\"\"\n\n"
+            "Output STRICT JSON only: "
+            "{\"intent\": \"<label>\", \"document_type\": \"<short name "
+            "or empty>\"} — no prose, no markdown fences."
+        )
+        try:
+            raw = await self._safe_llm_json(
+                prompt=prompt,
+                system_instruction=(
+                    "You are a strict single-label intent classifier. "
+                    "Output a JSON object with two fields: `intent` "
+                    "(one of: draft_request, revision_request, "
+                    "scoping_answer, acknowledgement, chat_question) and "
+                    "`document_type` (a short string, empty when the "
+                    "intent is not draft_request). Never invent any "
+                    "other intent label."
+                ),
+                temperature=0.0,
+                max_tokens=120,
+            )
+        except Exception as e:
+            logger.debug("Drafting-turn intent classifier failed: {}", e)
+            return {"intent": "chat_question", "document_type": ""}
+        parsed = _parse_json_object(raw) or {}
+        label = (parsed.get("intent") or "").strip().lower()
+        if label not in self._DRAFTING_TURN_INTENTS:
+            label = "chat_question"
+        doc_type = (parsed.get("document_type") or "").strip()
+        if label != "draft_request":
+            doc_type = ""
+        return {"intent": label, "document_type": doc_type}
+
+    # Drafting-state values that mean "there is active drafting work
+    # in progress on this session" — when one of these is set, a chat
+    # turn must NOT clobber draft_status or open_questions, or the
+    # lawyer loses scoping progress / draft context on every chat turn.
+    _ACTIVE_DRAFT_STATUSES = {
+        "analyzing",
+        "gathering_info",
+        "ready",
+        "revising",
+    }
+
+    async def _handle_chat_question(
+        self,
+        *,
+        user_message: str,
+        case_context: Dict[str, Any],
+        session_state: Dict[str, Any],
+        conversation_history: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Reply to a non-drafting message using the soft chat prompt.
+
+        Behaviour depends on whether a draft is in progress:
+          - When draft_status is "analyzing" / "gathering_info" /
+            "ready" / "revising", **preserve** all drafting fields and
+            only update `last_assistant_message`. The next scoping
+            answer / revision / ack still finds the session intact.
+          - Otherwise (no active draft / draft_status=="chatting" /
+            empty state), set draft_status="chatting" and clear
+            open_questions as before — there is no scoping progress to
+            preserve.
+        """
+        role = (case_context.get("role") or "ADJUDICATOR").upper()
+        case_summary = case_context.get("case_summary") or ""
+        case_facts = case_context.get("case_facts_brief") or ""
+        prior_status = (session_state.get("draft_status") or "").strip()
+        preserve_draft_state = prior_status in self._ACTIVE_DRAFT_STATUSES
+
+        prompt = build_chat_reply_prompt(
+            role=role,
+            case_summary=case_summary,
+            case_facts_brief=case_facts,
+            conversation_history=conversation_history,
+            user_message=user_message,
+        )
+        try:
+            raw = await gemini_client.generate(
+                prompt,
+                system_instruction=DRAFTING_CHAT_INSTRUCTION,
+                temperature=0.4,
+                max_tokens=12000,
+            )
+        except Exception as e:
+            logger.error("Drafting chat reply LLM call failed: {}", e)
+            session_state["last_assistant_message"] = (
+                "I ran into an issue replying just now. Could you re-send "
+                "your message, or rephrase it?"
+            )
+            if not preserve_draft_state:
+                session_state["draft_status"] = "chatting"
+            return session_state
+        reply = _strip_code_fences(raw).strip() or (
+            "I am not sure how to respond to that. Could you rephrase, "
+            "or tell me which document you would like me to help draft?"
+        )
+        session_state["last_assistant_message"] = reply
+        if not preserve_draft_state:
+            session_state["draft_status"] = "chatting"
+            # No active draft → no scoping questions to keep.
+            session_state["open_questions"] = []
+        # When preserving, we deliberately leave draft_status,
+        # open_questions, gathered_facts, draft_title, last_draft_* etc.
+        # untouched so the next scoping / revision turn picks up where
+        # the lawyer left off.
+        return session_state
+
+    async def _classify_incompatible_intent(
+        self, user_message: str
+    ) -> Dict[str, str]:
+        """Classify the reply to the incompatibility warning.
+
+        Returns a dict:
+            {"intent": <label>, "document_type": <short name or "">}
+
+        `intent` is one of: proceed_from_scratch, change_template,
+        cancel, clarifying_question. On any failure / unrecognised
+        value, returns
+        `{"intent": "clarifying_question", "document_type": ""}` — that
+        label routes to a contextual chat reply that engages with the
+        message and re-offers the options without robotically repeating
+        the canned block.
+
+        `document_type` is populated when the intent is
+        `proceed_from_scratch` AND the lawyer explicitly named the
+        document type to draft (e.g. "draft the legal notice" →
+        "Legal Notice"). Empty string otherwise — the caller falls
+        back to the existing draft title.
+
+        Note: pure acknowledgements ("ok", "thanks") never reach this
+        method — they are caught earlier by
+        `_is_post_draft_acknowledgement`. So any input here is a
+        non-trivial reply that deserves a real classification.
+        """
+        snippet = (user_message or "")[:400]
+        prompt = (
+            "You are classifying a single user reply in a legal-drafting "
+            "chat. The assistant previously told the lawyer that the "
+            "uploaded template is fundamentally incompatible with the case "
+            "and asked them to choose one of three options:\n"
+            "  (a) Draft from a fresh structure (drop the template, draft "
+            "from the case context).\n"
+            "  (b) Upload a different template.\n"
+            "  (c) Cancel the drafting session.\n\n"
+            f"USER REPLY:\n\"\"\"{snippet}\"\"\"\n\n"
+            "IMPORTANT: a single-letter reply like \"a\", \"A\", \"(a)\", "
+            "\"a)\", or \"option a\" is the lawyer SELECTING that option — "
+            "it is NOT the English article. Map a/A/(a) → proceed_from_scratch, "
+            "b/B/(b) → change_template, c/C/(c) → cancel. Do this even if "
+            "the reply is just one character.\n\n"
+            "Classify the reply into exactly one label:\n"
+            "  - proceed_from_scratch — the lawyer chose (a), OR explicitly "
+            "asks the assistant to draft a specific document the assistant "
+            "has previously mentioned in this conversation (legal notice, "
+            "civil plaint, demand notice, police complaint, affidavit, "
+            "criminal complaint, etc.), OR generically says to proceed / "
+            "draft / go ahead / use a fresh structure.\n"
+            "    Examples that MUST classify as proceed_from_scratch:\n"
+            "      \"draft the legal notice\"     → document_type: \"Legal Notice\"\n"
+            "      \"go ahead with the civil plaint\" → \"Civil Plaint\"\n"
+            "      \"yes, the demand notice please\"  → \"Demand Notice\"\n"
+            "      \"let's do the police complaint\"  → \"Police Complaint\"\n"
+            "      \"start the affidavit\"            → \"Affidavit\"\n"
+            "      \"draft it\" / \"yes proceed\" / \"go ahead\" → document_type: \"\"\n"
+            "  - change_template — the lawyer chose (b), or asks to upload "
+            "/ use / try a different template.\n"
+            "  - cancel — the lawyer chose (c), or asks to cancel / stop / "
+            "abandon / abort / nevermind / scrap this.\n"
+            "  - clarifying_question — the lawyer is asking ABOUT the "
+            "options without picking one (\"what are the other options?\", "
+            "\"what does (b) mean?\", \"any alternatives?\"), pushing back "
+            "on a suggestion without naming a replacement (\"i don't want "
+            "a criminal complaint\"), expressing confusion, or otherwise "
+            "engaging with the choice but NOT instructing the assistant "
+            "to draft something. This is the catch-all for non-empty "
+            "replies that do not unambiguously select (a)/(b)/(c), cancel, "
+            "or instruct drafting.\n\n"
+            "For proceed_from_scratch, also produce `document_type`: the "
+            "short canonical name of the document the lawyer named (e.g. "
+            "\"Legal Notice\", \"Civil Plaint\", \"Demand Notice\", \"FIR "
+            "Complaint\", \"Police Complaint\", \"Affidavit\", "
+            "\"Anticipatory Bail Application\", \"Written Statement\"). "
+            "Use the lawyer's wording when clear; otherwise leave it as "
+            "an empty string. For every other intent, leave it empty.\n\n"
+            "Output STRICT JSON only: "
+            "{\"intent\": \"<label>\", \"document_type\": \"<short name "
+            "or empty>\"} — no prose, no markdown fences."
+        )
+        try:
+            raw = await self._safe_llm_json(
+                prompt=prompt,
+                system_instruction=(
+                    "You are a strict classifier. Output a JSON object "
+                    "with two fields: `intent` (one of: "
+                    "proceed_from_scratch, change_template, cancel, "
+                    "clarifying_question) and `document_type` (a short "
+                    "string, empty unless the intent is "
+                    "proceed_from_scratch AND the user explicitly named "
+                    "a document to draft). Never invent any other intent "
+                    "label. When the user is not clearly selecting (a)/"
+                    "(b)/(c), choose clarifying_question — unless they "
+                    "are explicitly asking you to draft a specific "
+                    "document, in which case proceed_from_scratch."
+                ),
+                temperature=0.0,
+                max_tokens=120,
+            )
+        except Exception as e:
+            logger.debug("Incompatible-intent classifier failed: {}", e)
+            return {"intent": "clarifying_question", "document_type": ""}
+        parsed = _parse_json_object(raw) or {}
+        intent = (parsed.get("intent") or "").strip().lower()
+        if intent not in {
+            "proceed_from_scratch",
+            "change_template",
+            "cancel",
+            "clarifying_question",
+        }:
+            intent = "clarifying_question"
+        doc_type = (parsed.get("document_type") or "").strip()
+        if intent != "proceed_from_scratch":
+            doc_type = ""
+        return {"intent": intent, "document_type": doc_type}
+
+    def _build_incompatible_options_message(self, draft_title: str) -> str:
+        """Static restatement of the (a)/(b)/(c) options.
+
+        Used when the lawyer's reply is bare acknowledgement — we keep
+        the state as `incompatible=True` and re-emit the choice prompt
+        rather than guessing intent.
+        """
+        title = (draft_title or "this draft").strip() or "this draft"
+        return (
+            "The uploaded template does not fit the present matter, so I "
+            "have not started drafting yet. Please choose how you would "
+            "like to proceed:\n\n"
+            "**How would you like to proceed?**\n\n"
+            f"a) **Draft from a fresh structure** for {title}, using the "
+            "case context — the uploaded template will be set aside.\n"
+            "b) **Upload a different template** that fits this matter.\n"
+            "c) **Cancel** this drafting session.\n\n"
+            "Please reply with **(a)**, **(b)**, or **(c)** — or tell me "
+            "in your own words."
         )
 
     async def _map_answers_to_questions(
@@ -1226,7 +2606,7 @@ OUTPUT FORMAT:
                     "keyed by open-question id. Output strict JSON only."
                 ),
                 temperature=0.1,
-                max_tokens=1200,
+                max_tokens=12000,
                 response_mime_type="application/json",
             )
         except Exception as e:
@@ -1260,6 +2640,109 @@ OUTPUT FORMAT:
             mode_override="revision",
             revision_instruction=(user_message or "").strip(),
         )
+
+    async def _handle_translate_draft(
+        self,
+        *,
+        target_language: str,
+        case_context: Dict[str, Any],
+        session_state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Translate the most-recent draft into the requested language.
+
+        Reads `last_draft_markdown`, calls Gemini with the strict
+        `DRAFT_TRANSLATE_INSTRUCTION`, emits the translated draft as a
+        version-bumped `last_draft_document`. Frontend receives this as
+        a fresh draft delivery (`isDraft=true`) and replaces the rendered
+        body in the document panel. The previous English version remains
+        in the chat transcript for reference.
+        """
+        target = (target_language or "").strip() or "Hindi"
+        source_markdown = (session_state.get("last_draft_markdown") or "").strip()
+        if not source_markdown:
+            # Safety net — the dispatcher should already have ensured a
+            # draft exists before invoking this handler. If state got
+            # corrupted, reply gently rather than blowing up.
+            session_state["last_assistant_message"] = (
+                "I don't have a draft to translate yet. Once we finalise "
+                "a draft I can produce a "
+                f"{target} version of it."
+            )
+            return session_state
+
+        role = (case_context.get("role") or "ADJUDICATOR").upper()
+        case_summary = case_context.get("case_summary") or ""
+        prompt = build_draft_translate_prompt(
+            role=role,
+            case_summary=case_summary,
+            draft_markdown=source_markdown,
+            target_language=target,
+        )
+        try:
+            raw = await gemini_client.generate(
+                prompt,
+                system_instruction=DRAFT_TRANSLATE_INSTRUCTION,
+                temperature=0.2,
+                max_tokens=12000,
+            )
+        except Exception as e:
+            logger.error("Draft translate LLM call failed: {}", e)
+            session_state["last_assistant_message"] = (
+                "I ran into an issue translating the draft just now. "
+                "The original draft is still on file — please retry, "
+                "or let me know if you'd like to revise it instead."
+            )
+            return session_state
+
+        translated = _strip_code_fences(raw).strip()
+        if not translated:
+            session_state["last_assistant_message"] = (
+                "The translation came back empty. The original draft is "
+                "still on file — please retry."
+            )
+            return session_state
+
+        prev_version = int(session_state.get("current_draft_version") or 0)
+        new_version = prev_version + 1
+        prev_doc = session_state.get("last_draft_document") or {}
+        base_title = (prev_doc.get("title") or session_state.get("draft_title")
+                      or "Draft")
+        # Title gets a language suffix so the frontend can show both
+        # versions in a draft history if it tracks them. Avoid double-
+        # suffixing on round-trips like English → Hindi → English.
+        base_title_clean = re.sub(r"\s*\[[^\]]+\]\s*$", "", base_title).strip()
+        new_title = f"{base_title_clean} [{target}]"
+
+        translated_doc = {
+            "title": new_title,
+            "format": "markdown",
+            "content": translated,
+            "version": new_version,
+            "sourceTemplateId": prev_doc.get("sourceTemplateId"),
+            "sourceTemplateName": prev_doc.get("sourceTemplateName"),
+            "sourceType": prev_doc.get("sourceType")
+                or session_state.get("source") or "blank",
+            "wordCount": _word_count(translated),
+            "language": target,
+            "translatedFromVersion": prev_version or 1,
+        }
+
+        lead_in = (
+            f"I have translated the draft into {target}. Review the "
+            "document below — let me know if any term needs adjustment."
+        )
+
+        session_state["draft_status"] = "ready"
+        session_state["current_draft_version"] = new_version
+        session_state["last_draft_markdown"] = translated
+        session_state["last_draft_document"] = translated_doc
+        session_state["last_assistant_message"] = f"{lead_in}\n\n{translated}"
+        session_state["open_questions"] = []
+        # Per-turn delivery flag — consumed in handle_turn so BE marks
+        # this turn as a draft delivery (frontend re-renders the
+        # document panel).
+        session_state["_draft_just_delivered"] = True
+        return session_state
 
     # ------------------------------------------------------------------ render
 
@@ -1316,7 +2799,7 @@ OUTPUT FORMAT:
                 prompt,
                 system_instruction=DRAFT_RENDER_INSTRUCTION,
                 temperature=0.35,
-                max_tokens=8000,
+                max_tokens=12000,
             )
         except Exception as e:
             logger.error("Draft render LLM call failed: {}", e)

@@ -176,6 +176,70 @@ def _strip_enum_prefix(text: str) -> str:
     return stripped.strip() or text
 
 
+# UI-truncation guard for case-summary / strategic-objective narratives.
+# OCR of mobile/web app screenshots (UPI billers directories, recent-payees
+# lists, vendor catalogs) captures the UI's own visual truncation ("…" or
+# "..."). The strategy LLM is told to reproduce names verbatim and ends up
+# leaking those clipped labels into caseSummary / reportCaseSummary /
+# strategicObjective as if they were real entities ("Smart Prep…",
+# "Uttar Pradesh Power Corporatio…", "MSEDCL Mahavitaran - Maharashtra ...").
+#
+# Match constraints (deliberately conservative so prose ellipses
+# "the witness said ..." aren't mauled):
+#   - First word: Title Case word or ACRONYM (≥1 leading uppercase).
+#   - Continuation words: Title Case / acronym / parenthetical acronym /
+#     short lowercase connectors (≤3 chars: of, and, the, &, -).
+#   - Immediately followed by a 3-dot or U+2026 truncation marker.
+# A typical prose sentence ("he did not see the accused...") fails on the
+# very first lowercase content word and the regex backtracks to no-match.
+_UI_TRUNCATION_RE = re.compile(
+    r"\b("
+    r"(?:[A-Z][A-Za-z0-9&]*)"
+    r"(?:[\s\-&]+"
+    r"(?:[A-Z][A-Za-z0-9&]*"
+    r"|\([A-Z][A-Za-z0-9&]*\)"
+    r"|[a-z]{1,3}"
+    r"))*"
+    r")\s*(?:\.{3}|…)"
+)
+
+
+def _strip_ui_truncated_tokens(text: str) -> str:
+    """Remove UI-truncated entity labels (token ending in ... or …) that
+    survived the prompt-level filter. Idempotent and safe on None / empty
+    input. Applied only to narrative case-summary fields where we know the
+    consumer is a user-facing legal description (not raw OCR storage).
+
+    The grammar-repair pass below only runs when the regex actually
+    matched something — otherwise prose like "And then the court ruled..."
+    or "etc..." would have its legitimate leading "And" or trailing
+    "..." snipped off.
+    """
+    if not text or not isinstance(text, str):
+        return text or ""
+    if not _UI_TRUNCATION_RE.search(text):
+        return text
+    cleaned = _UI_TRUNCATION_RE.sub("", text)
+    # Repair commas / connectors orphaned by the removed labels so the
+    # surrounding sentence stays grammatical.
+    cleaned = re.sub(r"\s*,\s*,", ",", cleaned)
+    cleaned = re.sub(r"\s+,", ",", cleaned)
+    cleaned = re.sub(r",\s*(?=[.;])", "", cleaned)
+    cleaned = re.sub(r"\band\s*,", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\band\s+(?=[.;])", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\band\s*$", "", cleaned, flags=re.IGNORECASE)
+    # Second pass on ", ." that only emerges after the "and" stripping.
+    cleaned = re.sub(r",\s*(?=[.;])", "", cleaned)
+    cleaned = re.sub(r"\s+,", ",", cleaned)
+    # Orphan "and " / leading comma at sentence start when the removed
+    # label opened the sentence. Tolerates leading whitespace left by
+    # the strip.
+    cleaned = re.sub(r"^\s*(?:and\s+|,\s*)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"(\n\s*)(?:and\s+|,\s*)", r"\1", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
 def _coerce_analysis_text_list(items: Any) -> List[str]:
     """Apply `_coerce_analysis_text_item` to every entry, dropping empties."""
     if not isinstance(items, list):
@@ -418,6 +482,12 @@ class SocketEventHandler:
         self._workspace_chat_suggestion_chips: Dict[str, List[str]] = (
             PersistentWorkspaceDict("chat_suggestion_chips")
         )  # workspace_id -> 10-12 contextual chips (refreshed per AI reply; we return random 4 on each request)
+        # Drafting Assistant — separate chip cache so the Drafting panel
+        # never serves the intelligence-chat chips. Keyed by either
+        # actionable_id (per draft session) or workspace_id (panel-level
+        # fallback when the polling request doesn't carry actionableId).
+        # In-memory only; chips are cheap to regenerate.
+        self._workspace_drafting_suggestion_chips: Dict[str, List[str]] = {}
         self._last_workspace_id_with_chips: Optional[str] = (
             None  # fallback when request workspace has no chips
         )
@@ -1538,6 +1608,18 @@ may add it, but never invent.):
 DOCUMENT CONTENT:
 {combined_document_content}
 
+TRUNCATED-TEXT AND PERIPHERAL-ENTITY RULES (CRITICAL — applies to caseSummary, reportCaseSummary, strategicObjective, possibleNextSteps, and suggestionChips):
+
+1. Some uploaded annexures are SCREENSHOTS of mobile-app or web-app UIs (UPI apps, billers directories, recent-payees lists, vendor catalogs, search-suggestion dropdowns, etc.). In those UIs, the application itself truncates long labels with "..." or "…" so they fit the row width. OCR captures the truncation verbatim.
+
+2. TREAT ANY TOKEN, NAME, OR PHRASE IN THE DOCUMENT CONTENT THAT ENDS IN "..." OR "…" AS A UI-TRUNCATED LABEL, NOT A REAL ENTITY NAME. Examples of the pattern you must filter: "Smart Prep...", "Uttar Pradesh Power Corporatio...", "MSEDCL Mahavitaran - Maharashtra ...", "ABC Industri…".
+
+3. NEVER reproduce a UI-truncated label verbatim in your output. NEVER write any phrase that ends in "..." or "…" inside caseSummary / reportCaseSummary / strategicObjective / possibleNextSteps / suggestionChips. NEVER attempt to guess the full name from a truncated prefix — that would be a hallucination.
+
+4. PERIPHERAL ENTITIES — Only include in your output the entities that are MATERIALLY CONNECTED to the alleged events or transactions described in the documents (named parties, amounts paid/received, identified accused/complainants, banks where the disputed transactions occurred, statutes invoked, courts named). DO NOT list incidental items pulled from app-UI screenshots — billers directories, recent-payees lists, vendor catalogs, search results — unless a specific entry is itself part of the alleged events.
+
+5. If after filtering you have NO concrete case facts left in a section, state that limitation explicitly per the INSUFFICIENT DATA rule below — do NOT fill the gap with peripheral biller / vendor / payee listings.
+
 YOUR ROLE: {workspace_role}
 
 TASK:
@@ -1810,6 +1892,35 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                                     "Entity verifier retry failed (non-fatal): {}",
                                     retry_err,
                                 )
+
+                        # Strip UI-truncated labels ("Smart Prep…", "MSEDCL
+                        # Mahavitaran - Maharashtra ...") that leaked from
+                        # OCR of payment-app screenshots. Belt-and-braces
+                        # alongside the TRUNCATED-TEXT prompt rule above.
+                        # Keeps local vars in sync so the recovery prompt
+                        # below sees the sanitized narrative as context.
+                        _cs_clean = _strip_ui_truncated_tokens(
+                            analysis_data.get("caseSummary") or ""
+                        )
+                        _rcs_clean = _strip_ui_truncated_tokens(
+                            analysis_data.get("reportCaseSummary") or ""
+                        )
+                        _so_clean = _strip_ui_truncated_tokens(
+                            analysis_data.get("strategicObjective") or ""
+                        )
+                        if _cs_clean != (analysis_data.get("caseSummary") or "") or (
+                            _rcs_clean != (analysis_data.get("reportCaseSummary") or "")
+                        ) or _so_clean != (analysis_data.get("strategicObjective") or ""):
+                            logger.info(
+                                "Stripped UI-truncated tokens from strategy narrative "
+                                "(workspace {})",
+                                workspace_id[:12] if workspace_id else "",
+                            )
+                        analysis_data["caseSummary"] = _cs_clean
+                        analysis_data["reportCaseSummary"] = _rcs_clean
+                        analysis_data["strategicObjective"] = _so_clean
+                        case_summary = _cs_clean
+                        strategic_objective = _so_clean
 
                         possible_next_steps = (
                             analysis_data.get("possibleNextSteps")
@@ -2555,6 +2666,356 @@ Rules:
             logger.warning("Strategy objective regen failed: {}", e)
             return False
 
+    async def _regenerate_case_summary_with_feedback(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        user_feedback: str,
+        current_strategy: Dict[str, Any],
+    ) -> bool:
+        """
+        Regenerate caseSummary + reportCaseSummary applying the user's edit
+        instruction. Preserves strategicObjective + possibleNextSteps +
+        suggestionChips byte-for-byte. Updates cache and emits
+        document_feature_response (featureType=strategy_objective).
+        """
+        try:
+            from app.ai.gemini_client import gemini_client
+            from app.vectorstore.qdrant import vector_store
+
+            current_case_summary = (current_strategy.get("caseSummary") or "").strip()
+            current_report_case_summary = (
+                current_strategy.get("reportCaseSummary") or ""
+            ).strip()
+            if not current_case_summary:
+                return False
+
+            all_docs = []
+            try:
+                all_docs = await vector_store.get_all_documents(
+                    workspace_id=workspace_id
+                )
+            except Exception as e:
+                logger.warning("Case-summary regen: could not load documents: {}", e)
+            parts: List[str] = []
+            valid_docs = [
+                d
+                for d in all_docs
+                if (d.get("content") or "").strip()
+                and len((d.get("content") or "").strip()) >= 20
+            ]
+            max_total_content = 100000
+            per_doc_cap = (
+                (max_total_content // max(1, len(valid_docs)))
+                if valid_docs
+                else max_total_content
+            )
+            if not all_docs:
+                combined_document_content = "No document content available."
+            else:
+                for i, doc in enumerate(all_docs, 1):
+                    content = (doc.get("content") or "").strip()
+                    if not content or len(content) < 20:
+                        continue
+                    label = f"Annexure {i}"
+                    if len(content) > per_doc_cap:
+                        content = content[:per_doc_cap] + "\n[... truncated for length ...]"
+                    parts.append(f"--- {label} ---\n{content}")
+                combined_document_content = (
+                    "\n\n".join(parts) if parts else "No document content available."
+                )
+            if len(combined_document_content) > max_total_content:
+                combined_document_content = (
+                    combined_document_content[:max_total_content]
+                    + "\n[... content truncated ...]"
+                )
+
+            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                role = "ADJUDICATOR"
+
+            prompt = f"""You are a legal-strategy editor for Indian law.
+
+You will edit the existing Case Summary and Report Case Summary based on the user's instruction below. The Strategic Objective and Possible Next Steps are LOCKED and must NOT change.
+
+**User's edit instruction** (THIS IS THE PRIMARY CONSTRAINT — apply it EXACTLY as worded):
+{user_feedback.strip()}
+
+CURRENT caseSummary (you must produce an edited version of this text after applying the user's instruction):
+{current_case_summary}
+
+CURRENT reportCaseSummary (apply the SAME edit; keep it a neutral expanded narrative — no role labels like Petitioner/Respondent/Client/Case/Adjudicator/Mediator):
+{current_report_case_summary or current_case_summary}
+
+LOCKED strategicObjective (verbatim context, do not output):
+{(current_strategy.get("strategicObjective") or "").strip()}
+
+LOCKED possibleNextSteps (verbatim context, do not output):
+{json.dumps(current_strategy.get("possibleNextSteps") or [], ensure_ascii=True)}
+
+**Role**: {role}
+
+**Document content** (for fact consistency only; do NOT invent named parties, dates, amounts, suit numbers, or statutes that are not in this content):
+{combined_document_content}
+
+EDIT-INSTRUCTION RULES (CRITICAL — override all preservation rules below when they conflict):
+1. The user's instruction OUTRANKS the "preserve every named party / amount / date / statute" rule. If the user says "remove" / "delete" / "drop" / "change" a specific sentence, paragraph, fact, or phrase, you MUST apply that change to the text — even if it means dropping a named party, an amount, or a date.
+2. If the user QUOTES exact text inside the instruction (anything that looks like a verbatim sentence or phrase from the current case summary), find that exact text in the CURRENT caseSummary above and REMOVE it (and apply the same removal to reportCaseSummary if the same content appears there). Do not "interpret" — match the surface text.
+3. Apply ONLY the edits the user asked for. Do NOT remove other content the user did not mention.
+4. If the user's instruction asks for something impossible (e.g. add a new dated fact not in the documents), ignore that invention and apply only the parts of the instruction that are removals / rephrases / valid edits.
+
+TRUNCATED-TEXT RULE: Never reproduce a token, name, or phrase that ends in "..." or "…" — those are UI-truncation noise from screenshots, not real entity names. Drop them silently.
+
+Return JSON ONLY with these two keys:
+{{
+  "caseSummary": "edited case summary; MUST start EXACTLY with 'This case is about...'; reflect the user's instruction; preserve everything else from CURRENT caseSummary that the user did NOT ask to change",
+  "reportCaseSummary": "edited report case summary; MUST start EXACTLY with 'This matter is about...'; mirror the caseSummary facts after the edit; neutral expanded narrative; do NOT use the words Petitioner/Respondent/Client/Case/Adjudicator/Mediator"
+}}
+
+Output rules:
+- Do not output strategicObjective, possibleNextSteps, or suggestionChips.
+- Preserve Indian-law citations exactly as in the source (BNS/BNSS/BSA/IT Act). Do not switch to IPC/CrPC/Evidence Act.
+- JSON only; complete strings."""
+
+            custom_suffix = build_custom_instruction_suffix(workspace_id)
+            if custom_suffix:
+                prompt = prompt.rstrip() + "\n\n" + custom_suffix
+
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                system_instruction=get_structured_document_feature_system_instruction(
+                    role
+                ),
+                temperature=0.2,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            if not json_str:
+                return False
+            data = json.loads(json_str)
+            if not isinstance(data, dict):
+                return False
+
+            new_case_summary = _strip_ui_truncated_tokens(
+                (data.get("caseSummary") or "").strip()
+            )
+            new_report_case_summary = _strip_ui_truncated_tokens(
+                (data.get("reportCaseSummary") or "").strip()
+            )
+            if not new_case_summary:
+                return False
+            # If the model omitted reportCaseSummary, mirror caseSummary as a fallback.
+            if not new_report_case_summary:
+                new_report_case_summary = new_case_summary
+
+            merged = dict(current_strategy)
+            merged["caseSummary"] = new_case_summary
+            merged["reportCaseSummary"] = new_report_case_summary
+            # Explicitly lock the other three fields from the prior payload.
+            merged["strategicObjective"] = current_strategy.get("strategicObjective", "")
+            merged["possibleNextSteps"] = list(
+                current_strategy.get("possibleNextSteps") or []
+            )
+            merged["suggestionChips"] = list(
+                current_strategy.get("suggestionChips") or []
+            )
+            merged["isUpdate"] = True
+            merged["role"] = role
+            merged["workspaceId"] = workspace_id
+            merged["userId"] = user_id
+            merged["timestamp"] = datetime.utcnow().isoformat()
+
+            self._workspace_strategy_payload[workspace_id] = merged
+
+            if self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "strategy_objective",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": merged,
+                    },
+                )
+                logger.success(
+                    "✅ Case summary regen emitted (other fields preserved) workspace={}",
+                    workspace_id[:12] if workspace_id else "",
+                )
+            return True
+        except Exception as e:
+            logger.warning("Case summary regen failed: {}", e)
+            return False
+
+    async def _regenerate_next_steps_with_feedback(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        user_feedback: str,
+        current_strategy: Dict[str, Any],
+    ) -> bool:
+        """
+        Regenerate possibleNextSteps + suggestionChips applying the user's edit
+        instruction. Preserves caseSummary + reportCaseSummary + strategicObjective
+        byte-for-byte. Updates cache and emits document_feature_response
+        (featureType=strategy_objective).
+        """
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            current_case_summary = (current_strategy.get("caseSummary") or "").strip()
+            current_strategic_objective = (
+                current_strategy.get("strategicObjective") or ""
+            ).strip()
+            if not current_case_summary:
+                return False
+
+            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                role = "ADJUDICATOR"
+
+            prompt = f"""You are a legal-strategy editor for Indian law.
+
+You will edit the existing Possible Next Steps based on the user's instruction below. The Case Summary, Report Case Summary, and Strategic Objective are LOCKED and must NOT change.
+
+**User's edit instruction** (PRIMARY CONSTRAINT — apply EXACTLY as worded):
+{user_feedback.strip()}
+
+CURRENT possibleNextSteps (apply the user's instruction to this list; the indices are 1-based):
+{json.dumps(current_strategy.get("possibleNextSteps") or [], ensure_ascii=True)}
+
+CURRENT suggestionChips (refresh only as needed to stay aligned with the updated next steps):
+{json.dumps(current_strategy.get("suggestionChips") or [], ensure_ascii=True)}
+
+LOCKED caseSummary (verbatim context, do not output):
+{current_case_summary}
+
+LOCKED strategicObjective (verbatim context, do not output):
+{current_strategic_objective}
+
+**Role**: {role}
+
+EDIT-INSTRUCTION RULES (CRITICAL):
+1. The user's instruction OUTRANKS any general guidance. If the user says "remove the 4th point", the returned list MUST omit the 4th item from CURRENT possibleNextSteps and keep the other items in their original order.
+2. If the user says "add a step about X", APPEND a new step about X (or insert at the position they specified) and keep all existing steps unless the user also asked to drop something.
+3. If the user QUOTES an existing step verbatim and asks to remove / rephrase it, match the surface text and apply the change.
+4. Do NOT silently rewrite untouched steps. Only the steps the user asked to change should differ; the rest must be reproduced word-for-word.
+
+TRUNCATED-TEXT RULE: Never produce a token ending in "..." or "…" — those are UI-truncation noise from screenshots, not real entity names.
+
+Return JSON ONLY with these two keys:
+{{
+  "possibleNextSteps": ["the resulting 3-5 next steps after applying the instruction; reference uploads as Annexure N (NEVER 'Document N')"],
+  "suggestionChips": ["15-16 short labels, 2-5 words each, actionable; aligned with the updated next steps"]
+}}
+
+Output rules:
+- Do not output caseSummary, reportCaseSummary, or strategicObjective.
+- No invented facts (no new named parties / dates / amounts / suit numbers / statutes that are not already in caseSummary or strategicObjective).
+- Use Indian-law naming (BNS/BNSS/BSA/IT Act). Do not cite IPC/CrPC/IEA.
+- JSON only; complete strings and arrays."""
+
+            custom_suffix = build_custom_instruction_suffix(workspace_id)
+            if custom_suffix:
+                prompt = prompt.rstrip() + "\n\n" + custom_suffix
+
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                system_instruction=get_structured_document_feature_system_instruction(
+                    role
+                ),
+                temperature=0.25,
+                max_tokens=8000,
+                response_mime_type="application/json",
+            )
+            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            if not json_str:
+                return False
+            data = json.loads(json_str)
+            if not isinstance(data, dict):
+                return False
+
+            possible_next_steps = (
+                data.get("possibleNextSteps") or data.get("possible_next_steps") or []
+            )
+            if isinstance(possible_next_steps, str):
+                possible_next_steps = [possible_next_steps] if possible_next_steps else []
+            possible_next_steps = [
+                _annexure_wording_for_next_steps(_strip_ui_truncated_tokens(str(s).strip()))
+                for s in possible_next_steps
+                if s
+            ][:5]
+            if len(possible_next_steps) < 2:
+                # Refuse the change rather than emit a degraded list — keep the user's
+                # prior content rather than half-empty next steps.
+                return False
+
+            suggestion_chips = (
+                data.get("suggestionChips") or data.get("suggestion_chips") or []
+            )
+            if isinstance(suggestion_chips, str):
+                suggestion_chips = [suggestion_chips] if suggestion_chips else []
+            suggestion_chips = [
+                _strip_ui_truncated_tokens(str(s).strip())
+                for s in suggestion_chips
+                if s
+            ][:16]
+            if len(suggestion_chips) < 10:
+                prior = current_strategy.get("suggestionChips") or []
+                if isinstance(prior, list):
+                    for p in prior:
+                        t = str(p).strip()
+                        if t and t.lower() not in {x.lower() for x in suggestion_chips}:
+                            suggestion_chips.append(t)
+                        if len(suggestion_chips) >= 16:
+                            break
+            if len(suggestion_chips) < 10:
+                for pad in self._fallback_chips_for_role(role, 16):
+                    if pad and pad.lower() not in {x.lower() for x in suggestion_chips}:
+                        suggestion_chips.append(pad)
+                    if len(suggestion_chips) >= 16:
+                        break
+
+            merged = dict(current_strategy)
+            # Lock these three explicitly.
+            merged["caseSummary"] = current_strategy.get("caseSummary", "")
+            merged["reportCaseSummary"] = current_strategy.get("reportCaseSummary", "")
+            merged["strategicObjective"] = current_strategy.get("strategicObjective", "")
+            merged["possibleNextSteps"] = possible_next_steps
+            merged["suggestionChips"] = suggestion_chips
+            merged["isUpdate"] = True
+            merged["role"] = role
+            merged["workspaceId"] = workspace_id
+            merged["userId"] = user_id
+            merged["timestamp"] = datetime.utcnow().isoformat()
+
+            self._workspace_strategy_payload[workspace_id] = merged
+            self._workspace_suggestion_chips[workspace_id] = list(suggestion_chips)
+            self._last_workspace_id_with_chips = workspace_id
+
+            if self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "strategy_objective",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": merged,
+                    },
+                )
+                logger.success(
+                    "✅ Possible next steps regen emitted (other fields preserved) workspace={}",
+                    workspace_id[:12] if workspace_id else "",
+                )
+            return True
+        except Exception as e:
+            logger.warning("Possible next steps regen failed: {}", e)
+            return False
+
     def _last_ai_offered_objective_update(self, ai_text: str) -> bool:
         """True if the assistant previously appended the objective-update offer question."""
         t = (ai_text or "").lower()
@@ -3070,6 +3531,195 @@ USER MESSAGE
                 "isQuestionLike": False,
                 "updateRequestedNow": False,
             }
+
+    async def _llm_classify_panel_edit_intent(
+        self,
+        user_message: str,
+        *,
+        current_strategy: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        LLM-based classifier that decides whether the user's chat message is a
+        direct edit request on one of the four strategy panel fields:
+        caseSummary, reportCaseSummary, strategicObjective, possibleNextSteps.
+
+        Returns:
+            {
+              "caseSummary":         {"shouldEdit": bool, "instruction": str},
+              "reportCaseSummary":   {"shouldEdit": bool, "instruction": str},
+              "strategicObjective":  {"shouldEdit": bool, "instruction": str},
+              "possibleNextSteps":   {"shouldEdit": bool, "instruction": str},
+              "isQuestionLike":      bool
+            }
+
+        ``shouldEdit`` is True only when the user is directly asking for a
+        change (remove / drop / delete / change / replace / edit / modify /
+        rewrite / add / append / insert / expand / shorten / rephrase /
+        fix / correct). Questions, explanations, and greetings classify as
+        all-False so the message falls through to the intelligence chat
+        agent unchanged. ``instruction`` is the normalised edit text (the
+        whole user message when no narrower extraction is possible).
+        """
+        empty: Dict[str, Any] = {
+            "caseSummary": {"shouldEdit": False, "instruction": ""},
+            "reportCaseSummary": {"shouldEdit": False, "instruction": ""},
+            "strategicObjective": {"shouldEdit": False, "instruction": ""},
+            "possibleNextSteps": {"shouldEdit": False, "instruction": ""},
+            "isQuestionLike": False,
+        }
+        msg = (user_message or "").strip()
+        if not msg:
+            return empty
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            has_strategy = bool(
+                isinstance(current_strategy, dict)
+                and (current_strategy.get("caseSummary") or "").strip()
+            )
+            if not has_strategy:
+                # No cached strategy means there's nothing to edit yet.
+                return empty
+
+            prompt = f"""You are a STRICT intent classifier for a legal-strategy workspace chat.
+
+The user is viewing a workspace with FOUR generated panels:
+- CASE SUMMARY (caseSummary): a 10-20 sentence factual narrative of the case.
+- REPORT CASE SUMMARY (reportCaseSummary): the same facts rewritten as a neutral, expanded narrative for formal reports.
+- STRATEGIC OBJECTIVE (strategicObjective): the role-tailored strategic plan, 10-20 sentences.
+- POSSIBLE NEXT STEPS (possibleNextSteps): 3-5 immediate actionable bullets.
+
+Your job: decide whether the user is DIRECTLY asking to edit one or more of these panels, and split the user's instruction into per-panel chunks.
+
+USER MESSAGE:
+\"\"\"{msg}\"\"\"
+
+OUTPUT FORMAT (JSON ONLY):
+{{
+  "caseSummary":        {{"shouldEdit": true | false, "instruction": "ONLY the per-panel edit text for case summary; empty when shouldEdit=false"}},
+  "reportCaseSummary":  {{"shouldEdit": true | false, "instruction": "ONLY the per-panel edit text for report case summary; empty when shouldEdit=false"}},
+  "strategicObjective": {{"shouldEdit": true | false, "instruction": "ONLY the per-panel edit text for strategic objective; empty when shouldEdit=false"}},
+  "possibleNextSteps":  {{"shouldEdit": true | false, "instruction": "ONLY the per-panel edit text for possible next steps; empty when shouldEdit=false"}},
+  "isQuestionLike":     true | false
+}}
+
+DECISION RULES:
+
+1) QUESTIONS / EXPLANATIONS / GREETINGS → all four shouldEdit = false, isQuestionLike = true.
+   Examples: "what laws apply?", "explain the case summary", "hi", "can you describe this?",
+   "is X applicable?", "tell me about ...".
+
+2) EDIT VERBS that trigger shouldEdit when paired with a panel name:
+   remove, delete, drop, change, replace, edit, modify, rewrite, add, append,
+   insert, expand, shorten, rephrase, fix, correct, update.
+
+3) PANEL NAME RECOGNITION (tolerate typos and case):
+   - "case summary", "summary", "the summary"                → caseSummary
+   - "report case summary", "report summary"                 → reportCaseSummary
+   - "strategic objective", "stategic objective" (typo),
+     "objective", "strategy"                                 → strategicObjective
+   - "possible next steps", "next steps", "next step",
+     "action items", "steps"                                 → possibleNextSteps
+
+4) "client objective is to ..." / "the objective is to ..." / "we want to ..." PREFIX RULE (CRITICAL):
+   These phrases are NOT a strategic objective declaration when they are followed by an edit verb plus a panel name.
+   Example: "client objective is to remove sentence X from case summary" means
+   caseSummary.shouldEdit=true, instruction="Remove sentence X from case summary".
+   Do NOT treat the wrapping phrase as a strategic objective change.
+   ONLY when the user says "client objective is X" with no edit verb / no panel name and X is a substantive
+   strategic direction (e.g. "focus on recovering ₹12,000 first") → strategicObjective.shouldEdit=true.
+
+5) SPLIT MULTI-PANEL MESSAGES INTO PER-PANEL INSTRUCTIONS. CRITICAL.
+   Each shouldEdit=true field's `instruction` MUST contain ONLY the user's edit text for THAT panel — not the wrapping phrase, not the other panels' edits.
+   Use the surrounding "from case summary" / "in the objective" / "from possible next steps" clauses to attribute each sub-instruction.
+   Worked example for a three-panel message:
+     INPUT: "client objective is to remove this sentence 'AAA AAA AAA' from case summary and 'BBB BBB BBB' remove this from strategic objective and remove 4th point from possible next steps"
+     OUTPUT:
+     {{
+       "caseSummary":        {{"shouldEdit": true,  "instruction": "Remove this sentence from the case summary: AAA AAA AAA"}},
+       "reportCaseSummary":  {{"shouldEdit": false, "instruction": ""}},
+       "strategicObjective": {{"shouldEdit": true,  "instruction": "Remove this from the strategic objective: BBB BBB BBB"}},
+       "possibleNextSteps":  {{"shouldEdit": true,  "instruction": "Remove the 4th point from possible next steps"}},
+       "isQuestionLike":     false
+     }}
+
+6) WHEN THE USER QUOTES EXACT TEXT TO REMOVE/CHANGE — preserve that quoted text verbatim inside the per-panel `instruction`.
+
+7) `instruction` MUST be non-empty whenever shouldEdit=true. If you cannot extract a clean per-panel instruction with the targeted text, set shouldEdit=false for that panel instead of guessing.
+
+8) AMBIGUITY: if the user says "remove this" / "the response" / "that paragraph" without naming a panel, set ALL four shouldEdit=false. The chat agent will ask for clarification.
+
+9) NEVER trigger an edit when the message is a question, even if a panel name appears.
+   "Explain the objective" → strategicObjective.shouldEdit = false, isQuestionLike = true.
+
+10) FACT DISCUSSION WITHOUT EDIT VERB: if the message is only discussing facts
+    ("I think the date was actually 16/05/2026") with NO imperative edit verb, set all four shouldEdit=false.
+
+Return JSON only — no markdown, no commentary."""
+
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=4096,
+                response_mime_type="application/json",
+            )
+            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            if not json_str:
+                return empty
+            try:
+                data = json.loads(json_str)
+            except Exception:
+                return empty
+            if not isinstance(data, dict):
+                return empty
+
+            def _slot(key: str) -> Dict[str, Any]:
+                val = data.get(key)
+                if not isinstance(val, dict):
+                    return {"shouldEdit": False, "instruction": ""}
+                should = bool(val.get("shouldEdit") is True)
+                instr = str(val.get("instruction") or "").strip()
+                # Require a non-empty per-panel instruction. If the model
+                # flagged shouldEdit but didn't extract clean per-panel text,
+                # treat as classifier failure for THIS panel — better to
+                # under-trigger than to dispatch the wrong instruction.
+                if should and not instr:
+                    return {"shouldEdit": False, "instruction": ""}
+                if not should:
+                    instr = ""
+                return {"shouldEdit": should, "instruction": instr}
+
+            result = {
+                "caseSummary": _slot("caseSummary"),
+                "reportCaseSummary": _slot("reportCaseSummary"),
+                "strategicObjective": _slot("strategicObjective"),
+                "possibleNextSteps": _slot("possibleNextSteps"),
+                "isQuestionLike": bool(data.get("isQuestionLike") is True),
+            }
+            # If the model marked it as a question AND also flagged an edit,
+            # trust the question signal and drop the edit flags — safer
+            # default for "explain X" / "what about X" style messages.
+            if result["isQuestionLike"]:
+                for k in (
+                    "caseSummary",
+                    "reportCaseSummary",
+                    "strategicObjective",
+                    "possibleNextSteps",
+                ):
+                    result[k] = {"shouldEdit": False, "instruction": ""}
+            logger.info(
+                "Panel-edit classifier: msg_len={} isQuestion={} caseSummary={} reportCaseSummary={} strategicObjective={} possibleNextSteps={}",
+                len(msg),
+                result["isQuestionLike"],
+                "yes" if result["caseSummary"]["shouldEdit"] else "no",
+                "yes" if result["reportCaseSummary"]["shouldEdit"] else "no",
+                "yes" if result["strategicObjective"]["shouldEdit"] else "no",
+                "yes" if result["possibleNextSteps"]["shouldEdit"] else "no",
+            )
+            return result
+        except Exception as e:
+            logger.warning("Panel-edit intent classifier failed: {}", e)
+            return empty
 
     @staticmethod
     def _drop_entries_for_deleted_docs(
@@ -14439,21 +15089,76 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
         }
         if ai_response_payload["draftDocument"] is None:
             ai_response_payload.pop("draftDocument", None)
+
+        # Generate drafting-specific chips so the bottom strip in the
+        # Drafting Assistant panel shows draft-actionable prompts ("Adjust
+        # the Prayer", "Strengthen Grounds", …) instead of the stale
+        # intelligence-chat chips that were leaking through before this fix.
+        try:
+            import random as _random
+
+            chips = await self._generate_drafting_chips(
+                workspace_id=workspace_id,
+                actionable_id=actionable_id,
+                draft_status=turn.get("draftStatus") or "",
+                draft_title=(turn.get("draftDocument") or {}).get("title")
+                or (turn.get("draftDocument") or {}).get("draftTitle")
+                or "",
+                open_questions=turn.get("openQuestions") or [],
+                last_assistant_message=ai_response_payload["content"],
+                last_draft_markdown=(turn.get("draftDocument") or {}).get("content")
+                or "",
+            )
+            if chips:
+                # Cache under both keys so on_probing_prompts_request can find
+                # them whether BE polls with actionableId or not.
+                if actionable_id:
+                    self._workspace_drafting_suggestion_chips[actionable_id] = list(chips)
+                if workspace_id:
+                    self._workspace_drafting_suggestion_chips[workspace_id] = list(chips)
+                ai_response_payload["suggestionChips"] = _random.sample(
+                    chips, min(4, len(chips))
+                )
+        except Exception as chip_err:
+            logger.warning("Drafting chips emit failed (non-fatal): {}", chip_err)
         # Cache the assistant text so a short "yes" follow-up resolves correctly.
         if ai_response_payload["content"]:
             self._intelligence_last_ai_by_chat[chat_id] = ai_response_payload[
                 "content"
             ]
-        self._pending_ai_response = ai_response_payload
+        # _pending_ai_response represents an emit that did NOT make it to BE
+        # and must be retried on the next reconnect. If we buffer the payload
+        # unconditionally (the old behaviour) every disconnect/reconnect cycle
+        # re-emits the last delivered message, producing duplicate drafts in
+        # the chat. Detect a confirmed delivery via (no exception thrown) +
+        # (socket still connected after the await) — the second guard catches
+        # the silent-skip path where emit_ai_response waited for reconnect and
+        # then returned without raising.
+        emit_succeeded = False
         try:
             await self._socket_client.emit_ai_response(ai_response_payload)
+            emit_succeeded = bool(
+                getattr(self._socket_client, "is_connected", True)
+            )
+        except Exception as e:
+            logger.error("Failed to emit drafting ai_response: {}", e)
+
+        if emit_succeeded:
+            # Drop any stale pending payload from a previous failed emit so
+            # reconnect doesn't re-emit it after we just delivered fresh content.
+            self._pending_ai_response = None
             logger.success(
                 "✅ Drafting ai_response emitted (status={}, version={})",
                 ai_response_payload.get("draftStatus"),
                 (turn.get("draftDocument") or {}).get("version"),
             )
-        except Exception as e:
-            logger.error("Failed to emit drafting ai_response: {}", e)
+        else:
+            # Emit raised or socket was silently disconnected — keep the
+            # payload buffered so on_connected can retry once we reconnect.
+            self._pending_ai_response = ai_response_payload
+            logger.warning(
+                "Drafting ai_response not confirmed delivered — will retry on reconnect"
+            )
 
         audit_logger.log_event(
             "user_drafting_message_processed",
@@ -14697,7 +15402,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                             )
                             payload_dict = ai_response.dict(by_alias=True)
                             await self._socket_client.emit_ai_response(payload_dict)
-                            self._pending_ai_response = payload_dict
+                            # Do NOT populate _pending_ai_response here — the
+                            # role-confirmation ack does not need reconnect
+                            # retry, and leaving a stale buffer here caused
+                            # this acknowledgement to be re-emitted on the
+                            # next disconnect cycle (duplicate-message bug).
                             self._intelligence_last_ai_by_chat[chat_id] = (
                                 ai_response.content
                             )
@@ -14833,6 +15542,9 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
             objective_regen_ok = False
             objective_ack_kind: Optional[str] = None
             implicit_objective_shift_text: Optional[str] = None
+            # Defined here so the ack-builder below can read it even if the
+            # try-block raises before the pre-dispatcher initialises it.
+            panel_edit_applied: List[str] = []
             try:
                 combined_text_for_updates = payload.content or ""
                 # Include attachment text if present (so updates can be pasted into a file)
@@ -14845,10 +15557,203 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                             )
 
                 um_early = (payload.content or "").strip()
+
+                # -------------------------------------------------------------
+                # Pre-dispatcher: free-form panel-edit detector for ANY chat_type.
+                # Fires for messages like "remove the 3rd line from case summary",
+                # "add a step about WhatsApp chats to possible next steps",
+                # "change the date in strategic objective", etc.
+                # Cheap keyword precheck avoids the LLM classifier call on every
+                # message; only when the message contains at least one edit verb
+                # AND one panel-name token do we ask the classifier.
+                # -------------------------------------------------------------
+                panel_edit_applied: List[str] = []
+                _edit_verbs = (
+                    "remove", "delete", "drop", "change", "replace", "edit",
+                    "modify", "rewrite", "rephrase", "add", "append", "insert",
+                    "expand", "shorten", "fix", "correct", "update",
+                )
+                _panel_words = (
+                    "case summary", "report summary", "objective", "strategy",
+                    "next step", "action item", " step", " steps", "summary",
+                )
+                _um_lower = um_early.lower()
+                _maybe_edit = (
+                    bool(um_early)
+                    and any(v in _um_lower for v in _edit_verbs)
+                    and any(w in _um_lower for w in _panel_words)
+                )
+                cur_strat_for_edit = (
+                    self._workspace_strategy_payload.get(workspace_id) or {}
+                )
+                if (
+                    _maybe_edit
+                    and isinstance(cur_strat_for_edit, dict)
+                    and (cur_strat_for_edit.get("caseSummary") or "").strip()
+                ):
+                    try:
+                        classification = await self._llm_classify_panel_edit_intent(
+                            um_early,
+                            current_strategy=cur_strat_for_edit,
+                        )
+                    except Exception as cls_err:
+                        logger.warning(
+                            "Panel-edit classification failed (non-fatal): {}", cls_err
+                        )
+                        classification = {}
+
+                    if classification and not classification.get("isQuestionLike"):
+                        # Emit a single workspace:refresh up-front so the FE
+                        # shows the loading state across all four strategy
+                        # fields plus the cascaded panels (analysis_report,
+                        # list_of_dates, applicable_laws) that will refresh
+                        # after the strategy regen completes. We always
+                        # emit BEFORE the first regen call so the FE loader
+                        # is visible while Gemini works, and we always use
+                        # the FE-recognised reason `objective_change_regeneration_started`
+                        # so the loading panel actually appears in the UI.
+                        _any_should_edit = any(
+                            (classification.get(k) or {}).get("shouldEdit") is True
+                            for k in (
+                                "caseSummary",
+                                "reportCaseSummary",
+                                "strategicObjective",
+                                "possibleNextSteps",
+                            )
+                        )
+                        if _any_should_edit:
+                            try:
+                                await self._emit_workspace_refresh(
+                                    workspace_id=workspace_id,
+                                    user_id=user_id,
+                                    reason="objective_change_regeneration_started",
+                                    feature_types=[
+                                        "strategy_objective",
+                                        "analysis_report",
+                                        "list_of_dates",
+                                        "applicable_laws",
+                                    ],
+                                )
+                            except Exception as rf_err:
+                                logger.warning(
+                                    "workspace:refresh emit (panel edit) failed (non-fatal): {}",
+                                    rf_err,
+                                )
+
+                        so_slot = classification.get("strategicObjective") or {}
+                        if so_slot.get("shouldEdit") and so_slot.get("instruction"):
+                            ok = await self._regenerate_strategy_objective_preserving_case_summary(
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                workspace_role=(
+                                    role_context.get("role") or "ADJUDICATOR"
+                                ),
+                                user_objective_instruction=so_slot["instruction"],
+                                current_strategy=cur_strat_for_edit,
+                            )
+                            if ok:
+                                panel_edit_applied.append("strategic objective")
+                                cur_strat_for_edit = (
+                                    self._workspace_strategy_payload.get(workspace_id)
+                                    or cur_strat_for_edit
+                                )
+                            else:
+                                logger.warning(
+                                    "Strategic objective edit returned False — instruction={!r}",
+                                    (so_slot.get("instruction") or "")[:200],
+                                )
+
+                        cs_slot = classification.get("caseSummary") or {}
+                        rcs_slot = classification.get("reportCaseSummary") or {}
+                        if cs_slot.get("shouldEdit") or rcs_slot.get("shouldEdit"):
+                            _combined_instr = " ".join(
+                                x
+                                for x in [
+                                    cs_slot.get("instruction"),
+                                    rcs_slot.get("instruction"),
+                                ]
+                                if x
+                            ).strip()
+                            # Defensive: require at least one non-empty per-panel
+                            # instruction. The classifier's _slot rejects empty
+                            # instructions, so this should always be non-empty
+                            # when we enter this branch — but guard anyway so
+                            # we never pass the full multi-panel user message
+                            # to the case-summary regen by accident.
+                            if _combined_instr:
+                                ok = await self._regenerate_case_summary_with_feedback(
+                                    workspace_id=workspace_id,
+                                    user_id=user_id,
+                                    workspace_role=(
+                                        role_context.get("role") or "ADJUDICATOR"
+                                    ),
+                                    user_feedback=_combined_instr,
+                                    current_strategy=cur_strat_for_edit,
+                                )
+                                if ok:
+                                    panel_edit_applied.append("case summary")
+                                    cur_strat_for_edit = (
+                                        self._workspace_strategy_payload.get(workspace_id)
+                                        or cur_strat_for_edit
+                                    )
+                                else:
+                                    logger.warning(
+                                        "Case summary edit returned False — instruction={!r}",
+                                        _combined_instr[:200],
+                                    )
+
+                        ns_slot = classification.get("possibleNextSteps") or {}
+                        if ns_slot.get("shouldEdit") and ns_slot.get("instruction"):
+                            ok = await self._regenerate_next_steps_with_feedback(
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                workspace_role=(
+                                    role_context.get("role") or "ADJUDICATOR"
+                                ),
+                                user_feedback=ns_slot["instruction"],
+                                current_strategy=cur_strat_for_edit,
+                            )
+                            if ok:
+                                panel_edit_applied.append("possible next steps")
+                            else:
+                                logger.warning(
+                                    "Possible next steps edit returned False — instruction={!r}",
+                                    (ns_slot.get("instruction") or "")[:200],
+                                )
+
+                        if panel_edit_applied:
+                            # Reuse the existing skip-chat-agent gate. The ack
+                            # block below has a dedicated branch for
+                            # objective_ack_kind == "panel_edit_direct".
+                            objective_regen_ok = True
+                            objective_ack_kind = "panel_edit_direct"
+                            logger.success(
+                                "✅ Panel edits applied from free-form chat: {} (workspace={})",
+                                panel_edit_applied,
+                                workspace_id[:12] if workspace_id else "",
+                            )
+                            # Cascade: trigger the existing analysis-report /
+                            # list-of-dates / applicable-laws reanalysis so
+                            # downstream panels reflect the edited strategy.
+                            # Matches the behaviour the user already expects
+                            # from the explicit objective-change flow.
+                            try:
+                                self._schedule_objective_change_reanalysis(
+                                    workspace_id=workspace_id,
+                                    user_id=user_id,
+                                    log_context=" (from chat panel edit)",
+                                )
+                            except Exception as cascade_err:
+                                logger.warning(
+                                    "Cascade reanalysis schedule failed (non-fatal): {}",
+                                    cascade_err,
+                                )
+
                 # User said yes after we asked whether to update the objective (informal discussion flow)
                 if (
                     chat_type_upper == "STRATEGY_OBJECTIVE"
                     and is_user_affirmation_to_continue(um_early)
+                    and not panel_edit_applied
                 ):
                     last_ai_for_offer = _last_ai_message_from_history(
                         chat_history_resolved
@@ -15029,7 +15934,12 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     "Skipping intelligence chat LLM (strategy objective regen emitted)"
                 )
                 ack_parts: List[str] = []
-                if objective_ack_kind == "followup_clarify":
+                if objective_ack_kind == "panel_edit_direct" and panel_edit_applied:
+                    # Free-form panel edit. Short, factual ack — the panel
+                    # itself was already emitted via document_feature_response.
+                    _fields_human = ", ".join(panel_edit_applied)
+                    ack_parts.append(f"Updated: {_fields_human}.")
+                elif objective_ack_kind == "followup_clarify":
                     ack_parts.append(
                         "I could not infer a clear new strategic objective from our discussion. "
                         "Please briefly state the priority you want (for example venue, relief, or focus), "
@@ -15279,14 +16189,31 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 ),
             )
 
-            # STEP 6: Emit ai_response back to server; cache for re-emit if socket disconnects right after
+            # STEP 6: Emit ai_response back to server. _pending_ai_response is
+            # the buffer that on_connected re-emits after a reconnect — we
+            # populate it ONLY when the emit was not confirmed delivered, so a
+            # successful emit does not get duplicated on the next disconnect
+            # cycle. See _handle_drafting_assistant_message for the same fix.
             if self._socket_client:
                 payload_dict = ai_response.dict(by_alias=True)
                 if payload_dict.get("suggestionChips") is None:
                     payload_dict.pop("suggestionChips", None)
-                self._pending_ai_response = payload_dict
-                await self._socket_client.emit_ai_response(payload_dict)
-                logger.success("✅ AI response sent successfully")
+                emit_succeeded = False
+                try:
+                    await self._socket_client.emit_ai_response(payload_dict)
+                    emit_succeeded = bool(
+                        getattr(self._socket_client, "is_connected", True)
+                    )
+                except Exception as emit_err:
+                    logger.error("Failed to emit ai_response: {}", emit_err)
+                if emit_succeeded:
+                    self._pending_ai_response = None
+                    logger.success("✅ AI response sent successfully")
+                else:
+                    self._pending_ai_response = payload_dict
+                    logger.warning(
+                        "ai_response not confirmed delivered — will retry on reconnect"
+                    )
                 await self._remember_workspace_role(
                     workspace_id,
                     user_id,
@@ -15498,6 +16425,185 @@ Return ONLY a JSON array, no other text. Example with 10+ items: ["Draft a settl
             logger.warning("Contextual suggestion chips generation failed: {}", str(e))
             # Still return 10–12 fallback chips so rotation works
             return self._fallback_chips_for_role(role, 12)
+
+    async def _generate_drafting_chips(
+        self,
+        *,
+        workspace_id: str,
+        actionable_id: str,
+        draft_status: str,
+        draft_title: str,
+        open_questions: List[Dict[str, Any]],
+        last_assistant_message: str,
+        last_draft_markdown: str,
+    ) -> List[str]:
+        """
+        Drafting-specific suggestion chips for the chip strip at the bottom
+        of the Drafting Assistant panel. Branches on `draft_status`:
+
+          - "gathering_info"  → chips that help fill the open slots.
+          - "ready"           → chips that suggest specific edits / additions
+                                to the just-delivered draft.
+          - "revising"        → similar to ready, plus version-comparison.
+
+        Each chip is 2–6 words and is meant to be sent verbatim as the
+        lawyer's next message — clicking "Strengthen Grounds" sends the
+        text "Strengthen Grounds" back as a follow-up turn. Indian-law
+        framing only; no IPC.
+        """
+        import json
+
+        status = (draft_status or "").strip().lower()
+        title = (draft_title or "New Draft").strip()
+        msg_preview = (last_assistant_message or "")[:600]
+        draft_preview = (last_draft_markdown or "")[:1200]
+        open_q_text = "\n".join(
+            f"- {q.get('label')}" for q in (open_questions or []) if q.get("label")
+        )[:600]
+
+        # Mode-specific guidance for the model.
+        if status == "gathering_info":
+            mode_block = (
+                "MODE: gathering_info — open slots remain. Each chip should "
+                "either (a) volunteer one of the missing pieces verbatim "
+                "(short imperative phrasing), or (b) push the draft forward "
+                "(\"Generate Final Draft\", \"Use Defaults and Proceed\")."
+            )
+        elif status == "revising":
+            mode_block = (
+                "MODE: revising — a draft was just regenerated. Suggest "
+                "specific further edits the lawyer might apply to this draft, "
+                "plus one comparison option (\"Show Previous Version\")."
+            )
+        else:
+            mode_block = (
+                "MODE: ready — a full draft was just delivered. Suggest "
+                "specific, actionable edits to that draft: strengthen / add "
+                "specific clauses or grounds, tighten / shorten sections, "
+                "add citations applicable to this case, adjust the prayer."
+            )
+
+        prompt = f"""You are suggesting follow-up chips for the Drafting Assistant chat panel of an Indian legal workspace. The lawyer is mid-draft.
+
+DRAFT TITLE: {title}
+DRAFT STATUS: {status or "ready"}
+
+OPEN QUESTIONS STILL ON FILE (if any):
+{open_q_text or "(none — all answered)"}
+
+LAST ASSISTANT MESSAGE (the most recent chat turn shown to the lawyer):
+\"\"\"
+{msg_preview}
+\"\"\"
+
+DRAFT BODY PREVIEW (if a draft has been delivered):
+\"\"\"
+{draft_preview or "(no draft yet)"}
+\"\"\"
+
+{mode_block}
+
+CONSTRAINTS:
+- Each chip MUST be 2–6 words.
+- Use Indian-advocate phrasing (\"Adjust the Prayer\", \"Add Section 50 Ground\", \"Tighten the Facts\", \"Cite Arnesh Kumar\", \"Mention Tihar Detention\", \"Add Verification Clause\").
+- Reference real case anchors when visible in the draft body (e.g. quantity numbers, dates, party names, statute citations).
+- No IPC / CrPC / Indian Evidence Act references. Use BNS / BNSS / BSA where citations are needed.
+- No full sentences. No trailing punctuation.
+- Each chip stands alone — if the lawyer clicks it, the text is sent as their next message and the drafting agent should be able to act on it as a revision instruction (or as a slot answer when in gathering_info).
+
+OUTPUT FORMAT — strict JSON array of 8 to 12 chip strings, no commentary, no markdown fences:
+["Strengthen the Grounds", "Adjust the Prayer", "Add Section 50 Ground", ...]
+"""
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            gemini_client.initialize()
+            raw = await gemini_client.generate(
+                prompt,
+                temperature=0.4,
+                max_tokens=1200,
+                response_mime_type="application/json",
+            )
+        except Exception as e:
+            logger.warning("Drafting chips generation failed: {}", e)
+            return self._fallback_drafting_chips(8)
+
+        if not raw or "Error" in (raw[:80] or ""):
+            return self._fallback_drafting_chips(8)
+        try:
+            text = raw.strip()
+            start = text.find("[")
+            if start < 0:
+                return self._fallback_drafting_chips(8)
+            depth = 0
+            end = -1
+            for i in range(start, len(text)):
+                if text[i] == "[":
+                    depth += 1
+                elif text[i] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            if end <= start:
+                return self._fallback_drafting_chips(8)
+            arr = json.loads(text[start:end])
+        except Exception:
+            return self._fallback_drafting_chips(8)
+        if not isinstance(arr, list):
+            return self._fallback_drafting_chips(8)
+
+        chips: List[str] = []
+        seen: set = set()
+        for item in arr:
+            s = str(item or "").strip().strip('"').strip("'").rstrip(".!?,;:")
+            if not s or len(s) > 60:
+                continue
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            chips.append(s)
+            if len(chips) >= 12:
+                break
+
+        # Pad with fallback chips if the model gave us fewer than 8.
+        if len(chips) < 8:
+            for pad in self._fallback_drafting_chips(8):
+                if pad.lower() in seen:
+                    continue
+                chips.append(pad)
+                seen.add(pad.lower())
+                if len(chips) >= 8:
+                    break
+
+        logger.info(
+            "Drafting chips: generated {} for workspace={} actionable={} status={}",
+            len(chips),
+            (workspace_id or "")[:12],
+            (actionable_id or "")[:24],
+            status,
+        )
+        return chips
+
+    def _fallback_drafting_chips(self, needed: int = 8) -> List[str]:
+        """Return generic drafting-relevant chips when no draft turn has run yet.
+
+        Used when BE polls probing_prompts_request with chatType=DRAFTING_ASSISTANT
+        before any drafting LLM turn has produced contextual chips. Indian-law
+        framing only; no IPC.
+        """
+        generic = [
+            "Adjust the Prayer",
+            "Strengthen the Grounds",
+            "Add a Section 50 Ground",
+            "Tighten the Facts",
+            "Add Verification Clause",
+            "Cite Arnesh Kumar",
+            "Provide Missing Details",
+            "Generate Final Draft",
+        ]
+        return list(generic)[:needed]
 
     def _fallback_chips_for_analysis_report(self, needed: int = 16) -> List[str]:
         """Return generic analysis-report prompt chips when AI generation fails or report is empty."""
@@ -15752,6 +16858,38 @@ Return ONLY a JSON array of 15-16 strings, no other text."""
                     "probing_prompts: ANALYSIS_REPORT, returning random {} from {} chips",
                     len(prompts),
                     len(chips),
+                )
+            elif chat_type == "DRAFTING_ASSISTANT":
+                # Drafting panel: serve from the drafting-specific chip cache
+                # (populated by _handle_drafting_assistant_message after every
+                # drafting turn). Prefer per-session chips when BE supplies
+                # actionableId; fall back to workspace-keyed chips; then
+                # static drafting fallback. This isolates the drafting strip
+                # from the intelligence-chat chip cache so the lawyer never
+                # sees stale Strategy / Analysis chips here.
+                actionable_id_for_chips = (
+                    (data.get("actionableId") or data.get("actionable_id") or "").strip()
+                )
+                chips = (
+                    self._workspace_drafting_suggestion_chips.get(actionable_id_for_chips)
+                    or self._workspace_drafting_suggestion_chips.get(workspace_id)
+                    or []
+                )
+                source = (
+                    "actionable" if (actionable_id_for_chips and chips)
+                    else "workspace" if chips
+                    else "fallback"
+                )
+                if not chips:
+                    chips = self._fallback_drafting_chips(8)
+                count = min(max_prompts, len(chips))
+                prompts = random.sample(chips, count) if count > 0 else []
+                logger.info(
+                    "probing_prompts: DRAFTING_ASSISTANT, returning random {} from {} chips (source={}, actionableId={})",
+                    len(prompts),
+                    len(chips),
+                    source,
+                    actionable_id_for_chips[:24] if actionable_id_for_chips else "(none)",
                 )
             else:
                 # STRATEGY_OBJECTIVE or other: contextual chips, then strategy chips

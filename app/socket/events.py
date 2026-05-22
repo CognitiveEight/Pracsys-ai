@@ -383,6 +383,126 @@ def _clamp_annexure_references(text: Any, max_annexure: int) -> Any:
     return text
 
 
+def _format_document_for_prompt(
+    doc: Dict[str, Any],
+    index: int,
+    total: int,
+    *,
+    label_kind: str = "Annexure",
+) -> str:
+    """Render a single Qdrant document as a labelled prompt block.
+
+    Prepends a metadata header (DOCUMENT TYPE, ISSUED BY, ADDRESSEES,
+    SUBJECT, KEY DATES, LEGAL PROVISIONS CITED, LANGUAGE, DRAFTED BY
+    ASSISTANT) above the raw body, so the regeneration prompts can
+    reason about each document as structured evidence instead of
+    treating every annexure as undifferentiated text. The metadata
+    keys come from `extracted_fields` that the document processor
+    already populates.
+
+    The `DRAFTED BY ASSISTANT` line is emitted only when
+    `extracted_fields.drafted_by_assistant` is True (set in
+    `app/processing/document_processor.py` based on the assistant-
+    draft filename pattern). It signals that the underlying
+    procedural action has already been performed by the client side
+    in this workspace, so panels should treat it as a completed
+    milestone — not a pending action.
+    """
+    metadata = doc.get("metadata") or {}
+    extracted = metadata.get("extracted_fields") or {}
+    document_type = (metadata.get("document_type") or "").strip()
+    body = (doc.get("content") or "").strip()
+
+    label = (
+        f"{label_kind} {index} (most recently uploaded)"
+        if index == total
+        else f"{label_kind} {index}"
+    )
+
+    header_lines: List[str] = []
+    if document_type and document_type.lower() != "other":
+        header_lines.append(f"[DOCUMENT TYPE: {document_type}]")
+
+    def _coerce_str_list(val: Any) -> List[str]:
+        if val is None:
+            return []
+        if isinstance(val, str):
+            s = val.strip()
+            return [s] if s else []
+        if isinstance(val, (list, tuple)):
+            return [str(v).strip() for v in val if str(v).strip()]
+        return [str(val).strip()]
+
+    issued_by = (
+        extracted.get("issuing_party_or_deponent")
+        or extracted.get("issued_by")
+        or ""
+    )
+    client_name = extracted.get("client_name") or ""
+    if issued_by:
+        issued_line = f"[ISSUED BY: {issued_by}"
+        if client_name and client_name.lower() not in issued_by.lower():
+            issued_line += f" — representing {client_name}"
+        issued_line += "]"
+        header_lines.append(issued_line)
+    elif client_name:
+        header_lines.append(f"[CLIENT: {client_name}]")
+
+    addressees = _coerce_str_list(extracted.get("addressee"))
+    if addressees:
+        header_lines.append(f"[ADDRESSEES: {'; '.join(addressees)}]")
+
+    subject = (extracted.get("subject") or "").strip()
+    if subject:
+        # Keep subject short to avoid duplicating the entire body
+        if len(subject) > 200:
+            subject = subject[:200].rstrip() + "…"
+        header_lines.append(f"[SUBJECT: {subject}]")
+
+    # Surface key dates (date of issue, due date, notice period).
+    date_bits: List[str] = []
+    issue_date = (extracted.get("date") or extracted.get("issue_date") or "").strip()
+    if issue_date:
+        date_bits.append(f"issued {issue_date}")
+    due_date = (extracted.get("due_date") or extracted.get("deadline") or "").strip()
+    if due_date:
+        date_bits.append(f"due {due_date}")
+    notice_period = (extracted.get("notice_period") or "").strip()
+    if notice_period:
+        date_bits.append(f"notice period {notice_period}")
+    if date_bits:
+        header_lines.append(f"[KEY DATES: {'; '.join(date_bits)}]")
+
+    laws = _coerce_str_list(extracted.get("legal_provisions"))
+    if laws:
+        # Cap the law list so one verbose doc does not eat the prompt budget.
+        if len(laws) > 6:
+            laws = laws[:6] + [f"…and {len(laws) - 6} more"]
+        header_lines.append(f"[LEGAL PROVISIONS CITED: {'; '.join(laws)}]")
+
+    language = (extracted.get("language") or "").strip()
+    if language and language.lower() not in {"english", "en"}:
+        header_lines.append(f"[LANGUAGE: {language}]")
+
+    if extracted.get("drafted_by_assistant"):
+        drafted_at = (extracted.get("drafted_at") or "").strip()
+        if drafted_at:
+            header_lines.append(
+                f"[DRAFTED BY ASSISTANT on {drafted_at} — represents a "
+                "COMPLETED ACTION by the client side in this workspace]"
+            )
+        else:
+            header_lines.append(
+                "[DRAFTED BY ASSISTANT — represents a COMPLETED ACTION "
+                "by the client side in this workspace]"
+            )
+
+    header_block = "\n".join(header_lines)
+    if header_block:
+        return f"--- {label} ---\n{header_block}\n\n{body}"
+    return f"--- {label} ---\n{body}"
+
+
 _OVERVIEW_CONTACTED_DATE_RE = re.compile(
     r"Contacted\s+SimplerToday(?:\.ai)?\s+on:\s*"
     r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})",
@@ -1419,16 +1539,20 @@ class SocketEventHandler:
                     content = (doc.get("content") or "").strip()
                     if not content or len(content) < 20:
                         continue
-                    label = (
-                        f"Annexure {i} (most recently uploaded)"
-                        if i == len(all_docs)
-                        else f"Annexure {i}"
-                    )
                     if len(content) > per_doc_cap:
                         content = (
                             content[:per_doc_cap] + "\n[... truncated for length ...]"
                         )
-                    parts.append(f"--- {label} ---\n{content}")
+                    # Build labelled block with metadata header so the
+                    # prompt distinguishes drafted-by-assistant documents
+                    # (completed client-side actions) from raw evidence.
+                    doc_with_clip = dict(doc)
+                    doc_with_clip["content"] = content
+                    parts.append(
+                        _format_document_for_prompt(
+                            doc_with_clip, i, len(all_docs)
+                        )
+                    )
                 combined_document_content = (
                     "\n\n".join(parts) if parts else "No document content available."
                 )
@@ -1546,6 +1670,12 @@ class SocketEventHandler:
 3. **Strategic Objective** (10-20 sentences): Write a role-tailored strategic objective for the **{workspace_role}** perspective. It MUST anchor on the actual strongest facts (named parties, specific dates, named documents/Annexures, exact amounts, suit numbers) — never generic categories. Cover: (a) the strongest facts from the documents (named), (b) the legal issues (with named statutes such as BNS / BNSS / BSA / IT Act / Specific Relief Act etc. as relevant), (c) practical priority order (what to do first), and (d) how evidence/timeline supports or limits the objective.
 
 4. **Possible Next Steps** (3-5 bullet points): Immediate, executable actions for right away. Keep them concrete (who/what to do). Prefer steps that preserve evidence, clarify missing facts, and move the case forward procedurally for the selected role. When citing an uploaded file by its order in the bundle, write **Annexure N** (same order as above); **never** write "Document N" or "document" for an upload—use **annexure / annexures** only.
+
+**Completed-action recognition (CRITICAL).** Inspect the metadata header on every annexure. When a document is a `notice` / `complaint` / `affidavit` / `application` / `plaint` AND either (a) its `ISSUED BY` field names the client side (matches the `{workspace_role}` perspective, the named client, or the client's advocate), OR (b) the header carries a `[DRAFTED BY ASSISTANT …]` marker, treat the underlying procedural action as **ALREADY COMPLETED** in this matter. Apply this consistently across every output field:
+- `caseSummary` / `reportCaseSummary`: narrate the completed action in past tense (e.g. *"On 22/05/2026, a legal notice for recovery of €17,185 was issued by Advocate Rohan Mehta to Dana Europe OÜ and the related noticees…"*), citing the served-on date, the addressees, the demand amount, and the compliance window. Then continue with the next stage of the matter.
+- `strategicObjective`: refer to the action in past tense (*"the demand notice has been served on …"*) and shift focus to the next pending action that the served notice enables — monitoring the compliance window, preparing the follow-up suit/FIR/application on default, evaluating arbitration invocation, etc.
+- `possibleNextSteps`: **DO NOT re-list the action that has already been performed**. If a legal/demand notice has been served, the next step is NOT *"issue a legal notice"*; it is monitoring the compliance deadline (cite the exact date if available in `[KEY DATES]`) and the natural follow-up (e.g. summary suit under Order XXXVII CPC, BNS §318 / §316 criminal complaint, arbitration invocation per the agreement). If an FIR complaint has been filed, the next step is NOT *"file an FIR"*; it is follow-up on registration / investigation status. Same for affidavits, applications, plaints, written statements.
+- Apply this rule independently to each completed action — if multiple drafted documents exist in the annexure set, each one is a separate completed milestone.
 
 **Format your response as JSON**:
 {{
@@ -2504,16 +2634,21 @@ Rules:
                     content = (doc.get("content") or "").strip()
                     if not content or len(content) < 20:
                         continue
-                    label = (
-                        f"Document {i} (most recently uploaded)"
-                        if i == len(all_docs)
-                        else f"Document {i}"
-                    )
                     if len(content) > per_doc_cap:
                         content = (
                             content[:per_doc_cap] + "\n[... truncated for length ...]"
                         )
-                    parts.append(f"--- {label} ---\n{content}")
+                    # Build labelled block with metadata header so the
+                    # prompt distinguishes drafted-by-assistant documents
+                    # from raw evidence.
+                    doc_with_clip = dict(doc)
+                    doc_with_clip["content"] = content
+                    parts.append(
+                        _format_document_for_prompt(
+                            doc_with_clip, i, len(all_docs),
+                            label_kind="Document",
+                        )
+                    )
                 combined_document_content = (
                     "\n\n".join(parts) if parts else "No document content available."
                 )
@@ -2719,10 +2854,15 @@ Rules:
                     content = (doc.get("content") or "").strip()
                     if not content or len(content) < 20:
                         continue
-                    label = f"Annexure {i}"
                     if len(content) > per_doc_cap:
                         content = content[:per_doc_cap] + "\n[... truncated for length ...]"
-                    parts.append(f"--- {label} ---\n{content}")
+                    doc_with_clip = dict(doc)
+                    doc_with_clip["content"] = content
+                    parts.append(
+                        _format_document_for_prompt(
+                            doc_with_clip, i, len(all_docs)
+                        )
+                    )
                 combined_document_content = (
                     "\n\n".join(parts) if parts else "No document content available."
                 )
@@ -4085,14 +4225,19 @@ Return JSON only — no markdown, no commentary."""
                 content = (doc.get("content") or "").strip()
                 if not content or len(content) < 20:
                     continue
-                label = (
-                    "Annexure {} (most recently uploaded)".format(i)
-                    if i == len(all_docs)
-                    else "Annexure {}".format(i)
-                )
                 if len(content) > per_doc_cap:
                     content = content[:per_doc_cap] + "\n[... truncated for length ...]"
-                parts.append("--- {} ---\n{}".format(label, content))
+                # Build labelled block with metadata header (document_type,
+                # issued_by, addressees, subject, key dates, legal provisions,
+                # drafted_by_assistant marker) so the analysis-report prompt
+                # treats drafted documents as completed actions.
+                doc_with_clip = dict(doc)
+                doc_with_clip["content"] = content
+                parts.append(
+                    _format_document_for_prompt(
+                        doc_with_clip, i, len(all_docs)
+                    )
+                )
             combined_document_content = (
                 "\n\n".join(parts) if parts else "No document content available."
             )
@@ -4323,6 +4468,13 @@ When BOTH branches are plausibly supported by the documents, the analysis MUST c
 When the facts only support one branch (purely civil OR purely criminal), stay in that branch — do NOT manufacture the other side just to look balanced. Coherence beats balance.
 
 **No bracket tags in user-facing output.** Do NOT prefix or label any item in `strengths` / `weaknesses` / `risks` / `pendingActions` / `nextSteps` / `suggestedDrafts` / `relevantJurisdiction` with "(criminal angle)", "(civil angle)", "(criminal-law angle)", "(civil-law angle)", or any similar bracketed tag. Cite the relevant statutes inside the `laws` array (where present) or weave them into normal sentences — never use a parenthesised "angle" prefix.
+
+COMPLETED-ACTION RECOGNITION (CRITICAL):
+Inspect the metadata header on every annexure. When a document is a `notice` / `complaint` / `affidavit` / `application` / `plaint` AND either (a) its `ISSUED BY` field names the client side (matches the active role, the named client, or the client's advocate), OR (b) the header carries a `[DRAFTED BY ASSISTANT …]` marker, treat the underlying procedural action as **ALREADY COMPLETED** in this matter. Apply this consistently:
+- `strengths`: surface the completed action as a procedural strength when relevant (e.g. *"Demand notice under §73 Indian Contract Act, 1872 has already been served on the noticees, perfecting the cause of action for a money-recovery suit"*). Cite the served-on date and the addressees.
+- `weaknesses` / `risks`: do NOT flag "notice not yet served" or "complaint not yet filed" as a weakness if the metadata shows the action has been completed; instead flag dependent risks (e.g. *"Compliance deadline 06/06/2026 — if no response, the matter must move to suit promptly to avoid limitation drift"*).
+- `pendingActions` and `nextSteps`: **DO NOT re-list the completed action**. If a legal/demand notice has been served, the next step is monitoring the compliance window and preparing the follow-up suit, not *"issue a legal notice"*. If an FIR complaint has been filed, the next step is follow-up on registration / investigation status, not *"file an FIR"*. Same for affidavits, applications, plaints, written statements.
+- Apply independently to each completed action if multiple drafted documents exist.
 
 DOCUMENT RELATION RULE:
 If documents appear to include multiple matters, mention that ambiguity and prioritize the dispute best supported by evidence.

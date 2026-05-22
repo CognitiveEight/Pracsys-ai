@@ -737,6 +737,242 @@ class QdrantStore:
             # Backwards-compatibility: return raw value if it isn't JSON.
             return raw
 
+    # ------------------------------------------------------------------
+    # Per-user (lawyer-scoped) state cache.
+    #
+    # Used by the Drafting Assistant for template-library storage (full
+    # extracted template text, keyed by template_id) so a single template
+    # survives across all of a lawyer's workspaces and across restarts.
+    #
+    # Same metadata-only / zero-vector trick as the workspace state cache,
+    # but partitioned on `cache_user_id` instead of `workspace_id`. We
+    # reuse the existing collection without a schema migration.
+    # ------------------------------------------------------------------
+
+    async def upsert_user_state_cache(
+        self,
+        user_id: str,
+        kind: str,
+        scope_id: str,
+        data: Any,
+    ) -> bool:
+        """Persist arbitrary lawyer-scoped state as JSON in Qdrant.
+
+        scope_id discriminates rows within the same kind (e.g. template_id
+        when kind="template"). Re-upserts overwrite the existing point.
+        """
+        if not user_id or not kind or not scope_id:
+            return False
+        if self.client is None:
+            await self.initialize()
+
+        try:
+            import json as _json
+
+            cache_data_json = _json.dumps(data, default=str)
+        except Exception as e:
+            logger.warning(
+                "User state cache serialization failed (user={}, kind={}, scope={}): {}",
+                user_id,
+                kind,
+                scope_id,
+                e,
+            )
+            return False
+
+        point_id = str(
+            uuid5(NAMESPACE_DNS, f"user-state:{user_id}:{kind}:{scope_id}")
+        )
+        now_iso = datetime.utcnow().isoformat()
+        payload = {
+            # Reuse the workspace_id column with a sentinel so existing
+            # workspace-filtered queries do not pick these rows up.
+            "workspace_id": "__user_state_cache__",
+            "document_id": "__user_state_cache__",
+            "original_document_id": "__user_state_cache__",
+            "content": "",
+            "uploaded_at": now_iso,
+            "cache_kind": str(kind),
+            "cache_scope": "user",
+            "cache_user_id": str(user_id),
+            "cache_scope_id": str(scope_id),
+            "cache_data": cache_data_json,
+            "metadata": {
+                "kind": str(kind),
+                "scope": "user",
+                "user_id": str(user_id),
+                "scope_id": str(scope_id),
+                "updated_at": now_iso,
+            },
+        }
+        point = PointStruct(
+            id=point_id, vector=[0.0] * self.vector_size, payload=payload
+        )
+        try:
+            await asyncio.to_thread(
+                self.client.upsert,
+                collection_name=self.collection_name,
+                points=[point],
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "Failed to upsert user state cache (user={}, kind={}, scope={}): {}",
+                user_id,
+                kind,
+                scope_id,
+                e,
+            )
+            return False
+
+    async def get_user_state_cache(
+        self,
+        user_id: str,
+        kind: str,
+        scope_id: str,
+    ) -> Optional[Any]:
+        """Read a single lawyer-scoped state payload. Returns None if missing."""
+        if not user_id or not kind or not scope_id:
+            return None
+        if self.client is None:
+            await self.initialize()
+        filt = Filter(
+            must=[
+                FieldCondition(
+                    key="cache_user_id", match=MatchValue(value=str(user_id))
+                ),
+                FieldCondition(key="cache_kind", match=MatchValue(value=str(kind))),
+                FieldCondition(
+                    key="cache_scope_id", match=MatchValue(value=str(scope_id))
+                ),
+            ]
+        )
+        try:
+            result, _next = await asyncio.to_thread(
+                self.client.scroll,
+                collection_name=self.collection_name,
+                scroll_filter=filt,
+                limit=1,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to read user state cache (user={}, kind={}, scope={}): {}",
+                user_id,
+                kind,
+                scope_id,
+                e,
+            )
+            return None
+        if not result:
+            return None
+        payload = result[0].payload or {}
+        raw = payload.get("cache_data")
+        if raw is None:
+            return None
+        try:
+            import json as _json
+
+            return _json.loads(raw)
+        except Exception:
+            return raw
+
+    async def delete_user_state_cache(
+        self,
+        user_id: str,
+        kind: str,
+        scope_id: str,
+    ) -> bool:
+        """Delete a single lawyer-scoped state entry."""
+        if not user_id or not kind or not scope_id:
+            return False
+        if self.client is None:
+            await self.initialize()
+        delete_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="cache_user_id", match=MatchValue(value=str(user_id))
+                ),
+                FieldCondition(key="cache_kind", match=MatchValue(value=str(kind))),
+                FieldCondition(
+                    key="cache_scope_id", match=MatchValue(value=str(scope_id))
+                ),
+            ]
+        )
+        try:
+            await asyncio.to_thread(
+                self.client.delete,
+                collection_name=self.collection_name,
+                points_selector=models.FilterSelector(filter=delete_filter),
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "Failed to delete user state cache (user={}, kind={}, scope={}): {}",
+                user_id,
+                kind,
+                scope_id,
+                e,
+            )
+            return False
+
+    async def list_user_state_cache(
+        self,
+        user_id: str,
+        kind: str,
+        *,
+        limit: int = 256,
+    ) -> List[Dict[str, Any]]:
+        """List all lawyer-scoped entries for a given kind.
+
+        Returns a list of {scope_id, data} dicts. Used to enumerate a
+        lawyer's templates when populating chat context.
+        """
+        if not user_id or not kind:
+            return []
+        if self.client is None:
+            await self.initialize()
+        filt = Filter(
+            must=[
+                FieldCondition(
+                    key="cache_user_id", match=MatchValue(value=str(user_id))
+                ),
+                FieldCondition(key="cache_kind", match=MatchValue(value=str(kind))),
+            ]
+        )
+        try:
+            result, _next = await asyncio.to_thread(
+                self.client.scroll,
+                collection_name=self.collection_name,
+                scroll_filter=filt,
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to list user state cache (user={}, kind={}): {}",
+                user_id,
+                kind,
+                e,
+            )
+            return []
+        out: List[Dict[str, Any]] = []
+        import json as _json
+
+        for point in result or []:
+            payload = point.payload or {}
+            scope_id = payload.get("cache_scope_id")
+            raw = payload.get("cache_data")
+            try:
+                data = _json.loads(raw) if raw is not None else None
+            except Exception:
+                data = raw
+            if scope_id:
+                out.append({"scope_id": scope_id, "data": data})
+        return out
+
     async def delete_workspace_state_cache(
         self,
         workspace_id: str,
@@ -772,6 +1008,8 @@ class QdrantStore:
                             "procedural_timeline",
                             "applicable_laws",
                             "custom_instructions",
+                            "drafting_suggestions",
+                            "drafting_session",
                         ]
                     ),
                 )

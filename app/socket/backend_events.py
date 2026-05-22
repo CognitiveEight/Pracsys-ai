@@ -257,6 +257,28 @@ class AIResponsePayload(BaseModel):
 AI_HEARTBEAT_PING = "ai_heartbeat_ping"
 AI_HEARTBEAT_PONG = "ai_heartbeat_pong"
 
+# ============================================================================
+# Drafting Assistant — Template Library sync (Server → AI)
+# ============================================================================
+
+TEMPLATE_SYNC = "template_sync"
+
+
+class TemplateAction:
+    """Action values for the template_sync event."""
+
+    UPLOADED = "uploaded"
+    DELETED = "deleted"
+    RENAMED = "renamed"
+
+
+class TemplateCategory:
+    """Category values for templates in the lawyer's library."""
+
+    LETTERHEAD = "Letterhead"
+    FOLDER = "Folder"
+    DOCUMENT_DRAFT = "Document Draft"
+
 
 class AIHeartbeatPingPayload(BaseModel):
     """

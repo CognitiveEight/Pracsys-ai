@@ -134,6 +134,67 @@ If a legal draft template is uploaded:
   under an existing "Grounds" section). Never extend by introducing
   new top-level structural sections that the template does not have.
 
+CONCRETE NEGATIVE EXAMPLE — DO NOT DO THIS:
+
+  INPUT TEMPLATE (a Legal Notice; ONLY contains advocate letterhead,
+  date, "TO:" addressee, "SUBJECT:" line, narrative paragraphs, demand
+  + deadline, and an advocate signature block at the end — NO court
+  heading, NO party array, NO "MOST RESPECTFULLY SHOWETH", NO PRAYER,
+  NO VERIFICATION):
+      ADVOCATE & CO.
+      Chamber: 14, Tis Hazari Courts, Delhi 110054
+      Date: 22.04.2026
+
+      TO,
+      <Recipient Name>
+      <Recipient Address>
+
+      SUBJECT: LEGAL NOTICE FOR RECOVERY OF ₹<AMOUNT>
+
+      Dear Sir/Madam,
+      Under instructions from my client <CLIENT NAME>, I…
+      <numbered paragraphs>
+      …you are hereby called upon to <DEMAND> within 15 days, failing
+      which my client shall be constrained to initiate appropriate
+      civil and criminal proceedings.
+
+      Yours faithfully,
+      <Advocate Signature Block>
+
+  WRONG OUTPUT (what the model MUST NOT produce) — adds a court
+  heading + "MOST RESPECTFULLY SHOWETH" + a PRAYER + VERIFICATION,
+  none of which exist in the template:
+      IN THE COURT OF THE LEARNED SESSIONS JUDGE, DELHI          ❌
+      IN THE MATTER OF: <CLIENT> vs <RESPONDENT>                  ❌
+      MOST RESPECTFULLY SHOWETH:                                  ❌
+      1. That the Petitioner …                                    ❌
+      PRAYER                                                      ❌
+      VERIFICATION                                                ❌
+
+  RIGHT OUTPUT (matches the template's letter format exactly — only
+  case-variable slots filled in):
+      ADVOCATE & CO.
+      Chamber: 14, Tis Hazari Courts, Delhi 110054
+      Date: 22.04.2026
+
+      TO,
+      Axis Bank Ltd., <Recipient Address>
+
+      SUBJECT: LEGAL NOTICE FOR RECOVERY OF ₹12,000
+
+      Dear Sir/Madam,
+      Under instructions from my client Mr. Rajveer Maurya, I…
+      <case-specific paragraphs>
+      …you are hereby called upon to refund ₹12,000 within 15 days…
+
+      Yours faithfully,
+      <Advocate Signature Block>                                  ✓
+
+The same rule applies to ANY template type: an Affidavit template
+has NO PRAYER → output has no PRAYER. An FIR Complaint template has
+NO court heading → output has no court heading. Match the template's
+actual structure; do not borrow scaffolding from other document types.
+
 If multiple templates are uploaded:
 - Identify the most relevant template based on case type and legal context.
 - Merge drafting styles intelligently if required.
@@ -182,30 +243,182 @@ LEGAL ACCURACY RULES
 - Ensure party names, dates, sections, courts, and reliefs remain consistent.
 
 ========================
-FORMATTING RULES (apply ONLY when NO template is provided — blank / suggestedDraft mode)
+DOCUMENT-TYPE REGISTRY (apply ONLY when NO template is provided — blank / suggestedDraft mode)
 ========================
 
-The following defaults are for drafting FROM SCRATCH when the lawyer did
-not supply a template. **When a template is provided, IGNORE this entire
-section** — the template's own layout is the contract, and you must NOT
-overlay these defaults on top of it. See TEMPLATE USAGE RULES above.
+When the lawyer has NOT supplied a template, the document's structural
+skeleton is chosen based on the requested DOCUMENT TYPE — NOT a single
+fixed court-petition layout. **When a template is provided, IGNORE this
+entire section** — the template's own layout is the contract. See
+TEMPLATE USAGE RULES above.
 
-Use proper legal formatting:
-- Court headings in uppercase.
-- Proper party representation.
-- Numbered paragraphs.
-- Proper prayer clause.
-- Verification/Affidavit sections where applicable.
-- Formal advocate signature blocks.
-- Clear section spacing.
-- Chronological fact presentation.
+For each turn, look at the DOCUMENT TYPE / DRAFT TITLE supplied with
+the render request and apply the matching skeleton from the registry
+below. **Do NOT default to a court-petition skeleton for documents
+that do not naturally have a court heading.**
 
-Maintain document readability and professional formatting suitable for:
-- Court filing,
-- Advocate office usage,
-- PDF generation,
-- DOCX generation,
-- E-filing systems.
+──────────────────────────────────────────────────────────────────
+1. BAIL APPLICATION / ANTICIPATORY BAIL APPLICATION (Section 480 / 482 / 483 BNSS)
+──────────────────────────────────────────────────────────────────
+- Opening: court heading in uppercase (e.g. `IN THE COURT OF THE
+  LEARNED SPECIAL JUDGE, NDPS ACT, <PLACE>` or
+  `IN THE COURT OF THE LEARNED SESSIONS JUDGE, <PLACE>`).
+- Parties: formal party array — `STATE` vs `<APPLICANT NAME>`, with
+  FIR number / PS / sections invoked below the array.
+- Body: title clause (`APPLICATION ON BEHALF OF THE APPLICANT…
+  UNDER SECTION 483 OF THE BNSS, 2023…`) → `MOST RESPECTFULLY
+  SHOWETH:` → numbered grounds (custody facts, age, antecedents,
+  procedural lapses under Section 50 NDPS where relevant, Section
+  37 NDPS quantity argument where relevant).
+- Closing: `PRAYER` clause — release on bail + such other relief.
+- Signature/attestation: applicant THROUGH advocate + `VERIFICATION`
+  by the deponent.
+
+──────────────────────────────────────────────────────────────────
+2. APPLICATION UNDER A SPECIFIC BNSS SECTION (Section 94 production,
+   Section 173 magistrate complaint, Section 529 misc, etc.)
+──────────────────────────────────────────────────────────────────
+- Opening: court heading in uppercase.
+- Parties: party array as appropriate to the section.
+- Body: title clause naming the BNSS section invoked →
+  `MOST RESPECTFULLY SHOWETH:` → numbered grounds tied to that
+  section's threshold.
+- Closing: `PRAYER` — the specific relief the section enables.
+- Signature: applicant THROUGH advocate + `VERIFICATION`.
+
+──────────────────────────────────────────────────────────────────
+3. CIVIL PLAINT
+──────────────────────────────────────────────────────────────────
+- Opening: court heading (civil court with pecuniary jurisdiction).
+- Parties: plaintiff vs defendant.
+- Body: `THE PLAINTIFF MOST RESPECTFULLY SUBMITS:` → numbered paras
+  covering jurisdiction, valuation, cause of action, limitation,
+  facts, and the legal grounds.
+- Closing: `PRAYER FOR RELIEF` — the specific reliefs sought.
+- Signature: plaintiff THROUGH advocate + `VERIFICATION`.
+
+──────────────────────────────────────────────────────────────────
+4. WRITTEN STATEMENT (defendant's reply to plaint)
+──────────────────────────────────────────────────────────────────
+- Opening: court heading mirroring the plaint.
+- Parties: same as the plaint.
+- Body: preliminary objections (if any) → paragraph-by-paragraph
+  ADMISSIONS and DENIALS keyed to the plaint's paragraph numbers
+  → counterclaims (if any) → grounds.
+- Closing: `PRAYER` — dismissal of the plaint and any counterclaim
+  relief.
+- Signature: defendant THROUGH advocate + `VERIFICATION`.
+
+──────────────────────────────────────────────────────────────────
+5. LEGAL NOTICE / DEMAND NOTICE (advocate's letter, NOT a court filing)
+──────────────────────────────────────────────────────────────────
+- Opening: advocate's **letterhead** (firm name + chamber address +
+  contact). Date. Reference number / "WITHOUT PREJUDICE".
+- Addressee: `TO,` block — recipient's name and full address.
+- Subject line: `SUBJECT: LEGAL NOTICE FOR <relief sought>`.
+- Body: `Dear Sir / Madam,` → narrative paragraphs setting out
+  client instructions, facts, and the cause of action → cite
+  applicable provisions (BNS / BNSS / BSA / IT Act).
+- Closing: **DEMAND clause + DEADLINE** (e.g. "comply within 15
+  days"), followed by consequences of non-compliance.
+- Signature: advocate's signature block (name, enrolment number,
+  chamber address). Optionally `CC: client`.
+- **FORBIDDEN in a Legal Notice**: court heading, party array,
+  `MOST RESPECTFULLY SHOWETH`, `PRAYER`, `VERIFICATION`, deponent
+  block. A Legal Notice is a letter, not a court petition.
+
+──────────────────────────────────────────────────────────────────
+6. REPLY NOTICE (advocate's reply to an incoming legal notice)
+──────────────────────────────────────────────────────────────────
+- Opening: advocate's letterhead + date + reference to the incoming
+  notice (date, sender's advocate).
+- Addressee: `TO,` — sender's advocate.
+- Body: `Dear Sir / Madam,` → introduction of client → numbered
+  point-by-point rebuttal keyed to the paragraphs of the incoming
+  notice.
+- Closing: denial of the demand, reservation of legal remedies.
+- Signature: advocate's signature block.
+- **FORBIDDEN**: court heading, `PRAYER`, `VERIFICATION` — same
+  rules as a Legal Notice.
+
+──────────────────────────────────────────────────────────────────
+7. FIR COMPLAINT / POLICE COMPLAINT
+──────────────────────────────────────────────────────────────────
+- Opening: `TO,` block — `THE STATION HOUSE OFFICER, POLICE
+  STATION <NAME>, <DISTRICT>`. Date.
+- Subject line: `SUBJECT: COMPLAINT FOR THE REGISTRATION OF AN FIR
+  UNDER <BNS SECTIONS> AGAINST <ACCUSED NAME>`.
+- Body: complainant's full particulars (name, age, parentage,
+  address, contact) → factual narrative in numbered paragraphs
+  (date, place, modus operandi, evidence, witnesses) →
+  applicable BNS / IT Act sections.
+- Closing: prayer paragraph requesting registration of FIR and
+  appropriate action against the accused.
+- Signature: **complainant's** signature (advocate may co-sign
+  only if explicitly representing the complainant; the document
+  itself does not require an advocate signature).
+- **FORBIDDEN**: court heading, party array,
+  `MOST RESPECTFULLY SHOWETH`. The complaint is addressed to the
+  SHO, not a court.
+
+──────────────────────────────────────────────────────────────────
+8. AFFIDAVIT (standalone, or as annexure to another filing)
+──────────────────────────────────────────────────────────────────
+- Opening: `AFFIDAVIT` heading (no court heading unless filed as
+  annexure to a court petition — and even then, the affidavit's
+  own body has no court heading).
+- Deponent identification: `I, <NAME>, S/o / D/o <PARENTAGE>, aged
+  <AGE> years, R/o <ADDRESS>, do hereby solemnly affirm on oath as
+  follows:`.
+- Body: numbered statements **ON OATH** — first-person factual
+  statements only. No legal argument, no advocacy.
+- Closing: `VERIFICATION` clause — "Verified at <PLACE> on <DATE>
+  that the contents of the above affidavit are true to my
+  knowledge / belief / information…".
+- Signature/attestation: deponent's signature → **NOTARY
+  ATTESTATION** block (notary's seal, registration number).
+- **FORBIDDEN**: `PRAYER` clause, `MOST RESPECTFULLY SHOWETH`,
+  advocate signature, court heading on the affidavit itself.
+
+──────────────────────────────────────────────────────────────────
+9. VAKALATNAMA (counsel's authorisation document)
+──────────────────────────────────────────────────────────────────
+- Opening: court heading.
+- Body: client's authorisation of counsel to appear, plead, sign,
+  receive, withdraw, settle, etc.
+- Signature: client signature + counsel acceptance signature with
+  enrolment number.
+
+──────────────────────────────────────────────────────────────────
+10. MEMO OF PARTIES (annexure listing parties)
+──────────────────────────────────────────────────────────────────
+- Opening: court heading + case number (or placeholder).
+- Body: numbered parties — petitioner(s) on one side, respondent(s)
+  on the other, with full names, parentage, and addresses.
+- No prayer, no verification, no signature block (the document is
+  an annexure).
+
+──────────────────────────────────────────────────────────────────
+FALLBACK (document type not in registry)
+──────────────────────────────────────────────────────────────────
+If the requested document does not match any entry above, infer the
+closest Indian legal-drafting equivalent from the registry and apply
+that skeleton. **DO NOT default to a court-petition skeleton.**
+Examples: a "Representation to SSP" follows the FIR-Complaint pattern
+(letter to authority, not court). A "Lokpal complaint" follows the
+FIR-Complaint pattern. A "Settlement Deed" follows neither — apply
+proper deed structure (parties, recitals, operative clauses,
+witnesses).
+
+──────────────────────────────────────────────────────────────────
+GENERIC FORMATTING (applies to all of the above)
+──────────────────────────────────────────────────────────────────
+- Numbered paragraphs where appropriate to the skeleton.
+- Clear section spacing and Markdown headings for major sections.
+- Chronological fact presentation within each numbered ground /
+  paragraph.
+- Suitable for court filing, advocate office usage, PDF / DOCX
+  generation, and e-filing.
 
 ========================
 LANGUAGE RULES
@@ -569,6 +782,69 @@ DRAFT_RENDER_INSTRUCTION = (
 )
 
 
+# Document-type inference for blank-mode rendering. Maps the lawyer's
+# draft_title onto a canonical registry label so the model picks the
+# right structural skeleton (Legal Notice vs Bail Application vs FIR
+# Complaint vs Affidavit etc.) instead of defaulting to a court-petition
+# layout for every blank draft.
+_DOC_TYPE_KEYWORDS: list = [
+    # Order matters — more specific patterns first.
+    ("Anticipatory Bail Application",
+        ["anticipatory bail"]),
+    ("Bail Application",
+        ["bail application", "regular bail", "bail under"]),
+    ("Reply Notice",
+        ["reply notice", "reply to notice", "reply to legal notice",
+         "reply to demand notice"]),
+    ("Legal Notice",
+        ["legal notice", "demand notice", "lawyer notice",
+         "advocate notice"]),
+    ("FIR Complaint",
+        ["fir complaint", "police complaint", "complaint to police",
+         "complaint to sho", "complaint to station house officer",
+         "register an fir", "registration of fir", "fir registration"]),
+    ("Affidavit",
+        ["affidavit"]),
+    ("Vakalatnama",
+        ["vakalatnama", "vakalat"]),
+    ("Memo of Parties",
+        ["memo of parties", "memo of party"]),
+    ("Written Statement",
+        ["written statement"]),
+    ("Civil Plaint",
+        ["civil plaint", "plaint", "suit for"]),
+    ("BNSS Section Application",
+        ["section 94 bnss", "94 bnss", "section 173 bnss",
+         "173 bnss", "section 529 bnss", "529 bnss",
+         "bnss section", "section 480 bnss", "section 482 bnss",
+         "section 483 bnss"]),
+    ("CCTV Preservation Application",
+        ["cctv preservation", "preservation of cctv",
+         "preservation of evidence", "evidence preservation"]),
+    ("Representation",
+        ["representation to", "representation before",
+         "formal representation"]),
+]
+
+
+def _infer_document_type_label(draft_title: Optional[str]) -> str:
+    """Return a canonical document-type label for the render prompt.
+
+    Lowercased substring match against `_DOC_TYPE_KEYWORDS`. Returns
+    "OTHER" when no keyword matches — the model then falls back on the
+    registry's FALLBACK rule. This is deterministic and free; no LLM
+    round-trip needed.
+    """
+    title = (draft_title or "").strip().lower()
+    if not title:
+        return "OTHER"
+    for label, needles in _DOC_TYPE_KEYWORDS:
+        for needle in needles:
+            if needle in title:
+                return label
+    return "OTHER"
+
+
 def build_draft_render_prompt(
     role: str,
     case_summary: str,
@@ -679,6 +955,26 @@ to ANY template — even if its layout differs from generic Indian advocate
 format.
 """
 
+    # Document-type hint — emitted only in blank/no-template mode so the
+    # model selects the right skeleton from the registry instead of
+    # applying a generic court-petition layout to every draft.
+    doc_type_block = ""
+    if not template_text:
+        inferred_type = _infer_document_type_label(draft_title)
+        doc_type_block = (
+            f"DOCUMENT TYPE: {inferred_type}\n"
+            "STRUCTURE: Apply the matching skeleton from the "
+            "DOCUMENT-TYPE REGISTRY in the system instruction. Do NOT "
+            "default to a court-petition layout (court heading + party "
+            "array + MOST RESPECTFULLY SHOWETH + PRAYER + VERIFICATION) "
+            "when the document type does not call for one — Legal "
+            "Notices, Reply Notices, FIR Complaints, Affidavits, and "
+            "Vakalatnamas all have distinct skeletons. If DOCUMENT TYPE "
+            "is OTHER, apply the FALLBACK rule in the registry — pick "
+            "the closest equivalent, do NOT default to a court "
+            "petition.\n"
+        )
+
     return f"""WORKSPACE ROLE: {role_upper}
 MODE: {mode}
 
@@ -692,7 +988,7 @@ GATHERED FACTS FROM LAWYER (JSON):
 {gathered_facts_json or "{{}}"}
 
 DRAFT TITLE: {draft_title}
-
+{doc_type_block}
 {template_block}{instructions_block}{revision_block}{template_example_block}
 
 TASK:
@@ -704,6 +1000,13 @@ CONSTRAINTS:
   - No invented citations, statute sections, court names, or monetary figures.
   - Where a slot value is missing, leave it as <placeholder> with a clear
     label, e.g. "<applicant address>". Do not fabricate.
+  - When NO template is provided, the document's structural skeleton is
+    determined by the DOCUMENT TYPE inferred from DRAFT TITLE above. Do
+    NOT apply a generic court-petition skeleton to Legal Notices, FIR
+    Complaints, Affidavits, Reply Notices, Vakalatnamas, or any other
+    document type that does not naturally have a court heading. See the
+    DOCUMENT-TYPE REGISTRY in the base instruction for the canonical
+    skeleton of each type.
   - When a template is provided, the template's skeleton is a CONTRACT.
     Preserve all of its headings, section order, party-block layout,
     salutations, prayer scaffolding, verification, and signature blocks

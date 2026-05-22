@@ -3016,6 +3016,151 @@ Output rules:
             logger.warning("Possible next steps regen failed: {}", e)
             return False
 
+    async def _regenerate_strategic_objective_with_feedback(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        user_feedback: str,
+        current_strategy: Dict[str, Any],
+    ) -> bool:
+        """
+        Regenerate strategicObjective applying the user's surgical edit
+        instruction (e.g. "remove this exact line", "rephrase the X sentence").
+        Preserves caseSummary + reportCaseSummary + possibleNextSteps +
+        suggestionChips byte-for-byte. Updates cache and emits
+        document_feature_response with featureType=strategy_objective.
+
+        Distinct from _regenerate_strategy_objective_preserving_case_summary,
+        which is used by the legacy STRATEGY_OBJECTIVE chat_type flow when
+        the user DECLARES a brand-new objective (and therefore needs the
+        next steps + chips to refresh). This surgical variant assumes the
+        user wants the existing content reproduced verbatim except for the
+        specific change they named.
+        """
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            current_strategic_objective = (
+                current_strategy.get("strategicObjective") or ""
+            ).strip()
+            current_case_summary = (current_strategy.get("caseSummary") or "").strip()
+            if not current_strategic_objective:
+                return False
+
+            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                role = "ADJUDICATOR"
+
+            prompt = f"""You are a legal-strategy editor for Indian law.
+
+You will edit the existing Strategic Objective based on the user's instruction below. The Case Summary, Report Case Summary, Possible Next Steps, and Suggestion Chips are LOCKED and must NOT change.
+
+**User's edit instruction** (THIS IS THE PRIMARY CONSTRAINT — apply it EXACTLY as worded):
+{user_feedback.strip()}
+
+CURRENT strategicObjective (you must produce an edited version of this text after applying the user's instruction):
+{current_strategic_objective}
+
+LOCKED caseSummary (verbatim context, do not output):
+{current_case_summary}
+
+LOCKED reportCaseSummary (verbatim context, do not output):
+{(current_strategy.get("reportCaseSummary") or "").strip()}
+
+LOCKED possibleNextSteps (verbatim context, do not output):
+{json.dumps(current_strategy.get("possibleNextSteps") or [], ensure_ascii=True)}
+
+LOCKED suggestionChips (verbatim context, do not output):
+{json.dumps(current_strategy.get("suggestionChips") or [], ensure_ascii=True)}
+
+**Role**: {role}
+
+EDIT-INSTRUCTION RULES (CRITICAL — override every other instinct):
+1. The user's instruction OUTRANKS any tendency to "improve" or "summarise" the strategic objective. Apply ONLY the change the user named.
+2. If the user QUOTES exact text (a sentence, a phrase, a list of names) inside the instruction, find that exact text in CURRENT strategicObjective and REMOVE (or rephrase, per the verb the user used) ONLY that text.
+3. Every other sentence, clause, and reference in CURRENT strategicObjective MUST be reproduced WORD-FOR-WORD in the output. Do NOT compress lists of entities. Do NOT drop arbitration/summary-suit/GST/cloud-suspension/leverage sentences. Do NOT change the length of the output unless the user explicitly asked for that.
+4. Do NOT enforce any sentence-count or word-count target. The output length should equal the input length minus what the user removed (or plus what the user asked to add).
+5. If the user asks for something impossible (e.g. inventing a fact not in the documents), ignore that invention and apply only the valid removal / rephrase parts.
+
+TRUNCATED-TEXT RULE: Never reproduce a token, name, or phrase that ends in "..." or "…" — those are UI-truncation noise, not real entity names. Drop them silently.
+
+Return JSON ONLY with ONE key:
+{{
+  "strategicObjective": "edited strategic objective; reflect the user's instruction; reproduce every other sentence from CURRENT strategicObjective verbatim"
+}}
+
+Output rules:
+- Do NOT output caseSummary, reportCaseSummary, possibleNextSteps, or suggestionChips.
+- Preserve Indian-law citations exactly as in the source (BNS/BNSS/BSA/IT Act). Do NOT switch to IPC/CrPC/Evidence Act.
+- JSON only; complete string."""
+
+            custom_suffix = build_custom_instruction_suffix(workspace_id)
+            if custom_suffix:
+                prompt = prompt.rstrip() + "\n\n" + custom_suffix
+
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                system_instruction=get_structured_document_feature_system_instruction(
+                    role
+                ),
+                temperature=0.2,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            if not json_str:
+                return False
+            data = json.loads(json_str)
+            if not isinstance(data, dict):
+                return False
+
+            new_strategic_objective = _strip_ui_truncated_tokens(
+                (data.get("strategicObjective") or "").strip()
+            )
+            if not new_strategic_objective:
+                return False
+
+            merged = dict(current_strategy)
+            # Lock the other four fields explicitly so any future refactor
+            # of dict(current_strategy) cannot accidentally let them drift.
+            merged["caseSummary"] = current_strategy.get("caseSummary", "")
+            merged["reportCaseSummary"] = current_strategy.get("reportCaseSummary", "")
+            merged["strategicObjective"] = new_strategic_objective
+            merged["possibleNextSteps"] = list(
+                current_strategy.get("possibleNextSteps") or []
+            )
+            merged["suggestionChips"] = list(
+                current_strategy.get("suggestionChips") or []
+            )
+            merged["isUpdate"] = True
+            merged["role"] = role
+            merged["workspaceId"] = workspace_id
+            merged["userId"] = user_id
+            merged["timestamp"] = datetime.utcnow().isoformat()
+
+            self._workspace_strategy_payload[workspace_id] = merged
+
+            if self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "strategy_objective",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": merged,
+                    },
+                )
+                logger.success(
+                    "✅ Strategic objective surgical edit emitted (other fields preserved) workspace={}",
+                    workspace_id[:12] if workspace_id else "",
+                )
+            return True
+        except Exception as e:
+            logger.warning("Strategic objective surgical edit failed: {}", e)
+            return False
+
     def _last_ai_offered_objective_update(self, ai_text: str) -> bool:
         """True if the assistant previously appended the objective-update offer question."""
         t = (ai_text or "").lower()
@@ -15642,13 +15787,21 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
 
                         so_slot = classification.get("strategicObjective") or {}
                         if so_slot.get("shouldEdit") and so_slot.get("instruction"):
-                            ok = await self._regenerate_strategy_objective_preserving_case_summary(
+                            # Surgical edit: preserve everything except what
+                            # the user named. The legacy
+                            # _regenerate_strategy_objective_preserving_case_summary
+                            # is intentionally NOT used here — its prompt is
+                            # biased toward a full rewrite (labels current
+                            # objective "to replace", caps output at 5-6
+                            # sentences, forbids repetition) which causes
+                            # surgical removes to collapse unrelated content.
+                            ok = await self._regenerate_strategic_objective_with_feedback(
                                 workspace_id=workspace_id,
                                 user_id=user_id,
                                 workspace_role=(
                                     role_context.get("role") or "ADJUDICATOR"
                                 ),
-                                user_objective_instruction=so_slot["instruction"],
+                                user_feedback=so_slot["instruction"],
                                 current_strategy=cur_strat_for_edit,
                             )
                             if ok:

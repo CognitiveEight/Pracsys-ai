@@ -17,7 +17,7 @@ model does not invent IPC sections.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 
 
 DRAFTING_SYSTEM_INSTRUCTION = """You are an expert Indian legal drafting assistant trained to generate professional, court-ready legal drafts in the style, tone, structure, and language commonly used by experienced Indian advocates and law firms.
@@ -778,7 +778,18 @@ DRAFT_RENDER_INSTRUCTION = (
     + "original matter that does not apply to THIS case. Never invent "
     + "citations, case-law, monetary figures, court names, or party "
     + "details. If the lawyer has not provided a slot value, leave a "
-    + "<placeholder> rather than fabricate it."
+    + "<placeholder> rather than fabricate it.\n\n"
+    + "LENGTH MATCHING — when a template is supplied: the output's "
+    + "length MUST be approximately the same order of magnitude as the "
+    + "template's. If the template is 40 pages, the output is also "
+    + "tens of pages. NEVER summarise the template, NEVER skip "
+    + "sections, NEVER abbreviate clauses with phrases like \"…and "
+    + "so on\" or \"[remaining paragraphs as per template]\". Render "
+    + "every section in full. The lawyer expects a document the same "
+    + "size as their template. If you hit your output budget, "
+    + "prioritise completing the section you are inside rather than "
+    + "stopping mid-sentence — a clean truncation at a section "
+    + "boundary is acceptable, mid-sentence truncation is not."
 )
 
 
@@ -1308,14 +1319,170 @@ TEMPLATE_MATCH_INSTRUCTION = (
     "You are matching one AI-generated draft suggestion to a lawyer's uploaded "
     "template library. Return strict JSON ONLY: "
     "{\"templateId\": \"<id or null>\", \"reason\": \"<short justification>\"}. "
-    "Pick the single best structural match. If no template is a good fit for "
-    "this draft, return templateId: null. Do not invent template ids — only "
-    "ids that appear verbatim in the provided list are valid. Bias toward "
-    "matching when the template's name clearly refers to the same document "
-    "type as the suggested draft (e.g. 'Bail Application' template ↔ "
-    "'Bail Application under Section 483 BNSS'); bias toward null when the "
-    "template covers an unrelated document type."
+    "Pick the single best structural match. Do not invent template ids — only "
+    "ids that appear verbatim in the provided list are valid. The candidate "
+    "list has already been filtered to plausible matches; prefer picking the "
+    "closest one rather than returning null. Return templateId: null ONLY "
+    "when every candidate clearly covers an unrelated document type (e.g. an "
+    "affidavit template when the suggestion is a bail application)."
 )
+
+
+# ---------------------------------------------------------------------------
+# 4b) Template document-type classifier (used at ingest AND on click)
+# ---------------------------------------------------------------------------
+
+# Closed vocabulary of canonical document-type labels. Keep this aligned with
+# the legal-instrument anchor vocabulary in DraftingAgent so the type-first
+# matcher and the anchor-fallback path agree on the same families.
+TEMPLATE_DOCUMENT_TYPE_LABELS = (
+    "Legal Notice",
+    "Reply Notice",
+    "Demand Notice",
+    "Section 138 Notice",
+    "Bail Application",
+    "Anticipatory Bail Application",
+    "Written Statement",
+    "Plaint",
+    "Petition",
+    "Writ Petition",
+    "Appeal",
+    "Revision Petition",
+    "Rejoinder",
+    "Synopsis",
+    "Vakalatnama",
+    "Affidavit",
+    "Undertaking",
+    "Consumer Complaint",
+    "Cheque Bounce Complaint",
+    "Criminal Complaint",
+    "Police Complaint",
+    "FIR",
+    "Divorce Petition",
+    "Maintenance Application",
+    "Domestic Violence Application",
+    "Custody Application",
+    "RTI Application",
+    "MoU / Agreement",
+    "Deed",
+    "Letterhead",
+    "Miscellaneous Application",
+    "Arbitration Notice",
+    "Injunction Application",
+    "Stay Application",
+    "Other",
+)
+
+
+TEMPLATE_CLASSIFY_INSTRUCTION = (
+    "You classify a single Indian legal document (or a clicked draft "
+    "suggestion) into ONE canonical document type, drawn from a fixed "
+    "vocabulary. Return strict JSON ONLY, with keys: "
+    "{\"documentType\": \"<canonical label, exactly as listed>\", "
+    "\"aliases\": [\"<short alternative phrasing>\", ...], "
+    "\"confidence\": \"high|medium|low\"}. "
+    "Rules:\n"
+    "1. `documentType` MUST be one of the canonical labels supplied in the "
+    "   user prompt — copy the spelling verbatim. If nothing fits, return "
+    "   \"Other\" with confidence \"low\".\n"
+    "2. **The BODY TEXT is the source of truth — NOT the filename.** "
+    "   Lawyers routinely upload templates with uninformative names like "
+    "   \"abc.docx\", \"document.pdf\", \"format_A.docx\", \"123.docx\", "
+    "   \"draft.docx\", \"sample.pdf\", \"new_doc.docx\", a stray UUID, "
+    "   or just the date. When the filename is generic, IGNORE it and "
+    "   classify purely from the body content. A file named "
+    "   \"abc.docx\" whose body opens with \"LEGAL NOTICE\" or recites a "
+    "   Section 138 demand IS a Legal Notice (or Section 138 Notice). "
+    "   Treat the filename as a tie-breaker ONLY when it clearly names a "
+    "   document type (e.g. \"Legal_Notice_Template.docx\").\n"
+    "3. Reading the body — Indian legal documents typically start with "
+    "   a court header, party block, addressee block, or a \"REGISTERED "
+    "   A.D.\" / \"Through Speed Post\" line. The document-type marker "
+    "   usually appears AFTER that preamble as an all-caps heading "
+    "   (\"LEGAL NOTICE\", \"BAIL APPLICATION\", \"WRITTEN STATEMENT\", "
+    "   \"MOST RESPECTFULLY SHOWETH\") or via tell-tale phrasing "
+    "   (\"Under instructions from my client…\" → Legal Notice; \"the "
+    "   accused humbly prays…\" → Bail Application; \"the dishonoured "
+    "   cheque…\" → Section 138 Notice). Read the whole excerpt before "
+    "   deciding.\n"
+    "4. `aliases` are 0-4 short, lowercased phrasings a lawyer might use "
+    "   for the same document (e.g. \"statutory notice\", \"notice u/s 138\", "
+    "   \"reg. bail\"). Do NOT include the canonical label itself. Skip "
+    "   when nothing useful comes to mind — an empty list is fine.\n"
+    "5. `confidence` reflects how clearly the BODY signals the document "
+    "   type. Use \"high\" when the body explicitly names the document "
+    "   type or includes its tell-tale section. Use \"medium\" for "
+    "   indirect-but-strong signals (statute references, party-block "
+    "   layout, characteristic prayer/relief language). Use \"low\" only "
+    "   when guessing. Do NOT downgrade confidence just because the "
+    "   filename is generic — the body is what matters.\n"
+    "6. Indian-law grounding: BNS / BNSS / BSA / IT Act — never IPC or "
+    "   CrPC. A \"Section 138\" reference is a Negotiable Instruments Act "
+    "   cheque-bounce signal.\n"
+    "7. No commentary, no markdown fences — JSON object only."
+)
+
+
+def build_template_classify_prompt(
+    *,
+    name: str,
+    content_head: str,
+    is_suggestion: bool = False,
+) -> str:
+    """Build the user prompt for the document-type classifier.
+
+    Used twice:
+      - at template ingest time, with the uploaded file's name + extracted
+        body head;
+      - at suggested-draft click time, with the suggestion's title +
+        description (+ optional fallback text from the user's kickoff
+        message). Pass that combined string as `content_head`.
+
+    `is_suggestion=True` slightly reframes the prompt so the model knows it
+    is classifying an AI-generated draft idea rather than an uploaded file.
+    """
+    vocabulary_block = "\n".join(f"  - {label}" for label in TEMPLATE_DOCUMENT_TYPE_LABELS)
+    if is_suggestion:
+        header = (
+            "You are classifying an AI-generated DRAFT SUGGESTION the lawyer "
+            "just clicked. Infer the document type the lawyer is asking for."
+        )
+        name_label = "SUGGESTION TITLE"
+        body_label = "SUGGESTION DESCRIPTION / KICK-OFF TEXT"
+    else:
+        header = (
+            "You are classifying an UPLOADED TEMPLATE FILE from the lawyer's "
+            "Template Library. Infer what kind of legal document this "
+            "template is meant to produce. The filename is OFTEN "
+            "uninformative (\"abc.docx\", \"document.pdf\", \"format_A.docx\") "
+            "— in that case, classify purely from the body content below. "
+            "The filename is only useful when it explicitly names a "
+            "document type."
+        )
+        name_label = (
+            "TEMPLATE FILE NAME (treat as untrusted when generic — see the body)"
+        )
+        body_label = (
+            "TEMPLATE BODY EXCERPT (this is the source of truth; read all of "
+            "it before deciding — the document-type marker may appear AFTER "
+            "the court header / addressee block / boiler-plate)"
+        )
+    safe_name = (name or "").strip() or "(no name supplied)"
+    safe_body = (content_head or "").strip() or "(no body text supplied)"
+    return f"""{header}
+
+CANONICAL DOCUMENT TYPES (pick ONE — copy spelling verbatim):
+{vocabulary_block}
+
+{name_label}:
+{safe_name}
+
+{body_label}:
+{safe_body}
+
+OUTPUT — strict JSON object, no commentary, no markdown fences:
+{{"documentType": "<canonical label>", "aliases": ["<alt phrasing>", "..."], "confidence": "high|medium|low"}}
+"""
 
 
 def build_template_match_prompt(
@@ -1388,4 +1555,185 @@ template even if the filename says `document.docx`.
 OUTPUT FORMAT — strict JSON only, no commentary, no markdown fences:
 {{"templateId": "<id or null>", "reason": "<short justification under 200 chars>"}}
 """
+
+
+# ---------------------------------------------------------------------------
+# 5) Template placeholder filler (run AFTER the markdown draft is generated)
+# ---------------------------------------------------------------------------
+
+TEMPLATE_FILL_INSTRUCTION = (
+    "You are filling the placeholders of a lawyer's DOCX template with "
+    "case-specific values. The full draft body has already been authored "
+    "as Markdown — your job is purely to map each placeholder label to "
+    "the exact value that should appear in its slot. Rules:\n"
+    "1. Read the case facts and the generated Markdown draft. Pick values "
+    "   that are consistent with both.\n"
+    "2. Keep replacements concise and natural for a legal document. A "
+    "   placeholder like [Name of Accused] takes a name; [Date] takes a "
+    "   date (DD/MM/YYYY or 'DD Month YYYY'); [FIR No.] takes the FIR "
+    "   number; [Police Station] takes the PS name; [Sections] takes the "
+    "   applicable statute sections; etc.\n"
+    "3. If a placeholder's value is genuinely unknown from the case facts, "
+    "   return the original placeholder text unchanged (so the lawyer "
+    "   can fill it manually) — DO NOT invent.\n"
+    "4. If a placeholder marks a narrative section (e.g. [Grounds], "
+    "   [Facts Narrative]) write 2–6 sentences inline; use \\n between "
+    "   sentences only if you genuinely need a line break.\n"
+    "5. Indian-law grounding applies — BNS / BNSS / BSA / IT Act, NOT IPC.\n"
+    "OUTPUT — strict JSON object. Keys MUST be the exact placeholder text "
+    "including delimiters (e.g. \"[Name of Accused]\", \"<court>\"). Values "
+    "are plain strings. No commentary, no markdown fences."
+)
+
+
+TEMPLATE_DIFF_INSTRUCTION = (
+    "You are editing a lawyer's DOCX template to match a draft that was "
+    "already written in Markdown by another AI. The template provides "
+    "the EXACT format, headings, and prose the lawyer wants. The "
+    "Markdown is the source of truth for case-specific content. Your "
+    "single job: identify the smallest set of text edits inside the "
+    "template that make it carry the Markdown's content while keeping "
+    "every other character of the template unchanged.\n\n"
+    "You MUST:\n"
+    "1. Detect if the template is a CATALOG of multiple top-level "
+    "numbered documents (\"1. Only Child Affidavit\", \"2. Distance "
+    "Affidavit\", etc.). If yes, return the section numbers the "
+    "Markdown selects in `keep_sections`. Sections NOT in that list "
+    "will be REMOVED from the output. If the template is a single "
+    "document, return `keep_sections: []`.\n"
+    "2. For every fill slot in the kept content, return a `text_edits` "
+    "entry with `find` (exact substring of the template) and "
+    "`replace` (the value from the Markdown).\n"
+    "Fill slot conventions you must recognise:\n"
+    "   - `[Label]`, `<Label>`, `{{Label}}`, `(PascalCase_or_snake)` — "
+    "     placeholder tokens. Replace the entire token (including "
+    "     delimiters) with the value.\n"
+    "   - `Father|Mother`, `He|she`, `male/female`, `S/o|D/o`, "
+    "     `son|daughter` — pipe-/slash-separated CHOICE MARKERS. Pick "
+    "     ONE alternative based on facts in the Markdown and replace "
+    "     the whole `X|Y` (or `X/Y`) token with that single value.\n"
+    "   - Labelled blanks like \"Age: ____ years\" or \"Aadhar number: "
+    "     _______\" — replace by including ENOUGH SURROUNDING CONTEXT "
+    "     to make the `find` string unique. The right `find` is the "
+    "     labelled phrase plus its blank (e.g. `find: \"Aadhar number "
+    "     / Passport Number is: _______\"`, `replace: \"Aadhar "
+    "     number / Passport Number is: 4587 2365 9142\"`). NEVER use "
+    "     a bare run of underscores as `find` — that matches dozens "
+    "     of unrelated blanks throughout the template.\n"
+    "STRICT RULES for `text_edits` entries:\n"
+    "A. Each `find` MUST be at least 4 characters long.\n"
+    "B. Each `find` MUST be unique enough that it appears at most a "
+    "   handful of times in the template (≤ 20 occurrences). If a "
+    "   slot's natural marker (`{{X}}`, etc.) appears in many "
+    "   sections, that is OK — the same value applies everywhere. "
+    "   But never use generic substrings like \"is:\", \" \", \"of\", "
+    "   or bare underscores.\n"
+    "C. `find` MUST NOT appear inside `replace`. (E.g. don't write "
+    "   `find: \"Name:\"` with `replace: \"Name: Mrs. Sunita Kumar\"` "
+    "   — that causes runaway replacement. Either include enough "
+    "   surrounding text so `find` is no longer a substring of "
+    "   `replace`, or split into a non-overlapping edit.)\n"
+    "D. NEVER include an edit whose `find` text does not appear "
+    "   verbatim in the template — those edits are silently dropped.\n"
+    "E. NEVER edit template prose that should stay verbatim — only "
+    "   the slot conventions above are eligible.\n"
+    "F. NEVER invent values not present in the Markdown.\n\n"
+    "OUTPUT — strict JSON only, no markdown fences, no commentary:\n"
+    '{"keep_sections": [<section numbers>], "text_edits": '
+    '[{"find": "<exact substring>", "replace": "<new text>"}, ...]}'
+)
+
+
+def build_template_diff_prompt(
+    *,
+    role: str,
+    case_summary: str,
+    case_facts_brief: str,
+    gathered_facts_json: str,
+    draft_markdown: str,
+    template_text: str,
+    lawyer_instructions: Optional[str] = None,
+) -> str:
+    """User prompt for the LLM-guided template-diff call.
+
+    The model returns ``{keep_sections, text_edits}`` describing how
+    the cloned template should be modified to carry the Markdown's
+    content while preserving every other byte of the template.
+    """
+    parts: List[str] = []
+    parts.append(f"ROLE: {role}")
+    if case_summary:
+        parts.append(f"CASE SUMMARY:\n{case_summary.strip()}")
+    if case_facts_brief:
+        parts.append(f"CASE FACTS BRIEF:\n{case_facts_brief.strip()}")
+    if gathered_facts_json:
+        parts.append("FACTS COLLECTED FROM LAWYER (JSON):\n" + gathered_facts_json)
+    if lawyer_instructions:
+        parts.append(f"LAWYER INSTRUCTIONS:\n{lawyer_instructions.strip()}")
+    parts.append(
+        "TEMPLATE TEXT (each line below is one paragraph of the "
+        "lawyer's uploaded DOCX):\n" + template_text.strip()
+    )
+    parts.append(
+        "AI-DRAFTED MARKDOWN (the lawyer's intended final content — "
+        "source of truth):\n" + draft_markdown.strip()
+    )
+    parts.append(
+        "Return strict JSON: which numbered top-level sections to "
+        "keep (empty list if not a catalog), and the minimal set of "
+        "text edits inside the template to make it carry the "
+        "Markdown's content."
+    )
+    return "\n\n".join(parts)
+
+
+def build_template_fill_prompt(
+    *,
+    role: str,
+    case_summary: str,
+    case_facts_brief: str,
+    gathered_facts_json: str,
+    draft_markdown: str,
+    placeholders: list,
+    lawyer_instructions: Optional[str] = None,
+) -> str:
+    """Prompt that asks Gemini to map each template placeholder to a value.
+
+    Args:
+        placeholders: list of {"raw": str, "label": str, "kind": str} —
+            the unique placeholders found in the template, each with
+            its exact raw text (the JSON key Gemini must use).
+    """
+    parts: List[str] = []
+    parts.append(f"ROLE: {role}")
+    if case_summary:
+        parts.append(f"CASE SUMMARY:\n{case_summary.strip()}")
+    if case_facts_brief:
+        parts.append(f"CASE FACTS BRIEF:\n{case_facts_brief.strip()}")
+    if gathered_facts_json:
+        parts.append("FACTS COLLECTED FROM LAWYER (JSON):\n" + gathered_facts_json)
+    if lawyer_instructions:
+        parts.append(f"LAWYER INSTRUCTIONS:\n{lawyer_instructions.strip()}")
+    if draft_markdown:
+        parts.append(
+            "GENERATED DRAFT (Markdown, already written — use as source "
+            "of truth for placeholder values):\n" + draft_markdown.strip()
+        )
+
+    parts.append(
+        "PLACEHOLDERS TO FILL (each line is one slot — JSON key must be "
+        "the exact text in column 1, including delimiters):"
+    )
+    for ph in placeholders:
+        raw = ph.get("raw") or ""
+        label = ph.get("label") or ""
+        kind = ph.get("kind") or ""
+        parts.append(f'  {raw}   (label="{label}", kind={kind})')
+
+    parts.append(
+        "Return a strict JSON object mapping each raw placeholder to its "
+        "filled value. Skip none — include every placeholder, returning "
+        "the original raw text when the value is unknown."
+    )
+    return "\n\n".join(parts)
 

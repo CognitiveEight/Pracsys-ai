@@ -367,6 +367,9 @@ class DraftDocumentPayload(BaseModel):
     sourceTemplateName: Optional[str] = None
     sourceType: Optional[str] = None  # "template" | "suggestedDraft" | "blank"
     wordCount: Optional[int] = None
+    # Public HTTPS URL to the generated .docx blob uploaded to GCS.
+    # Absent when DOCX generation or upload failed — markdown still ships.
+    downloadUrl: Optional[str] = None
 
 
 class AIResponsePayload(BaseModel):

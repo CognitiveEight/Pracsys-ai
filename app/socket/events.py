@@ -2077,29 +2077,100 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                             str(s).strip() for s in suggestion_chips if s
                         ][:16]
 
-                        # If tail arrays are missing due partial/truncated JSON, recover them.
-                        if len(possible_next_steps) < 3 or len(suggestion_chips) < 10:
+                        # If the objective or the tail arrays are missing/short
+                        # due to partial AI output, recover them with a focused
+                        # follow-up call. Objective threshold = 200 chars
+                        # because the main prompt demands 10-20 sentences and
+                        # anything shorter is implausibly thin (and triggers
+                        # the generic hardcoded fallback below).
+                        strategic_objective_missing = (
+                            not strategic_objective
+                            or len(strategic_objective.strip()) < 200
+                        )
+                        next_steps_missing = len(possible_next_steps) < 3
+                        chips_missing = len(suggestion_chips) < 10
+                        if (
+                            strategic_objective_missing
+                            or next_steps_missing
+                            or chips_missing
+                        ):
                             try:
-                                recovery_prompt = f"""Return ONLY one valid JSON object with:
+                                # Build the recovery prompt conditionally —
+                                # only ask Gemini for the fields actually
+                                # missing, preserving whatever the first call
+                                # produced correctly.
+                                _requested_fields = []
+                                _field_specs = []
+                                if strategic_objective_missing:
+                                    _requested_fields.append(
+                                        '"strategicObjective": "..."'
+                                    )
+                                    _field_specs.append(
+                                        "- strategicObjective: 10-20 sentences. "
+                                        f"Role-specific for {workspace_role}. "
+                                        "Anchor on named parties from the "
+                                        "EXTRACTED FACTS, exact dates in "
+                                        "DD/MM/YYYY, suit/FIR numbers, exact "
+                                        "amounts, and named statutes "
+                                        "(BNS/BNSS/BSA/IT Act/NDPS/etc.). Do "
+                                        "NOT use Petitioner / Respondent / "
+                                        "Client / Case / Adjudicator / "
+                                        "Mediator labels. Cover both "
+                                        "criminal-law and civil-law tracks "
+                                        "when both are supported by the "
+                                        "facts. No bracket tags like "
+                                        "'(criminal angle)'."
+                                    )
+                                if next_steps_missing:
+                                    _requested_fields.append(
+                                        '"possibleNextSteps": ["..."]'
+                                    )
+                                    _field_specs.append(
+                                        "- possibleNextSteps: exactly 3-5 "
+                                        "immediate, practical actions."
+                                    )
+                                if chips_missing:
+                                    _requested_fields.append(
+                                        '"suggestionChips": ["..."]'
+                                    )
+                                    _field_specs.append(
+                                        "- suggestionChips: exactly 15-16 "
+                                        "short labels (2-5 words each), "
+                                        "actionable and case-specific."
+                                    )
+
+                                try:
+                                    _entities_block_recovery = json.dumps(
+                                        case_entities,
+                                        indent=2,
+                                        ensure_ascii=False,
+                                    )
+                                except Exception:
+                                    _entities_block_recovery = "{}"
+
+                                _fields_json = ",\n  ".join(_requested_fields)
+                                _rules_block = "\n".join(_field_specs)
+                                recovery_prompt = f"""Return ONLY one valid JSON object with these keys:
 {{
-  "possibleNextSteps": ["..."],
-  "suggestionChips": ["..."]
+  {_fields_json}
 }}
 
 Context:
 - Role: {workspace_role}
 - Case summary: {case_summary}
-- Strategic objective: {strategic_objective}
+- Strategic objective (existing, may be empty/short): {strategic_objective}
+
+EXTRACTED FACTS (authoritative ground truth — use exact names/spellings, do NOT rename or abbreviate):
+{_entities_block_recovery}
 
 Documents:
 {combined_document_content}
 
 Rules:
-- possibleNextSteps: exactly 3-5 immediate, practical actions.
-- suggestionChips: exactly 15-16 short labels (2-5 words each), actionable and case-specific.
-- Use Annexure wording for uploads (never Document N).
-- No invented facts.
-- JSON only; no markdown.
+{_rules_block}
+- Use "Annexure N" wording for uploaded files (never "Document N").
+- No invented facts; only use what is in the EXTRACTED FACTS and Documents above.
+- JSON only; no markdown fences.
 """
                                 recovery_raw = await gemini_client.generate(
                                     prompt=recovery_prompt,
@@ -2119,6 +2190,18 @@ Rules:
                                     else json.loads((recovery_raw or "").strip())
                                 )
                                 if isinstance(recovered_data, dict):
+                                    recovered_objective_raw = (
+                                        recovered_data.get("strategicObjective")
+                                        or recovered_data.get("strategic_objective")
+                                        or ""
+                                    )
+                                    if isinstance(recovered_objective_raw, str):
+                                        recovered_objective = _strip_ui_truncated_tokens(
+                                            recovered_objective_raw.strip()
+                                        )
+                                    else:
+                                        recovered_objective = ""
+
                                     recovered_next_steps = (
                                         recovered_data.get("possibleNextSteps")
                                         or recovered_data.get("possible_next_steps")
@@ -2151,19 +2234,23 @@ Rules:
                                         if str(s).strip()
                                     ][:16]
 
+                                    if strategic_objective_missing and recovered_objective:
+                                        strategic_objective = recovered_objective
+                                        analysis_data["strategicObjective"] = recovered_objective
                                     if len(possible_next_steps) < 3 and recovered_next_steps:
                                         possible_next_steps = recovered_next_steps
                                     if len(suggestion_chips) < 10 and recovered_chips:
                                         suggestion_chips = recovered_chips
 
                                     logger.info(
-                                        "Recovered strategy tail fields: nextSteps={}, chips={}",
+                                        "Recovered strategy tail fields: objective={} chars, nextSteps={}, chips={}",
+                                        len(strategic_objective),
                                         len(possible_next_steps),
                                         len(suggestion_chips),
                                     )
                             except Exception as recovery_err:
                                 logger.warning(
-                                    "Could not recover strategy nextSteps/chips: {}",
+                                    "Could not recover strategy tail fields: {}",
                                     recovery_err,
                                 )
 

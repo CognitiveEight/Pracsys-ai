@@ -39,12 +39,19 @@ from app.prompts.drafting import (
     DRAFT_TRANSLATE_INSTRUCTION,
     DRAFTING_CHAT_INSTRUCTION,
     SUGGESTED_DRAFTS_INSTRUCTION,
+    TEMPLATE_CLASSIFY_INSTRUCTION,
+    TEMPLATE_DIFF_INSTRUCTION,
+    TEMPLATE_DOCUMENT_TYPE_LABELS,
+    TEMPLATE_FILL_INSTRUCTION,
     TEMPLATE_KICKOFF_INSTRUCTION,
     TEMPLATE_MATCH_INSTRUCTION,
     build_chat_reply_prompt,
     build_draft_render_prompt,
     build_draft_translate_prompt,
     build_suggested_drafts_prompt,
+    build_template_classify_prompt,
+    build_template_diff_prompt,
+    build_template_fill_prompt,
     build_template_kickoff_prompt,
     build_template_match_prompt,
 )
@@ -56,6 +63,39 @@ from app.prompts.drafting import (
 
 TEMPLATE_CACHE_KIND = "template"
 DRAFTING_SESSION_CACHE_KIND = "drafting_session"
+
+# How many characters of the extracted template body to read when
+# classifying the document type. Indian legal documents often spend the
+# first 1-2k chars on court header, addressee block, "REGISTERED A.D."
+# preambles, and party arrays — the document-type heading ("LEGAL
+# NOTICE", "BAIL APPLICATION", "MOST RESPECTFULLY SHOWETH") commonly
+# appears AFTER that boiler-plate, so a generous window matters.
+_CLASSIFY_CONTENT_CHARS = 4000
+
+# DOCX export — public bucket prefix for generated drafts, private prefix
+# for the original template skeletons we retain so future drafts can
+# reuse the lawyer's formatting.
+_DOCX_MIME = (
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+)
+_TEMPLATE_GCS_PREFIX = "templates"
+_DRAFT_GCS_PREFIX = "draft"
+
+
+def _safe_filename(name: str, *, default: str = "draft") -> str:
+    """Slugify a draft title for safe inclusion in a GCS object key.
+
+    Rules (matches the convention used elsewhere in the platform):
+      - Spaces → ``_``.
+      - Any character outside ``[A-Za-z0-9._-]`` is stripped.
+      - Empty result falls back to ``default``.
+    """
+    name = (name or "").strip()
+    if not name:
+        return default
+    name = name.replace(" ", "_")
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "", name)
+    return cleaned or default
 
 _RELEVANCE_VALUES = {"High", "Medium", "Low"}
 _VALID_SOURCES = {"template", "suggestedDraft", "blank"}
@@ -290,6 +330,8 @@ class DraftingAgent:
             return None
 
         # Skip re-extraction when content hash is stable.
+        downloaded_bytes: Optional[bytes] = None
+        ext_lower = (extension or "").lstrip(".").lower()
         if (
             previous_payload
             and file_hash
@@ -313,6 +355,7 @@ class DraftingAgent:
                 content, _size = await document_processor._download_file(
                     file_url, filename
                 )
+                downloaded_bytes = content
             except Exception as e:
                 logger.error(
                     "Template download failed (user={}, template={}, url={}): {}",
@@ -342,17 +385,147 @@ class DraftingAgent:
             extracted_text = (extracted_text or "").strip()
             extraction_status = "ready" if extracted_text else "failed"
 
+        # Persist a DOCX skeleton to GCS so future drafts can reproduce
+        # the lawyer's formatting under the llm_diff path. Native DOCX
+        # templates are stored as-is. PDF templates are converted to a
+        # DOCX skeleton at ingest (pdf2docx → OCR fallback) so the same
+        # editing pipeline applies. Reuse the previously stored URI
+        # when the file hash hasn't changed.
+        template_docx_gcs_uri: Optional[str] = None
+        if (
+            previous_payload
+            and file_hash
+            and previous_payload.get("file_hash") == file_hash
+            and previous_payload.get("template_docx_gcs_uri")
+        ):
+            template_docx_gcs_uri = previous_payload.get("template_docx_gcs_uri")
+        else:
+            if ext_lower == "pdf" and downloaded_bytes:
+                # Convert PDF → DOCX so the existing upload-as-DOCX block
+                # below can handle it. On failure we log and continue
+                # without a skeleton — the draft path will fall through
+                # to skeleton_clone with defaults styling, which still
+                # produces a usable DOCX.
+                try:
+                    from app.processing.pdf_to_docx import convert_pdf_to_docx
+
+                    pdf_bytes_len = len(downloaded_bytes)
+                    converted = await asyncio.to_thread(
+                        convert_pdf_to_docx, downloaded_bytes, name,
+                    )
+                    if converted:
+                        downloaded_bytes = converted
+                        ext_lower = "docx"
+                        logger.info(
+                            "Template PDF→DOCX conversion succeeded "
+                            "(user={}, template={}, in_bytes={}, out_bytes={})",
+                            user_id, template_id,
+                            pdf_bytes_len, len(converted),
+                        )
+                    else:
+                        logger.warning(
+                            "Template PDF→DOCX conversion produced no usable "
+                            "output (user={}, template={}) — llm_diff path will "
+                            "fall back to skeleton_clone for this template",
+                            user_id, template_id,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Template PDF→DOCX conversion raised (user={}, "
+                        "template={}): {} — continuing without skeleton",
+                        user_id, template_id, exc,
+                    )
+
+        if (
+            template_docx_gcs_uri is None
+            and ext_lower == "docx"
+            and downloaded_bytes
+        ):
+            try:
+                from app.core.config import settings as _settings
+                from app.storage import gcs as _gcs
+
+                bucket = getattr(_settings, "gcs_docx_bucket_name", None)
+                if bucket:
+                    blob_name = (
+                        f"{_TEMPLATE_GCS_PREFIX}/{user_id}/{template_id}.docx"
+                    )
+                    await asyncio.to_thread(
+                        _gcs.upload_bytes,
+                        bucket,
+                        blob_name,
+                        downloaded_bytes,
+                        _DOCX_MIME,
+                        public=False,  # skeleton stays internal
+                    )
+                    template_docx_gcs_uri = f"gs://{bucket}/{blob_name}"
+                else:
+                    logger.warning(
+                        "Template skeleton upload skipped — "
+                        "GCS_DOCX_BUCKET_NAME not set"
+                    )
+            except Exception as e:
+                # Non-fatal: text extraction already succeeded; only the
+                # formatted-DOCX export path will degrade for this template.
+                logger.warning(
+                    "Template skeleton upload failed (user={}, template={}): {}",
+                    user_id,
+                    template_id,
+                    e,
+                )
+
         now_iso = datetime.utcnow().isoformat()
         name_history: List[str] = []
         if previous_payload:
             name_history = list(previous_payload.get("name_history") or [])
+
+        # Document-type classification. Reuse the cached classification when
+        # the file hash is unchanged AND a previous label exists, otherwise
+        # run the classifier on the freshly-extracted body head. Never block
+        # ingest on classifier failure — leave the field empty and the
+        # matcher's anchor-overlap fallback path will still operate.
+        document_type = ""
+        document_type_aliases: List[str] = []
+        document_type_confidence = ""
+        classified_at = ""
+        hash_stable = bool(
+            previous_payload
+            and file_hash
+            and previous_payload.get("file_hash") == file_hash
+        )
+        if (
+            hash_stable
+            and previous_payload
+            and previous_payload.get("document_type")
+        ):
+            document_type = (previous_payload.get("document_type") or "").strip()
+            prev_aliases = previous_payload.get("document_type_aliases") or []
+            if isinstance(prev_aliases, list):
+                document_type_aliases = [
+                    str(a).strip() for a in prev_aliases if str(a).strip()
+                ]
+            document_type_confidence = (
+                previous_payload.get("document_type_confidence") or ""
+            )
+            classified_at = previous_payload.get("classified_at") or ""
+        elif extraction_status == "ready" and extracted_text:
+            classified = await self._classify_document_type(
+                name=name,
+                content_head=extracted_text[:_CLASSIFY_CONTENT_CHARS],
+                is_suggestion=False,
+            )
+            if classified:
+                document_type = classified.get("documentType", "") or ""
+                document_type_aliases = classified.get("aliases", []) or []
+                document_type_confidence = classified.get("confidence", "") or ""
+                classified_at = now_iso
 
         payload: Dict[str, Any] = {
             "template_id": template_id,
             "user_id": user_id,
             "category": category,
             "name": name,
-            "extension": (extension or "").lstrip(".").lower(),
+            "extension": ext_lower,
             "mime_type": mime_type or "",
             "file_hash": file_hash or "",
             "source_path": path or "",
@@ -361,6 +534,11 @@ class DraftingAgent:
             "extraction_status": extraction_status,
             "ingested_at": now_iso,
             "name_history": name_history,
+            "template_docx_gcs_uri": template_docx_gcs_uri,
+            "document_type": document_type,
+            "document_type_aliases": document_type_aliases,
+            "document_type_confidence": document_type_confidence,
+            "classified_at": classified_at,
         }
 
         try:
@@ -389,11 +567,14 @@ class DraftingAgent:
             return None
 
         logger.success(
-            "Template ingested (user={}, template={}, status={}, chars={})",
+            "Template ingested (user={}, template={}, status={}, chars={}, "
+            "document_type={!r}, confidence={!r})",
             user_id,
             template_id,
             extraction_status,
             len(extracted_text),
+            document_type or "(unclassified)",
+            document_type_confidence or "(n/a)",
         )
         return payload
 
@@ -469,6 +650,76 @@ class DraftingAgent:
             scope_id=template_id,
         )
         return data if isinstance(data, dict) else None
+
+    # ------------------------------------------------------------------
+    # 2a) Document-type classification (shared by ingest + click-time match)
+    # ------------------------------------------------------------------
+
+    # Pre-compute a case-folded lookup of the canonical vocabulary so we can
+    # snap LLM responses back to their canonical spelling regardless of how
+    # the model casing/spacing comes back.
+    _DOC_TYPE_CANONICAL = {
+        label.lower(): label for label in TEMPLATE_DOCUMENT_TYPE_LABELS
+    }
+
+    async def _classify_document_type(
+        self,
+        *,
+        name: str,
+        content_head: str,
+        is_suggestion: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """Classify a template or a clicked suggestion into a canonical
+        document type. Returns a dict with keys `documentType`, `aliases`,
+        `confidence` on success; returns None on failure (the caller should
+        treat that as "unclassified" — never block on it).
+        """
+        try:
+            prompt = build_template_classify_prompt(
+                name=name or "",
+                content_head=content_head or "",
+                is_suggestion=is_suggestion,
+            )
+            raw = await gemini_client.generate(
+                prompt,
+                system_instruction=TEMPLATE_CLASSIFY_INSTRUCTION,
+                temperature=0.1,
+                max_tokens=2000,
+                response_mime_type="application/json",
+            )
+        except Exception as e:
+            logger.warning(
+                "Template document-type classification LLM call failed "
+                "(is_suggestion={}): {}",
+                is_suggestion,
+                e,
+            )
+            return None
+
+        parsed = _parse_json_object(raw) or {}
+        raw_type = (parsed.get("documentType") or "").strip()
+        # Snap to canonical spelling. Anything unrecognised collapses to "Other"
+        # so the matcher never has to deal with free-form labels.
+        canonical = self._DOC_TYPE_CANONICAL.get(raw_type.lower(), "")
+        if not canonical:
+            canonical = "Other"
+        raw_aliases = parsed.get("aliases") or []
+        aliases: List[str] = []
+        if isinstance(raw_aliases, list):
+            for a in raw_aliases:
+                s = str(a or "").strip().lower()
+                if s and s != canonical.lower() and s not in aliases:
+                    aliases.append(s)
+                if len(aliases) >= 6:
+                    break
+        confidence = (parsed.get("confidence") or "").strip().lower()
+        if confidence not in {"high", "medium", "low"}:
+            confidence = "low"
+        return {
+            "documentType": canonical,
+            "aliases": aliases,
+            "confidence": confidence,
+        }
 
     # ------------------------------------------------------------------
     # 2b) Suggested-draft → lawyer's-library template matching
@@ -595,21 +846,37 @@ class DraftingAgent:
         suggestion_title: str,
         suggestion_description: str,
         fallback_text: str = "",
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Tuple[Optional[Dict[str, Any]], int]:
         """Pick a template from the lawyer's library that matches a clicked
-        suggestion, using a deterministic fast-path with an LLM tiebreaker.
+        suggestion. Returns ``(payload, ready_library_size)``.
 
-        `fallback_text` is folded into the search blob alongside
-        `suggestion_title` / `suggestion_description` so the matcher can still
-        find a template when BE hasn't yet shipped the suggestion fields on
-        `user_message_request` — the kickoff message body (user content) is
-        passed in as a fallback signal.
+        Match strategy (in order):
+          1. **Type-first**: classify the suggestion into a canonical
+             document type (e.g. "Legal Notice") and filter the library to
+             templates carrying the same `document_type`. If the candidate
+             set is unique, return it deterministically; if multiple share
+             the type, run an LLM tiebreaker on that filtered shortlist.
+          2. **Anchor-overlap fallback**: if type-first found nothing
+             (suggestion classified as "Other", or no template shares the
+             type), fall through to the legacy anchor-token / anchor-phrase
+             overlap path so this change is backward-compatible with
+             previously-ingested template caches that lack `document_type`.
 
-        Returns the full cached template payload on success, or None when no
-        template is appropriate (falls back to AI generation downstream).
+        Lazy backfill: when a template payload is missing `document_type`,
+        we classify it on the fly (in parallel with siblings) and persist
+        the result so subsequent clicks are fast.
+
+        `fallback_text` is folded into the suggestion blob so the matcher
+        can still find a template when BE has not yet shipped the
+        suggestion fields on `user_message_request` — the kickoff message
+        body is passed in as a fallback signal.
+
+        The second tuple element (ready library size — templates with
+        usable extracted text) lets the kickoff path decide whether to
+        surface a "no close template found" note to the lawyer.
         """
         if not user_id:
-            return None
+            return None, 0
         suggestion_text = " ".join(
             s for s in (suggestion_title, suggestion_description, fallback_text) if s
         ).strip()
@@ -619,7 +886,7 @@ class DraftingAgent:
                 "(user={})",
                 user_id[:12],
             )
-            return None
+            return None, 0
 
         try:
             from app.vectorstore.qdrant import vector_store
@@ -629,25 +896,24 @@ class DraftingAgent:
             )
         except Exception as e:
             logger.warning("Template matcher: list_user_state_cache failed: {}", e)
-            return None
+            return None, 0
+        library_size = len(entries) if entries else 0
         logger.info(
             "Template matcher invoked (user={}, library_size={}, suggestion_text={!r})",
             user_id[:12],
-            len(entries) if entries else 0,
+            library_size,
             suggestion_text[:160],
         )
         if not entries:
-            return None  # Empty library — fast-out, no LLM call.
+            return None, 0  # Empty library — fast-out, no LLM call.
 
         # Filter to ready, text-bearing templates and project the bits we
-        # need for scoring. Crucially, the **match blob** now combines the
-        # template name (+ history) with the first ~1500 chars of the
-        # extracted body. The body's opening lines are where document-type
-        # signal is densest (cover-page headings, party blocks, "IN THE
-        # COURT OF…", "BAIL APPLICATION", "MOST RESPECTFULLY SHOWETH").
-        # This lets the matcher work even when the lawyer uploaded the
-        # template with an uninformative filename like `document.docx` or
-        # `Format_A.pdf`.
+        # need for scoring. The **match blob** combines the template name
+        # (+ history) with the first ~1500 chars of the extracted body —
+        # opening lines are where document-type signal is densest (court
+        # headers, party blocks, "BAIL APPLICATION", "MOST RESPECTFULLY
+        # SHOWETH"), so this works even when filenames are uninformative
+        # like `document.docx` or `Format_A.pdf`.
         ready: List[Dict[str, Any]] = []
         for ent in entries:
             data = ent.get("data") if isinstance(ent, dict) else None
@@ -663,7 +929,12 @@ class DraftingAgent:
                 continue
             name = (data.get("name") or "").strip()
             history = [str(x).strip() for x in (data.get("name_history") or []) if x]
-            content_head = extracted[:1500]
+            # Use a generous window so both the classifier (lazy backfill
+            # of un-classified templates) and the anchor-overlap fallback
+            # have enough body text to pick up document-type markers that
+            # appear after court headers / addressee blocks. The LLM
+            # tiebreaker explicitly trims this down via `snippet_chars`.
+            content_head = extracted[:_CLASSIFY_CONTENT_CHARS]
             match_blob = " | ".join(
                 s for s in [name, *history, content_head] if s
             )
@@ -677,14 +948,138 @@ class DraftingAgent:
                     "payload": data,
                 }
             )
+        ready_size = len(ready)
         if not ready:
-            return None
+            return None, 0
 
+        # ---- 1) Type-first match -----------------------------------------
+        # Classify the suggestion in parallel with any lazy backfill of
+        # un-classified templates in the library. Bound concurrent calls so
+        # large libraries do not blow up the LLM quota on a single click.
+        suggestion_payload = {
+            "name": suggestion_title or "",
+            "content_head": " ".join(
+                s for s in (
+                    suggestion_title,
+                    suggestion_description,
+                    fallback_text,
+                ) if s
+            )[:2000],
+        }
+        backfill_targets = [
+            t for t in ready
+            if not (t["payload"].get("document_type") or "").strip()
+        ]
+        classify_jobs: List[Any] = [
+            self._classify_document_type(
+                name=suggestion_payload["name"],
+                content_head=suggestion_payload["content_head"],
+                is_suggestion=True,
+            )
+        ]
+        for t in backfill_targets:
+            classify_jobs.append(
+                self._classify_document_type(
+                    name=t["name"],
+                    content_head=t["content_head"],
+                    is_suggestion=False,
+                )
+            )
+        try:
+            results = await asyncio.gather(*classify_jobs, return_exceptions=True)
+        except Exception as e:
+            # asyncio.gather with return_exceptions=True shouldn't normally
+            # raise, but guard against unexpected runtime errors.
+            logger.warning("Template matcher: classification batch raised: {}", e)
+            results = [None] * len(classify_jobs)
+
+        suggestion_class = results[0] if results else None
+        if isinstance(suggestion_class, BaseException):
+            suggestion_class = None
+        backfill_results = results[1:] if len(results) > 1 else []
+
+        # Persist any lazy backfill so the next click is fast.
+        for t, res in zip(backfill_targets, backfill_results):
+            if isinstance(res, BaseException) or not res:
+                continue
+            doc_type = res.get("documentType") or ""
+            if not doc_type:
+                continue
+            updated = dict(t["payload"])
+            updated["document_type"] = doc_type
+            updated["document_type_aliases"] = res.get("aliases") or []
+            updated["document_type_confidence"] = res.get("confidence") or ""
+            updated["classified_at"] = datetime.utcnow().isoformat()
+            t["payload"] = updated
+            try:
+                await vector_store.upsert_user_state_cache(
+                    user_id=user_id,
+                    kind=TEMPLATE_CACHE_KIND,
+                    scope_id=t["templateId"],
+                    data=updated,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Template matcher: lazy classification backfill upsert "
+                    "failed (template={}): {}",
+                    t["templateId"],
+                    e,
+                )
+
+        # Log a one-line summary of the classification round.
+        sugg_type = (
+            (suggestion_class or {}).get("documentType") or ""
+        ) if suggestion_class else ""
+        sugg_conf = (
+            (suggestion_class or {}).get("confidence") or ""
+        ) if suggestion_class else ""
+        logger.info(
+            "Template matcher classification (suggestion_type={!r}, "
+            "confidence={!r}, library_types=[{}])",
+            sugg_type or "(unclassified)",
+            sugg_conf or "(n/a)",
+            ", ".join(
+                f"{t['payload'].get('document_type') or '?'}"
+                for t in ready[:10]
+            ),
+        )
+
+        type_match_payload = self._select_by_type(
+            ready=ready,
+            suggestion_class=suggestion_class,
+        )
+        if type_match_payload is not None and len(type_match_payload) == 1:
+            chosen = type_match_payload[0]
+            logger.info(
+                "Drafting suggestion matched to template (user={}, template={}, "
+                "mode=type-match, type={!r})",
+                user_id[:12],
+                chosen["templateId"],
+                sugg_type,
+            )
+            return chosen["payload"], ready_size
+        if type_match_payload is not None and len(type_match_payload) > 1:
+            # Multiple templates share the suggestion's document type —
+            # tiebreak with the LLM. 1500-char snippets give it enough body
+            # to distinguish variants (e.g. Section 138 vs general dispute
+            # notice).
+            chosen = await self._llm_tiebreak_template(
+                user_id=user_id,
+                suggestion_title=suggestion_title,
+                suggestion_description=suggestion_description,
+                candidates=type_match_payload,
+                snippet_chars=1500,
+                mode_label="type-tiebreak",
+            )
+            if chosen is not None:
+                return chosen["payload"], ready_size
+            # LLM tiebreaker on the type-matched shortlist gave us nothing
+            # usable; fall through to the anchor-overlap path below.
+
+        # ---- 2) Anchor-overlap fallback ---------------------------------
         suggestion_anchors = self._anchor_tokens(suggestion_text)
         suggestion_phrases = self._anchor_phrases_in(suggestion_text)
 
-        # Deterministic fast-path: score each template by anchor overlap
-        # against the enriched match_blob (name + history + content head).
         scored: List[Tuple[Dict[str, Any], int, int]] = []
         for t in ready:
             tpl_anchors = self._anchor_tokens(t["match_blob"])
@@ -696,11 +1091,10 @@ class DraftingAgent:
         # Sort by phrase overlap then token overlap, both descending.
         scored.sort(key=lambda r: (r[2], r[1]), reverse=True)
 
-        # Per-candidate trace at INFO level so production logs reveal
-        # exactly how each library template scored against the suggestion.
         logger.info(
-            "Template matcher candidates (ready={}, suggestion_anchors={}, suggestion_phrases={}):",
-            len(ready),
+            "Template matcher anchor-fallback candidates (ready={}, "
+            "suggestion_anchors={}, suggestion_phrases={}):",
+            ready_size,
             sorted(suggestion_anchors),
             sorted(suggestion_phrases),
         )
@@ -713,20 +1107,18 @@ class DraftingAgent:
                 phr,
             )
 
-        # Candidates with any anchor signal at all.
         with_signal = [(t, tok, phr) for t, tok, phr in scored if (tok + phr) > 0]
-
         if not with_signal:
-            # Zero anchor overlap with any template — save the LLM call.
-            logger.info(
-                "Drafting suggestion matcher: no anchor overlap with any of "
-                "{} template(s); falling back to AI generation",
-                len(ready),
+            logger.warning(
+                "Drafting suggestion matcher: no template selected from "
+                "non-empty library (size={}, suggestion_type={!r}) — "
+                "falling back to AI generation",
+                ready_size,
+                sugg_type or "(unclassified)",
             )
-            return None
+            return None, ready_size
 
         if len(with_signal) == 1:
-            # Single candidate with signal — confident deterministic match.
             entry, tok, phr = with_signal[0]
             logger.info(
                 "Drafting suggestion matched to template (user={}, template={}, "
@@ -736,28 +1128,99 @@ class DraftingAgent:
                 phr,
                 tok,
             )
-            return entry["payload"]
+            return entry["payload"], ready_size
 
-        # Multiple candidates with anchor signal — defer to the LLM tiebreaker,
-        # because deterministic counts cannot read modifiers like
-        # "anticipatory" vs "regular" or "reply" vs "demand" that distinguish
-        # otherwise similarly-named templates. We also pass a short content
-        # snippet per candidate so the LLM can disambiguate when filenames
-        # are uninformative (e.g. `document.docx`). Send up to the top 15
-        # by score.
+        # Multiple candidates with anchor signal — tiebreak via LLM.
+        candidates = [t for t, _tok, _phr in with_signal]
+        chosen = await self._llm_tiebreak_template(
+            user_id=user_id,
+            suggestion_title=suggestion_title,
+            suggestion_description=suggestion_description,
+            candidates=candidates,
+            snippet_chars=1500,
+            mode_label="anchor-tiebreak",
+        )
+        if chosen is None:
+            logger.warning(
+                "Drafting suggestion matcher: LLM tiebreaker returned no "
+                "match from {} anchor-overlapping candidate(s); falling "
+                "back to AI generation",
+                len(candidates),
+            )
+            return None, ready_size
+        return chosen["payload"], ready_size
+
+    def _select_by_type(
+        self,
+        *,
+        ready: List[Dict[str, Any]],
+        suggestion_class: Optional[Dict[str, Any]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Filter `ready` templates to those whose `document_type` matches
+        the suggestion's classification. Returns the matched list (possibly
+        size 1) or None when type-first matching does not apply (suggestion
+        unclassified, classified as "Other", or no template carries the
+        same type)."""
+        if not suggestion_class:
+            return None
+        sugg_type = (suggestion_class.get("documentType") or "").strip()
+        if not sugg_type or sugg_type.lower() == "other":
+            return None
+        # Aliases the model returned for the suggestion give us extra
+        # vocabulary to match against template aliases (lawyer phrasings
+        # captured at template-ingest time).
+        sugg_aliases = {
+            str(a).strip().lower()
+            for a in (suggestion_class.get("aliases") or [])
+            if str(a).strip()
+        }
+        sugg_type_lower = sugg_type.lower()
+        matched: List[Dict[str, Any]] = []
+        for t in ready:
+            tpl_type = (t["payload"].get("document_type") or "").strip().lower()
+            if not tpl_type:
+                continue
+            if tpl_type == sugg_type_lower:
+                matched.append(t)
+                continue
+            tpl_aliases = {
+                str(a).strip().lower()
+                for a in (t["payload"].get("document_type_aliases") or [])
+                if str(a).strip()
+            }
+            if sugg_aliases and (sugg_aliases & {tpl_type, *tpl_aliases}):
+                matched.append(t)
+                continue
+            if sugg_type_lower in tpl_aliases:
+                matched.append(t)
+        return matched or None
+
+    async def _llm_tiebreak_template(
+        self,
+        *,
+        user_id: str,
+        suggestion_title: str,
+        suggestion_description: str,
+        candidates: List[Dict[str, Any]],
+        snippet_chars: int,
+        mode_label: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Send a candidate shortlist to the LLM tiebreaker and return the
+        chosen candidate (or None if the LLM declined / returned an unknown
+        id). Honours only ids that appear in `candidates`.
+        """
+        if not candidates:
+            return None
         shortlist: List[Dict[str, Any]] = []
-        for entry, tok, phr in with_signal:
+        for entry in candidates[:15]:
             shortlist.append(
                 {
                     "templateId": entry["templateId"],
                     "name": entry["name"],
                     "category": entry["category"],
-                    "contentSnippet": (entry.get("content_head") or "")[:500],
+                    "contentSnippet": (entry.get("content_head") or "")[:snippet_chars],
                 }
             )
-            if len(shortlist) >= 15:
-                break
-
         prompt = build_template_match_prompt(
             suggestion_title=suggestion_title,
             suggestion_description=suggestion_description,
@@ -772,35 +1235,41 @@ class DraftingAgent:
                 response_mime_type="application/json",
             )
         except Exception as e:
-            logger.warning("Template matcher LLM tiebreaker failed: {}", e)
+            logger.warning(
+                "Template matcher LLM tiebreaker failed (mode={}): {}",
+                mode_label,
+                e,
+            )
             return None
-
         parsed = _parse_json_object(raw) or {}
         chosen_id = (parsed.get("templateId") or "").strip()
         if not chosen_id or chosen_id.lower() == "null":
             logger.info(
-                "Drafting suggestion matcher: LLM returned no match (reason={!r})",
+                "Template matcher LLM returned no match (mode={}, reason={!r})",
+                mode_label,
                 (parsed.get("reason") or "")[:120],
             )
             return None
-
-        # Defensive — only honour ids we showed the model.
         chosen = next(
-            (t for t in scored if t[0]["templateId"] == chosen_id), None
+            (c for c in candidates if c["templateId"] == chosen_id), None
         )
         if chosen is None:
             logger.warning(
-                "Template matcher: LLM returned unknown templateId={!r} — ignoring",
+                "Template matcher LLM returned unknown templateId={!r} "
+                "(mode={}) — ignoring",
                 chosen_id,
+                mode_label,
             )
             return None
         logger.info(
-            "Drafting suggestion matched to template (user={}, template={}, mode=llm, reason={!r})",
+            "Drafting suggestion matched to template (user={}, template={}, "
+            "mode={}, reason={!r})",
             user_id[:12],
             chosen_id,
+            mode_label,
             (parsed.get("reason") or "")[:120],
         )
-        return chosen[0]["payload"]
+        return chosen
 
     # ------------------------------------------------------------------
     # 3) Multi-turn drafting conversation
@@ -1228,6 +1697,12 @@ class DraftingAgent:
         #  - blank: no template lookup.
         template_payload: Optional[Dict[str, Any]] = None
         template_match_note: Optional[str] = None
+        # When the suggested-draft path runs but no template matches AND
+        # the library is non-empty, surface a short explanatory prefix on
+        # the assistant's first reply so the lawyer learns why the upload
+        # they expected to be reused wasn't picked.
+        no_match_prefix: Optional[str] = None
+        ready_library_size = 0
         if source == "template" or request_fields.get("templateId"):
             template_payload = await self._resolve_template(
                 user_id=user_id, request_fields=request_fields
@@ -1238,7 +1713,7 @@ class DraftingAgent:
             # `user_message_request` — the lawyer's kickoff content often
             # still names the document type ("draft a bail application
             # ...") and is enough to drive matching deterministically.
-            template_payload = await self._find_matching_template_for_suggestion(
+            template_payload, ready_library_size = await self._find_matching_template_for_suggestion(
                 user_id=user_id,
                 suggestion_title=suggestion_title or "",
                 suggestion_description=suggestion_description,
@@ -1250,6 +1725,17 @@ class DraftingAgent:
                     f"Matched the lawyer's template '{matched_name}' from the "
                     f"library based on the suggested draft "
                     f"'{suggestion_title or 'New Draft'}'."
+                )
+            elif ready_library_size > 0:
+                # Library has usable templates but none was a close enough
+                # match. Tell the lawyer plainly so they can either pick a
+                # template directly or upload a closer one.
+                pretty_title = (suggestion_title or "this draft").strip() or "this draft"
+                no_match_prefix = (
+                    f"I couldn't find a close match in your Template Library "
+                    f"for *{pretty_title}*, so I'm drafting this from "
+                    f"scratch. If you have a closer template, upload it or "
+                    f"open it directly from the library."
                 )
 
         # Without a template / suggestion / instruction, we still kick off
@@ -1326,6 +1812,7 @@ class DraftingAgent:
             lawyer_instructions=lawyer_instructions,
             suggestion_title=suggestion_title,
             suggested_draft_id=request_fields.get("suggestedDraftId"),
+            no_match_prefix=no_match_prefix,
         )
 
     async def _scope_blank_draft(
@@ -1338,6 +1825,7 @@ class DraftingAgent:
         lawyer_instructions: Optional[str],
         suggestion_title: Optional[str],
         suggested_draft_id: Optional[str],
+        no_match_prefix: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Produce a fresh, template-less scoping session_state.
 
@@ -1395,6 +1883,11 @@ class DraftingAgent:
         # question block.
         if not message or "Information Required to Complete the Draft" not in message:
             message = self._compose_questions_message(open_qs, draft_title)
+        # Prepend the "no template matched" note when the kickoff
+        # decided the lawyer should be told their library was searched
+        # but nothing fit.
+        if no_match_prefix:
+            message = f"{no_match_prefix}\n\n{message}"
 
         return {
             "source": source or "blank",
@@ -2679,11 +3172,13 @@ OUTPUT FORMAT:
             target_language=target,
         )
         try:
+            # Same headroom as draft render — a translated long
+            # rejoinder needs the same room as the English original.
             raw = await gemini_client.generate(
                 prompt,
                 system_instruction=DRAFT_TRANSLATE_INSTRUCTION,
                 temperature=0.2,
-                max_tokens=12000,
+                max_tokens=32000,
             )
         except Exception as e:
             logger.error("Draft translate LLM call failed: {}", e)
@@ -2713,6 +3208,32 @@ OUTPUT FORMAT:
         base_title_clean = re.sub(r"\s*\[[^\]]+\]\s*$", "", base_title).strip()
         new_title = f"{base_title_clean} [{target}]"
 
+        # Translated drafts get their own DOCX export too.
+        translate_user_id = (
+            session_state.get("user_id") or case_context.get("user_id") or ""
+        )
+        translate_template_id = session_state.get("template_id")
+        translate_tpl: Optional[Dict[str, Any]] = None
+        if translate_template_id and translate_user_id:
+            translate_tpl = await self.get_template(
+                user_id=translate_user_id, template_id=translate_template_id
+            )
+        translated_download_url = await self._export_draft_docx(
+            markdown=translated,
+            draft_title=new_title,
+            tpl=translate_tpl,
+            user_id=translate_user_id,
+            template_id=translate_template_id,
+            workspace_id=session_state.get("workspace_id") or "",
+            actionable_id=session_state.get("actionable_id") or "",
+            version=new_version,
+            role=role,
+            case_summary=case_summary,
+            case_facts_brief=(case_context.get("case_facts_brief") or ""),
+            gathered_facts=(session_state.get("gathered_facts") or {}),
+            lawyer_instructions=None,
+        )
+
         translated_doc = {
             "title": new_title,
             "format": "markdown",
@@ -2725,6 +3246,7 @@ OUTPUT FORMAT:
             "wordCount": _word_count(translated),
             "language": target,
             "translatedFromVersion": prev_version or 1,
+            "downloadUrl": translated_download_url,
         }
 
         lead_in = (
@@ -2743,6 +3265,827 @@ OUTPUT FORMAT:
         # document panel).
         session_state["_draft_just_delivered"] = True
         return session_state
+
+    # ------------------------------------------------------------------ docx export
+
+    # ------------------------- DOCX path dispatcher -------------------------
+    #
+    # The dispatcher works for ANY template the lawyer can upload — it
+    # never assumes a specific placeholder convention or layout. The
+    # decision is principled, observable (every branch is logged), and
+    # defaults safely: when in doubt we use skeleton-clone, which
+    # *always* produces a coherent DOCX because the AI's markdown is
+    # the source of truth for content and the template only contributes
+    # styling.
+    #
+    # Strong placeholders ([bracket] / <angle>) are the signal that a
+    # template is *explicitly designed* for AI fill (the lawyer marked
+    # slots). Without them we don't risk in-place edit. With them we
+    # still bail to skeleton-clone if the AI's markdown is shorter than
+    # the template — that's the catalog-subset pattern.
+
+    _SUBSET_RATIO = 0.7         # md/tpl below this → treat as subset
+    _SUBSET_MIN_TPL_LEN = 500   # templates shorter than this skip the check
+
+    @staticmethod
+    def _template_text_length(template_docx_bytes: bytes) -> int:
+        """Total visible text length across body, tables, headers, footers."""
+        try:
+            from io import BytesIO
+            from docx import Document
+
+            doc = Document(BytesIO(template_docx_bytes))
+            total = 0
+            for p in doc.paragraphs:
+                total += len(p.text or "")
+            for t in doc.tables:
+                for row in t.rows:
+                    for cell in row.cells:
+                        for p in cell.paragraphs:
+                            total += len(p.text or "")
+            for section in doc.sections:
+                for part in (section.header, section.footer):
+                    try:
+                        for p in part.paragraphs:
+                            total += len(p.text or "")
+                    except Exception:
+                        continue
+            return total
+        except Exception:
+            return 0
+
+    @classmethod
+    def _decide_render_path(
+        cls,
+        markdown: str,
+        template_docx_bytes: Optional[bytes],
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Choose the DOCX render path. Returns (path, debug_info).
+
+        Possible paths: ``llm_diff`` | ``skeleton_clone`` | ``defaults``.
+
+        ``llm_diff`` (the primary path when a template is present): clone
+        the lawyer's template, ask Gemini for ``{keep_sections,
+        text_edits}`` that describe how to transform the template into
+        the lawyer's drafted content. Drops unrequested sections in
+        catalog templates; replaces only the exact text the model
+        identifies as fill content (placeholders, choice markers,
+        labelled blanks). Every other byte of the template is preserved
+        — same fonts, headings, numbering, tables, headers/footers,
+        theme. This works for ANY template format because the matching
+        is done by the LLM rather than fixed regex patterns.
+
+        ``skeleton_clone`` runs if ``llm_diff`` fails (LLM error, bad
+        JSON, zero applicable edits) — uses AI markdown as content with
+        the template's fonts and styles inherited.
+
+        ``defaults`` runs when there is no template at all — standard
+        legal styling.
+        """
+        info: Dict[str, Any] = {
+            "has_template": bool(template_docx_bytes),
+            "tpl_text_len": 0,
+            "md_len": len(markdown or ""),
+        }
+
+        if not template_docx_bytes:
+            return "defaults", info
+
+        info["tpl_text_len"] = cls._template_text_length(template_docx_bytes)
+        return "llm_diff", info
+
+    async def _fallback_heuristic_fill(
+        self,
+        *,
+        markdown: str,
+        template_docx_bytes: bytes,
+        template_id: Optional[str],
+        role: Optional[str],
+        case_summary: Optional[str],
+        case_facts_brief: Optional[str],
+        gathered_facts: Optional[Dict[str, Any]],
+        lawyer_instructions: Optional[str],
+    ) -> Optional[bytes]:
+        """Heuristic template-fill fallback used when LLM diff returns nothing.
+
+        Order of attempts:
+        1. **Catalog detection** — if the template looks like a catalog
+           (≥2 detected top-level sections) AND the markdown selects a
+           subset of them, run :func:`fill_template_sectional` and
+           apply known placeholder values inside the survivors.
+        2. **Placeholder fill** — if the template has lawyer-marked
+           slots ([bracket]/<angle>/{{handle}}/(Foo_Bar)), call Gemini
+           for values and apply :func:`fill_template`.
+
+        Returns DOCX bytes on success, ``None`` on failure (caller then
+        falls all the way back to skeleton-clone).
+        """
+        try:
+            from app.processing.docx_template_filler import (
+                detect_template_sections,
+                extract_markdown_section_selections,
+                extract_placeholders,
+                fill_template,
+                fill_template_sectional,
+                select_template_sections,
+            )
+        except Exception as exc:
+            logger.warning("Heuristic fill imports failed: {}", exc)
+            return None
+
+        # --- Catalog path ---
+        try:
+            tpl_sections = await asyncio.to_thread(
+                detect_template_sections, template_docx_bytes
+            )
+        except Exception as exc:
+            logger.warning("Section detection raised: {}", exc)
+            tpl_sections = []
+
+        if tpl_sections and len(tpl_sections) >= 2:
+            md_nums, md_titles = extract_markdown_section_selections(markdown or "")
+            kept = select_template_sections(
+                tpl_sections,
+                requested_titles=md_titles,
+                requested_numbers=md_nums,
+            )
+            if kept:
+                logger.info(
+                    "Heuristic catalog fill: keeping {} of {} sections "
+                    "(numbers={})",
+                    len(kept), len(tpl_sections),
+                    [s.number for s in kept],
+                )
+                try:
+                    placeholders = await asyncio.to_thread(
+                        extract_placeholders, template_docx_bytes
+                    )
+                    values = await self._extract_template_placeholder_values(
+                        placeholders=placeholders,
+                        role=role or "ADJUDICATOR",
+                        case_summary=case_summary or "",
+                        case_facts_brief=case_facts_brief or "",
+                        gathered_facts=gathered_facts or {},
+                        lawyer_instructions=lawyer_instructions,
+                        draft_markdown=markdown,
+                    ) or {}
+                    return await asyncio.to_thread(
+                        fill_template_sectional,
+                        template_docx_bytes,
+                        kept,
+                        values,
+                    )
+                except Exception as exc:
+                    logger.warning("Heuristic catalog fill failed: {}", exc)
+
+        # --- Placeholder fill path ---
+        try:
+            placeholders = await asyncio.to_thread(
+                extract_placeholders, template_docx_bytes
+            )
+            if not placeholders:
+                return None
+            strong = sum(
+                1 for ph in placeholders
+                if ph.kind in ("bracket", "angle", "handlebar", "paren_label")
+            )
+            if strong == 0:
+                return None
+            values = await self._extract_template_placeholder_values(
+                placeholders=placeholders,
+                role=role or "ADJUDICATOR",
+                case_summary=case_summary or "",
+                case_facts_brief=case_facts_brief or "",
+                gathered_facts=gathered_facts or {},
+                lawyer_instructions=lawyer_instructions,
+                draft_markdown=markdown,
+            )
+            if not values:
+                return None
+            logger.info(
+                "Heuristic placeholder fill: applying {} values to "
+                "template {}",
+                len(values), template_id,
+            )
+            return await asyncio.to_thread(
+                fill_template, template_docx_bytes, values,
+            )
+        except Exception as exc:
+            logger.warning("Heuristic placeholder fill failed: {}", exc)
+            return None
+
+    async def _extract_template_diff(
+        self,
+        *,
+        template_docx_bytes: bytes,
+        markdown: str,
+        role: str,
+        case_summary: str,
+        case_facts_brief: str,
+        gathered_facts: Dict[str, Any],
+        lawyer_instructions: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Ask Gemini for ``{keep_sections, text_edits}`` for a template.
+
+        This is the heart of the LLM-guided render path. The model sees
+        the template's plain text + the AI's markdown, and returns the
+        minimal set of edits required to make the template carry the
+        markdown's content.
+
+        Returns the parsed dict on success, ``None`` on any failure so
+        the caller can fall back to skeleton-clone.
+        """
+        try:
+            from app.processing.docx_template_filler import extract_template_text
+
+            template_text = extract_template_text(template_docx_bytes)
+        except Exception as exc:
+            logger.warning("Failed to extract template text for diff: {}", exc)
+            return None
+
+        if not template_text.strip():
+            return None
+
+        prompt = build_template_diff_prompt(
+            role=role,
+            case_summary=case_summary,
+            case_facts_brief=case_facts_brief,
+            gathered_facts_json=json.dumps(gathered_facts, ensure_ascii=False),
+            draft_markdown=markdown,
+            template_text=template_text,
+            lawyer_instructions=lawyer_instructions,
+        )
+        logger.info(
+            "Template diff LLM call — template_text={} chars, markdown={} chars",
+            len(template_text), len(markdown or ""),
+        )
+        try:
+            raw = await gemini_client.generate(
+                prompt,
+                system_instruction=TEMPLATE_DIFF_INSTRUCTION,
+                temperature=0.15,
+                # Headroom for 50–100 edits across a multi-section catalog.
+                # Each edit is ~100 chars so 16k tokens is comfortable.
+                max_tokens=16000,
+            )
+        except Exception as exc:
+            logger.warning("Template diff LLM call failed: {}", exc)
+            return None
+
+        if not raw:
+            logger.warning("Template diff LLM returned empty response")
+            return None
+
+        # Log a short preview so we can debug post-hoc if parsing fails.
+        preview = raw.strip()[:200].replace("\n", " ")
+        logger.debug("Template diff raw response (preview): {}", preview)
+
+        parsed = _parse_json_object(raw)
+        if not parsed:
+            logger.warning(
+                "Template diff LLM returned non-JSON output. Preview: {}",
+                preview,
+            )
+            return None
+
+        # Normalise the shape.
+        raw_keep = parsed.get("keep_sections") or []
+        keep_sections: List[int] = []
+        if isinstance(raw_keep, list):
+            for n in raw_keep:
+                try:
+                    keep_sections.append(int(n))
+                except (TypeError, ValueError):
+                    continue
+
+        raw_edits = parsed.get("text_edits") or []
+        text_edits: List[Dict[str, str]] = []
+        skipped_no_match = 0
+        skipped_recursive = 0
+        skipped_too_short = 0
+        skipped_too_many = 0
+        skipped_other = 0
+        if isinstance(raw_edits, list):
+            for e in raw_edits:
+                if not isinstance(e, dict):
+                    skipped_other += 1
+                    continue
+                find = e.get("find")
+                replace = e.get("replace")
+                if not isinstance(find, str) or not find:
+                    skipped_other += 1
+                    continue
+                if replace is None:
+                    skipped_other += 1
+                    continue
+                rep = str(replace)
+                if find == rep:
+                    continue  # no-op
+
+                # --- Defensive validation ---
+                # Edits that would cause a runaway replacement, match
+                # in too many places, or are too short to be specific
+                # are all rejected here so they never reach the DOCX
+                # editor.
+                if len(find) < 4:
+                    skipped_too_short += 1
+                    logger.debug(
+                        "Diff edit too short — skipping. find={!r}",
+                        find,
+                    )
+                    continue
+                if find in rep:
+                    # Recursive replacement (find substring of replace)
+                    # would cause infinite/runaway expansion at apply
+                    # time. Reject.
+                    skipped_recursive += 1
+                    logger.warning(
+                        "Diff edit is recursive (find is substring of "
+                        "replace) — skipping. find={!r} replace={!r}",
+                        find[:60],
+                        rep[:60],
+                    )
+                    continue
+
+                # Validate the find string is locatable in the template
+                # (exact or whitespace-normalised) AND that it doesn't
+                # match an unreasonable number of times — that's a sign
+                # the find string is too generic.
+                located_find: Optional[str] = None
+                if find in template_text:
+                    located_find = find
+                else:
+                    find_norm = " ".join(find.split())
+                    tpl_norm = " ".join(template_text.split())
+                    if find_norm and find_norm in tpl_norm:
+                        located_find = find_norm
+
+                if not located_find:
+                    skipped_no_match += 1
+                    logger.debug(
+                        "Diff edit find not in template — skipping. find={!r}",
+                        find[:80],
+                    )
+                    continue
+
+                match_count = template_text.count(located_find)
+                if match_count == 0:
+                    # Fallback for whitespace-normalised match.
+                    match_count = " ".join(template_text.split()).count(located_find)
+                if match_count > 20:
+                    skipped_too_many += 1
+                    logger.warning(
+                        "Diff edit too generic — skipping. find={!r} "
+                        "matches {} times in template.",
+                        located_find[:60],
+                        match_count,
+                    )
+                    continue
+
+                text_edits.append({"find": located_find, "replace": rep})
+
+        logger.info(
+            "Template diff result: keep_sections={} | applicable_edits={} "
+            "(returned={}, no_match={}, recursive={}, too_short={}, "
+            "too_many={}, other={})",
+            keep_sections,
+            len(text_edits),
+            len(raw_edits) if isinstance(raw_edits, list) else 0,
+            skipped_no_match,
+            skipped_recursive,
+            skipped_too_short,
+            skipped_too_many,
+            skipped_other,
+        )
+        return {"keep_sections": keep_sections, "text_edits": text_edits}
+
+    async def _extract_template_placeholder_values(
+        self,
+        *,
+        placeholders: List[Any],
+        role: str,
+        case_summary: str,
+        case_facts_brief: str,
+        gathered_facts: Dict[str, Any],
+        lawyer_instructions: Optional[str],
+        draft_markdown: str,
+    ) -> Optional[Dict[str, str]]:
+        """Ask Gemini to map each detected placeholder to a filled value.
+
+        Returns ``{raw_placeholder_text -> replacement}`` on success, or
+        ``None`` if the call/parse fails. Placeholders the model couldn't
+        confidently fill are returned with their raw text unchanged so
+        the lawyer can complete them manually.
+        """
+        if not placeholders:
+            return None
+
+        prompt_placeholders: List[Dict[str, str]] = []
+        for ph in placeholders:
+            raw = getattr(ph, "raw", None) or (ph.get("raw") if isinstance(ph, dict) else None)
+            label = getattr(ph, "label", None) or (ph.get("label") if isinstance(ph, dict) else "")
+            kind = getattr(ph, "kind", None) or (ph.get("kind") if isinstance(ph, dict) else "")
+            if not raw:
+                continue
+            prompt_placeholders.append({
+                "raw": raw,
+                "label": label or "",
+                "kind": kind or "",
+            })
+
+        if not prompt_placeholders:
+            return None
+
+        prompt = build_template_fill_prompt(
+            role=role,
+            case_summary=case_summary,
+            case_facts_brief=case_facts_brief,
+            gathered_facts_json=json.dumps(gathered_facts, ensure_ascii=False),
+            draft_markdown=draft_markdown,
+            placeholders=prompt_placeholders,
+            lawyer_instructions=lawyer_instructions,
+        )
+        try:
+            raw = await gemini_client.generate(
+                prompt,
+                system_instruction=TEMPLATE_FILL_INSTRUCTION,
+                temperature=0.2,
+                max_tokens=4000,
+            )
+        except Exception as e:
+            logger.warning("Template fill LLM call failed: {}", e)
+            return None
+
+        parsed = _parse_json_object(raw or "")
+        if not parsed:
+            logger.warning("Template fill LLM returned non-JSON output")
+            return None
+
+        # Coerce keys/values to clean strings and drop entries that don't
+        # match a detected placeholder (model may hallucinate extras).
+        valid_raws = {ph["raw"] for ph in prompt_placeholders}
+        values: Dict[str, str] = {}
+        for k, v in parsed.items():
+            if not isinstance(k, str) or k not in valid_raws:
+                continue
+            if v is None:
+                continue
+            sval = str(v).strip()
+            if not sval:
+                continue
+            # If the model returned the placeholder text unchanged, skip —
+            # the run already has that text, no need to overwrite.
+            if sval == k:
+                continue
+            values[k] = sval
+
+        logger.info(
+            "Template fill mapped {}/{} placeholders",
+            len(values),
+            len(prompt_placeholders),
+        )
+        return values or None
+
+    async def _export_draft_docx(
+        self,
+        *,
+        markdown: str,
+        draft_title: str,
+        tpl: Optional[Dict[str, Any]],
+        user_id: str,
+        template_id: Optional[str],
+        workspace_id: str,
+        actionable_id: str,
+        version: int,
+        # Context used by the placeholder-fill path. All optional so the
+        # method stays callable from translate / revision paths that may
+        # not have every field handy.
+        role: Optional[str] = None,
+        case_summary: Optional[str] = None,
+        case_facts_brief: Optional[str] = None,
+        gathered_facts: Optional[Dict[str, Any]] = None,
+        lawyer_instructions: Optional[str] = None,
+    ) -> Optional[str]:
+        """Render the draft Markdown into a .docx, upload to GCS, return public URL.
+
+        Two paths produce the DOCX, in priority order:
+
+        1. **Placeholder-fill path** — when the template has detectable
+           placeholders (``[bracket]``, ``<angle>``, ``{{handlebar}}``,
+           ``___underscore``), we ask Gemini for a value per placeholder
+           and replace them **in-place** in the original template bytes.
+           Output is byte-for-byte identical to the template except in
+           the filled slots (full fidelity).
+        2. **Skeleton-clone path** — when the template has no
+           placeholders (or the filler fails), we clone the template,
+           clear the fill area, and re-render the AI's markdown using
+           the template's heading / body styles. Lower fidelity but
+           still inherits fonts and section structure.
+
+        Returns None on any failure — markdown content still ships in
+        ``draftDocument.content`` and the caller omits ``downloadUrl``.
+        """
+        try:
+            from app.core.config import settings as _settings
+            from app.processing.docx_generator import render_markdown_to_docx
+            from app.storage import gcs as _gcs
+
+            bucket = getattr(_settings, "gcs_docx_bucket_name", None)
+            if not bucket:
+                logger.warning(
+                    "DOCX export skipped — GCS_DOCX_BUCKET_NAME not configured"
+                )
+                return None
+
+            template_docx_bytes: Optional[bytes] = None
+            if tpl and tpl.get("template_docx_gcs_uri"):
+                try:
+                    b, n = _gcs.parse_gs_uri(tpl["template_docx_gcs_uri"])
+                    template_docx_bytes = await asyncio.to_thread(
+                        _gcs.download_bytes, b, n
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to fetch template skeleton from GCS "
+                        "(template={}, uri={}): {}",
+                        template_id,
+                        tpl.get("template_docx_gcs_uri"),
+                        exc,
+                    )
+                    template_docx_bytes = None
+
+            # Lazy backfill: legacy templates ingested before this feature
+            # have no `template_docx_gcs_uri`. Try one re-download via the
+            # cached `source_url`; if it works, convert (PDF→DOCX) when
+            # needed and upload to GCS, then persist the URI to the
+            # template cache for next time.
+            if (
+                template_docx_bytes is None
+                and tpl
+                and (tpl.get("extension") or "").lower() in ("docx", "pdf")
+                and tpl.get("source_url")
+            ):
+                template_docx_bytes = await self._lazy_backfill_template_skeleton(
+                    tpl=tpl,
+                    user_id=user_id,
+                    template_id=template_id or "",
+                    bucket=bucket,
+                )
+
+            # ----- Choose the DOCX render path -----
+            chosen_path, dispatch_info = self._decide_render_path(
+                markdown, template_docx_bytes
+            )
+            logger.info(
+                "DOCX dispatch: path={} | template={} | tpl_len={} | md_len={}",
+                chosen_path,
+                dispatch_info["has_template"],
+                dispatch_info["tpl_text_len"],
+                dispatch_info["md_len"],
+            )
+
+            docx_bytes: Optional[bytes] = None
+            path_used = chosen_path
+
+            if chosen_path == "llm_diff":
+                # LLM-guided template edit. Gemini sees the template's
+                # text plus the AI's markdown and returns
+                # {keep_sections, text_edits}. We clone the template,
+                # drop unrequested catalog sections, and apply the
+                # edits in place. Template formatting (fonts, headings,
+                # alignment, numbering, tables, headers/footers, theme)
+                # is preserved byte-for-byte; only the slot text is
+                # replaced.
+                try:
+                    from app.processing.docx_template_filler import (
+                        apply_template_diff as _apply_diff,
+                    )
+
+                    diff = await self._extract_template_diff(
+                        template_docx_bytes=template_docx_bytes,
+                        markdown=markdown,
+                        role=role or "ADJUDICATOR",
+                        case_summary=case_summary or "",
+                        case_facts_brief=case_facts_brief or "",
+                        gathered_facts=gathered_facts or {},
+                        lawyer_instructions=lawyer_instructions,
+                    )
+                    if diff and (diff.get("text_edits")
+                                 or diff.get("keep_sections")):
+                        keep = diff.get("keep_sections") or []
+                        edits = diff.get("text_edits") or []
+                        docx_bytes = await asyncio.to_thread(
+                            _apply_diff,
+                            template_docx_bytes,
+                            keep,
+                            edits,
+                        )
+                    else:
+                        logger.warning(
+                            "LLM diff returned no usable output — "
+                            "falling back to sectional/placeholder fill"
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "LLM diff failed: {} — falling back to "
+                        "sectional/placeholder fill",
+                        exc,
+                    )
+
+                # Heuristic fallback chain — try sectional_fill /
+                # placeholder_fill before skeleton-clone so we still
+                # preserve template formatting when the LLM diff path
+                # didn't produce a result.
+                if docx_bytes is None:
+                    docx_bytes = await self._fallback_heuristic_fill(
+                        markdown=markdown,
+                        template_docx_bytes=template_docx_bytes,
+                        template_id=template_id,
+                        role=role,
+                        case_summary=case_summary,
+                        case_facts_brief=case_facts_brief,
+                        gathered_facts=gathered_facts,
+                        lawyer_instructions=lawyer_instructions,
+                    )
+                    if docx_bytes is not None:
+                        path_used = "heuristic_fill"
+
+                if docx_bytes is None:
+                    path_used = "skeleton_clone"
+
+            if path_used == "skeleton_clone":
+                # AI markdown drives content; template provides fonts,
+                # styles, theme, and (when detectable) preamble. Works
+                # for ANY template — prose, catalog, form, mixed.
+                docx_bytes = await asyncio.to_thread(
+                    render_markdown_to_docx,
+                    markdown,
+                    template_docx_bytes=template_docx_bytes,
+                    title=draft_title,
+                )
+            elif path_used == "defaults":
+                # No template — standard legal styling for AI-only drafts.
+                docx_bytes = await asyncio.to_thread(
+                    render_markdown_to_docx,
+                    markdown,
+                    template_docx_bytes=None,
+                    title=draft_title,
+                )
+
+            # Object key convention (matches the rest of the platform):
+            #   draft/{userId}/{uuid4}-{safeOriginalName}.docx
+            # A fresh UUID per upload prevents collisions across revisions
+            # and across users re-using the same draft title. The user id
+            # scopes the object to its owner for easy lifecycle policies.
+            import uuid as _uuid
+
+            safe_user = user_id or "anonymous"
+            safe_name = _safe_filename(draft_title) + ".docx"
+            file_uuid = _uuid.uuid4().hex
+            blob_name = (
+                f"{_DRAFT_GCS_PREFIX}/{safe_user}/{file_uuid}-{safe_name}"
+            )
+            await asyncio.to_thread(
+                _gcs.upload_bytes,
+                bucket,
+                blob_name,
+                docx_bytes,
+                _DOCX_MIME,
+            )
+            # V2 signed URL — long-lived (~25 years), works under UBLA.
+            # Matches the platform's TS uploader (expires 2050-01-01).
+            url = await asyncio.to_thread(
+                _gcs.generate_signed_url, bucket, blob_name
+            )
+            logger.success(
+                "DOCX exported (user={}, workspace={}, session={}, "
+                "version={}, path={}): {}",
+                safe_user,
+                workspace_id or "-",
+                actionable_id or "-",
+                version,
+                path_used,
+                url,
+            )
+            return url
+        except Exception as e:
+            logger.warning(
+                "DOCX export failed (workspace={}, session={}, version={}): {}",
+                workspace_id,
+                actionable_id,
+                version,
+                e,
+            )
+            return None
+
+    async def _lazy_backfill_template_skeleton(
+        self,
+        *,
+        tpl: Dict[str, Any],
+        user_id: str,
+        template_id: str,
+        bucket: str,
+    ) -> Optional[bytes]:
+        """Re-download a legacy template's bytes and persist them to GCS.
+
+        Best-effort: returns the bytes on success so the current render
+        can use them; the cache is updated in the background so subsequent
+        renders skip the round-trip.
+        """
+        source_url = tpl.get("source_url")
+        if not source_url:
+            return None
+        ext = (tpl.get("extension") or "").lower()
+        try:
+            from app.processing.document_processor import document_processor
+
+            if not document_processor.http_client:
+                await document_processor.initialize()
+            content, _size = await document_processor._download_file(
+                source_url,
+                _filename_for_extraction(
+                    tpl.get("name") or "template",
+                    ext or "docx",
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Lazy template re-download failed (template={}, url expired?): {}",
+                template_id,
+                exc,
+            )
+            return None
+
+        # PDFs need conversion before we can store them as an editable
+        # DOCX skeleton. Conversion is best-effort; on failure we abort
+        # the backfill and the dispatcher falls through to skeleton_clone.
+        if ext == "pdf":
+            try:
+                from app.processing.pdf_to_docx import convert_pdf_to_docx
+
+                converted = await asyncio.to_thread(
+                    convert_pdf_to_docx, content, tpl.get("name") or "template",
+                )
+                if not converted:
+                    logger.warning(
+                        "Lazy PDF→DOCX conversion produced no usable output "
+                        "(template={}) — skipping backfill",
+                        template_id,
+                    )
+                    return None
+                content = converted
+            except Exception as exc:
+                logger.warning(
+                    "Lazy PDF→DOCX conversion raised (template={}): {}",
+                    template_id, exc,
+                )
+                return None
+
+        try:
+            from app.storage import gcs as _gcs
+
+            blob_name = f"{_TEMPLATE_GCS_PREFIX}/{user_id}/{template_id}.docx"
+            await asyncio.to_thread(
+                _gcs.upload_bytes,
+                bucket,
+                blob_name,
+                content,
+                _DOCX_MIME,
+                public=False,
+            )
+            new_uri = f"gs://{bucket}/{blob_name}"
+        except Exception as exc:
+            logger.warning(
+                "Lazy template upload to GCS failed (template={}): {}",
+                template_id,
+                exc,
+            )
+            return content  # still usable for this render
+
+        try:
+            from app.vectorstore.qdrant import vector_store
+
+            updated_payload = dict(tpl)
+            updated_payload["template_docx_gcs_uri"] = new_uri
+            await vector_store.upsert_user_state_cache(
+                user_id=user_id,
+                kind=TEMPLATE_CACHE_KIND,
+                scope_id=template_id,
+                data=updated_payload,
+            )
+            logger.info(
+                "Lazy backfill complete — template={} now has skeleton at {}",
+                template_id,
+                new_uri,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Lazy template cache update failed (template={}): {}",
+                template_id,
+                exc,
+            )
+
+        return content
 
     # ------------------------------------------------------------------ render
 
@@ -2766,6 +4109,7 @@ OUTPUT FORMAT:
         template_text: Optional[str] = None
         template_name: Optional[str] = session_state.get("template_name")
         template_id: Optional[str] = session_state.get("template_id")
+        tpl: Optional[Dict[str, Any]] = None
         if template_id and user_id:
             tpl = await self.get_template(user_id=user_id, template_id=template_id)
             if tpl:
@@ -2795,11 +4139,16 @@ OUTPUT FORMAT:
             revision_instruction=revision_instruction,
         )
         try:
+            # 32000 tokens ≈ 30–40 pages of typical legal prose, giving
+            # long templates (rejoinders, evidence affidavits, multi-
+            # affidavit packs) room to render in full. Previous 12000-
+            # cap truncated long renders mid-sentence and the user only
+            # saw a partial draft.
             raw = await gemini_client.generate(
                 prompt,
                 system_instruction=DRAFT_RENDER_INSTRUCTION,
                 temperature=0.35,
-                max_tokens=12000,
+                max_tokens=32000,
             )
         except Exception as e:
             logger.error("Draft render LLM call failed: {}", e)
@@ -2819,6 +4168,28 @@ OUTPUT FORMAT:
             )
             return session_state
 
+        # Generate the .docx artifact, upload to GCS, and collect the
+        # download URL. Any failure here is non-fatal — markdown still
+        # ships in `draftDocument.content` and the URL is simply
+        # omitted. Case context is forwarded so the placeholder-fill
+        # path (when the template uses [bracket]-style slots) can map
+        # each slot to a value from the lawyer's gathered facts.
+        download_url: Optional[str] = await self._export_draft_docx(
+            markdown=markdown,
+            draft_title=draft_title,
+            tpl=tpl,
+            user_id=user_id,
+            template_id=template_id,
+            workspace_id=session_state.get("workspace_id") or "",
+            actionable_id=session_state.get("actionable_id") or "",
+            version=new_version,
+            role=role,
+            case_summary=case_summary,
+            case_facts_brief=case_facts,
+            gathered_facts=gathered,
+            lawyer_instructions=lawyer_instructions,
+        )
+
         draft_document = {
             "title": draft_title,
             "format": "markdown",
@@ -2828,6 +4199,7 @@ OUTPUT FORMAT:
             "sourceTemplateName": template_name,
             "sourceType": source_value,
             "wordCount": _word_count(markdown),
+            "downloadUrl": download_url,
         }
         # Conversational lead-in mirroring the screenshots (
         # "I have prepared the complete bail application below...")

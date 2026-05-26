@@ -1737,3 +1737,337 @@ def build_template_fill_prompt(
     )
     return "\n\n".join(parts)
 
+
+# ---------------------------------------------------------------------------
+# docxtpl path — runs ONCE per template at ingest to identify variable
+# regions, then PER DRAFT to fill them.
+# ---------------------------------------------------------------------------
+
+
+TEMPLATE_ANNOTATION_INSTRUCTION = (
+    "You are converting a lawyer's DOCX template into a reusable Jinja2 "
+    "template. Identify ONLY the regions that change between drafts — "
+    "recipient names and addresses, case numbers, dates, factual "
+    "narratives, prayer wording, signatures, amounts. Leave every "
+    "template-fixed element ALONE: firm name, firm address, advocate "
+    "block, chamber header, advocate roll number, statutory boilerplate, "
+    "letterhead, fixed legal phrasing.\n\n"
+    "OUTPUT — strict JSON array (no markdown fences, no commentary). "
+    "Each item:\n"
+    '{\n'
+    '  "name": "snake_case_variable",\n'
+    '  "original_text": "<verbatim text from the template that will be replaced>",\n'
+    '  "context_before": "<5-10 chars immediately preceding original_text>",\n'
+    '  "context_after": "<5-10 chars immediately following original_text>",\n'
+    '  "hint": "<one-line human description>",\n'
+    '  "multi_paragraph": false\n'
+    '}\n\n'
+    "Rules:\n"
+    "1. `original_text` MUST appear verbatim in the template — character-"
+    "for-character. If a region in the template already uses a "
+    "placeholder convention ([Name], <date>, {{x}}, _______), the "
+    "`original_text` is that placeholder token (including delimiters).\n"
+    "2. `context_before` and `context_after` are short anchors used to "
+    "disambiguate when `original_text` appears multiple times. Use "
+    "verbatim text from the template — do NOT invent.\n"
+    "3. Variable names MUST be unique. If two regions hold semantically "
+    "similar but distinct content (e.g. two different recipients), name "
+    "them `recipient_name` and `recipient_name_secondary`, etc.\n"
+    "4. Set `multi_paragraph: true` ONLY when the variable region spans "
+    "more than one paragraph in the template (e.g. a multi-paragraph "
+    "facts narrative or prayer block). Otherwise `false`.\n"
+    "5. NEVER annotate: firm/chamber name, firm/chamber address, "
+    "advocate name on the letterhead, advocate roll number, advocate "
+    "phone/email when part of the letterhead, statutory citation text "
+    "(\"under Section 138 of the Negotiable Instruments Act, 1881\" is "
+    "boilerplate, NOT a variable), \"Yours faithfully\" / \"Yours "
+    "sincerely\" sign-offs, court name when fixed (e.g. \"In the Court "
+    "of the Chief Metropolitan Magistrate, New Delhi\"), generic "
+    "salutations.\n"
+    "6. If a region is purely fixed boilerplate, do not output it at "
+    "all. Empty array is acceptable.\n"
+    "7. Indian-law grounding: BNS / BNSS / BSA / IT Act, NOT IPC."
+)
+
+
+def build_template_annotation_prompt(
+    *,
+    document_type: str,
+    template_text: str,
+    classification_hints: Optional[str] = None,
+) -> str:
+    """User prompt for the template-annotation call.
+
+    Run ONCE per template at ingest. The model returns the JSON array
+    described in ``TEMPLATE_ANNOTATION_INSTRUCTION``; the caller then
+    locates each ``original_text`` in the DOCX and replaces it with the
+    Jinja2 placeholder via
+    :func:`app.processing.docx_generator.annotate_docx_with_variables`.
+    """
+    parts: List[str] = []
+    parts.append(f"DOCUMENT TYPE: {document_type or 'unknown'}")
+    if classification_hints:
+        parts.append(f"CLASSIFICATION HINTS:\n{classification_hints.strip()}")
+    parts.append(
+        "TEMPLATE TEXT (each line is one paragraph of the lawyer's "
+        "uploaded DOCX — preserve verbatim spellings/spacing in your "
+        "`original_text` and context anchors):\n" + (template_text or "").strip()
+    )
+    parts.append(
+        "Return ONLY the JSON array. Variables only — no boilerplate, no "
+        "firm/chamber/advocate fixed content. If the template is purely "
+        "fixed text with nothing variable, return `[]`."
+    )
+    return "\n\n".join(parts)
+
+
+DOCXTPL_FILL_INSTRUCTION = (
+    "You are filling the variables of a Jinja2-annotated lawyer's "
+    "template. The template has already been annotated with named "
+    "placeholders ({{ recipient_name }}, {{ facts }}, etc.) — your job "
+    "is to produce a JSON object mapping each variable name to its "
+    "final value. The renderer (docxtpl) will inject your values into "
+    "the EXACT lawyer template; you control content, never formatting.\n\n"
+    "Rules:\n"
+    "1. Output keys MUST EXACTLY match the variable names in the schema "
+    "below (case-sensitive, including underscores). Include every "
+    "variable listed.\n"
+    "2. Values are PLAIN TEXT — no Markdown headings, no bullet "
+    "characters, no `**bold**` syntax. Bold/italic come from the "
+    "template's run formatting; you only supply text.\n"
+    "3. For variables flagged `multi_paragraph: true`, use \\n\\n "
+    "between paragraphs. For single-paragraph variables, do NOT include "
+    "paragraph breaks.\n"
+    "4. Indian-law grounding: BNS / BNSS / BSA / IT Act / NDPS / IT Act "
+    "/ etc., NOT IPC.\n"
+    "5. Use named parties exactly as they appear in the case facts — "
+    "no `Petitioner` / `Respondent` / `Party No. 1` placeholders.\n"
+    "6. Dates in DD/MM/YYYY unless the template hint says otherwise.\n"
+    "7. If a value is genuinely unknown from the facts, return an empty "
+    "string for that variable — do NOT invent.\n"
+    "8. OUTPUT — strict JSON object only. No markdown fences, no "
+    "commentary, no extra keys."
+)
+
+
+def build_docxtpl_fill_prompt(
+    *,
+    role: str,
+    case_summary: str,
+    case_facts_brief: str,
+    gathered_facts_json: str,
+    variable_schema: List[dict],
+    lawyer_instructions: Optional[str] = None,
+) -> str:
+    """User prompt for the docxtpl variable-fill call.
+
+    Args:
+        variable_schema: list of ``{"name": str, "hint": str,
+            "multi_paragraph": bool}`` — one entry per Jinja2 variable
+            present in the annotated template. The AI must produce a
+            JSON object whose keys are exactly these names.
+    """
+    parts: List[str] = []
+    parts.append(f"ROLE: {role}")
+    if case_summary:
+        parts.append(f"CASE SUMMARY:\n{case_summary.strip()}")
+    if case_facts_brief:
+        parts.append(f"CASE FACTS BRIEF:\n{case_facts_brief.strip()}")
+    if gathered_facts_json:
+        parts.append(
+            "FACTS COLLECTED FROM LAWYER (JSON):\n" + gathered_facts_json
+        )
+    if lawyer_instructions:
+        parts.append(f"LAWYER INSTRUCTIONS:\n{lawyer_instructions.strip()}")
+
+    parts.append("VARIABLE SCHEMA (one row per Jinja2 variable in the template):")
+    for var in variable_schema or []:
+        name = (var.get("name") or "").strip()
+        hint = (var.get("hint") or "").strip()
+        multi = bool(var.get("multi_paragraph", False))
+        if not name:
+            continue
+        parts.append(
+            f'  "{name}": hint="{hint}", multi_paragraph={str(multi).lower()}'
+        )
+
+    parts.append(
+        "Return a strict JSON object whose keys are EXACTLY the variable "
+        "names above, with plain-text values. Empty string for unknowns. "
+        "No extra keys, no markdown."
+    )
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Turn router — runs on EVERY turn after the cheap deterministic shortcuts
+# have missed (greeting / explicit kickoff / incompatible-template flow /
+# gathering_info short-circuit / finalize phrase / option-pick / affirm- or
+# negate-with-menu). The router picks the next action and (for chat-like
+# actions) emits the assistant reply inline so we never need a second call.
+# ---------------------------------------------------------------------------
+
+
+DRAFTING_ROUTER_INSTRUCTION = (
+    "You are the TURN ROUTER for an Indian legal drafting assistant. "
+    "Given the session state, recent conversation, and the lawyer's new "
+    "message, decide which ACTION the assistant should take next AND "
+    "(when applicable) produce the assistant's reply text. You are NOT "
+    "drafting documents here — you are deciding what happens next.\n\n"
+    "AVAILABLE ACTIONS:\n\n"
+    "1. chat_reply — Plain conversation, legal Q&A, status questions, "
+    "small talk, fallback. Produce a complete reply in "
+    "`assistant_message`. Use this when the lawyer is asking a question, "
+    "making an observation, or saying something that does NOT clearly "
+    "match the other actions.\n\n"
+    "2. post_draft_ack — The lawyer is merely acknowledging the draft "
+    "you delivered (\"thanks\", \"looks good\", \"perfect\", \"ok\", "
+    "\"done thanks\"). NO state change. Produce a short, warm closing "
+    "in `assistant_message` (e.g. \"Glad the draft works. Let me know "
+    "if you want any edits.\"). Only choose this when a draft has "
+    "already been delivered AND the lawyer's message is pure "
+    "acknowledgement with no new request.\n\n"
+    "3. propose_alternatives — The lawyer rejected the previous offer, "
+    "seems stuck, or asked a vague \"what next\" question. Produce a "
+    "reply in `assistant_message` that lists 2-3 concrete alternative "
+    "documents or actions relevant to THIS case, in this EXACT format:\n"
+    "  \"<one-line lead-in tying to the case>\\n\\n"
+    "  1. **<Document Title>** — <one-line description>\\n"
+    "  2. **<Document Title>** — <one-line description>\\n"
+    "  3. **<Document Title>** — <one-line description>\\n\\n"
+    "  <one-line closing prompt>\"\n"
+    "The numbered ``N. **Title**`` format is REQUIRED — it lets the "
+    "next turn detect the menu and resolve picks.\n\n"
+    "4. kickoff_new_draft — The lawyer wants to START a new draft "
+    "(different document, fresh attempt, switching topics). Provide "
+    "`params.document_type` — a clean canonical name "
+    "(e.g. \"Bail Application\", \"Consumer Complaint\", "
+    "\"Legal Notice\"). DO NOT include `assistant_message` — the "
+    "kickoff handler produces its own scoping output. Trigger phrases: "
+    "\"draft\", \"create\", \"give me\", \"prepare\", \"I want\", "
+    "\"can you make\", or any clear request for a specific document "
+    "type.\n\n"
+    "5. revise_draft — The lawyer wants edits to the EXISTING draft "
+    "(\"tighten the prayer\", \"add a clause about jurisdiction\", "
+    "\"remove paragraph 7\", \"make the facts more concise\"). Provide "
+    "`params.revision_instruction` — the lawyer's verbatim instruction "
+    "if useful, or a clean rephrasing. DO NOT include "
+    "`assistant_message` — the revision handler re-renders.\n\n"
+    "6. translate_draft — The lawyer wants the existing draft in "
+    "another language (\"translate to Hindi\", \"Marathi version\", "
+    "\"convert this to Tamil\"). Provide `params.target_language` — the "
+    "language name (e.g. \"Hindi\", \"Marathi\", \"Tamil\", "
+    "\"Bengali\"). DO NOT include `assistant_message`.\n\n"
+    "DECISION RULES:\n"
+    "- If draft_status is not \"ready\", actions 2/5/6 are usually "
+    "wrong — the lawyer has no draft yet to ack / revise / translate.\n"
+    "- If the lawyer names a NEW document type that differs from the "
+    "current draft_title, prefer kickoff_new_draft over revise_draft.\n"
+    "- Edits to the SAME document are revise_draft; switching to a "
+    "different document is kickoff_new_draft.\n"
+    "- Bare \"yes\" / \"ok\" with no menu pending and no clear ask → "
+    "post_draft_ack (if a draft exists) or chat_reply (otherwise).\n"
+    "- Bare \"no\" with no menu pending and no clear ask → chat_reply "
+    "asking what the lawyer would like to change.\n"
+    "- Indian-law grounding: BNS / BNSS / BSA / IT Act, NOT IPC. Never "
+    "cite IPC sections in `assistant_message`.\n"
+    "- Never invent facts not present in the case context.\n"
+    "- Never produce markdown code fences in the output.\n\n"
+    "OUTPUT — strict JSON object only:\n"
+    '{\n'
+    '  "action": "chat_reply|post_draft_ack|propose_alternatives|kickoff_new_draft|revise_draft|translate_draft",\n'
+    '  "params": {"document_type": "...", "revision_instruction": "...", "target_language": "..."},\n'
+    '  "assistant_message": "...",\n'
+    '  "reasoning": "<one short sentence>"\n'
+    '}\n'
+    "Include only the `params` keys relevant to the chosen action. "
+    "Include `assistant_message` only for chat_reply / post_draft_ack / "
+    "propose_alternatives."
+)
+
+
+def build_router_prompt(
+    *,
+    user_message: str,
+    role: str,
+    case_summary: str,
+    case_facts_brief: str,
+    draft_status: str,
+    draft_title: str,
+    last_draft_preview: str,
+    has_pending_menu: bool,
+    pending_menu_options: List[str],
+    gathered_facts_keys: List[str],
+    template_id: Optional[str],
+    template_name: Optional[str],
+    conversation_history: List[dict],
+) -> str:
+    """Assemble the per-turn router user prompt.
+
+    Keeps payload tight: session-state snapshot, case context, last 6
+    turns of conversation (trimmed), and the new user message. The
+    system instruction (``DRAFTING_ROUTER_INSTRUCTION``) carries the
+    action vocabulary and decision rules.
+    """
+    parts: List[str] = []
+
+    # Session state snapshot.
+    state_lines: List[str] = []
+    state_lines.append(f"- draft_status: {draft_status or '(none)'}")
+    state_lines.append(f"- draft_title: {draft_title or '(none)'}")
+    state_lines.append(f"- has_delivered_draft: {bool(last_draft_preview)}")
+    if last_draft_preview:
+        preview = last_draft_preview.strip().replace("\n", " ")[:240]
+        state_lines.append(f"- last_draft_preview_240: {preview!r}")
+    state_lines.append(f"- has_pending_menu: {bool(has_pending_menu)}")
+    if has_pending_menu and pending_menu_options:
+        opts_str = ", ".join(f'"{o}"' for o in pending_menu_options[:6])
+        state_lines.append(f"- pending_menu_options: [{opts_str}]")
+    if gathered_facts_keys:
+        state_lines.append(
+            "- gathered_facts_keys: ["
+            + ", ".join(f'"{k}"' for k in gathered_facts_keys[:12])
+            + "]"
+        )
+    if template_id:
+        state_lines.append(
+            f"- template: id={template_id!r}, name={(template_name or '')!r}"
+        )
+    parts.append("SESSION STATE:\n" + "\n".join(state_lines))
+
+    # Case context.
+    case_lines: List[str] = [f"- role: {role or 'ADJUDICATOR'}"]
+    if case_summary:
+        case_lines.append(f"- case_summary: {case_summary.strip()[:1200]}")
+    if case_facts_brief:
+        case_lines.append(f"- case_facts_brief: {case_facts_brief.strip()[:600]}")
+    parts.append("CASE CONTEXT:\n" + "\n".join(case_lines))
+
+    # Last 6 turns, content trimmed to 400 chars per side.
+    history_lines: List[str] = []
+    for turn in (conversation_history or [])[-6:]:
+        if not isinstance(turn, dict):
+            continue
+        who = (turn.get("role") or "").strip().lower()
+        content = (turn.get("content") or "").strip()
+        if not content:
+            continue
+        if who in {"user", "human", "lawyer"}:
+            history_lines.append(f"LAWYER: {content[:400]}")
+        elif who in {"assistant", "ai", "bot", "model"}:
+            history_lines.append(f"ASSISTANT: {content[:400]}")
+    if history_lines:
+        parts.append("RECENT CONVERSATION (most recent 6 turns):\n"
+                     + "\n".join(history_lines))
+    else:
+        parts.append("RECENT CONVERSATION: (no prior turns)")
+
+    parts.append(f"NEW LAWYER MESSAGE: {(user_message or '').strip()[:1500]}")
+
+    parts.append(
+        "Pick ONE action from the system instruction and return the "
+        "strict JSON object. Include `assistant_message` only for "
+        "chat_reply / post_draft_ack / propose_alternatives."
+    )
+
+    return "\n\n".join(parts)

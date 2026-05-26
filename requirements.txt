@@ -71,3 +71,11 @@ rapidfuzz>=3.0
 pdf2docx>=0.5.1
 PyMuPDF>=1.23
 
+# Drafting Assistant — Jinja2-templated DOCX rendering for exact
+# template preservation. Used by the docxtpl render path: lawyer
+# templates are annotated with {{ var }} placeholders at ingest, then
+# docxtpl injects AI-generated content into the EXACT same DOCX —
+# preserving logo, headers/footers, fonts, margins, advocate block,
+# numbering and page flow byte-for-byte.
+docxtpl>=0.16.7
+

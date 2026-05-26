@@ -698,3 +698,311 @@ def render_markdown_to_docx(
                 exc,
             )
     return _render_with_defaults(markdown_text)
+
+
+# ---------------------------------------------------------------------------
+# docxtpl path — exact template preservation via Jinja2-annotated DOCX.
+#
+# Two helpers:
+#   * annotate_docx_with_variables() — runs ONCE per template at ingest.
+#     Locates every variable region in the lawyer's DOCX (using the
+#     AI-produced variable_specs) and rewrites the text of the matching
+#     runs in-place to ``{{ var_name }}``. Run-level formatting
+#     (font/size/bold/italic) is preserved because we mutate ``run.text``
+#     without recreating the run object — this is the key trick.
+#   * render_with_docxtpl() — runs PER DRAFT. Takes annotated DOCX bytes
+#     plus a {var_name -> value} dict and lets ``docxtpl`` render the
+#     final document. Output is byte-identical to the annotated template
+#     except for the variable text.
+# ---------------------------------------------------------------------------
+
+
+def _normalize_for_match(s: str) -> str:
+    """Whitespace-collapsed lowercase. Used for fuzzy region locating."""
+    import re
+
+    return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+
+def _iter_text_runs(doc: _DocxDocument):
+    """Yield every editable text run in the document.
+
+    Walks body paragraphs (including those inside tables) AND header /
+    footer paragraphs across all sections. Runs inside text boxes are not
+    covered — those are rare in legal templates and require a deeper XML
+    walk; we accept that limitation.
+    """
+    for para in doc.paragraphs:
+        for run in para.runs:
+            yield run, para
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    for run in para.runs:
+                        yield run, para
+    for section in doc.sections:
+        for container in (
+            section.header,
+            section.footer,
+            section.first_page_header,
+            section.first_page_footer,
+            section.even_page_header,
+            section.even_page_footer,
+        ):
+            try:
+                for para in container.paragraphs:
+                    for run in para.runs:
+                        yield run, para
+            except Exception:
+                # Some headers/footers may not exist; skip silently.
+                continue
+
+
+def _find_paragraph_containing(
+    doc: _DocxDocument,
+    needle_norm: str,
+    *,
+    context_before_norm: str = "",
+    context_after_norm: str = "",
+):
+    """Locate the paragraph whose normalized text contains ``needle_norm``.
+
+    Disambiguates by context when provided — preferred match is one whose
+    text also contains both context strings.
+    """
+    if not needle_norm:
+        return None
+
+    candidates = []
+    for para in doc.paragraphs:
+        text_norm = _normalize_for_match(para.text)
+        if needle_norm and needle_norm in text_norm:
+            candidates.append((para, text_norm))
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    text_norm = _normalize_for_match(para.text)
+                    if needle_norm and needle_norm in text_norm:
+                        candidates.append((para, text_norm))
+
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0][0]
+
+    # Disambiguate by context anchors.
+    for para, text_norm in candidates:
+        if context_before_norm and context_before_norm not in text_norm:
+            continue
+        if context_after_norm and context_after_norm not in text_norm:
+            continue
+        return para
+
+    # Fall back to the first candidate — ambiguous but predictable.
+    return candidates[0][0]
+
+
+def _replace_text_in_paragraph_preserving_format(
+    paragraph,
+    old_text: str,
+    new_text: str,
+) -> bool:
+    """Replace ``old_text`` with ``new_text`` across runs in ``paragraph``.
+
+    Splitting / merging runs is avoided wherever possible: when the entire
+    ``old_text`` sits inside a single run we mutate that run's text only,
+    preserving its font / size / bold / italic exactly. When it spans
+    multiple runs, the leading run absorbs ``new_text`` and the trailing
+    runs are cleared (acceptable because variable regions are typically
+    homogeneously styled).
+
+    Returns True if a replacement was made.
+    """
+    if not old_text or not paragraph.runs:
+        return False
+
+    full_text = "".join(r.text for r in paragraph.runs)
+    if old_text not in full_text:
+        return False
+
+    start_idx = full_text.find(old_text)
+    end_idx = start_idx + len(old_text)
+
+    # Map character offsets to run indices.
+    run_spans = []
+    cursor = 0
+    for run in paragraph.runs:
+        run_spans.append((cursor, cursor + len(run.text), run))
+        cursor += len(run.text)
+
+    affected = [
+        (s, e, r)
+        for (s, e, r) in run_spans
+        if not (e <= start_idx or s >= end_idx)
+    ]
+    if not affected:
+        return False
+
+    if len(affected) == 1:
+        s, e, run = affected[0]
+        local_start = start_idx - s
+        local_end = end_idx - s
+        run.text = run.text[:local_start] + new_text + run.text[local_end:]
+        return True
+
+    # Multi-run span: put ``new_text`` into the first affected run (with
+    # whatever leading slice it already had), clear the rest within the
+    # region.
+    first_s, first_e, first_run = affected[0]
+    last_s, last_e, last_run = affected[-1]
+    first_local = start_idx - first_s
+    last_local = end_idx - last_s
+    first_run.text = first_run.text[:first_local] + new_text
+    for (s, e, run) in affected[1:-1]:
+        run.text = ""
+    last_run.text = last_run.text[last_local:]
+    return True
+
+
+def annotate_docx_with_variables(
+    template_docx_bytes: bytes,
+    variable_specs: List[dict],
+) -> Tuple[bytes, List[dict]]:
+    """Inject Jinja2 placeholders into a lawyer's DOCX template.
+
+    ``variable_specs`` is the AI-produced list. Each item must carry:
+
+    * ``name``               — snake_case variable name (e.g. ``recipient_name``)
+    * ``original_text``      — verbatim text in the template to replace
+    * ``context_before``     — 5-10 chars of preceding text (disambiguation)
+    * ``context_after``      — 5-10 chars of following text (disambiguation)
+    * ``hint`` (optional)    — human description, surfaced to frontend
+    * ``multi_paragraph``    — bool, default False
+
+    Returns ``(annotated_docx_bytes, applied_specs)``. Specs whose
+    ``original_text`` could not be located are dropped from the second
+    return value — caller can compare lengths to detect partial success.
+
+    Run-level formatting (font, size, bold, italic) is preserved because
+    we mutate ``run.text`` without re-creating the run.
+    """
+    if not template_docx_bytes:
+        raise ValueError("template_docx_bytes is empty")
+
+    doc = Document(BytesIO(template_docx_bytes))
+
+    applied: List[dict] = []
+    seen_names = set()
+    for spec in variable_specs or []:
+        if not isinstance(spec, dict):
+            continue
+        name = (spec.get("name") or "").strip()
+        original = spec.get("original_text") or ""
+        if not name or not original:
+            continue
+        if name in seen_names:
+            # Duplicate names from the AI; skip subsequent occurrences so
+            # we don't accidentally point two regions at the same Jinja
+            # variable.
+            continue
+
+        needle_norm = _normalize_for_match(original)
+        ctx_before_norm = _normalize_for_match(spec.get("context_before") or "")
+        ctx_after_norm = _normalize_for_match(spec.get("context_after") or "")
+        para = _find_paragraph_containing(
+            doc,
+            needle_norm,
+            context_before_norm=ctx_before_norm,
+            context_after_norm=ctx_after_norm,
+        )
+        if para is None:
+            logger.debug(
+                "annotate_docx: could not locate variable '{}' (original={!r})",
+                name,
+                original[:60],
+            )
+            continue
+
+        placeholder = "{{ " + name + " }}"
+        # Find the actual substring in the paragraph text that matches our
+        # normalized needle, so the replacement preserves the original
+        # surrounding whitespace exactly.
+        actual_text = para.text
+        if original in actual_text:
+            replaced = _replace_text_in_paragraph_preserving_format(
+                para, original, placeholder
+            )
+        else:
+            # Try a normalized search to find the actual substring bounds.
+            actual_norm = _normalize_for_match(actual_text)
+            if needle_norm in actual_norm:
+                # Fall back to replacing the longest unique substring of
+                # the run text that overlaps with needle_norm. Practical
+                # heuristic: replace the whole paragraph text in one shot,
+                # losing intra-paragraph formatting but preserving the
+                # paragraph's style. We only do this when the paragraph is
+                # mostly the variable.
+                if len(needle_norm) >= 0.7 * max(1, len(actual_norm)):
+                    if paragraph_runs := para.runs:
+                        paragraph_runs[0].text = placeholder
+                        for r in paragraph_runs[1:]:
+                            r.text = ""
+                        replaced = True
+                    else:
+                        replaced = False
+                else:
+                    replaced = False
+            else:
+                replaced = False
+
+        if replaced:
+            seen_names.add(name)
+            applied.append(
+                {
+                    "name": name,
+                    "hint": spec.get("hint") or "",
+                    "multi_paragraph": bool(spec.get("multi_paragraph", False)),
+                }
+            )
+
+    out = BytesIO()
+    doc.save(out)
+    return out.getvalue(), applied
+
+
+def render_with_docxtpl(
+    annotated_docx_bytes: bytes,
+    context: dict,
+) -> bytes:
+    """Render an annotated DOCX with ``docxtpl``.
+
+    ``context`` must be a flat ``{var_name: value}`` mapping. Values are
+    coerced to strings; ``None`` becomes an empty string. Multi-paragraph
+    values can be passed as ``"para1\\n\\npara2"`` — ``docxtpl`` handles
+    newlines inside paragraph-level variables.
+
+    Raises ``RuntimeError`` if ``docxtpl`` is not installed.
+    """
+    try:
+        from docxtpl import DocxTemplate
+    except ImportError as exc:
+        raise RuntimeError(
+            "docxtpl is not installed — run `pip install docxtpl>=0.16.7`"
+        ) from exc
+
+    safe_context = {}
+    for key, value in (context or {}).items():
+        if value is None:
+            safe_context[key] = ""
+        elif isinstance(value, (list, tuple)):
+            safe_context[key] = "\n".join(str(v) for v in value if v is not None)
+        else:
+            safe_context[key] = str(value)
+
+    tpl = DocxTemplate(BytesIO(annotated_docx_bytes))
+    tpl.render(safe_context)
+    out = BytesIO()
+    tpl.save(out)
+    return out.getvalue()

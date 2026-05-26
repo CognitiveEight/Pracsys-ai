@@ -418,6 +418,15 @@ class DraftingSuggestionItem(BaseModel):
     One suggested draft in the proactive Drafting Assistant panel.
 
     Emitted inside document_feature_response payload.suggestedDrafts[].
+
+    Template pre-match fields (``templateId`` / ``templateName`` /
+    ``matchMode``) are populated by ``DraftingAgent.suggest()`` when a
+    template in the lawyer's library matches the suggestion. When set,
+    the frontend can render a "Uses <template name>" badge and pass
+    ``templateId`` straight through on click so the kickoff handler
+    skips a second matcher round-trip. When unset (None), the click
+    flow falls back to a blank-source kickoff and the AI infers a
+    standard Indian-advocate skeleton from the case context alone.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -425,6 +434,13 @@ class DraftingSuggestionItem(BaseModel):
     title: str
     relevance: Literal["High", "Medium", "Low"] = "Medium"
     description: Optional[str] = None  # one-line summary, <= 160 chars
+    templateId: Optional[str] = None
+    templateName: Optional[str] = None
+    # Debug / UX hint — "type-match", "anchor-match", "tiebreak" when
+    # a template was matched; "no-match" when the library had no
+    # suitable template; None when matching was not attempted (e.g.
+    # legacy callers or empty library).
+    matchMode: Optional[str] = None
 
 
 class DraftingSuggestionsPayload(BaseModel):

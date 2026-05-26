@@ -38,6 +38,7 @@ from app.prompts.drafting import (
     DRAFT_RENDER_INSTRUCTION,
     DRAFT_TRANSLATE_INSTRUCTION,
     DRAFTING_CHAT_INSTRUCTION,
+    DRAFTING_ROUTER_INSTRUCTION,
     SUGGESTED_DRAFTS_INSTRUCTION,
     TEMPLATE_CLASSIFY_INSTRUCTION,
     TEMPLATE_DIFF_INSTRUCTION,
@@ -48,6 +49,7 @@ from app.prompts.drafting import (
     build_chat_reply_prompt,
     build_draft_render_prompt,
     build_draft_translate_prompt,
+    build_router_prompt,
     build_suggested_drafts_prompt,
     build_template_classify_prompt,
     build_template_diff_prompt,
@@ -257,11 +259,20 @@ class DraftingAgent:
         strategy_brief: str = "",
         analysis_brief: str = "",
         list_of_dates_brief: str = "",
+        user_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Return 4–6 proactive draft suggestions for the workspace.
 
-        Falls back to an empty list on any failure — callers should not block
-        workspace creation on this feature.
+        When ``user_id`` is supplied, each suggestion is also pre-matched
+        against the lawyer's template library so the response carries
+        ``templateId`` / ``templateName`` / ``matchMode`` for the
+        frontend to render — and so the click path can skip a second
+        matcher round-trip and pass ``templateId`` straight to the
+        kickoff handler. Legacy callers that omit ``user_id`` get the
+        original shape (no template fields).
+
+        Falls back to an empty list on any failure — callers should not
+        block workspace creation on this feature.
         """
         prompt = build_suggested_drafts_prompt(
             role=role,
@@ -290,12 +301,79 @@ class DraftingAgent:
                 "Drafting suggestions produced no items (raw preview: {})",
                 (raw or "")[:200],
             )
-        else:
-            logger.success(
-                "Drafting suggestions: {} item(s) ready",
-                len(suggestions),
-            )
+            return suggestions
+
+        # Pre-match templates per suggestion so the lawyer sees which
+        # template (if any) will be used before clicking. Runs in
+        # parallel; per-item failures degrade gracefully (item just
+        # lacks the template fields, click path will re-match).
+        if user_id:
+            try:
+                suggestions = await self._attach_template_matches(
+                    user_id=user_id, suggestions=suggestions
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Pre-match for suggestions failed (non-fatal): {}", exc
+                )
+
+        logger.success(
+            "Drafting suggestions: {} item(s) ready (pre-matched={})",
+            len(suggestions),
+            bool(user_id),
+        )
         return suggestions
+
+    async def _attach_template_matches(
+        self,
+        *,
+        user_id: str,
+        suggestions: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Run ``_find_matching_template_for_suggestion`` per suggestion
+        in parallel and attach ``templateId`` / ``templateName`` /
+        ``matchMode`` to each item.
+
+        Per-item failures are isolated — a single matcher failure does
+        not poison the whole panel; the item just comes back without
+        the template fields (frontend behaves as if no match was
+        attempted).
+        """
+
+        async def _match_one(item: Dict[str, Any]) -> Dict[str, Any]:
+            title = (item.get("title") or "").strip()
+            description = (item.get("description") or "").strip()
+            try:
+                payload, library_size = await self._find_matching_template_for_suggestion(
+                    user_id=user_id,
+                    suggestion_title=title,
+                    suggestion_description=description,
+                    fallback_text="",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Pre-match for suggestion {!r} failed: {}", title[:60], exc
+                )
+                return item  # leave fields unset; click-time matcher will retry
+
+            enriched = dict(item)
+            if payload and isinstance(payload, dict):
+                enriched["templateId"] = payload.get("template_id") or None
+                enriched["templateName"] = payload.get("name") or None
+                enriched["matchMode"] = "matched"
+            elif library_size > 0:
+                enriched["templateId"] = None
+                enriched["templateName"] = None
+                enriched["matchMode"] = "no-match"
+            else:
+                # Empty library: no point asserting "no match" — the
+                # lawyer hasn't given us anything to match against.
+                enriched["templateId"] = None
+                enriched["templateName"] = None
+                enriched["matchMode"] = None
+            return enriched
+
+        return await asyncio.gather(*(_match_one(s) for s in suggestions))
 
     # ------------------------------------------------------------------
     # 2) Template ingestion (called from template_sync handler)
@@ -1321,7 +1399,20 @@ class DraftingAgent:
             request_fields.get("templateId")
             or request_fields.get("suggestedDraftId")
         )
+        # Read the menu (if any) the assistant offered on the previous
+        # turn. When set, short user replies are interpreted against this
+        # menu BEFORE generic ack / classifier paths run — this is the
+        # fix for the "yes / no / bare-doc-name after a menu" loop where
+        # the post-draft-ack fast-path was eating context-sensitive
+        # replies and emitting "Glad the draft looks good".
+        last_offered_options: List[str] = list(
+            (session_state or {}).get("last_offered_options") or []
+        )
+
         if self._is_greeting(user_message) and not has_explicit_template:
+            # Greeting clears any pending menu — a "hi" is not an
+            # option-pick.
+            (session_state or {}).pop("last_offered_options", None)
             session_state = await self._handle_chat_question(
                 user_message=user_message,
                 case_context=case_context,
@@ -1378,53 +1469,297 @@ class DraftingAgent:
                 )
             elif (
                 (session_state or {}).get("draft_status") == "ready"
-                and self._is_post_draft_acknowledgement(user_message)
-            ):
-                # Post-draft acknowledgement fast-path — deterministic,
-                # free, and stable. Skips the classifier so a bare "ok" /
-                # "thanks" never costs an LLM round-trip and never risks
-                # misroute.
-                session_state["last_assistant_message"] = (
-                    "Glad the draft looks good. Let me know any time if "
-                    "you would like edits — for example, adjusting the "
-                    "prayer, tightening the grounds, or adding a clause."
-                )
-                session_state["open_questions"] = []
-                # draft_status stays "ready"; last_draft_document untouched.
-            elif (
-                (session_state or {}).get("draft_status") == "ready"
                 and (session_state or {}).get("last_draft_markdown")
-                and self._extract_translate_target(user_message) is not None
+                and self._is_finalize_request(user_message)
             ):
-                # Translate fast-path — the lawyer asked to translate the
-                # delivered draft into a target language. Routes directly
-                # to `_handle_translate_draft` which preserves every
-                # structural element and only swaps the natural-language
-                # text. The classifier never sees this turn, so it cannot
-                # mis-route to a chat reply or a side-suggestion.
-                target_language = self._extract_translate_target(user_message)
-                session_state = await self._handle_translate_draft(
-                    target_language=target_language or "Hindi",
-                    case_context=case_context,
-                    session_state=session_state or {},
-                )
-            else:
-                # Per-turn intent classifier: route everything else
-                # through a single Gemini call so free-form drafting
-                # requests, mid-flow draft switches, scoping answers,
-                # revisions, and plain chat / legal Q&A all reach the
-                # right handler.
-                session_state = await self._dispatch_classified_turn(
-                    user_message=user_message,
+                # Finalize fast-path — "Generate Final Draft" / "export
+                # draft" / "finalise the draft". Re-renders the cached
+                # markdown into a fresh DOCX, uploads, and returns a new
+                # signed URL. No Gemini round-trip, no follow-up menu.
+                session_state = await self._handle_finalize_export(
                     case_context=case_context,
                     session_state=session_state or {},
                     request_fields=request_fields,
+                )
+            elif last_offered_options and (
+                _picked := self._match_offered_option(
+                    user_message, last_offered_options
+                )
+            ):
+                # Option-pick fast-path: the lawyer's reply names (or
+                # numerically references) one of the documents the
+                # assistant just offered. Treat as a fresh kickoff for
+                # that document type and clear the menu.
+                logger.info(
+                    "Drafting menu pick: '{}' → '{}'",
+                    user_message[:60],
+                    _picked,
+                )
+                (session_state or {}).pop("last_offered_options", None)
+                session_state = (session_state or {})
+                session_state["draft_title"] = _picked
+                session_state["source"] = "blank"
+                # Reset draft-in-progress fields so the new kickoff
+                # scoping does not inherit slots from the previous draft.
+                for stale_key in (
+                    "open_questions",
+                    "gathered_facts",
+                    "incompatible",
+                    "_draft_just_delivered",
+                ):
+                    session_state.pop(stale_key, None)
+                session_state["draft_status"] = "analyzing"
+                session_state = await self._handle_kickoff(
+                    user_message=f"Draft a {_picked}",
+                    case_context=case_context,
+                    request_fields={
+                        **(request_fields or {}),
+                        "source": "blank",
+                        "suggestionTitle": _picked,
+                    },
+                )
+            elif last_offered_options and self._is_pure_affirmation(user_message):
+                # Ambiguous "yes" / "ok" with a pending menu — the lawyer
+                # didn't say which one. Ask explicitly instead of
+                # auto-picking or falling into the canned ack.
+                opts_listing = "\n".join(
+                    f"{i + 1}. **{opt}**"
+                    for i, opt in enumerate(last_offered_options[:6])
+                )
+                session_state["last_assistant_message"] = (
+                    "Which of these would you like me to draft? Reply "
+                    "with the document name or the number:\n\n"
+                    + opts_listing
+                )
+                # Keep last_offered_options set so the next-turn pick can
+                # still resolve. open_questions stays as-is.
+            elif last_offered_options and self._is_pure_negation(user_message):
+                # "no" / "no thanks" to the menu — clear the offer and
+                # route to chat for alternatives. The chat handler will
+                # see the negation and either propose different options
+                # or stay quiet, depending on context.
+                (session_state or {}).pop("last_offered_options", None)
+                session_state = await self._handle_chat_question(
+                    user_message=user_message,
+                    case_context=case_context,
+                    session_state=session_state or {},
                     conversation_history=conversation_history,
                 )
+            else:
+                # ---- LLM router (single Gemini call) ----
+                # All remaining turns flow through one router decision so
+                # the model — not phrase-based heuristics — picks the
+                # next action. The router emits the assistant reply
+                # inline for chat-shaped actions, or supplies structured
+                # params for handler-shaped actions (kickoff / revise /
+                # translate). This replaces the old post-draft-ack
+                # canned response, the translate fast-path, and the
+                # `_dispatch_classified_turn` → `_classify_drafting_turn_intent`
+                # two-step.
+                #
+                # Fresh sessions reach this branch with `session_state ==
+                # None`. The action-dispatcher below writes directly to
+                # `session_state[...]`, so we materialise a mutable dict
+                # here. Existing branches above use `(session_state or {})`
+                # defensively; the router path needs the same safety but
+                # in dict form because handlers below mutate it.
+                if session_state is None:
+                    session_state = {}
+
+                # If a menu was pending but the lawyer's reply did not
+                # fit any deterministic menu-aware branch above, clear
+                # it before routing so the router does not double-count.
+                if last_offered_options:
+                    session_state.pop("last_offered_options", None)
+
+                decision = await self._llm_route_turn(
+                    user_message=user_message,
+                    case_context=case_context,
+                    session_state=session_state,
+                    conversation_history=conversation_history,
+                )
+                action = decision.get("action") or "chat_reply"
+                params = decision.get("params") or {}
+                assistant_message = (decision.get("assistant_message") or "").strip()
+
+                if action == "chat_reply":
+                    # Plain Q&A / fallback. Use the router-emitted reply
+                    # directly — no second Gemini call. Mirror the prior
+                    # `_handle_chat_question` behaviour around active
+                    # draft states: when a draft is in progress, do NOT
+                    # clobber draft_status / open_questions / gathered
+                    # facts; only swap the assistant message.
+                    safe_reply = assistant_message or (
+                        "I am not sure how to respond to that. Could "
+                        "you rephrase?"
+                    )
+                    session_state["last_assistant_message"] = safe_reply
+                    prior_status = (
+                        (session_state.get("draft_status") or "").strip()
+                    )
+                    if prior_status not in self._ACTIVE_DRAFT_STATUSES:
+                        session_state["draft_status"] = "chatting"
+                        session_state["open_questions"] = []
+
+                elif action == "post_draft_ack":
+                    # Lawyer acknowledged the delivered draft. No state
+                    # change beyond the assistant message.
+                    safe_reply = assistant_message or (
+                        "Glad the draft works. Let me know any time if "
+                        "you would like edits."
+                    )
+                    session_state["last_assistant_message"] = safe_reply
+                    session_state["open_questions"] = []
+
+                elif action == "propose_alternatives":
+                    # Router has produced a numbered list of alternative
+                    # documents/actions. Persist the message; the
+                    # end-of-turn `_extract_offered_options` call below
+                    # will pick the menu up and populate
+                    # `last_offered_options` so next turn's pick / yes /
+                    # no resolves correctly. Preserve active draft state.
+                    safe_reply = assistant_message or (
+                        "Could you tell me more about what you would "
+                        "like to draft next?"
+                    )
+                    session_state["last_assistant_message"] = safe_reply
+                    prior_status = (
+                        (session_state.get("draft_status") or "").strip()
+                    )
+                    if prior_status not in self._ACTIVE_DRAFT_STATUSES:
+                        session_state["draft_status"] = "chatting"
+
+                elif action == "kickoff_new_draft":
+                    # Router identified a new-draft request. Reset stale
+                    # draft-in-progress fields so the new kickoff does
+                    # not inherit slots from the previous draft, then
+                    # call `_handle_kickoff` exactly the same way the
+                    # deterministic option-pick branch does.
+                    doc_type = (
+                        params.get("document_type")
+                        if isinstance(params, dict)
+                        else ""
+                    ) or "New Draft"
+                    doc_type = str(doc_type).strip() or "New Draft"
+                    session_state["draft_title"] = doc_type
+                    session_state["source"] = "blank"
+                    for stale_key in (
+                        "open_questions",
+                        "gathered_facts",
+                        "incompatible",
+                        "_draft_just_delivered",
+                        "last_offered_options",
+                    ):
+                        session_state.pop(stale_key, None)
+                    session_state["draft_status"] = "analyzing"
+                    session_state = await self._handle_kickoff(
+                        user_message=f"Draft a {doc_type}",
+                        case_context=case_context,
+                        request_fields={
+                            **(request_fields or {}),
+                            "source": "blank",
+                            "suggestionTitle": doc_type,
+                        },
+                    )
+
+                elif action == "revise_draft":
+                    # Router identified an edit-to-existing-draft
+                    # request. Route to the same render-with-revision
+                    # path the old classifier used.
+                    revision_instruction = (
+                        params.get("revision_instruction")
+                        if isinstance(params, dict)
+                        else None
+                    )
+                    revision_instruction = (
+                        revision_instruction or user_message or ""
+                    ).strip()
+                    if not (session_state or {}).get("last_draft_markdown"):
+                        # No draft yet — degrade to chat instead of
+                        # mis-routing a revision against an empty draft.
+                        session_state["last_assistant_message"] = (
+                            "I do not yet have a draft to revise. Tell "
+                            "me which document you would like me to "
+                            "draft and I will get started."
+                        )
+                        prior_status = (
+                            (session_state.get("draft_status") or "").strip()
+                        )
+                        if prior_status not in self._ACTIVE_DRAFT_STATUSES:
+                            session_state["draft_status"] = "chatting"
+                    else:
+                        session_state = await self._render_and_attach(
+                            case_context=case_context,
+                            session_state=session_state or {},
+                            lawyer_instructions=None,
+                            mode_override="revision",
+                            revision_instruction=revision_instruction,
+                        )
+
+                elif action == "translate_draft":
+                    # Router identified a translation request. Pull the
+                    # target language from params with a Hindi default
+                    # so the handler always has something to work with.
+                    target_language = (
+                        params.get("target_language")
+                        if isinstance(params, dict)
+                        else None
+                    )
+                    target_language = (
+                        str(target_language or "Hindi").strip() or "Hindi"
+                    )
+                    if not (session_state or {}).get("last_draft_markdown"):
+                        session_state["last_assistant_message"] = (
+                            "I do not yet have a draft to translate. "
+                            "Tell me which document you would like me "
+                            "to draft and I will get started."
+                        )
+                        prior_status = (
+                            (session_state.get("draft_status") or "").strip()
+                        )
+                        if prior_status not in self._ACTIVE_DRAFT_STATUSES:
+                            session_state["draft_status"] = "chatting"
+                    else:
+                        session_state = await self._handle_translate_draft(
+                            target_language=target_language,
+                            case_context=case_context,
+                            session_state=session_state or {},
+                        )
+
+                else:
+                    # Should be unreachable — router action vocab is
+                    # validated inside `_llm_route_turn`. Defensive
+                    # fallback to chat with the router's message.
+                    safe_reply = assistant_message or (
+                        "I am not sure how to respond to that. Could "
+                        "you rephrase?"
+                    )
+                    session_state["last_assistant_message"] = safe_reply
 
         # Consume the per-turn delivery flag so it does NOT persist into the
         # next turn (BE only wants isDraft=true on the actual delivery turn).
         is_draft_delivery = bool(session_state.pop("_draft_just_delivered", False))
+
+        # Pick up any numbered menu the assistant just emitted so the
+        # NEXT turn can interpret short replies in context. We always
+        # refresh this field from the new assistant message — when the
+        # message has no menu, the value is cleared. Skipping this on
+        # delivery turns is intentional: a delivered draft also ends
+        # with markdown that may contain incidental numbered lists, but
+        # those are part of the draft itself, not a menu of options the
+        # lawyer is being asked to choose from.
+        if not is_draft_delivery:
+            new_assistant_msg = session_state.get("last_assistant_message") or ""
+            extracted = self._extract_offered_options(new_assistant_msg)
+            if extracted:
+                session_state["last_offered_options"] = extracted
+            else:
+                session_state.pop("last_offered_options", None)
+        else:
+            # On a delivery turn, do not let a numbered list inside the
+            # draft body be mistaken for an offered menu. Clear any stale
+            # value so the next turn starts clean.
+            session_state.pop("last_offered_options", None)
 
         # Persist the updated session state (best-effort).
         await self._save_session_state(
@@ -1707,6 +2042,29 @@ class DraftingAgent:
             template_payload = await self._resolve_template(
                 user_id=user_id, request_fields=request_fields
             )
+            # Safety net for pre-matched suggestion clicks: when the
+            # suggestion panel pre-matched a templateId but the lawyer
+            # deleted that template between suggest-time and click, the
+            # resolver returns None. Fall back to a fresh matcher run
+            # so the click still produces a usable kickoff instead of
+            # silently degrading to blank.
+            if (
+                template_payload is None
+                and source == "suggestedDraft"
+                and request_fields.get("templateId")
+            ):
+                logger.info(
+                    "Pre-matched template {} not resolvable for user {} "
+                    "— running fresh matcher",
+                    request_fields.get("templateId"),
+                    (user_id or "")[:12],
+                )
+                template_payload, ready_library_size = await self._find_matching_template_for_suggestion(
+                    user_id=user_id,
+                    suggestion_title=suggestion_title or "",
+                    suggestion_description=suggestion_description,
+                    fallback_text=(user_message or "").strip(),
+                )
         elif source == "suggestedDraft":
             # `fallback_text` covers the case where BE has not yet shipped
             # `suggestionTitle` / `suggestionDescription` on
@@ -2850,6 +3208,156 @@ class DraftingAgent:
         if label != "draft_request":
             doc_type = ""
         return {"intent": label, "document_type": doc_type}
+
+    # LLM-driven turn router. Replaces the post-draft-ack canned response,
+    # the translate fast-path, and the older `_dispatch_classified_turn`
+    # → `_classify_drafting_turn_intent` two-step. Runs AFTER the cheap
+    # deterministic shortcuts in `handle_turn` have missed.
+    _ROUTER_ACTIONS = {
+        "chat_reply",
+        "post_draft_ack",
+        "propose_alternatives",
+        "kickoff_new_draft",
+        "revise_draft",
+        "translate_draft",
+    }
+
+    async def _llm_route_turn(
+        self,
+        *,
+        user_message: str,
+        case_context: Dict[str, Any],
+        session_state: Dict[str, Any],
+        conversation_history: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """One Gemini call that decides the next action for the turn.
+
+        Returns ``{action, params, assistant_message, reasoning}``. For
+        chat-shaped actions (chat_reply / post_draft_ack /
+        propose_alternatives) the router emits ``assistant_message``
+        directly, so the caller does not need a second Gemini round-trip
+        to compose the reply. For action-shaped actions
+        (kickoff_new_draft / revise_draft / translate_draft) the caller
+        dispatches to the existing handler with the structured params.
+
+        Failure mode: any LLM / JSON error returns a safe ``chat_reply``
+        fallback so the turn never crashes the caller.
+        """
+        role = (case_context.get("role") or "ADJUDICATOR").upper()
+        case_summary = (case_context.get("case_summary") or "")
+        case_facts = (case_context.get("case_facts_brief") or "")
+
+        draft_status = (session_state.get("draft_status") or "").strip()
+        draft_title = (session_state.get("draft_title") or "").strip()
+        last_draft_md = (session_state.get("last_draft_markdown") or "")
+        last_draft_preview = last_draft_md.strip()[:400] if last_draft_md else ""
+        pending_menu = list(session_state.get("last_offered_options") or [])
+        gathered_keys = list((session_state.get("gathered_facts") or {}).keys())
+        template_id = session_state.get("template_id")
+        template_name = session_state.get("template_name")
+
+        prompt = build_router_prompt(
+            user_message=user_message,
+            role=role,
+            case_summary=case_summary,
+            case_facts_brief=case_facts,
+            draft_status=draft_status,
+            draft_title=draft_title,
+            last_draft_preview=last_draft_preview,
+            has_pending_menu=bool(pending_menu),
+            pending_menu_options=pending_menu,
+            gathered_facts_keys=gathered_keys,
+            template_id=template_id,
+            template_name=template_name,
+            conversation_history=conversation_history or [],
+        )
+
+        try:
+            raw = await gemini_client.generate(
+                prompt,
+                system_instruction=DRAFTING_ROUTER_INSTRUCTION,
+                temperature=0.2,
+                max_tokens=6000,
+                response_mime_type="application/json",
+            )
+        except Exception as exc:
+            logger.error("Drafting router LLM call failed: {}", exc)
+            return {
+                "action": "chat_reply",
+                "params": {},
+                "assistant_message": (
+                    "I ran into an issue replying just now. Could you "
+                    "re-send your message, or rephrase it?"
+                ),
+                "reasoning": "llm_failure",
+            }
+
+        cleaned = _strip_code_fences(raw or "").strip()
+        if not cleaned:
+            return {
+                "action": "chat_reply",
+                "params": {},
+                "assistant_message": (
+                    "I am not sure how to respond to that. Could you "
+                    "rephrase, or tell me which document you would like "
+                    "me to help draft?"
+                ),
+                "reasoning": "empty_response",
+            }
+
+        try:
+            data = json.loads(cleaned)
+        except Exception as exc:
+            logger.warning(
+                "Drafting router JSON parse failed: {} (raw first 300 chars: {!r})",
+                exc,
+                cleaned[:300],
+            )
+            return {
+                "action": "chat_reply",
+                "params": {},
+                "assistant_message": (
+                    "I am not sure how to respond to that. Could you "
+                    "rephrase?"
+                ),
+                "reasoning": "json_parse_failure",
+            }
+
+        if not isinstance(data, dict):
+            return {
+                "action": "chat_reply",
+                "params": {},
+                "assistant_message": (
+                    "I am not sure how to respond to that. Could you "
+                    "rephrase?"
+                ),
+                "reasoning": "non_object_response",
+            }
+
+        action = str(data.get("action") or "").strip().lower()
+        if action not in self._ROUTER_ACTIONS:
+            logger.warning(
+                "Drafting router returned unknown action {!r}; "
+                "falling back to chat_reply",
+                action,
+            )
+            action = "chat_reply"
+
+        params = data.get("params") if isinstance(data.get("params"), dict) else {}
+        assistant_message = (data.get("assistant_message") or "").strip()
+        reasoning = (data.get("reasoning") or "").strip()
+
+        logger.info(
+            "Drafting router: action={}, reasoning={!r}",
+            action,
+            reasoning[:160],
+        )
+        return {
+            "action": action,
+            "params": params,
+            "assistant_message": assistant_message,
+            "reasoning": reasoning,
+        }
 
     # Drafting-state values that mean "there is active drafting work
     # in progress on this session" — when one of these is set, a chat
@@ -4233,6 +4741,114 @@ OUTPUT FORMAT:
         session_state["_draft_just_delivered"] = True
         return session_state
 
+    async def _handle_finalize_export(
+        self,
+        *,
+        case_context: Dict[str, Any],
+        session_state: Dict[str, Any],
+        request_fields: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Re-export the already-approved draft as a fresh DOCX (no AI call).
+
+        Triggered when the lawyer types "Generate Final Draft", "finalize
+        the draft", "export draft", etc. AFTER a draft has been rendered
+        and is sitting at ``draft_status == "ready"``. We re-run the DOCX
+        renderer on the cached ``last_draft_markdown``, upload the result
+        to GCS, and surface a new signed URL — content is unchanged, only
+        the file is regenerated. No Gemini round-trip, no follow-up menu.
+        """
+        markdown = (session_state.get("last_draft_markdown") or "").strip()
+        if not markdown:
+            session_state["last_assistant_message"] = (
+                "I do not yet have a draft to finalise. Tell me which "
+                "document you would like me to draft and I will get started."
+            )
+            return session_state
+
+        draft_title = session_state.get("draft_title") or "Final Draft"
+        template_id: Optional[str] = session_state.get("template_id")
+        template_name: Optional[str] = session_state.get("template_name")
+        user_id = (
+            (request_fields or {}).get("userId")
+            or session_state.get("user_id")
+            or (case_context or {}).get("user_id")
+            or ""
+        )
+        workspace_id = (
+            (request_fields or {}).get("workspaceId")
+            or session_state.get("workspace_id")
+            or ""
+        )
+        actionable_id = (
+            (request_fields or {}).get("actionableId")
+            or session_state.get("actionable_id")
+            or ""
+        )
+
+        tpl: Optional[Dict[str, Any]] = None
+        if template_id and user_id:
+            try:
+                tpl = await self.get_template(
+                    user_id=user_id, template_id=template_id
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Finalize: could not fetch template {} for user {}: {}",
+                    template_id,
+                    user_id,
+                    exc,
+                )
+                tpl = None
+            if tpl:
+                template_name = template_name or tpl.get("name")
+
+        prev_version = int(session_state.get("current_draft_version") or 0)
+        new_version = prev_version + 1
+
+        download_url: Optional[str] = await self._export_draft_docx(
+            markdown=markdown,
+            draft_title=draft_title,
+            tpl=tpl,
+            user_id=user_id,
+            template_id=template_id,
+            workspace_id=workspace_id,
+            actionable_id=actionable_id,
+            version=new_version,
+            role=(case_context.get("role") or "ADJUDICATOR").upper(),
+            case_summary=case_context.get("case_summary") or "",
+            case_facts_brief=case_context.get("case_facts_brief") or "",
+            gathered_facts=session_state.get("gathered_facts") or {},
+        )
+
+        source_value = session_state.get("source") or (
+            "template" if template_id else "blank"
+        )
+        draft_document = {
+            "title": draft_title,
+            "format": "markdown",
+            "content": markdown,
+            "version": new_version,
+            "sourceTemplateId": template_id,
+            "sourceTemplateName": template_name,
+            "sourceType": source_value,
+            "wordCount": _word_count(markdown),
+            "downloadUrl": download_url,
+        }
+        lead_in = (
+            "Here is the finalised draft, ready to download. Let me know "
+            "if you need any last edits before filing."
+        )
+        session_state["draft_status"] = "ready"
+        session_state["current_draft_version"] = new_version
+        session_state["last_draft_document"] = draft_document
+        session_state["last_assistant_message"] = f"{lead_in}\n\n{markdown}"
+        session_state["open_questions"] = []
+        session_state["_draft_just_delivered"] = True
+        # Any pending menu is moot now — the lawyer chose the finalise
+        # path, not one of the offered alternatives.
+        session_state.pop("last_offered_options", None)
+        return session_state
+
     # ------------------------------------------------------------------ utils
 
     def _normalize_open_questions(self, raw: Any) -> List[Dict[str, str]]:
@@ -4328,6 +4944,177 @@ OUTPUT FORMAT:
         if not tokens:
             return True
         return all(tok in cls._ACK_TOKENS for tok in tokens)
+
+    # Tight affirmation / negation sets used only when interpreting a
+    # short reply against a previously-offered numbered menu. Narrower
+    # than `_ACK_PHRASES` on purpose — we want only unambiguous yes/no
+    # surface forms here, not "thanks" / "looks good" / etc.
+    _AFFIRM_PHRASES = frozenset(
+        {
+            "yes", "yeah", "yep", "yup", "y",
+            "ok", "okay", "k", "kk", "sure",
+            "yes please", "yes pls", "ok please",
+            "alright", "all right", "fine",
+            "go ahead", "proceed", "do it", "do that",
+        }
+    )
+    _NEGATE_PHRASES = frozenset(
+        {
+            "no", "nope", "nah", "n", "naa",
+            "no thanks", "no thank you", "not really",
+            "i dont want", "i don't want",
+            "no i dont want", "no i don't want",
+            "no i dont want it", "no i don't want it",
+            "not interested", "skip", "skip it",
+        }
+    )
+
+    @classmethod
+    def _is_pure_affirmation(cls, text: str) -> bool:
+        """Strict: True only for unambiguous bare-affirmation messages."""
+        if not text:
+            return False
+        normalised = cls._normalize_ack_text(text)
+        return bool(normalised) and normalised in cls._AFFIRM_PHRASES
+
+    @classmethod
+    def _is_pure_negation(cls, text: str) -> bool:
+        """Strict: True only for unambiguous bare-negation messages."""
+        if not text:
+            return False
+        normalised = cls._normalize_ack_text(text)
+        return bool(normalised) and normalised in cls._NEGATE_PHRASES
+
+    # ``Generate Final Draft`` / ``finalize the draft`` and friends — these
+    # signal "produce a downloadable file from the draft I already
+    # approved", NOT "regenerate the content". Routed to a no-AI export
+    # path that re-renders the cached markdown into a fresh DOCX.
+    _FINALIZE_NEEDLES = (
+        "generate final draft",
+        "generate the final draft",
+        "generate final",
+        "final draft",
+        "finalize draft",
+        "finalize the draft",
+        "finalise draft",
+        "finalise the draft",
+        "finalize this",
+        "finalise this",
+        "give me the final",
+        "give me final",
+        "the final version",
+        "export draft",
+        "export the draft",
+        "download draft",
+        "download the draft",
+        "produce final",
+        "produce the final",
+        "i want the final",
+    )
+
+    @classmethod
+    def _is_finalize_request(cls, text: str) -> bool:
+        """True when the user is asking to export the already-approved draft."""
+        if not text:
+            return False
+        normalised = cls._normalize_ack_text(text)
+        if not normalised:
+            return False
+        if len(normalised) > 80:
+            return False
+        return any(needle in normalised for needle in cls._FINALIZE_NEEDLES)
+
+    # Regex used to extract a numbered menu from the assistant's reply.
+    # Matches lines that look like ``1. **Title** — description`` or
+    # ``2. **Title**``. The capture group is the bolded title only.
+    _OFFERED_OPTION_RE = re.compile(
+        r"^\s*\d+\.\s*\*\*([^*\n]+?)\*\*",
+        flags=re.MULTILINE,
+    )
+
+    @classmethod
+    def _extract_offered_options(cls, message: str) -> List[str]:
+        """Pull bolded option titles from a numbered list in the AI's reply.
+
+        Used to populate ``session_state['last_offered_options']`` so the
+        next turn can interpret short replies (``yes`` / ``no`` / a bare
+        document name / a number) against the menu the assistant just
+        offered. Returns at most 6 unique titles in order; ``[]`` when
+        the message does not contain a recognised menu.
+        """
+        if not message:
+            return []
+        options: List[str] = []
+        seen: set = set()
+        for match in cls._OFFERED_OPTION_RE.finditer(message):
+            title = (match.group(1) or "").strip()
+            # Strip trailing punctuation that sometimes leaks in
+            # (``Title:`` / ``Title —`` etc.).
+            title = title.rstrip(":—–-").strip()
+            if not title:
+                continue
+            key = title.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            options.append(title)
+            if len(options) >= 6:
+                break
+        return options
+
+    # Numeric / ordinal aliases for picking an offered option by index.
+    _OPTION_NUMERIC_ALIASES = {
+        "1": 0, "2": 1, "3": 2, "4": 3, "5": 4, "6": 5,
+        "first": 0, "the first": 0, "first one": 0, "the first one": 0,
+        "second": 1, "the second": 1, "second one": 1, "the second one": 1,
+        "third": 2, "the third": 2, "third one": 2, "the third one": 2,
+        "fourth": 3, "fifth": 4, "sixth": 5,
+        "option 1": 0, "option 2": 1, "option 3": 2,
+        "option 4": 3, "option 5": 4, "option 6": 5,
+    }
+
+    @classmethod
+    def _match_offered_option(
+        cls,
+        user_message: str,
+        offered_options: List[str],
+    ) -> Optional[str]:
+        """Match a short user reply against the previously-offered options.
+
+        Returns the matched option title or ``None``. Matching priority:
+          1. Numeric / ordinal alias (``"1"`` / ``"first"`` / ``"option 2"``).
+          2. Exact (case-insensitive) match of the option title.
+          3. Substring containment in either direction (e.g. user types
+             ``"Supporting Affidavit"`` and the option title is
+             ``"Supporting Affidavit"`` — works; also matches when the
+             user prefixes with ``"I want ..."`` or ``"draft ..."``).
+        """
+        if not user_message or not offered_options:
+            return None
+        msg_norm = cls._normalize_ack_text(user_message)
+        if not msg_norm:
+            return None
+
+        # 1. Numeric / ordinal alias.
+        idx = cls._OPTION_NUMERIC_ALIASES.get(msg_norm)
+        if idx is not None and 0 <= idx < len(offered_options):
+            return offered_options[idx]
+
+        # 2 & 3. Title match (exact or substring).
+        for option in offered_options:
+            opt_norm = cls._normalize_ack_text(option)
+            if not opt_norm:
+                continue
+            if msg_norm == opt_norm:
+                return option
+            # Substring: works for "i want criminal complaint" → "criminal complaint".
+            if opt_norm in msg_norm or msg_norm in opt_norm:
+                # Require the substring to be a non-trivial fraction of one
+                # of the strings, so a 2-char user message can't snag a
+                # long option title by accident.
+                if len(opt_norm) >= 4 and len(msg_norm) >= 4:
+                    return option
+        return None
 
     def _compose_questions_message(
         self, open_questions: List[Dict[str, Any]], draft_title: str

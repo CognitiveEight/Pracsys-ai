@@ -7946,6 +7946,12 @@ Indian Kanoon / case-law search results:
                 strategy_brief=brief["strategy_brief"],
                 analysis_brief=brief["analysis_brief"],
                 list_of_dates_brief=brief["list_of_dates_brief"],
+                # Pre-match each suggestion against the lawyer's template
+                # library so the response carries templateId / templateName
+                # per card. Frontend can display "Uses <template>" badge
+                # and pass templateId straight through on click, skipping
+                # a second matcher round-trip server-side.
+                user_id=user_id,
             )
 
             payload = {"suggestedDrafts": suggestions or []}

@@ -779,6 +779,25 @@ DRAFT_RENDER_INSTRUCTION = (
     + "citations, case-law, monetary figures, court names, or party "
     + "details. If the lawyer has not provided a slot value, leave a "
     + "<placeholder> rather than fabricate it.\n\n"
+    + "CONFLICT RESOLUTION — when a template is supplied, the template "
+    + "WINS over your own structural habits and over the DOCUMENT-TYPE "
+    + "REGISTRY in the base instruction (the registry applies ONLY in "
+    + "blank / no-template mode). Specifically:\n"
+    + "  • Do NOT add sections the template does not have, and do NOT "
+    + "    re-organise the template's sections. If the template lists its "
+    + "    grounds as a single flat numbered list (1., 2., 3. …), keep that "
+    + "    flat list — do NOT split it into a separate lettered 'GROUNDS "
+    + "    (A), (B)…' section. If the template has no FIR/PS/Sections "
+    + "    header block, do NOT add one. Match the template's prayer "
+    + "    formatting (bullets vs lettered) and its exact closing line "
+    + "    (e.g. 'shall remain grateful forever' vs 'shall ever pray').\n"
+    + "  • STATUTE MODERNISATION is a TOKEN-LEVEL substitution ONLY. When "
+    + "    the template cites a repealed statute (e.g. 'Section 437/439 "
+    + "    CrPC', IPC sections), replace just that citation in place with "
+    + "    its current equivalent (CrPC bail → Section 483 BNSS; IPC → the "
+    + "    BNS equivalent) — keep the surrounding sentence, numbering and "
+    + "    layout exactly as the template has them. Modernising a citation "
+    + "    is NOT a licence to restructure the document.\n\n"
     + "LENGTH MATCHING — when a template is supplied: the output's "
     + "length MUST be approximately the same order of magnitude as the "
     + "template's. If the template is 40 pages, the output is also "
@@ -1316,15 +1335,30 @@ translated Markdown body. No preamble, no commentary.
 # ---------------------------------------------------------------------------
 
 TEMPLATE_MATCH_INSTRUCTION = (
-    "You are matching one AI-generated draft suggestion to a lawyer's uploaded "
-    "template library. Return strict JSON ONLY: "
+    "You decide whether any of a lawyer's uploaded templates is genuinely "
+    "usable as the FORMAT / SKELETON for a specific draft the lawyer wants "
+    "to create. The candidate list was assembled by a COARSE heuristic "
+    "(shared document-type bucket or keyword overlap) and may contain "
+    "unrelated documents — do NOT assume any candidate fits.\n\n"
+    "Return strict JSON ONLY: "
     "{\"templateId\": \"<id or null>\", \"reason\": \"<short justification>\"}. "
-    "Pick the single best structural match. Do not invent template ids — only "
-    "ids that appear verbatim in the provided list are valid. The candidate "
-    "list has already been filtered to plausible matches; prefer picking the "
-    "closest one rather than returning null. Return templateId: null ONLY "
-    "when every candidate clearly covers an unrelated document type (e.g. an "
-    "affidavit template when the suggestion is a bail application)."
+    "Only ids that appear verbatim in the provided list are valid; never "
+    "invent ids.\n\n"
+    "Choose a templateId ONLY when that template is the SAME KIND of legal "
+    "instrument as the requested draft — the same procedural purpose and "
+    "document family, such that a lawyer would actually reuse its structure "
+    "to produce the requested draft. Same-kind examples: a 'Regular Bail "
+    "Application' template for a 'Bail Application under Section 483 BNSS' "
+    "draft; a 'Legal Notice' template for a 'Demand Notice' draft.\n\n"
+    "Return templateId: null when NO candidate is the same kind of "
+    "instrument — even if a candidate shares generic words ('application', "
+    "'court', a section number) or sits in the same coarse bucket such as "
+    "'Miscellaneous Application'. Concrete REJECTIONS (must return null): an "
+    "Evidence Affidavit template is NOT a match for an 'Application for "
+    "Production of CCTV Footage under Section 94 BNSS'; a Consumer-court "
+    "affidavit is NOT a match for a criminal application; a Bail Application "
+    "is NOT a match for a Legal Notice. When in doubt, return null — a wrong "
+    "template is worse than none (the draft can be produced from scratch)."
 )
 
 
@@ -1380,7 +1414,9 @@ TEMPLATE_CLASSIFY_INSTRUCTION = (
     "vocabulary. Return strict JSON ONLY, with keys: "
     "{\"documentType\": \"<canonical label, exactly as listed>\", "
     "\"aliases\": [\"<short alternative phrasing>\", ...], "
-    "\"confidence\": \"high|medium|low\"}. "
+    "\"confidence\": \"high|medium|low\", "
+    "\"purpose\": \"<one sentence: what this document is for / when a "
+    "lawyer would use it>\"}. "
     "Rules:\n"
     "1. `documentType` MUST be one of the canonical labels supplied in the "
     "   user prompt — copy the spelling verbatim. If nothing fits, return "
@@ -1419,7 +1455,16 @@ TEMPLATE_CLASSIFY_INSTRUCTION = (
     "6. Indian-law grounding: BNS / BNSS / BSA / IT Act — never IPC or "
     "   CrPC. A \"Section 138\" reference is a Negotiable Instruments Act "
     "   cheque-bounce signal.\n"
-    "7. No commentary, no markdown fences — JSON object only."
+    "7. `purpose` is ONE concrete sentence describing what this specific "
+    "   document is for and when a lawyer would reuse it — be specific, not "
+    "   generic. Good: \"Regular bail application for an accused in judicial "
+    "   custody, reciting grounds and an undertaking to seek release.\" or "
+    "   \"Affidavit declaring the deponent is the only child of the "
+    "   deceased, for succession/legal-heir purposes.\" Bad (too generic): "
+    "   \"A legal document.\" Capture the SPECIFIC sub-purpose so two "
+    "   documents of the same type (e.g. two different affidavits) are "
+    "   distinguishable.\n"
+    "8. No commentary, no markdown fences — JSON object only."
 )
 
 
@@ -1481,7 +1526,7 @@ CANONICAL DOCUMENT TYPES (pick ONE — copy spelling verbatim):
 {safe_body}
 
 OUTPUT — strict JSON object, no commentary, no markdown fences:
-{{"documentType": "<canonical label>", "aliases": ["<alt phrasing>", "..."], "confidence": "high|medium|low"}}
+{{"documentType": "<canonical label>", "aliases": ["<alt phrasing>", "..."], "confidence": "high|medium|low", "purpose": "<one specific sentence: what this document is for / when to use it>"}}
 """
 
 
@@ -1525,9 +1570,14 @@ def build_template_match_prompt(
             collapsed = " ".join(raw_snippet.split())[:400]
         else:
             collapsed = ""
+        purpose = " ".join((t.get("purpose") or "").split())[:280]
         if tid:
+            purpose_line = (
+                f"\n  purpose: {purpose!r}" if purpose else ""
+            )
             catalog_lines.append(
-                f"- templateId={tid} | category={category} | name={name!r}\n"
+                f"- templateId={tid} | category={category} | name={name!r}"
+                f"{purpose_line}\n"
                 f"  content_excerpt: {collapsed!r}"
             )
     catalog_block = (
@@ -1537,19 +1587,23 @@ def build_template_match_prompt(
 TITLE: {suggestion_title or "(no title)"}
 {description_block}
 
-LAWYER'S TEMPLATE LIBRARY (each template shows its name, category, and a
-short excerpt from the start of the document body — use the excerpt to
-verify what kind of document the template actually is, especially when
-the filename is uninformative like 'document.docx' or 'Format_A.pdf'):
+LAWYER'S TEMPLATE LIBRARY (each template shows its name, category, a stored
+`purpose` describing what the template is FOR, and a short excerpt from the
+start of the document body — use the purpose + excerpt to verify what kind
+of document the template actually is, especially when the filename is
+uninformative like 'document.docx' or 'Format_A.pdf'):
 
 {catalog_block}
 
 TASK:
-Choose the templateId whose document type best matches the suggested draft,
-or null if no template is appropriate (e.g. all templates cover unrelated
-document types — affidavit templates when the suggestion is a bail
-application, etc.). Read the `content_excerpt` carefully — a template whose
-body opens with "IN THE COURT OF ... BAIL APPLICATION" is a bail-application
+Choose the templateId whose purpose / document type best matches the
+suggested draft, or null if no template is appropriate (e.g. all templates
+cover unrelated purposes — an only-child affidavit when the suggestion is a
+Pairokar affidavit; affidavit templates when the suggestion is a bail
+application, etc.). Weigh the stored `purpose` first (it states the
+template's specific sub-purpose), then confirm against the `content_excerpt`
+— a template whose purpose is "regular bail application…" or whose body
+opens with "IN THE COURT OF ... BAIL APPLICATION" is a bail-application
 template even if the filename says `document.docx`.
 
 OUTPUT FORMAT — strict JSON only, no commentary, no markdown fences:

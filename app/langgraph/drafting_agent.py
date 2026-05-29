@@ -26,6 +26,7 @@ The agent reuses:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from datetime import datetime
@@ -63,7 +64,10 @@ from app.prompts.drafting import (
 # Constants
 # ---------------------------------------------------------------------------
 
-TEMPLATE_CACHE_KIND = "template"
+# Templates are no longer persisted in Qdrant — they live in the in-memory
+# `app.langgraph.template_store.template_store`, fed in real time by the
+# inbound `template_sync` socket event (backend re-pushes the full library
+# on reconnect). Only drafting-session state still uses the Qdrant cache.
 DRAFTING_SESSION_CACHE_KIND = "drafting_session"
 
 # How many characters of the extracted template body to read when
@@ -98,6 +102,27 @@ def _safe_filename(name: str, *, default: str = "draft") -> str:
     name = name.replace(" ", "_")
     cleaned = re.sub(r"[^A-Za-z0-9._-]", "", name)
     return cleaned or default
+
+
+def _is_missing_object_error(exc: Exception) -> bool:
+    """True when a download error means the file is GONE (not transient).
+
+    Detects a definitive "object does not exist" from GCS / HTTP:
+    ``404 NoSuchKey`` / ``No such object`` / ``The specified key does not
+    exist``. Deliberately does NOT match ``403`` (expired signed URL) or
+    network/timeout errors — we only treat a confirmed-missing object as
+    an orphan worth purging from the template cache.
+    """
+    msg = str(exc).lower()
+    if "nosuchkey" in msg:
+        return True
+    if "no such object" in msg:
+        return True
+    if "specified key does not exist" in msg:
+        return True
+    if "404" in msg and "not found" in msg:
+        return True
+    return False
 
 _RELEVANCE_VALUES = {"High", "Medium", "Low"}
 _VALID_SOURCES = {"template", "suggestedDraft", "blank"}
@@ -237,6 +262,13 @@ def _normalize_suggestions(raw: List[Any]) -> List[Dict[str, Any]]:
                 "title": title,
                 "relevance": _normalize_relevance(item.get("relevance")),
                 "description": (item.get("description") or "").strip()[:160] or None,
+                # Template pre-match fields always present so the backend
+                # reliably receives both id and name (populated later by
+                # _attach_template_matches when user_id is supplied; left
+                # None on the legacy no-user_id path).
+                "templateId": None,
+                "templateName": None,
+                "matchMode": None,
             }
         )
     cleaned = _filter_forbidden_acts(_dedupe_suggestions(cleaned))
@@ -565,6 +597,7 @@ class DraftingAgent:
         document_type = ""
         document_type_aliases: List[str] = []
         document_type_confidence = ""
+        document_purpose = ""
         classified_at = ""
         hash_stable = bool(
             previous_payload
@@ -585,6 +618,7 @@ class DraftingAgent:
             document_type_confidence = (
                 previous_payload.get("document_type_confidence") or ""
             )
+            document_purpose = (previous_payload.get("document_purpose") or "").strip()
             classified_at = previous_payload.get("classified_at") or ""
         elif extraction_status == "ready" and extracted_text:
             classified = await self._classify_document_type(
@@ -596,6 +630,7 @@ class DraftingAgent:
                 document_type = classified.get("documentType", "") or ""
                 document_type_aliases = classified.get("aliases", []) or []
                 document_type_confidence = classified.get("confidence", "") or ""
+                document_purpose = classified.get("purpose", "") or ""
                 classified_at = now_iso
 
         payload: Dict[str, Any] = {
@@ -616,28 +651,28 @@ class DraftingAgent:
             "document_type": document_type,
             "document_type_aliases": document_type_aliases,
             "document_type_confidence": document_type_confidence,
+            "document_purpose": document_purpose,
             "classified_at": classified_at,
         }
 
         try:
-            from app.vectorstore.qdrant import vector_store
+            from app.langgraph.template_store import template_store
 
-            ok = await vector_store.upsert_user_state_cache(
+            ok = await template_store.put(
                 user_id=user_id,
-                kind=TEMPLATE_CACHE_KIND,
-                scope_id=template_id,
-                data=payload,
+                template_id=template_id,
+                payload=payload,
             )
             if not ok:
                 logger.warning(
-                    "Template cache upsert returned False (user={}, template={})",
+                    "Template cache put returned False (user={}, template={})",
                     user_id,
                     template_id,
                 )
                 return None
         except Exception as e:
             logger.warning(
-                "Template cache upsert raised (user={}, template={}): {}",
+                "Template cache put raised (user={}, template={}): {}",
                 user_id,
                 template_id,
                 e,
@@ -646,13 +681,14 @@ class DraftingAgent:
 
         logger.success(
             "Template ingested (user={}, template={}, status={}, chars={}, "
-            "document_type={!r}, confidence={!r})",
+            "document_type={!r}, confidence={!r}, purpose={!r})",
             user_id,
             template_id,
             extraction_status,
             len(extracted_text),
             document_type or "(unclassified)",
             document_type_confidence or "(n/a)",
+            document_purpose or "(none)",
         )
         return payload
 
@@ -665,12 +701,11 @@ class DraftingAgent:
         previous_name: Optional[str],
     ) -> bool:
         """Patch the cached template's name; content untouched."""
-        from app.vectorstore.qdrant import vector_store
+        from app.langgraph.template_store import template_store
 
-        existing = await vector_store.get_user_state_cache(
+        existing = await template_store.get(
             user_id=user_id,
-            kind=TEMPLATE_CACHE_KIND,
-            scope_id=template_id,
+            template_id=template_id,
         )
         if not isinstance(existing, dict):
             logger.debug(
@@ -685,11 +720,10 @@ class DraftingAgent:
         existing["name"] = new_name
         existing["name_history"] = history
         existing["ingested_at"] = datetime.utcnow().isoformat()
-        ok = await vector_store.upsert_user_state_cache(
+        ok = await template_store.put(
             user_id=user_id,
-            kind=TEMPLATE_CACHE_KIND,
-            scope_id=template_id,
-            data=existing,
+            template_id=template_id,
+            payload=existing,
         )
         if ok:
             logger.info(
@@ -702,12 +736,11 @@ class DraftingAgent:
         return ok
 
     async def delete_template(self, *, user_id: str, template_id: str) -> bool:
-        from app.vectorstore.qdrant import vector_store
+        from app.langgraph.template_store import template_store
 
-        ok = await vector_store.delete_user_state_cache(
+        ok = await template_store.delete(
             user_id=user_id,
-            kind=TEMPLATE_CACHE_KIND,
-            scope_id=template_id,
+            template_id=template_id,
         )
         if ok:
             logger.info(
@@ -720,14 +753,40 @@ class DraftingAgent:
     async def get_template(
         self, *, user_id: str, template_id: str
     ) -> Optional[Dict[str, Any]]:
-        from app.vectorstore.qdrant import vector_store
+        from app.langgraph.template_store import template_store
 
-        data = await vector_store.get_user_state_cache(
+        data = await template_store.get(
             user_id=user_id,
-            kind=TEMPLATE_CACHE_KIND,
-            scope_id=template_id,
+            template_id=template_id,
         )
         return data if isinstance(data, dict) else None
+
+    async def _purge_orphan_template(
+        self, *, user_id: str, template_id: str
+    ) -> None:
+        """Delete a template whose backing file was confirmed gone (404).
+
+        Self-heal helper called when a download returns a definitive
+        object-missing error. Best-effort and non-fatal — never raises
+        into the render path.
+        """
+        try:
+            ok = await self.delete_template(
+                user_id=user_id, template_id=template_id
+            )
+            if ok:
+                logger.info(
+                    "Self-heal: purged orphan template {} for user {} "
+                    "(backing file 404/NoSuchKey)",
+                    template_id,
+                    (user_id or "")[:12],
+                )
+        except Exception as exc:
+            logger.warning(
+                "Self-heal: failed to purge orphan template {}: {}",
+                template_id,
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # 2a) Document-type classification (shared by ingest + click-time match)
@@ -793,10 +852,14 @@ class DraftingAgent:
         confidence = (parsed.get("confidence") or "").strip().lower()
         if confidence not in {"high", "medium", "low"}:
             confidence = "low"
+        # One-line "what this document is for / when to use it" — gives the
+        # matcher an explicit purpose signal beyond the coarse type label.
+        purpose = " ".join(str(parsed.get("purpose") or "").split())[:280]
         return {
             "documentType": canonical,
             "aliases": aliases,
             "confidence": confidence,
+            "purpose": purpose,
         }
 
     # ------------------------------------------------------------------
@@ -917,6 +980,89 @@ class DraftingAgent:
                 out.add(phrase)
         return out
 
+    @staticmethod
+    def _dedupe_template_entries(
+        ready: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Collapse duplicate template entries — both backend-pushed
+        duplicate ids AND the same document re-uploaded under a
+        different filename.
+
+        Dedupe key, in priority order:
+          1. ``file_hash`` — identical bytes are an unambiguous duplicate
+             regardless of name.
+          2. Hash of the full normalised ``extracted_text`` — catches the
+             same document saved under two names (e.g. "123.docx" and
+             "General_Bail_Application_Template_India.docx" are the same
+             bail template). Only applied when the body is substantial
+             (>= 100 chars) so two short/empty stubs don't collide.
+          3. Fallback: the template_id itself (never collapse — too
+             little signal to be safe).
+
+        When two entries collapse, the survivor is chosen for the BEST
+        future match quality, not arbitrarily: the entry with the more
+        informative name wins (more non-numeric word characters after
+        normalisation — so "General Bail Application Template India"
+        beats "123"), because the surviving name feeds anchor-token
+        scoring on later turns. Ties break to the most-recently-ingested
+        entry. Order is otherwise preserved so scoring stays stable.
+        """
+        if len(ready) <= 1:
+            return ready
+
+        def _key(entry: Dict[str, Any]) -> Any:
+            data = entry.get("payload") or {}
+            fhash = (data.get("file_hash") or "").strip()
+            if fhash:
+                return ("hash", fhash)
+            body = (data.get("extracted_text") or "").strip()
+            if len(body) >= 100:
+                normalized = re.sub(r"\s+", " ", body).lower()
+                digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+                return ("content", digest)
+            # Too little signal to dedupe safely — keep unique.
+            return ("unique", entry.get("templateId") or id(entry))
+
+        def _name_informativeness(entry: Dict[str, Any]) -> int:
+            # Count alphabetic word characters after normalisation
+            # (numbers are dropped by _normalise_for_match), so a junk
+            # name like "123" scores 0 and a descriptive name scores high.
+            return len(DraftingAgent._normalise_for_match(entry.get("name") or ""))
+
+        def _is_better_survivor(
+            candidate: Dict[str, Any], current: Dict[str, Any]
+        ) -> bool:
+            cand_info = _name_informativeness(candidate)
+            cur_info = _name_informativeness(current)
+            if cand_info != cur_info:
+                return cand_info > cur_info
+            cand_ts = (candidate.get("payload") or {}).get("ingested_at") or ""
+            cur_ts = (current.get("payload") or {}).get("ingested_at") or ""
+            return cand_ts > cur_ts
+
+        deduped: Dict[Any, Dict[str, Any]] = {}
+        order: List[Any] = []
+        for entry in ready:
+            key = _key(entry)
+            existing = deduped.get(key)
+            if existing is None:
+                deduped[key] = entry
+                order.append(key)
+                continue
+            if _is_better_survivor(entry, existing):
+                deduped[key] = entry
+
+        result = [deduped[k] for k in order]
+        if len(result) < len(ready):
+            logger.info(
+                "Template matcher deduped {} → {} entries "
+                "(collapsed {} duplicate/same-content template(s))",
+                len(ready),
+                len(result),
+                len(ready) - len(result),
+            )
+        return result
+
     async def _find_matching_template_for_suggestion(
         self,
         *,
@@ -953,28 +1099,37 @@ class DraftingAgent:
         usable extracted text) lets the kickoff path decide whether to
         surface a "no close template found" note to the lawyer.
         """
-        if not user_id:
-            return None, 0
-        suggestion_text = " ".join(
-            s for s in (suggestion_title, suggestion_description, fallback_text) if s
-        ).strip()
-        if not suggestion_text:
-            logger.info(
-                "Template matcher: no suggestion / fallback text — skipping match "
-                "(user={})",
-                user_id[:12],
-            )
-            return None, 0
+        from app.langgraph.template_match_graph import run_template_match
 
+        return await run_template_match(
+            self,
+            user_id=user_id,
+            suggestion_title=suggestion_title,
+            suggestion_description=suggestion_description,
+            fallback_text=fallback_text,
+        )
+
+    # ------------------------------------------------------------------
+    # Template-match graph phases — orchestrated by `template_match_graph`
+    # (gather → understand → decide). Kept as methods on the agent so the
+    # graph nodes reuse the existing classifier / type-select / anchor /
+    # LLM-tiebreak helpers; the graph adds the parallel "deep-agent"
+    # understanding step and the conditional skip when the library is empty.
+    # ------------------------------------------------------------------
+
+    async def _tm_gather(
+        self, *, user_id: str, suggestion_text: str
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Phase 1 — list the lawyer's templates from the in-memory store,
+        keep the ready (text-bearing) ones, project scoring fields, and
+        dedupe phantom duplicates. Returns ``(ready, ready_size)``."""
         try:
-            from app.vectorstore.qdrant import vector_store
+            from app.langgraph.template_store import template_store
 
-            entries = await vector_store.list_user_state_cache(
-                user_id=user_id, kind=TEMPLATE_CACHE_KIND
-            )
+            entries = await template_store.list_for_user(user_id=user_id)
         except Exception as e:
-            logger.warning("Template matcher: list_user_state_cache failed: {}", e)
-            return None, 0
+            logger.warning("Template matcher: template_store.list_for_user failed: {}", e)
+            return [], 0
         library_size = len(entries) if entries else 0
         logger.info(
             "Template matcher invoked (user={}, library_size={}, suggestion_text={!r})",
@@ -983,7 +1138,7 @@ class DraftingAgent:
             suggestion_text[:160],
         )
         if not entries:
-            return None, 0  # Empty library — fast-out, no LLM call.
+            return [], 0  # Empty library — fast-out, no LLM call.
 
         # Filter to ready, text-bearing templates and project the bits we
         # need for scoring. The **match blob** combines the template name
@@ -994,7 +1149,9 @@ class DraftingAgent:
         # like `document.docx` or `Format_A.pdf`.
         ready: List[Dict[str, Any]] = []
         for ent in entries:
-            data = ent.get("data") if isinstance(ent, dict) else None
+            # template_store.list_for_user returns payloads directly (not
+            # {scope_id, data} wrappers), so each entry IS the payload.
+            data = ent if isinstance(ent, dict) else None
             if not isinstance(data, dict):
                 continue
             if (data.get("extraction_status") or "").lower() != "ready":
@@ -1002,7 +1159,7 @@ class DraftingAgent:
             extracted = (data.get("extracted_text") or "").strip()
             if not extracted:
                 continue
-            tid = (data.get("template_id") or ent.get("scope_id") or "").strip()
+            tid = (data.get("template_id") or "").strip()
             if not tid:
                 continue
             name = (data.get("name") or "").strip()
@@ -1021,14 +1178,47 @@ class DraftingAgent:
                     "templateId": tid,
                     "name": name,
                     "category": data.get("category") or "",
+                    "purpose": (data.get("document_purpose") or "").strip(),
                     "match_blob": match_blob,
                     "content_head": content_head,
                     "payload": data,
                 }
             )
+
+        # Dedupe defensively. The backend has been observed pushing the
+        # SAME logical template under two different template_ids (e.g.
+        # "23 09 11 Affidavits EG Ezy.docx" + "23 09 11 Affidavits EG
+        # Ezy", and the same legal-notice name twice with sequential
+        # ids). Those phantom duplicates inflate the candidate set and
+        # waste an LLM tiebreaker. Collapse them here so the matcher
+        # sees each real template once. NOTE: the root cause is upstream
+        # — the backend should assign one template_id per upload and
+        # emit `deleted` events for removed/test files; this is a
+        # client-side workaround, not the real fix.
+        ready = self._dedupe_template_entries(ready)
         ready_size = len(ready)
         if not ready:
-            return None, 0
+            return [], 0
+        return ready, ready_size
+
+    async def _tm_understand(
+        self,
+        *,
+        user_id: str,
+        suggestion_title: str,
+        suggestion_description: str,
+        fallback_text: str,
+        ready: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Phase 2 — the "deep agents" understanding step.
+
+        Runs focused sub-agents in parallel via ``asyncio.gather``: one
+        classifies the suggestion's intent into a canonical document type,
+        the others lazily classify any candidate template missing a
+        ``document_type``. Backfilled classifications are persisted to the
+        in-memory store so the next click is fast. Returns the suggestion's
+        classification dict (or None)."""
+        from app.langgraph.template_store import template_store
 
         # ---- 1) Type-first match -----------------------------------------
         # Classify the suggestion in parallel with any lazy backfill of
@@ -1087,18 +1277,18 @@ class DraftingAgent:
             updated["document_type"] = doc_type
             updated["document_type_aliases"] = res.get("aliases") or []
             updated["document_type_confidence"] = res.get("confidence") or ""
+            updated["document_purpose"] = res.get("purpose") or ""
             updated["classified_at"] = datetime.utcnow().isoformat()
             t["payload"] = updated
             try:
-                await vector_store.upsert_user_state_cache(
+                await template_store.put(
                     user_id=user_id,
-                    kind=TEMPLATE_CACHE_KIND,
-                    scope_id=t["templateId"],
-                    data=updated,
+                    template_id=t["templateId"],
+                    payload=updated,
                 )
             except Exception as e:
                 logger.warning(
-                    "Template matcher: lazy classification backfill upsert "
+                    "Template matcher: lazy classification backfill put "
                     "failed (template={}): {}",
                     t["templateId"],
                     e,
@@ -1121,22 +1311,55 @@ class DraftingAgent:
                 for t in ready[:10]
             ),
         )
+        return suggestion_class
+
+    async def _tm_decide(
+        self,
+        *,
+        user_id: str,
+        suggestion_title: str,
+        suggestion_description: str,
+        suggestion_text: str,
+        ready: List[Dict[str, Any]],
+        ready_size: int,
+        suggestion_class: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Phase 3 — pick the matching template: type-first (with LLM
+        applicability verification) then anchor-overlap fallback, with an
+        LLM tiebreaker on ambiguous shortlists. Returns the chosen template
+        payload, or None when nothing applicable is found."""
+        sugg_type = (
+            (suggestion_class or {}).get("documentType") or ""
+        ) if suggestion_class else ""
 
         type_match_payload = self._select_by_type(
             ready=ready,
             suggestion_class=suggestion_class,
         )
         if type_match_payload is not None and len(type_match_payload) == 1:
-            chosen = type_match_payload[0]
+            # A shared document_type is NOT sufficient proof of a match —
+            # the type buckets are coarse ("Miscellaneous Application"
+            # lumps a CCTV-preservation plea with a consumer evidence
+            # affidavit). Verify applicability with the LLM even for a
+            # single type-match; on rejection, fall through to the
+            # anchor path (which may find a genuinely-applicable template
+            # of a different type) and ultimately to no-match.
+            verified = await self._llm_tiebreak_template(
+                user_id=user_id,
+                suggestion_title=suggestion_title,
+                suggestion_description=suggestion_description,
+                candidates=type_match_payload,
+                snippet_chars=1500,
+                mode_label="type-verify",
+            )
+            if verified is not None:
+                return verified["payload"]
             logger.info(
-                "Drafting suggestion matched to template (user={}, template={}, "
-                "mode=type-match, type={!r})",
-                user_id[:12],
-                chosen["templateId"],
+                "Drafting suggestion: single type-match (type={!r}) failed "
+                "LLM applicability check — falling through to anchor/none",
                 sugg_type,
             )
-            return chosen["payload"], ready_size
-        if type_match_payload is not None and len(type_match_payload) > 1:
+        elif type_match_payload is not None and len(type_match_payload) > 1:
             # Multiple templates share the suggestion's document type —
             # tiebreak with the LLM. 1500-char snippets give it enough body
             # to distinguish variants (e.g. Section 138 vs general dispute
@@ -1150,7 +1373,7 @@ class DraftingAgent:
                 mode_label="type-tiebreak",
             )
             if chosen is not None:
-                return chosen["payload"], ready_size
+                return chosen["payload"]
             # LLM tiebreaker on the type-matched shortlist gave us nothing
             # usable; fall through to the anchor-overlap path below.
 
@@ -1194,19 +1417,43 @@ class DraftingAgent:
                 ready_size,
                 sugg_type or "(unclassified)",
             )
-            return None, ready_size
+            return None
 
         if len(with_signal) == 1:
             entry, tok, phr = with_signal[0]
-            logger.info(
-                "Drafting suggestion matched to template (user={}, template={}, "
-                "mode=fast-single, phrase_overlap={}, token_overlap={})",
-                user_id[:12],
-                entry["templateId"],
-                phr,
-                tok,
+            # A single weak anchor overlap (e.g. just "application" or a
+            # shared section number) is not proof the template fits.
+            # Verify applicability with the LLM; reject → no match so the
+            # draft is produced from scratch rather than forced into an
+            # unrelated template.
+            verified = await self._llm_tiebreak_template(
+                user_id=user_id,
+                suggestion_title=suggestion_title,
+                suggestion_description=suggestion_description,
+                candidates=[entry],
+                snippet_chars=1500,
+                mode_label="anchor-verify",
             )
-            return entry["payload"], ready_size
+            if verified is not None:
+                logger.info(
+                    "Drafting suggestion matched to template (user={}, "
+                    "template={}, mode=anchor-verify, phrase_overlap={}, "
+                    "token_overlap={})",
+                    user_id[:12],
+                    verified["templateId"],
+                    phr,
+                    tok,
+                )
+                return verified["payload"]
+            logger.warning(
+                "Drafting suggestion matcher: single anchor candidate "
+                "(template={}, tok={}, phr={}) failed LLM applicability "
+                "check — falling back to AI generation",
+                entry["templateId"],
+                tok,
+                phr,
+            )
+            return None
 
         # Multiple candidates with anchor signal — tiebreak via LLM.
         candidates = [t for t, _tok, _phr in with_signal]
@@ -1225,8 +1472,8 @@ class DraftingAgent:
                 "back to AI generation",
                 len(candidates),
             )
-            return None, ready_size
-        return chosen["payload"], ready_size
+            return None
+        return chosen["payload"]
 
     def _select_by_type(
         self,
@@ -1296,6 +1543,10 @@ class DraftingAgent:
                     "templateId": entry["templateId"],
                     "name": entry["name"],
                     "category": entry["category"],
+                    # Stored at ingest: a one-line "what this template is for".
+                    # Gives the LLM an explicit purpose signal beyond the raw
+                    # body excerpt so applicability judgments are sharper.
+                    "purpose": entry.get("purpose") or "",
                     "contentSnippet": (entry.get("content_head") or "")[:snippet_chars],
                 }
             )
@@ -4321,6 +4572,13 @@ OUTPUT FORMAT:
                         exc,
                     )
                     template_docx_bytes = None
+                    # Self-heal: a 404/NoSuchKey means the skeleton file was
+                    # deleted on the backend — this cached template is an
+                    # orphan. Purge it so it stops polluting future matches.
+                    if template_id and _is_missing_object_error(exc):
+                        await self._purge_orphan_template(
+                            user_id=user_id, template_id=template_id
+                        )
 
             # Lazy backfill: legacy templates ingested before this feature
             # have no `template_docx_gcs_uri`. Try one re-download via the
@@ -4522,6 +4780,13 @@ OUTPUT FORMAT:
                 template_id,
                 exc,
             )
+            # Self-heal: 404/NoSuchKey on the source means the file is
+            # gone on the backend — purge this orphan from the cache so
+            # it stops being matched. Transient/403 errors are left alone.
+            if template_id and _is_missing_object_error(exc):
+                await self._purge_orphan_template(
+                    user_id=user_id, template_id=template_id
+                )
             return None
 
         # PDFs need conversion before we can store them as an editable
@@ -4571,15 +4836,14 @@ OUTPUT FORMAT:
             return content  # still usable for this render
 
         try:
-            from app.vectorstore.qdrant import vector_store
+            from app.langgraph.template_store import template_store
 
             updated_payload = dict(tpl)
             updated_payload["template_docx_gcs_uri"] = new_uri
-            await vector_store.upsert_user_state_cache(
+            await template_store.put(
                 user_id=user_id,
-                kind=TEMPLATE_CACHE_KIND,
-                scope_id=template_id,
-                data=updated_payload,
+                template_id=template_id,
+                payload=updated_payload,
             )
             logger.info(
                 "Lazy backfill complete — template={} now has skeleton at {}",
@@ -4628,6 +4892,21 @@ OUTPUT FORMAT:
             "template" if template_id else "blank"
         )
         mode = mode_override or source_value or "blank"
+
+        # Diagnostic: make it unambiguous whether this render is driven by a
+        # template (and which one) or is a from-scratch generation. If
+        # template_chars=0 here, the draft CANNOT mirror any template — the
+        # issue is upstream (no templateId on the click / template not in the
+        # store), not the render prompt.
+        logger.info(
+            "🖋️ Draft render: mode={} template_id={} template_name={!r} "
+            "template_chars={} gathered_facts={}",
+            mode,
+            template_id or "(none)",
+            template_name or "(none)",
+            len(template_text or ""),
+            len(gathered) if isinstance(gathered, dict) else 0,
+        )
 
         prev_version = int(session_state.get("current_draft_version") or 0)
         new_version = prev_version + 1

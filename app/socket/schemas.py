@@ -317,6 +317,29 @@ class TemplateSyncPayload(BaseModel):
     timestamp: Optional[str] = None
 
 
+class TemplateSyncResponsePayload(BaseModel):
+    """
+    Schema for the template_sync_response event (Server → AI_Maverick).
+
+    The server's reply to an AI-initiated ``request_template_sync`` — a full
+    snapshot of the user's active (non-deleted) templates. Treated exactly
+    like a ``template_sync`` with ``action="uploaded"`` for the whole list,
+    so the in-memory template store is (re)populated on demand (e.g. after
+    an AI restart, where the backend has not pushed any delta this session).
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    userId: str = Field(validation_alias=AliasChoices("userId", "user_id"))
+    requestId: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("requestId", "request_id"),
+    )  # Echoed from the request so the AI can correlate reply → request.
+    count: Optional[int] = None  # === len(templates)
+    templates: List[TemplateSyncItem] = []
+    timestamp: Optional[str] = None
+
+
 # ============================================================================
 # AI Response Schemas (AI → Server)
 # ============================================================================

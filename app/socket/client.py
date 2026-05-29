@@ -383,6 +383,7 @@ class SocketClient:
             logger.info("   - applicable_law_relevance_request")
             logger.info("   - analysis_docx_generate_request")
             logger.info("   - template_sync")
+            logger.info("   - template_sync_response")
             logger.info("   - ai_heartbeat_ping")
             logger.info(
                 "📤 Ready to emit: ai_response, probing_prompts_response, document_feature_response, applicable_law_relevance_response, analysis_docx_generate_response, ai_heartbeat_pong"
@@ -581,6 +582,24 @@ class SocketClient:
             except Exception:
                 logger.info("template_sync payload (repr): {}", repr(data))
             await event_handler.handle("template_sync", data)
+
+        @self.sio.event
+        async def template_sync_response(data):
+            """
+            Server → AI_Maverick: full snapshot of a user's active templates
+            in reply to our request_template_sync emit. Populates the
+            in-memory template store on demand (e.g. after an AI restart).
+            """
+            logger.info("📚 template_sync_response ← backend (socket received)")
+            try:
+                raw = json.dumps(data, default=str) if data is not None else "null"
+                logger.info(
+                    "template_sync_response payload (preview): {}",
+                    raw[:1800] + ("..." if len(raw) > 1800 else ""),
+                )
+            except Exception:
+                logger.info("template_sync_response payload (repr): {}", repr(data))
+            await event_handler.handle("template_sync_response", data)
 
         @self.sio.on(AI_HEARTBEAT_PING)
         async def ai_heartbeat_ping(data):

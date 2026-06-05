@@ -29,6 +29,7 @@ import asyncio
 import hashlib
 import json
 import re
+from collections import OrderedDict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -278,6 +279,48 @@ def _normalize_suggestions(raw: List[Any]) -> List[Dict[str, Any]]:
 class DraftingAgent:
     """High-level entrypoint for the Drafting Assistant feature."""
 
+    # Bound the suggested-draft pre-match cache so it cannot grow without
+    # limit across a long-lived session (one entry per distinct
+    # user+suggestion-title; oldest evicted first).
+    _PREMATCH_CACHE_MAX = 256
+
+    def __init__(self) -> None:
+        # Bridge the suggested-drafts pre-match decision to the kickoff
+        # click. The frontend/backend does not always forward the
+        # pre-matched ``templateId`` when the lawyer clicks a suggestion
+        # card, and a fresh click-time re-match can disagree with the
+        # pre-match (the LLM applicability check is non-deterministic) —
+        # leaving the lawyer with a "matched" badge but a draft produced
+        # from scratch. We remember the pre-match ``templateId`` keyed by
+        # (user_id, normalized title) so the kickoff reuses the SAME
+        # template the panel advertised.
+        self._suggestion_prematch: "OrderedDict[str, str]" = OrderedDict()
+
+    @staticmethod
+    def _prematch_key(user_id: str, title: str) -> str:
+        return f"{(user_id or '').strip()}::{(title or '').strip().lower()}"
+
+    def _remember_prematch(
+        self, user_id: str, title: str, template_id: str
+    ) -> None:
+        """Record a suggestion's pre-matched templateId for later reuse on
+        click. No-op when any part is missing."""
+        if not (user_id and title and template_id):
+            return
+        key = self._prematch_key(user_id, title)
+        cache = self._suggestion_prematch
+        cache[key] = template_id
+        cache.move_to_end(key)
+        while len(cache) > self._PREMATCH_CACHE_MAX:
+            cache.popitem(last=False)
+
+    def _recall_prematch(self, user_id: str, title: str) -> Optional[str]:
+        """Return the pre-matched templateId for this suggestion title, or
+        None if we never matched one."""
+        if not (user_id and title):
+            return None
+        return self._suggestion_prematch.get(self._prematch_key(user_id, title))
+
     # ------------------------------------------------------------------
     # 1) Suggested drafts panel
     # ------------------------------------------------------------------
@@ -306,6 +349,26 @@ class DraftingAgent:
         Falls back to an empty list on any failure — callers should not
         block workspace creation on this feature.
         """
+        # Gather the lawyer's ready templates up front (when we know the
+        # user) so the suggestion LLM can surface drafts that reuse an
+        # existing template. Template-blind otherwise — see the empty
+        # default in build_suggested_drafts_prompt.
+        template_library_brief = ""
+        if user_id:
+            try:
+                ready_templates, _ = await self._tm_gather(
+                    user_id=user_id, suggestion_text=""
+                )
+                template_library_brief = self._format_template_library_brief(
+                    ready_templates
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Suggested-drafts template-library gather failed "
+                    "(non-fatal): {}",
+                    exc,
+                )
+
         prompt = build_suggested_drafts_prompt(
             role=role,
             case_summary=case_summary,
@@ -313,6 +376,7 @@ class DraftingAgent:
             strategy_brief=strategy_brief,
             analysis_brief=analysis_brief,
             list_of_dates_brief=list_of_dates_brief,
+            template_library_brief=template_library_brief,
         )
         try:
             raw = await gemini_client.generate(
@@ -344,6 +408,19 @@ class DraftingAgent:
                 suggestions = await self._attach_template_matches(
                     user_id=user_id, suggestions=suggestions
                 )
+                # Remember each matched suggestion's templateId keyed by
+                # title so the kickoff click reuses the SAME template the
+                # panel showed — even if the backend doesn't forward
+                # templateId on click. See _recall_prematch in _handle_kickoff.
+                for s in suggestions:
+                    if (
+                        isinstance(s, dict)
+                        and s.get("matchMode") == "matched"
+                        and s.get("templateId")
+                    ):
+                        self._remember_prematch(
+                            user_id, s.get("title") or "", s["templateId"]
+                        )
             except Exception as exc:
                 logger.warning(
                     "Pre-match for suggestions failed (non-fatal): {}", exc
@@ -355,6 +432,33 @@ class DraftingAgent:
             bool(user_id),
         )
         return suggestions
+
+    @staticmethod
+    def _format_template_library_brief(
+        ready: List[Dict[str, Any]], *, cap: int = 15
+    ) -> str:
+        """Render the ready-template list as compact one-line-per-template
+        hints for the suggestion prompt.
+
+        Carries only the document TYPE and PURPOSE — never the template's
+        original party names / facts — so the suggester cannot leak the
+        source matter's details into unrelated suggestions. Returns an empty
+        string when there is nothing reusable (prompt then behaves exactly
+        as the template-blind form).
+        """
+        if not ready:
+            return ""
+        lines: List[str] = []
+        for t in ready[:cap]:
+            payload = t.get("payload") or {}
+            doc_type = (payload.get("document_type") or t.get("category") or "").strip()
+            purpose = (t.get("purpose") or "").strip()
+            label = doc_type or "Unclassified template"
+            if purpose:
+                lines.append(f"- {label} (purpose: {purpose[:160]})")
+            else:
+                lines.append(f"- {label}")
+        return "\n".join(lines)
 
     async def _attach_template_matches(
         self,
@@ -2274,6 +2378,31 @@ class DraftingAgent:
         suggestion_description = (
             request_fields.get("suggestionDescription") or ""
         ).strip()
+
+        # Bridge the suggestion-panel pre-match to this click. When the
+        # panel advertised a matched template but the click request did not
+        # carry `templateId` (backend/frontend dropped it), recall the
+        # pre-matched id by title so the kickoff uses the SAME template the
+        # lawyer saw on the card — instead of re-matching from scratch (a
+        # non-deterministic LLM check that can disagree with the badge and
+        # silently draft from scratch).
+        if (
+            source == "suggestedDraft"
+            and not (request_fields.get("templateId") or "").strip()
+        ):
+            recalled_template_id = self._recall_prematch(user_id, suggestion_title or "")
+            if recalled_template_id:
+                logger.info(
+                    "Suggested-draft click without templateId — reusing "
+                    "pre-matched template {} (title={!r}, user={})",
+                    recalled_template_id,
+                    (suggestion_title or "")[:60],
+                    (user_id or "")[:12],
+                )
+                request_fields = {
+                    **request_fields,
+                    "templateId": recalled_template_id,
+                }
 
         # Resolve template — three paths:
         #  - explicit template pick: honour `templateId` directly.

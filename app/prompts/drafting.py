@@ -470,6 +470,10 @@ SUGGESTED_DRAFTS_INSTRUCTION = (
     + "Read the workspace context (role, case summary, applicable laws, "
     + "strategy, analysis report, list of dates) and propose 4 to 6 "
     + "drafts that are actually useful for this matter right now. "
+    + "A list of the lawyer's reusable templates may also be supplied; "
+    + "treat it as a reuse HINT — prefer a draft that an available template "
+    + "fits when the case posture genuinely calls for it, but never propose "
+    + "a draft solely because a template exists. "
     + "Each suggestion is a one-line title plus a one-line description. "
     + "Output strict JSON only — no markdown fences, no commentary."
 )
@@ -482,8 +486,15 @@ def build_suggested_drafts_prompt(
     strategy_brief: str,
     analysis_brief: str,
     list_of_dates_brief: str,
+    template_library_brief: str = "",
 ) -> str:
     """Build the user prompt for proactive draft suggestions.
+
+    ``template_library_brief`` (optional) lists the lawyer's reusable
+    templates by document type / purpose. When supplied, it is injected as
+    a reuse HINT so existing templates surface as suggestions when the case
+    posture fits — it never forces an inapplicable draft. When empty, the
+    prompt is identical to the no-library form.
 
     Returns a prompt that asks for a JSON array of 4-6 suggestion objects.
     """
@@ -505,6 +516,9 @@ ANALYSIS REPORT (strengths, weaknesses, gaps, pending actions):
 LIST OF DATES (chronology):
 {list_of_dates_brief or "(none yet)"}
 
+LAWYER'S TEMPLATE LIBRARY (drafts you can reuse if the case posture fits):
+{template_library_brief or "(no reusable templates available)"}
+
 TASK:
 Propose 4 to 6 drafts that this {role_upper} should be preparing right now,
 given the case posture above. For each, return:
@@ -524,6 +538,13 @@ CONSTRAINTS:
     title rather than guess.
   - Prefer drafts that are time-bound (statutory deadlines, hearing dates
     in list-of-dates) or that close an explicit gap in the analysis report.
+  - If a template in the LAWYER'S TEMPLATE LIBRARY fits a draft this case
+    genuinely needs right now, prefer proposing that draft and title it by
+    its document type (e.g. "Legal Notice under Section 35 of the Consumer
+    Protection Act, 2019"). But do NOT propose a draft solely because a
+    template exists — case appropriateness and posture still decide. Never
+    copy the template's original party names, dates, or facts into the
+    suggestion; use only this case's facts.
   - Do not duplicate suggestions; each must be a distinct legal action.
   - Cap the list at 6.
 

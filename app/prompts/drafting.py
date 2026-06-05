@@ -703,9 +703,26 @@ TASK:
 3. Pre-fill any case-variable slot from the case context above whenever
    possible (parties, role, statute citations applicable to this matter,
    facts that are already in the case file).
-4. List the SLOTS that still need the lawyer's input. Each open question
-   must be focused and answerable in one short sentence (e.g. "What is the
-   FIR number and date of registration?"), not a 5-part request.
+4. List the SLOTS that still need the lawyer's input. To do this you MUST
+   scan the TEMPLATE FULL TEXT for EVERY literal placeholder / blank and
+   account for each one — do not stop at the obvious party/FIR slots.
+   Treat ALL of the following as placeholders that require a value:
+     • underscore / dotted blanks: `_____`, `………`, `____ day of ____`;
+     • bracketed tokens: `[...]`, `<...>`, `(to be filled)`, `XXXX`;
+     • execution / signing fields: the date the deed is signed
+       ("on this ___ day of ___ 2026", "Date: ___"), place of execution,
+       witness names, the signatory's name/designation in the signature
+       block, enrolment/registration numbers.
+   For each placeholder: if the case context already supplies the value,
+   pre-fill it (and reflect it in gatheredFacts); OTHERWISE it MUST appear
+   as an open question. Do NOT silently leave a blank un-asked. Execution
+   blanks that are conventionally completed at signing (signing date, place,
+   witness) STILL must be surfaced — either as an open question or, if the
+   lawyer will fill them by hand at execution, called out explicitly in the
+   `**Information Required to Complete the Draft:**` section so nothing is
+   left silently blank. Each open question must be focused and answerable in
+   one short sentence (e.g. "What is the FIR number and date of
+   registration?"), not a 5-part request.
 5. If the template's structural skeleton is fundamentally incompatible
    with this case (e.g. a property dispute template for a corporate
    matter with no structural overlap, or a school-admission affidavit
@@ -786,9 +803,14 @@ DRAFT_RENDER_INSTRUCTION = (
     + "verification clauses, footer addresses, salutations, party-block "
     + "layouts, and section dividers: present in the template → "
     + "reproduce verbatim; absent from the template → absent from the "
-    + "output. Substitute ONLY case-variable facts (parties, dates, FIR "
-    + "numbers, statutes, addresses) into the slots that the template "
-    + "already provides. The generic FORMATTING RULES section in the "
+    + "output. Substitute case-variable facts (parties, dates, FIR "
+    + "numbers, statutes, addresses) into the slots the template provides, "
+    + "AND particularise the template's generic, case-dependent clauses "
+    + "(enumerations of losses suffered, heads of compensation/damages, "
+    + "the defect/deficiency description, the reliefs/demands, the grounds) "
+    + "with the specific, quantified facts of THIS case — see FACT-GROUNDING "
+    + "below. Do NOT otherwise rewrite the template's fixed legal language. "
+    + "The generic FORMATTING RULES section in the "
     + "base instruction does NOT apply when a template is in use.\n\n"
     + "Produce the complete draft as a single Markdown document. "
     + "When a template is supplied, the template's structural skeleton — "
@@ -811,7 +833,11 @@ DRAFT_RENDER_INSTRUCTION = (
     + "    (A), (B)…' section. If the template has no FIR/PS/Sections "
     + "    header block, do NOT add one. Match the template's prayer "
     + "    formatting (bullets vs lettered) and its exact closing line "
-    + "    (e.g. 'shall remain grateful forever' vs 'shall ever pray').\n"
+    + "    (e.g. 'shall remain grateful forever' vs 'shall ever pray'). "
+    + "    When the template presents a NUMBERED list (its clauses/grounds/"
+    + "    prayers arrive as '1.', '2.', '3.' …), reproduce them as a Markdown "
+    + "    ordered list ('1.' '2.' '3.') so the numbering is preserved — never "
+    + "    flatten a numbered list into unnumbered paragraphs.\n"
     + "  • STATUTE MODERNISATION is a TOKEN-LEVEL substitution ONLY. When "
     + "    the template cites a repealed statute (e.g. 'Section 437/439 "
     + "    CrPC', IPC sections), replace just that citation in place with "
@@ -819,6 +845,37 @@ DRAFT_RENDER_INSTRUCTION = (
     + "    BNS equivalent) — keep the surrounding sentence, numbering and "
     + "    layout exactly as the template has them. Modernising a citation "
     + "    is NOT a licence to restructure the document.\n\n"
+    + "FACT-GROUNDING — generic case-dependent clauses are SOFT SLOTS, not "
+    + "fixed skeleton. A template's STRUCTURE (headings, section order, "
+    + "salutations, prayer scaffolding, verification, signature blocks, "
+    + "layout) is fixed and reproduced verbatim. But wherever the template "
+    + "states case-dependent CONTENT in generic terms — lists of losses "
+    + "suffered, heads of compensation/damages, the description of the "
+    + "defect/deficiency/cause of action, the reliefs/demands, the grounds "
+    + "— you MUST tailor each such item to THIS case from the case context "
+    + "and gathered facts:\n"
+    + "  • Replace each generic item with the specific, quantified "
+    + "    particular the case provides. e.g. a template bullet "
+    + "    'Depreciation and loss of value' becomes 'Depreciation of the "
+    + "    [specific asset] of approximately ₹[amount]' when the case "
+    + "    supplies the asset and figure; a generic 'Refund the purchase "
+    + "    consideration' becomes 'Refund ₹[actual amount] paid vide "
+    + "    [invoice/date]'.\n"
+    + "  • DROP generic items that do not apply to this case rather than "
+    + "    carrying them as empty boilerplate. Never leave a generic "
+    + "    boilerplate item un-grounded when the case context contains the "
+    + "    specific fact that should fill it.\n"
+    + "  • Do NOT repeat the SAME loss/relief head verbatim across multiple "
+    + "    sections. Where a later section (e.g. Demands/Compensation) "
+    + "    restates an earlier descriptive section (e.g. Financial Loss), "
+    + "    phrase the later one as the OPERATIVE demand — what is claimed and "
+    + "    quantified — not a second identical list of descriptive heads.\n"
+    + "  • This particularisation changes only the WORDS INSIDE a clause; it "
+    + "    NEVER adds, removes, reorders, or renames the template's sections, "
+    + "    and never alters fixed legal recitals. Never fabricate amounts or "
+    + "    facts — if a specific particular is genuinely absent from the case "
+    + "    context, keep a concise generic phrasing or a <placeholder>, but "
+    + "    do not invent figures.\n\n"
     + "LENGTH MATCHING — when a template is supplied: the output's "
     + "length MUST be approximately the same order of magnitude as the "
     + "template's. If the template is 40 pages, the output is also "
@@ -1004,6 +1061,42 @@ sparseness of the layout are IDENTICAL between TEMPLATE and OUTPUT. Only
 the in-line case-variable slots were filled in. Apply this same pattern
 to ANY template — even if its layout differs from generic Indian advocate
 format.
+
+FACT-GROUNDING EXAMPLE (illustrative — shows that GENERIC clauses must be
+particularised to the case, not copied verbatim):
+
+INPUT TEMPLATE CLAUSE (generic boilerplate list):
+\"\"\"
+B. Compensation
+Compensate Our Client for:
+• Depreciation and loss of value;
+• Loss of use and opportunity;
+• Litigation expenses and legal costs;
+• Any other consequential losses suffered.
+\"\"\"
+
+INPUT GATHERED FACTS (JSON):
+{{"asset": "IWC luxury watch", "purchase_price": "Rs 5,60,000",
+ "legal_costs": "Rs 1,50,000", "deprivation_period": "54 days"}}
+
+EXPECTED OUTPUT (same heading, same bullet formatting — but each head is
+now grounded in the actual case; the un-supported generic head is dropped):
+\"\"\"
+B. Compensation
+Compensate Our Client for:
+• Depreciation and loss of value of the IWC luxury watch, a high-value asset
+  purchased for Rs 5,60,000;
+• Loss of use and enjoyment of the timepiece over the 54-day deprivation
+  period;
+• Litigation expenses and legal costs quantified at Rs 1,50,000;
+• Any other consequential losses suffered.
+\"\"\"
+
+NOTICE — the section letter "B.", its heading "Compensation", and the
+bullet layout are IDENTICAL; only the WORDS INSIDE each bullet were tailored
+to the case. A generic bullet is NOT fixed skeleton — it is a soft slot to
+ground. Never leave it as un-particularised boilerplate when the case
+supplies the specific fact.
 """
 
     # Document-type hint — emitted only in blank/no-template mode so the

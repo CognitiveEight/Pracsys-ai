@@ -321,6 +321,56 @@ class DraftingAgent:
             return None
         return self._suggestion_prematch.get(self._prematch_key(user_id, title))
 
+    @staticmethod
+    def _recover_suggestion_title(user_message: str) -> Optional[str]:
+        """Recover the clicked card's title from the kickoff message when the
+        backend omits the ``suggestionTitle`` field.
+
+        The frontend embeds the title in ``content`` even when it drops the
+        explicit field, e.g.::
+
+            Please draft a complete "Legal Notice for Rescission of Contract
+            under Section 16 of the Sale of Goods Act, 1930" for this case ...
+
+        Returns the first reasonably-long double-quoted span, or None.
+        """
+        if not user_message:
+            return None
+        m = re.search(r'"([^"]{4,200})"', user_message)
+        return m.group(1).strip() if m else None
+
+    @staticmethod
+    def _recover_template_name(user_message: str) -> Optional[str]:
+        """Recover an explicit template name from the kickoff message when
+        the frontend phrases the click as ``using the template "<NAME>"``.
+        Returns the quoted name, or None."""
+        if not user_message:
+            return None
+        m = re.search(
+            r'using the template\s+"([^"]{2,200})"',
+            user_message,
+            re.IGNORECASE,
+        )
+        return m.group(1).strip() if m else None
+
+    async def _resolve_template_id_by_name(
+        self, *, user_id: str, name: str
+    ) -> Optional[str]:
+        """Look up a ready template's id by (normalized) name. Used to bridge
+        a click whose content names a template but carries no templateId."""
+        if not (user_id and name):
+            return None
+        try:
+            ready, _ = await self._tm_gather(user_id=user_id, suggestion_text="")
+        except Exception:
+            return None
+        norm = name.strip().lower()
+        for t in ready:
+            tname = (t.get("name") or "").strip().lower()
+            if tname and (tname == norm or norm in tname or tname in norm):
+                return t.get("templateId")
+        return None
+
     # ------------------------------------------------------------------
     # 1) Suggested drafts panel
     # ------------------------------------------------------------------
@@ -2379,6 +2429,22 @@ class DraftingAgent:
             request_fields.get("suggestionDescription") or ""
         ).strip()
 
+        # Recover the clicked card's title from the message when the backend
+        # omits `suggestionTitle` (observed: the frontend embeds the title in
+        # `content` as `Please draft a complete "<TITLE>" for this case`).
+        # Without this the kickoff has no card identity — the pre-match recall
+        # below can't fire and the lawyer sees "...for *this draft*...".
+        if not suggestion_title and source == "suggestedDraft":
+            recovered_title = self._recover_suggestion_title(user_message)
+            # Don't mistake the `using the template "X"` phrasing (X is a
+            # template NAME, handled separately below) for a suggestion title.
+            if recovered_title and not self._recover_template_name(user_message):
+                suggestion_title = recovered_title
+                logger.info(
+                    "Recovered suggestion title from kickoff content: {!r}",
+                    recovered_title[:80],
+                )
+
         # Bridge the suggestion-panel pre-match to this click. When the
         # panel advertised a matched template but the click request did not
         # carry `templateId` (backend/frontend dropped it), recall the
@@ -2391,6 +2457,15 @@ class DraftingAgent:
             and not (request_fields.get("templateId") or "").strip()
         ):
             recalled_template_id = self._recall_prematch(user_id, suggestion_title or "")
+            # Secondary bridge: the click names a template explicitly
+            # (`using the template "<NAME>"`) but carries no templateId —
+            # resolve the id from the store by name.
+            if not recalled_template_id:
+                named = self._recover_template_name(user_message)
+                if named:
+                    recalled_template_id = await self._resolve_template_id_by_name(
+                        user_id=user_id, name=named
+                    )
             if recalled_template_id:
                 logger.info(
                     "Suggested-draft click without templateId — reusing "

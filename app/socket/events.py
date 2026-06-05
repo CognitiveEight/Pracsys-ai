@@ -670,6 +670,14 @@ class SocketEventHandler:
         # into the in-memory template store. Lets the suggestion/kickoff path
         # await a cold-cache fill before matching.
         self._pending_template_sync: Dict[str, "asyncio.Future"] = {}
+        # Per-workspace drafting-suggestion provenance, used to self-heal the
+        # panel when a template finishes ingesting *after* suggestions were
+        # built (e.g. a slow scanned-PDF OCR that misses the template-sync
+        # window). Shape: workspace_id -> {"user_id", "role", "lib_count"},
+        # where lib_count is the ready-template count the suggestions were
+        # pre-matched against. When the library later grows, the panel is
+        # regenerated. See _maybe_reemit_drafting_on_templates.
+        self._drafting_meta_by_workspace: Dict[str, Dict[str, Any]] = {}
         # Re-emit after reconnect when socket dropped right after analysis report (so backend gets the update)
         self._had_disconnect: bool = False
         self._pending_reemit_workspace_id: Optional[str] = None
@@ -7971,6 +7979,23 @@ Indian Kanoon / case-law search results:
             payload = {"suggestedDrafts": suggestions or []}
             self._workspace_drafting_payload[workspace_id] = payload
 
+            # Record provenance so the panel can self-heal if a template
+            # finishes ingesting after this point (slow scanned-PDF OCR that
+            # missed the template-sync window). `lib_count` is the template
+            # count these suggestions were pre-matched against; a later growth
+            # triggers a regenerate. See _maybe_reemit_drafting_on_templates.
+            try:
+                from app.langgraph.template_store import template_store
+
+                lib_count = await template_store.count_for_user(user_id=user_id)
+            except Exception:
+                lib_count = 0
+            self._drafting_meta_by_workspace[workspace_id] = {
+                "user_id": user_id,
+                "role": role_upper,
+                "lib_count": lib_count,
+            }
+
             # Log exactly what we're about to send back per suggestion —
             # title + the pre-matched template fields the frontend uses to
             # render the "Uses <template>" badge and pass templateId on click.
@@ -8024,6 +8049,61 @@ Indian Kanoon / case-law search results:
             await asyncio.sleep(0.05)
         except Exception as e:
             logger.warning("Drafting suggestions emit failed: {}", e)
+
+    async def _maybe_reemit_drafting_on_templates(self, user_id: str) -> None:
+        """Self-heal the Drafting Assistant panel after a template lands late.
+
+        When a template finishes ingesting (e.g. a slow scanned-PDF OCR that
+        missed the original ``request_template_sync`` window), the suggestions
+        already emitted for this user's workspace(s) were pre-matched against a
+        smaller / empty library and carry no template. Regenerate those panels
+        when the user's ready-template count has grown since the panel was last
+        built. The ``lib_count`` comparison debounces this so rename/delete
+        deltas and no-op snapshots don't trigger redundant regeneration.
+        """
+        user_id = (user_id or "").strip()
+        if not user_id:
+            return
+        try:
+            from app.langgraph.template_store import template_store
+
+            current_count = await template_store.count_for_user(user_id=user_id)
+        except Exception as e:
+            logger.warning(
+                "drafting re-emit: count_for_user failed (user={}): {}",
+                user_id[:12],
+                e,
+            )
+            return
+
+        for workspace_id, meta in list(self._drafting_meta_by_workspace.items()):
+            if (meta or {}).get("user_id") != user_id:
+                continue
+            prev_count = int((meta or {}).get("lib_count") or 0)
+            if current_count <= prev_count:
+                continue  # library didn't grow — nothing new to match
+            role = (meta or {}).get("role") or "ADJUDICATOR"
+            logger.info(
+                "🔁 Template library grew ({}→{}) — regenerating drafting "
+                "suggestions for workspace={} (user={})",
+                prev_count,
+                current_count,
+                workspace_id,
+                user_id[:12],
+            )
+            # Bump the recorded count up front so a burst of template events
+            # can't queue duplicate regenerations for the same growth.
+            self._drafting_meta_by_workspace[workspace_id] = {
+                **(meta or {}),
+                "lib_count": current_count,
+            }
+            asyncio.create_task(
+                self._generate_and_emit_drafting_suggestions(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=role,
+                )
+            )
 
     def _strategy_objective_fallback(
         self,
@@ -12413,6 +12493,9 @@ Indian Kanoon / search results (titles and snippets):
 
         if action == "uploaded":
             await self._ingest_template_items(user_id, templates)
+            # A newly-ingested template may match suggestions that were built
+            # before it was ready — regenerate the panel if the library grew.
+            await self._maybe_reemit_drafting_on_templates(user_id)
         elif action == "renamed":
             for tpl in templates:
                 if not tpl.id or not tpl.name:
@@ -12547,6 +12630,12 @@ Indian Kanoon / search results (titles and snippets):
         fut = self._pending_template_sync.get(request_id) if request_id else None
         if fut is not None and not fut.done():
             fut.set_result(True)
+
+        # If this snapshot arrived late (after the ensure_templates_synced
+        # timeout) and grew the library, regenerate any drafting panels that
+        # were built against the smaller/empty library.
+        if user_id:
+            await self._maybe_reemit_drafting_on_templates(user_id)
 
     async def ensure_templates_synced(
         self, user_id: str, *, timeout: float = 30.0

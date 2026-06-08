@@ -9,11 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added the **Drafting Assistant** feature (`app/langgraph/drafting_agent.py`, `app/prompts/drafting.py`).
-  - New inbound event **`template_sync`** (uploaded / renamed / deleted) for the lawyer-scoped Template Library — each template is downloaded, its text extracted via `app/processing/file_handlers.py`, and persisted in a new lawyer-scoped Qdrant cache (`upsert_user_state_cache` / `get_user_state_cache` / `delete_user_state_cache` / `list_user_state_cache`).
-  - New outbound `document_feature_response` with **`featureType: "drafting_assistant"`** — 4–6 proactive draft suggestions (`{title, relevance, description}`) generated at `workspace_created` / `workspace_sync`, cached in `_workspace_drafting_payload`, re-emitted on reconnect.
-  - Multi-turn drafting **chat flow** on the existing `user_message_request` ↔ `ai_response` pair (`chat_type="DRAFTING_ASSISTANT"`). The drafting agent keeps per-`actionableId` session state in a new `drafting_session` workspace state cache, asks the lawyer for missing slots, and emits an augmented `ai_response` with `draftStatus`, `openQuestions`, and (when ready) `draftDocument` (Markdown body). When the lawyer picks a template, the template's structural skeleton is preserved verbatim; only case-specific facts are substituted.
-  - Lawyer-scoped state cache support in `app/vectorstore/qdrant.py` (mirrors the existing workspace-state cache pattern but keyed by `user_id`, with no vectors).
+- (Document changes here before release)
 
 ### Changed
 
@@ -22,6 +18,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - (Document changes here before release)
+
+---
+
+## [4.0.0] - 2026-06-08
+
+### Added
+
+- Added the **Drafting Assistant** feature (`app/langgraph/drafting_agent.py`, `app/prompts/drafting.py`).
+  - New inbound event **`template_sync`** (uploaded / renamed / deleted) for the lawyer-scoped Template Library — each template is downloaded, its text extracted via `app/processing/file_handlers.py`, and persisted in a new lawyer-scoped Qdrant cache (`upsert_user_state_cache` / `get_user_state_cache` / `delete_user_state_cache` / `list_user_state_cache`).
+  - New outbound `document_feature_response` with **`featureType: "drafting_assistant"`** — 4–6 proactive draft suggestions (`{title, relevance, description}`) generated at `workspace_created` / `workspace_sync`, cached in `_workspace_drafting_payload`, re-emitted on reconnect.
+  - Multi-turn drafting **chat flow** on the existing `user_message_request` ↔ `ai_response` pair (`chat_type="DRAFTING_ASSISTANT"`). The drafting agent keeps per-`actionableId` session state in a new `drafting_session` workspace state cache, asks the lawyer for missing slots, and emits an augmented `ai_response` with `draftStatus`, `openQuestions`, and (when ready) `draftDocument` (Markdown body). When the lawyer picks a template, the template's structural skeleton is preserved verbatim; only case-specific facts are substituted.
+  - Lawyer-scoped state cache support in `app/vectorstore/qdrant.py` (mirrors the existing workspace-state cache pattern but keyed by `user_id`, with no vectors).
+- Added a dedicated **long-form generation path** `GeminiClient.generate_longform()` (`app/ai/gemini_client.py`) for draft render and draft translation, built on the current **`google-genai`** SDK with native async (`client.aio.models.generate_content`). It exposes explicit **`thinking_level`** control (Gemini 3 thinking models) and falls back to the legacy `generate()` path automatically if the new SDK is unavailable or returns no text — so drafting never hard-fails.
+- Added Gemini generation **diagnostics** (`GeminiClient._log_generation_diagnostics`): every Gemini call now logs `finish_reason` and token usage (`prompt` / `output` / `thinking` / `total`), at WARNING when a response is truncated or blocked. Makes draft cut-offs immediately diagnosable in production logs.
+
+### Changed
+
+- Draft render (`_render_and_attach`) and draft translation (`_handle_translate_draft`) in `app/langgraph/drafting_agent.py` now call `generate_longform(...)` with `max_tokens=65536` (the model's full 64k output ceiling) and `thinking_level="HIGH"`. Drafting is the product's core feature, so it uses the deepest reasoning pass for fuller legal structure and more complete drafts. Previously these used the legacy one-shot call capped at 32000 tokens.
+
+### Fixed
+
+- **Incomplete / truncated drafts.** Long drafts (rejoinders, multi-affidavit packs, 10–20 page legal notices) were rendering cut off mid-sentence. Root cause: draft generation ran on the deprecated `google-generativeai` SDK with no control over the Gemini 3 thinking budget (reasoning tokens are billed against `max_output_tokens`) and a 32000-token cap. Fixed by migrating the draft path to the `google-genai` SDK with explicit thinking control and raising the output ceiling to 64k.
 
 ---
 

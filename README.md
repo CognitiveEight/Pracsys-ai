@@ -117,7 +117,7 @@ Do not rely on these being in Git — they appear after the first runs.
 | System | Role |
 |--------|------|
 | **Socket.IO server** | Your app backend; **required** for production use. |
-| **Google Gemini** | Primary LLM (`GOOGLE_API_KEY`); see `env.example`. |
+| **Google Gemini** | Primary LLM (`GOOGLE_API_KEY`); model set via `GEMINI_MODEL` (e.g. `gemini-3-flash-preview`). Long-form drafting uses the `google-genai` SDK with thinking control; other paths use `google-generativeai`. See `env.example`. |
 | **Qdrant** | Vector database for document search; often run via Docker. |
 | **Redis** | Optional caching (see `docker-compose.yml` / `config.py`). |
 | **GCP / Vision** | Optional OCR or vision keys if you enable those features. |
@@ -146,7 +146,7 @@ Do not rely on these being in Git — they appear after the first runs.
 2. Set at least:
 
    - **Socket:** `SOCKET_URL`, `SOCKET_SECRET_KEY`, `SOCKET_AI_PAYLOAD` (per your backend).
-   - **AI:** `GOOGLE_API_KEY` for Gemini; optional GCP fields for OCR or other Google services.
+   - **AI:** `GOOGLE_API_KEY` for Gemini; `GEMINI_MODEL` to pick the model (default `gemini-3-flash-preview`); optional GCP fields for OCR or other Google services.
    - **Vectors:** `QDRANT_URL` (and API key if used).
 
 See `env.example` for all variables and comments.

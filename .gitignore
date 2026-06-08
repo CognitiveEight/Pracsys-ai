@@ -83,6 +83,7 @@ temp/
 *-serviceaccount*.json
 bns-ai-*.json
 gcp-vision.json
+gcp-bucket-dev.json
 google-application-credentials.json
 # Auto-generated Documentation
 *.md

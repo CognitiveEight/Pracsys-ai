@@ -317,6 +317,29 @@ class TemplateSyncPayload(BaseModel):
     timestamp: Optional[str] = None
 
 
+class TemplateSyncResponsePayload(BaseModel):
+    """
+    Schema for the template_sync_response event (Server → AI_Maverick).
+
+    The server's reply to an AI-initiated ``request_template_sync`` — a full
+    snapshot of the user's active (non-deleted) templates. Treated exactly
+    like a ``template_sync`` with ``action="uploaded"`` for the whole list,
+    so the in-memory template store is (re)populated on demand (e.g. after
+    an AI restart, where the backend has not pushed any delta this session).
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    userId: str = Field(validation_alias=AliasChoices("userId", "user_id"))
+    requestId: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("requestId", "request_id"),
+    )  # Echoed from the request so the AI can correlate reply → request.
+    count: Optional[int] = None  # === len(templates)
+    templates: List[TemplateSyncItem] = []
+    timestamp: Optional[str] = None
+
+
 # ============================================================================
 # AI Response Schemas (AI → Server)
 # ============================================================================
@@ -367,6 +390,9 @@ class DraftDocumentPayload(BaseModel):
     sourceTemplateName: Optional[str] = None
     sourceType: Optional[str] = None  # "template" | "suggestedDraft" | "blank"
     wordCount: Optional[int] = None
+    # Public HTTPS URL to the generated .docx blob uploaded to GCS.
+    # Absent when DOCX generation or upload failed — markdown still ships.
+    downloadUrl: Optional[str] = None
 
 
 class AIResponsePayload(BaseModel):
@@ -415,6 +441,15 @@ class DraftingSuggestionItem(BaseModel):
     One suggested draft in the proactive Drafting Assistant panel.
 
     Emitted inside document_feature_response payload.suggestedDrafts[].
+
+    Template pre-match fields (``templateId`` / ``templateName`` /
+    ``matchMode``) are populated by ``DraftingAgent.suggest()`` when a
+    template in the lawyer's library matches the suggestion. When set,
+    the frontend can render a "Uses <template name>" badge and pass
+    ``templateId`` straight through on click so the kickoff handler
+    skips a second matcher round-trip. When unset (None), the click
+    flow falls back to a blank-source kickoff and the AI infers a
+    standard Indian-advocate skeleton from the case context alone.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -422,6 +457,13 @@ class DraftingSuggestionItem(BaseModel):
     title: str
     relevance: Literal["High", "Medium", "Low"] = "Medium"
     description: Optional[str] = None  # one-line summary, <= 160 chars
+    templateId: Optional[str] = None
+    templateName: Optional[str] = None
+    # Debug / UX hint — "type-match", "anchor-match", "tiebreak" when
+    # a template was matched; "no-match" when the library had no
+    # suitable template; None when matching was not attempted (e.g.
+    # legacy callers or empty library).
+    matchMode: Optional[str] = None
 
 
 class DraftingSuggestionsPayload(BaseModel):

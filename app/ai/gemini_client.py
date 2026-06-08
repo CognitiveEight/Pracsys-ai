@@ -12,6 +12,20 @@ import google.generativeai as genai
 from google.generativeai.types import HarmBlockThreshold, HarmCategory
 from loguru import logger
 
+# New unified SDK (google-genai), used ONLY for long-form draft rendering so we
+# can control the Gemini 3 thinking budget (thinking_level) — reasoning tokens
+# are otherwise billed against max_output_tokens and can starve a long draft.
+# Guarded so a missing/old package can never break the legacy generate() path.
+try:
+    from google import genai as genai_ng
+    from google.genai import types as genai_ng_types
+
+    _NG_SDK_AVAILABLE = True
+except Exception:  # pragma: no cover - depends on installed deps
+    genai_ng = None  # type: ignore
+    genai_ng_types = None  # type: ignore
+    _NG_SDK_AVAILABLE = False
+
 from app.core.config import settings
 from app.observability.trace import tracer
 
@@ -43,11 +57,13 @@ class GeminiClient:
     """
 
     def __init__(self):
-        self.model_name = settings.gemini_model  # gemini-2.5-flash
+        self.model_name = settings.gemini_model  # e.g. gemini-3-flash-preview
         self.embedding_model_name = "models/gemini-embedding-001"
         self.model = None
         self.embedding_model = None
         self._initialized = False
+        # Lazily-built google-genai (new SDK) client for long-form drafting.
+        self._ng_client = None
 
     def initialize(self):
         """Initialize Gemini client."""
@@ -115,6 +131,48 @@ class GeminiClient:
                     return text[start : i + 1].strip()
             i += 1
         return text[start:].strip()
+
+    @staticmethod
+    def _log_generation_diagnostics(response: Any, label: str = "") -> None:
+        """Surface *why* a generation stopped and how the token budget was spent.
+
+        Without this, a response with finish_reason=MAX_TOKENS (or SAFETY /
+        RECITATION) still returns its partial text via _safe_extract_text and
+        ships silently — a draft cut off mid-sentence with no trace of the
+        cause. This logs the finish_reason and usage_metadata so we can tell a
+        genuine token-budget exhaustion (candidates+thoughts ≈ requested cap)
+        apart from an early STOP or a content-filter cut. Best-effort only:
+        never raises, and field names are read defensively because the
+        google-generativeai 0.8.x usage_metadata shape varies by version /
+        model (Gemini 3 thinking models add thoughts_token_count)."""
+        try:
+            candidates = list(getattr(response, "candidates", None) or [])
+            fr_repr = "none"
+            if candidates:
+                fr = getattr(candidates[0], "finish_reason", None)
+                fr_repr = getattr(fr, "name", None) or str(fr)
+            usage = getattr(response, "usage_metadata", None)
+            prompt_t = getattr(usage, "prompt_token_count", None)
+            out_t = getattr(usage, "candidates_token_count", None)
+            think_t = getattr(usage, "thoughts_token_count", None)
+            total_t = getattr(usage, "total_token_count", None)
+            # WARNING when the stop reason indicates truncation/blocking, INFO
+            # otherwise — so normal STOP completions don't spam prod logs but a
+            # truncated draft is loud and greppable.
+            truncated = fr_repr not in ("STOP", "1", "none")
+            log = logger.warning if truncated else logger.info
+            log(
+                "Gemini generation diagnostics [{}]: finish_reason={} "
+                "prompt_tokens={} output_tokens={} thinking_tokens={} total_tokens={}",
+                label or "generate",
+                fr_repr,
+                prompt_t,
+                out_t,
+                think_t,
+                total_t,
+            )
+        except Exception as exc:  # diagnostics must never break generation
+            logger.debug("Gemini diagnostics logging failed: {}", exc)
 
     @staticmethod
     def _safe_extract_text(response: Any) -> str:
@@ -243,6 +301,7 @@ class GeminiClient:
                 )
 
             response = await asyncio.to_thread(_sync_generate)
+            self._log_generation_diagnostics(response, label=self.model_name)
             result = self._safe_extract_text(response)
 
             # Global guardrail: when caller requests JSON mode, ensure we return valid JSON.
@@ -295,6 +354,135 @@ class GeminiClient:
         except Exception as e:
             logger.error("Gemini generation error: {}", str(e))
             return f"Error generating response: {str(e)}"
+
+    def _get_ng_client(self):
+        """Lazily build the google-genai (new SDK) async-capable client.
+
+        Returns None when the SDK is unavailable or no API key is set, so the
+        caller can transparently fall back to the legacy generate() path."""
+        if not _NG_SDK_AVAILABLE:
+            return None
+        if not settings.google_api_key:
+            return None
+        if self._ng_client is None:
+            try:
+                self._ng_client = genai_ng.Client(api_key=settings.google_api_key)
+            except Exception as exc:
+                logger.warning("Failed to init google-genai client: {}", exc)
+                self._ng_client = None
+        return self._ng_client
+
+    @staticmethod
+    def _ng_thinking_level(level: str):
+        """Map a string thinking level to the SDK enum, defaulting to LOW.
+
+        LOW keeps the Gemini 3 reasoning pass cheap so the bulk of
+        max_output_tokens is spent on the actual draft, not on hidden thoughts."""
+        mapping = {
+            "MINIMAL": genai_ng_types.ThinkingLevel.MINIMAL,
+            "LOW": genai_ng_types.ThinkingLevel.LOW,
+            "MEDIUM": genai_ng_types.ThinkingLevel.MEDIUM,
+            "HIGH": genai_ng_types.ThinkingLevel.HIGH,
+        }
+        return mapping.get((level or "LOW").upper(), genai_ng_types.ThinkingLevel.LOW)
+
+    @tracer.trace("gemini_generate_longform")
+    async def generate_longform(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        temperature: float = 0.35,
+        max_tokens: int = 65536,
+        thinking_level: str = "LOW",
+    ) -> str:
+        """Generate a long-form document (legal draft / translation) via the
+        new google-genai SDK with explicit thinking control.
+
+        Why a separate path from generate(): Gemini 3 is a thinking model and
+        its reasoning tokens are billed against max_output_tokens. The legacy
+        google-generativeai SDK gives us no handle on that budget, so a long
+        draft could be starved (or truncated mid-sentence) by an unbounded
+        thinking pass. Here the caller chooses thinking_level explicitly
+        (drafting uses HIGH for the deepest reasoning), we request the full
+        64k output ceiling, and log finish_reason + token usage so a
+        thinking-vs-output budget squeeze is visible. NOTE: thinking tokens are
+        billed against max_output_tokens, so HIGH thinking reduces the room
+        left for the draft — step the level down if long drafts truncate.
+
+        On ANY failure (SDK missing, network, parsing) this falls back to the
+        legacy generate() so drafting never hard-fails because of the migration.
+        """
+        client = self._get_ng_client()
+        if client is None:
+            logger.info(
+                "google-genai unavailable; long-form draft falling back to legacy generate()"
+            )
+            return await self.generate(
+                prompt,
+                system_instruction=system_instruction,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+        try:
+            safety = [
+                genai_ng_types.SafetySetting(
+                    category=cat,
+                    threshold=genai_ng_types.HarmBlockThreshold.BLOCK_NONE,
+                )
+                for cat in (
+                    genai_ng_types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                    genai_ng_types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                    genai_ng_types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                    genai_ng_types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                )
+            ]
+            config = genai_ng_types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+                safety_settings=safety,
+                thinking_config=genai_ng_types.ThinkingConfig(
+                    thinking_level=self._ng_thinking_level(thinking_level),
+                ),
+            )
+            response = await client.aio.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=config,
+            )
+            self._log_generation_diagnostics(
+                response, label=f"{self.model_name}/longform"
+            )
+            result = self._safe_extract_text(response)
+            if not result:
+                # Empty (blocked / truncated-to-nothing) — fall back so the
+                # user still gets a draft from the legacy path.
+                logger.warning(
+                    "Long-form generation returned no text; falling back to legacy generate()"
+                )
+                return await self.generate(
+                    prompt,
+                    system_instruction=system_instruction,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            logger.success(
+                "✅ Generated {} characters via google-genai long-form path",
+                len(result),
+            )
+            return result
+        except Exception as exc:
+            logger.error(
+                "Long-form generation failed ({}); falling back to legacy generate()",
+                exc,
+            )
+            return await self.generate(
+                prompt,
+                system_instruction=system_instruction,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
 
     @tracer.trace("gemini_chat")
     async def chat(

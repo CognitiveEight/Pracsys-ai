@@ -7,6 +7,7 @@ import asyncio
 import json
 import re
 import time
+import uuid
 from datetime import date as date_type
 from datetime import datetime
 from html import unescape
@@ -50,6 +51,7 @@ from app.socket.schemas import (
     AnalysisDocxGenerateRequestPayload,
     ApplicableLawRelevanceRequestPayload,
     TemplateSyncPayload,
+    TemplateSyncResponsePayload,
     UserMessageRequestPayload,
     WorkspaceCreatedPayload,
     WorkspaceSyncPayload,
@@ -663,6 +665,19 @@ class SocketEventHandler:
         self._workspace_drafting_payload: Dict[str, Dict[str, Any]] = (
             PersistentWorkspaceDict(CacheKinds.DRAFTING_SUGGESTIONS)
         )
+        # In-flight request_template_sync correlations: requestId -> Future,
+        # resolved by on_template_sync_response once the snapshot is ingested
+        # into the in-memory template store. Lets the suggestion/kickoff path
+        # await a cold-cache fill before matching.
+        self._pending_template_sync: Dict[str, "asyncio.Future"] = {}
+        # Per-workspace drafting-suggestion provenance, used to self-heal the
+        # panel when a template finishes ingesting *after* suggestions were
+        # built (e.g. a slow scanned-PDF OCR that misses the template-sync
+        # window). Shape: workspace_id -> {"user_id", "role", "lib_count"},
+        # where lib_count is the ready-template count the suggestions were
+        # pre-matched against. When the library later grows, the panel is
+        # regenerated. See _maybe_reemit_drafting_on_templates.
+        self._drafting_meta_by_workspace: Dict[str, Dict[str, Any]] = {}
         # Re-emit after reconnect when socket dropped right after analysis report (so backend gets the update)
         self._had_disconnect: bool = False
         self._pending_reemit_workspace_id: Optional[str] = None
@@ -1002,6 +1017,8 @@ class SocketEventHandler:
         )
         # Drafting Assistant — template library sync from BE.
         self.register("template_sync", self.on_template_sync)
+        # Reply to our AI-initiated request_template_sync (full snapshot).
+        self.register("template_sync_response", self.on_template_sync_response)
 
         # Legacy event handlers
         self.register("workspace_updated", self.on_workspace_updated)
@@ -2077,29 +2094,100 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                             str(s).strip() for s in suggestion_chips if s
                         ][:16]
 
-                        # If tail arrays are missing due partial/truncated JSON, recover them.
-                        if len(possible_next_steps) < 3 or len(suggestion_chips) < 10:
+                        # If the objective or the tail arrays are missing/short
+                        # due to partial AI output, recover them with a focused
+                        # follow-up call. Objective threshold = 200 chars
+                        # because the main prompt demands 10-20 sentences and
+                        # anything shorter is implausibly thin (and triggers
+                        # the generic hardcoded fallback below).
+                        strategic_objective_missing = (
+                            not strategic_objective
+                            or len(strategic_objective.strip()) < 200
+                        )
+                        next_steps_missing = len(possible_next_steps) < 3
+                        chips_missing = len(suggestion_chips) < 10
+                        if (
+                            strategic_objective_missing
+                            or next_steps_missing
+                            or chips_missing
+                        ):
                             try:
-                                recovery_prompt = f"""Return ONLY one valid JSON object with:
+                                # Build the recovery prompt conditionally —
+                                # only ask Gemini for the fields actually
+                                # missing, preserving whatever the first call
+                                # produced correctly.
+                                _requested_fields = []
+                                _field_specs = []
+                                if strategic_objective_missing:
+                                    _requested_fields.append(
+                                        '"strategicObjective": "..."'
+                                    )
+                                    _field_specs.append(
+                                        "- strategicObjective: 10-20 sentences. "
+                                        f"Role-specific for {workspace_role}. "
+                                        "Anchor on named parties from the "
+                                        "EXTRACTED FACTS, exact dates in "
+                                        "DD/MM/YYYY, suit/FIR numbers, exact "
+                                        "amounts, and named statutes "
+                                        "(BNS/BNSS/BSA/IT Act/NDPS/etc.). Do "
+                                        "NOT use Petitioner / Respondent / "
+                                        "Client / Case / Adjudicator / "
+                                        "Mediator labels. Cover both "
+                                        "criminal-law and civil-law tracks "
+                                        "when both are supported by the "
+                                        "facts. No bracket tags like "
+                                        "'(criminal angle)'."
+                                    )
+                                if next_steps_missing:
+                                    _requested_fields.append(
+                                        '"possibleNextSteps": ["..."]'
+                                    )
+                                    _field_specs.append(
+                                        "- possibleNextSteps: exactly 3-5 "
+                                        "immediate, practical actions."
+                                    )
+                                if chips_missing:
+                                    _requested_fields.append(
+                                        '"suggestionChips": ["..."]'
+                                    )
+                                    _field_specs.append(
+                                        "- suggestionChips: exactly 15-16 "
+                                        "short labels (2-5 words each), "
+                                        "actionable and case-specific."
+                                    )
+
+                                try:
+                                    _entities_block_recovery = json.dumps(
+                                        case_entities,
+                                        indent=2,
+                                        ensure_ascii=False,
+                                    )
+                                except Exception:
+                                    _entities_block_recovery = "{}"
+
+                                _fields_json = ",\n  ".join(_requested_fields)
+                                _rules_block = "\n".join(_field_specs)
+                                recovery_prompt = f"""Return ONLY one valid JSON object with these keys:
 {{
-  "possibleNextSteps": ["..."],
-  "suggestionChips": ["..."]
+  {_fields_json}
 }}
 
 Context:
 - Role: {workspace_role}
 - Case summary: {case_summary}
-- Strategic objective: {strategic_objective}
+- Strategic objective (existing, may be empty/short): {strategic_objective}
+
+EXTRACTED FACTS (authoritative ground truth — use exact names/spellings, do NOT rename or abbreviate):
+{_entities_block_recovery}
 
 Documents:
 {combined_document_content}
 
 Rules:
-- possibleNextSteps: exactly 3-5 immediate, practical actions.
-- suggestionChips: exactly 15-16 short labels (2-5 words each), actionable and case-specific.
-- Use Annexure wording for uploads (never Document N).
-- No invented facts.
-- JSON only; no markdown.
+{_rules_block}
+- Use "Annexure N" wording for uploaded files (never "Document N").
+- No invented facts; only use what is in the EXTRACTED FACTS and Documents above.
+- JSON only; no markdown fences.
 """
                                 recovery_raw = await gemini_client.generate(
                                     prompt=recovery_prompt,
@@ -2119,6 +2207,18 @@ Rules:
                                     else json.loads((recovery_raw or "").strip())
                                 )
                                 if isinstance(recovered_data, dict):
+                                    recovered_objective_raw = (
+                                        recovered_data.get("strategicObjective")
+                                        or recovered_data.get("strategic_objective")
+                                        or ""
+                                    )
+                                    if isinstance(recovered_objective_raw, str):
+                                        recovered_objective = _strip_ui_truncated_tokens(
+                                            recovered_objective_raw.strip()
+                                        )
+                                    else:
+                                        recovered_objective = ""
+
                                     recovered_next_steps = (
                                         recovered_data.get("possibleNextSteps")
                                         or recovered_data.get("possible_next_steps")
@@ -2151,19 +2251,23 @@ Rules:
                                         if str(s).strip()
                                     ][:16]
 
+                                    if strategic_objective_missing and recovered_objective:
+                                        strategic_objective = recovered_objective
+                                        analysis_data["strategicObjective"] = recovered_objective
                                     if len(possible_next_steps) < 3 and recovered_next_steps:
                                         possible_next_steps = recovered_next_steps
                                     if len(suggestion_chips) < 10 and recovered_chips:
                                         suggestion_chips = recovered_chips
 
                                     logger.info(
-                                        "Recovered strategy tail fields: nextSteps={}, chips={}",
+                                        "Recovered strategy tail fields: objective={} chars, nextSteps={}, chips={}",
+                                        len(strategic_objective),
                                         len(possible_next_steps),
                                         len(suggestion_chips),
                                     )
                             except Exception as recovery_err:
                                 logger.warning(
-                                    "Could not recover strategy nextSteps/chips: {}",
+                                    "Could not recover strategy tail fields: {}",
                                     recovery_err,
                                 )
 
@@ -7851,6 +7955,11 @@ Indian Kanoon / case-law search results:
             from app.langgraph.drafting_agent import drafting_agent
 
             role_upper = (workspace_role or "ADJUDICATOR").strip().upper() or "ADJUDICATOR"
+            # Make sure the lawyer's template library is loaded into the
+            # in-memory store BEFORE pre-matching. The backend only pushes
+            # template_sync on upload/rename/delete, so after an AI restart
+            # the store is cold — request a full snapshot and wait for it.
+            await self.ensure_templates_synced(user_id)
             brief = self._build_case_brief_for_drafting(workspace_id)
             suggestions = await drafting_agent.suggest(
                 role=role_upper,
@@ -7859,18 +7968,79 @@ Indian Kanoon / case-law search results:
                 strategy_brief=brief["strategy_brief"],
                 analysis_brief=brief["analysis_brief"],
                 list_of_dates_brief=brief["list_of_dates_brief"],
+                # Pre-match each suggestion against the lawyer's template
+                # library so the response carries templateId / templateName
+                # per card. Frontend can display "Uses <template>" badge
+                # and pass templateId straight through on click, skipping
+                # a second matcher round-trip server-side.
+                user_id=user_id,
             )
 
             payload = {"suggestedDrafts": suggestions or []}
             self._workspace_drafting_payload[workspace_id] = payload
+
+            # Record provenance so the panel can self-heal if a template
+            # finishes ingesting after this point (slow scanned-PDF OCR that
+            # missed the template-sync window). `lib_count` is the template
+            # count these suggestions were pre-matched against; a later growth
+            # triggers a regenerate. See _maybe_reemit_drafting_on_templates.
+            try:
+                from app.langgraph.template_store import template_store
+
+                lib_count = await template_store.count_for_user(user_id=user_id)
+            except Exception:
+                lib_count = 0
+            self._drafting_meta_by_workspace[workspace_id] = {
+                "user_id": user_id,
+                "role": role_upper,
+                "lib_count": lib_count,
+            }
+
+            # Log exactly what we're about to send back per suggestion —
+            # title + the pre-matched template fields the frontend uses to
+            # render the "Uses <template>" badge and pass templateId on click.
+            logger.info(
+                "📤 drafting_assistant suggestions payload (workspace={}, user={}): "
+                "{} suggestion(s)",
+                workspace_id,
+                (user_id or "")[:12],
+                len(payload["suggestedDrafts"]),
+            )
+            for idx, s in enumerate(payload["suggestedDrafts"]):
+                if not isinstance(s, dict):
+                    logger.info("   ✏️ [{}] (non-dict: {})", idx, type(s).__name__)
+                    continue
+                logger.info(
+                    "   ✏️ [{}] title={!r} relevance={} matchMode={} "
+                    "templateId={} templateName={!r}",
+                    idx,
+                    s.get("title"),
+                    s.get("relevance"),
+                    s.get("matchMode"),
+                    s.get("templateId"),
+                    s.get("templateName"),
+                )
+
+            response_body = {
+                "featureType": "drafting_assistant",
+                "workspaceId": workspace_id,
+                "userId": user_id,
+                "payload": payload,
+            }
+            # Full dump of the exact response body sent to the backend for
+            # end-to-end verification (titles/descriptions/templateId/
+            # templateName only — no credentials, so no redaction needed).
+            try:
+                logger.info(
+                    "📦 drafting_assistant RESPONSE body to backend:\n{}",
+                    json.dumps(response_body, indent=2, ensure_ascii=False, default=str),
+                )
+            except Exception as e:
+                logger.warning("Drafting suggestions: could not dump response body: {}", e)
+
             await self._socket_client.emit(
                 "document_feature_response",
-                {
-                    "featureType": "drafting_assistant",
-                    "workspaceId": workspace_id,
-                    "userId": user_id,
-                    "payload": payload,
-                },
+                response_body,
             )
             logger.success(
                 "✅ Drafting suggestions sent to backend ({} item(s))",
@@ -7879,6 +8049,61 @@ Indian Kanoon / case-law search results:
             await asyncio.sleep(0.05)
         except Exception as e:
             logger.warning("Drafting suggestions emit failed: {}", e)
+
+    async def _maybe_reemit_drafting_on_templates(self, user_id: str) -> None:
+        """Self-heal the Drafting Assistant panel after a template lands late.
+
+        When a template finishes ingesting (e.g. a slow scanned-PDF OCR that
+        missed the original ``request_template_sync`` window), the suggestions
+        already emitted for this user's workspace(s) were pre-matched against a
+        smaller / empty library and carry no template. Regenerate those panels
+        when the user's ready-template count has grown since the panel was last
+        built. The ``lib_count`` comparison debounces this so rename/delete
+        deltas and no-op snapshots don't trigger redundant regeneration.
+        """
+        user_id = (user_id or "").strip()
+        if not user_id:
+            return
+        try:
+            from app.langgraph.template_store import template_store
+
+            current_count = await template_store.count_for_user(user_id=user_id)
+        except Exception as e:
+            logger.warning(
+                "drafting re-emit: count_for_user failed (user={}): {}",
+                user_id[:12],
+                e,
+            )
+            return
+
+        for workspace_id, meta in list(self._drafting_meta_by_workspace.items()):
+            if (meta or {}).get("user_id") != user_id:
+                continue
+            prev_count = int((meta or {}).get("lib_count") or 0)
+            if current_count <= prev_count:
+                continue  # library didn't grow — nothing new to match
+            role = (meta or {}).get("role") or "ADJUDICATOR"
+            logger.info(
+                "🔁 Template library grew ({}→{}) — regenerating drafting "
+                "suggestions for workspace={} (user={})",
+                prev_count,
+                current_count,
+                workspace_id,
+                user_id[:12],
+            )
+            # Bump the recorded count up front so a burst of template events
+            # can't queue duplicate regenerations for the same growth.
+            self._drafting_meta_by_workspace[workspace_id] = {
+                **(meta or {}),
+                "lib_count": current_count,
+            }
+            asyncio.create_task(
+                self._generate_and_emit_drafting_suggestions(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=role,
+                )
+            )
 
     def _strategy_objective_fallback(
         self,
@@ -12174,10 +12399,23 @@ Indian Kanoon / search results (titles and snippets):
         For "uploaded" the AI downloads each template, extracts its text via
         `file_handlers.process_file_by_extension`, and stores the result in a
         lawyer-scoped Qdrant cache keyed by (userId, template_id). "renamed"
-        only patches cached metadata (content unchanged). "deleted" removes
-        the cache entry.
+        only patches cached metadata (content unchanged) — keyed on
+        template_id, so no stale name-keyed entry is left behind. "deleted"
+        removes the cache entry (supports bulk: multiple templates per event).
         """
         payload_in = data if isinstance(data, dict) else {}
+        # Log the RAW inbound event exactly as the backend pushed it
+        # (top-level keys + action + template count) before validation,
+        # so a malformed/unexpected payload is still visible in the logs.
+        logger.info(
+            "📥 template_sync RECEIVED: action={} userId={} templates={} keys={}",
+            (payload_in or {}).get("action"),
+            str((payload_in or {}).get("userId") or "")[:12],
+            len((payload_in or {}).get("templates") or [])
+            if isinstance((payload_in or {}).get("templates"), list)
+            else "(not a list)",
+            list((payload_in or {}).keys()),
+        )
         try:
             payload = TemplateSyncPayload(**payload_in)
         except Exception as e:
@@ -12202,6 +12440,50 @@ Indian Kanoon / search results (titles and snippets):
             user_id[:12],
             len(templates),
         )
+        # Per-item log so it's clear exactly what the backend pushed.
+        # Signed-URL query strings (credentials) are stripped — only the
+        # GCS object path is shown so each file is identifiable.
+        for idx, tpl in enumerate(templates):
+            raw_url = tpl.fileUrl or ""
+            url_path = raw_url.split("?", 1)[0] if raw_url else ""
+            logger.info(
+                "   📄 [{}] id={} name={!r} category={} ext={} "
+                "hasFileUrl={} fileHash={} path={}",
+                idx,
+                tpl.id,
+                tpl.name,
+                tpl.category,
+                tpl.extension,
+                bool(raw_url),
+                tpl.fileHash,
+                tpl.path or url_path or "(none)",
+            )
+
+        # Full field-by-field dump of the raw inbound payload for end-to-end
+        # verification. Signed-URL credentials are stripped from every
+        # template's fileUrl (only the GCS object path is kept) so no
+        # credentials ever land in the logs.
+        try:
+            sanitized = dict(payload_in)
+            raw_templates = payload_in.get("templates")
+            if isinstance(raw_templates, list):
+                redacted = []
+                for tpl_raw in raw_templates:
+                    if isinstance(tpl_raw, dict):
+                        tpl_copy = dict(tpl_raw)
+                        fu = tpl_copy.get("fileUrl")
+                        if isinstance(fu, str) and fu:
+                            tpl_copy["fileUrl"] = fu.split("?", 1)[0]
+                        redacted.append(tpl_copy)
+                    else:
+                        redacted.append(tpl_raw)
+                sanitized["templates"] = redacted
+            logger.info(
+                "📋 template_sync RAW payload (credentials stripped):\n{}",
+                json.dumps(sanitized, indent=2, ensure_ascii=False, default=str),
+            )
+        except Exception as e:
+            logger.warning("template_sync: could not dump raw payload: {}", e)
 
         try:
             from app.langgraph.drafting_agent import drafting_agent
@@ -12210,33 +12492,10 @@ Indian Kanoon / search results (titles and snippets):
             return
 
         if action == "uploaded":
-            for tpl in templates:
-                if not tpl.id or not tpl.fileUrl:
-                    logger.warning(
-                        "template_sync uploaded: skipping item with missing id/fileUrl ({!r})",
-                        tpl.id,
-                    )
-                    continue
-                # Reuse existing cached payload to skip re-extraction when the
-                # file hash hasn't changed (BE may re-send on reconnect).
-                try:
-                    previous = await drafting_agent.get_template(
-                        user_id=user_id, template_id=tpl.id
-                    )
-                except Exception:
-                    previous = None
-                await drafting_agent.ingest_template(
-                    user_id=user_id,
-                    template_id=tpl.id,
-                    name=tpl.name or tpl.id,
-                    category=tpl.category or "Document Draft",
-                    extension=tpl.extension or "",
-                    mime_type=tpl.mimeType,
-                    file_url=tpl.fileUrl,
-                    path=tpl.path,
-                    file_hash=tpl.fileHash,
-                    previous_payload=previous if isinstance(previous, dict) else None,
-                )
+            await self._ingest_template_items(user_id, templates)
+            # A newly-ingested template may match suggestions that were built
+            # before it was ready — regenerate the panel if the library grew.
+            await self._maybe_reemit_drafting_on_templates(user_id)
         elif action == "renamed":
             for tpl in templates:
                 if not tpl.id or not tpl.name:
@@ -12256,6 +12515,184 @@ Indian Kanoon / search results (titles and snippets):
                 )
         else:
             logger.warning("template_sync: unknown action {!r}", action)
+
+    async def _ingest_template_items(
+        self, user_id: str, templates: List[Any]
+    ) -> int:
+        """Download + extract + cache each template into the in-memory store.
+
+        Shared by the ``template_sync`` ``uploaded`` action and the
+        ``template_sync_response`` snapshot. Returns the count ingested.
+        Per-item failures are isolated and non-fatal. Re-uses any existing
+        cached payload so an unchanged file hash skips re-extraction.
+        """
+        try:
+            from app.langgraph.drafting_agent import drafting_agent
+        except Exception as e:
+            logger.error("_ingest_template_items: drafting agent unavailable: {}", e)
+            return 0
+
+        ingested = 0
+        for tpl in templates:
+            if not tpl.id or not tpl.fileUrl:
+                logger.warning(
+                    "template ingest: skipping item with missing id/fileUrl ({!r})",
+                    tpl.id,
+                )
+                continue
+            try:
+                previous = await drafting_agent.get_template(
+                    user_id=user_id, template_id=tpl.id
+                )
+            except Exception:
+                previous = None
+            try:
+                await drafting_agent.ingest_template(
+                    user_id=user_id,
+                    template_id=tpl.id,
+                    name=tpl.name or tpl.id,
+                    category=tpl.category or "Document Draft",
+                    extension=tpl.extension or "",
+                    mime_type=tpl.mimeType,
+                    file_url=tpl.fileUrl,
+                    path=tpl.path,
+                    file_hash=tpl.fileHash,
+                    previous_payload=previous if isinstance(previous, dict) else None,
+                )
+                ingested += 1
+            except Exception as e:
+                logger.warning(
+                    "template ingest failed (template={}): {}", tpl.id, e
+                )
+        return ingested
+
+    async def on_template_sync_response(self, data: Dict[str, Any]) -> None:
+        """Handle template_sync_response (Server → AI), the reply to our
+        ``request_template_sync``. Ingests the full snapshot into the
+        in-memory store and resolves the awaiting Future (by requestId)."""
+        payload_in = data if isinstance(data, dict) else {}
+        logger.info(
+            "📥 template_sync_response RECEIVED: userId={} requestId={} count={} keys={}",
+            str((payload_in or {}).get("userId") or "")[:12],
+            (payload_in or {}).get("requestId"),
+            (payload_in or {}).get("count"),
+            list((payload_in or {}).keys()),
+        )
+        try:
+            payload = TemplateSyncResponsePayload(**payload_in)
+        except Exception as e:
+            logger.warning(
+                "template_sync_response: invalid payload (keys={}): {}",
+                list((payload_in or {}).keys()),
+                e,
+            )
+            return
+
+        user_id = (payload.userId or "").strip()
+        request_id = payload.requestId
+        templates = list(payload.templates or [])
+
+        # Full sanitized dump (signed-URL credentials stripped) for verification.
+        try:
+            sanitized = dict(payload_in)
+            raw_templates = payload_in.get("templates")
+            if isinstance(raw_templates, list):
+                redacted = []
+                for tpl_raw in raw_templates:
+                    if isinstance(tpl_raw, dict):
+                        tpl_copy = dict(tpl_raw)
+                        fu = tpl_copy.get("fileUrl")
+                        if isinstance(fu, str) and fu:
+                            tpl_copy["fileUrl"] = fu.split("?", 1)[0]
+                        redacted.append(tpl_copy)
+                    else:
+                        redacted.append(tpl_raw)
+                sanitized["templates"] = redacted
+            logger.info(
+                "📋 template_sync_response RAW payload (credentials stripped):\n{}",
+                json.dumps(sanitized, indent=2, ensure_ascii=False, default=str),
+            )
+        except Exception as e:
+            logger.warning("template_sync_response: could not dump raw payload: {}", e)
+
+        if not user_id:
+            logger.warning("template_sync_response: missing userId — dropping event")
+        else:
+            ingested = await self._ingest_template_items(user_id, templates)
+            logger.success(
+                "📚 template_sync_response ingested {}/{} template(s) for user={}",
+                ingested,
+                len(templates),
+                user_id[:12],
+            )
+
+        # Resolve the awaiting future so the suggestion/kickoff path can proceed.
+        fut = self._pending_template_sync.get(request_id) if request_id else None
+        if fut is not None and not fut.done():
+            fut.set_result(True)
+
+        # If this snapshot arrived late (after the ensure_templates_synced
+        # timeout) and grew the library, regenerate any drafting panels that
+        # were built against the smaller/empty library.
+        if user_id:
+            await self._maybe_reemit_drafting_on_templates(user_id)
+
+    async def ensure_templates_synced(
+        self, user_id: str, *, timeout: float = 30.0
+    ) -> None:
+        """Make sure the in-memory template store is warm for ``user_id``.
+
+        If the store already has templates for the user (delta events keep it
+        fresh within a session), this is a no-op. Otherwise it emits
+        ``request_template_sync`` and awaits the ``template_sync_response``
+        snapshot (resolved in :meth:`on_template_sync_response`) up to
+        ``timeout`` seconds, so a cold cache (e.g. right after an AI restart)
+        is filled before template matching runs. Times out gracefully —
+        callers proceed with whatever is in the store.
+        """
+        if not user_id or not self._socket_client:
+            return
+        try:
+            from app.langgraph.template_store import template_store
+
+            if await template_store.count_for_user(user_id=user_id) > 0:
+                return  # already warm this session
+        except Exception:
+            pass
+
+        request_id = f"tmpl-{(user_id or '')[:8]}-{uuid.uuid4().hex[:12]}"
+        loop = asyncio.get_event_loop()
+        fut: "asyncio.Future" = loop.create_future()
+        self._pending_template_sync[request_id] = fut
+        try:
+            await self._socket_client.emit(
+                "request_template_sync",
+                {"userId": user_id, "requestId": request_id},
+            )
+            logger.info(
+                "📨 request_template_sync emitted (user={}, requestId={})",
+                user_id[:12],
+                request_id,
+            )
+            await asyncio.wait_for(fut, timeout=timeout)
+            logger.info(
+                "✅ template snapshot received for user={} (requestId={})",
+                user_id[:12],
+                request_id,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "request_template_sync timed out after {}s (user={}) — "
+                "proceeding with current store",
+                timeout,
+                user_id[:12],
+            )
+        except Exception as e:
+            logger.warning(
+                "request_template_sync failed (user={}): {}", user_id[:12], e
+            )
+        finally:
+            self._pending_template_sync.pop(request_id, None)
 
     def _normalize_case_title(self, title: str) -> str:
         """
@@ -15340,6 +15777,13 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
             "templateOriginalName": payload.templateOriginalName,
             "templateMimeType": payload.templateMimeType,
         }
+
+        # When the turn may need to resolve/match a template (a suggested-draft
+        # or explicit template kickoff), make sure the in-memory store is warm
+        # first — no-op if already populated this session.
+        _src = (payload.source or "").strip().lower()
+        if _src in ("suggesteddraft", "template") or payload.templateId:
+            await self.ensure_templates_synced(user_id)
 
         try:
             from app.langgraph.drafting_agent import drafting_agent

@@ -386,6 +386,20 @@ class GeminiClient:
         }
         return mapping.get((level or "LOW").upper(), genai_ng_types.ThinkingLevel.LOW)
 
+    @staticmethod
+    def _ng_finish_reason(response: Any) -> str:
+        """Return the first candidate's finish_reason name (e.g. 'MAX_TOKENS',
+        'STOP'), or '' if it cannot be read. Used to detect truncation so the
+        long-form path can auto-continue."""
+        try:
+            candidates = list(getattr(response, "candidates", None) or [])
+            if not candidates:
+                return ""
+            fr = getattr(candidates[0], "finish_reason", None)
+            return getattr(fr, "name", None) or str(fr or "")
+        except Exception:
+            return ""
+
     @tracer.trace("gemini_generate_longform")
     async def generate_longform(
         self,
@@ -394,23 +408,32 @@ class GeminiClient:
         temperature: float = 0.35,
         max_tokens: int = 65536,
         thinking_level: str = "LOW",
+        max_continuations: int = 3,
     ) -> str:
         """Generate a long-form document (legal draft / translation) via the
-        new google-genai SDK with explicit thinking control.
+        new google-genai SDK, with explicit thinking control AND automatic
+        continuation so the document always finishes.
 
         Why a separate path from generate(): Gemini 3 is a thinking model and
         its reasoning tokens are billed against max_output_tokens. The legacy
         google-generativeai SDK gives us no handle on that budget, so a long
         draft could be starved (or truncated mid-sentence) by an unbounded
-        thinking pass. Here the caller chooses thinking_level explicitly
-        (drafting uses HIGH for the deepest reasoning), we request the full
-        64k output ceiling, and log finish_reason + token usage so a
-        thinking-vs-output budget squeeze is visible. NOTE: thinking tokens are
-        billed against max_output_tokens, so HIGH thinking reduces the room
-        left for the draft — step the level down if long drafts truncate.
+        thinking pass. Two mechanisms keep drafts complete:
 
-        On ANY failure (SDK missing, network, parsing) this falls back to the
-        legacy generate() so drafting never hard-fails because of the migration.
+          1. thinking_level (drafting uses LOW): keeps the reasoning pass cheap
+             so the bulk of the 64k output budget is spent on the draft itself,
+             not on hidden thoughts. At MEDIUM/HIGH the thinking pass was eating
+             ~60k tokens and the visible draft truncated after only ~2-3k.
+          2. Continuation loop: if a response still comes back with
+             finish_reason=MAX_TOKENS, we re-prompt with the draft-so-far and
+             ask the model to continue from exactly where it stopped, then
+             concatenate — up to `max_continuations` rounds. Continuation calls
+             use MINIMAL thinking to maximise output per round. This guarantees
+             completion for drafts longer than a single 64k response (20+ pages).
+
+        finish_reason + token usage are logged each round so a thinking-vs-output
+        squeeze stays visible. On ANY failure (SDK missing, network, parsing)
+        this falls back to the legacy generate() so drafting never hard-fails.
         """
         client = self._get_ng_client()
         if client is None:
@@ -437,19 +460,22 @@ class GeminiClient:
                     genai_ng_types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
                 )
             ]
-            config = genai_ng_types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=temperature,
-                max_output_tokens=max_tokens,
-                safety_settings=safety,
-                thinking_config=genai_ng_types.ThinkingConfig(
-                    thinking_level=self._ng_thinking_level(thinking_level),
-                ),
-            )
+
+            def _build_config(level: str):
+                return genai_ng_types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=temperature,
+                    max_output_tokens=max_tokens,
+                    safety_settings=safety,
+                    thinking_config=genai_ng_types.ThinkingConfig(
+                        thinking_level=self._ng_thinking_level(level),
+                    ),
+                )
+
             response = await client.aio.models.generate_content(
                 model=self.model_name,
                 contents=prompt,
-                config=config,
+                config=_build_config(thinking_level),
             )
             self._log_generation_diagnostics(
                 response, label=f"{self.model_name}/longform"
@@ -467,9 +493,64 @@ class GeminiClient:
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
+
+            # Continuation loop: while the model stopped because it ran out of
+            # output budget (MAX_TOKENS), ask it to pick up exactly where it
+            # left off and stitch the pieces together. MINIMAL thinking on the
+            # continuation rounds leaves nearly the whole budget for text.
+            rounds = 0
+            while (
+                self._ng_finish_reason(response) == "MAX_TOKENS"
+                and rounds < max_continuations
+            ):
+                rounds += 1
+                logger.warning(
+                    "Long-form hit MAX_TOKENS; auto-continuation round {}/{}",
+                    rounds,
+                    max_continuations,
+                )
+                continuation_prompt = (
+                    f"{prompt}\n\n"
+                    "--- DOCUMENT GENERATED SO FAR (do NOT repeat any of it) ---\n"
+                    f"{result}\n\n"
+                    "--- INSTRUCTION ---\n"
+                    "Continue the document from EXACTLY where it stops above, "
+                    "picking up mid-sentence or mid-word if necessary. Do NOT "
+                    "repeat, summarise, or restart any text already written. "
+                    "Do NOT add a preamble. Output ONLY the remaining text, and "
+                    "carry on until the document is fully complete (including any "
+                    "signature, verification, or annexure blocks the template "
+                    "requires)."
+                )
+                response = await client.aio.models.generate_content(
+                    model=self.model_name,
+                    contents=continuation_prompt,
+                    config=_build_config("MINIMAL"),
+                )
+                self._log_generation_diagnostics(
+                    response, label=f"{self.model_name}/longform-cont{rounds}"
+                )
+                piece = self._safe_extract_text(response)
+                if not piece:
+                    logger.warning(
+                        "Continuation round {} returned no text; stopping.", rounds
+                    )
+                    break
+                result += piece
+
+            if self._ng_finish_reason(response) == "MAX_TOKENS":
+                logger.warning(
+                    "Long-form still truncated after {} continuation rounds; "
+                    "returning best-effort {} chars.",
+                    max_continuations,
+                    len(result),
+                )
+
             logger.success(
-                "✅ Generated {} characters via google-genai long-form path",
+                "✅ Generated {} characters via google-genai long-form path "
+                "({} continuation round(s))",
                 len(result),
+                rounds,
             )
             return result
         except Exception as exc:

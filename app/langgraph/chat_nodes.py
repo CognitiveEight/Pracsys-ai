@@ -314,7 +314,11 @@ CACHED ANALYSIS REPORT (same data as the Analysis Report panel; use for question
     uploaded_docs = workspace_state.get("uploaded_documents") or []
     if uploaded_docs:
         docs_section = "\nUPLOADED ANNEXURES (reference evidence for this workspace):\n"
-        docs_section += "Ordering: Annexure 1 is the first block below, Annexure 2 the second, and so on.\n"
+        docs_section += (
+            "Each block is labeled with its stable annexure number. Annexure numbers are stable "
+            "identifiers and may not be contiguous below — only the annexures relevant to your "
+            "question are included.\n"
+        )
         docs_section += (
             'When the user refers to "Annexure 1", "Annexure 2", Roman numerals (Annexure I, II), '
             "or variants like annexure-1, map them to the corresponding numbered block below.\n"
@@ -331,13 +335,16 @@ CACHED ANALYSIS REPORT (same data as the Analysis Report panel; use for question
             "NUMERIC INTEGRITY: Transcribe purchase price, invoice totals, and other figures exactly as in the "
             "excerpts below; if a figure does not appear here, do not invent it — say it is not in the supplied excerpt.\n"
         )
-        for i, doc in enumerate(uploaded_docs, 1):
+        for idx, doc in enumerate(uploaded_docs, 1):
             content = doc.get("content") or ""
             if content:
+                # Prefer the stable annexure number set by the retrieval layer;
+                # fall back to enumeration position for other callers.
+                ann_num = doc.get("annexure_number") or idx
                 ann_label = (
                     doc.get("fileName") or doc.get("display_name") or ""
                 ).strip()
-                header = f"--- Annexure {i}"
+                header = f"--- Annexure {ann_num}"
                 if ann_label:
                     header += f" ({ann_label})"
                 header += " ---"

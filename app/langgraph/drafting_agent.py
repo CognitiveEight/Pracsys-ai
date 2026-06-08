@@ -4136,14 +4136,15 @@ OUTPUT FORMAT:
         )
         try:
             # Same long-form path as draft render (64k ceiling, thinking_level
-            # HIGH) — a translated long rejoinder needs the same room as the
-            # English original and benefits from the same deep reasoning pass.
+            # MEDIUM) — a translated long rejoinder needs the same room as the
+            # English original, and the same budget bias toward full-length
+            # output rather than an expensive reasoning pass.
             raw = await gemini_client.generate_longform(
                 prompt,
                 system_instruction=DRAFT_TRANSLATE_INSTRUCTION,
                 temperature=0.2,
                 max_tokens=65536,
-                thinking_level="HIGH",
+                thinking_level="MEDIUM",
             )
         except Exception as e:
             logger.error("Draft translate LLM call failed: {}", e)
@@ -5132,21 +5133,23 @@ OUTPUT FORMAT:
             revision_instruction=revision_instruction,
         )
         try:
-            # Long-form path (new google-genai SDK) with thinking_level=HIGH:
-            # drafting is the product's core feature, so we trade budget for
-            # the deepest reasoning pass — better legal structure, fuller
-            # argument, more complete drafts. Gemini 3 bills thinking tokens
-            # against max_output_tokens, so HIGH thinking eats into the 64k
-            # ceiling; watch the "/longform" diagnostics line for
-            # finish_reason=MAX_TOKENS with large thinking_tokens, and step
-            # down to MEDIUM if very long (15–20 page) drafts truncate. Falls
+            # Long-form path (new google-genai SDK) with thinking_level=MEDIUM:
+            # Gemini 3 bills thinking tokens against max_output_tokens, and at
+            # HIGH the model spent so much of the 64k budget reasoning that it
+            # compressed the final draft — producing output thinner / less
+            # detailed than the uploaded template. MEDIUM keeps solid legal
+            # reasoning while leaving most of the budget for a full-length,
+            # template-faithful render. If drafts still come back thinner than
+            # the template, drop to LOW (more literal/verbatim); if reasoning
+            # quality regresses, step back toward HIGH. Watch the "/longform"
+            # diagnostics line (thinking_tokens vs output_tokens) to tune. Falls
             # back to the legacy generate() automatically if the SDK is missing.
             raw = await gemini_client.generate_longform(
                 prompt,
                 system_instruction=DRAFT_RENDER_INSTRUCTION,
                 temperature=0.35,
                 max_tokens=65536,
-                thinking_level="HIGH",
+                thinking_level="MEDIUM",
             )
         except Exception as e:
             logger.error("Draft render LLM call failed: {}", e)

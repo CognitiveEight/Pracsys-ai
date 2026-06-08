@@ -29,6 +29,8 @@ FORBIDDEN = (
     "legal",
     "Case's",
     "case's",
+    "Victim",
+    "victim",
 )
 
 SYSTEM = """You are a strict text processor.
@@ -36,7 +38,7 @@ SYSTEM = """You are a strict text processor.
 Your task is to ONLY process specific forbidden words from the input text.
 
 Forbidden words (whole words only; case-sensitive; never match inside longer words, e.g. keep "clientele" unchanged):
-["Petitioner", "petitioner", "Client", "client", "Case", "case", "Case's", "case's", "Respondent", "respondent", "Legal", "legal"]
+["Petitioner", "petitioner", "Client", "client", "Case", "case", "Case's", "case's", "Respondent", "respondent", "Legal", "legal", "Victim", "victim"]
 
 Replacement rules - use the replacement that corresponds to the exact spelling you matched:
 
@@ -50,12 +52,14 @@ Replacement rules - use the replacement that corresponds to the exact spelling y
 "case's" -> "matter's"
 "Client" -> "Individual"
 "client" -> "individual"
+"Victim" -> "Individual"
+"victim" -> "individual"
 "Legal" -> (remove word only)
 "legal" -> (remove word only)
 
 Mandatory casing for replacements:
-- If the matched forbidden word is "Petitioner", "Client", "Respondent", "Case", or "Case's", you MUST output "Individual", "Individual", "Individual", "Matter", or "Matter's" respectively - never use the lowercase forms for those matches.
-- If the matched word is "petitioner", "client", "respondent", "case", or "case's", you MUST output "individual", "individual", "individual", "matter", or "matter's" respectively - unless the sentence-initial rule below requires capitalizing the first letter of that word.
+- If the matched forbidden word is "Petitioner", "Client", "Respondent", "Victim", "Case", or "Case's", you MUST output "Individual", "Individual", "Individual", "Individual", "Matter", or "Matter's" respectively - never use the lowercase forms for those matches.
+- If the matched word is "petitioner", "client", "respondent", "victim", "case", or "case's", you MUST output "individual", "individual", "individual", "individual", "matter", or "matter's" respectively - unless the sentence-initial rule below requires capitalizing the first letter of that word.
 
 Sentence starts after replacement or removal (English):
 - After all forbidden-word edits, if a word is the very first word of the entire text, OR the first word after a sentence boundary (. ! ? followed by space or newline), capitalize its first letter when normal English prose would (so you do not leave a sentence starting with a lowercase letter because a forbidden word was removed or replaced).
@@ -89,6 +93,8 @@ _DIRECT_REPLACEMENTS = {
     "case": "matter",
     "Client": "Individual",
     "client": "individual",
+    "Victim": "Individual",
+    "victim": "individual",
     "Legal": "",
     "legal": "",
 }

@@ -202,13 +202,24 @@ class QdrantStore:
             # Format results
             formatted_results = []
             for result in results:
+                payload = result.payload or {}
+                meta = payload.get("metadata", {}) or {}
+                # Resolve the parent document id via the same fallback chain as
+                # _get_all_documents_sync so callers can map a chunk back to its
+                # original document (used for stable annexure numbering in chat).
+                orig_id = (
+                    payload.get("original_document_id")
+                    or meta.get("original_document_id")
+                    or payload.get("document_id")
+                )
                 formatted_results.append(
                     {
                         "id": result.id,
                         "score": result.score,
-                        "content": result.payload.get("content"),
-                        "metadata": result.payload.get("metadata", {}),
-                        "document_id": result.payload.get("document_id"),
+                        "content": payload.get("content"),
+                        "metadata": meta,
+                        "document_id": payload.get("document_id"),
+                        "original_document_id": orig_id,
                     }
                 )
 

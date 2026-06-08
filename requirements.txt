@@ -12,6 +12,8 @@ aiohttp==3.9.5
 # AI/ML - Google Gemini
 google-generativeai>=0.4.0
 google-ai-generativelanguage>=0.4.0
+# New unified SDK — required for long-form drafting (thinking_level control).
+google-genai>=1.75.0
 
 # Google Cloud (for Vision API OCR)
 google-cloud-vision>=3.4.0

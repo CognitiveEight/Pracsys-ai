@@ -4,18 +4,22 @@ and vector storage.
 """
 
 import asyncio
-import json
+import os
 import re
 import socket
+import tempfile
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import httpx
 from loguru import logger
 
 from app.observability.audit import audit_logger
 from app.observability.trace import tracer
+from app.processing.document_classifier import classify_and_extract
 from app.processing.file_handlers import file_processor
+from app.processing.pii_detector import PIIScanResult, scan_text
 from app.processing.readability import readability_scorer
 from app.utils.exceptions import FileProcessingError
 from app.vectorstore.qdrant import vector_store
@@ -73,31 +77,6 @@ class DocumentProcessor:
                     return first[: max_chars - 1].rsplit(" ", 1)[0] + "…"
         return text[: max_chars - 1] + "…" if len(text) > max_chars else text
 
-    def _salvage_summary_from_truncated_json(self, raw: str) -> str:
-        """If Gemini returned truncated JSON (e.g. Unterminated string), extract the summary value."""
-        if not raw or "summary" not in raw:
-            return ""
-        idx = raw.find('"summary"')
-        if idx < 0:
-            return ""
-        # Find the opening quote of the value (after ": or ": )
-        colon = raw.find(":", idx + 9)
-        if colon < 0:
-            return ""
-        start_quote = raw.find('"', colon + 1)
-        if start_quote < 0:
-            return ""
-        start = start_quote + 1
-        end = start
-        while end < len(raw):
-            if raw[end] == "\\" and end + 1 < len(raw):
-                end += 2
-                continue
-            if raw[end] == '"':
-                return raw[start:end].strip()
-            end += 1
-        return raw[start:].strip()
-
     async def _get_english_summary_fallback(self, extracted_text: str) -> str:
         """Get a one-sentence English summary from Gemini when main JSON fails (avoids Hindi/extractive)."""
         if not extracted_text or len(extracted_text.strip()) < 20:
@@ -123,109 +102,90 @@ Document excerpt:
             logger.debug("English summary fallback failed: {}", str(e))
         return self._extractive_summary_fallback(extracted_text)
 
-    async def _get_summary_and_evidentiary_strength(
-        self, extracted_text: str, filename: str
-    ) -> Dict[str, str]:
+    # The frontend promotes drafts via `workspace_sync` with filenames
+    # of the form `annexure-<N>-<Slugified_Draft_Title>_<ISO timestamp>.txt`
+    # where the ISO timestamp uses `-` separators inside the time portion
+    # (e.g. `2026-05-22T12-45-55`). This regex anchors on that distinctive
+    # tail so we can flag drafted-by-assistant documents at ingestion.
+    _DRAFTED_FILENAME_PATTERN = re.compile(
+        r"_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})\.[a-zA-Z0-9]+$"
+    )
+
+    @classmethod
+    def _infer_drafted_by_assistant(
+        cls, filename: Optional[str]
+    ) -> Optional[Dict[str, str]]:
+        """Detect the assistant-draft filename tail and return parsed metadata.
+
+        Returns a dict with `drafted_at` (ISO-8601 timestamp string) and
+        `draft_title` (slugified title pulled from the filename body),
+        or `None` if the filename does not match the assistant-draft
+        pattern.
         """
-        Generate a short summary and evidentiary strength for the document using AI.
-        Summary is always requested in English. Returns {"summary": str, "evidentiary_strength": "Low"|"Medium"|"High"}.
-        """
-        fallback_extractive = self._extractive_summary_fallback(extracted_text)
-        if not extracted_text or len(extracted_text.strip()) < 30:
-            english_fallback = await self._get_english_summary_fallback(extracted_text)
-            return {"summary": english_fallback, "evidentiary_strength": "Low"}
+        name = (filename or "").strip()
+        if not name:
+            return None
+        match = cls._DRAFTED_FILENAME_PATTERN.search(name)
+        if not match:
+            return None
+        raw_ts = match.group(1)
+        # Convert the timestamp tail `2026-05-22T12-45-55` (which uses
+        # dashes in the time portion for filename safety) back into a
+        # standard ISO-8601 timestamp `2026-05-22T12:45:55`.
         try:
-            from app.ai.gemini_client import gemini_client
-
-            gemini_client.initialize()
-            text_snippet = (
-                (extracted_text.strip()[:4000] + "...")
-                if len(extracted_text) > 4000
-                else extracted_text.strip()
+            date_part, time_part = raw_ts.split("T", 1)
+            time_iso = time_part.replace("-", ":")
+            drafted_at_iso = f"{date_part}T{time_iso}"
+            # Validate by parsing — if it doesn't parse, we still
+            # accept the raw string but log a debug note.
+            datetime.fromisoformat(drafted_at_iso)
+        except Exception:
+            drafted_at_iso = raw_ts  # fallback: keep the dashed form
+            logger.debug(
+                "Drafted-by-assistant filename matched but ISO parse "
+                "failed for {}",
+                raw_ts,
             )
-            prompt = f"""You are a legal document analyst. For the document excerpt below, output a single JSON object with two keys:
-- "summary": 2-3 short sentences in English only summarizing what the document is about and its relevance. Keep the summary under 250 characters. Write in English regardless of the document language.
-- "evidentiaryStrength": exactly one of "Low", "Medium", or "High" (how useful as evidence).
 
-Document excerpt:
-{text_snippet}
+        # Derive a draft title from the filename body. The convention is
+        # `annexure-<N>-<Slugified_Title>_<timestamp>.<ext>` so we strip
+        # the annexure prefix and the timestamp suffix, then convert
+        # underscores back to spaces.
+        body = name[: match.start()]
+        # Remove leading `annexure-<digits>-`
+        body = re.sub(r"^annexure-\d+-", "", body, flags=re.IGNORECASE)
+        title = body.replace("_", " ").strip()
+        # Trim trailing punctuation residue
+        title = re.sub(r"[,\s]+$", "", title)
+        return {
+            "drafted_at": drafted_at_iso,
+            "draft_title": title or "",
+        }
 
-Output only the JSON object, no markdown, no code block, no other text. Example:
-{{"summary": "This document is a complaint letter to the police regarding a hacked social media account.", "evidentiaryStrength": "High"}}"""
-            raw = await gemini_client.generate(prompt, temperature=0.2, max_tokens=12000)
-            if not raw or "Error" in (raw[:80] or ""):
-                english_fallback = await self._get_english_summary_fallback(
-                    extracted_text
-                )
-                return {"summary": english_fallback, "evidentiary_strength": "Medium"}
-            raw_clean = raw.strip()
-            if "```" in raw_clean:
-                code = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw_clean)
-                if code:
-                    raw_clean = (code.group(1) or "").strip()
-            start = raw_clean.find("{")
-            if start >= 0:
-                depth = 0
-                for i in range(start, len(raw_clean)):
-                    if raw_clean[i] == "{":
-                        depth += 1
-                    elif raw_clean[i] == "}":
-                        depth -= 1
-                        if depth == 0:
-                            raw_clean = raw_clean[start : i + 1]
-                            break
-            if not raw_clean or not raw_clean.strip().startswith("{"):
-                logger.debug(
-                    "Summary JSON not found (response len={}). First 300 chars: {}",
-                    len(raw),
-                    (raw[:300] if raw else ""),
-                )
-                english_fallback = await self._get_english_summary_fallback(
-                    extracted_text
-                )
-                return {"summary": english_fallback, "evidentiary_strength": "Medium"}
-            data = json.loads(raw_clean)
-            summary = (data.get("summary") or "").strip()
-            if not summary:
-                summary = await self._get_english_summary_fallback(extracted_text)
-            strength = (
-                data.get("evidentiaryStrength")
-                or data.get("evidentiary_strength")
-                or "Medium"
-            ).strip()
-            if strength not in ("Low", "Medium", "High"):
-                strength = "Medium"
-            return {"summary": summary, "evidentiary_strength": strength}
-        except json.JSONDecodeError as e:
-            logger.warning(
-                "Summary JSON parse failed: {}; raw (first 400 chars): {}",
-                str(e),
-                (raw[:400] if raw else ""),
+    async def _classify_document(
+        self, redacted_text: str, filename: str
+    ) -> Dict[str, Any]:
+        """Run the unified classifier on PII-redacted text and fall back to
+        an English summary if the classifier returns nothing usable.
+
+        Returns a dict with keys:
+            summary, evidentiary_strength, document_type, extracted_fields.
+        """
+        if not redacted_text or len(redacted_text.strip()) < 30:
+            english_fallback = await self._get_english_summary_fallback(redacted_text)
+            return {
+                "summary": english_fallback,
+                "evidentiary_strength": "Low",
+                "document_type": "other",
+                "extracted_fields": {},
+            }
+
+        result = await classify_and_extract(redacted_text, filename)
+        if not result.get("summary"):
+            result["summary"] = await self._get_english_summary_fallback(
+                redacted_text
             )
-            # Try to repair truncated JSON (Unterminated string: close the value string and object)
-            if raw and "Unterminated string" in str(e):
-                try:
-                    # Append closing quote for the summary value and the rest of the object
-                    repaired = raw.rstrip() + '", "evidentiaryStrength": "Medium"}'
-                    data = json.loads(repaired)
-                    summary = (data.get("summary") or "").strip()
-                    if summary and len(summary) >= 10:
-                        strength = (data.get("evidentiaryStrength") or "Medium").strip()
-                        if strength not in ("Low", "Medium", "High"):
-                            strength = "Medium"
-                        return {"summary": summary, "evidentiary_strength": strength}
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            # Try to salvage partial summary from truncated JSON
-            salvaged = self._salvage_summary_from_truncated_json(raw)
-            if salvaged and len(salvaged) >= 25:
-                return {"summary": salvaged, "evidentiary_strength": "Medium"}
-            english_fallback = await self._get_english_summary_fallback(extracted_text)
-            return {"summary": english_fallback, "evidentiary_strength": "Medium"}
-        except Exception as e:
-            logger.warning("Summary/evidentiary strength generation failed: {}", str(e))
-            english_fallback = await self._get_english_summary_fallback(extracted_text)
-            return {"summary": english_fallback, "evidentiary_strength": "Medium"}
+        return result
 
     def _infer_format_from_filename(self, filename: str) -> str:
         """Infer a coarse format type used by readability scoring."""
@@ -277,20 +237,51 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
             # Download file
             file_content, file_size = await self._download_file(file_url, filename)
 
-            # Extract text using GCP-powered file processor
-            extracted_text = file_processor.process_file_by_extension(
-                file_content, filename
-            )
+            # Audio path: transcribe + diarize via Chirp 3, then treat the formatted
+            # transcript as the document's extracted text so summary/strength/vector
+            # store all keep working unchanged.
+            audio_extras: Dict[str, Any] = {}
+            if file_processor.is_audio_file(filename):
+                audio_result = await self._transcribe_audio_bytes(
+                    file_content, filename
+                )
+                if audio_result.success:
+                    extracted_text = audio_result.transcript or audio_result.raw_transcript
+                    audio_extras = {
+                        "is_audio": True,
+                        "transcript": audio_result.transcript,
+                        "transcript_status": "ready",
+                        "audio_segments": audio_result.segments,
+                        "audio_speaker_source": audio_result.speaker_source,
+                        "audio_languages": audio_result.detected_languages,
+                    }
+                else:
+                    extracted_text = ""
+                    audio_extras = {
+                        "is_audio": True,
+                        "transcript": "",
+                        "transcript_status": "failed",
+                        "audio_error": audio_result.error or "transcription_failed",
+                    }
+            else:
+                # Extract text using GCP-powered file processor
+                extracted_text = file_processor.process_file_by_extension(
+                    file_content, filename
+                )
 
             # Create extraction metadata
             extraction_metadata = {
                 "extraction_method": (
-                    "gcp_vision"
-                    if any(
-                        ext in filename.lower()
-                        for ext in [".jpg", ".jpeg", ".png", ".gif", ".bmp"]
+                    "audio_transcription"
+                    if audio_extras.get("is_audio")
+                    else (
+                        "gcp_vision"
+                        if any(
+                            ext in filename.lower()
+                            for ext in [".jpg", ".jpeg", ".png", ".gif", ".bmp"]
+                        )
+                        else "direct"
                     )
-                    else "direct"
                 ),
                 "has_errors": extracted_text.startswith("[Error")
                 or extracted_text.startswith("["),
@@ -301,38 +292,119 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
                 "format": self._infer_format_from_filename(filename),
             }
 
-            # Calculate readability score
+            # Calculate readability score (uses raw text length, not redacted)
             readability_result = readability_scorer.calculate_score(
                 extracted_text, extraction_metadata, file_size
             )
 
-            # Store in vector database (user-scoped)
-            stored_in_vector_db = False
-            if extracted_text and readability_result["readable"]:
-                try:
-                    await self._store_in_vector_db(
-                        workspace_id=workspace_id,
-                        user_id=user_id,
-                        document_id=document_id,
-                        text=extracted_text,
-                        filename=filename,
-                        metadata={
-                            **(metadata or {}),
-                            **extraction_metadata,
-                            "readability": readability_result,
-                            "file_size": file_size,
-                        },
-                    )
-                    stored_in_vector_db = True
-                except Exception as vector_error:
-                    logger.warning(f"Could not store in vector DB: {vector_error}")
-                    # Continue processing even if vector storage fails
-                    stored_in_vector_db = False
+            # PII redaction: scan the raw extracted text for Indian
+            # identifier patterns (Aadhaar, PAN, GSTIN, Udyam, passport,
+            # EPIC, DL, bank account, mobile). The redacted copy is what
+            # leaves this function — vector DB, Gemini calls, logs, and
+            # the public ``summary`` / ``extracted_fields`` payload all
+            # use ``redacted_text``. Full values stay only in ``sensitive_fields``
+            # which downstream is expected to encrypt at rest.
+            pii_scan: PIIScanResult = scan_text(extracted_text)
+            redacted_text = pii_scan.redacted_text
+            sensitive_fields = pii_scan.sensitive_fields()
+            masked_pii_fields = pii_scan.masked_fields()
 
-            # Generate summary and evidentiary strength for the document
-            summary_strength = await self._get_summary_and_evidentiary_strength(
-                extracted_text, filename
+            # Classify document type, extract structured fields, and produce
+            # the legal-analyst summary in a single Gemini call. Runs on the
+            # REDACTED text so PII never reaches the LLM. We classify BEFORE
+            # vector storage so document_type / extracted_fields can be
+            # persisted in chunk metadata — downstream feature agents can
+            # then ground their reasoning on a deterministic document
+            # inventory rather than re-inferring type from OCR text.
+            classification = await self._classify_document(redacted_text, filename)
+
+            # Merge identifier matches from regex extraction into the LLM's
+            # extracted_fields output. Regex wins on numeric IDs (deterministic);
+            # LLM provides names, dates, addresses, and free-form fields.
+            extracted_fields: Dict[str, Any] = dict(
+                classification.get("extracted_fields") or {}
             )
+            for field_type, masked_values in masked_pii_fields.items():
+                # Single-value fields: take first match. List fields kept as-is.
+                if field_type in ("aadhaar_number", "pan_number",
+                                   "udyam_number", "passport_number",
+                                   "voter_id_number", "driving_licence_number"):
+                    extracted_fields.setdefault(field_type, masked_values[0])
+                else:
+                    extracted_fields.setdefault(field_type, masked_values)
+
+            # Drafted-by-assistant marker: the frontend promotes the
+            # assistant's rendered drafts via the same `workspace_sync`
+            # path as regular evidence uploads, but with a distinctive
+            # filename suffix `_YYYY-MM-DDTHH-MM-SS.txt` (per live log:
+            # `Legal_Notice_..._2026-05-22T12-45-55.txt`). Detect this
+            # filename tail and tag the extracted_fields so the
+            # regeneration prompts (strategy / analysis / list_of_dates /
+            # applicable_laws / procedural_timeline) treat the underlying
+            # procedural action as already completed by the client side.
+            drafted_meta = self._infer_drafted_by_assistant(filename)
+            if drafted_meta:
+                extracted_fields.setdefault(
+                    "drafted_by_assistant", True
+                )
+                extracted_fields.setdefault(
+                    "drafted_at", drafted_meta["drafted_at"]
+                )
+                derived_title = drafted_meta.get("draft_title")
+                if derived_title:
+                    extracted_fields.setdefault(
+                        "draft_title", derived_title
+                    )
+
+            # Store in vector database (user-scoped). Use REDACTED text so
+            # raw IDs never land in chunk content. Persist document_type and
+            # the masked extracted_fields in chunk metadata so retrievers
+            # downstream see the structured signal alongside the OCR content.
+            #
+            # Always store an entry — even when OCR yielded no readable text —
+            # so the workspace_sync dedup check (events.py:13593-13622) finds
+            # the document_id on subsequent syncs and skips reprocessing.
+            # Without this marker, image-only annexures fall through the
+            # vector-store presence check forever and trigger strategy /
+            # analysis / list_of_dates / applicable_laws regeneration on
+            # every backend sync (e.g. each "Download Analysis Report" click).
+            stored_in_vector_db = False
+            is_low_content_marker = not (
+                redacted_text and readability_result["readable"]
+            )
+            if is_low_content_marker:
+                # Marker text is deterministic and ≥ 20 chars, so it survives
+                # the content-length filter in qdrant.py get_all_documents.
+                text_for_store = (
+                    "[Low-content document marker — OCR produced no readable text] "
+                    f"filename: {filename} | "
+                    f"document_type: {classification.get('document_type') or 'other'} | "
+                    f"summary: {classification.get('summary') or 'no readable content extracted'}"
+                )
+            else:
+                text_for_store = redacted_text
+            try:
+                await self._store_in_vector_db(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    document_id=document_id,
+                    text=text_for_store,
+                    filename=filename,
+                    metadata={
+                        **(metadata or {}),
+                        **extraction_metadata,
+                        "readability": readability_result,
+                        "file_size": file_size,
+                        "document_type": classification["document_type"],
+                        "extracted_fields": extracted_fields,
+                        "is_low_content_marker": is_low_content_marker,
+                    },
+                )
+                stored_in_vector_db = True
+            except Exception as vector_error:
+                logger.warning(f"Could not store in vector DB: {vector_error}")
+                # Continue processing even if vector storage fails
+                stored_in_vector_db = False
 
             # Prepare result
             result = {
@@ -347,14 +419,31 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
                 "metadata": extraction_metadata,
                 "readability_breakdown": readability_result,
                 "stored_in_vector_db": stored_in_vector_db,
-                "summary": summary_strength["summary"],
-                "evidentiary_strength": summary_strength["evidentiary_strength"],
+                "summary": classification["summary"],
+                "evidentiary_strength": classification["evidentiary_strength"],
+                "document_type": classification["document_type"],
+                "extracted_fields": extracted_fields,
+                "sensitive_fields": sensitive_fields,
             }
+            if audio_extras:
+                # Replace raw transcript with the redacted copy so cached /
+                # re-emitted transcripts do not leak IDs spoken on a call.
+                if audio_extras.get("transcript"):
+                    audio_extras["transcript"] = redacted_text
+                result.update(audio_extras)
 
-            # Log audit event
+            # Log audit event — strip sensitive_fields so raw IDs never reach
+            # the audit sink. Audit is allowed to know *that* PII was found
+            # (counts per type), not the values.
+            audit_safe = {
+                k: v for k, v in result.items() if k != "sensitive_fields"
+            }
+            audit_safe["sensitive_field_counts"] = {
+                ftype: len(values) for ftype, values in sensitive_fields.items()
+            }
             audit_logger.log_event(
                 event_type="document_processed",
-                data=result,
+                data=audit_safe,
                 workspace_id=workspace_id,
                 user_id=user_id,
             )
@@ -380,7 +469,7 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
                 user_id=user_id,
             )
 
-            return {
+            failure_result: Dict[str, Any] = {
                 "success": False,
                 "document_id": document_id,
                 "filename": filename,
@@ -389,7 +478,63 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
                 "readable": False,
                 "summary": "",
                 "evidentiary_strength": "N/A",
+                "document_type": "other",
+                "extracted_fields": {},
+                "sensitive_fields": {},
             }
+            if file_processor.is_audio_file(filename):
+                failure_result["is_audio"] = True
+                failure_result["transcript"] = ""
+                failure_result["transcript_status"] = "failed"
+            return failure_result
+
+    async def _transcribe_audio_bytes(self, file_content: bytes, filename: str):
+        """Write audio bytes to a temp file and run Chirp 3 transcription.
+
+        Always returns an ``AudioTranscriptionResult`` (never raises) so the
+        caller can branch on ``.success`` and emit ``transcript_status:
+        "failed"`` for the document_assessments payload.
+        """
+        from app.processing.audio_transcription import (
+            AudioTranscriptionResult,
+            transcribe_audio,
+        )
+
+        suffix = Path(filename).suffix.lower() or ".audio"
+        tmp_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="audio_", suffix=suffix, delete=False
+            ) as fh:
+                fh.write(file_content)
+                tmp_path = fh.name
+            logger.info("Audio transcription starting: {}", filename)
+            result = await transcribe_audio(tmp_path)
+            if result.success:
+                logger.success(
+                    "Audio transcription succeeded: {} (source={}, segs={})",
+                    filename,
+                    result.speaker_source,
+                    len(result.segments),
+                )
+            else:
+                logger.warning(
+                    "Audio transcription failed: {} ({})",
+                    filename,
+                    result.error,
+                )
+            return result
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("Audio transcription crashed for {}: {}", filename, exc)
+            return AudioTranscriptionResult(
+                success=False, error=f"transcription_crashed: {exc}"
+            )
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     @tracer.trace("process_batch")
     async def process_batch(
@@ -621,14 +766,16 @@ Output only the JSON object, no markdown, no code block, no other text. Example:
         """
         Download a file from URL and extract text only (no vector store, no scoring).
         Used for chat attachments so the user can ask questions about the uploaded document.
-        Returns extracted text, truncated to max_text_chars; empty string on failure.
+        Returns PII-redacted extracted text, truncated to max_text_chars; empty
+        string on failure. Redaction matches the workspace evidence path so
+        chat context never carries raw Aadhaar/PAN/etc. into the LLM prompt.
         """
         try:
             file_content, _ = await self._download_file(url, filename)
             text = file_processor.process_file_by_extension(file_content, filename)
             if not text or not isinstance(text, str):
                 return ""
-            text = text.strip()
+            text = scan_text(text.strip()).redacted_text
             if len(text) > max_text_chars:
                 text = (
                     text[:max_text_chars]

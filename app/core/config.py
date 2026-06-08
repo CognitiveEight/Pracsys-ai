@@ -58,12 +58,23 @@ class Settings(BaseSettings):
 
     # Google Cloud Platform
     google_application_credentials: Optional[str] = None
+    # Separate service-account for Speech-to-Text V2 (Chirp 3) + audio GCS bucket.
+    # The OCR/Vision SA does not have Speech API permissions, so audio uses its own.
+    # Falls back to ``google_application_credentials`` when unset.
+    speech_google_application_credentials: Optional[str] = None
     gcp_project_id: Optional[str] = None
     # Optional: use an API key for Vision OCR instead of service-account credentials.
     # Environment variable supported: GOOGLE_CLOUD_VISION_API_KEY
     google_cloud_vision_api_key: Optional[str] = None
-    google_cse_id: Optional[str] = None
-    google_cse_base_url: str = "https://www.googleapis.com/customsearch/v1"
+
+    # Vertex AI Search (replaces the deprecated Google Custom Search / CSE flow).
+    # Used as the Indian Kanoon fallback search source. ``gcp_project_id``
+    # above is reused for the project field.
+    vertex_search_data_store_id: Optional[str] = None
+    vertex_search_location_id: str = "global"  # global | us | eu
+    # 0 = unstructured, 1 = structured, 2 = website, 3 = blended
+    vertex_search_engine_data_type: int = 2
+    vertex_search_max_documents: int = 8
 
     # Vector Store (Qdrant)
     qdrant_url: str = "http://localhost:6333"
@@ -72,6 +83,26 @@ class Settings(BaseSettings):
     qdrant_timeout_seconds: float = (
         60.0  # Request timeout for Qdrant (delete/index can be slow)
     )
+
+    # Audio transcription (Chirp 3 / Speech-to-Text V2)
+    # GCS bucket is required for native Chirp 3 speaker diarization via
+    # BatchRecognize. Without it, the pipeline falls back to chunked Recognize
+    # (transcription works, but speaker tags may be absent).
+    gcs_bucket_name: Optional[str] = None
+
+    # Drafting Assistant — separate bucket for generated draft .docx files
+    # and retained template skeletons. Kept distinct from the audio bucket
+    # so the two pipelines can have independent retention / IAM policies
+    # (drafts are public-read; audio uploads are private + ephemeral).
+    gcs_docx_bucket_name: Optional[str] = None
+    chirp_region: str = "us"  # Speech-to-Text V2 regional endpoint (us / eu / asia)
+    audio_languages: str = (
+        "en-IN,hi-IN"  # Comma-separated language codes (Chirp 3 diarization-supported)
+    )
+    audio_min_speakers: int = 2
+    audio_max_speakers: int = 6
+    huggingface_token: Optional[str] = None  # Optional, for pyannote fallback
+    pyannote_model: str = "pyannote/speaker-diarization-3.1"
 
     # Redis Configuration
     redis_host: str = "localhost"

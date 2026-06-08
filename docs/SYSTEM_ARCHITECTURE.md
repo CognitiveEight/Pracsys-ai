@@ -42,7 +42,8 @@ This document describes the **current system architecture** and **multi-agent fl
                                             ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │  Emits: document_feature_response (strategy_objective, document_assessments,     │
-│         analysis_report, list_of_dates, applicable_laws) | ai_response (chat)    │
+│         analysis_report, list_of_dates, procedural_timeline, applicable_laws) |  │
+│         ai_response (chat)                                                        │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -66,6 +67,8 @@ The AI service is driven by **Socket.IO** events from the backend. Main events:
 |----------------------------|------|
 | `document_feature_response` | After document assessments, strategy/objective, analysis report, list_of_dates, or applicable_laws |
 | `ai_response`              | After processing a user chat message |
+
+`document_feature_response` now also includes `procedural_timeline` as a first-class feature payload type.
 
 ---
 
@@ -180,6 +183,74 @@ context_builder → intent_classifier → explain_why → action_dispatcher → 
 
 ---
 
+### 3.5 Procedural Timeline Generation
+
+**Location:** `app/langgraph/procedural_timeline_agent.py` + `app/socket/events.py` (`_generate_procedural_timeline_from_documents`, `_generate_and_emit_procedural_timeline`).
+
+**Role:** Generate a lawyer-usable **procedural journey timeline** from workspace documents, then emit and cache it as `featureType: "procedural_timeline"`.
+
+**Flow:**
+
+1. Extract timeline candidates per document (date, title, type, source evidence).
+2. Consolidate overlapping/duplicate items into one cleaned sequence.
+3. Validate and normalize event type/date quality.
+4. Emit via `document_feature_response` with payload `{ "proceduralTimeline": [...] }`.
+
+**Scheduling and caching:**
+
+- Procedural timeline generation runs in the scheduled chain after `list_of_dates` and `applicable_laws`.
+- In-memory cache (`_workspace_procedural_timeline_payload`) supports reconnect/re-emit behavior, aligned with other feature payload caches.
+
+---
+
+### 3.6 Drafting Assistant
+
+**Location:** `app/langgraph/drafting_agent.py` + `app/prompts/drafting.py` + `app/socket/events.py` (`on_template_sync`, `_generate_and_emit_drafting_suggestions`, `_handle_drafting_assistant_message`).
+
+**Role:** Help the lawyer prepare case-specific pleadings, applications, legal notices, and replies — either from scratch (Blank Draft), from an AI-suggested draft, or by reusing one of their uploaded templates as a structural skeleton.
+
+Two surfaces:
+
+1. **Template Library** (lawyer-scoped, cross-workspace) — the lawyer uploads templates (Letterheads, Folders, Document Drafts). BE emits `template_sync` (`action="uploaded"|"renamed"|"deleted"`) to the AI service; AI downloads each new template, extracts the full text via `app/processing/file_handlers.py::FileProcessor.process_file_by_extension`, and persists it under a **lawyer-scoped Qdrant cache** keyed by `(userId, templateId)` via the new `upsert_user_state_cache` / `get_user_state_cache` helpers (zero-vector, metadata-only — same trick used for workspace state caches). `fileHash` is used as a content-identity check so a `template_sync` replay does not re-extract unchanged content. Templates are **not chunked or embedded** — they are reused as a whole-document structural reference.
+
+2. **Drafting Assistant panel** inside a workspace —
+   - Proactive **suggested drafts** generated at `workspace_created` / `workspace_sync` via `drafting_agent.suggest(...)`, scheduled after `list_of_dates` / `applicable_laws` / `procedural_timeline`. The result (4–6 `{title, relevance, description}` items, no IPC references) is cached in `_workspace_drafting_payload` and emitted as `document_feature_response` with `featureType: "drafting_assistant"`. Re-emitted on reconnect like other panel features.
+   - On lawyer click ("Start a New Draft" → pick template / suggestion / Blank Draft), BE emits the existing `user_message_request` event with `chat_type="DRAFTING_ASSISTANT"` plus optional drafting fields (`actionableId`, `source`, `templateId` / `suggestedDraftId`, `templateUrl`, `templateOriginalName`, `templateMimeType`). The AI short-circuits the general intelligence chat and routes the turn to `drafting_agent.handle_turn(...)`.
+
+**Conversation lifecycle (per `actionableId`):**
+
+- **Kick-off turn** (`conversation_history` is empty, plus `source`/`templateId`/`suggestedDraftId`): if a template is supplied, the agent resolves it from the lawyer cache (lazy-fetching via `templateUrl` if the cache is cold), then runs a single Gemini call that classifies the template into *skeleton* (preserve verbatim), *case-variable* (substitute), *context-bound* (strip — e.g. property facts in a reply-notice template adapted to a dowry matter), and *lawyer-input* slots. The agent pre-fills slots from case context (role, analysis report, list of dates, applicable laws, strategy) and replies with a chat message + an `openQuestions[]` array of remaining slots. `draftStatus="gathering_info"`.
+- **Follow-up turns**: the agent maps the lawyer's free-text reply onto remaining `openQuestions` (using a focused Gemini call that returns a `{question_id: answer}` JSON map), updates session state, and either re-asks remaining questions or renders the final draft.
+- **Render**: a single Gemini call with the *template-fidelity* prompt produces the full draft as a **Markdown string** carried in `draftDocument.content`. Headers, salutations, party blocks, prayer scaffolding, verification, and signature blocks from the template are preserved verbatim. Indian-law framing only (BNS / BNSS / BSA / IT Act + targeted civil acts — no IPC, no CrPC, no Indian Evidence Act). `draftStatus="ready"`.
+- **Revision turn** (lawyer asks for a change after a `ready` turn): re-renders with the same skeleton, `version++`.
+
+**Session state** is persisted per `actionableId` in a `drafting_session` workspace state cache (Qdrant), so drafts survive reconnects and AI service restarts.
+
+**Outbound shape (augmented `ai_response`):**
+
+```json
+{
+  "chatId": "...",
+  "actionableId": "user_draft_abc123",
+  "chat_type": "DRAFTING_ASSISTANT",
+  "content": "Conversational reply (questions or lead-in for the final draft)",
+  "draftStatus": "analyzing | gathering_info | ready | revising",
+  "openQuestions": [{"id": "...", "label": "..."}],
+  "draftDocument": {
+    "title": "...",
+    "format": "markdown",
+    "content": "# IN THE COURT OF ...\n\n...",
+    "version": 1,
+    "sourceTemplateId": "...",
+    "sourceTemplateName": "...",
+    "sourceType": "template | suggestedDraft | blank",
+    "wordCount": 487
+  }
+}
+```
+
+---
+
 ## 4. End-to-End Data Flows
 
 ### 4.1 workspace_created
@@ -217,6 +288,17 @@ Similar to workspace_created but triggered when workspace is updated (e.g. new o
 Backend emits user_message_request (chatId, workspaceId, userId, content, conversation_history, attachment?)
     → Socket handler (on_user_message_request)
     → workspace_manager.get_workspace(workspace_id) → role, role_context
+
+    [if chat_type == "DRAFTING_ASSISTANT" — Drafting Assistant short-circuit]
+        → _handle_drafting_assistant_message(payload, ...)
+            → drafting_agent.handle_turn(message, case_context, request_fields, history)
+                kick-off   → analyze template vs case → openQuestions[]
+                follow-up  → map answer → remaining openQuestions OR render
+                revision   → re-render preserving template skeleton
+        → emit augmented ai_response (draftStatus, openQuestions, draftDocument)
+        → return
+
+    [else — general intelligence chat]
     → vector_store.get_all_documents(workspace_id) → doc snippets for context
     → Optional: download attachment, extract text, cache by chat_id
     → Build ChatContext(workspace_id, user_id, role_context, workspace_state, chat_history, ...)
@@ -224,6 +306,19 @@ Backend emits user_message_request (chatId, workspaceId, userId, content, conver
         → context_builder → intent_classifier → explain_why (Gemini) → action_dispatcher → response_formatter → governance_validator
     → _generate_contextual_suggestion_chips(...) (e.g. 12 chips, send random 4)
     → Emit ai_response (content, metadata, suggestionChips)
+```
+
+### 4.4 template_sync
+
+```
+Backend emits template_sync (action: uploaded|renamed|deleted, userId, templates[])
+    → Socket handler (on_template_sync)
+    → action == "uploaded": for each template
+        → document_processor._download_file(fileUrl) → bytes
+        → file_processor.process_file_by_extension(bytes, filename) → extracted text
+        → vector_store.upsert_user_state_cache(userId, kind="template", scope_id=templateId, data={...})
+    → action == "renamed": patch cached payload's name; no re-download
+    → action == "deleted": vector_store.delete_user_state_cache(userId, "template", templateId)
 ```
 
 ---

@@ -9,7 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- (Document changes here before release)
+- Added the **Drafting Assistant** feature (`app/langgraph/drafting_agent.py`, `app/prompts/drafting.py`).
+  - New inbound event **`template_sync`** (uploaded / renamed / deleted) for the lawyer-scoped Template Library — each template is downloaded, its text extracted via `app/processing/file_handlers.py`, and persisted in a new lawyer-scoped Qdrant cache (`upsert_user_state_cache` / `get_user_state_cache` / `delete_user_state_cache` / `list_user_state_cache`).
+  - New outbound `document_feature_response` with **`featureType: "drafting_assistant"`** — 4–6 proactive draft suggestions (`{title, relevance, description}`) generated at `workspace_created` / `workspace_sync`, cached in `_workspace_drafting_payload`, re-emitted on reconnect.
+  - Multi-turn drafting **chat flow** on the existing `user_message_request` ↔ `ai_response` pair (`chat_type="DRAFTING_ASSISTANT"`). The drafting agent keeps per-`actionableId` session state in a new `drafting_session` workspace state cache, asks the lawyer for missing slots, and emits an augmented `ai_response` with `draftStatus`, `openQuestions`, and (when ready) `draftDocument` (Markdown body). When the lawyer picks a template, the template's structural skeleton is preserved verbatim; only case-specific facts are substituted.
+  - Lawyer-scoped state cache support in `app/vectorstore/qdrant.py` (mirrors the existing workspace-state cache pattern but keyed by `user_id`, with no vectors).
 
 ### Changed
 
@@ -18,6 +22,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - (Document changes here before release)
+
+---
+
+## [3.0.0] - 2026-04-27
+
+### Added
+
+- Added a new **Procedural Timeline Agent** (`app/langgraph/procedural_timeline_agent.py`) that extracts, consolidates, validates, and emits a legal-journey timeline across uploaded case documents.
+- Added a new socket feature payload type: **`procedural_timeline`** (via `document_feature_response`) with reconnect-safe cache and merge behavior.
+- Added `app/prompts/applicable_acts.py` to strengthen Indian-law grounding used in timeline and law-relevance reasoning.
+
+### Changed
+
+- Updated strategy, analysis, chat, and applicable-laws behavior to apply a **dual legal lens**: evaluate both **criminal-law** and **civil-law** tracks when facts support both.
+- Improved role-conditioned legal prompting so outputs remain role-consistent while still covering both legal branches where relevant.
+- Expanded scheduled feature generation flow to include `list_of_dates` → `applicable_laws` → `procedural_timeline` without blocking chat handling.
+
+### Fixed
+
+- Fixed procedural timeline event typing/normalization and downstream payload consistency in socket emission flow.
+- Fixed prompt-level behavior drift so criminal/civil coverage is consistently applied across generated legal outputs.
 
 ---
 
@@ -83,7 +108,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/viitoradmin/law-firm-simplertoday-ai/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/viitoradmin/law-firm-simplertoday-ai/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/viitoradmin/law-firm-simplertoday-ai/compare/v2.0.1...v3.0.0
 [2.0.1]: https://github.com/viitoradmin/law-firm-simplertoday-ai/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/viitoradmin/law-firm-simplertoday-ai/releases/tag/v2.0.0
 [1.0.0]: https://github.com/viitoradmin/law-firm-simplertoday-ai/releases/tag/v1.0.0

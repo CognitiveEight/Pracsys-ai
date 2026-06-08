@@ -5,8 +5,10 @@ and vector storage.
 
 import asyncio
 import os
+import re
 import socket
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -99,6 +101,66 @@ Document excerpt:
         except Exception as e:
             logger.debug("English summary fallback failed: {}", str(e))
         return self._extractive_summary_fallback(extracted_text)
+
+    # The frontend promotes drafts via `workspace_sync` with filenames
+    # of the form `annexure-<N>-<Slugified_Draft_Title>_<ISO timestamp>.txt`
+    # where the ISO timestamp uses `-` separators inside the time portion
+    # (e.g. `2026-05-22T12-45-55`). This regex anchors on that distinctive
+    # tail so we can flag drafted-by-assistant documents at ingestion.
+    _DRAFTED_FILENAME_PATTERN = re.compile(
+        r"_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})\.[a-zA-Z0-9]+$"
+    )
+
+    @classmethod
+    def _infer_drafted_by_assistant(
+        cls, filename: Optional[str]
+    ) -> Optional[Dict[str, str]]:
+        """Detect the assistant-draft filename tail and return parsed metadata.
+
+        Returns a dict with `drafted_at` (ISO-8601 timestamp string) and
+        `draft_title` (slugified title pulled from the filename body),
+        or `None` if the filename does not match the assistant-draft
+        pattern.
+        """
+        name = (filename or "").strip()
+        if not name:
+            return None
+        match = cls._DRAFTED_FILENAME_PATTERN.search(name)
+        if not match:
+            return None
+        raw_ts = match.group(1)
+        # Convert the timestamp tail `2026-05-22T12-45-55` (which uses
+        # dashes in the time portion for filename safety) back into a
+        # standard ISO-8601 timestamp `2026-05-22T12:45:55`.
+        try:
+            date_part, time_part = raw_ts.split("T", 1)
+            time_iso = time_part.replace("-", ":")
+            drafted_at_iso = f"{date_part}T{time_iso}"
+            # Validate by parsing — if it doesn't parse, we still
+            # accept the raw string but log a debug note.
+            datetime.fromisoformat(drafted_at_iso)
+        except Exception:
+            drafted_at_iso = raw_ts  # fallback: keep the dashed form
+            logger.debug(
+                "Drafted-by-assistant filename matched but ISO parse "
+                "failed for {}",
+                raw_ts,
+            )
+
+        # Derive a draft title from the filename body. The convention is
+        # `annexure-<N>-<Slugified_Title>_<timestamp>.<ext>` so we strip
+        # the annexure prefix and the timestamp suffix, then convert
+        # underscores back to spaces.
+        body = name[: match.start()]
+        # Remove leading `annexure-<digits>-`
+        body = re.sub(r"^annexure-\d+-", "", body, flags=re.IGNORECASE)
+        title = body.replace("_", " ").strip()
+        # Trim trailing punctuation residue
+        title = re.sub(r"[,\s]+$", "", title)
+        return {
+            "drafted_at": drafted_at_iso,
+            "draft_title": title or "",
+        }
 
     async def _classify_document(
         self, redacted_text: str, filename: str
@@ -271,33 +333,78 @@ Document excerpt:
                 else:
                     extracted_fields.setdefault(field_type, masked_values)
 
+            # Drafted-by-assistant marker: the frontend promotes the
+            # assistant's rendered drafts via the same `workspace_sync`
+            # path as regular evidence uploads, but with a distinctive
+            # filename suffix `_YYYY-MM-DDTHH-MM-SS.txt` (per live log:
+            # `Legal_Notice_..._2026-05-22T12-45-55.txt`). Detect this
+            # filename tail and tag the extracted_fields so the
+            # regeneration prompts (strategy / analysis / list_of_dates /
+            # applicable_laws / procedural_timeline) treat the underlying
+            # procedural action as already completed by the client side.
+            drafted_meta = self._infer_drafted_by_assistant(filename)
+            if drafted_meta:
+                extracted_fields.setdefault(
+                    "drafted_by_assistant", True
+                )
+                extracted_fields.setdefault(
+                    "drafted_at", drafted_meta["drafted_at"]
+                )
+                derived_title = drafted_meta.get("draft_title")
+                if derived_title:
+                    extracted_fields.setdefault(
+                        "draft_title", derived_title
+                    )
+
             # Store in vector database (user-scoped). Use REDACTED text so
             # raw IDs never land in chunk content. Persist document_type and
             # the masked extracted_fields in chunk metadata so retrievers
             # downstream see the structured signal alongside the OCR content.
+            #
+            # Always store an entry — even when OCR yielded no readable text —
+            # so the workspace_sync dedup check (events.py:13593-13622) finds
+            # the document_id on subsequent syncs and skips reprocessing.
+            # Without this marker, image-only annexures fall through the
+            # vector-store presence check forever and trigger strategy /
+            # analysis / list_of_dates / applicable_laws regeneration on
+            # every backend sync (e.g. each "Download Analysis Report" click).
             stored_in_vector_db = False
-            if redacted_text and readability_result["readable"]:
-                try:
-                    await self._store_in_vector_db(
-                        workspace_id=workspace_id,
-                        user_id=user_id,
-                        document_id=document_id,
-                        text=redacted_text,
-                        filename=filename,
-                        metadata={
-                            **(metadata or {}),
-                            **extraction_metadata,
-                            "readability": readability_result,
-                            "file_size": file_size,
-                            "document_type": classification["document_type"],
-                            "extracted_fields": extracted_fields,
-                        },
-                    )
-                    stored_in_vector_db = True
-                except Exception as vector_error:
-                    logger.warning(f"Could not store in vector DB: {vector_error}")
-                    # Continue processing even if vector storage fails
-                    stored_in_vector_db = False
+            is_low_content_marker = not (
+                redacted_text and readability_result["readable"]
+            )
+            if is_low_content_marker:
+                # Marker text is deterministic and ≥ 20 chars, so it survives
+                # the content-length filter in qdrant.py get_all_documents.
+                text_for_store = (
+                    "[Low-content document marker — OCR produced no readable text] "
+                    f"filename: {filename} | "
+                    f"document_type: {classification.get('document_type') or 'other'} | "
+                    f"summary: {classification.get('summary') or 'no readable content extracted'}"
+                )
+            else:
+                text_for_store = redacted_text
+            try:
+                await self._store_in_vector_db(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    document_id=document_id,
+                    text=text_for_store,
+                    filename=filename,
+                    metadata={
+                        **(metadata or {}),
+                        **extraction_metadata,
+                        "readability": readability_result,
+                        "file_size": file_size,
+                        "document_type": classification["document_type"],
+                        "extracted_fields": extracted_fields,
+                        "is_low_content_marker": is_low_content_marker,
+                    },
+                )
+                stored_in_vector_db = True
+            except Exception as vector_error:
+                logger.warning(f"Could not store in vector DB: {vector_error}")
+                # Continue processing even if vector storage fails
+                stored_in_vector_db = False
 
             # Prepare result
             result = {

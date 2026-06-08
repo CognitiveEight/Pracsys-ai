@@ -60,3 +60,22 @@ python-docx==1.1.0
 pdf2image>=1.16.0
 docx2txt>=0.8
 
+# Drafting Assistant — DOCX generation from AI Markdown
+markdown-it-py>=3.0
+rapidfuzz>=3.0
+
+# Drafting Assistant — PDF→DOCX conversion at template ingest.
+# pdf2docx is the fast path for text-based PDFs; PyMuPDF (fitz) is the
+# layout-aware fallback used to synthesize a DOCX from OCR'd text when
+# pdf2docx cannot extract useful content (e.g. Adobe-Scan image PDFs).
+pdf2docx>=0.5.1
+PyMuPDF>=1.23
+
+# Drafting Assistant — Jinja2-templated DOCX rendering for exact
+# template preservation. Used by the docxtpl render path: lawyer
+# templates are annotated with {{ var }} placeholders at ingest, then
+# docxtpl injects AI-generated content into the EXACT same DOCX —
+# preserving logo, headers/footers, fonts, margins, advocate block,
+# numbering and page flow byte-for-byte.
+docxtpl>=0.16.7
+

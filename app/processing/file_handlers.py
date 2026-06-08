@@ -369,7 +369,17 @@ class FileProcessor:
 
     @staticmethod
     def extract_text_from_docx(docx_data: bytes) -> str:
-        """Extract text from DOCX file."""
+        """Extract text from DOCX file.
+
+        Word auto-numbered list items (``<w:numPr>``) carry their numbers in
+        ``numbering.xml``, NOT in ``paragraph.text`` — so a naive extraction
+        drops the "1. 2. 3." an advocate sees on a Vakalatnama's authorisation
+        clauses, a petition's grounds, or a prayer list. We resolve each
+        numbered paragraph to its visible marker (decimal / a) / i) / bullet)
+        and prefix it, so the downstream drafter sees the list structure and
+        can reproduce it. ``numId == 0`` means "no list" (numbering removed)
+        and is left unprefixed.
+        """
         if not DOCX_AVAILABLE:
             logger.warning(
                 "DOCX processing library not available. Cannot extract text from DOCX."
@@ -379,16 +389,144 @@ class FileProcessor:
         try:
             docx_file = BytesIO(docx_data)
             doc = Document(docx_file)
-            text = ""
 
+            numfmt_map = FileProcessor._docx_numbering_formats(doc)
+            counters: dict = {}
+            lines: list = []
             for paragraph in doc.paragraphs:
-                text += paragraph.text + "\n"
+                marker = FileProcessor._docx_list_marker(
+                    paragraph, numfmt_map, counters
+                )
+                txt = paragraph.text
+                lines.append(f"{marker}{txt}" if marker else txt)
 
+            text = "\n".join(lines)
             logger.success(f"Extracted {len(text)} characters from DOCX")
             return text.strip()
         except Exception as e:
             logger.error(f"Error extracting text from DOCX: {str(e)}")
             return f"[Error extracting text from DOCX: {str(e)}]"
+
+    @staticmethod
+    def _docx_numbering_formats(doc) -> dict:
+        """Map ``numId -> {ilvl: (numFmt, start)}`` from the document's
+        numbering part. Returns ``{}`` when the document has no numbering
+        part (no auto-numbered lists)."""
+        from docx.oxml.ns import qn
+
+        try:
+            numbering = doc.part.numbering_part.element
+        except Exception:
+            return {}
+
+        # abstractNumId -> {ilvl: (numFmt, start)}
+        abstract: dict = {}
+        for anum in numbering.findall(qn("w:abstractNum")):
+            aid = anum.get(qn("w:abstractNumId"))
+            levels: dict = {}
+            for lvl in anum.findall(qn("w:lvl")):
+                try:
+                    ilvl = int(lvl.get(qn("w:ilvl")) or 0)
+                except (TypeError, ValueError):
+                    ilvl = 0
+                fmt_el = lvl.find(qn("w:numFmt"))
+                fmt = fmt_el.get(qn("w:val")) if fmt_el is not None else "decimal"
+                start_el = lvl.find(qn("w:start"))
+                try:
+                    start = int(start_el.get(qn("w:val"))) if start_el is not None else 1
+                except (TypeError, ValueError):
+                    start = 1
+                levels[ilvl] = (fmt, start)
+            if aid is not None:
+                abstract[aid] = levels
+
+        num_map: dict = {}
+        for num in numbering.findall(qn("w:num")):
+            nid = num.get(qn("w:numId"))
+            aref = num.find(qn("w:abstractNumId"))
+            aid = aref.get(qn("w:val")) if aref is not None else None
+            if nid is not None and aid in abstract:
+                num_map[nid] = abstract[aid]
+        return num_map
+
+    @staticmethod
+    def _docx_list_marker(paragraph, numfmt_map: dict, counters: dict) -> str:
+        """Return the visible list marker (e.g. ``"1. "``, ``"a) "``, ``"• "``)
+        for a numbered paragraph, advancing the per-(numId, ilvl) counter, or
+        ``""`` when the paragraph is not part of a real auto-numbered list."""
+        from docx.oxml.ns import qn
+
+        pPr = paragraph._p.pPr
+        if pPr is None:
+            return ""
+        numPr = pPr.find(qn("w:numPr"))
+        if numPr is None:
+            return ""
+        num_id_el = numPr.find(qn("w:numId"))
+        ilvl_el = numPr.find(qn("w:ilvl"))
+        num_id = num_id_el.get(qn("w:val")) if num_id_el is not None else None
+        # numId 0 (or absent) means numbering was removed for this paragraph.
+        if not num_id or num_id == "0":
+            return ""
+        try:
+            ilvl = int(ilvl_el.get(qn("w:val"))) if ilvl_el is not None else 0
+        except (TypeError, ValueError):
+            ilvl = 0
+
+        levels = numfmt_map.get(num_id)
+        if not levels or ilvl not in levels:
+            # Unknown list definition — fall back to a generic decimal marker
+            # so the structure is still visible.
+            fmt, start = "decimal", 1
+        else:
+            fmt, start = levels[ilvl]
+
+        if fmt == "bullet":
+            return ("  " * ilvl) + "• "
+
+        key = (num_id, ilvl)
+        counters[key] = counters.get(key, start - 1) + 1
+        # Reset any deeper levels under the same list when a higher level ticks.
+        for k in [k for k in counters if k[0] == num_id and k[1] > ilvl]:
+            del counters[k]
+        n = counters[key]
+
+        return ("  " * ilvl) + FileProcessor._format_list_number(fmt, n) + " "
+
+    @staticmethod
+    def _format_list_number(fmt: str, n: int) -> str:
+        """Format an ordinal ``n`` per a Word numFmt into its marker text."""
+        def to_roman(num: int) -> str:
+            vals = [
+                (1000, "m"), (900, "cm"), (500, "d"), (400, "cd"),
+                (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
+                (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"),
+            ]
+            out = []
+            for v, sym in vals:
+                while num >= v:
+                    out.append(sym)
+                    num -= v
+            return "".join(out)
+
+        def to_letter(num: int) -> str:
+            # 1->a, 2->b, ... 26->z, 27->aa (Excel-style)
+            s = ""
+            while num > 0:
+                num, rem = divmod(num - 1, 26)
+                s = chr(ord("a") + rem) + s
+            return s
+
+        if fmt == "lowerLetter":
+            return f"{to_letter(n)})"
+        if fmt == "upperLetter":
+            return f"{to_letter(n).upper()})"
+        if fmt == "lowerRoman":
+            return f"{to_roman(n)}."
+        if fmt == "upperRoman":
+            return f"{to_roman(n).upper()}."
+        # decimal and anything unrecognised
+        return f"{n}."
 
     @staticmethod
     def extract_text_from_txt(txt_data: bytes) -> str:

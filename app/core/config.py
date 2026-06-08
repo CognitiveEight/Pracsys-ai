@@ -89,6 +89,12 @@ class Settings(BaseSettings):
     # BatchRecognize. Without it, the pipeline falls back to chunked Recognize
     # (transcription works, but speaker tags may be absent).
     gcs_bucket_name: Optional[str] = None
+
+    # Drafting Assistant — separate bucket for generated draft .docx files
+    # and retained template skeletons. Kept distinct from the audio bucket
+    # so the two pipelines can have independent retention / IAM policies
+    # (drafts are public-read; audio uploads are private + ephemeral).
+    gcs_docx_bucket_name: Optional[str] = None
     chirp_region: str = "us"  # Speech-to-Text V2 regional endpoint (us / eu / asia)
     audio_languages: str = (
         "en-IN,hi-IN"  # Comma-separated language codes (Chirp 3 diarization-supported)

@@ -7,6 +7,7 @@ import asyncio
 import json
 import re
 import time
+import uuid
 from datetime import date as date_type
 from datetime import datetime
 from html import unescape
@@ -49,6 +50,8 @@ from app.socket.schemas import (
     AIResponsePayload,
     AnalysisDocxGenerateRequestPayload,
     ApplicableLawRelevanceRequestPayload,
+    TemplateSyncPayload,
+    TemplateSyncResponsePayload,
     UserMessageRequestPayload,
     WorkspaceCreatedPayload,
     WorkspaceSyncPayload,
@@ -175,6 +178,70 @@ def _strip_enum_prefix(text: str) -> str:
     return stripped.strip() or text
 
 
+# UI-truncation guard for case-summary / strategic-objective narratives.
+# OCR of mobile/web app screenshots (UPI billers directories, recent-payees
+# lists, vendor catalogs) captures the UI's own visual truncation ("…" or
+# "..."). The strategy LLM is told to reproduce names verbatim and ends up
+# leaking those clipped labels into caseSummary / reportCaseSummary /
+# strategicObjective as if they were real entities ("Smart Prep…",
+# "Uttar Pradesh Power Corporatio…", "MSEDCL Mahavitaran - Maharashtra ...").
+#
+# Match constraints (deliberately conservative so prose ellipses
+# "the witness said ..." aren't mauled):
+#   - First word: Title Case word or ACRONYM (≥1 leading uppercase).
+#   - Continuation words: Title Case / acronym / parenthetical acronym /
+#     short lowercase connectors (≤3 chars: of, and, the, &, -).
+#   - Immediately followed by a 3-dot or U+2026 truncation marker.
+# A typical prose sentence ("he did not see the accused...") fails on the
+# very first lowercase content word and the regex backtracks to no-match.
+_UI_TRUNCATION_RE = re.compile(
+    r"\b("
+    r"(?:[A-Z][A-Za-z0-9&]*)"
+    r"(?:[\s\-&]+"
+    r"(?:[A-Z][A-Za-z0-9&]*"
+    r"|\([A-Z][A-Za-z0-9&]*\)"
+    r"|[a-z]{1,3}"
+    r"))*"
+    r")\s*(?:\.{3}|…)"
+)
+
+
+def _strip_ui_truncated_tokens(text: str) -> str:
+    """Remove UI-truncated entity labels (token ending in ... or …) that
+    survived the prompt-level filter. Idempotent and safe on None / empty
+    input. Applied only to narrative case-summary fields where we know the
+    consumer is a user-facing legal description (not raw OCR storage).
+
+    The grammar-repair pass below only runs when the regex actually
+    matched something — otherwise prose like "And then the court ruled..."
+    or "etc..." would have its legitimate leading "And" or trailing
+    "..." snipped off.
+    """
+    if not text or not isinstance(text, str):
+        return text or ""
+    if not _UI_TRUNCATION_RE.search(text):
+        return text
+    cleaned = _UI_TRUNCATION_RE.sub("", text)
+    # Repair commas / connectors orphaned by the removed labels so the
+    # surrounding sentence stays grammatical.
+    cleaned = re.sub(r"\s*,\s*,", ",", cleaned)
+    cleaned = re.sub(r"\s+,", ",", cleaned)
+    cleaned = re.sub(r",\s*(?=[.;])", "", cleaned)
+    cleaned = re.sub(r"\band\s*,", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\band\s+(?=[.;])", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\band\s*$", "", cleaned, flags=re.IGNORECASE)
+    # Second pass on ", ." that only emerges after the "and" stripping.
+    cleaned = re.sub(r",\s*(?=[.;])", "", cleaned)
+    cleaned = re.sub(r"\s+,", ",", cleaned)
+    # Orphan "and " / leading comma at sentence start when the removed
+    # label opened the sentence. Tolerates leading whitespace left by
+    # the strip.
+    cleaned = re.sub(r"^\s*(?:and\s+|,\s*)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"(\n\s*)(?:and\s+|,\s*)", r"\1", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
 def _coerce_analysis_text_list(items: Any) -> List[str]:
     """Apply `_coerce_analysis_text_item` to every entry, dropping empties."""
     if not isinstance(items, list):
@@ -189,14 +256,25 @@ def _coerce_analysis_text_list(items: Any) -> List[str]:
     return out
 
 
+_STRENGTH_POINT_MIN_LEN = 60
+
+
 def _strip_strength_point_statute_boilerplate(text: str) -> str:
     """
     Remove trailing citation boilerplate from analysis strength points (statutes belong in `laws`, not prose).
     Strips phrases like 'which is a relevant fact under …' and 'admissible under …'.
+
+    Guard: if stripping would collapse the point below ``_STRENGTH_POINT_MIN_LEN``
+    characters (i.e. the model produced a label + boilerplate single-sentence form
+    like "Youth of the accused, which is a relevant fact under <Act>, YYYY."), we
+    return the ORIGINAL prose instead. The universal law-strip in ``agent.py`` will
+    then remove the citation in a context-aware way without collapsing the whole
+    point to a two-word fragment.
     """
     if not (text or "").strip():
         return ""
-    t = text.strip()
+    original = text.strip()
+    t = original
     for _ in range(5):
         prev = t
         t = re.sub(
@@ -227,7 +305,13 @@ def _strip_strength_point_statute_boilerplate(text: str) -> str:
             break
     t = re.sub(r"\s+", " ", t).strip()
     t = re.sub(r"\s*,\s*$", "", t)
-    return t.strip()
+    cleaned = t.strip()
+    # Preserve the original when stripping collapsed it to a sub-threshold label.
+    # The universal law-strip will neutralise the citation downstream without
+    # destroying the surrounding prose.
+    if len(cleaned) < _STRENGTH_POINT_MIN_LEN and len(cleaned) < len(original):
+        return original
+    return cleaned
 
 
 def _annexure_wording_for_next_steps(text: str) -> str:
@@ -247,6 +331,178 @@ def _annexure_wording_for_next_steps(text: str) -> str:
         flags=re.IGNORECASE,
     )
     return t
+
+
+_ANNEXURE_SINGLE_RE = re.compile(r"\bAnnexure\s+(\d+)\b", re.IGNORECASE)
+_ANNEXURE_PLURAL_RE = re.compile(
+    r"\bAnnexures\s+(\d+(?:\s*(?:,\s*(?:and\s+)?|and\s+|&\s+)\d+)*)\b",
+    re.IGNORECASE,
+)
+
+
+def _clamp_annexure_references(text: Any, max_annexure: int) -> Any:
+    """
+    Rewrite any "Annexure N" / "Annexures N, M" reference where N > max_annexure
+    down to the highest valid index (1..max_annexure). When max_annexure <= 0,
+    strip the phrase entirely so the output never falsely attributes facts to
+    annexures that were never uploaded.
+
+    Non-string inputs are returned unchanged (callers may pass through
+    arbitrary JSON values from the model).
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    if max_annexure <= 0:
+        text = _ANNEXURE_PLURAL_RE.sub("", text)
+        text = _ANNEXURE_SINGLE_RE.sub("", text)
+        return re.sub(r"\s{2,}", " ", text).strip()
+
+    def _clamp_plural(match: re.Match) -> str:
+        nums = [int(x) for x in re.findall(r"\d+", match.group(1))]
+        clamped: List[int] = []
+        for n in nums:
+            v = min(n, max_annexure)
+            if v not in clamped:
+                clamped.append(v)
+        if not clamped:
+            return ""
+        if len(clamped) == 1:
+            return f"Annexure {clamped[0]}"
+        if len(clamped) == 2:
+            return f"Annexures {clamped[0]} and {clamped[1]}"
+        return (
+            "Annexures "
+            + ", ".join(str(v) for v in clamped[:-1])
+            + f" and {clamped[-1]}"
+        )
+
+    def _clamp_single(match: re.Match) -> str:
+        n = int(match.group(1))
+        return f"Annexure {min(n, max_annexure)}"
+
+    text = _ANNEXURE_PLURAL_RE.sub(_clamp_plural, text)
+    text = _ANNEXURE_SINGLE_RE.sub(_clamp_single, text)
+    return text
+
+
+def _format_document_for_prompt(
+    doc: Dict[str, Any],
+    index: int,
+    total: int,
+    *,
+    label_kind: str = "Annexure",
+) -> str:
+    """Render a single Qdrant document as a labelled prompt block.
+
+    Prepends a metadata header (DOCUMENT TYPE, ISSUED BY, ADDRESSEES,
+    SUBJECT, KEY DATES, LEGAL PROVISIONS CITED, LANGUAGE, DRAFTED BY
+    ASSISTANT) above the raw body, so the regeneration prompts can
+    reason about each document as structured evidence instead of
+    treating every annexure as undifferentiated text. The metadata
+    keys come from `extracted_fields` that the document processor
+    already populates.
+
+    The `DRAFTED BY ASSISTANT` line is emitted only when
+    `extracted_fields.drafted_by_assistant` is True (set in
+    `app/processing/document_processor.py` based on the assistant-
+    draft filename pattern). It signals that the underlying
+    procedural action has already been performed by the client side
+    in this workspace, so panels should treat it as a completed
+    milestone — not a pending action.
+    """
+    metadata = doc.get("metadata") or {}
+    extracted = metadata.get("extracted_fields") or {}
+    document_type = (metadata.get("document_type") or "").strip()
+    body = (doc.get("content") or "").strip()
+
+    label = (
+        f"{label_kind} {index} (most recently uploaded)"
+        if index == total
+        else f"{label_kind} {index}"
+    )
+
+    header_lines: List[str] = []
+    if document_type and document_type.lower() != "other":
+        header_lines.append(f"[DOCUMENT TYPE: {document_type}]")
+
+    def _coerce_str_list(val: Any) -> List[str]:
+        if val is None:
+            return []
+        if isinstance(val, str):
+            s = val.strip()
+            return [s] if s else []
+        if isinstance(val, (list, tuple)):
+            return [str(v).strip() for v in val if str(v).strip()]
+        return [str(val).strip()]
+
+    issued_by = (
+        extracted.get("issuing_party_or_deponent")
+        or extracted.get("issued_by")
+        or ""
+    )
+    client_name = extracted.get("client_name") or ""
+    if issued_by:
+        issued_line = f"[ISSUED BY: {issued_by}"
+        if client_name and client_name.lower() not in issued_by.lower():
+            issued_line += f" — representing {client_name}"
+        issued_line += "]"
+        header_lines.append(issued_line)
+    elif client_name:
+        header_lines.append(f"[CLIENT: {client_name}]")
+
+    addressees = _coerce_str_list(extracted.get("addressee"))
+    if addressees:
+        header_lines.append(f"[ADDRESSEES: {'; '.join(addressees)}]")
+
+    subject = (extracted.get("subject") or "").strip()
+    if subject:
+        # Keep subject short to avoid duplicating the entire body
+        if len(subject) > 200:
+            subject = subject[:200].rstrip() + "…"
+        header_lines.append(f"[SUBJECT: {subject}]")
+
+    # Surface key dates (date of issue, due date, notice period).
+    date_bits: List[str] = []
+    issue_date = (extracted.get("date") or extracted.get("issue_date") or "").strip()
+    if issue_date:
+        date_bits.append(f"issued {issue_date}")
+    due_date = (extracted.get("due_date") or extracted.get("deadline") or "").strip()
+    if due_date:
+        date_bits.append(f"due {due_date}")
+    notice_period = (extracted.get("notice_period") or "").strip()
+    if notice_period:
+        date_bits.append(f"notice period {notice_period}")
+    if date_bits:
+        header_lines.append(f"[KEY DATES: {'; '.join(date_bits)}]")
+
+    laws = _coerce_str_list(extracted.get("legal_provisions"))
+    if laws:
+        # Cap the law list so one verbose doc does not eat the prompt budget.
+        if len(laws) > 6:
+            laws = laws[:6] + [f"…and {len(laws) - 6} more"]
+        header_lines.append(f"[LEGAL PROVISIONS CITED: {'; '.join(laws)}]")
+
+    language = (extracted.get("language") or "").strip()
+    if language and language.lower() not in {"english", "en"}:
+        header_lines.append(f"[LANGUAGE: {language}]")
+
+    if extracted.get("drafted_by_assistant"):
+        drafted_at = (extracted.get("drafted_at") or "").strip()
+        if drafted_at:
+            header_lines.append(
+                f"[DRAFTED BY ASSISTANT on {drafted_at} — represents a "
+                "COMPLETED ACTION by the client side in this workspace]"
+            )
+        else:
+            header_lines.append(
+                "[DRAFTED BY ASSISTANT — represents a COMPLETED ACTION "
+                "by the client side in this workspace]"
+            )
+
+    header_block = "\n".join(header_lines)
+    if header_block:
+        return f"--- {label} ---\n{header_block}\n\n{body}"
+    return f"--- {label} ---\n{body}"
 
 
 _OVERVIEW_CONTACTED_DATE_RE = re.compile(
@@ -348,6 +604,12 @@ class SocketEventHandler:
         self._workspace_chat_suggestion_chips: Dict[str, List[str]] = (
             PersistentWorkspaceDict("chat_suggestion_chips")
         )  # workspace_id -> 10-12 contextual chips (refreshed per AI reply; we return random 4 on each request)
+        # Drafting Assistant — separate chip cache so the Drafting panel
+        # never serves the intelligence-chat chips. Keyed by either
+        # actionable_id (per draft session) or workspace_id (panel-level
+        # fallback when the polling request doesn't carry actionableId).
+        # In-memory only; chips are cheap to regenerate.
+        self._workspace_drafting_suggestion_chips: Dict[str, List[str]] = {}
         self._last_workspace_id_with_chips: Optional[str] = (
             None  # fallback when request workspace has no chips
         )
@@ -373,6 +635,11 @@ class SocketEventHandler:
         self._workspace_analysis_payload: Dict[str, Any] = PersistentWorkspaceDict(
             CacheKinds.ANALYSIS_REPORT
         )
+        # Per-workspace cache of the extracted case_entities dict so a single
+        # generation cycle that runs strategy → analysis_report extracts the
+        # entities ONCE. Keyed by workspace_id, value is (content_sha1, entities).
+        # The content hash automatically busts the cache when documents change.
+        self._workspace_case_entities_cache: Dict[str, Tuple[str, Dict[str, Any]]] = {}
         # Per-workspace memory of rejected analysis-report items so that an
         # objective-change regeneration does not silently re-introduce a
         # missingInfo / weakness / risk the user already dismissed via
@@ -393,6 +660,24 @@ class SocketEventHandler:
         self._workspace_procedural_timeline_payload: Dict[
             str, List[Dict[str, Any]]
         ] = PersistentWorkspaceDict(CacheKinds.PROCEDURAL_TIMELINE)
+        # Drafting Assistant — proactive suggested drafts panel per workspace.
+        # Shape: {"suggestedDrafts": [{"title","relevance","description"}, ...]}
+        self._workspace_drafting_payload: Dict[str, Dict[str, Any]] = (
+            PersistentWorkspaceDict(CacheKinds.DRAFTING_SUGGESTIONS)
+        )
+        # In-flight request_template_sync correlations: requestId -> Future,
+        # resolved by on_template_sync_response once the snapshot is ingested
+        # into the in-memory template store. Lets the suggestion/kickoff path
+        # await a cold-cache fill before matching.
+        self._pending_template_sync: Dict[str, "asyncio.Future"] = {}
+        # Per-workspace drafting-suggestion provenance, used to self-heal the
+        # panel when a template finishes ingesting *after* suggestions were
+        # built (e.g. a slow scanned-PDF OCR that misses the template-sync
+        # window). Shape: workspace_id -> {"user_id", "role", "lib_count"},
+        # where lib_count is the ready-template count the suggestions were
+        # pre-matched against. When the library later grows, the panel is
+        # regenerated. See _maybe_reemit_drafting_on_templates.
+        self._drafting_meta_by_workspace: Dict[str, Dict[str, Any]] = {}
         # Re-emit after reconnect when socket dropped right after analysis report (so backend gets the update)
         self._had_disconnect: bool = False
         self._pending_reemit_workspace_id: Optional[str] = None
@@ -516,6 +801,7 @@ class SocketEventHandler:
             CacheKinds.DOCUMENT_ASSESSMENTS: self._workspace_document_assessments_payload,
             CacheKinds.STRATEGY_PAYLOAD: self._workspace_strategy_payload,
             CacheKinds.REJECTED_ANALYSIS_ITEMS: self._workspace_rejected_analysis_items,
+            CacheKinds.DRAFTING_SUGGESTIONS: self._workspace_drafting_payload,
         }
         for kind, target in kind_to_dict.items():
             payload = cached_kinds.get(kind)
@@ -530,7 +816,10 @@ class SocketEventHandler:
             # cache (and every downstream emit) stays well-formed.
             if kind == CacheKinds.ANALYSIS_REPORT and isinstance(payload, dict):
                 try:
-                    self._normalize_analysis_report_lists(payload)
+                    self._normalize_analysis_report_lists(
+                        payload,
+                        max_annexure=self._get_annexure_count(workspace_id),
+                    )
                 except Exception as norm_err:
                     logger.debug(
                         "Analysis report hydration normalization skipped "
@@ -726,6 +1015,10 @@ class SocketEventHandler:
             "analysis_docx_generate_request",
             self.on_analysis_docx_generate_request,
         )
+        # Drafting Assistant — template library sync from BE.
+        self.register("template_sync", self.on_template_sync)
+        # Reply to our AI-initiated request_template_sync (full snapshot).
+        self.register("template_sync_response", self.on_template_sync_response)
 
         # Legacy event handlers
         self.register("workspace_updated", self.on_workspace_updated)
@@ -771,6 +1064,413 @@ class SocketEventHandler:
     # ========================================================================
     # Helper Methods
     # ========================================================================
+
+    # Empty case-entities scaffold used by the strategy "deep agents" pipeline.
+    # Sub-extractors that fail or time out fall back to this so synthesis never
+    # crashes on a missing key.
+    _EMPTY_CASE_ENTITIES: Dict[str, List[Any]] = {
+        "parties": [],
+        "dates": [],
+        "properties": [],
+        "amounts": [],
+        "suit_numbers": [],
+        "statutes": [],
+        "annexures": [],
+    }
+
+    async def _run_extraction_subagent(
+        self,
+        workspace_id: str,
+        prompt: str,
+        sub_name: str,
+        expected_keys: List[str],
+    ) -> Dict[str, Any]:
+        """
+        Shared driver for the three parallel extraction sub-agents.
+
+        Runs ONE Gemini call (temperature 0.0, JSON mode, max_tokens 12000),
+        parses the response, and returns a dict with every ``expected_keys``
+        entry populated to a list. Failures are non-fatal: returns
+        ``{key: [] for key in expected_keys}`` so other sub-agents and
+        downstream synthesis still proceed.
+        """
+        scaffold: Dict[str, Any] = {k: [] for k in expected_keys}
+        from app.ai.gemini_client import gemini_client
+        try:
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+        except Exception as e:
+            logger.warning(
+                "Strategy sub-extractor '{}' failed for workspace {}: {}",
+                sub_name,
+                workspace_id[:12] if workspace_id else "",
+                e,
+            )
+            return scaffold
+        if not raw:
+            return scaffold
+        try:
+            json_str = self._prepare_json_candidate(raw.strip(), prefer="object")
+            if not json_str:
+                return scaffold
+            import json as _json
+            parsed = _json.loads(json_str)
+            if not isinstance(parsed, dict):
+                return scaffold
+            for k in expected_keys:
+                if not isinstance(parsed.get(k), list):
+                    parsed[k] = []
+            return parsed
+        except Exception as parse_err:
+            logger.warning(
+                "Strategy sub-extractor '{}' JSON parse failed for workspace {}: {}",
+                sub_name,
+                workspace_id[:12] if workspace_id else "",
+                parse_err,
+            )
+            return scaffold
+
+    async def _extract_parties_subagent(
+        self,
+        workspace_id: str,
+        combined_document_content: str,
+    ) -> Dict[str, Any]:
+        """Sub-extractor A: parties + designations (people and organisations)."""
+        prompt = (
+            "You are a focused entity extractor for legal documents. Your ONLY "
+            "job is to list every PARTY (person, firm, company, government "
+            "office) that appears in the documents below.\n\n"
+            "Return ONE JSON object with this shape (no commentary, no markdown):\n\n"
+            "{\n"
+            '  "parties": [\n'
+            '    { "name": "exact name as written in the documents", '
+            '"designation": "role / community / status as written (e.g. plaintiff, defendant, vendor, vendee, complainant, M/s ..., advocate, SDM, Sub-Registrar, member of Scheduled Caste community)", '
+            '"role_in_matter": "short description of why this party matters (e.g. original owner, registered purchaser, civil-suit plaintiff)", '
+            '"first_mention_doc": "Annexure N or document filename" }\n'
+            "  ]\n"
+            "}\n\n"
+            "STRICT RULES:\n"
+            "- Use names EXACTLY as written. Do NOT collapse 'Smt. Premlata' "
+            "to 'Premlata' or 'Munna Lal' to 'Munnalal'. Write what the "
+            "documents write, including honorifics (Smt., Shri, Dr., M/s).\n"
+            "- Include every distinct party — original owners, current owners, "
+            "purchasers, advocates, court officials, witnesses, official "
+            "signatories — if they are named in the documents.\n"
+            "- Never write 'Party No. 1' / 'Party No. 2' / 'the plaintiff' / "
+            "'the petitioner' / 'the respondent' placeholders. If you cannot "
+            "find a real name for an entry, DROP the entry.\n"
+            "- Reference uploaded files only as Annexure N.\n"
+            "- Return ONLY valid JSON. No commentary, no markdown fences.\n\n"
+            "DOCUMENTS:\n"
+            f"{combined_document_content}"
+        )
+        return await self._run_extraction_subagent(
+            workspace_id, prompt, "parties", ["parties"]
+        )
+
+    async def _extract_timeline_subagent(
+        self,
+        workspace_id: str,
+        combined_document_content: str,
+    ) -> Dict[str, Any]:
+        """Sub-extractor B: dated events + suit/case/FIR numbers."""
+        prompt = (
+            "You are a focused timeline extractor for legal documents. Your "
+            "ONLY job is to extract every DATED EVENT and every SUIT/CASE/FIR "
+            "number that appears in the documents below.\n\n"
+            "Return ONE JSON object with this shape (no commentary, no markdown):\n\n"
+            "{\n"
+            '  "dates": [\n'
+            '    { "date_iso": "YYYY-MM-DD", '
+            '"event": "what happened on this date — name the actor, the counterparty, the action (e.g. \\"Sitaram executed a registered agreement to sell Arazi No. 262 to M/s Srinet & Sandhilya Construction Pvt. Ltd.\\")", '
+            '"actors": ["names exactly as written"], '
+            '"source_doc": "Annexure N or document filename" }\n'
+            "  ],\n"
+            '  "suit_numbers": [\n'
+            '    { "number": "exact case/suit/FIR identifier as written (e.g. O.S. No. 827/2019, Case No. 13779, FIR No. 145/2024)", '
+            '"court": "court / forum where filed", '
+            '"filed_by": "name exactly as written", '
+            '"against": ["names"], '
+            '"filed_on": "YYYY-MM-DD or null", '
+            '"subject_matter": "what the suit is about" }\n'
+            "  ]\n"
+            "}\n\n"
+            "STRICT RULES:\n"
+            "- Walk the documents chronologically. Include EVERY dated event "
+            "with a clear actor and action — agreements, notices, registrations, "
+            "sale deeds, FIRs, filings, hearings, orders, judgments, payments.\n"
+            "- Use Indian DD/MM/YYYY convention when parsing dates: '02/12/2008' "
+            "is 2 December 2008 (date_iso = '2008-12-02').\n"
+            "- For suit/case/FIR numbers: include EVERY one you can find with "
+            "its exact identifier verbatim. Do not normalise 'O.S. No. 827/2019' "
+            "to 'OS 827 2019' — keep the source punctuation.\n"
+            "- Use names EXACTLY as written. Never invent or generalise.\n"
+            "- Reference uploaded files only as Annexure N.\n"
+            "- Return ONLY valid JSON.\n\n"
+            "DOCUMENTS:\n"
+            f"{combined_document_content}"
+        )
+        return await self._run_extraction_subagent(
+            workspace_id, prompt, "timeline", ["dates", "suit_numbers"]
+        )
+
+    async def _extract_assets_and_law_subagent(
+        self,
+        workspace_id: str,
+        combined_document_content: str,
+    ) -> Dict[str, Any]:
+        """Sub-extractor C: properties + amounts + statutes + annexures."""
+        prompt = (
+            "You are a focused asset and legal-framework extractor for legal "
+            "documents. Your ONLY job is to extract every PROPERTY / ASSET, "
+            "every MONETARY AMOUNT, every STATUTE referenced, and every "
+            "ANNEXURE described in the documents below.\n\n"
+            "Return ONE JSON object with this shape (no commentary, no markdown):\n\n"
+            "{\n"
+            '  "properties": [\n'
+            '    { "identifier": "Arazi No. X / Khasra No. Y / Plot N / Survey No. N etc., exactly as written", '
+            '"area": "area exactly as written (e.g. 0.263 Hectares, 2400 sq.ft.)", '
+            '"location": "most specific location written in the docs (Mauza / Village -> Block / Tehsil -> District -> State)", '
+            '"current_owner_per_docs": "name as written, if stated" }\n'
+            "  ],\n"
+            '  "amounts": [\n'
+            '    { "amount": "in source notation (e.g. Rs. 11,64,000)", '
+            '"context": "advance / total consideration / balance / payment / loan / fine / etc.", '
+            '"from": "name as written", '
+            '"to": "name as written", '
+            '"date_iso": "YYYY-MM-DD if a date attaches to the amount, else null" }\n'
+            "  ],\n"
+            '  "statutes": [\n'
+            '    { "name": "exact statute name as written (e.g. Specific Relief Act, 1963; Bharatiya Nyaya Sanhita, 2023; UP Zamindari Abolition & Land Reforms Act)", '
+            '"sections": ["section numbers as written, e.g. 10, 12, 143"], '
+            '"applies_to": "short reason why this statute is relevant per the documents" }\n'
+            "  ],\n"
+            '  "annexures": [\n'
+            '    { "label": "Annexure 1", '
+            '"type": "Sale Deed / Affidavit / Notice / Khatauni / Written Statement / etc.", '
+            '"date_iso": "YYYY-MM-DD or null", '
+            '"parties": ["names exactly as written"] }\n'
+            "  ]\n"
+            "}\n\n"
+            "STRICT RULES:\n"
+            "- Use values EXACTLY as written. Preserve Indian numerical "
+            "notation for amounts (Rs. 11,64,000 stays that way; do NOT "
+            "convert to '11.64 lakh' or '1,164,000').\n"
+            "- Include every distinct property mention, even when the same "
+            "plot is referenced by different identifiers in different docs.\n"
+            "- For statutes: use names as written. Include both BNS / BNSS / "
+            "BSA / IT Act / etc. and any state-level land-revenue / property "
+            "statutes referenced.\n"
+            "- Reference uploaded files only as Annexure N.\n"
+            "- Return ONLY valid JSON.\n\n"
+            "DOCUMENTS:\n"
+            f"{combined_document_content}"
+        )
+        return await self._run_extraction_subagent(
+            workspace_id,
+            prompt,
+            "assets_and_law",
+            ["properties", "amounts", "statutes", "annexures"],
+        )
+
+    def _merge_case_entities(
+        self,
+        parties_result: Dict[str, Any],
+        timeline_result: Dict[str, Any],
+        assets_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Combine three sub-extractor results into the unified case_entities dict."""
+        merged: Dict[str, Any] = {k: [] for k in self._EMPTY_CASE_ENTITIES.keys()}
+        if isinstance(parties_result, dict):
+            merged["parties"] = list(parties_result.get("parties") or [])
+        if isinstance(timeline_result, dict):
+            merged["dates"] = list(timeline_result.get("dates") or [])
+            merged["suit_numbers"] = list(timeline_result.get("suit_numbers") or [])
+        if isinstance(assets_result, dict):
+            merged["properties"] = list(assets_result.get("properties") or [])
+            merged["amounts"] = list(assets_result.get("amounts") or [])
+            merged["statutes"] = list(assets_result.get("statutes") or [])
+            merged["annexures"] = list(assets_result.get("annexures") or [])
+        return merged
+
+    async def _extract_case_entities(
+        self,
+        workspace_id: str,
+        combined_document_content: str,
+    ) -> Dict[str, Any]:
+        """
+        Pass 1 of the strategy pipeline — "deep agents in spirit".
+
+        Runs three focused sub-extractors in parallel via ``asyncio.gather`` so
+        each entity family gets the full 12000-token budget for its slice:
+
+        - parties (people + organisations + designations)
+        - timeline (dated events + suit/case/FIR numbers)
+        - assets_and_law (properties + amounts + statutes + annexures)
+
+        Combines into the unified ``case_entities`` dict that the synthesis
+        pass anchors to. Any sub-extractor that fails contributes empty arrays
+        so a single sub-failure never blocks the whole strategy generation.
+        """
+        if not combined_document_content or not combined_document_content.strip():
+            return dict(self._EMPTY_CASE_ENTITIES)
+        if combined_document_content.strip() == "No document content available.":
+            return dict(self._EMPTY_CASE_ENTITIES)
+
+        # Content-hash short-circuit. Strategy and analysis_report both call this
+        # helper inside the same generation pipeline; without the cache we would
+        # pay for the 3-parallel-sub-extractor pass twice for the same content.
+        import hashlib as _hashlib
+        try:
+            _content_hash = _hashlib.sha1(
+                combined_document_content[:80000].encode("utf-8", errors="ignore")
+            ).hexdigest()
+        except Exception:
+            _content_hash = ""
+        if _content_hash and workspace_id:
+            _cached = self._workspace_case_entities_cache.get(workspace_id)
+            if _cached and _cached[0] == _content_hash:
+                logger.info(
+                    "🧠 case_entities cache HIT for workspace {} (skipping 3 sub-extractors)",
+                    workspace_id[:12],
+                )
+                return _cached[1]
+
+        try:
+            parties_result, timeline_result, assets_result = await asyncio.gather(
+                self._extract_parties_subagent(
+                    workspace_id, combined_document_content
+                ),
+                self._extract_timeline_subagent(
+                    workspace_id, combined_document_content
+                ),
+                self._extract_assets_and_law_subagent(
+                    workspace_id, combined_document_content
+                ),
+            )
+        except Exception as gather_err:
+            logger.warning(
+                "Strategy extraction (parallel sub-agents) failed for workspace {}: {}",
+                workspace_id[:12] if workspace_id else "",
+                gather_err,
+            )
+            return dict(self._EMPTY_CASE_ENTITIES)
+
+        merged = self._merge_case_entities(
+            parties_result, timeline_result, assets_result
+        )
+        # Per-sub-agent diagnostic logs so future thin-summary failures can be
+        # traced to whichever sub-agent came back empty.
+        logger.info(
+            "🔎 Strategy sub-extractor PARTIES: {} party/entity record(s) for workspace {}",
+            len(merged.get("parties") or []),
+            workspace_id[:12] if workspace_id else "",
+        )
+        logger.info(
+            "🔎 Strategy sub-extractor TIMELINE: {} dated event(s), {} suit/case number(s) for workspace {}",
+            len(merged.get("dates") or []),
+            len(merged.get("suit_numbers") or []),
+            workspace_id[:12] if workspace_id else "",
+        )
+        logger.info(
+            "🔎 Strategy sub-extractor ASSETS+LAW: {} property/ies, {} amount(s), {} statute(s), {} annexure(s) for workspace {}",
+            len(merged.get("properties") or []),
+            len(merged.get("amounts") or []),
+            len(merged.get("statutes") or []),
+            len(merged.get("annexures") or []),
+            workspace_id[:12] if workspace_id else "",
+        )
+        # Populate cache so a sibling caller (e.g. analysis_report after
+        # strategy) sees the same entities without re-running extraction.
+        if _content_hash and workspace_id:
+            self._workspace_case_entities_cache[workspace_id] = (_content_hash, merged)
+        return merged
+
+    @staticmethod
+    def _verify_entities_in_summary(
+        summary_text: str,
+        entities: Dict[str, Any],
+    ) -> Dict[str, List[str]]:
+        """
+        Programmatic coverage check after synthesis. Returns a dict with three
+        buckets of missing items so the caller can issue one consolidated
+        retry prompt:
+
+        - ``missing_parties``: party names whose full form OR primary surname
+          token does not appear in ``summary_text``.
+        - ``missing_suit_numbers``: every ``suit_numbers[i]["number"]`` that
+          does not appear verbatim in ``summary_text``.
+        - ``missing_key_dates``: up to 8 of the most legally material dates
+          (suit filings, registered deeds, notices, court orders) that do not
+          appear in either ISO or DD/MM/YYYY form in ``summary_text``.
+        """
+        result: Dict[str, List[str]] = {
+            "missing_parties": [],
+            "missing_suit_numbers": [],
+            "missing_key_dates": [],
+        }
+        if not isinstance(summary_text, str) or not summary_text:
+            return result
+        if not isinstance(entities, dict):
+            return result
+
+        # Parties: full name OR primary surname token.
+        for party in entities.get("parties", []) or []:
+            if not isinstance(party, dict):
+                continue
+            name = (party.get("name") or "").strip()
+            if not name:
+                continue
+            primary_token = name.split()[-1] if " " in name else name
+            if name not in summary_text and primary_token not in summary_text:
+                result["missing_parties"].append(name)
+
+        # Suit numbers: verbatim.
+        for suit in entities.get("suit_numbers", []) or []:
+            if not isinstance(suit, dict):
+                continue
+            number = (suit.get("number") or "").strip()
+            if number and number not in summary_text:
+                result["missing_suit_numbers"].append(number)
+
+        # Key dates: pick the top-N most legally material entries.
+        _KEY_DATE_TOKENS = (
+            "suit", "civil suit", "fir", "complaint", "registered", "sale deed",
+            "notice", "legal notice", "order", "judgment", "decree", "writ",
+            "filed", "execution", "agreement", "registration",
+        )
+        key_date_candidates: List[Dict[str, Any]] = []
+        for entry in entities.get("dates", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            date_iso = (entry.get("date_iso") or "").strip()
+            event = (entry.get("event") or "").strip().lower()
+            if not date_iso or not event:
+                continue
+            if any(tok in event for tok in _KEY_DATE_TOKENS):
+                key_date_candidates.append(entry)
+        for entry in key_date_candidates[:8]:
+            date_iso = (entry.get("date_iso") or "").strip()
+            if not date_iso:
+                continue
+            # Build DD/MM/YYYY alternative for matching.
+            dmy = ""
+            try:
+                y, m, d = date_iso.split("-")
+                if len(y) == 4 and len(m) == 2 and len(d) == 2:
+                    dmy = f"{d}/{m}/{y}"
+            except Exception:
+                dmy = ""
+            if date_iso not in summary_text and (
+                not dmy or dmy not in summary_text
+            ):
+                result["missing_key_dates"].append(dmy or date_iso)
+
+        return result
 
     async def _generate_strategies_from_documents(
         self,
@@ -856,16 +1556,20 @@ class SocketEventHandler:
                     content = (doc.get("content") or "").strip()
                     if not content or len(content) < 20:
                         continue
-                    label = (
-                        f"Document {i} (most recently uploaded)"
-                        if i == len(all_docs)
-                        else f"Document {i}"
-                    )
                     if len(content) > per_doc_cap:
                         content = (
                             content[:per_doc_cap] + "\n[... truncated for length ...]"
                         )
-                    parts.append(f"--- {label} ---\n{content}")
+                    # Build labelled block with metadata header so the
+                    # prompt distinguishes drafted-by-assistant documents
+                    # (completed client-side actions) from raw evidence.
+                    doc_with_clip = dict(doc)
+                    doc_with_clip["content"] = content
+                    parts.append(
+                        _format_document_for_prompt(
+                            doc_with_clip, i, len(all_docs)
+                        )
+                    )
                 combined_document_content = (
                     "\n\n".join(parts) if parts else "No document content available."
                 )
@@ -880,6 +1584,55 @@ class SocketEventHandler:
                     len(valid_docs),
                     per_doc_cap,
                 )
+            num_annexures = len(valid_docs)
+            if num_annexures <= 0:
+                annexure_limit_block = (
+                    "AVAILABLE ANNEXURES (HARD LIMIT — do not violate):\n"
+                    "- No annexures have been uploaded.\n"
+                    "- Do NOT reference any 'Annexure N' anywhere in the output."
+                )
+            elif num_annexures == 1:
+                annexure_limit_block = (
+                    "AVAILABLE ANNEXURES (HARD LIMIT — do not violate):\n"
+                    "- The user has uploaded exactly 1 annexure.\n"
+                    "- The ONLY valid annexure reference is: Annexure 1.\n"
+                    "- You MUST NOT reference Annexure 2 or any higher number.\n"
+                    "- Do NOT invent additional annexures. Do NOT use the plural form \"annexures\"."
+                )
+            else:
+                annexure_limit_block = (
+                    "AVAILABLE ANNEXURES (HARD LIMIT — do not violate):\n"
+                    f"- The user has uploaded exactly {num_annexures} annexures.\n"
+                    f"- The ONLY valid annexure references are: Annexure 1 through Annexure {num_annexures}.\n"
+                    f"- You MUST NOT reference Annexure {num_annexures + 1} or any higher number.\n"
+                    "- Do NOT invent additional annexures."
+                )
+
+            # Pass 1: "deep agents" extraction — three focused sub-agents run
+            # in parallel (parties, timeline, assets+law). Each sub-agent logs
+            # its own counts; here we add one final summary line listing the
+            # actual party names so the synthesis output can be quickly audited.
+            case_entities: Dict[str, Any] = await self._extract_case_entities(
+                workspace_id=workspace_id,
+                combined_document_content=combined_document_content,
+            )
+            _extracted_party_names = [
+                (p.get("name") or "").strip()
+                for p in (case_entities.get("parties") or [])
+                if isinstance(p, dict) and (p.get("name") or "").strip()
+            ]
+            logger.info(
+                "🧠 Strategy deep-extraction complete for workspace {}: parties=[{}]",
+                workspace_id[:12] if workspace_id else "",
+                ", ".join(_extracted_party_names) if _extracted_party_names else "(none)",
+            )
+            # Diagnostic: dump first 1500 chars of combined_document_content so
+            # we can tell at a glance whether names ARE present in what we send
+            # to Gemini when the extracted parties list comes back empty.
+            logger.debug(
+                "Strategy pass 1 combined_document_content preview (first 1500 chars): {}",
+                (combined_document_content or "")[:1500],
+            )
 
             # When no documents (e.g. all deleted), return fallback so backend can clear strategy / show empty state
             doc_count = len(all_docs)
@@ -927,13 +1680,19 @@ class SocketEventHandler:
 
 **Task**: Based on the document content above, provide:
 
-1. **Case Summary** (5-6 sentences): Start EXACTLY with the phrase: **"This case is about..."**. Include the parties (as named in documents), core legal issues, and 2-4 case-specific facts (dates/events/agreements/communications). Keep it scannable for a lawyer.
+1. **Case Summary** (10-20 sentences): Start EXACTLY with the phrase: **"This case is about..."**. Write a fact-rich narrative that NAMES the parties exactly as written in the documents (full names + designations / roles such as plaintiff, defendant, complainant, vendor, vendee). When the documents contain them, you MUST include: property/land/document identifiers (e.g. *Arazi No. 262, area 0.263 Hectares*, *Khasra No. 285*), location to the most specific level supported by the documents (Mauza/Village → Block/Tehsil → District/State), exact monetary amounts in the same notation as the source (*Rs. 11,64,000*, *Rs. 10,00,000*), specific dates of agreements/notices/filings (DD/MM/YYYY), and any suit/case numbers (e.g. *O.S. No. 827/2019*). Reference uploaded files only as **Annexure N**. Do not generalise — extract.
 
-2. **Report Case Summary** (5-6 sentences): MUST start EXACTLY with **"This matter is about..."**. Mirror the same facts, structure, and coverage as the case summary but as a neutral, expanded, polished narrative for formal reports and filings. **Strictly do not** use: Petitioner, Respondent, Client, Case, Adjudicator, Mediator, or role-style labels; describe parties only by names, designations, or factual identifiers from the documents.
+2. **Report Case Summary** (10-20 sentences): MUST start EXACTLY with **"This matter is about..."**. Mirror the same facts, structure, and coverage as the case summary but as a neutral, expanded, polished narrative for formal reports and filings. Apply the SAME fact-extraction checklist: named parties (full names + designations), property/document identifiers, full location, exact amounts as written, specific dates, suit/case numbers, named statutes. **Strictly do not** use: Petitioner, Respondent, Client, Case, Adjudicator, Mediator, or role-style labels; describe parties only by names, designations, or factual identifiers from the documents.
 
-3. **Strategic Objective** (5-6 sentences): Write a role-tailored strategic objective for the **{workspace_role}** perspective. It must reference: (a) the strongest facts from the documents, (b) the legal issues, (c) practical priority order (what to do first), and (d) how evidence/timeline supports or limits the objective.
+3. **Strategic Objective** (10-20 sentences): Write a role-tailored strategic objective for the **{workspace_role}** perspective. It MUST anchor on the actual strongest facts (named parties, specific dates, named documents/Annexures, exact amounts, suit numbers) — never generic categories. Cover: (a) the strongest facts from the documents (named), (b) the legal issues (with named statutes such as BNS / BNSS / BSA / IT Act / Specific Relief Act etc. as relevant), (c) practical priority order (what to do first), and (d) how evidence/timeline supports or limits the objective.
 
 4. **Possible Next Steps** (3-5 bullet points): Immediate, executable actions for right away. Keep them concrete (who/what to do). Prefer steps that preserve evidence, clarify missing facts, and move the case forward procedurally for the selected role. When citing an uploaded file by its order in the bundle, write **Annexure N** (same order as above); **never** write "Document N" or "document" for an upload—use **annexure / annexures** only.
+
+**Completed-action recognition (CRITICAL).** Inspect the metadata header on every annexure. When a document is a `notice` / `complaint` / `affidavit` / `application` / `plaint` AND either (a) its `ISSUED BY` field names the client side (matches the `{workspace_role}` perspective, the named client, or the client's advocate), OR (b) the header carries a `[DRAFTED BY ASSISTANT …]` marker, treat the underlying procedural action as **ALREADY COMPLETED** in this matter. Apply this consistently across every output field:
+- `caseSummary` / `reportCaseSummary`: narrate the completed action in past tense (e.g. *"On 22/05/2026, a legal notice for recovery of €17,185 was issued by Advocate Rohan Mehta to Dana Europe OÜ and the related noticees…"*), citing the served-on date, the addressees, the demand amount, and the compliance window. Then continue with the next stage of the matter.
+- `strategicObjective`: refer to the action in past tense (*"the demand notice has been served on …"*) and shift focus to the next pending action that the served notice enables — monitoring the compliance window, preparing the follow-up suit/FIR/application on default, evaluating arbitration invocation, etc.
+- `possibleNextSteps`: **DO NOT re-list the action that has already been performed**. If a legal/demand notice has been served, the next step is NOT *"issue a legal notice"*; it is monitoring the compliance deadline (cite the exact date if available in `[KEY DATES]`) and the natural follow-up (e.g. summary suit under Order XXXVII CPC, BNS §318 / §316 criminal complaint, arbitration invocation per the agreement). If an FIR complaint has been filed, the next step is NOT *"file an FIR"*; it is follow-up on registration / investigation status. Same for affidavits, applications, plaints, written statements.
+- Apply this rule independently to each completed action — if multiple drafted documents exist in the annexure set, each one is a separate completed milestone.
 
 **Format your response as JSON**:
 {{
@@ -967,21 +1726,54 @@ class SocketEventHandler:
 
             try:
                 strategy_inventory = self._build_document_inventory(workspace_id)
+                import json as _json_strategy
+                try:
+                    _entities_block = _json_strategy.dumps(
+                        case_entities, indent=2, ensure_ascii=False
+                    )
+                except Exception:
+                    _entities_block = "{}"
                 # Improved prompt for better JSON generation
                 structured_prompt = f"""Analyze these legal documents and provide a JSON response.
 
+EXTRACTED FACTS (these entities were already pulled from the documents by a
+focused extraction step — treat them as authoritative ground truth. Anchor
+every named reference in your output to these. Do NOT rename, abbreviate,
+or modify any of these names. Do NOT introduce 'Party No. 1' / 'Party No. 2'
+/ 'the plaintiff' / 'the respondent' / 'the petitioner' style placeholders —
+EVERY reference to a person, entity, property, suit, or amount in your
+output MUST use the exact form listed below. If a relevant fact is missing
+from this block but is clearly present in the DOCUMENT CONTENT below, you
+may add it, but never invent.):
+
+{_entities_block}
+
 {strategy_inventory or "DOCUMENT INVENTORY: (no classified inventory available)"}
+
+{annexure_limit_block}
 
 DOCUMENT CONTENT:
 {combined_document_content}
 
+TRUNCATED-TEXT AND PERIPHERAL-ENTITY RULES (CRITICAL — applies to caseSummary, reportCaseSummary, strategicObjective, possibleNextSteps, and suggestionChips):
+
+1. Some uploaded annexures are SCREENSHOTS of mobile-app or web-app UIs (UPI apps, billers directories, recent-payees lists, vendor catalogs, search-suggestion dropdowns, etc.). In those UIs, the application itself truncates long labels with "..." or "…" so they fit the row width. OCR captures the truncation verbatim.
+
+2. TREAT ANY TOKEN, NAME, OR PHRASE IN THE DOCUMENT CONTENT THAT ENDS IN "..." OR "…" AS A UI-TRUNCATED LABEL, NOT A REAL ENTITY NAME. Examples of the pattern you must filter: "Smart Prep...", "Uttar Pradesh Power Corporatio...", "MSEDCL Mahavitaran - Maharashtra ...", "ABC Industri…".
+
+3. NEVER reproduce a UI-truncated label verbatim in your output. NEVER write any phrase that ends in "..." or "…" inside caseSummary / reportCaseSummary / strategicObjective / possibleNextSteps / suggestionChips. NEVER attempt to guess the full name from a truncated prefix — that would be a hallucination.
+
+4. PERIPHERAL ENTITIES — Only include in your output the entities that are MATERIALLY CONNECTED to the alleged events or transactions described in the documents (named parties, amounts paid/received, identified accused/complainants, banks where the disputed transactions occurred, statutes invoked, courts named). DO NOT list incidental items pulled from app-UI screenshots — billers directories, recent-payees lists, vendor catalogs, search results — unless a specific entry is itself part of the alleged events.
+
+5. If after filtering you have NO concrete case facts left in a section, state that limitation explicitly per the INSUFFICIENT DATA rule below — do NOT fill the gap with peripheral biller / vendor / payee listings.
+
 YOUR ROLE: {workspace_role}
 
 TASK:
-1. Case summary (5-6 sentences ; MUST start with "This case is about...")
-2. Report case summary (5-6 sentences ; MUST start EXACTLY with "This matter is about..." ; MUST mirror the same facts, structure, and coverage as the case summary BUT rewritten as a neutral, expanded, and polished narrative suitable for formal reports and filings ; STRICTLY DO NOT use the words: Petitioner, Respondent, Client, Case, Adjudicator, Mediator, or any role-based labels ; avoid even generic role references ; describe parties only by their names, designations, or factual identifiers from the documents ; maintain an advanced, professional tone while keeping it clear and easy to read)
-3. Strategic objective (5-6 sentences ; role-specific for {workspace_role})
-4. Possible next steps (3-5 immediate, concrete actions that should be taken right away). When referring to an uploaded file by index, use **Annexure 1**, **Annexure 2**, etc. (upload order). Never use the word **Document** or **document** for an upload—use **annexure** / **annexures** only.
+1. Case summary (10-20 sentences — write the FULL chronological narrative, do NOT compress ; MUST start with "This case is about..." ; MUST name every party exactly as written, include every property/land/document identifier, exact amounts in source notation, every significant date in DD/MM/YYYY, every suit/case/FIR number, and named statutes when present in the documents — never generic categories)
+2. Report case summary (10-20 sentences — write the FULL narrative, do NOT compress ; MUST start EXACTLY with "This matter is about..." ; MUST mirror the same facts, structure, and coverage as the case summary BUT rewritten as a neutral, expanded, and polished narrative suitable for formal reports and filings ; same fact-extraction checklist as the case summary — named parties, property/document IDs, exact amounts, every significant date, suit numbers, named statutes ; STRICTLY DO NOT use the words: Petitioner, Respondent, Client, Case, Adjudicator, Mediator, or any role-based labels ; avoid even generic role references ; describe parties only by their names, designations, or factual identifiers from the documents ; maintain an advanced, professional tone while keeping it clear and easy to read)
+3. Strategic objective (10-20 sentences — write the FULL plan, do NOT compress ; role-specific for {workspace_role} ; MUST anchor on named parties, specific dates, exact amounts, suit numbers, and named statutes from the documents — never generic categories)
+4. Possible next steps (3-5 immediate, concrete actions that should be taken right away). When referring to an uploaded file by index, use **Annexure N** where N is the upload-order index within the hard limit specified in AVAILABLE ANNEXURES above. Never use the word **Document** or **document** for an upload—use **annexure** / **annexures** only.
 
 LEGAL FRAMEWORK (CRITICAL - USE CORRECT INDIAN LAWS):
 - Always reference applicable and **most relevant Indian statutes/sections based on the case facts**, including but not limited to:
@@ -1052,7 +1844,7 @@ OUTPUT (JSON only, complete all fields):
 
 suggestionChips: exactly 15-16 short, actionable next-step labels (2-5 words each) specific to this case and role. Examples: "Review Title Deeds", "Map Legal Heirs", "Draft Demand Notice", "File FIR", "Preserve Digital Evidence". No full sentences. Provide 15-16 varied chips.
 
-CRITICAL: Output complete, valid JSON only. Do not truncate; close every string with \", close every array with ], and make sure the root JSON object is fully closed. Keep caseSummary, reportCaseSummary, and strategicObjective under 1200 characters each so the full JSON fits in one response. Ensure caseSummary starts exactly with "This case is about..." and reportCaseSummary starts exactly with "This matter is about...". In possibleNextSteps strings, never use "Document" or "document" to mean an uploaded file—use Annexure N or annexure/annexures."""
+CRITICAL: Output complete, valid JSON only. Do not truncate; close every string with \", close every array with ], and make sure the root JSON object is fully closed. Keep caseSummary, reportCaseSummary, and strategicObjective under 4500 characters each AND target 10-20 sentences each — use the full budget to include every named party, every suit/document/property identifier, every exact amount (in the same notation as the documents), every significant date, and every named statute reference. Do NOT compress to a short summary; do NOT pad with generic boilerplate. Ensure caseSummary starts exactly with "This case is about..." and reportCaseSummary starts exactly with "This matter is about...". In possibleNextSteps strings, never use "Document" or "document" to mean an uploaded file—use Annexure N or annexure/annexures."""
                 custom_suffix = build_custom_instruction_suffix(workspace_id)
                 if custom_suffix:
                     structured_prompt = (
@@ -1095,6 +1887,188 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                         strategic_objective = analysis_data.get(
                             "strategicObjective", ""
                         )
+
+                        # Pass 3 (verifier): if the synthesis dropped any
+                        # extracted party name from caseSummary or
+                        # strategicObjective, ask Gemini to rewrite all three
+                        # fields preserving every missing item. One retry only.
+                        try:
+                            _missing_report = self._verify_entities_in_summary(
+                                f"{case_summary}\n{strategic_objective}",
+                                case_entities,
+                            )
+                        except Exception as ver_err:
+                            logger.debug(
+                                "Entity verifier failed (non-fatal): {}", ver_err
+                            )
+                            _missing_report = {
+                                "missing_parties": [],
+                                "missing_suit_numbers": [],
+                                "missing_key_dates": [],
+                            }
+                        _missing_parties = _missing_report.get("missing_parties") or []
+                        _missing_suits = _missing_report.get("missing_suit_numbers") or []
+                        _missing_dates = _missing_report.get("missing_key_dates") or []
+                        _any_missing = bool(_missing_parties or _missing_suits or _missing_dates)
+                        if _any_missing and (
+                            case_entities.get("parties")
+                            or case_entities.get("suit_numbers")
+                            or case_entities.get("dates")
+                        ):
+                            logger.warning(
+                                "Strategy synthesis dropped items for workspace {}: "
+                                "parties={} suits={} dates={}; retrying once with explicit directive",
+                                workspace_id[:12] if workspace_id else "",
+                                _missing_parties,
+                                _missing_suits,
+                                _missing_dates,
+                            )
+                            try:
+                                _report_case_summary = analysis_data.get(
+                                    "reportCaseSummary", ""
+                                )
+                                _missing_blocks: List[str] = []
+                                if _missing_parties:
+                                    _missing_blocks.append(
+                                        "PARTY NAMES you omitted (use verbatim, exact spellings):\n- "
+                                        + "\n- ".join(_missing_parties)
+                                    )
+                                if _missing_suits:
+                                    _missing_blocks.append(
+                                        "SUIT / CASE / FIR NUMBERS you omitted (must appear verbatim):\n- "
+                                        + "\n- ".join(_missing_suits)
+                                    )
+                                if _missing_dates:
+                                    _missing_blocks.append(
+                                        "KEY DATES you omitted (use DD/MM/YYYY):\n- "
+                                        + "\n- ".join(_missing_dates)
+                                    )
+                                _verify_prompt = (
+                                    "You produced the following caseSummary, "
+                                    "reportCaseSummary, and strategicObjective for a "
+                                    "legal matter, but you OMITTED these load-bearing "
+                                    "facts from the extracted ground-truth:\n\n"
+                                    + "\n\n".join(_missing_blocks)
+                                    + "\n\nRewrite all THREE fields so EVERY missing "
+                                    "item above appears in the prose. Do NOT introduce "
+                                    "new facts beyond what is needed to incorporate "
+                                    "these. Do NOT delete any existing facts. Keep the "
+                                    "length budget (under 4500 characters each). Keep "
+                                    "the openers EXACTLY: caseSummary must start with "
+                                    "'This case is about...'; reportCaseSummary must "
+                                    "start with 'This matter is about...'.\n\n"
+                                    "Return ONE JSON object with exactly these three "
+                                    "keys: caseSummary, reportCaseSummary, "
+                                    "strategicObjective. No other keys, no "
+                                    "commentary, no markdown.\n\n"
+                                    "ORIGINAL caseSummary:\n"
+                                    f"{case_summary}\n\n"
+                                    "ORIGINAL reportCaseSummary:\n"
+                                    f"{_report_case_summary}\n\n"
+                                    "ORIGINAL strategicObjective:\n"
+                                    f"{strategic_objective}\n"
+                                )
+                                _verify_raw = await gemini_client.generate(
+                                    prompt=_verify_prompt,
+                                    system_instruction=get_structured_document_feature_system_instruction(
+                                        workspace_role
+                                    ),
+                                    temperature=0.1,
+                                    max_tokens=12000,
+                                    response_mime_type="application/json",
+                                )
+                                _verify_json = self._prepare_json_candidate(
+                                    (_verify_raw or "").strip(), prefer="object"
+                                )
+                                if _verify_json:
+                                    _verify_parsed = json.loads(_verify_json)
+                                    if isinstance(_verify_parsed, dict):
+                                        _new_cs = (
+                                            _verify_parsed.get("caseSummary") or ""
+                                        ).strip()
+                                        _new_rcs = (
+                                            _verify_parsed.get("reportCaseSummary")
+                                            or ""
+                                        ).strip()
+                                        _new_so = (
+                                            _verify_parsed.get("strategicObjective")
+                                            or ""
+                                        ).strip()
+                                        if _new_cs:
+                                            analysis_data["caseSummary"] = _new_cs
+                                            case_summary = _new_cs
+                                        if _new_rcs:
+                                            analysis_data["reportCaseSummary"] = _new_rcs
+                                        if _new_so:
+                                            analysis_data[
+                                                "strategicObjective"
+                                            ] = _new_so
+                                            strategic_objective = _new_so
+                                        # Re-check after retry so we can tell at a
+                                        # glance whether the retry actually closed
+                                        # the gap.
+                                        _still = self._verify_entities_in_summary(
+                                            f"{case_summary}\n{strategic_objective}",
+                                            case_entities,
+                                        )
+                                        _still_any = bool(
+                                            (_still.get("missing_parties") or [])
+                                            or (_still.get("missing_suit_numbers") or [])
+                                            or (_still.get("missing_key_dates") or [])
+                                        )
+                                        if _still_any:
+                                            logger.warning(
+                                                "Entity verifier retry STILL missing for "
+                                                "workspace {}: parties={} suits={} dates={}",
+                                                workspace_id[:12] if workspace_id else "",
+                                                _still.get("missing_parties") or [],
+                                                _still.get("missing_suit_numbers") or [],
+                                                _still.get("missing_key_dates") or [],
+                                            )
+                                        else:
+                                            logger.success(
+                                                "Entity verifier retry recovered all missing items "
+                                                "(parties={} suits={} dates={}) for workspace {}",
+                                                len(_missing_parties),
+                                                len(_missing_suits),
+                                                len(_missing_dates),
+                                                workspace_id[:12] if workspace_id else "",
+                                            )
+                            except Exception as retry_err:
+                                logger.warning(
+                                    "Entity verifier retry failed (non-fatal): {}",
+                                    retry_err,
+                                )
+
+                        # Strip UI-truncated labels ("Smart Prep…", "MSEDCL
+                        # Mahavitaran - Maharashtra ...") that leaked from
+                        # OCR of payment-app screenshots. Belt-and-braces
+                        # alongside the TRUNCATED-TEXT prompt rule above.
+                        # Keeps local vars in sync so the recovery prompt
+                        # below sees the sanitized narrative as context.
+                        _cs_clean = _strip_ui_truncated_tokens(
+                            analysis_data.get("caseSummary") or ""
+                        )
+                        _rcs_clean = _strip_ui_truncated_tokens(
+                            analysis_data.get("reportCaseSummary") or ""
+                        )
+                        _so_clean = _strip_ui_truncated_tokens(
+                            analysis_data.get("strategicObjective") or ""
+                        )
+                        if _cs_clean != (analysis_data.get("caseSummary") or "") or (
+                            _rcs_clean != (analysis_data.get("reportCaseSummary") or "")
+                        ) or _so_clean != (analysis_data.get("strategicObjective") or ""):
+                            logger.info(
+                                "Stripped UI-truncated tokens from strategy narrative "
+                                "(workspace {})",
+                                workspace_id[:12] if workspace_id else "",
+                            )
+                        analysis_data["caseSummary"] = _cs_clean
+                        analysis_data["reportCaseSummary"] = _rcs_clean
+                        analysis_data["strategicObjective"] = _so_clean
+                        case_summary = _cs_clean
+                        strategic_objective = _so_clean
+
                         possible_next_steps = (
                             analysis_data.get("possibleNextSteps")
                             or analysis_data.get("possible_next_steps")
@@ -1120,29 +2094,100 @@ CRITICAL: Output complete, valid JSON only. Do not truncate; close every string 
                             str(s).strip() for s in suggestion_chips if s
                         ][:16]
 
-                        # If tail arrays are missing due partial/truncated JSON, recover them.
-                        if len(possible_next_steps) < 3 or len(suggestion_chips) < 10:
+                        # If the objective or the tail arrays are missing/short
+                        # due to partial AI output, recover them with a focused
+                        # follow-up call. Objective threshold = 200 chars
+                        # because the main prompt demands 10-20 sentences and
+                        # anything shorter is implausibly thin (and triggers
+                        # the generic hardcoded fallback below).
+                        strategic_objective_missing = (
+                            not strategic_objective
+                            or len(strategic_objective.strip()) < 200
+                        )
+                        next_steps_missing = len(possible_next_steps) < 3
+                        chips_missing = len(suggestion_chips) < 10
+                        if (
+                            strategic_objective_missing
+                            or next_steps_missing
+                            or chips_missing
+                        ):
                             try:
-                                recovery_prompt = f"""Return ONLY one valid JSON object with:
+                                # Build the recovery prompt conditionally —
+                                # only ask Gemini for the fields actually
+                                # missing, preserving whatever the first call
+                                # produced correctly.
+                                _requested_fields = []
+                                _field_specs = []
+                                if strategic_objective_missing:
+                                    _requested_fields.append(
+                                        '"strategicObjective": "..."'
+                                    )
+                                    _field_specs.append(
+                                        "- strategicObjective: 10-20 sentences. "
+                                        f"Role-specific for {workspace_role}. "
+                                        "Anchor on named parties from the "
+                                        "EXTRACTED FACTS, exact dates in "
+                                        "DD/MM/YYYY, suit/FIR numbers, exact "
+                                        "amounts, and named statutes "
+                                        "(BNS/BNSS/BSA/IT Act/NDPS/etc.). Do "
+                                        "NOT use Petitioner / Respondent / "
+                                        "Client / Case / Adjudicator / "
+                                        "Mediator labels. Cover both "
+                                        "criminal-law and civil-law tracks "
+                                        "when both are supported by the "
+                                        "facts. No bracket tags like "
+                                        "'(criminal angle)'."
+                                    )
+                                if next_steps_missing:
+                                    _requested_fields.append(
+                                        '"possibleNextSteps": ["..."]'
+                                    )
+                                    _field_specs.append(
+                                        "- possibleNextSteps: exactly 3-5 "
+                                        "immediate, practical actions."
+                                    )
+                                if chips_missing:
+                                    _requested_fields.append(
+                                        '"suggestionChips": ["..."]'
+                                    )
+                                    _field_specs.append(
+                                        "- suggestionChips: exactly 15-16 "
+                                        "short labels (2-5 words each), "
+                                        "actionable and case-specific."
+                                    )
+
+                                try:
+                                    _entities_block_recovery = json.dumps(
+                                        case_entities,
+                                        indent=2,
+                                        ensure_ascii=False,
+                                    )
+                                except Exception:
+                                    _entities_block_recovery = "{}"
+
+                                _fields_json = ",\n  ".join(_requested_fields)
+                                _rules_block = "\n".join(_field_specs)
+                                recovery_prompt = f"""Return ONLY one valid JSON object with these keys:
 {{
-  "possibleNextSteps": ["..."],
-  "suggestionChips": ["..."]
+  {_fields_json}
 }}
 
 Context:
 - Role: {workspace_role}
 - Case summary: {case_summary}
-- Strategic objective: {strategic_objective}
+- Strategic objective (existing, may be empty/short): {strategic_objective}
+
+EXTRACTED FACTS (authoritative ground truth — use exact names/spellings, do NOT rename or abbreviate):
+{_entities_block_recovery}
 
 Documents:
 {combined_document_content}
 
 Rules:
-- possibleNextSteps: exactly 3-5 immediate, practical actions.
-- suggestionChips: exactly 15-16 short labels (2-5 words each), actionable and case-specific.
-- Use Annexure wording for uploads (never Document N).
-- No invented facts.
-- JSON only; no markdown.
+{_rules_block}
+- Use "Annexure N" wording for uploaded files (never "Document N").
+- No invented facts; only use what is in the EXTRACTED FACTS and Documents above.
+- JSON only; no markdown fences.
 """
                                 recovery_raw = await gemini_client.generate(
                                     prompt=recovery_prompt,
@@ -1162,6 +2207,18 @@ Rules:
                                     else json.loads((recovery_raw or "").strip())
                                 )
                                 if isinstance(recovered_data, dict):
+                                    recovered_objective_raw = (
+                                        recovered_data.get("strategicObjective")
+                                        or recovered_data.get("strategic_objective")
+                                        or ""
+                                    )
+                                    if isinstance(recovered_objective_raw, str):
+                                        recovered_objective = _strip_ui_truncated_tokens(
+                                            recovered_objective_raw.strip()
+                                        )
+                                    else:
+                                        recovered_objective = ""
+
                                     recovered_next_steps = (
                                         recovered_data.get("possibleNextSteps")
                                         or recovered_data.get("possible_next_steps")
@@ -1194,19 +2251,23 @@ Rules:
                                         if str(s).strip()
                                     ][:16]
 
+                                    if strategic_objective_missing and recovered_objective:
+                                        strategic_objective = recovered_objective
+                                        analysis_data["strategicObjective"] = recovered_objective
                                     if len(possible_next_steps) < 3 and recovered_next_steps:
                                         possible_next_steps = recovered_next_steps
                                     if len(suggestion_chips) < 10 and recovered_chips:
                                         suggestion_chips = recovered_chips
 
                                     logger.info(
-                                        "Recovered strategy tail fields: nextSteps={}, chips={}",
+                                        "Recovered strategy tail fields: objective={} chars, nextSteps={}, chips={}",
+                                        len(strategic_objective),
                                         len(possible_next_steps),
                                         len(suggestion_chips),
                                     )
                             except Exception as recovery_err:
                                 logger.warning(
-                                    "Could not recover strategy nextSteps/chips: {}",
+                                    "Could not recover strategy tail fields: {}",
                                     recovery_err,
                                 )
 
@@ -1420,6 +2481,26 @@ Rules:
                 t = _annexure_wording_for_next_steps(str(s).strip())
                 if t:
                     possible_next_steps.append(t)
+
+            # Clamp any "Annexure N" reference where N exceeds the number of
+            # uploaded annexures. The strategy prompt asks the model to use
+            # Annexure-N wording, but with a single upload the model has
+            # historically hallucinated Annexure 2 / Annexure 3 — this is the
+            # safety net that guarantees no such reference reaches the client.
+            case_summary = _clamp_annexure_references(case_summary, num_annexures)
+            report_case_summary = _clamp_annexure_references(
+                report_case_summary, num_annexures
+            )
+            strategic_objective = _clamp_annexure_references(
+                strategic_objective, num_annexures
+            )
+            possible_next_steps = [
+                _clamp_annexure_references(s, num_annexures) for s in possible_next_steps
+            ]
+            suggestion_chips = [
+                _clamp_annexure_references(s, num_annexures)
+                for s in (suggestion_chips or [])
+            ]
 
             # Format the response (use doc_count from vector store when batch_result not provided, e.g. after delete)
             strategies_payload = {
@@ -1657,16 +2738,21 @@ Rules:
                     content = (doc.get("content") or "").strip()
                     if not content or len(content) < 20:
                         continue
-                    label = (
-                        f"Document {i} (most recently uploaded)"
-                        if i == len(all_docs)
-                        else f"Document {i}"
-                    )
                     if len(content) > per_doc_cap:
                         content = (
                             content[:per_doc_cap] + "\n[... truncated for length ...]"
                         )
-                    parts.append(f"--- {label} ---\n{content}")
+                    # Build labelled block with metadata header so the
+                    # prompt distinguishes drafted-by-assistant documents
+                    # from raw evidence.
+                    doc_with_clip = dict(doc)
+                    doc_with_clip["content"] = content
+                    parts.append(
+                        _format_document_for_prompt(
+                            doc_with_clip, i, len(all_docs),
+                            label_kind="Document",
+                        )
+                    )
                 combined_document_content = (
                     "\n\n".join(parts) if parts else "No document content available."
                 )
@@ -1817,6 +2903,506 @@ Rules:
             return True
         except Exception as e:
             logger.warning("Strategy objective regen failed: {}", e)
+            return False
+
+    async def _regenerate_case_summary_with_feedback(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        user_feedback: str,
+        current_strategy: Dict[str, Any],
+    ) -> bool:
+        """
+        Regenerate caseSummary + reportCaseSummary applying the user's edit
+        instruction. Preserves strategicObjective + possibleNextSteps +
+        suggestionChips byte-for-byte. Updates cache and emits
+        document_feature_response (featureType=strategy_objective).
+        """
+        try:
+            from app.ai.gemini_client import gemini_client
+            from app.vectorstore.qdrant import vector_store
+
+            current_case_summary = (current_strategy.get("caseSummary") or "").strip()
+            current_report_case_summary = (
+                current_strategy.get("reportCaseSummary") or ""
+            ).strip()
+            if not current_case_summary:
+                return False
+
+            all_docs = []
+            try:
+                all_docs = await vector_store.get_all_documents(
+                    workspace_id=workspace_id
+                )
+            except Exception as e:
+                logger.warning("Case-summary regen: could not load documents: {}", e)
+            parts: List[str] = []
+            valid_docs = [
+                d
+                for d in all_docs
+                if (d.get("content") or "").strip()
+                and len((d.get("content") or "").strip()) >= 20
+            ]
+            max_total_content = 100000
+            per_doc_cap = (
+                (max_total_content // max(1, len(valid_docs)))
+                if valid_docs
+                else max_total_content
+            )
+            if not all_docs:
+                combined_document_content = "No document content available."
+            else:
+                for i, doc in enumerate(all_docs, 1):
+                    content = (doc.get("content") or "").strip()
+                    if not content or len(content) < 20:
+                        continue
+                    if len(content) > per_doc_cap:
+                        content = content[:per_doc_cap] + "\n[... truncated for length ...]"
+                    doc_with_clip = dict(doc)
+                    doc_with_clip["content"] = content
+                    parts.append(
+                        _format_document_for_prompt(
+                            doc_with_clip, i, len(all_docs)
+                        )
+                    )
+                combined_document_content = (
+                    "\n\n".join(parts) if parts else "No document content available."
+                )
+            if len(combined_document_content) > max_total_content:
+                combined_document_content = (
+                    combined_document_content[:max_total_content]
+                    + "\n[... content truncated ...]"
+                )
+
+            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                role = "ADJUDICATOR"
+
+            prompt = f"""You are a legal-strategy editor for Indian law.
+
+You will edit the existing Case Summary and Report Case Summary based on the user's instruction below. The Strategic Objective and Possible Next Steps are LOCKED and must NOT change.
+
+**User's edit instruction** (THIS IS THE PRIMARY CONSTRAINT — apply it EXACTLY as worded):
+{user_feedback.strip()}
+
+CURRENT caseSummary (you must produce an edited version of this text after applying the user's instruction):
+{current_case_summary}
+
+CURRENT reportCaseSummary (apply the SAME edit; keep it a neutral expanded narrative — no role labels like Petitioner/Respondent/Client/Case/Adjudicator/Mediator):
+{current_report_case_summary or current_case_summary}
+
+LOCKED strategicObjective (verbatim context, do not output):
+{(current_strategy.get("strategicObjective") or "").strip()}
+
+LOCKED possibleNextSteps (verbatim context, do not output):
+{json.dumps(current_strategy.get("possibleNextSteps") or [], ensure_ascii=True)}
+
+**Role**: {role}
+
+**Document content** (for fact consistency only; do NOT invent named parties, dates, amounts, suit numbers, or statutes that are not in this content):
+{combined_document_content}
+
+EDIT-INSTRUCTION RULES (CRITICAL — override all preservation rules below when they conflict):
+1. The user's instruction OUTRANKS the "preserve every named party / amount / date / statute" rule. If the user says "remove" / "delete" / "drop" / "change" a specific sentence, paragraph, fact, or phrase, you MUST apply that change to the text — even if it means dropping a named party, an amount, or a date.
+2. If the user QUOTES exact text inside the instruction (anything that looks like a verbatim sentence or phrase from the current case summary), find that exact text in the CURRENT caseSummary above and REMOVE it (and apply the same removal to reportCaseSummary if the same content appears there). Do not "interpret" — match the surface text.
+3. Apply ONLY the edits the user asked for. Do NOT remove other content the user did not mention.
+4. If the user's instruction asks for something impossible (e.g. add a new dated fact not in the documents), ignore that invention and apply only the parts of the instruction that are removals / rephrases / valid edits.
+
+TRUNCATED-TEXT RULE: Never reproduce a token, name, or phrase that ends in "..." or "…" — those are UI-truncation noise from screenshots, not real entity names. Drop them silently.
+
+Return JSON ONLY with these two keys:
+{{
+  "caseSummary": "edited case summary; MUST start EXACTLY with 'This case is about...'; reflect the user's instruction; preserve everything else from CURRENT caseSummary that the user did NOT ask to change",
+  "reportCaseSummary": "edited report case summary; MUST start EXACTLY with 'This matter is about...'; mirror the caseSummary facts after the edit; neutral expanded narrative; do NOT use the words Petitioner/Respondent/Client/Case/Adjudicator/Mediator"
+}}
+
+Output rules:
+- Do not output strategicObjective, possibleNextSteps, or suggestionChips.
+- Preserve Indian-law citations exactly as in the source (BNS/BNSS/BSA/IT Act). Do not switch to IPC/CrPC/Evidence Act.
+- JSON only; complete strings."""
+
+            custom_suffix = build_custom_instruction_suffix(workspace_id)
+            if custom_suffix:
+                prompt = prompt.rstrip() + "\n\n" + custom_suffix
+
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                system_instruction=get_structured_document_feature_system_instruction(
+                    role
+                ),
+                temperature=0.2,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            if not json_str:
+                return False
+            data = json.loads(json_str)
+            if not isinstance(data, dict):
+                return False
+
+            new_case_summary = _strip_ui_truncated_tokens(
+                (data.get("caseSummary") or "").strip()
+            )
+            new_report_case_summary = _strip_ui_truncated_tokens(
+                (data.get("reportCaseSummary") or "").strip()
+            )
+            if not new_case_summary:
+                return False
+            # If the model omitted reportCaseSummary, mirror caseSummary as a fallback.
+            if not new_report_case_summary:
+                new_report_case_summary = new_case_summary
+
+            merged = dict(current_strategy)
+            merged["caseSummary"] = new_case_summary
+            merged["reportCaseSummary"] = new_report_case_summary
+            # Explicitly lock the other three fields from the prior payload.
+            merged["strategicObjective"] = current_strategy.get("strategicObjective", "")
+            merged["possibleNextSteps"] = list(
+                current_strategy.get("possibleNextSteps") or []
+            )
+            merged["suggestionChips"] = list(
+                current_strategy.get("suggestionChips") or []
+            )
+            merged["isUpdate"] = True
+            merged["role"] = role
+            merged["workspaceId"] = workspace_id
+            merged["userId"] = user_id
+            merged["timestamp"] = datetime.utcnow().isoformat()
+
+            self._workspace_strategy_payload[workspace_id] = merged
+
+            if self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "strategy_objective",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": merged,
+                    },
+                )
+                logger.success(
+                    "✅ Case summary regen emitted (other fields preserved) workspace={}",
+                    workspace_id[:12] if workspace_id else "",
+                )
+            return True
+        except Exception as e:
+            logger.warning("Case summary regen failed: {}", e)
+            return False
+
+    async def _regenerate_next_steps_with_feedback(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        user_feedback: str,
+        current_strategy: Dict[str, Any],
+    ) -> bool:
+        """
+        Regenerate possibleNextSteps + suggestionChips applying the user's edit
+        instruction. Preserves caseSummary + reportCaseSummary + strategicObjective
+        byte-for-byte. Updates cache and emits document_feature_response
+        (featureType=strategy_objective).
+        """
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            current_case_summary = (current_strategy.get("caseSummary") or "").strip()
+            current_strategic_objective = (
+                current_strategy.get("strategicObjective") or ""
+            ).strip()
+            if not current_case_summary:
+                return False
+
+            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                role = "ADJUDICATOR"
+
+            prompt = f"""You are a legal-strategy editor for Indian law.
+
+You will edit the existing Possible Next Steps based on the user's instruction below. The Case Summary, Report Case Summary, and Strategic Objective are LOCKED and must NOT change.
+
+**User's edit instruction** (PRIMARY CONSTRAINT — apply EXACTLY as worded):
+{user_feedback.strip()}
+
+CURRENT possibleNextSteps (apply the user's instruction to this list; the indices are 1-based):
+{json.dumps(current_strategy.get("possibleNextSteps") or [], ensure_ascii=True)}
+
+CURRENT suggestionChips (refresh only as needed to stay aligned with the updated next steps):
+{json.dumps(current_strategy.get("suggestionChips") or [], ensure_ascii=True)}
+
+LOCKED caseSummary (verbatim context, do not output):
+{current_case_summary}
+
+LOCKED strategicObjective (verbatim context, do not output):
+{current_strategic_objective}
+
+**Role**: {role}
+
+EDIT-INSTRUCTION RULES (CRITICAL):
+1. The user's instruction OUTRANKS any general guidance. If the user says "remove the 4th point", the returned list MUST omit the 4th item from CURRENT possibleNextSteps and keep the other items in their original order.
+2. If the user says "add a step about X", APPEND a new step about X (or insert at the position they specified) and keep all existing steps unless the user also asked to drop something.
+3. If the user QUOTES an existing step verbatim and asks to remove / rephrase it, match the surface text and apply the change.
+4. Do NOT silently rewrite untouched steps. Only the steps the user asked to change should differ; the rest must be reproduced word-for-word.
+
+TRUNCATED-TEXT RULE: Never produce a token ending in "..." or "…" — those are UI-truncation noise from screenshots, not real entity names.
+
+Return JSON ONLY with these two keys:
+{{
+  "possibleNextSteps": ["the resulting 3-5 next steps after applying the instruction; reference uploads as Annexure N (NEVER 'Document N')"],
+  "suggestionChips": ["15-16 short labels, 2-5 words each, actionable; aligned with the updated next steps"]
+}}
+
+Output rules:
+- Do not output caseSummary, reportCaseSummary, or strategicObjective.
+- No invented facts (no new named parties / dates / amounts / suit numbers / statutes that are not already in caseSummary or strategicObjective).
+- Use Indian-law naming (BNS/BNSS/BSA/IT Act). Do not cite IPC/CrPC/IEA.
+- JSON only; complete strings and arrays."""
+
+            custom_suffix = build_custom_instruction_suffix(workspace_id)
+            if custom_suffix:
+                prompt = prompt.rstrip() + "\n\n" + custom_suffix
+
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                system_instruction=get_structured_document_feature_system_instruction(
+                    role
+                ),
+                temperature=0.25,
+                max_tokens=8000,
+                response_mime_type="application/json",
+            )
+            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            if not json_str:
+                return False
+            data = json.loads(json_str)
+            if not isinstance(data, dict):
+                return False
+
+            possible_next_steps = (
+                data.get("possibleNextSteps") or data.get("possible_next_steps") or []
+            )
+            if isinstance(possible_next_steps, str):
+                possible_next_steps = [possible_next_steps] if possible_next_steps else []
+            possible_next_steps = [
+                _annexure_wording_for_next_steps(_strip_ui_truncated_tokens(str(s).strip()))
+                for s in possible_next_steps
+                if s
+            ][:5]
+            if len(possible_next_steps) < 2:
+                # Refuse the change rather than emit a degraded list — keep the user's
+                # prior content rather than half-empty next steps.
+                return False
+
+            suggestion_chips = (
+                data.get("suggestionChips") or data.get("suggestion_chips") or []
+            )
+            if isinstance(suggestion_chips, str):
+                suggestion_chips = [suggestion_chips] if suggestion_chips else []
+            suggestion_chips = [
+                _strip_ui_truncated_tokens(str(s).strip())
+                for s in suggestion_chips
+                if s
+            ][:16]
+            if len(suggestion_chips) < 10:
+                prior = current_strategy.get("suggestionChips") or []
+                if isinstance(prior, list):
+                    for p in prior:
+                        t = str(p).strip()
+                        if t and t.lower() not in {x.lower() for x in suggestion_chips}:
+                            suggestion_chips.append(t)
+                        if len(suggestion_chips) >= 16:
+                            break
+            if len(suggestion_chips) < 10:
+                for pad in self._fallback_chips_for_role(role, 16):
+                    if pad and pad.lower() not in {x.lower() for x in suggestion_chips}:
+                        suggestion_chips.append(pad)
+                    if len(suggestion_chips) >= 16:
+                        break
+
+            merged = dict(current_strategy)
+            # Lock these three explicitly.
+            merged["caseSummary"] = current_strategy.get("caseSummary", "")
+            merged["reportCaseSummary"] = current_strategy.get("reportCaseSummary", "")
+            merged["strategicObjective"] = current_strategy.get("strategicObjective", "")
+            merged["possibleNextSteps"] = possible_next_steps
+            merged["suggestionChips"] = suggestion_chips
+            merged["isUpdate"] = True
+            merged["role"] = role
+            merged["workspaceId"] = workspace_id
+            merged["userId"] = user_id
+            merged["timestamp"] = datetime.utcnow().isoformat()
+
+            self._workspace_strategy_payload[workspace_id] = merged
+            self._workspace_suggestion_chips[workspace_id] = list(suggestion_chips)
+            self._last_workspace_id_with_chips = workspace_id
+
+            if self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "strategy_objective",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": merged,
+                    },
+                )
+                logger.success(
+                    "✅ Possible next steps regen emitted (other fields preserved) workspace={}",
+                    workspace_id[:12] if workspace_id else "",
+                )
+            return True
+        except Exception as e:
+            logger.warning("Possible next steps regen failed: {}", e)
+            return False
+
+    async def _regenerate_strategic_objective_with_feedback(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        user_feedback: str,
+        current_strategy: Dict[str, Any],
+    ) -> bool:
+        """
+        Regenerate strategicObjective applying the user's surgical edit
+        instruction (e.g. "remove this exact line", "rephrase the X sentence").
+        Preserves caseSummary + reportCaseSummary + possibleNextSteps +
+        suggestionChips byte-for-byte. Updates cache and emits
+        document_feature_response with featureType=strategy_objective.
+
+        Distinct from _regenerate_strategy_objective_preserving_case_summary,
+        which is used by the legacy STRATEGY_OBJECTIVE chat_type flow when
+        the user DECLARES a brand-new objective (and therefore needs the
+        next steps + chips to refresh). This surgical variant assumes the
+        user wants the existing content reproduced verbatim except for the
+        specific change they named.
+        """
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            current_strategic_objective = (
+                current_strategy.get("strategicObjective") or ""
+            ).strip()
+            current_case_summary = (current_strategy.get("caseSummary") or "").strip()
+            if not current_strategic_objective:
+                return False
+
+            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                role = "ADJUDICATOR"
+
+            prompt = f"""You are a legal-strategy editor for Indian law.
+
+You will edit the existing Strategic Objective based on the user's instruction below. The Case Summary, Report Case Summary, Possible Next Steps, and Suggestion Chips are LOCKED and must NOT change.
+
+**User's edit instruction** (THIS IS THE PRIMARY CONSTRAINT — apply it EXACTLY as worded):
+{user_feedback.strip()}
+
+CURRENT strategicObjective (you must produce an edited version of this text after applying the user's instruction):
+{current_strategic_objective}
+
+LOCKED caseSummary (verbatim context, do not output):
+{current_case_summary}
+
+LOCKED reportCaseSummary (verbatim context, do not output):
+{(current_strategy.get("reportCaseSummary") or "").strip()}
+
+LOCKED possibleNextSteps (verbatim context, do not output):
+{json.dumps(current_strategy.get("possibleNextSteps") or [], ensure_ascii=True)}
+
+LOCKED suggestionChips (verbatim context, do not output):
+{json.dumps(current_strategy.get("suggestionChips") or [], ensure_ascii=True)}
+
+**Role**: {role}
+
+EDIT-INSTRUCTION RULES (CRITICAL — override every other instinct):
+1. The user's instruction OUTRANKS any tendency to "improve" or "summarise" the strategic objective. Apply ONLY the change the user named.
+2. If the user QUOTES exact text (a sentence, a phrase, a list of names) inside the instruction, find that exact text in CURRENT strategicObjective and REMOVE (or rephrase, per the verb the user used) ONLY that text.
+3. Every other sentence, clause, and reference in CURRENT strategicObjective MUST be reproduced WORD-FOR-WORD in the output. Do NOT compress lists of entities. Do NOT drop arbitration/summary-suit/GST/cloud-suspension/leverage sentences. Do NOT change the length of the output unless the user explicitly asked for that.
+4. Do NOT enforce any sentence-count or word-count target. The output length should equal the input length minus what the user removed (or plus what the user asked to add).
+5. If the user asks for something impossible (e.g. inventing a fact not in the documents), ignore that invention and apply only the valid removal / rephrase parts.
+
+TRUNCATED-TEXT RULE: Never reproduce a token, name, or phrase that ends in "..." or "…" — those are UI-truncation noise, not real entity names. Drop them silently.
+
+Return JSON ONLY with ONE key:
+{{
+  "strategicObjective": "edited strategic objective; reflect the user's instruction; reproduce every other sentence from CURRENT strategicObjective verbatim"
+}}
+
+Output rules:
+- Do NOT output caseSummary, reportCaseSummary, possibleNextSteps, or suggestionChips.
+- Preserve Indian-law citations exactly as in the source (BNS/BNSS/BSA/IT Act). Do NOT switch to IPC/CrPC/Evidence Act.
+- JSON only; complete string."""
+
+            custom_suffix = build_custom_instruction_suffix(workspace_id)
+            if custom_suffix:
+                prompt = prompt.rstrip() + "\n\n" + custom_suffix
+
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                system_instruction=get_structured_document_feature_system_instruction(
+                    role
+                ),
+                temperature=0.2,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            if not json_str:
+                return False
+            data = json.loads(json_str)
+            if not isinstance(data, dict):
+                return False
+
+            new_strategic_objective = _strip_ui_truncated_tokens(
+                (data.get("strategicObjective") or "").strip()
+            )
+            if not new_strategic_objective:
+                return False
+
+            merged = dict(current_strategy)
+            # Lock the other four fields explicitly so any future refactor
+            # of dict(current_strategy) cannot accidentally let them drift.
+            merged["caseSummary"] = current_strategy.get("caseSummary", "")
+            merged["reportCaseSummary"] = current_strategy.get("reportCaseSummary", "")
+            merged["strategicObjective"] = new_strategic_objective
+            merged["possibleNextSteps"] = list(
+                current_strategy.get("possibleNextSteps") or []
+            )
+            merged["suggestionChips"] = list(
+                current_strategy.get("suggestionChips") or []
+            )
+            merged["isUpdate"] = True
+            merged["role"] = role
+            merged["workspaceId"] = workspace_id
+            merged["userId"] = user_id
+            merged["timestamp"] = datetime.utcnow().isoformat()
+
+            self._workspace_strategy_payload[workspace_id] = merged
+
+            if self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "strategy_objective",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": merged,
+                    },
+                )
+                logger.success(
+                    "✅ Strategic objective surgical edit emitted (other fields preserved) workspace={}",
+                    workspace_id[:12] if workspace_id else "",
+                )
+            return True
+        except Exception as e:
+            logger.warning("Strategic objective surgical edit failed: {}", e)
             return False
 
     def _last_ai_offered_objective_update(self, ai_text: str) -> bool:
@@ -2335,6 +3921,195 @@ USER MESSAGE
                 "updateRequestedNow": False,
             }
 
+    async def _llm_classify_panel_edit_intent(
+        self,
+        user_message: str,
+        *,
+        current_strategy: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        LLM-based classifier that decides whether the user's chat message is a
+        direct edit request on one of the four strategy panel fields:
+        caseSummary, reportCaseSummary, strategicObjective, possibleNextSteps.
+
+        Returns:
+            {
+              "caseSummary":         {"shouldEdit": bool, "instruction": str},
+              "reportCaseSummary":   {"shouldEdit": bool, "instruction": str},
+              "strategicObjective":  {"shouldEdit": bool, "instruction": str},
+              "possibleNextSteps":   {"shouldEdit": bool, "instruction": str},
+              "isQuestionLike":      bool
+            }
+
+        ``shouldEdit`` is True only when the user is directly asking for a
+        change (remove / drop / delete / change / replace / edit / modify /
+        rewrite / add / append / insert / expand / shorten / rephrase /
+        fix / correct). Questions, explanations, and greetings classify as
+        all-False so the message falls through to the intelligence chat
+        agent unchanged. ``instruction`` is the normalised edit text (the
+        whole user message when no narrower extraction is possible).
+        """
+        empty: Dict[str, Any] = {
+            "caseSummary": {"shouldEdit": False, "instruction": ""},
+            "reportCaseSummary": {"shouldEdit": False, "instruction": ""},
+            "strategicObjective": {"shouldEdit": False, "instruction": ""},
+            "possibleNextSteps": {"shouldEdit": False, "instruction": ""},
+            "isQuestionLike": False,
+        }
+        msg = (user_message or "").strip()
+        if not msg:
+            return empty
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            has_strategy = bool(
+                isinstance(current_strategy, dict)
+                and (current_strategy.get("caseSummary") or "").strip()
+            )
+            if not has_strategy:
+                # No cached strategy means there's nothing to edit yet.
+                return empty
+
+            prompt = f"""You are a STRICT intent classifier for a legal-strategy workspace chat.
+
+The user is viewing a workspace with FOUR generated panels:
+- CASE SUMMARY (caseSummary): a 10-20 sentence factual narrative of the case.
+- REPORT CASE SUMMARY (reportCaseSummary): the same facts rewritten as a neutral, expanded narrative for formal reports.
+- STRATEGIC OBJECTIVE (strategicObjective): the role-tailored strategic plan, 10-20 sentences.
+- POSSIBLE NEXT STEPS (possibleNextSteps): 3-5 immediate actionable bullets.
+
+Your job: decide whether the user is DIRECTLY asking to edit one or more of these panels, and split the user's instruction into per-panel chunks.
+
+USER MESSAGE:
+\"\"\"{msg}\"\"\"
+
+OUTPUT FORMAT (JSON ONLY):
+{{
+  "caseSummary":        {{"shouldEdit": true | false, "instruction": "ONLY the per-panel edit text for case summary; empty when shouldEdit=false"}},
+  "reportCaseSummary":  {{"shouldEdit": true | false, "instruction": "ONLY the per-panel edit text for report case summary; empty when shouldEdit=false"}},
+  "strategicObjective": {{"shouldEdit": true | false, "instruction": "ONLY the per-panel edit text for strategic objective; empty when shouldEdit=false"}},
+  "possibleNextSteps":  {{"shouldEdit": true | false, "instruction": "ONLY the per-panel edit text for possible next steps; empty when shouldEdit=false"}},
+  "isQuestionLike":     true | false
+}}
+
+DECISION RULES:
+
+1) QUESTIONS / EXPLANATIONS / GREETINGS → all four shouldEdit = false, isQuestionLike = true.
+   Examples: "what laws apply?", "explain the case summary", "hi", "can you describe this?",
+   "is X applicable?", "tell me about ...".
+
+2) EDIT VERBS that trigger shouldEdit when paired with a panel name:
+   remove, delete, drop, change, replace, edit, modify, rewrite, add, append,
+   insert, expand, shorten, rephrase, fix, correct, update.
+
+3) PANEL NAME RECOGNITION (tolerate typos and case):
+   - "case summary", "summary", "the summary"                → caseSummary
+   - "report case summary", "report summary"                 → reportCaseSummary
+   - "strategic objective", "stategic objective" (typo),
+     "objective", "strategy"                                 → strategicObjective
+   - "possible next steps", "next steps", "next step",
+     "action items", "steps"                                 → possibleNextSteps
+
+4) "client objective is to ..." / "the objective is to ..." / "we want to ..." PREFIX RULE (CRITICAL):
+   These phrases are NOT a strategic objective declaration when they are followed by an edit verb plus a panel name.
+   Example: "client objective is to remove sentence X from case summary" means
+   caseSummary.shouldEdit=true, instruction="Remove sentence X from case summary".
+   Do NOT treat the wrapping phrase as a strategic objective change.
+   ONLY when the user says "client objective is X" with no edit verb / no panel name and X is a substantive
+   strategic direction (e.g. "focus on recovering ₹12,000 first") → strategicObjective.shouldEdit=true.
+
+5) SPLIT MULTI-PANEL MESSAGES INTO PER-PANEL INSTRUCTIONS. CRITICAL.
+   Each shouldEdit=true field's `instruction` MUST contain ONLY the user's edit text for THAT panel — not the wrapping phrase, not the other panels' edits.
+   Use the surrounding "from case summary" / "in the objective" / "from possible next steps" clauses to attribute each sub-instruction.
+   Worked example for a three-panel message:
+     INPUT: "client objective is to remove this sentence 'AAA AAA AAA' from case summary and 'BBB BBB BBB' remove this from strategic objective and remove 4th point from possible next steps"
+     OUTPUT:
+     {{
+       "caseSummary":        {{"shouldEdit": true,  "instruction": "Remove this sentence from the case summary: AAA AAA AAA"}},
+       "reportCaseSummary":  {{"shouldEdit": false, "instruction": ""}},
+       "strategicObjective": {{"shouldEdit": true,  "instruction": "Remove this from the strategic objective: BBB BBB BBB"}},
+       "possibleNextSteps":  {{"shouldEdit": true,  "instruction": "Remove the 4th point from possible next steps"}},
+       "isQuestionLike":     false
+     }}
+
+6) WHEN THE USER QUOTES EXACT TEXT TO REMOVE/CHANGE — preserve that quoted text verbatim inside the per-panel `instruction`.
+
+7) `instruction` MUST be non-empty whenever shouldEdit=true. If you cannot extract a clean per-panel instruction with the targeted text, set shouldEdit=false for that panel instead of guessing.
+
+8) AMBIGUITY: if the user says "remove this" / "the response" / "that paragraph" without naming a panel, set ALL four shouldEdit=false. The chat agent will ask for clarification.
+
+9) NEVER trigger an edit when the message is a question, even if a panel name appears.
+   "Explain the objective" → strategicObjective.shouldEdit = false, isQuestionLike = true.
+
+10) FACT DISCUSSION WITHOUT EDIT VERB: if the message is only discussing facts
+    ("I think the date was actually 16/05/2026") with NO imperative edit verb, set all four shouldEdit=false.
+
+Return JSON only — no markdown, no commentary."""
+
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=4096,
+                response_mime_type="application/json",
+            )
+            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            if not json_str:
+                return empty
+            try:
+                data = json.loads(json_str)
+            except Exception:
+                return empty
+            if not isinstance(data, dict):
+                return empty
+
+            def _slot(key: str) -> Dict[str, Any]:
+                val = data.get(key)
+                if not isinstance(val, dict):
+                    return {"shouldEdit": False, "instruction": ""}
+                should = bool(val.get("shouldEdit") is True)
+                instr = str(val.get("instruction") or "").strip()
+                # Require a non-empty per-panel instruction. If the model
+                # flagged shouldEdit but didn't extract clean per-panel text,
+                # treat as classifier failure for THIS panel — better to
+                # under-trigger than to dispatch the wrong instruction.
+                if should and not instr:
+                    return {"shouldEdit": False, "instruction": ""}
+                if not should:
+                    instr = ""
+                return {"shouldEdit": should, "instruction": instr}
+
+            result = {
+                "caseSummary": _slot("caseSummary"),
+                "reportCaseSummary": _slot("reportCaseSummary"),
+                "strategicObjective": _slot("strategicObjective"),
+                "possibleNextSteps": _slot("possibleNextSteps"),
+                "isQuestionLike": bool(data.get("isQuestionLike") is True),
+            }
+            # If the model marked it as a question AND also flagged an edit,
+            # trust the question signal and drop the edit flags — safer
+            # default for "explain X" / "what about X" style messages.
+            if result["isQuestionLike"]:
+                for k in (
+                    "caseSummary",
+                    "reportCaseSummary",
+                    "strategicObjective",
+                    "possibleNextSteps",
+                ):
+                    result[k] = {"shouldEdit": False, "instruction": ""}
+            logger.info(
+                "Panel-edit classifier: msg_len={} isQuestion={} caseSummary={} reportCaseSummary={} strategicObjective={} possibleNextSteps={}",
+                len(msg),
+                result["isQuestionLike"],
+                "yes" if result["caseSummary"]["shouldEdit"] else "no",
+                "yes" if result["reportCaseSummary"]["shouldEdit"] else "no",
+                "yes" if result["strategicObjective"]["shouldEdit"] else "no",
+                "yes" if result["possibleNextSteps"]["shouldEdit"] else "no",
+            )
+            return result
+        except Exception as e:
+            logger.warning("Panel-edit intent classifier failed: {}", e)
+            return empty
+
     @staticmethod
     def _drop_entries_for_deleted_docs(
         entries: List[Dict[str, Any]],
@@ -2554,14 +4329,19 @@ USER MESSAGE
                 content = (doc.get("content") or "").strip()
                 if not content or len(content) < 20:
                     continue
-                label = (
-                    "Document {} (most recently uploaded)".format(i)
-                    if i == len(all_docs)
-                    else "Document {}".format(i)
-                )
                 if len(content) > per_doc_cap:
                     content = content[:per_doc_cap] + "\n[... truncated for length ...]"
-                parts.append("--- {} ---\n{}".format(label, content))
+                # Build labelled block with metadata header (document_type,
+                # issued_by, addressees, subject, key dates, legal provisions,
+                # drafted_by_assistant marker) so the analysis-report prompt
+                # treats drafted documents as completed actions.
+                doc_with_clip = dict(doc)
+                doc_with_clip["content"] = content
+                parts.append(
+                    _format_document_for_prompt(
+                        doc_with_clip, i, len(all_docs)
+                    )
+                )
             combined_document_content = (
                 "\n\n".join(parts) if parts else "No document content available."
             )
@@ -2626,8 +4406,77 @@ USER MESSAGE
 
             document_inventory = self._build_document_inventory(workspace_id)
 
+            # Tell the model exactly how many annexures exist so it cannot
+            # invent "Annexure 2", "Annexure 3", ... when only one upload
+            # is present. The post-processing clamp in
+            # _normalize_analysis_report_lists is the safety net; this is
+            # the prevention layer.
+            num_user_uploads = num_docs
+            if num_user_uploads <= 0:
+                annexure_limit_block = (
+                    "AVAILABLE ANNEXURES (HARD LIMIT — do not violate):\n"
+                    "- No annexures have been uploaded.\n"
+                    "- Do NOT reference any 'Annexure N' anywhere in the output."
+                )
+            elif num_user_uploads == 1:
+                annexure_limit_block = (
+                    "AVAILABLE ANNEXURES (HARD LIMIT — do not violate):\n"
+                    "- The user has uploaded exactly 1 annexure.\n"
+                    "- The ONLY valid annexure reference is: Annexure 1.\n"
+                    "- You MUST NOT reference Annexure 2 or any higher number.\n"
+                    "- Do NOT invent additional annexures. Do NOT use the plural form \"annexures\"."
+                )
+            else:
+                annexure_limit_block = (
+                    "AVAILABLE ANNEXURES (HARD LIMIT — do not violate):\n"
+                    f"- The user has uploaded exactly {num_user_uploads} annexures.\n"
+                    f"- The ONLY valid annexure references are: Annexure 1 through Annexure {num_user_uploads}.\n"
+                    f"- You MUST NOT reference Annexure {num_user_uploads + 1} or any higher number.\n"
+                    "- Do NOT invent additional annexures."
+                )
+
+            # Deep-extraction pre-pass: pull structured entities (parties,
+            # dates, suits, properties, amounts, statutes, annexures) so the
+            # analysis_report synthesis below can anchor strengths /
+            # weaknesses / risks / missingInfo to named facts instead of
+            # generic phrasing. Shares the content-hash cache with the strategy
+            # pipeline — when strategy already ran for this content this is a
+            # cache hit, no extra Gemini calls.
+            case_entities = await self._extract_case_entities(
+                workspace_id=workspace_id,
+                combined_document_content=combined_document_content,
+            )
+            _ar_party_names = [
+                (p.get("name") or "").strip()
+                for p in (case_entities.get("parties") or [])
+                if isinstance(p, dict) and (p.get("name") or "").strip()
+            ]
+            logger.info(
+                "🧠 Analysis-report extraction complete for workspace {}: parties=[{}]",
+                workspace_id[:12] if workspace_id else "",
+                ", ".join(_ar_party_names) if _ar_party_names else "(none)",
+            )
+            import json as _json_ar
+            try:
+                _entities_block_ar = _json_ar.dumps(
+                    case_entities, indent=2, ensure_ascii=False
+                )
+            except Exception:
+                _entities_block_ar = "{}"
+
             analysis_prompt = (
                 """You are a senior legal analyst specializing in Indian law. Your task is to produce a structured legal analysis based ONLY on the uploaded documents.
+
+EXTRACTED FACTS (these entities were already pulled from the documents by a
+focused extraction step — treat them as authoritative ground truth. Anchor
+every reference in strengths / weaknesses / risks / missingInfo to these.
+Do NOT introduce 'Party No. 1' / 'the plaintiff' / 'the petitioner' /
+'the respondent' style placeholders — EVERY reference to a person, entity,
+property, suit, amount, or statute MUST use the exact form listed below.
+relevantJurisdiction is governed by the strict FORMAT block below and is
+NOT subject to this entity-grounding directive.):
+
+{entities_block_ar}
 
 CRITICAL OUTPUT RULES:
 - Your entire response MUST be exactly one valid JSON object.
@@ -2645,6 +4494,8 @@ CURRENT STRATEGIC OBJECTIVE (from strategy panel):
 {}
 
 {}
+
+{annexure_limit_block}
 
 DOCUMENTS (in upload order; last document is most recent):
 {}
@@ -2721,6 +4572,13 @@ When BOTH branches are plausibly supported by the documents, the analysis MUST c
 When the facts only support one branch (purely civil OR purely criminal), stay in that branch — do NOT manufacture the other side just to look balanced. Coherence beats balance.
 
 **No bracket tags in user-facing output.** Do NOT prefix or label any item in `strengths` / `weaknesses` / `risks` / `pendingActions` / `nextSteps` / `suggestedDrafts` / `relevantJurisdiction` with "(criminal angle)", "(civil angle)", "(criminal-law angle)", "(civil-law angle)", or any similar bracketed tag. Cite the relevant statutes inside the `laws` array (where present) or weave them into normal sentences — never use a parenthesised "angle" prefix.
+
+COMPLETED-ACTION RECOGNITION (CRITICAL):
+Inspect the metadata header on every annexure. When a document is a `notice` / `complaint` / `affidavit` / `application` / `plaint` AND either (a) its `ISSUED BY` field names the client side (matches the active role, the named client, or the client's advocate), OR (b) the header carries a `[DRAFTED BY ASSISTANT …]` marker, treat the underlying procedural action as **ALREADY COMPLETED** in this matter. Apply this consistently:
+- `strengths`: surface the completed action as a procedural strength when relevant (e.g. *"Demand notice under §73 Indian Contract Act, 1872 has already been served on the noticees, perfecting the cause of action for a money-recovery suit"*). Cite the served-on date and the addressees.
+- `weaknesses` / `risks`: do NOT flag "notice not yet served" or "complaint not yet filed" as a weakness if the metadata shows the action has been completed; instead flag dependent risks (e.g. *"Compliance deadline 06/06/2026 — if no response, the matter must move to suit promptly to avoid limitation drift"*).
+- `pendingActions` and `nextSteps`: **DO NOT re-list the completed action**. If a legal/demand notice has been served, the next step is monitoring the compliance window and preparing the follow-up suit, not *"issue a legal notice"*. If an FIR complaint has been filed, the next step is follow-up on registration / investigation status, not *"file an FIR"*. Same for affidavits, applications, plaints, written statements.
+- Apply independently to each completed action if multiple drafted documents exist.
 
 DOCUMENT RELATION RULE:
 If documents appear to include multiple matters, mention that ambiguity and prioritize the dispute best supported by evidence.
@@ -2807,11 +4665,20 @@ STEP 3 — LEGAL ANALYSIS
 All strengths and weaknesses MUST be based on facts from the documents.
 
 Strength rules:
-- 2–6 items
-- Each `point` must state the factual and legal reasoning in plain prose (clear, specific to the annexures)
-- Put **statutes and sections only** in the `laws` array (e.g. "BSA", "BNS Section 318", "IT Act 2000")
-- **Forbidden in `point` text:** do not end (or pad) a strength with boilerplate such as "which is a relevant fact under [Act]" or "admissible under [Act(s)]" — no trailing "under the Bharatiya Sakshya Adhiniyam" / "under the IT Act" restatements; the `laws` field carries citations
-- Must be supported by the annexure facts
+- **MANDATORY: minimum 2 strengths, maximum 6.** Returning 0 or 1 is a schema violation. Every matter has at least two facts that help the client's position — find them.
+- Each `point` must state the factual and legal reasoning in plain prose as 2-4 sentences (clear, specific to the annexures), naming the party / date / document / amount it relies on (from EXTRACTED FACTS).
+- Put **statutes and sections only** in the `laws` array (e.g. "BSA", "BNS Section 318", "IT Act 2000").
+- **Forbidden in `point` text:** do not end (or pad) a strength with boilerplate such as "which is a relevant fact under [Act]" or "admissible under [Act(s)]" — no trailing "under the Bharatiya Sakshya Adhiniyam" / "under the IT Act" restatements; the `laws` field carries citations.
+- Must be supported by the annexure facts.
+
+What COUNTS as a strength (use these categories when evidence feels thin — at least 2 of these almost always apply):
+1. **Documentary evidence** preserved in an annexure — e.g. a registered sale deed, MLC / medico-legal certificate, hospital record, FIR, charge-sheet, written notice, audio/video transcript, bank statement, signed contract, photograph, official certificate.
+2. **Party admissions** — anything the opposing side stated, signed, or did that supports the client's position (e.g. partial payment, written reply admitting a fact, official detention record).
+3. **Procedural advantage** — favourable forum / jurisdiction, limitation period still open, statutory presumption in client's favour (e.g. presumption of cruelty under §498A successor, presumption under BSA §85B for electronic records).
+4. **Statutory framework support** — a named provision under BNS / BNSS / BSA / IT Act / Specific Relief Act / Hindu Marriage Act / Domestic Violence Act / etc. that, on the recorded facts, points to relief for the client.
+5. **Corroboration across annexures** — two or more annexures that independently support the same fact, increasing evidentiary weight. ONLY apply this category when AVAILABLE ANNEXURES shows multiple annexures are present; when only a single annexure exists, do NOT invent corroboration.
+
+If the documents are genuinely sparse, still produce 2 strengths by anchoring to the annexure(s) actually uploaded (within the hard limit in AVAILABLE ANNEXURES) and the most credible statutory provision. Do NOT skip the field. Do NOT replace it with empty `[]`.
 
 Weakness rules:
 - Only list weaknesses supported by document facts
@@ -2849,17 +4716,17 @@ Output keys in this exact order (score and explanations FIRST so they are not tr
 
 {{
   "caseResolutionScore": 72,
-  "qualityScoreExplanation": "Required: 2-4 sentences explaining how this score follows from missing info, weaknesses, risks, and strengths. Non-empty. Example: Score reflects gaps in annexures and procedural risks.",
-  "reportQualityScoreExplanation": "Required: 2-4 sentences with the same scoring logic as qualityScoreExplanation, written for external or report-facing use. Do not use the words legal or respondent (any casing). Use neutral wording (e.g. procedural risk, parties, case file). Non-empty.",
-  "missingInfo": ["item1","item2"],
+  "qualityScoreExplanation": "Required: 3-5 sentences explaining how this score follows from THIS case's specific missing info, weaknesses, risks, and strengths. MUST start with 'The current score is <N>% because'. MUST name at least one specific missing item, one specific weakness/risk, and one specific strength using named parties (from EXTRACTED FACTS), specific dates (DD/MM/YYYY), exact amounts (Rs. notation), and Annexure/suit references — never generic phrasing like 'Score reflects gaps in annexures and procedural risks'. Non-empty.",
+  "reportQualityScoreExplanation": "Required: 3-5 sentences with the same scoring logic as qualityScoreExplanation, written for external or report-facing use. MUST start with 'The current score is <N>% because'. Same entity-grounding rule — name at least one specific missing item, one specific weakness/risk, and one specific strength using named parties, dates, amounts, and Annexure/suit references. Do not use the words 'legal' or 'respondent' (any casing). Use neutral wording (e.g. procedural risk, parties, case file). Non-empty.",
+  "missingInfo": ["Each missing-info entry is a 2-4 sentence string naming WHAT is missing, FROM WHOM (the named party/document/Annexure it should come from), WHY it matters for the strategic objective, and which existing Annexure (if any) currently approximates it. Use exact names and identifiers from EXTRACTED FACTS — never one-word labels like 'address' or 'medical report'."],
   "strengths": [
     {{
-      "point": "Factual strength stated clearly without repeating statute boilerplate in the sentence",
+      "point": "MANDATORY 2-4 SENTENCES of factual prose (NOT a label, NOT a one-liner). Name the specific parties (use exact names from EXTRACTED FACTS), the dated events (DD/MM/YYYY), exact amounts in source notation (Rs. 11,64,000), suit/document references (O.S. No. 827/2019), and the Annexure(s) that establish this strength. Do NOT pad with statute boilerplate phrases such as 'which is a relevant fact under <Act>, YYYY' or 'admissible under <Act>'; statutes belong only in the laws array. Anchor every claim in named facts. The whole point string must be at least 120 characters.\n\nGOOD example (do this): 'Rohan Sharma was 20 years old at the time of the arrest on 18/04/2026, as recorded in Annexure 1. Youth at this scale is a recognised mitigating factor for bail and is supported by the contact log showing his sister approached counsel within five days of the remand to Tihar Jail.'\n\nBAD example (do NOT do this): 'Youth of the accused.' — that is a label, not a strength.\n\nBAD example (do NOT do this): 'Youth of the accused, which is a relevant fact under the Narcotic Drugs and Psychotropic Substances Act, 1985.' — single-sentence label padded with a citation; the citation belongs in the laws array, and the prose must be 2-4 sentences with named entities.",
       "laws": ["BNS Section 318", "BSA"]
     }}
   ],
-  "weaknesses": ["weakness1"],
-  "risks": ["risk1"],
+  "weaknesses": ["Each weakness is a 2-4 sentence string naming the SPECIFIC party (exact name), the dated event, the exact amount or document/annexure, and the statute or principle that makes this a weakness for the client's case. Never generic phrasing like 'limitation may apply' — say which party's claim is exposed under which Act and why."],
+  "risks": ["Each risk is a 2-4 sentence string explaining the SPECIFIC procedural / evidentiary / limitation / contradiction risk, with the named party + date + document/annexure that triggers it, and the named rule (e.g. Limitation Act 1963 §54, BNSS §187, BSA §65B) that is exposed. Use exact names and amounts from EXTRACTED FACTS."],
   "relevantJurisdiction": ["District Court, City"],
   "pendingActions": ["action1"],
   "nextSteps": ["step1","step2"],
@@ -2873,7 +4740,7 @@ missingInfo:
 ONLY information absent from documents and legally required.
 
 strengths:
-2–6 items; each has factual `point` prose plus `laws` for citations — **no** "relevant fact under …" / "admissible under …" sentences in `point`.
+**MANDATORY 2-6 items (never 0, never 1).** Each has factual `point` prose (2-4 FULL sentences with named parties, DD/MM/YYYY dates, exact amounts, and Annexure references — minimum 120 characters total) plus `laws` for citations. **NEVER emit a label-only `point` like "Youth of the accused" or "Duration of detention"** — that is a heading, not a strength. **NEVER pad a label with citation boilerplate like ", which is a relevant fact under <Act>, YYYY"** — statutes belong only in the `laws` array; the prose must stand on its own as 2-4 sentences of named facts.
 
 weaknesses:
 0–6 factual weaknesses.
@@ -2888,15 +4755,26 @@ pendingActions / nextSteps / suggestedDrafts:
 0–5 items each.
 
 qualityScoreExplanation RULE:
-- MANDATORY non-empty string. If the score is below 100, say why (missing info / weaknesses / risks). If 100, say that no gaps, weaknesses, or risks were flagged.
+- MANDATORY non-empty string of 3-5 sentences.
+- MUST start with "The current score is <N>% because" (where N is the integer caseResolutionScore).
+- MUST cite the SPECIFIC facts driving the score: name at least one missingInfo item by what is missing and from whom (using EXTRACTED FACTS names), one weakness or risk by the named party/date/amount/annexure that triggers it, and one strength by the named fact (party + date + Annexure) that supports it.
+- If the score is 100, say specifically that no missingInfo, weaknesses, or risks were flagged, and name the top 1-2 strengths (parties + dates + Annexures) that justify it.
+- Never use generic phrasing like "gaps in annexures" or "procedural risks identified" without naming WHICH gap, WHICH risk, and FOR WHOM.
 
 reportQualityScoreExplanation RULE:
-- MANDATORY non-empty string. Same substance as qualityScoreExplanation (tie the score to missing info, weaknesses, risks, and strengths).
+- MANDATORY non-empty string of 3-5 sentences.
+- MUST start with "The current score is <N>% because" (same N as above).
+- Same entity-grounding obligation as qualityScoreExplanation — name specific missingInfo / weakness / risk / strength items with parties, dates, amounts, and Annexure/suit references from EXTRACTED FACTS.
 - MUST NOT contain the words "legal" or "respondent" in any form—including compounds where they appear as standalone words (rewrite to neutral alternatives: e.g. procedural risk, parties, opposing side, case file, annexures).
 
 FINAL RULE:
 Output ONLY the JSON object.
 No extra text.
+
+ENTITY-GROUNDING RULE (CRITICAL):
+- Every entry in `strengths` (the `point` field), `weaknesses`, `risks`, and `missingInfo` MUST cite at least one named party, specific date (DD/MM/YYYY), exact amount, suit/case/FIR number, or Annexure reference taken from EXTRACTED FACTS — never generic categories.
+- Do NOT use "Party No. 1" / "Party No. 2" / "the plaintiff" / "the respondent" / "the petitioner" anywhere in `strengths`, `weaknesses`, `risks`, `missingInfo`, `pendingActions`, `nextSteps`, `suggestedDrafts`, or the explanation strings. Always use the exact names listed in EXTRACTED FACTS.
+- The `relevantJurisdiction` array is EXEMPT from this rule: it follows the strict COURT/FORUM-by-location format defined above and lists only jurisdiction/forum names — no party names, no dates, no amounts.
 """
             ).format(
                 role,
@@ -2905,6 +4783,8 @@ No extra text.
                 current_strategic_objective,
                 document_inventory or "DOCUMENT INVENTORY: (no classified inventory available — reason from DOCUMENTS text below)",
                 combined_document_content,
+                entities_block_ar=_entities_block_ar,
+                annexure_limit_block=annexure_limit_block,
             )
 
             custom_suffix = build_custom_instruction_suffix(workspace_id)
@@ -3167,6 +5047,137 @@ Rules:
                     if not point:
                         continue
                     strengths.append({"point": point, "laws": []})
+
+            # Guard: the schema mandates 2-6 strengths, each with 2-4 sentence
+            # prose. The model occasionally returns an empty array OR emits
+            # label-only points like "Youth of the accused" — usually because
+            # the entity-grounding rules made it over-cautious on cases with
+            # thin documentary evidence. Fire ONE focused retry when either:
+            #   (a) fewer than 2 strengths were produced, OR
+            #   (b) any surviving strength has a point shorter than 40 chars
+            #       (a label, not a 2-4 sentence strength).
+            _has_short_strength_point = any(
+                isinstance(s, dict) and len((s.get("point") or "").strip()) < 40
+                for s in strengths
+            )
+            if (len(strengths) < 2 or _has_short_strength_point) and (
+                isinstance(combined_document_content, str)
+                and combined_document_content.strip()
+                and combined_document_content.strip() != "No document content available."
+            ):
+                logger.warning(
+                    "Analysis report returned {} strength(s) (short_label_present={}) "
+                    "for workspace {}; firing focused retry to recover full prose.",
+                    len(strengths),
+                    _has_short_strength_point,
+                    workspace_id[:12] if workspace_id else "",
+                )
+                try:
+                    _strengths_retry_prompt = (
+                        "You produced an analysis report for an Indian-law matter but "
+                        "left the strengths array nearly empty. The schema MANDATES "
+                        "2-6 strengths. Every matter has at least two facts that help "
+                        "the client's position.\n\n"
+                        "Return ONE JSON object with exactly this shape (no commentary, "
+                        "no markdown):\n\n"
+                        "{\n"
+                        '  "strengths": [\n'
+                        '    { "point": "2-4 sentence factual strength naming the specific '
+                        'party / date / Annexure / amount from EXTRACTED FACTS that '
+                        'establishes it. Do NOT pad with statute boilerplate. Do NOT use '
+                        '\'Party No. X\' placeholders.", "laws": ["BNS Section 318", '
+                        '"BSA"] }\n'
+                        "  ]\n"
+                        "}\n\n"
+                        "Anchor every strength to EXTRACTED FACTS. Valid strength "
+                        "categories (use at least 2):\n"
+                        "1. Documentary evidence preserved in an annexure (MLC, FIR, "
+                        "registered deed, hospital record, signed contract, "
+                        "audio/video transcript, bank statement, photograph, official "
+                        "certificate).\n"
+                        "2. Party admissions (opposing side stated, signed, or did "
+                        "something supporting the client — partial payment, written "
+                        "reply admitting a fact, official detention record).\n"
+                        "3. Procedural advantage (favourable forum / jurisdiction, "
+                        "limitation period still open, statutory presumption in "
+                        "client's favour).\n"
+                        "4. Statutory framework support (a named provision under BNS / "
+                        "BNSS / BSA / IT Act / Specific Relief Act / Hindu Marriage "
+                        "Act / Domestic Violence Act / etc. that on the recorded facts "
+                        "points to relief for the client).\n"
+                        "5. Corroboration across annexures (two or more annexures that "
+                        "independently support the same fact).\n\n"
+                        f"EXTRACTED FACTS:\n{_entities_block_ar}\n\n"
+                        "CONTEXT — items you already produced for this report:\n"
+                        f"- missingInfo: {(missing_info or [])[:8]}\n"
+                        f"- weaknesses: {(data.get('weaknesses') or [])[:6] if isinstance(data.get('weaknesses'), list) else []}\n"
+                        f"- risks: {(data.get('risks') or [])[:6] if isinstance(data.get('risks'), list) else []}\n\n"
+                        "DOCUMENTS (in upload order):\n"
+                        f"{combined_document_content[:60000]}\n"
+                    )
+                    _strengths_retry_raw = await gemini_client.generate(
+                        prompt=_strengths_retry_prompt,
+                        system_instruction=get_structured_document_feature_system_instruction(
+                            workspace_role
+                        ),
+                        temperature=0.2,
+                        max_tokens=12000,
+                        response_mime_type="application/json",
+                    )
+                    _strengths_retry_json = self._prepare_json_candidate(
+                        (_strengths_retry_raw or "").strip(), prefer="object"
+                    )
+                    if _strengths_retry_json:
+                        import json as _json_sr
+                        _retry_parsed = _json_sr.loads(_strengths_retry_json)
+                        if isinstance(_retry_parsed, dict):
+                            _retry_strengths = _retry_parsed.get("strengths") or []
+                            if isinstance(_retry_strengths, list) and _retry_strengths:
+                                _rebuilt: List[Dict[str, Any]] = []
+                                for s in _retry_strengths[:6]:
+                                    if isinstance(s, dict):
+                                        point = (s.get("point") or s.get("text") or "").strip()
+                                        laws = s.get("laws") or s.get("law") or []
+                                        if not isinstance(laws, list):
+                                            laws = [laws] if laws else []
+                                        laws = [str(l).strip() for l in laws if l][:5]
+                                        if point:
+                                            point = re.sub(
+                                                r"\bdocuments\b",
+                                                "annexures",
+                                                re.sub(
+                                                    r"\bdocument\b",
+                                                    "annexure",
+                                                    point,
+                                                    flags=re.IGNORECASE,
+                                                ),
+                                                flags=re.IGNORECASE,
+                                            )
+                                            point = _strip_strength_point_statute_boilerplate(
+                                                point
+                                            )
+                                            if point:
+                                                _rebuilt.append(
+                                                    {"point": point, "laws": laws}
+                                                )
+                                if len(_rebuilt) >= 2:
+                                    logger.success(
+                                        "Strengths retry recovered {} item(s) for workspace {}",
+                                        len(_rebuilt),
+                                        workspace_id[:12] if workspace_id else "",
+                                    )
+                                    strengths = _rebuilt
+                                else:
+                                    logger.warning(
+                                        "Strengths retry only produced {} item(s) for "
+                                        "workspace {}; keeping original list",
+                                        len(_rebuilt),
+                                        workspace_id[:12] if workspace_id else "",
+                                    )
+                except Exception as _sr_err:
+                    logger.warning(
+                        "Strengths retry failed (non-fatal): {}", _sr_err
+                    )
 
             weaknesses = data.get("weaknesses") or []
             # Coerce off-schema shapes (the model sometimes returns
@@ -3479,6 +5490,13 @@ Rules:
                 len(strengths),
                 len(missing_info),
             )
+            # Clamp "Annexure N" references in the freshly generated payload
+            # against the real upload count so a single-doc workspace never
+            # sees hallucinated Annexure 2 / Annexure 3 / ... in the first
+            # emit. Downstream merge and feedback paths re-apply the clamp
+            # via _normalize_analysis_report_lists, so this is defence in
+            # depth.
+            self._normalize_analysis_report_lists(payload, max_annexure=num_docs)
             return payload
 
         except Exception as e:
@@ -5802,6 +7820,291 @@ Indian Kanoon / case-law search results:
         )
         await asyncio.sleep(0.1)
 
+    # ------------------------------------------------------------------
+    # Drafting Assistant — suggested drafts panel
+    # ------------------------------------------------------------------
+
+    def _build_case_brief_for_drafting(
+        self, workspace_id: str
+    ) -> Dict[str, str]:
+        """Compose the case-context strings the drafting agent needs.
+
+        Pulled from already-cached panels (analysis_report, strategy, etc.)
+        so a single LLM call generates focused, grounded suggestions.
+        """
+        case_summary = ""
+        applicable_laws_brief = ""
+        strategy_brief = ""
+        analysis_brief = ""
+        list_of_dates_brief = ""
+
+        try:
+            strat = self._workspace_strategy_payload.get(workspace_id) or {}
+            if isinstance(strat, dict):
+                case_summary = (strat.get("caseSummary") or "").strip()
+                strategic = (strat.get("strategicObjective") or "").strip()
+                next_steps = strat.get("possibleNextSteps") or []
+                if isinstance(next_steps, list):
+                    next_steps_text = "; ".join(
+                        str(s).strip() for s in next_steps[:5] if s
+                    )
+                else:
+                    next_steps_text = ""
+                strategy_brief = "\n".join(
+                    line for line in [
+                        f"Strategic objective: {strategic}" if strategic else "",
+                        f"Possible next steps: {next_steps_text}" if next_steps_text else "",
+                    ] if line
+                )
+        except Exception:
+            pass
+
+        try:
+            analysis = self._workspace_analysis_payload.get(workspace_id) or {}
+            if isinstance(analysis, dict):
+                weaknesses = analysis.get("weaknesses") or []
+                missing = analysis.get("missingInfo") or []
+                pending = analysis.get("pendingActions") or []
+                strengths = analysis.get("strengths") or []
+                lines: List[str] = []
+                if isinstance(strengths, list) and strengths:
+                    strength_pts = [
+                        (s.get("point") or s.get("text") or "") if isinstance(s, dict) else str(s)
+                        for s in strengths[:4]
+                    ]
+                    strength_pts = [p.strip() for p in strength_pts if p and p.strip()]
+                    if strength_pts:
+                        lines.append("Strengths: " + " | ".join(strength_pts))
+                if isinstance(weaknesses, list) and weaknesses:
+                    weak_pts = [str(w).strip() for w in weaknesses[:4] if w]
+                    if weak_pts:
+                        lines.append("Weaknesses: " + " | ".join(weak_pts))
+                if isinstance(missing, list) and missing:
+                    miss_pts = [str(m).strip() for m in missing[:4] if m]
+                    if miss_pts:
+                        lines.append("Missing info: " + " | ".join(miss_pts))
+                if isinstance(pending, list) and pending:
+                    pend_pts = [str(p).strip() for p in pending[:4] if p]
+                    if pend_pts:
+                        lines.append("Pending actions: " + " | ".join(pend_pts))
+                analysis_brief = "\n".join(lines)
+        except Exception:
+            pass
+
+        try:
+            laws_payload = (
+                self._workspace_applicable_laws_payload.get(workspace_id) or {}
+            )
+            if isinstance(laws_payload, dict):
+                laws = laws_payload.get("applicableLaws") or laws_payload.get("laws") or []
+                if isinstance(laws, list) and laws:
+                    parts: List[str] = []
+                    for law in laws[:8]:
+                        if not isinstance(law, dict):
+                            continue
+                        act = (law.get("act") or "").strip()
+                        section = (law.get("section") or "").strip()
+                        if act and section:
+                            parts.append(f"{act} §{section}")
+                        elif act:
+                            parts.append(act)
+                    if parts:
+                        applicable_laws_brief = "; ".join(parts)
+        except Exception:
+            pass
+
+        try:
+            dates = self._workspace_list_of_dates_payload.get(workspace_id) or []
+            if isinstance(dates, list) and dates:
+                lines = []
+                for d in dates[:6]:
+                    if not isinstance(d, dict):
+                        continue
+                    dt = (d.get("date") or "").strip()
+                    title = (d.get("title") or d.get("eventType") or "").strip()
+                    if dt and title:
+                        lines.append(f"{dt} — {title}")
+                if lines:
+                    list_of_dates_brief = "\n".join(lines)
+        except Exception:
+            pass
+
+        return {
+            "case_summary": case_summary,
+            "applicable_laws_brief": applicable_laws_brief,
+            "strategy_brief": strategy_brief,
+            "analysis_brief": analysis_brief,
+            "list_of_dates_brief": list_of_dates_brief,
+        }
+
+    async def _generate_and_emit_drafting_suggestions(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: Optional[str] = None,
+    ) -> None:
+        """
+        Generate the proactive Drafting Assistant panel suggestions and emit
+        them as a document_feature_response (featureType="drafting_assistant").
+
+        Cached in `_workspace_drafting_payload` for reconnect re-emit.
+        """
+        if not self._socket_client:
+            return
+        try:
+            from app.langgraph.drafting_agent import drafting_agent
+
+            role_upper = (workspace_role or "ADJUDICATOR").strip().upper() or "ADJUDICATOR"
+            # Make sure the lawyer's template library is loaded into the
+            # in-memory store BEFORE pre-matching. The backend only pushes
+            # template_sync on upload/rename/delete, so after an AI restart
+            # the store is cold — request a full snapshot and wait for it.
+            await self.ensure_templates_synced(user_id)
+            brief = self._build_case_brief_for_drafting(workspace_id)
+            suggestions = await drafting_agent.suggest(
+                role=role_upper,
+                case_summary=brief["case_summary"],
+                applicable_laws_brief=brief["applicable_laws_brief"],
+                strategy_brief=brief["strategy_brief"],
+                analysis_brief=brief["analysis_brief"],
+                list_of_dates_brief=brief["list_of_dates_brief"],
+                # Pre-match each suggestion against the lawyer's template
+                # library so the response carries templateId / templateName
+                # per card. Frontend can display "Uses <template>" badge
+                # and pass templateId straight through on click, skipping
+                # a second matcher round-trip server-side.
+                user_id=user_id,
+            )
+
+            payload = {"suggestedDrafts": suggestions or []}
+            self._workspace_drafting_payload[workspace_id] = payload
+
+            # Record provenance so the panel can self-heal if a template
+            # finishes ingesting after this point (slow scanned-PDF OCR that
+            # missed the template-sync window). `lib_count` is the template
+            # count these suggestions were pre-matched against; a later growth
+            # triggers a regenerate. See _maybe_reemit_drafting_on_templates.
+            try:
+                from app.langgraph.template_store import template_store
+
+                lib_count = await template_store.count_for_user(user_id=user_id)
+            except Exception:
+                lib_count = 0
+            self._drafting_meta_by_workspace[workspace_id] = {
+                "user_id": user_id,
+                "role": role_upper,
+                "lib_count": lib_count,
+            }
+
+            # Log exactly what we're about to send back per suggestion —
+            # title + the pre-matched template fields the frontend uses to
+            # render the "Uses <template>" badge and pass templateId on click.
+            logger.info(
+                "📤 drafting_assistant suggestions payload (workspace={}, user={}): "
+                "{} suggestion(s)",
+                workspace_id,
+                (user_id or "")[:12],
+                len(payload["suggestedDrafts"]),
+            )
+            for idx, s in enumerate(payload["suggestedDrafts"]):
+                if not isinstance(s, dict):
+                    logger.info("   ✏️ [{}] (non-dict: {})", idx, type(s).__name__)
+                    continue
+                logger.info(
+                    "   ✏️ [{}] title={!r} relevance={} matchMode={} "
+                    "templateId={} templateName={!r}",
+                    idx,
+                    s.get("title"),
+                    s.get("relevance"),
+                    s.get("matchMode"),
+                    s.get("templateId"),
+                    s.get("templateName"),
+                )
+
+            response_body = {
+                "featureType": "drafting_assistant",
+                "workspaceId": workspace_id,
+                "userId": user_id,
+                "payload": payload,
+            }
+            # Full dump of the exact response body sent to the backend for
+            # end-to-end verification (titles/descriptions/templateId/
+            # templateName only — no credentials, so no redaction needed).
+            try:
+                logger.info(
+                    "📦 drafting_assistant RESPONSE body to backend:\n{}",
+                    json.dumps(response_body, indent=2, ensure_ascii=False, default=str),
+                )
+            except Exception as e:
+                logger.warning("Drafting suggestions: could not dump response body: {}", e)
+
+            await self._socket_client.emit(
+                "document_feature_response",
+                response_body,
+            )
+            logger.success(
+                "✅ Drafting suggestions sent to backend ({} item(s))",
+                len(payload["suggestedDrafts"]),
+            )
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.warning("Drafting suggestions emit failed: {}", e)
+
+    async def _maybe_reemit_drafting_on_templates(self, user_id: str) -> None:
+        """Self-heal the Drafting Assistant panel after a template lands late.
+
+        When a template finishes ingesting (e.g. a slow scanned-PDF OCR that
+        missed the original ``request_template_sync`` window), the suggestions
+        already emitted for this user's workspace(s) were pre-matched against a
+        smaller / empty library and carry no template. Regenerate those panels
+        when the user's ready-template count has grown since the panel was last
+        built. The ``lib_count`` comparison debounces this so rename/delete
+        deltas and no-op snapshots don't trigger redundant regeneration.
+        """
+        user_id = (user_id or "").strip()
+        if not user_id:
+            return
+        try:
+            from app.langgraph.template_store import template_store
+
+            current_count = await template_store.count_for_user(user_id=user_id)
+        except Exception as e:
+            logger.warning(
+                "drafting re-emit: count_for_user failed (user={}): {}",
+                user_id[:12],
+                e,
+            )
+            return
+
+        for workspace_id, meta in list(self._drafting_meta_by_workspace.items()):
+            if (meta or {}).get("user_id") != user_id:
+                continue
+            prev_count = int((meta or {}).get("lib_count") or 0)
+            if current_count <= prev_count:
+                continue  # library didn't grow — nothing new to match
+            role = (meta or {}).get("role") or "ADJUDICATOR"
+            logger.info(
+                "🔁 Template library grew ({}→{}) — regenerating drafting "
+                "suggestions for workspace={} (user={})",
+                prev_count,
+                current_count,
+                workspace_id,
+                user_id[:12],
+            )
+            # Bump the recorded count up front so a burst of template events
+            # can't queue duplicate regenerations for the same growth.
+            self._drafting_meta_by_workspace[workspace_id] = {
+                **(meta or {}),
+                "lib_count": current_count,
+            }
+            asyncio.create_task(
+                self._generate_and_emit_drafting_suggestions(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=role,
+                )
+            )
+
     def _strategy_objective_fallback(
         self,
         workspace_id: str,
@@ -5907,11 +8210,28 @@ Indian Kanoon / case-law search results:
                     ctx,
                     pt_err,
                 )
+            try:
+                logger.info(
+                    "Drafting suggestions: invoking (background{}) for workspace {}",
+                    ctx,
+                    workspace_id[:12] if workspace_id else "",
+                )
+                await self._generate_and_emit_drafting_suggestions(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=workspace_role,
+                )
+            except Exception as draft_err:
+                logger.warning(
+                    "Drafting suggestions (background{}) failed: {}",
+                    ctx,
+                    draft_err,
+                )
 
         try:
             asyncio.create_task(_runner())
             logger.debug(
-                "Scheduled list_of_dates + applicable_laws + procedural_timeline{} for workspace {}",
+                "Scheduled list_of_dates + applicable_laws + procedural_timeline + drafting_suggestions{} for workspace {}",
                 ctx,
                 workspace_id[:12] if workspace_id else "",
             )
@@ -7210,7 +9530,9 @@ Return ONLY this JSON, no commentary:
             ).strip()
 
         merged["timestamp"] = datetime.utcnow().isoformat() + "Z"
-        self._normalize_analysis_report_lists(merged)
+        self._normalize_analysis_report_lists(
+            merged, max_annexure=self._get_annexure_count(workspace_id)
+        )
 
         logger.info(
             "Analysis sync merge{}: prev_missing={} new_missing={} merged_missing={}; "
@@ -7840,9 +10162,16 @@ Return ONLY this JSON, no commentary:
             )
             prompt = (
                 f"You are a senior legal analyst. Given this case analysis summary (JSON only), "
-                f"write exactly 2-3 short sentences for an Indian-law workspace. "
+                f"write exactly 3-5 sentences for an Indian-law workspace. "
                 f'Start with "The current score is {case_resolution_score}% because". '
-                "Explain the score using only the listed gaps, weaknesses, risks, and strengths—do not invent facts.\n\n"
+                "Then anchor the explanation to SPECIFIC items from the summary — quote (do not paraphrase generically) "
+                "at least one missingInfo item by what is missing and from whom, one weakness or risk by the "
+                "named party / date / amount / annexure that triggers it, and one strength by the named fact "
+                "(party + date + Annexure) that supports it. If the score is 100, name the top 1-2 strengths "
+                "instead and state that no missingInfo / weaknesses / risks were flagged. "
+                "Never use generic phrasing like 'gaps in annexures' or 'procedural risks identified' without naming "
+                "WHICH gap, WHICH risk, and FOR WHOM. Use names exactly as they appear in the summary; do NOT "
+                "invent facts not present in the summary.\n\n"
                 f"{summary}"
             )
             txt = await gemini_client.generate(
@@ -7890,8 +10219,29 @@ Return ONLY this JSON, no commentary:
             strengths,
         )
 
+    def _get_annexure_count(self, workspace_id: str) -> int:
+        """
+        Return the number of annexures the user has actually uploaded for a
+        workspace. Backs the analysis-report / strategy clamp so the model
+        cannot emit "Annexure N" where N exceeds the real upload count.
+        Falls back to 0 when the workspace has no cached assessments yet
+        (e.g. cold reconnect with no documents).
+        """
+        if not workspace_id:
+            return 0
+        cached = self._workspace_document_assessments_payload.get(workspace_id)
+        if not isinstance(cached, dict):
+            return 0
+        inner = cached.get("payload") or {}
+        assessments = inner.get("documentAssessments")
+        if isinstance(assessments, list):
+            return len(assessments)
+        return 0
+
     def _normalize_analysis_report_lists(
-        self, report: Optional[Dict[str, Any]]
+        self,
+        report: Optional[Dict[str, Any]],
+        max_annexure: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Defense-in-depth sanitizer: ensures the user-facing list fields of an
@@ -7903,6 +10253,12 @@ Return ONLY this JSON, no commentary:
         would render in the FE as Python dict literals like
         ``"{'point': '...', 'laws': [...]}"``. Strengths are intentionally
         left untouched because they are a typed `List[Dict{point, laws}]`.
+
+        When ``max_annexure`` is provided, also clamps any "Annexure N"
+        reference in the user-facing fields down to the highest valid index,
+        so the model cannot emit "Annexure 2 / 3 / N" when fewer documents
+        are actually uploaded. ``relevantJurisdiction`` is exempt — the
+        prompt enforces a forum-only format there.
 
         Mutates the dict in place and returns it for convenience. Returns
         the input unchanged when it is not a dict.
@@ -7939,6 +10295,37 @@ Return ONLY this JSON, no commentary:
                 point = s.get("point")
                 if isinstance(point, str) and point.strip():
                     s["point"] = _strip_enum_prefix(point.strip())
+
+        if max_annexure is not None:
+            for key in (
+                "missingInfo",
+                "missing_info",
+                "weaknesses",
+                "risks",
+                "pendingActions",
+                "nextSteps",
+                "suggestedDrafts",
+            ):
+                values = report.get(key)
+                if isinstance(values, list):
+                    report[key] = [
+                        _clamp_annexure_references(v, max_annexure) for v in values
+                    ]
+            for scalar_key in (
+                "qualityScoreExplanation",
+                "reportQualityScoreExplanation",
+            ):
+                if scalar_key in report:
+                    report[scalar_key] = _clamp_annexure_references(
+                        report.get(scalar_key), max_annexure
+                    )
+            if isinstance(strengths, list):
+                for s in strengths:
+                    if not isinstance(s, dict):
+                        continue
+                    point = s.get("point")
+                    if isinstance(point, str) and point:
+                        s["point"] = _clamp_annexure_references(point, max_annexure)
         return report
 
     def _record_rejected_analysis_item(
@@ -8917,7 +11304,9 @@ Output ONLY valid JSON, no markdown, no code block:
             return
 
         report = copy.deepcopy(current)
-        self._normalize_analysis_report_lists(report)
+        self._normalize_analysis_report_lists(
+            report, max_annexure=self._get_annexure_count(workspace_id)
+        )
         old_score = int(
             report.get("caseResolutionScore")
             or report.get("case_resolution_score")
@@ -9345,7 +11734,9 @@ Output ONLY valid JSON, no markdown, no code block:
         report = copy.deepcopy(current)
         # Self-heal any dict-shaped list entries that may already be sitting
         # in the cached report from before the dict→string coercion fix.
-        self._normalize_analysis_report_lists(report)
+        self._normalize_analysis_report_lists(
+            report, max_annexure=self._get_annexure_count(workspace_id)
+        )
         old_score = int(
             report.get("caseResolutionScore")
             or report.get("case_resolution_score")
@@ -9975,7 +12366,9 @@ Indian Kanoon / search results (titles and snippets):
             logger.warning("analysis_docx_generate_request: invalid payload: {}", e)
             normalized_request = payload_in
 
-        response_body = process_analysis_docx_request(normalized_request)
+        response_body = await asyncio.to_thread(
+            process_analysis_docx_request, normalized_request
+        )
         try:
             preview = json.dumps(response_body, default=str)
         except Exception:
@@ -9989,6 +12382,317 @@ Indian Kanoon / search results (titles and snippets):
             "✅ analysis_docx_generate_response emitted for requestId={}",
             response_body.get("requestId"),
         )
+
+    async def on_template_sync(self, data: Dict[str, Any]) -> None:
+        """
+        Handle template_sync event (Server → AI_Maverick).
+
+        Payload:
+        {
+            action: "uploaded" | "renamed" | "deleted",
+            userId: str,
+            templates: [ {id, name, previousName?, category, extension,
+                          mimeType?, size?, fileHash?, fileUrl?, path?} ],
+            timestamp: str (ISO)
+        }
+
+        For "uploaded" the AI downloads each template, extracts its text via
+        `file_handlers.process_file_by_extension`, and stores the result in a
+        lawyer-scoped Qdrant cache keyed by (userId, template_id). "renamed"
+        only patches cached metadata (content unchanged) — keyed on
+        template_id, so no stale name-keyed entry is left behind. "deleted"
+        removes the cache entry (supports bulk: multiple templates per event).
+        """
+        payload_in = data if isinstance(data, dict) else {}
+        # Log the RAW inbound event exactly as the backend pushed it
+        # (top-level keys + action + template count) before validation,
+        # so a malformed/unexpected payload is still visible in the logs.
+        logger.info(
+            "📥 template_sync RECEIVED: action={} userId={} templates={} keys={}",
+            (payload_in or {}).get("action"),
+            str((payload_in or {}).get("userId") or "")[:12],
+            len((payload_in or {}).get("templates") or [])
+            if isinstance((payload_in or {}).get("templates"), list)
+            else "(not a list)",
+            list((payload_in or {}).keys()),
+        )
+        try:
+            payload = TemplateSyncPayload(**payload_in)
+        except Exception as e:
+            logger.warning(
+                "template_sync: invalid payload (action={}, keys={}): {}",
+                (payload_in or {}).get("action"),
+                list((payload_in or {}).keys()),
+                e,
+            )
+            return
+
+        action = (payload.action or "").strip().lower()
+        user_id = (payload.userId or "").strip()
+        if not user_id:
+            logger.warning("template_sync: missing userId — dropping event")
+            return
+
+        templates = list(payload.templates or [])
+        logger.info(
+            "📚 template_sync action={} user={} count={}",
+            action,
+            user_id[:12],
+            len(templates),
+        )
+        # Per-item log so it's clear exactly what the backend pushed.
+        # Signed-URL query strings (credentials) are stripped — only the
+        # GCS object path is shown so each file is identifiable.
+        for idx, tpl in enumerate(templates):
+            raw_url = tpl.fileUrl or ""
+            url_path = raw_url.split("?", 1)[0] if raw_url else ""
+            logger.info(
+                "   📄 [{}] id={} name={!r} category={} ext={} "
+                "hasFileUrl={} fileHash={} path={}",
+                idx,
+                tpl.id,
+                tpl.name,
+                tpl.category,
+                tpl.extension,
+                bool(raw_url),
+                tpl.fileHash,
+                tpl.path or url_path or "(none)",
+            )
+
+        # Full field-by-field dump of the raw inbound payload for end-to-end
+        # verification. Signed-URL credentials are stripped from every
+        # template's fileUrl (only the GCS object path is kept) so no
+        # credentials ever land in the logs.
+        try:
+            sanitized = dict(payload_in)
+            raw_templates = payload_in.get("templates")
+            if isinstance(raw_templates, list):
+                redacted = []
+                for tpl_raw in raw_templates:
+                    if isinstance(tpl_raw, dict):
+                        tpl_copy = dict(tpl_raw)
+                        fu = tpl_copy.get("fileUrl")
+                        if isinstance(fu, str) and fu:
+                            tpl_copy["fileUrl"] = fu.split("?", 1)[0]
+                        redacted.append(tpl_copy)
+                    else:
+                        redacted.append(tpl_raw)
+                sanitized["templates"] = redacted
+            logger.info(
+                "📋 template_sync RAW payload (credentials stripped):\n{}",
+                json.dumps(sanitized, indent=2, ensure_ascii=False, default=str),
+            )
+        except Exception as e:
+            logger.warning("template_sync: could not dump raw payload: {}", e)
+
+        try:
+            from app.langgraph.drafting_agent import drafting_agent
+        except Exception as e:
+            logger.error("template_sync: drafting agent unavailable: {}", e)
+            return
+
+        if action == "uploaded":
+            await self._ingest_template_items(user_id, templates)
+            # A newly-ingested template may match suggestions that were built
+            # before it was ready — regenerate the panel if the library grew.
+            await self._maybe_reemit_drafting_on_templates(user_id)
+        elif action == "renamed":
+            for tpl in templates:
+                if not tpl.id or not tpl.name:
+                    continue
+                await drafting_agent.rename_template(
+                    user_id=user_id,
+                    template_id=tpl.id,
+                    new_name=tpl.name,
+                    previous_name=tpl.previousName,
+                )
+        elif action == "deleted":
+            for tpl in templates:
+                if not tpl.id:
+                    continue
+                await drafting_agent.delete_template(
+                    user_id=user_id, template_id=tpl.id
+                )
+        else:
+            logger.warning("template_sync: unknown action {!r}", action)
+
+    async def _ingest_template_items(
+        self, user_id: str, templates: List[Any]
+    ) -> int:
+        """Download + extract + cache each template into the in-memory store.
+
+        Shared by the ``template_sync`` ``uploaded`` action and the
+        ``template_sync_response`` snapshot. Returns the count ingested.
+        Per-item failures are isolated and non-fatal. Re-uses any existing
+        cached payload so an unchanged file hash skips re-extraction.
+        """
+        try:
+            from app.langgraph.drafting_agent import drafting_agent
+        except Exception as e:
+            logger.error("_ingest_template_items: drafting agent unavailable: {}", e)
+            return 0
+
+        ingested = 0
+        for tpl in templates:
+            if not tpl.id or not tpl.fileUrl:
+                logger.warning(
+                    "template ingest: skipping item with missing id/fileUrl ({!r})",
+                    tpl.id,
+                )
+                continue
+            try:
+                previous = await drafting_agent.get_template(
+                    user_id=user_id, template_id=tpl.id
+                )
+            except Exception:
+                previous = None
+            try:
+                await drafting_agent.ingest_template(
+                    user_id=user_id,
+                    template_id=tpl.id,
+                    name=tpl.name or tpl.id,
+                    category=tpl.category or "Document Draft",
+                    extension=tpl.extension or "",
+                    mime_type=tpl.mimeType,
+                    file_url=tpl.fileUrl,
+                    path=tpl.path,
+                    file_hash=tpl.fileHash,
+                    previous_payload=previous if isinstance(previous, dict) else None,
+                )
+                ingested += 1
+            except Exception as e:
+                logger.warning(
+                    "template ingest failed (template={}): {}", tpl.id, e
+                )
+        return ingested
+
+    async def on_template_sync_response(self, data: Dict[str, Any]) -> None:
+        """Handle template_sync_response (Server → AI), the reply to our
+        ``request_template_sync``. Ingests the full snapshot into the
+        in-memory store and resolves the awaiting Future (by requestId)."""
+        payload_in = data if isinstance(data, dict) else {}
+        logger.info(
+            "📥 template_sync_response RECEIVED: userId={} requestId={} count={} keys={}",
+            str((payload_in or {}).get("userId") or "")[:12],
+            (payload_in or {}).get("requestId"),
+            (payload_in or {}).get("count"),
+            list((payload_in or {}).keys()),
+        )
+        try:
+            payload = TemplateSyncResponsePayload(**payload_in)
+        except Exception as e:
+            logger.warning(
+                "template_sync_response: invalid payload (keys={}): {}",
+                list((payload_in or {}).keys()),
+                e,
+            )
+            return
+
+        user_id = (payload.userId or "").strip()
+        request_id = payload.requestId
+        templates = list(payload.templates or [])
+
+        # Full sanitized dump (signed-URL credentials stripped) for verification.
+        try:
+            sanitized = dict(payload_in)
+            raw_templates = payload_in.get("templates")
+            if isinstance(raw_templates, list):
+                redacted = []
+                for tpl_raw in raw_templates:
+                    if isinstance(tpl_raw, dict):
+                        tpl_copy = dict(tpl_raw)
+                        fu = tpl_copy.get("fileUrl")
+                        if isinstance(fu, str) and fu:
+                            tpl_copy["fileUrl"] = fu.split("?", 1)[0]
+                        redacted.append(tpl_copy)
+                    else:
+                        redacted.append(tpl_raw)
+                sanitized["templates"] = redacted
+            logger.info(
+                "📋 template_sync_response RAW payload (credentials stripped):\n{}",
+                json.dumps(sanitized, indent=2, ensure_ascii=False, default=str),
+            )
+        except Exception as e:
+            logger.warning("template_sync_response: could not dump raw payload: {}", e)
+
+        if not user_id:
+            logger.warning("template_sync_response: missing userId — dropping event")
+        else:
+            ingested = await self._ingest_template_items(user_id, templates)
+            logger.success(
+                "📚 template_sync_response ingested {}/{} template(s) for user={}",
+                ingested,
+                len(templates),
+                user_id[:12],
+            )
+
+        # Resolve the awaiting future so the suggestion/kickoff path can proceed.
+        fut = self._pending_template_sync.get(request_id) if request_id else None
+        if fut is not None and not fut.done():
+            fut.set_result(True)
+
+        # If this snapshot arrived late (after the ensure_templates_synced
+        # timeout) and grew the library, regenerate any drafting panels that
+        # were built against the smaller/empty library.
+        if user_id:
+            await self._maybe_reemit_drafting_on_templates(user_id)
+
+    async def ensure_templates_synced(
+        self, user_id: str, *, timeout: float = 30.0
+    ) -> None:
+        """Make sure the in-memory template store is warm for ``user_id``.
+
+        If the store already has templates for the user (delta events keep it
+        fresh within a session), this is a no-op. Otherwise it emits
+        ``request_template_sync`` and awaits the ``template_sync_response``
+        snapshot (resolved in :meth:`on_template_sync_response`) up to
+        ``timeout`` seconds, so a cold cache (e.g. right after an AI restart)
+        is filled before template matching runs. Times out gracefully —
+        callers proceed with whatever is in the store.
+        """
+        if not user_id or not self._socket_client:
+            return
+        try:
+            from app.langgraph.template_store import template_store
+
+            if await template_store.count_for_user(user_id=user_id) > 0:
+                return  # already warm this session
+        except Exception:
+            pass
+
+        request_id = f"tmpl-{(user_id or '')[:8]}-{uuid.uuid4().hex[:12]}"
+        loop = asyncio.get_event_loop()
+        fut: "asyncio.Future" = loop.create_future()
+        self._pending_template_sync[request_id] = fut
+        try:
+            await self._socket_client.emit(
+                "request_template_sync",
+                {"userId": user_id, "requestId": request_id},
+            )
+            logger.info(
+                "📨 request_template_sync emitted (user={}, requestId={})",
+                user_id[:12],
+                request_id,
+            )
+            await asyncio.wait_for(fut, timeout=timeout)
+            logger.info(
+                "✅ template snapshot received for user={} (requestId={})",
+                user_id[:12],
+                request_id,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "request_template_sync timed out after {}s (user={}) — "
+                "proceeding with current store",
+                timeout,
+                user_id[:12],
+            )
+        except Exception as e:
+            logger.warning(
+                "request_template_sync failed (user={}): {}", user_id[:12], e
+            )
+        finally:
+            self._pending_template_sync.pop(request_id, None)
 
     def _normalize_case_title(self, title: str) -> str:
         """
@@ -11144,6 +13848,21 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 )
                 logger.success(
                     "✅ Procedural timeline re-emitted to backend after reconnect"
+                )
+            # 8) Drafting Assistant — proactive suggestions panel
+            drafting_payload = self._workspace_drafting_payload.get(workspace_id)
+            if drafting_payload is not None:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "drafting_assistant",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": drafting_payload,
+                    },
+                )
+                logger.success(
+                    "✅ Drafting suggestions re-emitted to backend after reconnect"
                 )
         except Exception as e:
             logger.warning("Failed to re-emit after reconnect: {}", e)
@@ -12974,6 +15693,227 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
             logger.exception(e)
             raise
 
+    async def _handle_drafting_assistant_message(
+        self,
+        *,
+        payload: UserMessageRequestPayload,
+        workspace_id: str,
+        user_id: str,
+        chat_id: str,
+    ) -> None:
+        """Drive one turn of the Drafting Assistant conversation.
+
+        Builds a lightweight case-context dict from already-cached panels,
+        invokes the drafting agent, and emits an augmented `ai_response`
+        with `draftStatus`, `openQuestions`, and (when ready) `draftDocument`.
+        """
+        actionable_id = (payload.actionableId or "").strip()
+        if not actionable_id:
+            # Without an actionableId we cannot keep session state coherent.
+            # Generate a stable fallback so the conversation can still run
+            # within the same chat.
+            actionable_id = f"user_draft_chat_{chat_id}"
+
+        # Resolve role from workspace context (same logic as the main chat
+        # path, but minimised because drafting is role-aware not gated).
+        role = "ADJUDICATOR"
+        try:
+            from app.workspace.manager import workspace_manager
+
+            ctx = workspace_manager.get_workspace(workspace_id)
+            if ctx and getattr(ctx, "workspace_role", None):
+                role = (ctx.workspace_role or "ADJUDICATOR").upper()
+        except Exception:
+            pass
+        cached_role = await self._restore_workspace_role(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+        if cached_role:
+            role = cached_role
+
+        # Compose case context for the drafting agent.
+        brief = self._build_case_brief_for_drafting(workspace_id)
+        case_context = {
+            "role": role,
+            "workspace_id": workspace_id,
+            "user_id": user_id,
+            "case_summary": brief.get("case_summary") or "",
+            "case_facts_brief": "\n".join(
+                line for line in [
+                    brief.get("analysis_brief") or "",
+                    brief.get("list_of_dates_brief") or "",
+                ] if line
+            ),
+            "applicable_laws_brief": brief.get("applicable_laws_brief") or "",
+            "strategy_brief": brief.get("strategy_brief") or "",
+        }
+
+        conversation_history: List[Dict[str, Any]] = []
+        for item in payload.conversation_history or []:
+            role_str = getattr(item, "role", None) or (
+                item.get("role") if isinstance(item, dict) else None
+            )
+            content_str = getattr(item, "content", None) or (
+                item.get("content") if isinstance(item, dict) else None
+            )
+            if role_str and content_str is not None:
+                conversation_history.append(
+                    {"role": str(role_str).upper(), "content": str(content_str)}
+                )
+
+        request_fields = {
+            "actionableId": actionable_id,
+            "userId": user_id,
+            "workspaceId": workspace_id,
+            "chatId": chat_id,
+            "source": (payload.source or "").strip() or None,
+            "suggestedDraftId": payload.suggestedDraftId,
+            "suggestionTitle": payload.suggestionTitle,
+            "suggestionDescription": payload.suggestionDescription,
+            "templateId": payload.templateId,
+            "templateUrl": payload.templateUrl,
+            "templateOriginalName": payload.templateOriginalName,
+            "templateMimeType": payload.templateMimeType,
+        }
+
+        # When the turn may need to resolve/match a template (a suggested-draft
+        # or explicit template kickoff), make sure the in-memory store is warm
+        # first — no-op if already populated this session.
+        _src = (payload.source or "").strip().lower()
+        if _src in ("suggesteddraft", "template") or payload.templateId:
+            await self.ensure_templates_synced(user_id)
+
+        try:
+            from app.langgraph.drafting_agent import drafting_agent
+
+            turn = await drafting_agent.handle_turn(
+                user_message=payload.content or "",
+                case_context=case_context,
+                request_fields=request_fields,
+                conversation_history=conversation_history,
+            )
+        except Exception as e:
+            logger.error("Drafting agent failed: {}", e)
+            logger.exception(e)
+            turn = {
+                "content": (
+                    "I ran into an issue while preparing the draft. "
+                    "Please retry, or share any additional details that may help."
+                ),
+                "draftStatus": "gathering_info",
+                "openQuestions": [],
+                "draftDocument": None,
+            }
+
+        # Emit the augmented ai_response.
+        if not self._socket_client:
+            logger.error("Socket client unavailable; cannot emit drafting ai_response")
+            return
+
+        ai_response_payload: Dict[str, Any] = {
+            "chatId": chat_id,
+            "workspaceId": workspace_id,
+            "userId": user_id,
+            "chat_type": "DRAFTING_ASSISTANT",
+            "actionableId": actionable_id,
+            "content": (turn.get("content") or "").strip(),
+            "isDraft": bool(turn.get("isDraft")),
+            "draftStatus": turn.get("draftStatus"),
+            "openQuestions": turn.get("openQuestions") or [],
+            "draftDocument": turn.get("draftDocument"),
+            "metadata": {
+                "messageId": chat_id,
+                "aiModel": settings.gemini_model,
+            },
+        }
+        if ai_response_payload["draftDocument"] is None:
+            ai_response_payload.pop("draftDocument", None)
+
+        # Generate drafting-specific chips so the bottom strip in the
+        # Drafting Assistant panel shows draft-actionable prompts ("Adjust
+        # the Prayer", "Strengthen Grounds", …) instead of the stale
+        # intelligence-chat chips that were leaking through before this fix.
+        try:
+            import random as _random
+
+            chips = await self._generate_drafting_chips(
+                workspace_id=workspace_id,
+                actionable_id=actionable_id,
+                draft_status=turn.get("draftStatus") or "",
+                draft_title=(turn.get("draftDocument") or {}).get("title")
+                or (turn.get("draftDocument") or {}).get("draftTitle")
+                or "",
+                open_questions=turn.get("openQuestions") or [],
+                last_assistant_message=ai_response_payload["content"],
+                last_draft_markdown=(turn.get("draftDocument") or {}).get("content")
+                or "",
+            )
+            if chips:
+                # Cache under both keys so on_probing_prompts_request can find
+                # them whether BE polls with actionableId or not.
+                if actionable_id:
+                    self._workspace_drafting_suggestion_chips[actionable_id] = list(chips)
+                if workspace_id:
+                    self._workspace_drafting_suggestion_chips[workspace_id] = list(chips)
+                ai_response_payload["suggestionChips"] = _random.sample(
+                    chips, min(4, len(chips))
+                )
+        except Exception as chip_err:
+            logger.warning("Drafting chips emit failed (non-fatal): {}", chip_err)
+        # Cache the assistant text so a short "yes" follow-up resolves correctly.
+        if ai_response_payload["content"]:
+            self._intelligence_last_ai_by_chat[chat_id] = ai_response_payload[
+                "content"
+            ]
+        # _pending_ai_response represents an emit that did NOT make it to BE
+        # and must be retried on the next reconnect. If we buffer the payload
+        # unconditionally (the old behaviour) every disconnect/reconnect cycle
+        # re-emits the last delivered message, producing duplicate drafts in
+        # the chat. Detect a confirmed delivery via (no exception thrown) +
+        # (socket still connected after the await) — the second guard catches
+        # the silent-skip path where emit_ai_response waited for reconnect and
+        # then returned without raising.
+        emit_succeeded = False
+        try:
+            await self._socket_client.emit_ai_response(ai_response_payload)
+            emit_succeeded = bool(
+                getattr(self._socket_client, "is_connected", True)
+            )
+        except Exception as e:
+            logger.error("Failed to emit drafting ai_response: {}", e)
+
+        if emit_succeeded:
+            # Drop any stale pending payload from a previous failed emit so
+            # reconnect doesn't re-emit it after we just delivered fresh content.
+            self._pending_ai_response = None
+            logger.success(
+                "✅ Drafting ai_response emitted (status={}, version={})",
+                ai_response_payload.get("draftStatus"),
+                (turn.get("draftDocument") or {}).get("version"),
+            )
+        else:
+            # Emit raised or socket was silently disconnected — keep the
+            # payload buffered so on_connected can retry once we reconnect.
+            self._pending_ai_response = ai_response_payload
+            logger.warning(
+                "Drafting ai_response not confirmed delivered — will retry on reconnect"
+            )
+
+        audit_logger.log_event(
+            "user_drafting_message_processed",
+            {
+                "workspace_id": workspace_id,
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "actionable_id": actionable_id,
+                "draft_status": turn.get("draftStatus"),
+                "open_questions": len(turn.get("openQuestions") or []),
+                "draft_ready": bool(turn.get("draftDocument")),
+            },
+        )
+
     async def on_user_message_request(self, data: Dict[str, Any]) -> None:
         """
         Handle user_message_request event (Server → AI_Maverick).
@@ -13026,6 +15966,21 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
             # No-op if the cache is already warm or workspace_id is missing.
             if workspace_id and workspace_id != "unknown":
                 await self._hydrate_workspace_caches(workspace_id, user_id=user_id)
+
+            # Drafting Assistant short-circuit: when chat_type is
+            # DRAFTING_ASSISTANT we hand the turn to the drafting agent
+            # instead of running it through the general intelligence chat.
+            # The drafting agent owns its own session state keyed by
+            # `actionableId` and emits the augmented `ai_response` payload
+            # (draftStatus / openQuestions / draftDocument).
+            if (payload.chat_type or "").strip().upper() == "DRAFTING_ASSISTANT":
+                await self._handle_drafting_assistant_message(
+                    payload=payload,
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                )
+                return
 
             role_context = {
                 "role": "ADJUDICATOR",
@@ -13188,7 +16143,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                             )
                             payload_dict = ai_response.dict(by_alias=True)
                             await self._socket_client.emit_ai_response(payload_dict)
-                            self._pending_ai_response = payload_dict
+                            # Do NOT populate _pending_ai_response here — the
+                            # role-confirmation ack does not need reconnect
+                            # retry, and leaving a stale buffer here caused
+                            # this acknowledgement to be re-emitted on the
+                            # next disconnect cycle (duplicate-message bug).
                             self._intelligence_last_ai_by_chat[chat_id] = (
                                 ai_response.content
                             )
@@ -13324,6 +16283,9 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
             objective_regen_ok = False
             objective_ack_kind: Optional[str] = None
             implicit_objective_shift_text: Optional[str] = None
+            # Defined here so the ack-builder below can read it even if the
+            # try-block raises before the pre-dispatcher initialises it.
+            panel_edit_applied: List[str] = []
             try:
                 combined_text_for_updates = payload.content or ""
                 # Include attachment text if present (so updates can be pasted into a file)
@@ -13336,10 +16298,211 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                             )
 
                 um_early = (payload.content or "").strip()
+
+                # -------------------------------------------------------------
+                # Pre-dispatcher: free-form panel-edit detector for ANY chat_type.
+                # Fires for messages like "remove the 3rd line from case summary",
+                # "add a step about WhatsApp chats to possible next steps",
+                # "change the date in strategic objective", etc.
+                # Cheap keyword precheck avoids the LLM classifier call on every
+                # message; only when the message contains at least one edit verb
+                # AND one panel-name token do we ask the classifier.
+                # -------------------------------------------------------------
+                panel_edit_applied: List[str] = []
+                _edit_verbs = (
+                    "remove", "delete", "drop", "change", "replace", "edit",
+                    "modify", "rewrite", "rephrase", "add", "append", "insert",
+                    "expand", "shorten", "fix", "correct", "update",
+                )
+                _panel_words = (
+                    "case summary", "report summary", "objective", "strategy",
+                    "next step", "action item", " step", " steps", "summary",
+                )
+                _um_lower = um_early.lower()
+                _maybe_edit = (
+                    bool(um_early)
+                    and any(v in _um_lower for v in _edit_verbs)
+                    and any(w in _um_lower for w in _panel_words)
+                )
+                cur_strat_for_edit = (
+                    self._workspace_strategy_payload.get(workspace_id) or {}
+                )
+                if (
+                    _maybe_edit
+                    and isinstance(cur_strat_for_edit, dict)
+                    and (cur_strat_for_edit.get("caseSummary") or "").strip()
+                ):
+                    try:
+                        classification = await self._llm_classify_panel_edit_intent(
+                            um_early,
+                            current_strategy=cur_strat_for_edit,
+                        )
+                    except Exception as cls_err:
+                        logger.warning(
+                            "Panel-edit classification failed (non-fatal): {}", cls_err
+                        )
+                        classification = {}
+
+                    if classification and not classification.get("isQuestionLike"):
+                        # Emit a single workspace:refresh up-front so the FE
+                        # shows the loading state across all four strategy
+                        # fields plus the cascaded panels (analysis_report,
+                        # list_of_dates, applicable_laws) that will refresh
+                        # after the strategy regen completes. We always
+                        # emit BEFORE the first regen call so the FE loader
+                        # is visible while Gemini works, and we always use
+                        # the FE-recognised reason `objective_change_regeneration_started`
+                        # so the loading panel actually appears in the UI.
+                        _any_should_edit = any(
+                            (classification.get(k) or {}).get("shouldEdit") is True
+                            for k in (
+                                "caseSummary",
+                                "reportCaseSummary",
+                                "strategicObjective",
+                                "possibleNextSteps",
+                            )
+                        )
+                        if _any_should_edit:
+                            try:
+                                await self._emit_workspace_refresh(
+                                    workspace_id=workspace_id,
+                                    user_id=user_id,
+                                    reason="objective_change_regeneration_started",
+                                    feature_types=[
+                                        "strategy_objective",
+                                        "analysis_report",
+                                        "list_of_dates",
+                                        "applicable_laws",
+                                    ],
+                                )
+                            except Exception as rf_err:
+                                logger.warning(
+                                    "workspace:refresh emit (panel edit) failed (non-fatal): {}",
+                                    rf_err,
+                                )
+
+                        so_slot = classification.get("strategicObjective") or {}
+                        if so_slot.get("shouldEdit") and so_slot.get("instruction"):
+                            # Surgical edit: preserve everything except what
+                            # the user named. The legacy
+                            # _regenerate_strategy_objective_preserving_case_summary
+                            # is intentionally NOT used here — its prompt is
+                            # biased toward a full rewrite (labels current
+                            # objective "to replace", caps output at 5-6
+                            # sentences, forbids repetition) which causes
+                            # surgical removes to collapse unrelated content.
+                            ok = await self._regenerate_strategic_objective_with_feedback(
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                workspace_role=(
+                                    role_context.get("role") or "ADJUDICATOR"
+                                ),
+                                user_feedback=so_slot["instruction"],
+                                current_strategy=cur_strat_for_edit,
+                            )
+                            if ok:
+                                panel_edit_applied.append("strategic objective")
+                                cur_strat_for_edit = (
+                                    self._workspace_strategy_payload.get(workspace_id)
+                                    or cur_strat_for_edit
+                                )
+                            else:
+                                logger.warning(
+                                    "Strategic objective edit returned False — instruction={!r}",
+                                    (so_slot.get("instruction") or "")[:200],
+                                )
+
+                        cs_slot = classification.get("caseSummary") or {}
+                        rcs_slot = classification.get("reportCaseSummary") or {}
+                        if cs_slot.get("shouldEdit") or rcs_slot.get("shouldEdit"):
+                            _combined_instr = " ".join(
+                                x
+                                for x in [
+                                    cs_slot.get("instruction"),
+                                    rcs_slot.get("instruction"),
+                                ]
+                                if x
+                            ).strip()
+                            # Defensive: require at least one non-empty per-panel
+                            # instruction. The classifier's _slot rejects empty
+                            # instructions, so this should always be non-empty
+                            # when we enter this branch — but guard anyway so
+                            # we never pass the full multi-panel user message
+                            # to the case-summary regen by accident.
+                            if _combined_instr:
+                                ok = await self._regenerate_case_summary_with_feedback(
+                                    workspace_id=workspace_id,
+                                    user_id=user_id,
+                                    workspace_role=(
+                                        role_context.get("role") or "ADJUDICATOR"
+                                    ),
+                                    user_feedback=_combined_instr,
+                                    current_strategy=cur_strat_for_edit,
+                                )
+                                if ok:
+                                    panel_edit_applied.append("case summary")
+                                    cur_strat_for_edit = (
+                                        self._workspace_strategy_payload.get(workspace_id)
+                                        or cur_strat_for_edit
+                                    )
+                                else:
+                                    logger.warning(
+                                        "Case summary edit returned False — instruction={!r}",
+                                        _combined_instr[:200],
+                                    )
+
+                        ns_slot = classification.get("possibleNextSteps") or {}
+                        if ns_slot.get("shouldEdit") and ns_slot.get("instruction"):
+                            ok = await self._regenerate_next_steps_with_feedback(
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                workspace_role=(
+                                    role_context.get("role") or "ADJUDICATOR"
+                                ),
+                                user_feedback=ns_slot["instruction"],
+                                current_strategy=cur_strat_for_edit,
+                            )
+                            if ok:
+                                panel_edit_applied.append("possible next steps")
+                            else:
+                                logger.warning(
+                                    "Possible next steps edit returned False — instruction={!r}",
+                                    (ns_slot.get("instruction") or "")[:200],
+                                )
+
+                        if panel_edit_applied:
+                            # Reuse the existing skip-chat-agent gate. The ack
+                            # block below has a dedicated branch for
+                            # objective_ack_kind == "panel_edit_direct".
+                            objective_regen_ok = True
+                            objective_ack_kind = "panel_edit_direct"
+                            logger.success(
+                                "✅ Panel edits applied from free-form chat: {} (workspace={})",
+                                panel_edit_applied,
+                                workspace_id[:12] if workspace_id else "",
+                            )
+                            # Cascade: trigger the existing analysis-report /
+                            # list-of-dates / applicable-laws reanalysis so
+                            # downstream panels reflect the edited strategy.
+                            # Matches the behaviour the user already expects
+                            # from the explicit objective-change flow.
+                            try:
+                                self._schedule_objective_change_reanalysis(
+                                    workspace_id=workspace_id,
+                                    user_id=user_id,
+                                    log_context=" (from chat panel edit)",
+                                )
+                            except Exception as cascade_err:
+                                logger.warning(
+                                    "Cascade reanalysis schedule failed (non-fatal): {}",
+                                    cascade_err,
+                                )
+
                 # User said yes after we asked whether to update the objective (informal discussion flow)
                 if (
                     chat_type_upper == "STRATEGY_OBJECTIVE"
                     and is_user_affirmation_to_continue(um_early)
+                    and not panel_edit_applied
                 ):
                     last_ai_for_offer = _last_ai_message_from_history(
                         chat_history_resolved
@@ -13520,7 +16683,12 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     "Skipping intelligence chat LLM (strategy objective regen emitted)"
                 )
                 ack_parts: List[str] = []
-                if objective_ack_kind == "followup_clarify":
+                if objective_ack_kind == "panel_edit_direct" and panel_edit_applied:
+                    # Free-form panel edit. Short, factual ack — the panel
+                    # itself was already emitted via document_feature_response.
+                    _fields_human = ", ".join(panel_edit_applied)
+                    ack_parts.append(f"Updated: {_fields_human}.")
+                elif objective_ack_kind == "followup_clarify":
                     ack_parts.append(
                         "I could not infer a clear new strategic objective from our discussion. "
                         "Please briefly state the priority you want (for example venue, relief, or focus), "
@@ -13770,14 +16938,31 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 ),
             )
 
-            # STEP 6: Emit ai_response back to server; cache for re-emit if socket disconnects right after
+            # STEP 6: Emit ai_response back to server. _pending_ai_response is
+            # the buffer that on_connected re-emits after a reconnect — we
+            # populate it ONLY when the emit was not confirmed delivered, so a
+            # successful emit does not get duplicated on the next disconnect
+            # cycle. See _handle_drafting_assistant_message for the same fix.
             if self._socket_client:
                 payload_dict = ai_response.dict(by_alias=True)
                 if payload_dict.get("suggestionChips") is None:
                     payload_dict.pop("suggestionChips", None)
-                self._pending_ai_response = payload_dict
-                await self._socket_client.emit_ai_response(payload_dict)
-                logger.success("✅ AI response sent successfully")
+                emit_succeeded = False
+                try:
+                    await self._socket_client.emit_ai_response(payload_dict)
+                    emit_succeeded = bool(
+                        getattr(self._socket_client, "is_connected", True)
+                    )
+                except Exception as emit_err:
+                    logger.error("Failed to emit ai_response: {}", emit_err)
+                if emit_succeeded:
+                    self._pending_ai_response = None
+                    logger.success("✅ AI response sent successfully")
+                else:
+                    self._pending_ai_response = payload_dict
+                    logger.warning(
+                        "ai_response not confirmed delivered — will retry on reconnect"
+                    )
                 await self._remember_workspace_role(
                     workspace_id,
                     user_id,
@@ -13989,6 +17174,185 @@ Return ONLY a JSON array, no other text. Example with 10+ items: ["Draft a settl
             logger.warning("Contextual suggestion chips generation failed: {}", str(e))
             # Still return 10–12 fallback chips so rotation works
             return self._fallback_chips_for_role(role, 12)
+
+    async def _generate_drafting_chips(
+        self,
+        *,
+        workspace_id: str,
+        actionable_id: str,
+        draft_status: str,
+        draft_title: str,
+        open_questions: List[Dict[str, Any]],
+        last_assistant_message: str,
+        last_draft_markdown: str,
+    ) -> List[str]:
+        """
+        Drafting-specific suggestion chips for the chip strip at the bottom
+        of the Drafting Assistant panel. Branches on `draft_status`:
+
+          - "gathering_info"  → chips that help fill the open slots.
+          - "ready"           → chips that suggest specific edits / additions
+                                to the just-delivered draft.
+          - "revising"        → similar to ready, plus version-comparison.
+
+        Each chip is 2–6 words and is meant to be sent verbatim as the
+        lawyer's next message — clicking "Strengthen Grounds" sends the
+        text "Strengthen Grounds" back as a follow-up turn. Indian-law
+        framing only; no IPC.
+        """
+        import json
+
+        status = (draft_status or "").strip().lower()
+        title = (draft_title or "New Draft").strip()
+        msg_preview = (last_assistant_message or "")[:600]
+        draft_preview = (last_draft_markdown or "")[:1200]
+        open_q_text = "\n".join(
+            f"- {q.get('label')}" for q in (open_questions or []) if q.get("label")
+        )[:600]
+
+        # Mode-specific guidance for the model.
+        if status == "gathering_info":
+            mode_block = (
+                "MODE: gathering_info — open slots remain. Each chip should "
+                "either (a) volunteer one of the missing pieces verbatim "
+                "(short imperative phrasing), or (b) push the draft forward "
+                "(\"Generate Final Draft\", \"Use Defaults and Proceed\")."
+            )
+        elif status == "revising":
+            mode_block = (
+                "MODE: revising — a draft was just regenerated. Suggest "
+                "specific further edits the lawyer might apply to this draft, "
+                "plus one comparison option (\"Show Previous Version\")."
+            )
+        else:
+            mode_block = (
+                "MODE: ready — a full draft was just delivered. Suggest "
+                "specific, actionable edits to that draft: strengthen / add "
+                "specific clauses or grounds, tighten / shorten sections, "
+                "add citations applicable to this case, adjust the prayer."
+            )
+
+        prompt = f"""You are suggesting follow-up chips for the Drafting Assistant chat panel of an Indian legal workspace. The lawyer is mid-draft.
+
+DRAFT TITLE: {title}
+DRAFT STATUS: {status or "ready"}
+
+OPEN QUESTIONS STILL ON FILE (if any):
+{open_q_text or "(none — all answered)"}
+
+LAST ASSISTANT MESSAGE (the most recent chat turn shown to the lawyer):
+\"\"\"
+{msg_preview}
+\"\"\"
+
+DRAFT BODY PREVIEW (if a draft has been delivered):
+\"\"\"
+{draft_preview or "(no draft yet)"}
+\"\"\"
+
+{mode_block}
+
+CONSTRAINTS:
+- Each chip MUST be 2–6 words.
+- Use Indian-advocate phrasing (\"Adjust the Prayer\", \"Add Section 50 Ground\", \"Tighten the Facts\", \"Cite Arnesh Kumar\", \"Mention Tihar Detention\", \"Add Verification Clause\").
+- Reference real case anchors when visible in the draft body (e.g. quantity numbers, dates, party names, statute citations).
+- No IPC / CrPC / Indian Evidence Act references. Use BNS / BNSS / BSA where citations are needed.
+- No full sentences. No trailing punctuation.
+- Each chip stands alone — if the lawyer clicks it, the text is sent as their next message and the drafting agent should be able to act on it as a revision instruction (or as a slot answer when in gathering_info).
+
+OUTPUT FORMAT — strict JSON array of 8 to 12 chip strings, no commentary, no markdown fences:
+["Strengthen the Grounds", "Adjust the Prayer", "Add Section 50 Ground", ...]
+"""
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            gemini_client.initialize()
+            raw = await gemini_client.generate(
+                prompt,
+                temperature=0.4,
+                max_tokens=1200,
+                response_mime_type="application/json",
+            )
+        except Exception as e:
+            logger.warning("Drafting chips generation failed: {}", e)
+            return self._fallback_drafting_chips(8)
+
+        if not raw or "Error" in (raw[:80] or ""):
+            return self._fallback_drafting_chips(8)
+        try:
+            text = raw.strip()
+            start = text.find("[")
+            if start < 0:
+                return self._fallback_drafting_chips(8)
+            depth = 0
+            end = -1
+            for i in range(start, len(text)):
+                if text[i] == "[":
+                    depth += 1
+                elif text[i] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            if end <= start:
+                return self._fallback_drafting_chips(8)
+            arr = json.loads(text[start:end])
+        except Exception:
+            return self._fallback_drafting_chips(8)
+        if not isinstance(arr, list):
+            return self._fallback_drafting_chips(8)
+
+        chips: List[str] = []
+        seen: set = set()
+        for item in arr:
+            s = str(item or "").strip().strip('"').strip("'").rstrip(".!?,;:")
+            if not s or len(s) > 60:
+                continue
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            chips.append(s)
+            if len(chips) >= 12:
+                break
+
+        # Pad with fallback chips if the model gave us fewer than 8.
+        if len(chips) < 8:
+            for pad in self._fallback_drafting_chips(8):
+                if pad.lower() in seen:
+                    continue
+                chips.append(pad)
+                seen.add(pad.lower())
+                if len(chips) >= 8:
+                    break
+
+        logger.info(
+            "Drafting chips: generated {} for workspace={} actionable={} status={}",
+            len(chips),
+            (workspace_id or "")[:12],
+            (actionable_id or "")[:24],
+            status,
+        )
+        return chips
+
+    def _fallback_drafting_chips(self, needed: int = 8) -> List[str]:
+        """Return generic drafting-relevant chips when no draft turn has run yet.
+
+        Used when BE polls probing_prompts_request with chatType=DRAFTING_ASSISTANT
+        before any drafting LLM turn has produced contextual chips. Indian-law
+        framing only; no IPC.
+        """
+        generic = [
+            "Adjust the Prayer",
+            "Strengthen the Grounds",
+            "Add a Section 50 Ground",
+            "Tighten the Facts",
+            "Add Verification Clause",
+            "Cite Arnesh Kumar",
+            "Provide Missing Details",
+            "Generate Final Draft",
+        ]
+        return list(generic)[:needed]
 
     def _fallback_chips_for_analysis_report(self, needed: int = 16) -> List[str]:
         """Return generic analysis-report prompt chips when AI generation fails or report is empty."""
@@ -14243,6 +17607,38 @@ Return ONLY a JSON array of 15-16 strings, no other text."""
                     "probing_prompts: ANALYSIS_REPORT, returning random {} from {} chips",
                     len(prompts),
                     len(chips),
+                )
+            elif chat_type == "DRAFTING_ASSISTANT":
+                # Drafting panel: serve from the drafting-specific chip cache
+                # (populated by _handle_drafting_assistant_message after every
+                # drafting turn). Prefer per-session chips when BE supplies
+                # actionableId; fall back to workspace-keyed chips; then
+                # static drafting fallback. This isolates the drafting strip
+                # from the intelligence-chat chip cache so the lawyer never
+                # sees stale Strategy / Analysis chips here.
+                actionable_id_for_chips = (
+                    (data.get("actionableId") or data.get("actionable_id") or "").strip()
+                )
+                chips = (
+                    self._workspace_drafting_suggestion_chips.get(actionable_id_for_chips)
+                    or self._workspace_drafting_suggestion_chips.get(workspace_id)
+                    or []
+                )
+                source = (
+                    "actionable" if (actionable_id_for_chips and chips)
+                    else "workspace" if chips
+                    else "fallback"
+                )
+                if not chips:
+                    chips = self._fallback_drafting_chips(8)
+                count = min(max_prompts, len(chips))
+                prompts = random.sample(chips, count) if count > 0 else []
+                logger.info(
+                    "probing_prompts: DRAFTING_ASSISTANT, returning random {} from {} chips (source={}, actionableId={})",
+                    len(prompts),
+                    len(chips),
+                    source,
+                    actionable_id_for_chips[:24] if actionable_id_for_chips else "(none)",
                 )
             else:
                 # STRATEGY_OBJECTIVE or other: contextual chips, then strategy chips

@@ -46,6 +46,10 @@ class CacheKinds:
     # does not silently re-introduce items the user already dismissed.
     # Shape: {"missingInfo": [str, ...], "riskOrWeakness": [str, ...]}
     REJECTED_ANALYSIS_ITEMS = "rejected_analysis_items"
+    # Drafting Assistant — proactive suggested drafts panel (one entry per
+    # workspace, regenerated on workspace_created / workspace_sync, re-emitted
+    # on reconnect like analysis_report).
+    DRAFTING_SUGGESTIONS = "drafting_suggestions"
 
 
 # All workspace-scoped cache kinds we routinely read on hydrate.
@@ -60,6 +64,7 @@ WORKSPACE_HYDRATION_KINDS = (
     CacheKinds.DOCUMENT_ASSESSMENTS,
     CacheKinds.STRATEGY_PAYLOAD,
     CacheKinds.REJECTED_ANALYSIS_ITEMS,
+    CacheKinds.DRAFTING_SUGGESTIONS,
 )
 
 

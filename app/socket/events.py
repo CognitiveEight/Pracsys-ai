@@ -80,6 +80,73 @@ OBJECTIVE_UPDATE_OFFER_QUESTION = (
     "that you have defined?"
 )
 
+# ---------------------------------------------------------------------------
+# Intelligence-chat document retrieval (hybrid: semantic search + stable
+# annexure numbering). Tuned for gemini-2.5-flash's 1M-token window — a missed
+# document (hallucination) costs far more than extra context tokens.
+# ---------------------------------------------------------------------------
+CHAT_SMALL_WORKSPACE_DOC_THRESHOLD = 15  # at/below this, include every doc
+CHAT_SEARCH_CHUNK_LIMIT = 40  # chunks fetched before dedup-to-document
+CHAT_MAX_DOCS_INCLUDED = 12  # distinct docs included in large workspaces
+CHAT_MAX_CHARS_PER_DOC = 40000  # ~10K tokens/doc
+CHAT_MAX_TOTAL_CHARS = 400000  # ~100K tokens of annexure context
+CHAT_MIN_SCORE_THRESHOLD = 0.30  # soft signal only (fallback trigger), never a hard drop
+
+# Explicit annexure references in a user message, e.g. "Annexure 3", "annexure-12",
+# "Annexure IV". Group 1 is an arabic integer or a roman numeral.
+_ANNEXURE_REF_RE = re.compile(
+    r"annexure[\s\-_]*([0-9]{1,3}|[ivxlcdm]+)\b",
+    re.I,
+)
+
+_ROMAN_VALUES = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
+
+# Injected into every prompt that generates / regenerates case-summary,
+# report-case-summary, or strategic-objective prose. Audio-transcript annexures
+# label speakers with diarization placeholders ("Caller", "Receiver",
+# "Speaker A", "Speaker B"); those are NOT party names and must never surface
+# in the generated narrative — the "name parties exactly as written" rule does
+# NOT extend to them. See app/processing/audio_transcription.py speaker labels.
+SPEAKER_LABEL_GUARDRAIL = (
+    "SPEAKER / DIARIZATION LABELS (CRITICAL — applies to caseSummary, "
+    "reportCaseSummary, strategicObjective, possibleNextSteps, and "
+    "suggestionChips): Audio-recording annexures are transcribed with "
+    "speaker placeholders such as \"Caller\", \"Receiver\", \"Speaker A\", "
+    "\"Speaker B\" (and timestamps like [MM:SS]). These are diarization "
+    "placeholders, NOT the names of the parties — the rule to name parties "
+    "exactly as written does NOT apply to them. NEVER write the words "
+    "\"Caller\", \"Receiver\", \"Speaker A\", or \"Speaker B\" in your output. "
+    "Instead, identify who each speaker actually is from the surrounding facts "
+    "and refer to them by their real name or factual designation (e.g. the "
+    "complainant, the accused, the recipient of the call, the advocate). If a "
+    "speaker's real identity cannot be determined from the documents, use a "
+    "neutral factual descriptor — never the placeholder label itself."
+)
+
+
+def _roman_or_int(token: str) -> Optional[int]:
+    """Parse an arabic integer or roman numeral to int; None if unparseable."""
+    token = (token or "").strip().lower()
+    if not token:
+        return None
+    if token.isdigit():
+        try:
+            return int(token)
+        except ValueError:
+            return None
+    if not all(ch in _ROMAN_VALUES for ch in token):
+        return None
+    total = 0
+    prev = 0
+    for ch in reversed(token):
+        val = _ROMAN_VALUES[ch]
+        if val < prev:
+            total -= val
+        else:
+            total += val
+            prev = val
+    return total if total > 0 else None
+
 
 def _derive_report_case_summary(case_summary: str) -> str:
     """Best-effort neutral summary when the model omits reportCaseSummary."""
@@ -1767,6 +1834,8 @@ TRUNCATED-TEXT AND PERIPHERAL-ENTITY RULES (CRITICAL — applies to caseSummary,
 
 5. If after filtering you have NO concrete case facts left in a section, state that limitation explicitly per the INSUFFICIENT DATA rule below — do NOT fill the gap with peripheral biller / vendor / payee listings.
 
+{SPEAKER_LABEL_GUARDRAIL}
+
 YOUR ROLE: {workspace_role}
 
 TASK:
@@ -2802,6 +2871,7 @@ Rules:
 - The new strategicObjective and possibleNextSteps MUST reflect the new user instruction and MUST NOT just repeat the current objective/steps.
 - BNS/BNSS/BSA naming (not IPC/CrPC/IEA where replaced).
 - No invented facts; if the instruction conflicts with documents, note the tension in strategicObjective.
+- {SPEAKER_LABEL_GUARDRAIL}
 - JSON only; complete strings and arrays."""
 
             custom_suffix = build_custom_instruction_suffix(workspace_id)
@@ -3011,6 +3081,8 @@ EDIT-INSTRUCTION RULES (CRITICAL — override all preservation rules below when 
 4. If the user's instruction asks for something impossible (e.g. add a new dated fact not in the documents), ignore that invention and apply only the parts of the instruction that are removals / rephrases / valid edits.
 
 TRUNCATED-TEXT RULE: Never reproduce a token, name, or phrase that ends in "..." or "…" — those are UI-truncation noise from screenshots, not real entity names. Drop them silently.
+
+{SPEAKER_LABEL_GUARDRAIL}
 
 Return JSON ONLY with these two keys:
 {{
@@ -3329,6 +3401,8 @@ EDIT-INSTRUCTION RULES (CRITICAL — override every other instinct):
 5. If the user asks for something impossible (e.g. inventing a fact not in the documents), ignore that invention and apply only the valid removal / rephrase parts.
 
 TRUNCATED-TEXT RULE: Never reproduce a token, name, or phrase that ends in "..." or "…" — those are UI-truncation noise, not real entity names. Drop them silently.
+
+{SPEAKER_LABEL_GUARDRAIL}
 
 Return JSON ONLY with ONE key:
 {{
@@ -3926,6 +4000,7 @@ USER MESSAGE
         user_message: str,
         *,
         current_strategy: Optional[Dict[str, Any]] = None,
+        default_panel: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         LLM-based classifier that decides whether the user's chat message is a
@@ -3969,6 +4044,29 @@ USER MESSAGE
             if not has_strategy:
                 # No cached strategy means there's nothing to edit yet.
                 return empty
+
+            # When the chat is already scoped to a specific panel (e.g. the
+            # Strategy & Objective panel), an edit instruction that names no
+            # panel ("change the wordings", "add a few words") should default
+            # to that panel rather than being dropped as ambiguous (rule 8).
+            _PANEL_LABELS = {
+                "strategicObjective": "STRATEGIC OBJECTIVE (strategicObjective)",
+                "caseSummary": "CASE SUMMARY (caseSummary)",
+                "reportCaseSummary": "REPORT CASE SUMMARY (reportCaseSummary)",
+                "possibleNextSteps": "POSSIBLE NEXT STEPS (possibleNextSteps)",
+            }
+            scoped_panel_rule = ""
+            if default_panel in _PANEL_LABELS:
+                scoped_panel_rule = (
+                    "\n11) SCOPED PANEL DEFAULT (CRITICAL — OVERRIDES RULE 8): "
+                    f"This chat is scoped to the {_PANEL_LABELS[default_panel]} panel. "
+                    "If the message contains an edit verb but names NO panel "
+                    '(e.g. "change the wordings", "add a few words", "make it shorter", '
+                    '"rephrase it"), attribute the edit to '
+                    f"{default_panel}.shouldEdit=true with the user's full edit text as the "
+                    "instruction. Rule 8 still applies when the user explicitly names a "
+                    "DIFFERENT panel. Genuine questions still classify as isQuestionLike=true.\n"
+                )
 
             prompt = f"""You are a STRICT intent classifier for a legal-strategy workspace chat.
 
@@ -4043,7 +4141,7 @@ DECISION RULES:
 
 10) FACT DISCUSSION WITHOUT EDIT VERB: if the message is only discussing facts
     ("I think the date was actually 16/05/2026") with NO imperative edit verb, set all four shouldEdit=false.
-
+{scoped_panel_rule}
 Return JSON only — no markdown, no commentary."""
 
             raw = await gemini_client.generate(
@@ -9486,9 +9584,26 @@ Return ONLY this JSON, no commentary:
             )
         except (TypeError, ValueError):
             prev_score_int = None
+        max_allowed = self._analysis_report_max_allowed_score(report=merged)
         if prev_score_int is not None:
-            max_allowed = self._analysis_report_max_allowed_score(report=merged)
             merged["caseResolutionScore"] = min(max(0, prev_score_int), max_allowed)
+        # Guard: when the prior score was missing/None (preservation above
+        # skipped) and the fresh analysis came back 0, a fully-resolved report
+        # (no pending items, has strengths) must not display 0 — reflect the
+        # full allowed score instead.
+        try:
+            _cur_score = int(merged.get("caseResolutionScore") or 0)
+        except (TypeError, ValueError):
+            _cur_score = 0
+        if _cur_score <= 0 and max_allowed >= 100 and merged.get("strengths"):
+            logger.warning(
+                "Analysis sync merge: score 0 with no pending items for "
+                "workspace {}{}; setting to {}",
+                workspace_id,
+                ctx,
+                max_allowed,
+            )
+            merged["caseResolutionScore"] = max_allowed
         prev_report_score = prev_analysis.get("reportQualityScore")
         if prev_report_score is not None:
             try:
@@ -11428,6 +11543,21 @@ Output ONLY valid JSON, no markdown, no code block:
         new_score = min(100, old_score + total_delta)
         max_allowed = self._analysis_report_max_allowed_score(report=report)
         new_score = min(new_score, max_allowed)
+        # Guard: clearing every pending item must not collapse the score to 0.
+        # This happens when the cached report carried a missing / None /
+        # non-numeric caseResolutionScore, so old_score read as 0 and the bump
+        # stayed ~0. A report with no pending items is fully resolved, so
+        # reflect the full allowed score instead of showing 0.
+        # (max_allowed == 100 ⟺ no missingInfo / weaknesses / risks remain.)
+        if new_score <= 0 and max_allowed >= 100:
+            logger.warning(
+                "analysis_report_feedback batch: score read as 0 with no pending "
+                "items for workspace {} (likely missing cached caseResolutionScore); "
+                "setting to {}",
+                workspace_id,
+                max_allowed,
+            )
+            new_score = max_allowed
         report["caseResolutionScore"] = new_score
 
         # Regenerate the explanation once for the final state.
@@ -12167,6 +12297,12 @@ Indian Kanoon / search results (titles and snippets):
         relevance: str,
     ) -> Dict[str, Any]:
         """Build law object for applicable-law relevance responses (omit empty optionals)."""
+        # User-facing label: the UI renders relevance as "<value> Relevance", so
+        # the internal "not relevant" value reads as "not relevant Relevance".
+        # Emit "No" instead so it displays as "No Relevance". Internal logic and
+        # comparisons continue to use the "not relevant" canonical value.
+        if str(relevance).strip().lower() == "not relevant":
+            relevance = "No"
         out: Dict[str, Any] = {
             "act": act,
             "section": section,
@@ -16183,41 +16319,152 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         disp = (getattr(ef, "filename", None) or "").strip()
                         if disp:
                             id_to_annexure_name[str(fid)] = disp
-                # Larger excerpts so invoice amounts and key clauses are less often truncated
-                max_chars_per_doc = 4500
-                max_total_chars = 12000
+                # Build a stable annexure-number index from the FULL upload
+                # order (oldest first). Annexure N always means the Nth uploaded
+                # document, regardless of which subset we end up including.
+                doc_by_id: Dict[str, Dict[str, Any]] = {}
+                for n, doc in enumerate(all_docs or [], 1):
+                    did = doc.get("document_id")
+                    if did is None:
+                        continue
+                    doc_by_id[str(did)] = {
+                        "content": (doc.get("content") or "").strip(),
+                        "annexure_number": n,
+                    }
+                total_docs = len(all_docs or [])
+
+                # Retrieval query: the user's message, widened with the previous
+                # user turn for short/vague follow-ups ("what about the second one?").
+                retrieval_query = (payload.content or "").strip()
+                try:
+                    prior_user = [
+                        (it.content or "")
+                        for it in (payload.conversation_history or [])
+                        if str(getattr(it, "role", "") or "").upper() == "USER"
+                        and getattr(it, "content", None)
+                    ]
+                    if len(retrieval_query) < 25 and prior_user:
+                        retrieval_query = (prior_user[-1] + " " + retrieval_query).strip()
+                except Exception:
+                    pass
+
+                # Force-include any annexure the user references explicitly, by
+                # number/roman numeral or by filename — even if it scores low.
+                forced_ids: Set[str] = set()
+                um_lower = (payload.content or "").lower()
+                for m in _ANNEXURE_REF_RE.finditer(payload.content or ""):
+                    num = _roman_or_int(m.group(1))
+                    if num is None:
+                        continue
+                    for did, info in doc_by_id.items():
+                        if info["annexure_number"] == num:
+                            forced_ids.add(did)
+                for did, name in id_to_annexure_name.items():
+                    if name and name.lower() in um_lower and did in doc_by_id:
+                        forced_ids.add(did)
+
+                # Select which documents to include.
+                selected_ids: List[str] = []
+                if total_docs <= CHAT_SMALL_WORKSPACE_DOC_THRESHOLD:
+                    # Small workspace: include everything (no retrieval-miss risk).
+                    selected_ids = [
+                        str(d.get("document_id"))
+                        for d in (all_docs or [])
+                        if d.get("document_id") is not None
+                    ]
+                else:
+                    # Large workspace: semantic search as a document selector.
+                    results: List[Dict[str, Any]] = []
+                    try:
+                        results = await vector_store.search(
+                            workspace_id=workspace_id,
+                            query=retrieval_query or (payload.content or ""),
+                            limit=CHAT_SEARCH_CHUNK_LIMIT,
+                        )
+                    except Exception as se:
+                        logger.warning(
+                            "Chat retrieval search failed for workspace {}, "
+                            "falling back to upload order: {}",
+                            workspace_id,
+                            str(se),
+                        )
+                        results = []
+
+                    seen: Set[str] = set()
+                    for r in results:
+                        orig = str(r.get("original_document_id") or "")
+                        if not orig or orig not in doc_by_id or orig in seen:
+                            continue
+                        seen.add(orig)
+                        selected_ids.append(orig)
+                        if len(selected_ids) >= CHAT_MAX_DOCS_INCLUDED:
+                            break
+
+                # Merge forced docs (explicit references) into the selection.
+                for did in forced_ids:
+                    if did not in selected_ids:
+                        selected_ids.append(did)
+
+                # Fallback: never send empty annexure context. Degrade to the
+                # first N docs by upload order (old behaviour) rather than nothing.
+                if not selected_ids:
+                    logger.warning(
+                        "Chat retrieval produced no documents for workspace {} "
+                        "(docs={}); falling back to first {} by upload order",
+                        workspace_id,
+                        total_docs,
+                        CHAT_MAX_DOCS_INCLUDED,
+                    )
+                    selected_ids = [
+                        str(d.get("document_id"))
+                        for d in (all_docs or [])[:CHAT_MAX_DOCS_INCLUDED]
+                        if d.get("document_id") is not None
+                    ]
+
+                # Assemble: ascending annexure order, full combined content per
+                # doc (chunks have no overlap, so a figure can straddle a boundary),
+                # truncated to the per-doc and total budgets.
+                selected_ids = sorted(
+                    dict.fromkeys(selected_ids),
+                    key=lambda d: doc_by_id.get(d, {}).get("annexure_number", 1_000_000),
+                )
                 total = 0
                 doc_snippets = []
-                for doc in (all_docs or [])[:20]:
-                    content = (doc.get("content") or "").strip()
-                    if not content:
+                for did in selected_ids:
+                    info = doc_by_id.get(did)
+                    if not info or not info["content"]:
                         continue
-                    snippet = content[:max_chars_per_doc] + (
-                        "..." if len(content) > max_chars_per_doc else ""
+                    content = info["content"]
+                    snippet = content[:CHAT_MAX_CHARS_PER_DOC] + (
+                        "..." if len(content) > CHAT_MAX_CHARS_PER_DOC else ""
                     )
-                    if total + len(snippet) > max_total_chars:
-                        snippet = snippet[: max_total_chars - total]
-                        entry = {
-                            "document_id": doc.get("document_id"),
-                            "content": snippet,
-                        }
-                        did = doc.get("document_id")
-                        if did is not None:
-                            ann_name = id_to_annexure_name.get(str(did))
-                            if ann_name:
-                                entry["fileName"] = ann_name
-                        doc_snippets.append(entry)
-                        break
-                    entry = {"document_id": doc.get("document_id"), "content": snippet}
-                    did = doc.get("document_id")
-                    if did is not None:
-                        ann_name = id_to_annexure_name.get(str(did))
-                        if ann_name:
-                            entry["fileName"] = ann_name
+                    if total + len(snippet) > CHAT_MAX_TOTAL_CHARS:
+                        snippet = snippet[: max(0, CHAT_MAX_TOTAL_CHARS - total)]
+                        if not snippet:
+                            break
+                    entry = {
+                        "document_id": did,
+                        "content": snippet,
+                        "annexure_number": info["annexure_number"],
+                    }
+                    ann_name = id_to_annexure_name.get(str(did))
+                    if ann_name:
+                        entry["fileName"] = ann_name
                     doc_snippets.append(entry)
                     total += len(snippet)
+                    if total >= CHAT_MAX_TOTAL_CHARS:
+                        break
                 if doc_snippets:
                     workspace_state["uploaded_documents"] = doc_snippets
+                logger.info(
+                    "Chat doc context: workspace={} total_docs={} mode={} "
+                    "included={} chars={}",
+                    workspace_id,
+                    total_docs,
+                    "small" if total_docs <= CHAT_SMALL_WORKSPACE_DOC_THRESHOLD else "retrieval",
+                    len(doc_snippets),
+                    total,
+                )
             except Exception as doc_err:
                 logger.warning(
                     "Could not load documents for chat context: {}", str(doc_err)
@@ -16317,12 +16564,22 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 _panel_words = (
                     "case summary", "report summary", "objective", "strategy",
                     "next step", "action item", " step", " steps", "summary",
+                    "wording", "wordings", "phrasing", "language",
                 )
                 _um_lower = um_early.lower()
                 _maybe_edit = (
                     bool(um_early)
                     and any(v in _um_lower for v in _edit_verbs)
-                    and any(w in _um_lower for w in _panel_words)
+                    and (
+                        any(w in _um_lower for w in _panel_words)
+                        # When the chat is explicitly scoped to the Strategy &
+                        # Objective panel, the panel is implied — an edit verb
+                        # alone (e.g. "change the wordings", "add a few words")
+                        # is enough to ask the classifier. Without this, such
+                        # messages skip the surgical panel-edit path and fall
+                        # through to the full-rewrite regenerator.
+                        or chat_type_upper == "STRATEGY_OBJECTIVE"
+                    )
                 )
                 cur_strat_for_edit = (
                     self._workspace_strategy_payload.get(workspace_id) or {}
@@ -16336,6 +16593,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         classification = await self._llm_classify_panel_edit_intent(
                             um_early,
                             current_strategy=cur_strat_for_edit,
+                            default_panel=(
+                                "strategicObjective"
+                                if chat_type_upper == "STRATEGY_OBJECTIVE"
+                                else None
+                            ),
                         )
                     except Exception as cls_err:
                         logger.warning(

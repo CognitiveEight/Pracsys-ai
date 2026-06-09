@@ -1152,20 +1152,19 @@ DRAFT_RENDER_INSTRUCTION = (
     + "    generic phrase and stop. EXPAND each such item into a full, "
     + "    substantive statement that articulates the SPECIFIC facts of "
     + "    THIS case and their legal significance, drawn from the case "
-    + "    context. WEAK (name-injection only): 'Reputation of the "
-    + "    manufacturer, IWC, and the retailer, Ethos Limited.' STRONG "
-    + "    (expanded, case-grounded): 'The global reputation of IWC "
-    + "    Schaffhausen as a Swiss manufacturer of precision horological "
-    + "    instruments, and of Ethos Limited as an authorised luxury-watch "
-    + "    retailer, which together induced Our Client's legitimate "
-    + "    expectation of flawless quality, durability and reliable "
-    + "    after-sales service.' Each grounded qualitative item is "
-    + "    typically a full sentence (1-3 sentences where the case "
-    + "    supports it) — never a bare 4-word stub. Build the elaboration "
-    + "    only from facts in the case context plus the legal/commercial "
-    + "    significance a reasonable advocate would articulate; do NOT "
-    + "    invent new facts, figures, or representations the record does "
-    + "    not support.\n"
+    + "    context. PATTERN (document-type-agnostic; do NOT copy any wording "
+    + "    or facts — fill it from THIS matter): a bare generic head such as "
+    + "    '<reliance / representation / ground head>' must become a full "
+    + "    sentence naming the actual parties/facts of this case and WHY "
+    + "    they matter legally — i.e. take the generic head and develop it "
+    + "    into 'the <specific party / standard / obligation in this matter>, "
+    + "    which <the concrete fact from the record> and therefore <its legal "
+    + "    significance>'. Each grounded qualitative item is typically a full "
+    + "    sentence (1-3 sentences where the case supports it) — never a bare "
+    + "    4-word stub. Build the elaboration only from facts in the case "
+    + "    context plus the legal significance a reasonable advocate would "
+    + "    articulate; do NOT invent new facts, figures, or representations "
+    + "    the record does not support.\n"
     + "  • DROP generic items that do not apply to this case rather than "
     + "    carrying them as empty boilerplate. Never leave a generic "
     + "    boilerplate item un-grounded when the case context contains the "
@@ -1187,6 +1186,38 @@ DRAFT_RENDER_INSTRUCTION = (
     + "    amounts or facts — if a specific particular is genuinely absent from "
     + "    the case context, keep a concise generic phrasing or a "
     + "    <placeholder>, but do not invent figures.\n\n"
+    + "MONETARY RELIEF / QUANTIFIED DEMANDS — whenever the document claims "
+    + "money (compensation, damages, refund, recovery, reimbursement, penalty, "
+    + "interest, mesne profits, maintenance, arrears, costs, etc.), the "
+    + "operative relief / demand section MUST be QUANTIFIED — not a list of "
+    + "abstract heads. This applies to EVERY matter and document type; the "
+    + "heads, amounts, rate and dates come ENTIRELY from THIS case's record — "
+    + "the bracketed tokens below are a FORMAT illustration ONLY, never values "
+    + "to copy:\n"
+    + "  • Itemise EACH monetary head with its SPECIFIC figure, drawn from the "
+    + "    gathered facts / case record / the document's own earlier factual "
+    + "    sections — i.e. render each head as '<head as the case names it> — "
+    + "    <amount from the record>'. Do NOT state a money head with no amount "
+    + "    when the record supplies one.\n"
+    + "  • State a TOTAL of the quantified heads, and — where claimed — the "
+    + "    interest (rate + the date from which it runs), the way a real demand "
+    + "    does: '...; Total: <sum of the heads>, plus interest @ <rate from "
+    + "    the record> from <date from the record> until realisation'. Compute "
+    + "    the total from the actual heads; never assert a total you did not "
+    + "    derive.\n"
+    + "  • A non-monetary catch-all (e.g. 'any other relief this Hon'ble "
+    + "    Forum deems fit') may remain unquantified, but it is IN ADDITION to "
+    + "    the itemised heads — never a substitute for quantifying them.\n"
+    + "  • CONSISTENCY — a head's amount MUST be identical wherever it appears; "
+    + "    the descriptive section and the operative demand must not state "
+    + "    different figures for the same head. Reconcile to ONE figure per "
+    + "    head.\n"
+    + "  • If a specific amount is genuinely absent from the record (the lawyer "
+    + "    did not provide it and it cannot be derived from the facts), insert "
+    + "    a clearly-marked placeholder for THAT head (e.g. '<amount for "
+    + "    [head]>') — never invent a figure, and never silently drop the "
+    + "    amount. (Such amounts should normally have been raised as Critical / "
+    + "    Important questions at kickoff.)\n\n"
     + "LENGTH — the template's length is a FLOOR, never a ceiling. The "
     + "output is NEVER shorter than the template. Two cases:\n"
     + "  • SKELETON template (sparse / generic / placeholder-driven, e.g. a "
@@ -1427,8 +1458,11 @@ the in-line case-variable slots were filled in. Apply this same pattern
 to ANY template — even if its layout differs from generic Indian advocate
 format.
 
-FACT-GROUNDING EXAMPLE (illustrative — shows that GENERIC clauses must be
-particularised to the case, not copied verbatim):
+FACT-GROUNDING EXAMPLE (illustrative FORMAT only — the <...> tokens are
+placeholders for THIS matter's real values; NEVER copy the tokens, and NEVER
+invent figures. Applies to ANY matter / document type). Shows that generic
+boilerplate heads must be particularised AND, where money is claimed,
+quantified and totalled:
 
 INPUT TEMPLATE CLAUSE (generic boilerplate list):
 \"\"\"
@@ -1440,28 +1474,27 @@ Compensate Our Client for:
 • Any other consequential losses suffered.
 \"\"\"
 
-INPUT GATHERED FACTS (JSON):
-{{"asset": "IWC luxury watch", "purchase_price": "Rs 5,60,000",
- "legal_costs": "Rs 1,50,000", "deprivation_period": "54 days"}}
-
-EXPECTED OUTPUT (same heading, same bullet formatting — but each head is
-now grounded in the actual case; the un-supported generic head is dropped):
+EXPECTED OUTPUT (same heading and bullet layout; each head grounded in the
+case AND, being a money head, quantified from the record; a total and any
+interest stated; any head the record does not support is dropped):
 \"\"\"
 B. Compensation
 Compensate Our Client for:
-• Depreciation and loss of value of the IWC luxury watch, a high-value asset
-  purchased for Rs 5,60,000;
-• Loss of use and enjoyment of the timepiece over the 54-day deprivation
-  period;
-• Litigation expenses and legal costs quantified at Rs 1,50,000;
+• Depreciation and loss of value of the <subject asset / claim>, quantified at ₹<amount from record>;
+• Loss of use and opportunity over the <relevant period>, quantified at ₹<amount from record>;
+• Litigation expenses and legal costs quantified at ₹<amount from record>;
 • Any other consequential losses suffered.
+Total claim: ₹<sum of the quantified heads>, plus interest @ <rate from record> from <date from record> until realisation.
 \"\"\"
 
-NOTICE — the section letter "B.", its heading "Compensation", and the
-bullet layout are IDENTICAL; only the WORDS INSIDE each bullet were tailored
-to the case. A generic bullet is NOT fixed skeleton — it is a soft slot to
-ground. Never leave it as un-particularised boilerplate when the case
-supplies the specific fact.
+NOTICE — the section letter "B.", its heading "Compensation", and the bullet
+layout are IDENTICAL; only the content inside each bullet is tailored to the
+case, every money head carries its figure, and the heads are TOTALLED. A
+generic bullet is a SOFT SLOT to ground and quantify — never leave it as
+un-particularised boilerplate when the case supplies the fact, and never an
+un-quantified money head when an amount exists. Fill each <...> token from
+the record; keep a clearly-marked <placeholder> only when the value is
+genuinely missing.
 """
 
     # Document-type hint — emitted only in blank/no-template mode so the

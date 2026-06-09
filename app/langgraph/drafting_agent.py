@@ -5747,6 +5747,11 @@ OUTPUT FORMAT:
 
     # ------------------------------------------------------------------ utils
 
+    # Missing-Information Matrix priorities (engine analysis phase). Anything
+    # the model doesn't classify defaults to "Important" — askable but not a
+    # hard blocker.
+    _QUESTION_CLASSES = {"Critical", "Important", "Optional"}
+
     def _normalize_open_questions(self, raw: Any) -> List[Dict[str, str]]:
         if not isinstance(raw, list):
             return []
@@ -5764,7 +5769,14 @@ OUTPUT FORMAT:
             if qid in seen_ids or not label:
                 continue
             seen_ids.add(qid)
-            out.append({"id": qid, "label": label})
+            # Carry the Missing-Information Matrix priority through (optional,
+            # additive — frontend may ignore it). Default to "Important".
+            classification = (item.get("classification") or "").strip().title()
+            if classification not in self._QUESTION_CLASSES:
+                classification = "Important"
+            out.append(
+                {"id": qid, "label": label, "classification": classification}
+            )
         return out[:10]
 
     # Acknowledgement vocabulary used to detect "ok" / "thanks" replies after
@@ -6031,19 +6043,37 @@ OUTPUT FORMAT:
                 f"Generating the draft now."
             )
 
-        # Each label is expected to be "Title: question". When present,
-        # split on the first colon so the title can be bolded inline.
-        numbered_lines: List[str] = []
-        for i, q in enumerate(open_questions, start=1):
+        # Group by the Missing-Information Matrix priority, mirroring the
+        # layout enforced by TEMPLATE_KICKOFF_INSTRUCTION. Each label is
+        # expected to be "Title: question"; split on the first colon so the
+        # title can be bolded inline.
+        def _fmt(n: int, q: Dict[str, Any]) -> str:
             label = (q.get("label") or "").strip()
             if ":" in label:
                 title_part, question_part = label.split(":", 1)
-                numbered_lines.append(
-                    f"{i}. **{title_part.strip()}:** {question_part.strip()}"
-                )
-            else:
-                numbered_lines.append(f"{i}. {label}")
-        questions_block = "\n".join(numbered_lines)
+                return f"{n}. **{title_part.strip()}:** {question_part.strip()}"
+            return f"{n}. {label}"
+
+        group_labels = [
+            ("Critical", "**Critical (required to finalise the draft):**"),
+            ("Important", "**Important (would materially strengthen the draft):**"),
+            ("Optional", "**Optional (useful but not essential):**"),
+        ]
+        blocks: List[str] = []
+        counter = 1
+        for key, header in group_labels:
+            items = [
+                q for q in open_questions
+                if (q.get("classification") or "Important").title() == key
+            ]
+            if not items:
+                continue
+            lines = [header]
+            for q in items:
+                lines.append(_fmt(counter, q))
+                counter += 1
+            blocks.append("\n".join(lines))
+        questions_block = "\n\n".join(blocks)
 
         return (
             f"I have initiated the drafting of {draft_title} based on the "

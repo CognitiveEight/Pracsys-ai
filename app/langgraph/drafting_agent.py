@@ -304,15 +304,46 @@ class DraftingAgent:
         self, user_id: str, title: str, template_id: str
     ) -> None:
         """Record a suggestion's pre-matched templateId for later reuse on
-        click. No-op when any part is missing."""
+        click. No-op when any part is missing.
+
+        First-match-wins LOCK: once a suggestion title is bound to a
+        template, a later re-match (e.g. triggered by the lawyer uploading
+        a *different* template) must NOT silently re-point the same card to
+        the new template. We keep the original binding and only refresh its
+        LRU position so it isn't evicted. A binding is only released
+        explicitly via `_forget_prematch` (used when the locked template is
+        confirmed deleted). This is what makes a matched card "frozen" — the
+        template it advertised is the template the click will use.
+        """
         if not (user_id and title and template_id):
             return
         key = self._prematch_key(user_id, title)
         cache = self._suggestion_prematch
+        existing = cache.get(key)
+        if existing and existing != template_id:
+            # Locked to a different template already — keep the original
+            # binding, just touch it so it survives LRU eviction.
+            cache.move_to_end(key)
+            logger.debug(
+                "Prematch lock held: title={!r} stays bound to {} "
+                "(ignored re-point to {})",
+                (title or "")[:60],
+                existing,
+                template_id,
+            )
+            return
         cache[key] = template_id
         cache.move_to_end(key)
         while len(cache) > self._PREMATCH_CACHE_MAX:
             cache.popitem(last=False)
+
+    def _forget_prematch(self, user_id: str, title: str) -> None:
+        """Release a suggestion's pre-matched binding. Used when the locked
+        template is confirmed gone so the card can be re-matched cleanly.
+        No-op when nothing is bound."""
+        if not (user_id and title):
+            return
+        self._suggestion_prematch.pop(self._prematch_key(user_id, title), None)
 
     def _recall_prematch(self, user_id: str, title: str) -> Optional[str]:
         """Return the pre-matched templateId for this suggestion title, or
@@ -364,10 +395,18 @@ class DraftingAgent:
             ready, _ = await self._tm_gather(user_id=user_id, suggestion_text="")
         except Exception:
             return None
-        norm = name.strip().lower()
+        # Exact (normalised) equality only. The previous loose substring
+        # test (`norm in tname or tname in norm`) let a newer, longer-named
+        # template win by partial overlap and return the WRONG template —
+        # exactly the bug where uploading another template hijacked a card's
+        # advertised template. Normalise both sides so filename punctuation
+        # / casing differences don't block a genuine exact match.
+        norm = self._normalise_for_match(name)
+        if not norm:
+            return None
         for t in ready:
-            tname = (t.get("name") or "").strip().lower()
-            if tname and (tname == norm or norm in tname or tname in norm):
+            tname = self._normalise_for_match(t.get("name") or "")
+            if tname and tname == norm:
                 return t.get("templateId")
         return None
 
@@ -560,6 +599,102 @@ class DraftingAgent:
             return enriched
 
         return await asyncio.gather(*(_match_one(s) for s in suggestions))
+
+    async def rematch_unmatched_suggestions(
+        self,
+        *,
+        user_id: str,
+        suggestions: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Refresh an *already-emitted* suggestions panel after the lawyer's
+        template library grew, WITHOUT disturbing matched cards.
+
+        Freeze semantics (the lawyer's requested behaviour):
+          - A card with ``matchMode == "matched"`` whose ``templateId`` still
+            exists in the library is kept verbatim — the template it
+            advertised stays its template, even though a new template was
+            just uploaded.
+          - A matched card whose ``templateId`` was deleted is demoted to
+            unmatched (its stale prematch lock is released) so it can pick up
+            a current template.
+          - Only the unmatched cards are re-run through
+            ``_attach_template_matches`` against the now-larger library, so a
+            freshly-uploaded template can fill in a card that previously had
+            no match.
+
+        Order is preserved. Used by the socket re-emit path instead of a
+        full LLM regeneration, which would re-roll the cards and lose their
+        bindings. Falls back to returning the input unchanged on any error.
+        """
+        if not suggestions:
+            return suggestions
+
+        frozen_idx: Dict[int, Dict[str, Any]] = {}
+        to_match: List[Tuple[int, Dict[str, Any]]] = []
+        for idx, item in enumerate(suggestions):
+            if not isinstance(item, dict):
+                frozen_idx[idx] = item
+                continue
+            tid = (item.get("templateId") or "").strip()
+            is_matched = (item.get("matchMode") == "matched") and bool(tid)
+            if is_matched:
+                exists = await self.get_template(user_id=user_id, template_id=tid)
+                if exists and (exists.get("extracted_text") or "").strip():
+                    frozen_idx[idx] = item  # keep the advertised binding
+                    # Re-assert the lock from the payload so a click without a
+                    # forwarded templateId still recalls THIS template — even
+                    # if the in-memory lock was lost across an AI restart.
+                    self._remember_prematch(user_id, item.get("title") or "", tid)
+                    continue
+                # Locked template gone — release the lock and re-match.
+                self._forget_prematch(user_id, item.get("title") or "")
+                demoted = dict(item)
+                demoted["templateId"] = None
+                demoted["templateName"] = None
+                demoted["matchMode"] = None
+                to_match.append((idx, demoted))
+            else:
+                to_match.append((idx, item))
+
+        rematched: Dict[int, Dict[str, Any]] = {}
+        if to_match:
+            try:
+                results = await self._attach_template_matches(
+                    user_id=user_id,
+                    suggestions=[item for _, item in to_match],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "rematch_unmatched_suggestions: _attach_template_matches "
+                    "failed (non-fatal, keeping prior cards): {}",
+                    exc,
+                )
+                results = [item for _, item in to_match]
+            for (idx, _orig), enriched in zip(to_match, results):
+                rematched[idx] = enriched
+                # Lock any newly-acquired binding so the click reuses it.
+                if (
+                    isinstance(enriched, dict)
+                    and enriched.get("matchMode") == "matched"
+                    and enriched.get("templateId")
+                ):
+                    self._remember_prematch(
+                        user_id, enriched.get("title") or "", enriched["templateId"]
+                    )
+
+        merged: List[Dict[str, Any]] = []
+        for idx in range(len(suggestions)):
+            if idx in frozen_idx:
+                merged.append(frozen_idx[idx])
+            else:
+                merged.append(rematched.get(idx, suggestions[idx]))
+        logger.info(
+            "rematch_unmatched_suggestions: {} card(s) — {} frozen, {} re-matched",
+            len(suggestions),
+            len(frozen_idx),
+            len(to_match),
+        )
+        return merged
 
     # ------------------------------------------------------------------
     # 2) Template ingestion (called from template_sync handler)
@@ -2480,10 +2615,15 @@ class DraftingAgent:
                 }
 
         # Resolve template — three paths:
-        #  - explicit template pick: honour `templateId` directly.
-        #  - suggested-draft click: scan the lawyer's Template Library for a
-        #    structural match; if found, use it; otherwise fall through to
-        #    AI-generated draft (current behaviour).
+        #  - explicit template pick OR an *advertised* suggestion (the card
+        #    already carries / recalls a templateId): honour that template
+        #    STRICTLY. Never re-match it to a different one — a card that
+        #    advertised template X must draft from X, even after the lawyer
+        #    uploads another template. If X was deleted, draft from scratch
+        #    with a note rather than silently substituting a new template.
+        #  - suggested-draft click with NO advertised template (a genuinely
+        #    unmatched card): scan the lawyer's library for a match so a
+        #    freshly-uploaded template can still be picked up.
         #  - blank: no template lookup.
         template_payload: Optional[Dict[str, Any]] = None
         template_match_note: Optional[str] = None
@@ -2493,32 +2633,34 @@ class DraftingAgent:
         # they expected to be reused wasn't picked.
         no_match_prefix: Optional[str] = None
         ready_library_size = 0
-        if source == "template" or request_fields.get("templateId"):
+        advertised_template_id = (request_fields.get("templateId") or "").strip()
+        if source == "template" or advertised_template_id:
             template_payload = await self._resolve_template(
                 user_id=user_id, request_fields=request_fields
             )
-            # Safety net for pre-matched suggestion clicks: when the
-            # suggestion panel pre-matched a templateId but the lawyer
-            # deleted that template between suggest-time and click, the
-            # resolver returns None. Fall back to a fresh matcher run
-            # so the click still produces a usable kickoff instead of
-            # silently degrading to blank.
+            # Advertised template is gone (deleted / unfetchable) on a
+            # suggested-draft click: honour the lawyer's intent without a
+            # silent wrong-template swap. Release the stale lock and draft
+            # from the case file with an honest note. NO fresh re-match —
+            # re-matching here is exactly what produced a different template
+            # than the card advertised.
             if (
                 template_payload is None
                 and source == "suggestedDraft"
-                and request_fields.get("templateId")
+                and advertised_template_id
             ):
                 logger.info(
-                    "Pre-matched template {} not resolvable for user {} "
-                    "— running fresh matcher",
-                    request_fields.get("templateId"),
+                    "Advertised template {} no longer available for user {} "
+                    "— drafting from scratch (no re-match)",
+                    advertised_template_id,
                     (user_id or "")[:12],
                 )
-                template_payload, ready_library_size = await self._find_matching_template_for_suggestion(
-                    user_id=user_id,
-                    suggestion_title=suggestion_title or "",
-                    suggestion_description=suggestion_description,
-                    fallback_text=(user_message or "").strip(),
+                self._forget_prematch(user_id, suggestion_title or "")
+                no_match_prefix = (
+                    "The template this draft was matched to is no longer in "
+                    "your library, so I'm drafting from your case file "
+                    "instead. If you have a replacement template, upload it "
+                    "or open it directly from the library."
                 )
         elif source == "suggestedDraft":
             # `fallback_text` covers the case where BE has not yet shipped

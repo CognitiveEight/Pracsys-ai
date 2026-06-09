@@ -8182,26 +8182,102 @@ Indian Kanoon / case-law search results:
                 continue  # library didn't grow — nothing new to match
             role = (meta or {}).get("role") or "ADJUDICATOR"
             logger.info(
-                "🔁 Template library grew ({}→{}) — regenerating drafting "
-                "suggestions for workspace={} (user={})",
+                "🔁 Template library grew ({}→{}) — refreshing drafting "
+                "suggestions for workspace={} (user={}) — matched cards "
+                "are frozen, only unmatched cards re-match",
                 prev_count,
                 current_count,
                 workspace_id,
                 user_id[:12],
             )
             # Bump the recorded count up front so a burst of template events
-            # can't queue duplicate regenerations for the same growth.
+            # can't queue duplicate refreshes for the same growth.
             self._drafting_meta_by_workspace[workspace_id] = {
                 **(meta or {}),
                 "lib_count": current_count,
             }
             asyncio.create_task(
-                self._generate_and_emit_drafting_suggestions(
+                self._refresh_drafting_matches_on_growth(
                     workspace_id=workspace_id,
                     user_id=user_id,
                     workspace_role=role,
                 )
             )
+
+    async def _refresh_drafting_matches_on_growth(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: Optional[str] = None,
+    ) -> None:
+        """Re-emit a workspace's drafting panel after the library grew,
+        FREEZING already-matched cards.
+
+        Unlike ``_generate_and_emit_drafting_suggestions`` (which re-rolls
+        the LLM suggestions and would lose each card's advertised template),
+        this preserves the previously-emitted cards: matched cards keep their
+        template verbatim and only unmatched cards are re-matched against the
+        larger library — so a freshly-uploaded template can fill in a card
+        that had no match, but can never hijack a card that already advertised
+        a different template.
+
+        Falls back to a full regeneration when there is no prior payload to
+        refresh (cold workspace).
+        """
+        if not self._socket_client:
+            return
+        prior_payload = self._workspace_drafting_payload.get(workspace_id) or {}
+        prior_cards = prior_payload.get("suggestedDrafts") or []
+        if not prior_cards:
+            # Nothing to freeze — fall back to a full generation.
+            await self._generate_and_emit_drafting_suggestions(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+            )
+            return
+        try:
+            from app.langgraph.drafting_agent import drafting_agent
+
+            refreshed = await drafting_agent.rematch_unmatched_suggestions(
+                user_id=user_id,
+                suggestions=prior_cards,
+            )
+            payload = {"suggestedDrafts": refreshed or []}
+            self._workspace_drafting_payload[workspace_id] = payload
+
+            for idx, s in enumerate(payload["suggestedDrafts"]):
+                if not isinstance(s, dict):
+                    continue
+                logger.info(
+                    "   ✏️ [{}] title={!r} matchMode={} templateId={} "
+                    "templateName={!r}",
+                    idx,
+                    s.get("title"),
+                    s.get("matchMode"),
+                    s.get("templateId"),
+                    s.get("templateName"),
+                )
+
+            response_body = {
+                "featureType": "drafting_assistant",
+                "workspaceId": workspace_id,
+                "userId": user_id,
+                "payload": payload,
+            }
+            await self._socket_client.emit(
+                "document_feature_response",
+                response_body,
+            )
+            logger.success(
+                "✅ Drafting panel refreshed (frozen matched cards) — "
+                "{} item(s) re-emitted (workspace={})",
+                len(payload["suggestedDrafts"]),
+                workspace_id,
+            )
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.warning("Drafting suggestions refresh failed: {}", e)
 
     def _strategy_objective_fallback(
         self,

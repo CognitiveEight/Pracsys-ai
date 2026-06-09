@@ -5532,23 +5532,27 @@ OUTPUT FORMAT:
             filing_context=filing_context or None,
         )
         try:
-            # Long-form path (new google-genai SDK) with thinking_level=LOW:
-            # Gemini 3 bills thinking tokens against max_output_tokens. At
-            # HIGH/MEDIUM the reasoning pass was consuming ~60k of the 64k
-            # budget, so a 7-page template render truncated mid-sentence after
-            # only ~2-3k tokens of draft. LOW keeps reasoning cheap so almost
-            # the entire budget goes to the draft itself — the right trade-off
-            # for faithful, full-length template reproduction (fidelity matters
-            # more than deep synthesis here). generate_longform also auto-
-            # continues on MAX_TOKENS, so drafts longer than one 64k response
-            # (20+ pages) still finish. If legal reasoning quality regresses,
-            # step back to MEDIUM. Falls back to legacy generate() if SDK absent.
+            # Long-form path (new google-genai SDK) with thinking_level=MEDIUM:
+            # the render must DEVELOP sparse skeleton templates into full,
+            # multi-paragraph, professionally-argued documents (see the DEPTH /
+            # DEVELOPMENT + NARRATIVE DEVELOPMENT mandates in
+            # DRAFT_RENDER_INSTRUCTION) — that elaboration is synthesis-heavy,
+            # which LOW thinking suppressed (output stayed at terse bullet
+            # stubs). MEDIUM gives the reasoning budget needed for narrative
+            # depth and legal characterisation. Gemini 3 bills thinking tokens
+            # against max_output_tokens, so on very long ALREADY-detailed
+            # templates the reasoning pass can eat into the 64k budget — but
+            # generate_longform auto-continues on MAX_TOKENS so multi-response
+            # drafts still finish; a clean section-boundary continuation is
+            # acceptable. If long-template renders regress on truncation/cost,
+            # gate MEDIUM to skeleton templates only (keep LOW for already-
+            # detailed ones). Falls back to legacy generate() if SDK absent.
             raw = await gemini_client.generate_longform(
                 prompt,
                 system_instruction=DRAFT_RENDER_INSTRUCTION,
                 temperature=0.35,
                 max_tokens=65536,
-                thinking_level="LOW",
+                thinking_level="MEDIUM",
             )
         except Exception as e:
             logger.error("Draft render LLM call failed: {}", e)

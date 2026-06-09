@@ -644,6 +644,27 @@ only — no markdown fences, no preamble outside the JSON."""
 )
 
 
+def _format_variable_checklist(interactive_variables: Optional[list]) -> str:
+    """Render the stored interactive-variable registry as a numbered checklist
+    for the kickoff prompt. Returns '' when there are no variables."""
+    if not interactive_variables:
+        return ""
+    lines: List[str] = []
+    for i, v in enumerate(interactive_variables, start=1):
+        if not isinstance(v, dict):
+            continue
+        label = (v.get("label") or "").strip() or f"Field {i}"
+        question = (v.get("question") or "").strip()
+        kind = (v.get("kind") or "other").strip()
+        fill_from_case = bool(v.get("fill_from_case", True))
+        source = "auto-fill from case if available" if fill_from_case else "ask the lawyer (execution/drafting-time value)"
+        q_part = f" — {question}" if question else ""
+        lines.append(f"  {i}. [{kind}] {label}{q_part}  ({source})")
+    if not lines:
+        return ""
+    return "\n".join(lines)
+
+
 def build_template_kickoff_prompt(
     role: str,
     case_summary: str,
@@ -653,6 +674,10 @@ def build_template_kickoff_prompt(
     lawyer_instructions: Optional[str],
     draft_title_hint: Optional[str],
     template_match_note: Optional[str] = None,
+    interactive_variables: Optional[list] = None,
+    template_tone: Optional[str] = None,
+    filing_context: Optional[str] = None,
+    structure_outline: Optional[list] = None,
 ) -> str:
     role_upper = (role or "ADJUDICATOR").strip().upper()
     instructions_block = (
@@ -665,6 +690,34 @@ def build_template_kickoff_prompt(
         if draft_title_hint
         else ""
     )
+    # Stored "AI Drafting Blueprint" for this template (extracted once at
+    # upload). When present, the variable registry is the AUTHORITATIVE
+    # checklist of slots — far more reliable than re-scanning the body each
+    # click. Absent for templates ingested before profiling / on extraction
+    # failure: the freeform TASK step 4 below still applies.
+    checklist = _format_variable_checklist(interactive_variables)
+    blueprint_block = ""
+    if checklist or template_tone or filing_context or structure_outline:
+        parts: List[str] = ["STORED TEMPLATE BLUEPRINT (authoritative — use this)"]
+        if filing_context:
+            parts.append(f"\nFILING CONTEXT / LEGAL PERSONA: {filing_context}")
+        if template_tone:
+            parts.append(f"\nTONE / RHETORICAL STYLE: {template_tone}")
+        if structure_outline:
+            outline = " → ".join(str(s).strip() for s in structure_outline if str(s).strip())
+            if outline:
+                parts.append(f"\nSTRUCTURE OUTLINE: {outline}")
+        if checklist:
+            parts.append(
+                "\nINTERACTIVE VARIABLE REGISTRY — this is the COMPLETE set of "
+                "fill-in fields for this template. You MUST account for EVERY "
+                "one: pre-fill it from the case context when available (reflect "
+                "in `gatheredFacts`), OTHERWISE surface it as an open question. "
+                "Do not invent fields outside this registry unless the body "
+                "clearly contains a slot the registry missed:\n"
+                f"{checklist}"
+            )
+        blueprint_block = "\n".join(parts) + "\n\n"
     match_note_block = (
         f"TEMPLATE MATCH NOTE: {template_match_note}\n"
         "When acknowledging in the `message` field, briefly tell the lawyer that "
@@ -689,7 +742,7 @@ TEMPLATE FULL TEXT (this is the structural contract for the new draft):
 {template_text or "(template text unavailable)"}
 \"\"\"
 
-{title_hint}{match_note_block}{instructions_block}
+{title_hint}{match_note_block}{blueprint_block}{instructions_block}
 
 TASK:
 1. Identify the template's structural skeleton — headers, salutations
@@ -703,9 +756,14 @@ TASK:
 3. Pre-fill any case-variable slot from the case context above whenever
    possible (parties, role, statute citations applicable to this matter,
    facts that are already in the case file).
-4. List the SLOTS that still need the lawyer's input. To do this you MUST
-   scan the TEMPLATE FULL TEXT for EVERY literal placeholder / blank and
-   account for each one — do not stop at the obvious party/FIR slots.
+4. List the SLOTS that still need the lawyer's input. When a STORED TEMPLATE
+   BLUEPRINT with an INTERACTIVE VARIABLE REGISTRY is present above, that
+   registry is the AUTHORITATIVE checklist — walk EVERY variable in it and,
+   for each, either pre-fill from the case context (reflect in gatheredFacts)
+   or surface it as an open question; never drop a registry field silently.
+   When NO blueprint is present (older template), fall back to scanning the
+   TEMPLATE FULL TEXT for EVERY literal placeholder / blank and account for
+   each one — do not stop at the obvious party/FIR slots.
    Treat ALL of the following as placeholders that require a value:
      • underscore / dotted blanks: `_____`, `………`, `____ day of ____`;
      • bracketed tokens: `[...]`, `<...>`, `(to be filled)`, `XXXX`;
@@ -794,6 +852,13 @@ DRAFT_RENDER_INSTRUCTION = (
     DRAFTING_SYSTEM_INSTRUCTION
     + "\n\n"
     + "MODE: FINAL DRAFT RENDER.\n\n"
+    + "TONE OVERRIDE — when a TEMPLATE TONE is supplied in the prompt, write "
+    + "the draft in THAT register / rhetorical style; it overrides the "
+    + "generic 'persuasive but respectful' default so the reused draft reads "
+    + "like the lawyer's original document. Tone affects WORD CHOICE and "
+    + "VOICE only — never the template's fixed structure, headings, or legal "
+    + "language. When no TEMPLATE TONE is supplied, keep the default "
+    + "Indian-advocate register.\n\n"
     + "TEMPLATE OVERRIDE — read this BEFORE applying any other rule: "
     + "when a template is supplied, the template's layout supersedes "
     + "every generic Indian-advocate formatting convention you may "
@@ -989,12 +1054,30 @@ def build_draft_render_prompt(
     mode: str,
     previous_draft_markdown: Optional[str] = None,
     revision_instruction: Optional[str] = None,
+    template_tone: Optional[str] = None,
+    filing_context: Optional[str] = None,
 ) -> str:
     """Build the user prompt for final draft rendering.
 
     mode ∈ {"template", "suggestedDraft", "blank", "revision"}.
     """
     role_upper = (role or "ADJUDICATOR").strip().upper()
+
+    # Template tone WINS over the default Indian-advocate register (decision:
+    # reused drafts should read like the lawyer's original document). Filing
+    # context grounds the document's persona/purpose. Both are no-ops when
+    # absent (older templates / blank drafts).
+    tone_block = ""
+    if template_tone or filing_context:
+        tone_lines: List[str] = []
+        if template_tone:
+            tone_lines.append(
+                f"TEMPLATE TONE (authoritative — write the draft in THIS register, "
+                f"overriding the generic register): {template_tone}"
+            )
+        if filing_context:
+            tone_lines.append(f"FILING CONTEXT / LEGAL PERSONA: {filing_context}")
+        tone_block = "\n".join(tone_lines) + "\n"
 
     template_block = ""
     if template_text:
@@ -1156,7 +1239,7 @@ GATHERED FACTS FROM LAWYER (JSON):
 {gathered_facts_json or "{{}}"}
 
 DRAFT TITLE: {draft_title}
-{doc_type_block}
+{tone_block}{doc_type_block}
 {template_block}{instructions_block}{revision_block}{template_example_block}
 
 TASK:
@@ -1665,6 +1748,144 @@ CANONICAL DOCUMENT TYPES (pick ONE — copy spelling verbatim):
 
 OUTPUT — strict JSON object, no commentary, no markdown fences:
 {{"documentType": "<canonical label>", "aliases": ["<alt phrasing>", "..."], "confidence": "high|medium|low", "purpose": "<one specific sentence: what this document is for / when to use it>"}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# 4c) Template "AI Drafting Blueprint" profiler (used at ingest AND lazily on
+#     first click). Extracts, once per uploaded template, the four-part
+#     blueprint: legal persona / filing context, structure outline, tone, and
+#     the interactive-variable registry (every fill-in field). The kickoff then
+#     uses the variable registry as the AUTHORITATIVE checklist of slots to
+#     fill — auto-filling those the case supplies, asking for the rest.
+# ---------------------------------------------------------------------------
+
+# Canonical kinds for an interactive variable. Kept small and stable so the
+# kickoff can reason about which slots the case file is likely to supply.
+TEMPLATE_VARIABLE_KINDS = (
+    "party",      # a person / entity name + identifying details
+    "date",       # any date the document needs
+    "amount",     # money / quantity figures
+    "statute",    # act / section citations specific to the matter
+    "fact",       # a case fact / narrative detail
+    "relief",     # prayer / relief / demand sought
+    "execution",  # signing date, place, witness, designation, enrolment no.
+    "other",
+)
+
+
+TEMPLATE_PROFILE_INSTRUCTION = (
+    "You profile a single Indian legal-document TEMPLATE into a reusable "
+    "\"drafting blueprint\". Return strict JSON ONLY, with keys:\n"
+    "{\"tone\": \"<short phrase: the document's register / rhetorical "
+    "style>\", "
+    "\"filing_context\": \"<2-4 sentences: the legal purpose, the governing "
+    "statute, who it is addressed to / filed against, and when / where it is "
+    "served or filed>\", "
+    "\"structure_outline\": [\"<ordered section name>\", ...], "
+    "\"interactive_variables\": [{\"id\": \"<snake_case_id>\", \"label\": "
+    "\"<2-4 word field name>\", \"question\": \"<one focused question asking "
+    "for this value>\", \"kind\": \"<party|date|amount|statute|fact|relief|"
+    "execution|other>\", \"fill_from_case\": <true|false>, \"required\": "
+    "<true|false>}]}.\n"
+    "Rules:\n"
+    "1. `interactive_variables` MUST capture EVERY fill-in field needed to "
+    "   complete a real draft from this template — BOTH:\n"
+    "     (a) literal placeholders in the body: `[...]`, `<...>`, `{{...}}`, "
+    "         `(Pascal_Case)`, `____` blanks, `(to be filled)`, `XXXX`, "
+    "         `____ day of ____`; AND\n"
+    "     (b) IMPLICIT case-variable fields the template states in prose that "
+    "         change per matter: party names + addresses, dates, amounts, "
+    "         applicable statute/section numbers, FIR / cheque / invoice "
+    "         numbers, the specific relief/prayer, and the execution block "
+    "         (signing date, place, witness, signatory designation, "
+    "         enrolment no.).\n"
+    "   Do NOT skip a field just because it appears in plain sentences rather "
+    "   than as a bracketed blank. The DETERMINISTIC PLACEHOLDERS list in the "
+    "   user prompt (when present) is a floor, not a ceiling — every one of "
+    "   them MUST appear as a variable, and you add the implicit ones too.\n"
+    "2. One variable per distinct value. Merge exact duplicates (the same "
+    "   slot appearing twice) into one. Give each a stable lowercase "
+    "   snake_case `id`, a short human `label`, and a `question` that is "
+    "   answerable in one sentence.\n"
+    "3. `fill_from_case` = true when the value is normally available from a "
+    "   case file / matter context (party names, dates, FIR no., amounts, "
+    "   applicable sections, relief). Set false for values only the lawyer "
+    "   knows at drafting/execution time (signing date, place, witness names, "
+    "   advocate enrolment no.). This lets the kickoff auto-fill the true "
+    "   ones from the case and ask the lawyer only for the rest.\n"
+    "4. `required` = true for fields without which the draft is incomplete; "
+    "   false for genuinely optional embellishments.\n"
+    "5. `structure_outline` is the ordered list of the template's top-level "
+    "   sections AS WRITTEN (e.g. recipient/court heading → statement of "
+    "   facts → grounds/deficiency → relief/prayer → verification/signature). "
+    "   Keep it short (3-12 items); name sections, do not summarise content.\n"
+    "6. `tone` is a short phrase describing the register actually used in the "
+    "   template (e.g. \"Formal, assertive pre-litigation register\", "
+    "   \"Respectful, deferential court-petition register\"). Describe what "
+    "   the template DOES, not a generic ideal.\n"
+    "7. `filing_context` is concrete and specific to THIS template's purpose "
+    "   — mirror the document's own framing (e.g. \"A formal pre-litigation "
+    "   Legal Notice under the Consumer Protection Act, 2019, served on a "
+    "   manufacturer/retailer before filing a consumer complaint before a "
+    "   District/State/National Commission for defective goods and deficiency "
+    "   in service.\").\n"
+    "8. Indian-law grounding: BNS / BNSS / BSA / IT Act — never IPC, CrPC, or "
+    "   the Indian Evidence Act. A \"Section 138\" reference is a Negotiable "
+    "   Instruments Act cheque-bounce signal.\n"
+    "9. No commentary, no markdown fences — JSON object only. If the body is "
+    "   empty or unreadable, return all four keys with empty values "
+    "   (\"\"/[]).\n"
+)
+
+
+def build_template_profile_prompt(
+    *,
+    name: str,
+    document_type: str,
+    content: str,
+    deterministic_placeholders: Optional[List[str]] = None,
+) -> str:
+    """Build the user prompt for the template blueprint profiler.
+
+    `content` should be a generous slice of the template body (placeholders /
+    execution fields often live near the end, so pass a large window).
+    `deterministic_placeholders` are the literal slots already found by the
+    DOCX placeholder regex (`extract_placeholders`); they seed the variable
+    list so no literal blank is missed.
+    """
+    safe_name = (name or "").strip() or "(no name supplied)"
+    safe_type = (document_type or "").strip() or "(unclassified)"
+    safe_body = (content or "").strip() or "(no body text supplied)"
+    placeholders = [p for p in (deterministic_placeholders or []) if (p or "").strip()]
+    if placeholders:
+        placeholder_block = "\n".join(f"  - {p}" for p in placeholders[:60])
+        placeholder_section = (
+            "DETERMINISTIC PLACEHOLDERS already detected in the body "
+            "(every one of these MUST appear as a variable; add implicit "
+            "fields too):\n"
+            f"{placeholder_block}\n\n"
+        )
+    else:
+        placeholder_section = (
+            "DETERMINISTIC PLACEHOLDERS: (none detected by regex — infer ALL "
+            "fill-in fields from the body, including implicit case-variable "
+            "fields stated in prose)\n\n"
+        )
+    return f"""You are profiling an UPLOADED TEMPLATE FILE from an Indian
+lawyer's Template Library into a reusable drafting blueprint.
+
+TEMPLATE FILE NAME: {safe_name}
+DOCUMENT TYPE (already classified): {safe_type}
+
+{placeholder_section}TEMPLATE BODY (source of truth — read all of it; placeholders and
+execution fields may appear anywhere, including the end):
+\"\"\"
+{safe_body}
+\"\"\"
+
+OUTPUT — strict JSON object only, no commentary, no markdown fences:
+{{"tone": "<short phrase>", "filing_context": "<2-4 sentences>", "structure_outline": ["<section>", "..."], "interactive_variables": [{{"id": "<snake_case>", "label": "<short>", "question": "<one sentence>", "kind": "<party|date|amount|statute|fact|relief|execution|other>", "fill_from_case": true, "required": true}}]}}
 """
 
 

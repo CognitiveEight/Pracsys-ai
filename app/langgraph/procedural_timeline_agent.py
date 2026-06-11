@@ -37,6 +37,11 @@ from langgraph.graph import END, START, StateGraph
 from loguru import logger
 
 from app.langgraph.list_of_dates_agent import snap_hallucinated_year
+from app.prompts.legal_intelligence_system import (
+    APP_BRAND_EXCLUSION_DIRECTIVE,
+    ENGLISH_ONLY_OUTPUT_DIRECTIVE,
+    NAME_CAPITALISATION_DIRECTIVE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +165,7 @@ that shape the case, from the earliest legally-relevant event to the latest dead
 The procedural timeline is broader than just "court deadlines". It is the **legal journey**
 of the matter: the critical moments a lawyer would mark on a case timeline when preparing
 a brief.
-"""
+""" + "\n\n" + ENGLISH_ONLY_OUTPUT_DIRECTIVE + "\n\n" + APP_BRAND_EXCLUSION_DIRECTIVE + "\n\n" + NAME_CAPITALISATION_DIRECTIVE
 
 
 def _build_extraction_prompt(

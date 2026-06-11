@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, TypedDict
 from langgraph.graph import END, START, StateGraph
 from loguru import logger
 
+from app.prompts.legal_intelligence_system import ENGLISH_ONLY_OUTPUT_DIRECTIVE
+
 
 def snap_hallucinated_year(
     *,
@@ -296,6 +298,8 @@ class ListOfDatesTemporalAgent:
             previous_year = current_year
 
         prompt = f"""You are a legal timeline extractor. Extract only factual, case-relevant dates from the legal text below.
+
+{ENGLISH_ONLY_OUTPUT_DIRECTIVE}
 
 EXTRACTED FACTS (these entities were already pulled from this document by a focused extraction step — treat them as authoritative ground truth. When you write each date entry's "description", you MUST use these exact names, amounts, suit numbers, and identifiers verbatim. Do NOT introduce "Party No. 1" / "the plaintiff" / "the petitioner" / "the respondent" placeholders. Every actor in a description must come from this list.):
 

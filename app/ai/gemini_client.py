@@ -280,9 +280,27 @@ class GeminiClient:
         try:
             logger.debug("Generating with Gemini 2.0 Flash...")
 
+            # Raise the output budget to the model's maximum on EVERY call.
+            # gemini-3 is a thinking model and its hidden reasoning tokens are
+            # billed against max_output_tokens; with a smaller cap the thinking
+            # pass starved the visible output → finish_reason=MAX_TOKENS with
+            # truncated/empty JSON (e.g. the strategy JSON cut off before
+            # strategicObjective / possibleNextSteps; small classifiers cut off
+            # too). max_output_tokens is only a CEILING — short answers stay
+            # short and you are billed only for tokens actually generated — so
+            # setting it to the model maximum is free and guarantees the
+            # reasoning pass can never exhaust the budget before the answer is
+            # written. Callers' own max_tokens is treated as a floor, never a cap.
+            _MODEL_MAX_OUTPUT_TOKENS = 65536
+            effective_max_tokens = max(
+                int(max_tokens or 0), _MODEL_MAX_OUTPUT_TOKENS
+            )
+
             # Configure generation
             generation_config = genai.types.GenerationConfig(
-                temperature=temperature, max_output_tokens=max_tokens, **kwargs
+                temperature=temperature,
+                max_output_tokens=effective_max_tokens,
+                **kwargs,
             )
 
             # Build full prompt with system instruction
@@ -320,7 +338,7 @@ class GeminiClient:
 
                         repair_config = genai.types.GenerationConfig(
                             temperature=0.0,
-                            max_output_tokens=max_tokens,
+                            max_output_tokens=effective_max_tokens,
                             response_mime_type="application/json",
                         )
 

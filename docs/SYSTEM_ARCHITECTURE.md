@@ -162,7 +162,7 @@ context_builder → intent_classifier → explain_why → action_dispatcher → 
 2. **Search (Indian Kanoon–oriented)**:
    - **Primary:** HTTP GET to `indiankanoon.org` search HTML; parse result links/titles (`_search_indiankanoon`).
    - **Fallback:** **Google Custom Search API** with `site:indiankanoon.org` (`_search_google_cse_for_indiankanoon`) when `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` are set; otherwise skip.
-3. **Synthesis** (`_generate_applicable_laws_from_sources`): Single **Gemini** call (`application/json`) with case signals + search result titles/snippets. System instruction uses `get_structured_document_feature_system_instruction` so output stays structured (no chat gate text). Model returns JSON: `laws[]` entries with `act`, `section`, `description`, `relevance` (`High` / `Medium` / `Low`). Prompt rules: Indian law focus, **no IPC** in output (prefer BNS where relevant), concise case-tied descriptions.
+3. **Synthesis** (`_generate_applicable_laws_from_sources`): Single **Gemini** call (`application/json`) with case signals + search result titles/snippets. System instruction uses `get_structured_document_feature_system_instruction` so output stays structured (no chat gate text). Model returns JSON: `laws[]` entries with `act`, `section`, `description`, `relevance` (`High` / `Medium` / `Low`). Prompt rules: Indian law focus, **no IPC** in output (prefer BNS where relevant), concise case-tied descriptions. **Objective-steered:** an optional `objective_context` (the current strategic objective) makes the objective the **primary law-selection lens** — used on an objective change so the statute list shifts to the new objective (with `merge_with_previous=False` to replace, not union, stale laws). See **§3.6a**.
 4. **Normalize** (`_normalize_applicable_laws_payload`): Validates fields, maps relevance, **drops IPC-labelled rows**, caps list at **12** items, assigns stable `id` fields (`law_1`, …).
 5. **Heuristic fallback** (`_heuristic_applicable_laws_fallback`): If the model returns no laws, optional keyword-based stubs (e.g. IT Act, BNS, Companies Act, GST) from the evidence snippet.
 
@@ -187,13 +187,15 @@ context_builder → intent_classifier → explain_why → action_dispatcher → 
 
 **Location:** `app/langgraph/procedural_timeline_agent.py` + `app/socket/events.py` (`_generate_procedural_timeline_from_documents`, `_generate_and_emit_procedural_timeline`).
 
-**Role:** Generate a lawyer-usable **procedural journey timeline** from workspace documents, then emit and cache it as `featureType: "procedural_timeline"`.
+**Role:** Generate the **Upcoming Dates** panel from workspace documents, then emit and cache it as `featureType: "procedural_timeline"`.
+
+**Scope (court/law procedural dates ONLY).** The panel carries only genuine procedural dates that are set **by a court / tribunal / forum or by law** and control how the case proceeds — exactly five kinds: **filing deadlines, hearing dates, evidence deadlines, compliance dates, and adjourned / next dates** (emitted as type `Court Hearing` or `Deadline`). Pre-litigation notices, police complaints / FIR / GD / missing-person reports, lawyer consultations / engagements, client meetings, and reconciliation attempts are **excluded**. Classification is **LLM-driven** via the extraction + consolidation prompts (no hardcoded keyword rules), and the agent **never invents dates** — if no procedural date exists it returns an empty timeline. A generic schema guard in `_node_validate_and_merge` drops any entry whose resolved type is not `Court Hearing` / `Deadline`.
 
 **Flow:**
 
-1. Extract timeline candidates per document (date, title, type, source evidence).
+1. Extract procedural-date candidates per document (date, title, type, source evidence).
 2. Consolidate overlapping/duplicate items into one cleaned sequence.
-3. Validate and normalize event type/date quality.
+3. Validate and normalize event type/date quality (and drop non-procedural types).
 4. Emit via `document_feature_response` with payload `{ "proceduralTimeline": [...] }`.
 
 **Scheduling and caching:**
@@ -225,6 +227,36 @@ Two surfaces:
 - **Revision turn** (lawyer asks for a change after a `ready` turn): re-renders with the same skeleton, `version++`.
 
 **Session state** is persisted per `actionableId` in a `drafting_session` workspace state cache (Qdrant), so drafts survive reconnects and AI service restarts.
+
+### 3.6a Chat-Driven Panel Editing & Objective Change
+
+**Location:** `app/socket/events.py` — the `user_message_request` handler for `chat_type="STRATEGY_OBJECTIVE"`, classifiers `_llm_classify_panel_edit_intent` / `_llm_classify_objective_change_intent`, the per-panel surgical editors, and the objective-change cascade `_run_objective_change_incremental_refresh` (scheduled by `_schedule_objective_change_reanalysis`).
+
+A chat message in the Strategy & Objective panel is routed into one of three intents, decided by the LLM with a deterministic question guard (`_is_pure_informational_query`) in front so a plain question never edits a panel:
+
+1. **Informational question** → answered normally; no panel changes.
+2. **Mode 1 — surgical name / word / line edit** (`isRename` or a per-panel edit slot). A NAME change is treated as an exhaustive, workspace-wide **rename of EXISTING content** across all panels — Case Summary, Report Summary, Strategic Objective, Possible Next Steps, Analysis Report, List of Dates, Applicable Laws, Upcoming Dates — with **no regeneration** (no new/removed dates, laws, or items). The dispatch fans one rename instruction to every panel editor deterministically (not relying on per-panel LLM flags), and names are applied **semantically** (a party referenced by role/description is named correctly even where it appears as "the Petitioner"). The strategy fields emit a single coalesced `strategy_objective` payload; other panels emit their own `document_feature_response`.
+3. **Mode 2 — objective / case-perspective change** (`direct_update`). Declaring a new objective runs `_regenerate_strategy_objective_preserving_case_summary` then the cascade, which:
+   - **regenerates + REPLACES the Analysis Report** for the new objective (it does NOT merge with the prior report — a perspective change must drop the old framing and old quality score; `_merge_analysis_report_with_previous` is reserved for the document re-upload / `workspace_sync` paths);
+   - **re-scores List of Dates relevance** only (`_reeval_list_of_dates_relevance` — same entries, no new/removed dates);
+   - **regenerates Applicable Laws** with the objective as the primary law-selection lens (`_generate_and_emit_applicable_laws(objective_context=…, merge_with_previous=False)`);
+   - **regenerates Drafting suggestions** (`_generate_and_emit_drafting_suggestions`, rebuilt from the now-updated caches);
+   - **preserves** the Case Summary and Upcoming Dates.
+   An up-front `workspace:refresh` (`reason="objective_change_regeneration_started"`) shows the loader across `strategy_objective`, `analysis_report`, `list_of_dates`, `applicable_laws`, `procedural_timeline`, `drafting_assistant`.
+
+So a name correction stays surgical and consistent everywhere, while an objective change re-derives the whole downstream intelligence (objective, analysis, score, laws, drafting) for the new perspective.
+
+### 3.6b Output Guardrails & Generation Controls
+
+**Shared output directives** (`app/prompts/legal_intelligence_system.py`, injected into the structured + chat system instructions and the inline case-summary / list-of-dates prompts and the procedural-timeline instruction):
+
+- `ENGLISH_ONLY_OUTPUT_DIRECTIVE` — all output in English / Latin script; non-Latin (e.g. Devanagari) names are transliterated.
+- `APP_BRAND_EXCLUSION_DIRECTIVE` + `scrub_app_brand()` — the platform's own name ("SimplerToday") is never surfaced as a case party/fact (prompt guardrail + a deterministic recursive scrub applied to each feature payload before cache/emit; **not** applied at the Qdrant layer, which must keep the intake-PDF text intact for date parsing).
+- `NAME_CAPITALISATION_DIRECTIVE` — person names / places / addresses in normal Title Case, never ALL-CAPS (statutory acronyms such as BNS / BNSS / BSA / FIR preserved).
+
+**Gemini thinking budget.** gemini-3 is a thinking model whose hidden reasoning tokens are billed against `max_output_tokens`. `GeminiClient.generate()` runs primarily on the `google-genai` SDK with an explicit `thinking_level` (default `LOW`) so the reasoning pass stays bounded — this keeps responses fast and prevents `finish_reason=MAX_TOKENS` truncation — with a moderate output ceiling and a transparent fallback to the legacy `google-generativeai` SDK. Latency is controlled by `thinking_level`, not by inflating the token ceiling.
+
+**Display trimming.** Panel descriptions (List of Dates, Procedural Timeline, Drafting suggestions) are trimmed only at a word boundary — never via a naive sentence split, which used to cut at abbreviation periods ("Model No.", "SRF No.") and leave dangling fragments.
 
 **Outbound shape (augmented `ai_response`):**
 
@@ -336,7 +368,7 @@ Backend emits template_sync (action: uploaded|renamed|deleted, userId, templates
 | **Intelligence Chat Agent** | `app/langgraph/intelligence_chat_agent.py` — LangGraph: context_builder → intent_classifier → explain_why (Gemini) → action_dispatcher → response_formatter → governance_validator. Used for every `user_message_request`. |
 | **Document processing** | `app/processing/document_processor.py` — Batch download and text extraction; stores content in vector store (Qdrant). |
 | **Vector store** | `app/vectorstore/qdrant.py` — Stores document content by workspace; used by strategy generation and chat context. |
-| **Gemini client** | `app/ai/gemini_client.py` — Used for strategy prompt, chat “explain_why”, analysis report generation, and applicable-laws JSON synthesis (legacy `google-generativeai` `generate()`). Long-form draft render / translation use `generate_longform()` on the current **`google-genai`** SDK with `thinking_level` control + 64k output ceiling. All calls log `finish_reason` + token usage via `_log_generation_diagnostics`. Model is configurable via `GEMINI_MODEL` (e.g. `gemini-3-flash-preview`). |
+| **Gemini client** | `app/ai/gemini_client.py` — Used for strategy prompt, chat “explain_why”, analysis report generation, and applicable-laws JSON synthesis. `generate()` runs primarily on the **`google-genai`** SDK with explicit **`thinking_level`** control (default `LOW`) and a moderate output ceiling, falling back to the legacy `google-generativeai` SDK; long-form draft render / translation use `generate_longform()` (`thinking_level="HIGH"`, 64k ceiling). Bounding the thinking budget (rather than inflating `max_output_tokens`) keeps gemini-3 responses fast and avoids `MAX_TOKENS` truncation. All calls log `finish_reason` + token usage via `_log_generation_diagnostics`. Model is configurable via `GEMINI_MODEL` (e.g. `gemini-3-flash-preview`). |
 | **Applicable laws (socket)** | `app/socket/events.py` — `_generate_and_emit_applicable_laws` and helpers: vector-store signals, Indian Kanoon + optional Google CSE search, Gemini normalization, heuristic fallback; see **§3.4**. |
 | **Integration** | `app/langgraph/integration.py` — `WorkspaceRoleIntegration`: init workspace with role, sync role to workspace context, handle role change, process user message through role agent. |
 | **Chat integration** | `app/langgraph/chat_integration.py` — `process_workspace_chat()` builds `ChatContext` from workspace and calls `intelligence_chat_agent.process_message()`. |

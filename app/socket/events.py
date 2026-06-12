@@ -7329,10 +7329,17 @@ Example shape:
                 if _is_garbage_text_local(raw_title) or _is_garbage_text_local(raw_desc):
                     continue
 
-                # Trim description to a single concise sentence (hard cap 120 chars)
-                if raw_desc:
-                    first_sentence = re.split(r"(?<=[.!?])\s", raw_desc)[0]
-                    raw_desc = first_sentence[:120]
+                # Cap the description length WITHOUT splitting on sentence
+                # boundaries — the naive ". " splitter treated abbreviation
+                # periods ("Model No.", "Serial No.", "SRF No.", "Rs.") as
+                # sentence ends and chopped descriptions mid-clause (e.g.
+                # "...received the IWC (Model No. /Serial No."). Keep the full
+                # description and only trim at a word boundary if it is unusually
+                # long (the prompt already targets 1-2 short sentences).
+                if raw_desc and len(raw_desc) > 350:
+                    raw_desc = (
+                        raw_desc[:350].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
+                    )
 
                 # Drop entries with a description too short to be meaningful
                 if raw_desc and len(raw_desc.strip()) < 8:

@@ -965,9 +965,14 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
             if not title or not description:
                 continue
 
-            # Keep first sentence, cap 150 chars
-            first_sentence = re.split(r"(?<=[.!?])\s", description)[0]
-            description = first_sentence[:150]
+            # Cap the description WITHOUT splitting on sentence boundaries — the
+            # naive ". " splitter treats abbreviation periods ("Model No.",
+            # "Rs.", "SRF No.") as sentence ends and chops descriptions
+            # mid-clause. Keep it whole; trim at a word boundary only if long.
+            if len(description) > 200:
+                description = (
+                    description[:200].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
+                )
 
             raw_type_input = (item.get("type") or "").strip()
             raw_type_lower = raw_type_input.lower()

@@ -261,11 +261,16 @@ def _normalize_suggestions(raw: List[Any]) -> List[Dict[str, Any]]:
         title = (item.get("title") or "").strip()
         if not title:
             continue
+        _desc = (item.get("description") or "").strip()
+        if len(_desc) > 220:
+            # Trim at a word boundary (never mid-word) so the card never shows a
+            # broken sentence fragment.
+            _desc = _desc[:220].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
         cleaned.append(
             {
                 "title": title,
                 "relevance": _normalize_relevance(item.get("relevance")),
-                "description": (item.get("description") or "").strip()[:160] or None,
+                "description": _desc or None,
                 # Template pre-match fields always present so the backend
                 # reliably receives both id and name (populated later by
                 # _attach_template_matches when user_id is supplied; left

@@ -255,6 +255,7 @@ class GeminiClient:
         system_instruction: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 12000,
+        thinking_level: str = "LOW",
         **kwargs,
     ) -> str:
         """
@@ -265,6 +266,10 @@ class GeminiClient:
             system_instruction: System instruction for model
             temperature: Temperature (0.0-1.0)
             max_tokens: Maximum tokens to generate
+            thinking_level: Gemini-3 reasoning budget ("MINIMAL"/"LOW"/"MEDIUM"/
+                "HIGH"). Defaults to LOW so the hidden reasoning pass stays cheap
+                and responses are fast; pass "MINIMAL" for the smallest
+                classifier-style calls.
             **kwargs: Additional generation parameters
 
         Returns:
@@ -278,49 +283,95 @@ class GeminiClient:
             return "Error: Gemini model not available"
 
         try:
-            logger.debug("Generating with Gemini 2.0 Flash...")
+            logger.debug("Generating with Gemini...")
 
-            # Raise the output budget to the model's maximum on EVERY call.
-            # gemini-3 is a thinking model and its hidden reasoning tokens are
-            # billed against max_output_tokens; with a smaller cap the thinking
-            # pass starved the visible output → finish_reason=MAX_TOKENS with
-            # truncated/empty JSON (e.g. the strategy JSON cut off before
-            # strategicObjective / possibleNextSteps; small classifiers cut off
-            # too). max_output_tokens is only a CEILING — short answers stay
-            # short and you are billed only for tokens actually generated — so
-            # setting it to the model maximum is free and guarantees the
-            # reasoning pass can never exhaust the budget before the answer is
-            # written. Callers' own max_tokens is treated as a floor, never a cap.
-            _MODEL_MAX_OUTPUT_TOKENS = 65536
-            effective_max_tokens = max(
-                int(max_tokens or 0), _MODEL_MAX_OUTPUT_TOKENS
-            )
+            # gemini-3 is a thinking model: its hidden reasoning tokens are billed
+            # against max_output_tokens, and with an uncapped budget it reasons
+            # for tens of thousands of tokens on EVERY call (slow). We instead
+            # CAP the reasoning effort via thinking_level (new SDK) and keep a
+            # generous-but-moderate output budget so the answer always completes
+            # without truncation. max_output_tokens is only a ceiling (billed for
+            # tokens actually generated), and with thinking capped it no longer
+            # drives latency. Callers' own max_tokens is honoured as a floor.
+            effective_max_tokens = max(int(max_tokens or 0), 16000)
+            is_json_mode = kwargs.get("response_mime_type") == "application/json"
 
-            # Configure generation
-            generation_config = genai.types.GenerationConfig(
-                temperature=temperature,
-                max_output_tokens=effective_max_tokens,
-                **kwargs,
-            )
+            result = None
 
-            # Build full prompt with system instruction
-            if system_instruction:
-                full_prompt = f"{system_instruction}\n\n{prompt}"
-            else:
-                full_prompt = prompt
+            # Primary path: new google-genai SDK with an explicit, low thinking
+            # budget so the reasoning pass stays cheap (fast) — same mechanism
+            # generate_longform uses. Falls back to the legacy SDK on any error.
+            ng_client = self._get_ng_client()
+            if ng_client is not None:
+                try:
+                    ng_safety = [
+                        genai_ng_types.SafetySetting(
+                            category=cat,
+                            threshold=genai_ng_types.HarmBlockThreshold.BLOCK_NONE,
+                        )
+                        for cat in (
+                            genai_ng_types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                            genai_ng_types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                            genai_ng_types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                            genai_ng_types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                        )
+                    ]
+                    ng_cfg_kwargs: Dict[str, Any] = dict(
+                        temperature=temperature,
+                        max_output_tokens=effective_max_tokens,
+                        safety_settings=ng_safety,
+                        thinking_config=genai_ng_types.ThinkingConfig(
+                            thinking_level=self._ng_thinking_level(thinking_level),
+                        ),
+                    )
+                    if system_instruction:
+                        ng_cfg_kwargs["system_instruction"] = system_instruction
+                    if is_json_mode:
+                        ng_cfg_kwargs["response_mime_type"] = "application/json"
+                    ng_response = await ng_client.aio.models.generate_content(
+                        model=self.model_name,
+                        contents=prompt,
+                        config=genai_ng_types.GenerateContentConfig(**ng_cfg_kwargs),
+                    )
+                    self._log_generation_diagnostics(
+                        ng_response, label=f"{self.model_name}/ng"
+                    )
+                    result = self._safe_extract_text(ng_response)
+                except Exception as ng_err:
+                    logger.warning(
+                        "google-genai generate failed ({}); falling back to legacy",
+                        ng_err,
+                    )
+                    result = None
 
-            # Run sync SDK in a thread so long strategy/analysis calls do not block
-            # the asyncio loop (intelligence chat must stay responsive).
-            def _sync_generate():
-                return self.model.generate_content(
-                    full_prompt,
-                    generation_config=generation_config,
-                    safety_settings=_PERMISSIVE_SAFETY_SETTINGS,
+            if not result:
+                # Legacy fallback (new SDK unavailable / errored). Cannot cap
+                # thinking here, so the moderate effective_max_tokens also keeps
+                # the reasoning pass bounded.
+                generation_config = genai.types.GenerationConfig(
+                    temperature=temperature,
+                    max_output_tokens=effective_max_tokens,
+                    **kwargs,
                 )
 
-            response = await asyncio.to_thread(_sync_generate)
-            self._log_generation_diagnostics(response, label=self.model_name)
-            result = self._safe_extract_text(response)
+                # Build full prompt with system instruction
+                if system_instruction:
+                    full_prompt = f"{system_instruction}\n\n{prompt}"
+                else:
+                    full_prompt = prompt
+
+                # Run sync SDK in a thread so long strategy/analysis calls do not
+                # block the asyncio loop (intelligence chat must stay responsive).
+                def _sync_generate():
+                    return self.model.generate_content(
+                        full_prompt,
+                        generation_config=generation_config,
+                        safety_settings=_PERMISSIVE_SAFETY_SETTINGS,
+                    )
+
+                response = await asyncio.to_thread(_sync_generate)
+                self._log_generation_diagnostics(response, label=self.model_name)
+                result = self._safe_extract_text(response)
 
             # Global guardrail: when caller requests JSON mode, ensure we return valid JSON.
             # If first pass is malformed, ask Gemini to repair the payload only.

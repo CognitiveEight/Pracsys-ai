@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, TypedDict
 from langgraph.graph import END, START, StateGraph
 from loguru import logger
 
+from app.prompts.legal_intelligence_system import ENGLISH_ONLY_OUTPUT_DIRECTIVE
+
 
 def snap_hallucinated_year(
     *,
@@ -296,6 +298,8 @@ class ListOfDatesTemporalAgent:
             previous_year = current_year
 
         prompt = f"""You are a legal timeline extractor. Extract only factual, case-relevant dates from the legal text below.
+
+{ENGLISH_ONLY_OUTPUT_DIRECTIVE}
 
 EXTRACTED FACTS (these entities were already pulled from this document by a focused extraction step — treat them as authoritative ground truth. When you write each date entry's "description", you MUST use these exact names, amounts, suit numbers, and identifiers verbatim. Do NOT introduce "Party No. 1" / "the plaintiff" / "the petitioner" / "the respondent" placeholders. Every actor in a description must come from this list.):
 
@@ -616,13 +620,18 @@ Legal text:
             ):
                 continue
 
-            # Keep the first two sentences and hard-cap at 350 chars so rich
-            # descriptions ("Sitaram executed a registered agreement to sell
-            # Arazi No. 262 ... for Rs. 11,64,000, taking an advance of
-            # Rs. 10,00,000.") survive without being truncated mid-clause.
+            # Cap at 350 chars WITHOUT splitting on sentence boundaries. The
+            # naive ". " splitter treated abbreviation periods ("Model No.",
+            # "Serial No.", "Rs.", "O.S. No.") as sentence ends and chopped
+            # rich descriptions mid-clause (e.g. "...(Model No. /Serial No.").
+            # Keep the full description and only trim at a word boundary if it
+            # is unusually long.
             if raw_desc:
-                sentences = re.split(r"(?<=[.!?])\s", raw_desc)
-                description = " ".join(sentences[:2]).strip()[:350]
+                description = raw_desc.strip()
+                if len(description) > 350:
+                    description = (
+                        description[:350].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
+                    )
             else:
                 description = ""
 

@@ -21,6 +21,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [4.1.0] - 2026-06-12
+
+### Added
+
+- **Chat-driven panel editing from the Strategy & Objective chat**, with two clearly separated modes (`app/socket/events.py`):
+  - **Mode 1 — name / word / line edit (surgical).** A NAME change is applied as an exhaustive, workspace-wide rename across the EXISTING content of every panel — Case Summary, Report Summary, Strategic Objective, Possible Next Steps, Analysis Report, List of Dates, Applicable Laws, and Upcoming Dates — with **no regeneration** (no new/removed dates, laws, or items). The intent classifier returns an `isRename` signal and the dispatch fans one rename instruction to all panel editors deterministically (so coverage no longer depends on the LLM flagging each panel). Name changes are applied **semantically** (a party referenced by role/description, e.g. "the female employee", is named correctly even where she appears as "the Petitioner").
+  - **Mode 2 — case-perspective / objective change (regeneration).** Declaring a new objective regenerates the Strategic Objective + Possible Next Steps, regenerates the Analysis Report, re-scores List-of-Dates relevance (same entries), regenerates Applicable Laws and Drafting suggestions for the new objective, and preserves the Case Summary + Upcoming Dates.
+- New surgical panel editors: `_regenerate_analysis_report_with_feedback`, `_regenerate_list_of_dates_with_feedback`, `_regenerate_applicable_laws_with_feedback`, `_regenerate_procedural_timeline_with_feedback`, plus `_reeval_list_of_dates_relevance` (Mode 2 relevance re-score).
+- **Output guardrails** shared across every generated panel and chat (`app/prompts/legal_intelligence_system.py`, injected into the structured + chat system instructions and the inline case-summary / list-of-dates / procedural-timeline prompts):
+  - `ENGLISH_ONLY_OUTPUT_DIRECTIVE` — all output in English/Latin script; Devanagari/mixed-script names are transliterated.
+  - `APP_BRAND_EXCLUSION_DIRECTIVE` + `scrub_app_brand()` — the platform's own name ("SimplerToday") never appears as a case party/fact (prompt guardrail + deterministic scrub before cache/emit).
+  - `NAME_CAPITALISATION_DIRECTIVE` — person names / places / addresses in Title Case, never ALL-CAPS (statutory acronyms preserved).
+- `GeminiClient.generate()` now accepts an explicit **`thinking_level`** (default `LOW`) and runs primarily on the `google-genai` SDK with `ThinkingConfig`, falling back to the legacy SDK.
+
+### Changed
+
+- **Objective change fully re-derives the downstream panels.** `_run_objective_change_incremental_refresh` now **regenerates and REPLACES** the Analysis Report for the new objective (previously it merged with the prior report, which kept the old-perspective strengths/risks and preserved the old quality score) and regenerates Applicable Laws with the **objective as the primary law-selection lens** (`merge_with_previous=False`). So changing the objective (e.g. jewellery-theft → divorce) produces an analysis report, quality score, applicable laws, and drafting suggestions framed entirely around the new objective. The incremental-merge helper is unchanged for the document re-upload / `workspace_sync` paths.
+- **Procedural Timeline scope narrowed** (`app/langgraph/procedural_timeline_agent.py`): the panel now carries ONLY genuine court/law-set procedural dates — filing deadlines, hearing dates, evidence deadlines, compliance dates, and adjourned/next dates (types `Court Hearing` / `Deadline`). Pre-litigation notices, police complaints / FIR / GD / missing-person reports, lawyer consultations / engagements, meetings, and reconciliation attempts are excluded, classification is LLM-driven (no hardcoded keyword rules), and the agent never invents dates — it returns an empty timeline when none exist.
+- **Gemini latency / completeness** governed by `thinking_level` rather than the output ceiling: gemini-3 reasoning tokens are billed against `max_output_tokens`, so the budget is kept moderate and the thinking pass is bounded (`LOW`) to keep responses fast while still completing the full output.
+- Drafting template sync no longer applies a hard 30-second cutoff (`ensure_templates_synced`) — suggestion matching waits for the lawyer's templates to finish ingesting instead of matching against an empty library; the awaiting future always resolves so it cannot hang.
+- A multi-field chat edit now emits a single consolidated `strategy_objective` payload instead of one partial emit per field (no "previous version" flicker).
+
+### Fixed
+
+- **Objective change left the Analysis Report and Applicable Laws on the OLD objective.** Root cause: the analysis report was merged with the previous report (keeping stale strengths/risks and the old quality score). Now replaced + re-derived for the new objective (see Changed).
+- **Intermittent 0% Quality Score** on a populated Analysis Report. `caseResolutionScore` parsing is now robust (accepts `"72"`, `"72%"`, floats) and a content-derived score is used when the model omits/zeroes it, so an analysed case never reads 0%.
+- **`finish_reason=MAX_TOKENS` truncation** that cut large structured outputs (e.g. the strategy JSON dropped `strategicObjective` / `possibleNextSteps`) and a follow-on latency regression — both traced to the gemini-3 thinking budget; fixed via `thinking_level` control on `generate()`.
+- **Mid-sentence truncation** of panel descriptions. A naive sentence splitter treated abbreviation periods ("Model No.", "SRF No.", "Rs.") as sentence ends and chopped descriptions; List of Dates, Procedural Timeline, and Drafting-suggestion descriptions now trim only at a word boundary.
+- Normal questions in the Strategy & Objective chat (e.g. "explain the applicable case laws") no longer trigger an objective regeneration — a question vs objective-update guard (`_is_pure_informational_query` + a strengthened LLM classifier) routes genuine objective changes to the regeneration flow and leaves questions/renames alone.
+- A genuine objective change now correctly shows the loader for and re-emits List of Dates / Applicable Laws / Upcoming Dates / Drafting (previously only the Analysis Report refreshed).
+
+---
+
 ## [4.0.0] - 2026-06-08
 
 ### Added

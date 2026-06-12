@@ -16,6 +16,7 @@ SimplerToday is the **AI engine** that connects to your application backend over
 | **Procedural timeline** | A dedicated **procedural timeline** feature that models the case journey (events, filings, hearings, orders) and emits structured timeline entries for downstream UI/workflows. |
 | **Applicable laws** | Suggestions for **relevant legal frameworks** tied to the matter (for research direction, not as final legal advice). |
 | **Intelligence chat** | A **chat** where lawyers ask follow‑ups (explain a risk, compare options, procedural questions, hypotheticals). Replies aim to be **balanced and accurate** and evaluate both **civil-law** and **criminal-law** implications when both are factually live; workspace role mainly affects **panel** drafts, not an automatic advocacy slant in chat. |
+| **Edit panels from chat** | From the Strategy & Objective chat a lawyer can **correct a name / word / line** (applied across all panels' existing content with nothing regenerated) or **change the objective / case perspective** (e.g. recovery → divorce), which **re-derives** the strategic objective, analysis report, applicable laws, and drafting suggestions for the new objective. |
 | **Responsive during generation** | Long jobs (strategy, analysis, dates, laws) run in the background when possible so **chat can still answer** while other outputs are being prepared. |
 
 Nothing here replaces a qualified lawyer or predicts court outcomes. Outputs support **professional judgment**, not **decisions**.
@@ -34,6 +35,8 @@ Nothing here replaces a qualified lawyer or predicts court outcomes. Outputs sup
 - The AI **must not invent** facts, amounts, dates, or citations that are not grounded in supplied materials or clearly labelled general legal background.
 - **Workspace role** (petitioner, respondent, etc.) mainly shapes how **panel outputs** (e.g. strategy blocks) are **generated**. **Intelligence chat** is configured for **neutral, accuracy‑first** analysis unless the user explicitly asks for a one‑sided view.
 - For case-specific legal reasoning, the system applies a **civil + criminal dual-track check** when facts support both branches; if facts support only one branch, it remains in that branch.
+- All panel and chat output is produced in **English** (non-English names are transliterated), in normal Title Case, and never references the SimplerToday platform itself as a case party.
+- When the **objective changes**, downstream panels (analysis report, applicable laws, quality score, drafting) are re-derived for the **new** objective so they stay consistent with it.
 - Use generated content as **drafting and thinking support**, subject to review by qualified counsel and local rules.
 
 ---
@@ -117,7 +120,7 @@ Do not rely on these being in Git — they appear after the first runs.
 | System | Role |
 |--------|------|
 | **Socket.IO server** | Your app backend; **required** for production use. |
-| **Google Gemini** | Primary LLM (`GOOGLE_API_KEY`); model set via `GEMINI_MODEL` (e.g. `gemini-3-flash-preview`). Long-form drafting uses the `google-genai` SDK with thinking control; other paths use `google-generativeai`. See `env.example`. |
+| **Google Gemini** | Primary LLM (`GOOGLE_API_KEY`); model set via `GEMINI_MODEL` (e.g. `gemini-3-flash-preview`). All generation runs on the `google-genai` SDK with explicit **thinking-budget control** (gemini-3 reasoning tokens are billed against the output budget, so a bounded thinking level keeps responses fast and complete); it falls back to `google-generativeai` if the new SDK is unavailable. See `env.example`. |
 | **Qdrant** | Vector database for document search; often run via Docker. |
 | **Redis** | Optional caching (see `docker-compose.yml` / `config.py`). |
 | **GCP / Vision** | Optional OCR or vision keys if you enable those features. |

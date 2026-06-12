@@ -33,6 +33,9 @@ from app.prompts.applicable_acts import (
 )
 from app.prompts.legal_intelligence_system import (
     ANNEXURE_UPLOAD_GATE_MESSAGE,
+    APP_BRAND_EXCLUSION_DIRECTIVE,
+    ENGLISH_ONLY_OUTPUT_DIRECTIVE,
+    NAME_CAPITALISATION_DIRECTIVE,
     get_legal_intelligence_system_instruction,
     get_structured_document_feature_system_instruction,
 )
@@ -307,6 +310,43 @@ def _strip_ui_truncated_tokens(text: str) -> str:
     cleaned = re.sub(r"(\n\s*)(?:and\s+|,\s*)", r"\1", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
     return cleaned
+
+
+# Matches the application's own brand/platform name in any casing/spacing
+# ("SimplerToday", "Simpler Today", "simplertoday.ai"). The platform name is
+# never a case party/fact, but it appears in the platform-generated intake PDF
+# ("Contacted SimplerToday.ai on: …"), so the model sometimes echoes it into
+# generated panels. scrub_app_brand removes it from output payloads.
+_APP_BRAND_RE = re.compile(r"\bsimpler\s*today(?:\s*\.?\s*ai)?\b", re.IGNORECASE)
+
+
+def scrub_app_brand(obj: Any) -> Any:
+    """Recursively remove the app/platform brand name from a generated payload
+    (str / list / dict) and tidy the punctuation/whitespace it leaves behind.
+    Idempotent; non-str/list/dict values are returned unchanged.
+    """
+    if isinstance(obj, str):
+        if not _APP_BRAND_RE.search(obj):
+            return obj
+        s = _APP_BRAND_RE.sub("", obj)
+        # Tidy connectors/punctuation orphaned by the removed token so the
+        # surrounding sentence stays grammatical, e.g.
+        # "by SimplerToday.ai, a hair transplant office" -> "by a hair transplant office".
+        # Order matters: drop the dangling "<connector> ," BEFORE collapsing
+        # "<space>," (which would otherwise erase the space the connector
+        # pattern needs to match).
+        s = re.sub(
+            r"\b(by|from|with|at|of|to|against)\s*,\s*", r"\1 ", s, flags=re.IGNORECASE
+        )
+        s = re.sub(r"\s+,", ",", s)
+        s = re.sub(r",\s*,", ",", s)
+        s = re.sub(r"\s{2,}", " ", s).strip()
+        return s
+    if isinstance(obj, list):
+        return [scrub_app_brand(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: scrub_app_brand(v) for k, v in obj.items()}
+    return obj
 
 
 def _coerce_analysis_text_list(items: Any) -> List[str]:
@@ -2610,12 +2650,79 @@ Rules:
                     report_contact_date,
                 )
 
+            # Strip the application's own brand/platform name from the strategy
+            # panel (caseSummary / reportCaseSummary / strategicObjective /
+            # possibleNextSteps) before it is cached or emitted.
+            strategies_payload = scrub_app_brand(strategies_payload)
             return strategies_payload
 
         except Exception as e:
             logger.error(f"Error generating strategies: {e}")
             logger.exception(e)
             return None
+
+    def _looks_like_question(self, text: str) -> bool:
+        """
+        Deterministic guard: True when the message is an informational query
+        (a question / request to explain / analyse / list / suggest), so it must
+        NEVER trigger a strategic-objective update or regeneration.
+
+        Used as a hard pre-check in front of the LLM objective-change classifier
+        and the STRATEGY_CHANGE intent path — LLM classifiers occasionally label
+        a plain question as an objective change, and that must not auto-rewrite
+        the objective.
+        """
+        tl = (text or "").strip().lower()
+        if not tl:
+            return False
+        if tl.rstrip().endswith("?"):
+            return True
+        q_starts = (
+            "what ", "what's", "whats ", "how ", "how's", "why ", "when ",
+            "where ", "which ", "who ", "whom ", "whose ", "explain",
+            "describe", "define ", "list ", "summarize", "summarise",
+            "outline ", "tell me", "can you", "could you", "would you",
+            "will you", "do you", "does ", "did ", "is ", "are ", "should i",
+            "should we", "is there", "are there", "give me", "show me",
+            "walk me", "clarify", "elaborate", "analyze", "analyse",
+            "compare ", "suggest", "recommend", "help me understand",
+            "i want to understand", "i want to know",
+        )
+        return any(tl.startswith(p) for p in q_starts)
+
+    def _mentions_objective_update_intent(self, text: str) -> bool:
+        """
+        True when the message explicitly couples an edit/change verb with the
+        objective/strategy target (e.g. "update the objective to ...", "can you
+        change the strategy to ..."). This holds even when the request is phrased
+        as a question, which is exactly why the informational-question fast-path
+        must NOT suppress it — the LLM classifier then confirms the details.
+        """
+        tl = (text or "").strip().lower()
+        if not tl:
+            return False
+        verbs = (
+            "update", "change", "revise", "modify", "replace", "regenerate",
+            "refresh", "set ", "rewrite", "adjust", "redefine", "reframe",
+            "make the", "make it",
+        )
+        targets = ("objective", "strategy", "strategic")
+        return any(v in tl for v in verbs) and any(t in tl for t in targets)
+
+    def _is_pure_informational_query(self, text: str) -> bool:
+        """
+        Deterministic fast-path used to short-circuit obvious informational
+        queries BEFORE the LLM objective-change classifier and to gate the
+        objective-regeneration paths.
+
+        Returns True ONLY when the message looks like a question AND carries no
+        explicit objective/strategy update intent — i.e. a genuine "explain /
+        what / how" query. Anything that pairs an edit verb with the objective
+        (even if phrased as a question) returns False so the LLM can decide.
+        """
+        return self._looks_like_question(text) and not self._mentions_objective_update_intent(
+            text
+        )
 
     def _extract_direct_objective_update_instruction(self, text: str) -> Optional[str]:
         """
@@ -2952,6 +3059,7 @@ Rules:
             merged["userId"] = user_id
             merged["timestamp"] = datetime.utcnow().isoformat()
 
+            merged = scrub_app_brand(merged)
             self._workspace_strategy_payload[workspace_id] = merged
             self._workspace_suggestion_chips[workspace_id] = list(suggestion_chips)
             self._last_workspace_id_with_chips = workspace_id
@@ -2983,6 +3091,7 @@ Rules:
         workspace_role: str,
         user_feedback: str,
         current_strategy: Dict[str, Any],
+        emit_result: bool = True,
     ) -> bool:
         """
         Regenerate caseSummary + reportCaseSummary applying the user's edit
@@ -3076,6 +3185,7 @@ LOCKED possibleNextSteps (verbatim context, do not output):
 
 EDIT-INSTRUCTION RULES (CRITICAL — override all preservation rules below when they conflict):
 1. The user's instruction OUTRANKS the "preserve every named party / amount / date / statute" rule. If the user says "remove" / "delete" / "drop" / "change" a specific sentence, paragraph, fact, or phrase, you MUST apply that change to the text — even if it means dropping a named party, an amount, or a date.
+1a. NAME ASSIGNMENT: If the instruction supplies or corrects a NAME for a party that is referenced by ROLE or DESCRIPTION (e.g. "the female employee", "the petitioner", "the employee", "she"), identify that party from the role / gender / description context and use the supplied name wherever that party is referenced — including role labels like "the Petitioner" — even if the name does not already appear in the text. A literal matching token is NOT required.
 2. If the user QUOTES exact text inside the instruction (anything that looks like a verbatim sentence or phrase from the current case summary), find that exact text in the CURRENT caseSummary above and REMOVE it (and apply the same removal to reportCaseSummary if the same content appears there). Do not "interpret" — match the surface text.
 3. Apply ONLY the edits the user asked for. Do NOT remove other content the user did not mention.
 4. If the user's instruction asks for something impossible (e.g. add a new dated fact not in the documents), ignore that invention and apply only the parts of the instruction that are removals / rephrases / valid edits.
@@ -3144,9 +3254,10 @@ Output rules:
             merged["userId"] = user_id
             merged["timestamp"] = datetime.utcnow().isoformat()
 
+            merged = scrub_app_brand(merged)
             self._workspace_strategy_payload[workspace_id] = merged
 
-            if self._socket_client:
+            if emit_result and self._socket_client:
                 await self._socket_client.emit(
                     "document_feature_response",
                     {
@@ -3173,6 +3284,7 @@ Output rules:
         workspace_role: str,
         user_feedback: str,
         current_strategy: Dict[str, Any],
+        emit_result: bool = True,
     ) -> bool:
         """
         Regenerate possibleNextSteps + suggestionChips applying the user's edit
@@ -3217,6 +3329,7 @@ LOCKED strategicObjective (verbatim context, do not output):
 
 EDIT-INSTRUCTION RULES (CRITICAL):
 1. The user's instruction OUTRANKS any general guidance. If the user says "remove the 4th point", the returned list MUST omit the 4th item from CURRENT possibleNextSteps and keep the other items in their original order.
+1a. NAME ASSIGNMENT: If the instruction supplies or corrects a NAME for a party that is referenced by ROLE or DESCRIPTION (e.g. "the female employee", "the petitioner", "the employee", "she"), identify that party from the role / gender / description context and use the supplied name wherever that party is referenced in the steps — including role labels like "the Petitioner" — even if the name does not already appear. A literal matching token is NOT required.
 2. If the user says "add a step about X", APPEND a new step about X (or insert at the position they specified) and keep all existing steps unless the user also asked to drop something.
 3. If the user QUOTES an existing step verbatim and asks to remove / rephrase it, match the surface text and apply the change.
 4. Do NOT silently rewrite untouched steps. Only the steps the user asked to change should differ; the rest must be reproduced word-for-word.
@@ -3309,11 +3422,12 @@ Output rules:
             merged["userId"] = user_id
             merged["timestamp"] = datetime.utcnow().isoformat()
 
+            merged = scrub_app_brand(merged)
             self._workspace_strategy_payload[workspace_id] = merged
             self._workspace_suggestion_chips[workspace_id] = list(suggestion_chips)
             self._last_workspace_id_with_chips = workspace_id
 
-            if self._socket_client:
+            if emit_result and self._socket_client:
                 await self._socket_client.emit(
                     "document_feature_response",
                     {
@@ -3340,6 +3454,7 @@ Output rules:
         workspace_role: str,
         user_feedback: str,
         current_strategy: Dict[str, Any],
+        emit_result: bool = True,
     ) -> bool:
         """
         Regenerate strategicObjective applying the user's surgical edit
@@ -3395,6 +3510,7 @@ LOCKED suggestionChips (verbatim context, do not output):
 
 EDIT-INSTRUCTION RULES (CRITICAL — override every other instinct):
 1. The user's instruction OUTRANKS any tendency to "improve" or "summarise" the strategic objective. Apply ONLY the change the user named.
+1a. NAME ASSIGNMENT: If the instruction supplies or corrects a NAME for a party that is referenced by ROLE or DESCRIPTION (e.g. "the female employee", "the petitioner", "the employee", "she"), identify that party from the role / gender / description context and use the supplied name wherever that party is referenced — including role labels like "the Petitioner" — even if the name does not already appear in the text. A literal matching token is NOT required.
 2. If the user QUOTES exact text (a sentence, a phrase, a list of names) inside the instruction, find that exact text in CURRENT strategicObjective and REMOVE (or rephrase, per the verb the user used) ONLY that text.
 3. Every other sentence, clause, and reference in CURRENT strategicObjective MUST be reproduced WORD-FOR-WORD in the output. Do NOT compress lists of entities. Do NOT drop arbitration/summary-suit/GST/cloud-suspension/leverage sentences. Do NOT change the length of the output unless the user explicitly asked for that.
 4. Do NOT enforce any sentence-count or word-count target. The output length should equal the input length minus what the user removed (or plus what the user asked to add).
@@ -3458,9 +3574,10 @@ Output rules:
             merged["userId"] = user_id
             merged["timestamp"] = datetime.utcnow().isoformat()
 
+            merged = scrub_app_brand(merged)
             self._workspace_strategy_payload[workspace_id] = merged
 
-            if self._socket_client:
+            if emit_result and self._socket_client:
                 await self._socket_client.emit(
                     "document_feature_response",
                     {
@@ -3477,6 +3594,540 @@ Output rules:
             return True
         except Exception as e:
             logger.warning("Strategic objective surgical edit failed: {}", e)
+            return False
+
+    async def _regenerate_analysis_report_with_feedback(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        user_feedback: str,
+        current_report: Dict[str, Any],
+    ) -> bool:
+        """
+        Apply a free-form user edit instruction (rename, rephrase, add / change /
+        remove a strength / weakness / risk / missingInfo item, etc.) to the
+        CACHED analysis report and re-emit it.
+
+        Operates on the cached payload only — it must NOT call
+        ``_emit_analysis_report`` / ``_generate_analysis_report_from_documents``,
+        which regenerate from documents and would re-introduce whatever the user
+        just asked to change (e.g. a misspelled name). Every field and list item
+        the user did not name is reproduced verbatim; the JSON schema is
+        preserved (strengths stay ``[{point, laws}]``, the other lists stay
+        lists of strings). Updates ``_workspace_analysis_payload`` and emits
+        ``document_feature_response`` with featureType=analysis_report.
+        """
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            if not isinstance(current_report, dict) or not current_report:
+                return False
+            instruction = (user_feedback or "").strip()
+            if not instruction:
+                return False
+
+            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                role = "ADJUDICATOR"
+
+            current_report_json = json.dumps(current_report, ensure_ascii=True)
+
+            prompt = f"""You are a legal-analysis-report editor for Indian law.
+
+You will edit the existing Analysis Report (JSON below) by applying the user's instruction. Return the FULL report with the change applied and everything else reproduced verbatim.
+
+**User's edit instruction** (THIS IS THE PRIMARY CONSTRAINT — apply it EXACTLY as worded):
+{instruction}
+
+CURRENT analysis report JSON (edit THIS, preserving its exact structure and keys):
+{current_report_json}
+
+**Role**: {role}
+
+EDIT-INSTRUCTION RULES (CRITICAL — override every other instinct):
+1. The user's instruction OUTRANKS any tendency to "improve", "summarise", or "regenerate" the report. Apply ONLY the change the user named.
+2. If the instruction is a RENAME / FIND-AND-REPLACE (e.g. replace every occurrence of "X" with "Y"), replace the term EVERYWHERE it appears across ALL string content: every `strengths[].point` and `strengths[].laws` entry, every `weaknesses`, `risks`, `missingInfo`, `nextSteps`, `pendingActions`, `suggestedDrafts`, and `relevantJurisdiction` item, and the `qualityScoreExplanation` / `reportQualityScoreExplanation` text. Miss NO occurrence.
+2a. NAME ASSIGNMENT: If the instruction supplies or corrects a NAME for a party that is referenced by ROLE or DESCRIPTION (e.g. "the female employee", "the petitioner", "the employee", "she") rather than by a literal existing token, identify that party from the role / gender / description context and use the supplied name wherever that party is referenced across ALL the string fields listed in rule 2 — INCLUDING role labels like "the Petitioner" / "the employee" — even if the name does not already appear in the report. A literal matching token is NOT required.
+3. If the user QUOTES exact text (a sentence, a phrase, a list item) inside the instruction, find that exact text in the report and REMOVE (or rephrase, per the verb the user used) ONLY that text/item.
+4. Every other field, list item, sentence, and reference MUST be reproduced WORD-FOR-WORD. Do NOT drop, reorder, compress, or re-score anything the user did not mention.
+5. Keep `caseResolutionScore` and the score explanations unchanged UNLESS the user explicitly asked to change the score. (A rename inside the explanation text is allowed — that is just text replacement, not a score change.)
+6. Preserve the exact JSON shape and keys present in CURRENT analysis report: `strengths` stays a list of objects with `point` (string) and `laws` (list of strings); `weaknesses` / `risks` / `missingInfo` / `nextSteps` / `pendingActions` / `suggestedDrafts` / `relevantJurisdiction` stay lists of strings.
+7. If the user asks for something impossible (e.g. inventing a fact not present), ignore that part and apply only the valid edit.
+
+TRUNCATED-TEXT RULE: Never reproduce a token, name, or phrase that ends in "..." or "…" — those are UI-truncation noise, not real entity names. Drop them silently.
+
+{SPEAKER_LABEL_GUARDRAIL}
+
+Output rules:
+- Preserve Indian-law citations exactly as in the source (BNS/BNSS/BSA/IT Act). Do NOT switch to IPC/CrPC/Evidence Act.
+- Return ONLY the complete, valid analysis-report JSON object (no markdown code fences, no commentary)."""
+
+            custom_suffix = build_custom_instruction_suffix(workspace_id)
+            if custom_suffix:
+                prompt = prompt.rstrip() + "\n\n" + custom_suffix
+
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                system_instruction=get_structured_document_feature_system_instruction(
+                    role
+                ),
+                temperature=0.2,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            if not json_str:
+                return False
+            edited = json.loads(json_str)
+            if not isinstance(edited, dict):
+                return False
+
+            edited = self._normalize_analysis_report_lists(
+                edited, max_annexure=self._get_annexure_count(workspace_id)
+            )
+            if not isinstance(edited, dict):
+                return False
+
+            # If the LLM produced an identical report (e.g. a rename whose term
+            # was not present), nothing actually changed — return False so the
+            # caller does NOT report "analysis report" as Updated and does not
+            # emit a no-op payload.
+            try:
+                if json.dumps(edited, sort_keys=True, ensure_ascii=True) == json.dumps(
+                    current_report, sort_keys=True, ensure_ascii=True
+                ):
+                    logger.info(
+                        "Analysis report edit produced no change — instruction={!r}",
+                        instruction[:160],
+                    )
+                    return False
+            except Exception:
+                pass
+
+            self._workspace_analysis_payload[workspace_id] = edited
+
+            if self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "analysis_report",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": edited,
+                    },
+                )
+                logger.success(
+                    "✅ Analysis report surgical edit emitted workspace={}",
+                    workspace_id[:12] if workspace_id else "",
+                )
+            return True
+        except Exception as e:
+            logger.warning("Analysis report surgical edit failed: {}", e)
+            return False
+
+    async def _regenerate_list_of_dates_with_feedback(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        user_feedback: str,
+        emit_result: bool = True,
+    ) -> bool:
+        """
+        Apply a NAME change to the EXISTING List of Dates entries (Mode 1).
+
+        Surgical only: it replaces the renamed party's name in each entry's
+        title / description / evidenceSnippet and changes NOTHING else — no new
+        or removed entries, and date / relevance / sourceDocId / sourceDocName /
+        eventType / pageNumber / isIncident are all preserved. It never
+        regenerates the list from documents. Operates on the cached
+        ``_workspace_list_of_dates_payload`` and re-emits featureType=list_of_dates.
+        """
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            current = self._workspace_list_of_dates_payload.get(workspace_id)
+            if not isinstance(current, list) or not current:
+                return False
+            instruction = (user_feedback or "").strip()
+            if not instruction:
+                return False
+
+            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                role = "ADJUDICATOR"
+
+            current_json = json.dumps(current, ensure_ascii=True)
+            prompt = f"""You are editing a legal case's LIST OF DATES (a JSON array of dated events). Apply ONLY the user's name change to the EXISTING entries and return the FULL array.
+
+**User's edit instruction** (apply EXACTLY as worded):
+{instruction}
+
+CURRENT list of dates (edit THIS array in place):
+{current_json}
+
+STRICT RULES:
+1. This is a NAME change ONLY. Replace the renamed party's name wherever it appears in each entry's "title", "description", and "evidenceSnippet". If the party is referenced by ROLE or DESCRIPTION (e.g. "the wife", "the female employee", "the petitioner", "she"), use the role / gender / description context to identify her and apply the supplied name there too — a literal matching token is NOT required.
+2. Keep the SAME number of entries in the SAME order. Do NOT add, remove, merge, or reorder entries.
+3. Do NOT change any other field — "date", "relevance", "sourceDocId", "sourceDocName", "eventType", "pageNumber", "isIncident" must be reproduced EXACTLY as-is for every entry.
+4. Change nothing except the renamed name. Every other word stays verbatim.
+
+Return ONLY the complete, valid JSON array (no markdown code fences, no commentary)."""
+
+            custom_suffix = build_custom_instruction_suffix(workspace_id)
+            if custom_suffix:
+                prompt = prompt.rstrip() + "\n\n" + custom_suffix
+
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                system_instruction=get_structured_document_feature_system_instruction(
+                    role
+                ),
+                temperature=0.1,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="array")
+            if not json_str:
+                return False
+            edited = json.loads(json_str)
+            # Guardrail: only accept when the entry count is unchanged — a name
+            # edit must never add/drop dates. Otherwise keep the cache untouched.
+            if not isinstance(edited, list) or len(edited) != len(current):
+                logger.warning(
+                    "List of dates name edit rejected (count {} != {}); keeping cache",
+                    len(edited) if isinstance(edited, list) else "n/a",
+                    len(current),
+                )
+                return False
+
+            edited = scrub_app_brand(edited)
+            if json.dumps(edited, sort_keys=True, ensure_ascii=True) == json.dumps(
+                current, sort_keys=True, ensure_ascii=True
+            ):
+                return False  # nothing changed
+
+            self._workspace_list_of_dates_payload[workspace_id] = edited
+
+            if emit_result and self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "list_of_dates",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": {
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "listOfDates": edited,
+                        },
+                    },
+                )
+                logger.success(
+                    "✅ List of dates name edit emitted workspace={}",
+                    workspace_id[:12] if workspace_id else "",
+                )
+            return True
+        except Exception as e:
+            logger.warning("List of dates name edit failed: {}", e)
+            return False
+
+    async def _reeval_list_of_dates_relevance(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        objective_text: str,
+        emit_result: bool = True,
+    ) -> bool:
+        """
+        Re-score ONLY the ``relevance`` field of the EXISTING List of Dates
+        entries against a changed case objective/perspective (Mode 2). It keeps
+        every entry and every other field (date / title / description /
+        sourceDocId / eventType / ...) exactly as-is — no new or removed dates,
+        no text rewrite. Operates on the cached payload and re-emits.
+        """
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            current = self._workspace_list_of_dates_payload.get(workspace_id)
+            if not isinstance(current, list) or not current:
+                return False
+            obj = (objective_text or "").strip()
+            if not obj:
+                return False
+
+            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                role = "ADJUDICATOR"
+
+            current_json = json.dumps(current, ensure_ascii=True)
+            prompt = f"""The case OBJECTIVE / perspective has changed. Re-score how RELEVANT each existing dated event is to the NEW objective. Return the SAME array with ONLY the "relevance" field updated.
+
+NEW objective / case perspective:
+{obj}
+
+CURRENT list of dates (re-score relevance against the new objective):
+{current_json}
+
+STRICT RULES:
+1. Keep the SAME entries in the SAME order. Do NOT add, remove, merge, or reorder entries.
+2. Change ONLY each entry's "relevance" value — set it to "High", "Medium", or "Low" based on how important that event is to the NEW objective.
+3. Reproduce EVERY other field ("date", "title", "description", "evidenceSnippet", "sourceDocId", "sourceDocName", "eventType", "pageNumber", "isIncident") EXACTLY as-is — do NOT rewrite any text.
+
+Return ONLY the complete, valid JSON array (no markdown code fences, no commentary)."""
+
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                system_instruction=get_structured_document_feature_system_instruction(
+                    role
+                ),
+                temperature=0.0,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="array")
+            if not json_str:
+                return False
+            edited = json.loads(json_str)
+            if not isinstance(edited, list) or len(edited) != len(current):
+                logger.warning(
+                    "List of dates relevance re-eval rejected (count {} != {}); keeping cache",
+                    len(edited) if isinstance(edited, list) else "n/a",
+                    len(current),
+                )
+                return False
+
+            edited = scrub_app_brand(edited)
+            self._workspace_list_of_dates_payload[workspace_id] = edited
+
+            if emit_result and self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "list_of_dates",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": {
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "listOfDates": edited,
+                        },
+                    },
+                )
+                logger.success(
+                    "✅ List of dates relevance re-evaluated for new objective workspace={}",
+                    workspace_id[:12] if workspace_id else "",
+                )
+            return True
+        except Exception as e:
+            logger.warning("List of dates relevance re-eval failed: {}", e)
+            return False
+
+    async def _regenerate_applicable_laws_with_feedback(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        user_feedback: str,
+        emit_result: bool = True,
+    ) -> bool:
+        """
+        Apply a NAME change to the EXISTING Applicable Laws entries (Mode 1
+        rename). Surgical only: replaces the renamed party's name in each law's
+        ``description`` and changes NOTHING else — same laws, same count/order,
+        and `id` / `act` / `section` / `relevance` preserved. Never regenerates
+        laws from documents. Operates on the cached
+        ``_workspace_applicable_laws_payload`` and re-emits featureType=applicable_laws.
+        """
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            current = self._workspace_applicable_laws_payload.get(workspace_id)
+            if not isinstance(current, dict):
+                return False
+            laws = current.get("laws")
+            if not isinstance(laws, list) or not laws:
+                return False
+            instruction = (user_feedback or "").strip()
+            if not instruction:
+                return False
+
+            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                role = "ADJUDICATOR"
+
+            current_json = json.dumps(current, ensure_ascii=True)
+            prompt = f"""You are editing a case's APPLICABLE LAWS (JSON object {{"laws": [...]}}). Apply ONLY the user's name change to the EXISTING law entries and return the FULL object.
+
+**User's edit instruction** (apply EXACTLY as worded):
+{instruction}
+
+CURRENT applicable laws (edit THIS object in place):
+{current_json}
+
+STRICT RULES:
+1. This is a NAME change ONLY. Replace the renamed party's name wherever it appears in each law's "description". If the party is referenced by ROLE or DESCRIPTION (e.g. "the wife", "the female employee", "the petitioner", "she"), use the role / gender / description context to identify her and apply the supplied name there too — a literal matching token is NOT required.
+2. Keep the SAME laws in the SAME order. Do NOT add, remove, merge, or reorder laws.
+3. Do NOT change "id", "act", "section", or "relevance" for any law — reproduce them EXACTLY.
+4. Change nothing except the renamed name inside "description". Statute names / section numbers stay verbatim.
+
+Return ONLY the complete, valid JSON object (no markdown code fences, no commentary)."""
+
+            custom_suffix = build_custom_instruction_suffix(workspace_id)
+            if custom_suffix:
+                prompt = prompt.rstrip() + "\n\n" + custom_suffix
+
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                system_instruction=get_structured_document_feature_system_instruction(
+                    role
+                ),
+                temperature=0.1,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            if not json_str:
+                return False
+            edited = json.loads(json_str)
+            edited_laws = edited.get("laws") if isinstance(edited, dict) else None
+            if not isinstance(edited_laws, list) or len(edited_laws) != len(laws):
+                logger.warning(
+                    "Applicable laws name edit rejected (count mismatch); keeping cache"
+                )
+                return False
+
+            edited = self._normalize_applicable_laws_payload(edited)
+            if json.dumps(edited, sort_keys=True, ensure_ascii=True) == json.dumps(
+                current, sort_keys=True, ensure_ascii=True
+            ):
+                return False  # nothing changed
+
+            self._workspace_applicable_laws_payload[workspace_id] = edited
+
+            if emit_result and self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "applicable_laws",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": edited,
+                    },
+                )
+                logger.success(
+                    "✅ Applicable laws name edit emitted workspace={}",
+                    workspace_id[:12] if workspace_id else "",
+                )
+            return True
+        except Exception as e:
+            logger.warning("Applicable laws name edit failed: {}", e)
+            return False
+
+    async def _regenerate_procedural_timeline_with_feedback(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        user_feedback: str,
+        emit_result: bool = True,
+    ) -> bool:
+        """
+        Apply a NAME change to the EXISTING Procedural Timeline (Upcoming Dates)
+        entries (Mode 1 rename). Surgical only: replaces the renamed party's name
+        in each entry's ``title`` / ``description`` and preserves ``date`` /
+        ``type`` and the entry set. Never regenerates the timeline. Operates on
+        the cached ``_workspace_procedural_timeline_payload`` and re-emits
+        featureType=procedural_timeline.
+        """
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            current = self._workspace_procedural_timeline_payload.get(workspace_id)
+            if not isinstance(current, list) or not current:
+                return False
+            instruction = (user_feedback or "").strip()
+            if not instruction:
+                return False
+
+            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
+                role = "ADJUDICATOR"
+
+            current_json = json.dumps(current, ensure_ascii=True)
+            prompt = f"""You are editing a case's PROCEDURAL TIMELINE / UPCOMING DATES (a JSON array of milestones). Apply ONLY the user's name change to the EXISTING entries and return the FULL array.
+
+**User's edit instruction** (apply EXACTLY as worded):
+{instruction}
+
+CURRENT procedural timeline (edit THIS array in place):
+{current_json}
+
+STRICT RULES:
+1. This is a NAME change ONLY. Replace the renamed party's name wherever it appears in each entry's "title" and "description". If the party is referenced by ROLE or DESCRIPTION (e.g. "the wife", "the female employee", "the petitioner", "she"), use the role / gender / description context to identify her and apply the supplied name there too — a literal matching token is NOT required.
+2. Keep the SAME number of entries in the SAME order. Do NOT add, remove, merge, or reorder entries.
+3. Do NOT change "date" or "type" for any entry — reproduce them EXACTLY.
+4. Change nothing except the renamed name.
+
+Return ONLY the complete, valid JSON array (no markdown code fences, no commentary)."""
+
+            custom_suffix = build_custom_instruction_suffix(workspace_id)
+            if custom_suffix:
+                prompt = prompt.rstrip() + "\n\n" + custom_suffix
+
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                system_instruction=get_structured_document_feature_system_instruction(
+                    role
+                ),
+                temperature=0.1,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="array")
+            if not json_str:
+                return False
+            edited = json.loads(json_str)
+            if not isinstance(edited, list) or len(edited) != len(current):
+                logger.warning(
+                    "Procedural timeline name edit rejected (count {} != {}); keeping cache",
+                    len(edited) if isinstance(edited, list) else "n/a",
+                    len(current),
+                )
+                return False
+
+            edited = scrub_app_brand(edited)
+            if json.dumps(edited, sort_keys=True, ensure_ascii=True) == json.dumps(
+                current, sort_keys=True, ensure_ascii=True
+            ):
+                return False  # nothing changed
+
+            self._workspace_procedural_timeline_payload[workspace_id] = edited
+
+            if emit_result and self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "procedural_timeline",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": {"proceduralTimeline": edited},
+                    },
+                )
+                logger.success(
+                    "✅ Procedural timeline name edit emitted workspace={}",
+                    workspace_id[:12] if workspace_id else "",
+                )
+            return True
+        except Exception as e:
+            logger.warning("Procedural timeline name edit failed: {}", e)
             return False
 
     def _last_ai_offered_objective_update(self, ai_text: str) -> bool:
@@ -3729,6 +4380,25 @@ Assistant reply (for context, first 1200 chars):
         msg = (user_message or "").strip()
         if not msg or chat_type_upper != "STRATEGY_OBJECTIVE":
             return {"mode": "none", "objectiveText": "", "isQuestionLike": False}
+        # Fast-path ONLY for pure informational queries — a question that carries
+        # no objective/strategy update intent ("explain the applicable case laws",
+        # "what is the strongest argument?"). These must never become an objective
+        # update, so we short-circuit before the model call. A question that DOES
+        # pair an edit verb with the objective ("can you update the objective to
+        # focus on bail?") is intentionally NOT short-circuited — it falls through
+        # to the LLM so the nuanced question-vs-update call is made properly.
+        if self._is_pure_informational_query(msg):
+            logger.info(
+                "Objective intent: pure informational query — treating as question "
+                "(no objective update). msg_len={}",
+                len(msg),
+            )
+            return {
+                "mode": "none",
+                "objectiveText": "",
+                "isQuestionLike": True,
+                "updateRequestedNow": False,
+            }
         try:
             from app.ai.gemini_client import gemini_client
 
@@ -3759,16 +4429,31 @@ If immediate intent is missing -> DO NOT use direct_update.
 STEP-BY-STEP DECISION LOGIC
 --------------------------------
 
-STEP 1: QUESTION DETECTION (HIGHEST PRIORITY)
-If the user is asking anything (what/how/why/which/can you/explain/list/analyze/suggest):
+STEP 1: INFORMATIONAL QUESTION DETECTION (HIGHEST PRIORITY)
+If the user is REQUESTING INFORMATION — asking you to explain, describe, analyse,
+list, compare, summarise, or answer a what/how/why/which question ABOUT the case,
+the law, the evidence, the current objective, the risks, etc.:
 
 -> isQuestionLike = true
 -> updateRequestedNow = false
 -> mode = "none"
 
-IMPORTANT:
-- Even if strategy/objective words appear, DO NOT treat as update
-- Questions NEVER trigger direct_update
+This includes questions that merely MENTION the words "objective" or "strategy"
+without asking to change them, e.g.:
+- "explain the applicable case laws"            -> mode = none (information)
+- "what is the current strategic objective?"    -> mode = none (information)
+- "how does the objective help the petitioner?" -> mode = none (information)
+- "which laws apply to this dispute?"            -> mode = none (information)
+
+CRITICAL EXCEPTION — a question FORM that is actually an INSTRUCTION to change the
+objective is NOT an informational question. If the user, even politely or as a
+question, asks you to UPDATE / CHANGE / REVISE / SET / REWRITE the objective or
+strategy, treat it as an update:
+- "can you update the objective to focus on bail?"   -> mode = direct_update
+- "please change the strategy to file in Patna only" -> mode = direct_update
+- "could you set the objective to recover Rs 12,000?" -> mode = direct_update
+The test is INTENT, not punctuation: information requested -> none; a change to the
+objective requested -> direct_update (or ask_confirmation if tentative).
 
 --------------------------------
 
@@ -4029,6 +4714,9 @@ USER MESSAGE
             "reportCaseSummary": {"shouldEdit": False, "instruction": ""},
             "strategicObjective": {"shouldEdit": False, "instruction": ""},
             "possibleNextSteps": {"shouldEdit": False, "instruction": ""},
+            "analysisReport": {"shouldEdit": False, "instruction": ""},
+            "listOfDates": {"shouldEdit": False, "instruction": ""},
+            "isRename": False,
             "isQuestionLike": False,
         }
         msg = (user_message or "").strip()
@@ -4054,27 +4742,33 @@ USER MESSAGE
                 "caseSummary": "CASE SUMMARY (caseSummary)",
                 "reportCaseSummary": "REPORT CASE SUMMARY (reportCaseSummary)",
                 "possibleNextSteps": "POSSIBLE NEXT STEPS (possibleNextSteps)",
+                "analysisReport": "ANALYSIS REPORT (analysisReport)",
             }
             scoped_panel_rule = ""
             if default_panel in _PANEL_LABELS:
                 scoped_panel_rule = (
                     "\n11) SCOPED PANEL DEFAULT (CRITICAL — OVERRIDES RULE 8): "
                     f"This chat is scoped to the {_PANEL_LABELS[default_panel]} panel. "
-                    "If the message contains an edit verb but names NO panel "
-                    '(e.g. "change the wordings", "add a few words", "make it shorter", '
-                    '"rephrase it"), attribute the edit to '
-                    f"{default_panel}.shouldEdit=true with the user's full edit text as the "
-                    "instruction. Rule 8 still applies when the user explicitly names a "
-                    "DIFFERENT panel. Genuine questions still classify as isQuestionLike=true.\n"
+                    "If the message contains an edit verb that operates on the EXISTING panel "
+                    'TEXT but names NO panel (e.g. "change the wordings", "add a few words", '
+                    '"make it shorter", "rephrase it", "remove the 2nd line"), attribute the '
+                    f"edit to {default_panel}.shouldEdit=true with the user's full edit text as "
+                    "the instruction. Rule 8 still applies when the user explicitly names a "
+                    "DIFFERENT panel. Genuine questions still classify as isQuestionLike=true. "
+                    "EXCEPTION: a statement that DECLARES a NEW strategic objective / direction "
+                    "(see Rule 4's NEW-OBJECTIVE DECLARATION clause) is NOT a surgical edit — do "
+                    "NOT apply this scoped default to it; leave strategicObjective.shouldEdit=false "
+                    "so the objective-change flow handles it.\n"
                 )
 
             prompt = f"""You are a STRICT intent classifier for a legal-strategy workspace chat.
 
-The user is viewing a workspace with FOUR generated panels:
+The user is viewing a workspace with FIVE editable panels:
 - CASE SUMMARY (caseSummary): a 10-20 sentence factual narrative of the case.
 - REPORT CASE SUMMARY (reportCaseSummary): the same facts rewritten as a neutral, expanded narrative for formal reports.
 - STRATEGIC OBJECTIVE (strategicObjective): the role-tailored strategic plan, 10-20 sentences.
 - POSSIBLE NEXT STEPS (possibleNextSteps): 3-5 immediate actionable bullets.
+- ANALYSIS REPORT (analysisReport): the case analysis — strengths, weaknesses, risks, missing information, and score explanations.
 
 Your job: decide whether the user is DIRECTLY asking to edit one or more of these panels, and split the user's instruction into per-panel chunks.
 
@@ -4087,8 +4781,12 @@ OUTPUT FORMAT (JSON ONLY):
   "reportCaseSummary":  {{"shouldEdit": true | false, "instruction": "ONLY the per-panel edit text for report case summary; empty when shouldEdit=false"}},
   "strategicObjective": {{"shouldEdit": true | false, "instruction": "ONLY the per-panel edit text for strategic objective; empty when shouldEdit=false"}},
   "possibleNextSteps":  {{"shouldEdit": true | false, "instruction": "ONLY the per-panel edit text for possible next steps; empty when shouldEdit=false"}},
+  "analysisReport":     {{"shouldEdit": true | false, "instruction": "ONLY the per-panel edit text for the analysis report; empty when shouldEdit=false"}},
+  "listOfDates":        {{"shouldEdit": true | false, "instruction": "set true ONLY for a NAME change / rename (Rule 12) so the person's name is replaced in the existing dated events; empty otherwise"}},
+  "isRename":           true | false,
   "isQuestionLike":     true | false
 }}
+("isRename" = true ONLY for a workspace-wide NAME change / rename / name-assignment per Rule 12; false for every other kind of edit.)
 
 DECISION RULES:
 
@@ -4107,14 +4805,34 @@ DECISION RULES:
      "objective", "strategy"                                 → strategicObjective
    - "possible next steps", "next steps", "next step",
      "action items", "steps"                                 → possibleNextSteps
+   - "analysis report", "analysis", "the report", "report",
+     "strength", "strengths", "weakness", "weaknesses",
+     "risk", "risks", "missing info", "missing information"  → analysisReport
 
 4) "client objective is to ..." / "the objective is to ..." / "we want to ..." PREFIX RULE (CRITICAL):
    These phrases are NOT a strategic objective declaration when they are followed by an edit verb plus a panel name.
    Example: "client objective is to remove sentence X from case summary" means
    caseSummary.shouldEdit=true, instruction="Remove sentence X from case summary".
    Do NOT treat the wrapping phrase as a strategic objective change.
-   ONLY when the user says "client objective is X" with no edit verb / no panel name and X is a substantive
-   strategic direction (e.g. "focus on recovering ₹12,000 first") → strategicObjective.shouldEdit=true.
+
+   NEW-OBJECTIVE DECLARATION → NOT A SURGICAL EDIT (CRITICAL):
+   When the user DECLARES or CHANGES the strategic objective to a NEW DIRECTION — e.g.
+   "objective is to <direction>", "the objective is to <direction>", "client objective is <direction>",
+   "the objective should be <direction>", "change/set/update the objective to <new direction>",
+   "we want to pursue <direction>" (e.g. "objective is to focus on recovering ₹12,000 first",
+   "change the objective to quashing the false FIR") — this is NOT a surgical panel edit.
+   Set strategicObjective.shouldEdit=FALSE and isQuestionLike=false. A separate objective-change
+   flow regenerates the whole strategy + analysis from the new objective; this classifier must
+   NOT claim it.
+   Set strategicObjective.shouldEdit=TRUE ONLY for a SURGICAL edit to the EXISTING objective TEXT —
+   remove / delete / drop / rephrase / replace a specific sentence, phrase, or quoted text in the
+   objective — or for a workspace-wide rename (see Rule 12).
+   Worked contrasts:
+     - "objective is to prioritise custody of the son"          -> strategicObjective.shouldEdit=FALSE (new direction → objective-change flow)
+     - "change the objective to focus on quashing the FIR"       -> strategicObjective.shouldEdit=FALSE (new direction → objective-change flow)
+     - "remove the jurisdiction line from the objective"         -> strategicObjective.shouldEdit=TRUE  (surgical text edit)
+     - "rephrase the second sentence of the objective"           -> strategicObjective.shouldEdit=TRUE  (surgical text edit)
+     - rename "Replace 'Wife' with 'Sandhya'" (Rule 12)          -> strategicObjective.shouldEdit=TRUE  (rename)
 
 5) SPLIT MULTI-PANEL MESSAGES INTO PER-PANEL INSTRUCTIONS. CRITICAL.
    Each shouldEdit=true field's `instruction` MUST contain ONLY the user's edit text for THAT panel — not the wrapping phrase, not the other panels' edits.
@@ -4140,7 +4858,38 @@ DECISION RULES:
    "Explain the objective" → strategicObjective.shouldEdit = false, isQuestionLike = true.
 
 10) FACT DISCUSSION WITHOUT EDIT VERB: if the message is only discussing facts
-    ("I think the date was actually 16/05/2026") with NO imperative edit verb, set all four shouldEdit=false.
+    ("I think the date was actually 16/05/2026") with NO imperative edit verb, set all five shouldEdit=false.
+
+12) WORKSPACE-WIDE RENAME / FIND-AND-REPLACE (HIGHEST PRIORITY — OVERRIDES RULES 8 AND 11):
+    When the user asks to correct / replace / change / rename / fix a specific WORD, NAME, TERM,
+    DATE, or PHRASE "X" with/to "Y" — e.g. "correct the name Rambur with rambir", "change Rambur to
+    Rambir in the workspace", "replace 19/04/2024 with 18/04/2024 everywhere", "fix the spelling of
+    Sandhya" — this is a workspace-wide rename. It is NOT scoped to a single panel even when the chat
+    is scoped (rule 11) and even if no panel is named.
+    Set shouldEdit=true for ALL SIX panels — caseSummary, reportCaseSummary, strategicObjective,
+    possibleNextSteps, analysisReport, AND listOfDates — and give EACH the SAME instruction in
+    the form:
+      Replace every occurrence of 'X' with 'Y' wherever it appears; change nothing else.
+    (Substitute the actual X and Y. Preserve the user's exact spelling/casing for X and Y.)
+    listOfDates is included ONLY for a rename / name change (so the person's name is replaced in
+    the existing dated events) — never for any other kind of edit.
+    isQuestionLike=false. Only a genuine question (no edit verb) stays isQuestionLike=true.
+
+    NAME-ASSIGNMENT sub-case (a party identified by ROLE / DESCRIPTION / GENDER, not a literal
+    existing token): when the user assigns or corrects the NAME of a party who is described
+    rather than named — e.g. "the female employee's name is heena", "the petitioner is named X",
+    "the complainant is heena because she is female" — DO NOT emit a bare literal "Replace 'X'
+    with 'Y'" (the party may currently appear only as a role label like "the Petitioner" / "the
+    employee" / "she", which a literal find-and-replace would miss). Instead set shouldEdit=true
+    for ALL SIX panels (including listOfDates) with a SEMANTIC instruction that preserves the
+    descriptor and any gender clue, e.g.:
+      Name the female employee (the female party, currently referred to as "the Petitioner" / "the
+      employee" / "she") "heena" wherever she is referenced — including role labels; do not require
+      a literal matching token; change nothing else.
+
+    For BOTH the literal-rename and the name-assignment sub-case, also set "isRename": true. For
+    every other kind of edit (line/word add/update/delete, rephrase, remove a sentence), set
+    "isRename": false.
 {scoped_panel_rule}
 Return JSON only — no markdown, no commentary."""
 
@@ -4181,6 +4930,9 @@ Return JSON only — no markdown, no commentary."""
                 "reportCaseSummary": _slot("reportCaseSummary"),
                 "strategicObjective": _slot("strategicObjective"),
                 "possibleNextSteps": _slot("possibleNextSteps"),
+                "analysisReport": _slot("analysisReport"),
+                "listOfDates": _slot("listOfDates"),
+                "isRename": bool(data.get("isRename") is True),
                 "isQuestionLike": bool(data.get("isQuestionLike") is True),
             }
             # If the model marked it as a question AND also flagged an edit,
@@ -4192,16 +4944,20 @@ Return JSON only — no markdown, no commentary."""
                     "reportCaseSummary",
                     "strategicObjective",
                     "possibleNextSteps",
+                    "analysisReport",
+                    "listOfDates",
                 ):
                     result[k] = {"shouldEdit": False, "instruction": ""}
             logger.info(
-                "Panel-edit classifier: msg_len={} isQuestion={} caseSummary={} reportCaseSummary={} strategicObjective={} possibleNextSteps={}",
+                "Panel-edit classifier: msg_len={} isQuestion={} caseSummary={} reportCaseSummary={} strategicObjective={} possibleNextSteps={} analysisReport={} listOfDates={}",
                 len(msg),
                 result["isQuestionLike"],
                 "yes" if result["caseSummary"]["shouldEdit"] else "no",
                 "yes" if result["reportCaseSummary"]["shouldEdit"] else "no",
                 "yes" if result["strategicObjective"]["shouldEdit"] else "no",
                 "yes" if result["possibleNextSteps"]["shouldEdit"] else "no",
+                "yes" if result["analysisReport"]["shouldEdit"] else "no",
+                "yes" if result["listOfDates"]["shouldEdit"] else "no",
             )
             return result
         except Exception as e:
@@ -4599,6 +5355,7 @@ DOCUMENTS (in upload order; last document is most recent):
 {}
 
 OBJECTIVE-ALIGNMENT RULES (MANDATORY):
+- The CURRENT STRATEGIC OBJECTIVE is the PRIMARY lens. EVERY strength, weakness, risk and missingInfo item MUST be about ACHIEVING THIS objective, using the annexures as evidence. Do NOT carry over or retain analysis framed for a different or earlier objective — if the objective is "divorce", analyse the divorce posture (grounds, cruelty/desertion, custody, maintenance, evidence of breakdown), NOT an unrelated factual angle (e.g. recovering stolen property) unless that fact directly advances the divorce objective.
 - If CURRENT STRATEGIC OBJECTIVE is provided, align analysis to it while staying faithful to annexure facts.
 - Evaluate objective feasibility using annexure evidence: strengths/weaknesses/risks must explicitly reflect what helps or blocks that objective.
 - missingInfo should prioritize gaps that are critical to execute that objective.
@@ -4798,12 +5555,16 @@ caseResolutionScore must follow STRICT logic:
 
 If ANY of those contain items → score must be < 100.
 
-Suggested scoring logic:
+Scoring logic (ALWAYS START FROM 100, then subtract):
+- Start at 100.
 - Each missingInfo item: -5
 - Each weakness: -5
 - Each risk: -3
 
-Cap score between 0 and 100.
+The score is the integer result of that subtraction. NEVER output 0 for a case
+that has any strengths or analysed content — clamp the final value between 30 and 100.
+caseResolutionScore is REQUIRED and MUST be a plain integer (e.g. 72), never null,
+never a string, never with a "%" sign.
 
 --------------------------------------------------
 OUTPUT JSON STRUCTURE
@@ -5406,18 +6167,44 @@ Rules:
                     "Appropriate forum to be confirmed from territorial and subject-matter nexus in annexures."
                 ]
 
-            score = data.get("caseResolutionScore") or data.get("case_resolution_score")
-            try:
-                case_resolution_score = max(
-                    0, min(100, int(score) if score is not None else 0)
-                )
-            except (TypeError, ValueError):
-                case_resolution_score = 0
+            raw_score = data.get("caseResolutionScore")
+            if raw_score is None:
+                raw_score = data.get("case_resolution_score")
+            # Robust parse: accept int/float, and pull the first integer out of
+            # strings like "72", "72%", "Approximately 70%". None when missing
+            # or unparseable.
+            if isinstance(raw_score, bool):
+                parsed_score: Optional[int] = None
+            elif isinstance(raw_score, (int, float)):
+                parsed_score = int(raw_score)
+            elif isinstance(raw_score, str):
+                _score_match = re.search(r"\d+", raw_score)
+                parsed_score = int(_score_match.group()) if _score_match else None
+            else:
+                parsed_score = None
             # Cap at 95% when Missing Info / Risks / Weaknesses still have items (100% only when all empty)
             max_allowed = self._analysis_report_max_allowed_score(
                 missing_info=missing_info, weaknesses=weaknesses, risks=risks
             )
-            case_resolution_score = min(case_resolution_score, max_allowed)
+            if parsed_score is None or parsed_score <= 0:
+                # The model omitted / zeroed / mangled the score, or its JSON was
+                # truncated. This report always carries real content here
+                # (weaknesses/risks are force-filled just above), so it must
+                # never display 0% — derive a score from the documented logic.
+                case_resolution_score = self._derive_case_resolution_score(
+                    missing_info=missing_info,
+                    weaknesses=weaknesses,
+                    risks=risks,
+                    max_allowed=max_allowed,
+                )
+                logger.warning(
+                    "Analysis report: model returned invalid/zero score ({!r}); "
+                    "derived {}% from content",
+                    raw_score,
+                    case_resolution_score,
+                )
+            else:
+                case_resolution_score = max(0, min(parsed_score, max_allowed))
 
             quality_score_explanation = (
                 data.get("qualityScoreExplanation")
@@ -5794,6 +6581,12 @@ Rules:
             current_year = today_str[:4]
             list_of_dates_inventory = self._build_document_inventory(workspace_id)
             prompt = f"""You are a legal case analyst. From the following annexures, extract a chronological list of FACTUAL, CASE-RELEVANT dates and events.
+
+{ENGLISH_ONLY_OUTPUT_DIRECTIVE}
+
+{APP_BRAND_EXCLUSION_DIRECTIVE}
+
+{NAME_CAPITALISATION_DIRECTIVE}
 
 **Today's date**: {today_str} (current year is {current_year}). Anchor every relative or partial date against this.
 
@@ -6537,10 +7330,17 @@ Example shape:
                 if _is_garbage_text_local(raw_title) or _is_garbage_text_local(raw_desc):
                     continue
 
-                # Trim description to a single concise sentence (hard cap 120 chars)
-                if raw_desc:
-                    first_sentence = re.split(r"(?<=[.!?])\s", raw_desc)[0]
-                    raw_desc = first_sentence[:120]
+                # Cap the description length WITHOUT splitting on sentence
+                # boundaries — the naive ". " splitter treated abbreviation
+                # periods ("Model No.", "Serial No.", "SRF No.", "Rs.") as
+                # sentence ends and chopped descriptions mid-clause (e.g.
+                # "...received the IWC (Model No. /Serial No."). Keep the full
+                # description and only trim at a word boundary if it is unusually
+                # long (the prompt already targets 1-2 short sentences).
+                if raw_desc and len(raw_desc) > 350:
+                    raw_desc = (
+                        raw_desc[:350].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
+                    )
 
                 # Drop entries with a description too short to be meaningful
                 if raw_desc and len(raw_desc.strip()) < 8:
@@ -6746,7 +7546,9 @@ Example shape:
                 len(result),
                 workspace_id[:12] if workspace_id else "",
             )
-            return result
+            # Strip the application's own brand/platform name from every entry
+            # (title / description / evidenceSnippet) before caching/emitting.
+            return scrub_app_brand(result)
 
         except Exception as e:
             logger.warning("List of dates generation failed: {}", e)
@@ -7146,7 +7948,9 @@ Example shape:
             )
             if len(normalized) >= 12:
                 break
-        return {"laws": normalized}
+        # Final safety net: never surface the application's own brand/platform
+        # name in any law row (central chokepoint for the applicable_laws path).
+        return scrub_app_brand({"laws": normalized})
 
     def _heuristic_applicable_laws_fallback(
         self, evidence_snippet: str
@@ -7495,8 +8299,14 @@ Example shape:
         workspace_role: str,
         signals: Dict[str, Any],
         search_results: List[Dict[str, str]],
+        objective_context: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Generate final laws list JSON from case signals + search context."""
+        """Generate final laws list JSON from case signals + search context.
+
+        When ``objective_context`` (the current strategic objective) is provided,
+        the law selection is steered toward that objective/perspective so a
+        perspective change re-derives the relevant statutes.
+        """
         from app.ai.gemini_client import gemini_client
 
         sources_text = []
@@ -7511,6 +8321,22 @@ Example shape:
         )
         targeted_acts_block = format_targeted_acts_for_prompt()
         targeted_acts_count = len(TARGETED_INDIAN_ACTS)
+        objective_block = (
+            (
+                "CURRENT STRATEGIC OBJECTIVE / CASE PERSPECTIVE — this is the PRIMARY lens for "
+                "selecting laws. Select ONLY statutes that ADVANCE this objective. Treat the case "
+                "facts/evidence as support for the objective — do NOT list statutes that merely "
+                "address the underlying factual incident (e.g. a theft, an accident) UNLESS they "
+                "directly serve the objective. When the objective is matrimonial (divorce, "
+                "judicial separation, custody, maintenance, restitution), prioritise "
+                "matrimonial/family law (e.g. Hindu Marriage Act, 1955; Guardians and Wards Act; "
+                "maintenance provisions) and DROP unrelated offence statutes. If the objective "
+                "shifts perspective, the law list must shift with it — drop laws that only fit the "
+                "earlier perspective:\n" + objective_context.strip()
+            )
+            if objective_context and objective_context.strip()
+            else ""
+        )
         prompt = f"""
 You are an Indian legal research assistant.
 Return ONLY one valid JSON object with this exact shape:
@@ -7582,6 +8408,7 @@ If — and only if — a fact in the documents is clearly governed by an Indian 
 
 Workspace role: {workspace_role}
 Workspace title: {signals.get("workspaceTitle","")}
+{objective_block}
 Search query: {signals.get("query","")}
 Case keywords: {", ".join(signals.get("keywords", []))}
 Document evidence snippet:
@@ -7643,19 +8470,33 @@ Indian Kanoon / case-law search results:
         workspace_id: str,
         user_id: str,
         workspace_role: Optional[str] = None,
+        *,
+        objective_context: Optional[str] = None,
+        merge_with_previous: bool = True,
     ) -> None:
-        """Generate and emit document_feature_response with featureType applicable_laws."""
+        """Generate and emit document_feature_response with featureType applicable_laws.
+
+        ``objective_context`` (the current strategic objective) steers law
+        selection and the Indian Kanoon search query so a case-perspective change
+        (e.g. divorce -> judicial separation) re-derives the relevant statutes.
+        ``merge_with_previous=False`` REPLACES the cached laws instead of unioning
+        them — used on an objective change so stale laws from the old perspective
+        are dropped.
+        """
         role = (workspace_role or "ADJUDICATOR").strip().upper()
         logger.info(
             "Applicable laws: generation started for workspace {}",
             workspace_id[:12] if workspace_id else "",
         )
         signals = await self._extract_case_signals_from_documents(workspace_id, user_id)
-        search_results = await self._search_indiankanoon(signals.get("query", ""))
+        # Bias the search query toward the new objective when provided, so a
+        # perspective change actually changes which case-law is fetched.
+        search_query = signals.get("query", "")
+        if objective_context:
+            search_query = (f"{objective_context} {search_query}").strip()[:400]
+        search_results = await self._search_indiankanoon(search_query)
         if not search_results:
-            search_results = await vertex_search_indiankanoon(
-                signals.get("query", "")
-            )
+            search_results = await vertex_search_indiankanoon(search_query)
         logger.info(
             "Applicable laws: gathered {} search result(s) for workspace {}",
             len(search_results),
@@ -7667,13 +8508,18 @@ Indian Kanoon / case-law search results:
             workspace_role=role,
             signals=signals,
             search_results=search_results,
+            objective_context=objective_context,
         )
-        # Union with the previously cached payload and dedupe so a regeneration
-        # after a transcript edit doesn't drop laws the user has already seen
-        # while still folding in any genuinely new entries.
-        payload = await self._merge_applicable_laws_with_previous(
-            workspace_id, new_payload
-        )
+        if merge_with_previous:
+            # Union with the previously cached payload and dedupe so a regeneration
+            # after a transcript edit doesn't drop laws the user has already seen
+            # while still folding in any genuinely new entries.
+            payload = await self._merge_applicable_laws_with_previous(
+                workspace_id, new_payload
+            )
+        else:
+            # Objective change: replace stale laws with the freshly-derived set.
+            payload = new_payload
         self._workspace_applicable_laws_payload[workspace_id] = payload
         if not self._socket_client:
             return
@@ -7748,7 +8594,9 @@ Indian Kanoon / case-law search results:
                 len(result),
                 workspace_id[:12] if workspace_id else "",
             )
-            return result
+            # Strip the application's own brand/platform name from every
+            # milestone (title / description) before caching/emitting.
+            return scrub_app_brand(result)
         except Exception as e:
             logger.warning("Procedural timeline agent failed: {}", e)
             return []
@@ -9671,15 +10519,34 @@ Return ONLY this JSON, no commentary:
             _cur_score = int(merged.get("caseResolutionScore") or 0)
         except (TypeError, ValueError):
             _cur_score = 0
-        if _cur_score <= 0 and max_allowed >= 100 and merged.get("strengths"):
+        if _cur_score <= 0 and (
+            merged.get("strengths")
+            or merged.get("missingInfo")
+            or merged.get("weaknesses")
+            or merged.get("risks")
+        ):
+            # A populated analysis report must never display 0%. When neither the
+            # previous nor the fresh score is usable, derive one from content
+            # (full allowed score if nothing is pending, otherwise the documented
+            # deduction logic) rather than leaving the stuck 0.
+            if max_allowed >= 100:
+                derived_score = max_allowed
+            else:
+                derived_score = self._derive_case_resolution_score(
+                    missing_info=merged.get("missingInfo")
+                    or merged.get("missing_info"),
+                    weaknesses=merged.get("weaknesses"),
+                    risks=merged.get("risks"),
+                    max_allowed=max_allowed,
+                )
             logger.warning(
-                "Analysis sync merge: score 0 with no pending items for "
-                "workspace {}{}; setting to {}",
+                "Analysis sync merge: score 0 for populated report, workspace "
+                "{}{}; deriving {}",
                 workspace_id,
                 ctx,
-                max_allowed,
+                derived_score,
             )
-            merged["caseResolutionScore"] = max_allowed
+            merged["caseResolutionScore"] = derived_score
         prev_report_score = prev_analysis.get("reportQualityScore")
         if prev_report_score is not None:
             try:
@@ -9751,44 +10618,31 @@ Return ONLY this JSON, no commentary:
     ) -> None:
         ctx = log_context or " (objective change)"
 
-        # 1) Analysis report: regenerate on the new objective, then merge with
-        # the previous cached report using the SAME prev-vs-new LLM merge that
-        # the audio-edit / re-upload path uses. This replaces the older flat
-        # union+dedup logic that was inline here. Behaviour preserved:
-        #   - list fields (missingInfo, weaknesses, risks, pendingActions,
-        #     nextSteps, suggestedDrafts, relevantJurisdiction, strengths)
-        #     get a single Gemini merge per field that keeps prev verbatim and
-        #     appends only genuinely-new items;
-        #   - identity fields (caseTitle, caseCategory, subcategories,
-        #     description, caseType) are preserved from prev;
-        #   - caseResolutionScore / reportQualityScore are preserved from prev
-        #     (then re-capped against the merged list state);
-        #   - qualityScoreExplanation / reportQualityScoreExplanation are
-        #     regenerated from the merged state;
-        #   - rejected-item memory is honoured via `_filter_rejected` inside
-        #     the helper;
-        #   - timestamp + `_normalize_analysis_report_lists` are applied.
-        # Without this swap, paraphrased duplicates from the new objective
-        # generation could leak past the old union+flat-dedup pass.
+        # 1) Analysis report: REGENERATE for the new objective and REPLACE the old
+        # one — do NOT merge with the previous report. A change of objective is a
+        # change of legal PERSPECTIVE (e.g. jewellery-theft → divorce); merging
+        # with the prev report would keep the stale theft strengths/weaknesses/
+        # risks and PRESERVE the old quality score, producing a mixed,
+        # wrong-perspective analysis. The generator already (a) anchors to the new
+        # cached objective, (b) applies OBJECTIVE-ALIGNMENT rules, (c) runs
+        # `_normalize_analysis_report_lists` (which also scrubs the brand), and
+        # (d) computes a fresh caseResolutionScore — so used directly it yields a
+        # fully objective-aligned report with a fresh score and no carryover.
+        # (`_merge_analysis_report_with_previous` is unchanged and still used by
+        # the document re-upload / sync paths, where incremental merge is correct.)
         new_analysis = await self._generate_analysis_report_from_documents(
             workspace_id=workspace_id,
             user_id=user_id,
             workspace_role=workspace_role,
             batch_result=None,
-            is_update=True,
+            is_update=False,
         )
         if not (isinstance(new_analysis, dict) and new_analysis):
             new_analysis = self._analysis_report_fallback(
                 (workspace_role or "ADJUDICATOR").strip().upper()
             )
 
-        merged_analysis = await self._merge_analysis_report_with_previous(
-            workspace_id=workspace_id,
-            workspace_role=workspace_role,
-            new_analysis=new_analysis,
-            log_context=ctx,
-        )
-        self._workspace_analysis_payload[workspace_id] = merged_analysis
+        self._workspace_analysis_payload[workspace_id] = new_analysis
         if self._socket_client:
             await self._socket_client.emit(
                 "document_feature_response",
@@ -9796,67 +10650,154 @@ Return ONLY this JSON, no commentary:
                     "featureType": "analysis_report",
                     "workspaceId": workspace_id,
                     "userId": user_id,
-                    "payload": merged_analysis,
+                    "payload": new_analysis,
                 },
             )
             logger.success(
-                "✅ Objective-change incremental analysis update emitted "
-                "(prev preserved, new points merged, rejections respected){}",
+                "✅ Objective-change analysis update emitted "
+                "(fully regenerated for new objective, prev replaced){}",
                 ctx,
             )
             # Fresh objective-aligned report is emitted; lift suppression so future emits are allowed.
             self._suppress_analysis_emit_until_ts.pop(workspace_id, None)
 
-        # 2) List of dates: preserve existing payload on objective change.
-        # Only regenerate dates when documents are uploaded/deleted.
-        preserved_dates = self._workspace_list_of_dates_payload.get(workspace_id) or []
-        if not isinstance(preserved_dates, list):
-            preserved_dates = []
-        self._workspace_list_of_dates_payload[workspace_id] = preserved_dates
-        if self._socket_client:
-            await self._socket_client.emit(
-                "document_feature_response",
-                {
-                    "featureType": "list_of_dates",
-                    "workspaceId": workspace_id,
-                    "userId": user_id,
-                    "payload": {
+        # The new objective text (set by the strategy regen that ran before this
+        # cascade) drives the list-of-dates relevance re-score and the applicable
+        # laws regeneration below.
+        _strat_now = self._workspace_strategy_payload.get(workspace_id) or {}
+        new_objective_text = (
+            (_strat_now.get("strategicObjective") or "").strip()
+            if isinstance(_strat_now, dict)
+            else ""
+        )
+
+        # 2) List of dates: keep the SAME entries but RE-SCORE their relevance for
+        # the new objective/perspective (Mode 2). No new/removed dates, no text
+        # rewrite. Falls back to a plain preserve-and-re-emit if the re-eval fails
+        # or there is no new objective text to score against.
+        relevance_done = False
+        if new_objective_text:
+            try:
+                relevance_done = await self._reeval_list_of_dates_relevance(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=workspace_role,
+                    objective_text=new_objective_text,
+                )
+            except Exception as rel_err:
+                logger.warning(
+                    "List of dates relevance re-eval failed{}: {}", ctx, rel_err
+                )
+        if not relevance_done:
+            preserved_dates = (
+                self._workspace_list_of_dates_payload.get(workspace_id) or []
+            )
+            if not isinstance(preserved_dates, list):
+                preserved_dates = []
+            self._workspace_list_of_dates_payload[workspace_id] = preserved_dates
+            if self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "list_of_dates",
                         "workspaceId": workspace_id,
                         "userId": user_id,
-                        "listOfDates": preserved_dates,
+                        "payload": {
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "listOfDates": preserved_dates,
+                        },
                     },
-                },
-            )
-            logger.success(
-                "✅ Objective-change preserved list_of_dates re-emitted{}",
-                ctx,
-            )
-            self._log_list_of_dates_outbound(
+                )
+                logger.success(
+                    "✅ Objective-change list_of_dates preserved (relevance re-eval skipped){}",
+                    ctx,
+                )
+
+        # 3) Applicable laws: REGENERATE for the new objective/perspective (Mode 2)
+        # — e.g. divorce → judicial separation changes which statutes apply.
+        # objective_context steers the law selection + search query, and
+        # merge_with_previous=False replaces stale laws instead of unioning them.
+        # Falls back to preserve-and-re-emit on failure.
+        laws_done = False
+        try:
+            await self._generate_and_emit_applicable_laws(
                 workspace_id=workspace_id,
                 user_id=user_id,
-                list_of_dates=preserved_dates,
-                context="objective-change-preserved",
+                workspace_role=workspace_role,
+                objective_context=new_objective_text or None,
+                merge_with_previous=False,
             )
+            laws_done = True
+        except Exception as laws_err:
+            logger.warning(
+                "Applicable laws regeneration failed{}: {}", ctx, laws_err
+            )
+        if not laws_done:
+            preserved_laws = (
+                self._workspace_applicable_laws_payload.get(workspace_id) or {}
+            )
+            if not isinstance(preserved_laws, dict):
+                preserved_laws = {}
+            self._workspace_applicable_laws_payload[workspace_id] = preserved_laws
+            if self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "applicable_laws",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": preserved_laws,
+                    },
+                )
+                logger.success(
+                    "✅ Objective-change applicable_laws preserved (regeneration skipped){}",
+                    ctx,
+                )
 
-        # 3) Applicable laws: preserve existing payload on objective change.
-        # Only regenerate laws when documents are uploaded/deleted.
-        preserved_laws = self._workspace_applicable_laws_payload.get(workspace_id) or {}
-        if not isinstance(preserved_laws, dict):
-            preserved_laws = {}
-        self._workspace_applicable_laws_payload[workspace_id] = preserved_laws
+        # 4) Upcoming dates (procedural timeline): preserve existing payload on
+        # objective change — same preserve-and-re-emit pattern as list_of_dates /
+        # applicable_laws above. Only regenerate the timeline when documents are
+        # uploaded/deleted, never on an objective change.
+        preserved_timeline = (
+            self._workspace_procedural_timeline_payload.get(workspace_id) or []
+        )
+        if not isinstance(preserved_timeline, list):
+            preserved_timeline = []
+        self._workspace_procedural_timeline_payload[workspace_id] = preserved_timeline
         if self._socket_client:
             await self._socket_client.emit(
                 "document_feature_response",
                 {
-                    "featureType": "applicable_laws",
+                    "featureType": "procedural_timeline",
                     "workspaceId": workspace_id,
                     "userId": user_id,
-                    "payload": preserved_laws,
+                    "payload": {"proceduralTimeline": preserved_timeline},
                 },
             )
             logger.success(
-                "✅ Objective-change preserved applicable_laws re-emitted{}",
+                "✅ Objective-change preserved procedural_timeline re-emitted{}",
                 ctx,
+            )
+
+        # 5) Drafting Assistant suggested drafts: REGENERATE for the new objective
+        # (Mode 2). It rebuilds its brief from the now-updated caches (case
+        # summary + regenerated strategy/objective + analysis + applicable laws +
+        # dates), so the suggested drafts realign with the new perspective.
+        try:
+            await self._generate_and_emit_drafting_suggestions(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+            )
+            logger.success(
+                "✅ Objective-change drafting suggestions regenerated{}", ctx
+            )
+        except Exception as draft_err:
+            logger.warning(
+                "Objective-change drafting regeneration failed{}: {}",
+                ctx,
+                draft_err,
             )
 
     def _schedule_objective_change_reanalysis(
@@ -10239,6 +11180,10 @@ Return ONLY this JSON, no commentary:
     _ADDED_MISSING_INFO_SCORE_DROP_DEFAULT = 3
     # Max score when Missing Information / Risks / Weaknesses still have items (100% only when all are empty)
     _ANALYSIS_REPORT_MAX_SCORE_WITH_PENDING_ITEMS = 95
+    # Floor for a derived score: an analysed case with real content must never
+    # read as 0% (the model occasionally omits/zeroes the score, or its JSON is
+    # truncated). Used by _derive_case_resolution_score as the safety net.
+    _ANALYSIS_REPORT_DERIVED_SCORE_FLOOR = 30
 
     def _analysis_report_max_allowed_score(
         self,
@@ -10264,6 +11209,35 @@ Return ONLY this JSON, no commentary:
             100
             if not has_pending
             else self._ANALYSIS_REPORT_MAX_SCORE_WITH_PENDING_ITEMS
+        )
+
+    def _derive_case_resolution_score(
+        self,
+        *,
+        missing_info: Optional[List[Any]] = None,
+        weaknesses: Optional[List[Any]] = None,
+        risks: Optional[List[Any]] = None,
+        max_allowed: Optional[int] = None,
+    ) -> int:
+        """
+        Deterministic fallback score, used when the model omits / zeroes /
+        returns an unparseable caseResolutionScore for a populated report.
+
+        Mirrors the prompt's documented scoring logic (start from 100, then
+        −5 per missingInfo, −5 per weakness, −3 per risk) and clamps the result
+        between a floor (so an analysed case never reads 0%) and the
+        pending-items cap.
+        """
+        if max_allowed is None:
+            max_allowed = self._analysis_report_max_allowed_score(
+                missing_info=missing_info, weaknesses=weaknesses, risks=risks
+            )
+        base = 100
+        base -= 5 * len(missing_info or [])
+        base -= 5 * len(weaknesses or [])
+        base -= 3 * len(risks or [])
+        return max(
+            self._ANALYSIS_REPORT_DERIVED_SCORE_FLOOR, min(base, max_allowed)
         )
 
     def _derive_quality_score_explanation(
@@ -10517,6 +11491,11 @@ Return ONLY this JSON, no commentary:
                     point = s.get("point")
                     if isinstance(point, str) and point:
                         s["point"] = _clamp_annexure_references(point, max_annexure)
+        # Final safety net: strip the application's own brand/platform name from
+        # every string in the report (central chokepoint — every analysis-report
+        # generation, sync, marker-removal, and surgical-edit path runs through
+        # here before caching/emitting).
+        report = scrub_app_brand(report)
         return report
 
     def _record_rejected_analysis_item(
@@ -12827,21 +13806,28 @@ Indian Kanoon / search results (titles and snippets):
         except Exception as e:
             logger.warning("template_sync_response: could not dump raw payload: {}", e)
 
-        if not user_id:
-            logger.warning("template_sync_response: missing userId — dropping event")
-        else:
-            ingested = await self._ingest_template_items(user_id, templates)
-            logger.success(
-                "📚 template_sync_response ingested {}/{} template(s) for user={}",
-                ingested,
-                len(templates),
-                user_id[:12],
+        try:
+            if not user_id:
+                logger.warning(
+                    "template_sync_response: missing userId — dropping event"
+                )
+            else:
+                ingested = await self._ingest_template_items(user_id, templates)
+                logger.success(
+                    "📚 template_sync_response ingested {}/{} template(s) for user={}",
+                    ingested,
+                    len(templates),
+                    user_id[:12],
+                )
+        finally:
+            # Always resolve the awaiting future — even if ingestion raised — so
+            # ensure_templates_synced (which now waits with no hard time cap)
+            # can never hang indefinitely on a failed ingest.
+            fut = (
+                self._pending_template_sync.get(request_id) if request_id else None
             )
-
-        # Resolve the awaiting future so the suggestion/kickoff path can proceed.
-        fut = self._pending_template_sync.get(request_id) if request_id else None
-        if fut is not None and not fut.done():
-            fut.set_result(True)
+            if fut is not None and not fut.done():
+                fut.set_result(True)
 
         # If this snapshot arrived late (after the ensure_templates_synced
         # timeout) and grew the library, regenerate any drafting panels that
@@ -12850,17 +13836,23 @@ Indian Kanoon / search results (titles and snippets):
             await self._maybe_reemit_drafting_on_templates(user_id)
 
     async def ensure_templates_synced(
-        self, user_id: str, *, timeout: float = 30.0
+        self, user_id: str, *, timeout: Optional[float] = None
     ) -> None:
         """Make sure the in-memory template store is warm for ``user_id``.
 
         If the store already has templates for the user (delta events keep it
         fresh within a session), this is a no-op. Otherwise it emits
         ``request_template_sync`` and awaits the ``template_sync_response``
-        snapshot (resolved in :meth:`on_template_sync_response`) up to
-        ``timeout`` seconds, so a cold cache (e.g. right after an AI restart)
-        is filled before template matching runs. Times out gracefully —
-        callers proceed with whatever is in the store.
+        snapshot (resolved in :meth:`on_template_sync_response` only AFTER the
+        templates finish ingesting), so a cold cache (e.g. right after an AI
+        restart) is fully filled before template matching runs.
+
+        ``timeout`` is ``None`` by default: there is NO hard time cap, because a
+        template PDF can take longer than any fixed limit to OCR/ingest, and
+        cutting off early made matching run against an empty library. The future
+        is always resolved by ``on_template_sync_response`` (even if ingestion
+        fails), so this await cannot hang indefinitely. Pass an explicit
+        ``timeout`` only if a caller deliberately wants to bound the wait.
         """
         if not user_id or not self._socket_client:
             return
@@ -12886,7 +13878,11 @@ Indian Kanoon / search results (titles and snippets):
                 user_id[:12],
                 request_id,
             )
-            await asyncio.wait_for(fut, timeout=timeout)
+            if timeout is None:
+                # No hard time cap — wait until templates are fully ingested.
+                await fut
+            else:
+                await asyncio.wait_for(fut, timeout=timeout)
             logger.info(
                 "✅ template snapshot received for user={} (requestId={})",
                 user_id[:12],
@@ -13084,6 +14080,12 @@ Indian Kanoon / search results (titles and snippets):
                 if attempt == 0:
                     prompt = f"""You are summarizing a legal case document. The document may be in Hindi, English, or mixed languages.
 
+{ENGLISH_ONLY_OUTPUT_DIRECTIVE}
+
+{APP_BRAND_EXCLUSION_DIRECTIVE}
+
+{NAME_CAPITALISATION_DIRECTIVE}
+
 TASK: Write a SHORT CASE SUMMARY in English. Requirements:
 - Exactly 3 or 4 lines. Each line = one short sentence (max 120 characters).
 - Line 1: Name the ACTUAL parties (real names of people/organizations) and the SPECIFIC dispute or issue (e.g. "contract breach", "social media hacking", "defamation", "cricket association dispute").
@@ -13107,6 +14109,12 @@ Document content:
 Case summary (3-4 lines, one sentence per line):"""
                 else:
                     prompt = f"""CRITICAL: Your previous response was too generic. For the SAME document below, write a SPECIFIC case summary.
+
+{ENGLISH_ONLY_OUTPUT_DIRECTIVE}
+
+{APP_BRAND_EXCLUSION_DIRECTIVE}
+
+{NAME_CAPITALISATION_DIRECTIVE}
 
 You MUST extract REAL information:
 - Line 1: Find and name the ACTUAL complainant/petitioner and respondent/defendant from the document (e.g. if document says "Umesh Malik" or "BCCI" or "Karnataka State Cricket Association", USE THOSE NAMES). Then state the SPECIFIC dispute type (e.g. "social media account hacking", "contract violation", "defamation", "cricket association dispute").
@@ -13214,7 +14222,7 @@ Specific case summary (3-4 lines, one sentence per line):"""
                     "Successfully generated case-specific description (attempt {})",
                     attempt + 1,
                 )
-                return summary
+                return scrub_app_brand(summary)
 
             logger.error(
                 "Failed to generate case-specific description after {} attempts", 2
@@ -13258,6 +14266,12 @@ Specific case summary (3-4 lines, one sentence per line):"""
             doc_content = combined[:3000].replace("--- Document", "\nDocument")
             prompt = f"""Summarize this legal case in exactly 3-4 short sentences in English. Name the actual parties and the actual dispute. Be specific. Put each sentence on its own line (newline after each sentence).
 
+{ENGLISH_ONLY_OUTPUT_DIRECTIVE}
+
+{APP_BRAND_EXCLUSION_DIRECTIVE}
+
+{NAME_CAPITALISATION_DIRECTIVE}
+
 {doc_content}
 
 Summary (3-4 lines, one sentence per line):"""
@@ -13299,7 +14313,7 @@ Summary (3-4 lines, one sentence per line):"""
             if self._is_valid_short_summary(
                 summary
             ) and not self._is_generic_description(summary):
-                return summary
+                return scrub_app_brand(summary)
             return ""
         except Exception:
             return ""
@@ -13330,7 +14344,7 @@ Summary (3-4 lines, one sentence per line):"""
 
         short_sentences = [s for s in sentences if len(s) <= 120][:4]
         if len(short_sentences) >= 3:
-            return "\n".join(short_sentences[:4])
+            return scrub_app_brand("\n".join(short_sentences[:4]))
         return "Legal matter based on uploaded documents.\nThe case involves parties and issues requiring legal review.\nThe matter requires appropriate legal action.\nSupporting documents provide further context."
 
     def _ensure_metadata_complete(
@@ -14885,6 +15899,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 "analysis_report",
                                 "list_of_dates",
                                 "applicable_laws",
+                                "procedural_timeline",
                             ],
                         )
                     except Exception as refresh_err:
@@ -16641,6 +17656,13 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                     "case summary", "report summary", "objective", "strategy",
                     "next step", "action item", " step", " steps", "summary",
                     "wording", "wordings", "phrasing", "language",
+                    "analysis report", "analysis", "report", "strength",
+                    "strengths", "weakness", "weaknesses", "risk", "risks",
+                    "missing info", "missing information",
+                    # Rename / find-and-replace cues — a workspace-wide rename
+                    # ("correct the name X with Y") names no panel but must still
+                    # reach the classifier (rule 12 fans it out to all panels).
+                    "name", "spelling", "rename", "everywhere", "workspace",
                 )
                 _um_lower = um_early.lower()
                 _maybe_edit = (
@@ -16682,6 +17704,41 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         classification = {}
 
                     if classification and not classification.get("isQuestionLike"):
+                        # WORKSPACE-WIDE RENAME: a name change must replace the
+                        # party's name in the EXISTING content of EVERY panel
+                        # (no regeneration). Don't rely on the LLM flagging each
+                        # panel — force the SAME rename instruction onto all of
+                        # them so coverage is exhaustive and deterministic.
+                        _is_rename = bool(classification.get("isRename"))
+                        if _is_rename:
+                            _rename_instr = next(
+                                (
+                                    (classification.get(k) or {}).get("instruction")
+                                    for k in (
+                                        "strategicObjective",
+                                        "caseSummary",
+                                        "reportCaseSummary",
+                                        "possibleNextSteps",
+                                        "analysisReport",
+                                        "listOfDates",
+                                    )
+                                    if (classification.get(k) or {}).get("instruction")
+                                ),
+                                "",
+                            ) or (um_early or "").strip()
+                            if _rename_instr:
+                                for k in (
+                                    "caseSummary",
+                                    "reportCaseSummary",
+                                    "strategicObjective",
+                                    "possibleNextSteps",
+                                    "analysisReport",
+                                    "listOfDates",
+                                ):
+                                    classification[k] = {
+                                        "shouldEdit": True,
+                                        "instruction": _rename_instr,
+                                    }
                         # Emit a single workspace:refresh up-front so the FE
                         # shows the loading state across all four strategy
                         # fields plus the cascaded panels (analysis_report,
@@ -16691,7 +17748,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         # is visible while Gemini works, and we always use
                         # the FE-recognised reason `objective_change_regeneration_started`
                         # so the loading panel actually appears in the UI.
-                        _any_should_edit = any(
+                        _strategy_should_edit = any(
                             (classification.get(k) or {}).get("shouldEdit") is True
                             for k in (
                                 "caseSummary",
@@ -16700,18 +17757,40 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 "possibleNextSteps",
                             )
                         )
+                        _analysis_should_edit = (
+                            (classification.get("analysisReport") or {}).get(
+                                "shouldEdit"
+                            )
+                            is True
+                        )
+                        _any_should_edit = (
+                            _strategy_should_edit or _analysis_should_edit
+                        )
                         if _any_should_edit:
+                            # Loader for the panels we actually re-emit. A normal
+                            # surgical edit touches only strategy_objective and/or
+                            # analysis_report. A RENAME touches every panel (name
+                            # replaced in existing content), so the loader covers
+                            # them all.
+                            _refresh_features: List[str] = []
+                            if _strategy_should_edit:
+                                _refresh_features.append("strategy_objective")
+                            if _analysis_should_edit:
+                                _refresh_features.append("analysis_report")
+                            if _is_rename:
+                                for _ft in (
+                                    "list_of_dates",
+                                    "applicable_laws",
+                                    "procedural_timeline",
+                                ):
+                                    if _ft not in _refresh_features:
+                                        _refresh_features.append(_ft)
                             try:
                                 await self._emit_workspace_refresh(
                                     workspace_id=workspace_id,
                                     user_id=user_id,
                                     reason="objective_change_regeneration_started",
-                                    feature_types=[
-                                        "strategy_objective",
-                                        "analysis_report",
-                                        "list_of_dates",
-                                        "applicable_laws",
-                                    ],
+                                    feature_types=_refresh_features,
                                 )
                             except Exception as rf_err:
                                 logger.warning(
@@ -16737,6 +17816,11 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 ),
                                 user_feedback=so_slot["instruction"],
                                 current_strategy=cur_strat_for_edit,
+                                # Suppress per-editor emit: the strategy payload is
+                                # emitted ONCE after all strategy fields are edited
+                                # (a rename touches 3 fields → one emit, not three
+                                # partial "Previous version" snapshots in the UI).
+                                emit_result=False,
                             )
                             if ok:
                                 panel_edit_applied.append("strategic objective")
@@ -16776,6 +17860,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                     ),
                                     user_feedback=_combined_instr,
                                     current_strategy=cur_strat_for_edit,
+                                    emit_result=False,
                                 )
                                 if ok:
                                     panel_edit_applied.append("case summary")
@@ -16799,6 +17884,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 ),
                                 user_feedback=ns_slot["instruction"],
                                 current_strategy=cur_strat_for_edit,
+                                emit_result=False,
                             )
                             if ok:
                                 panel_edit_applied.append("possible next steps")
@@ -16806,6 +17892,118 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 logger.warning(
                                     "Possible next steps edit returned False — instruction={!r}",
                                     (ns_slot.get("instruction") or "")[:200],
+                                )
+
+                        ar_slot = classification.get("analysisReport") or {}
+                        if ar_slot.get("shouldEdit") and ar_slot.get("instruction"):
+                            cur_report_for_edit = (
+                                self._workspace_analysis_payload.get(workspace_id)
+                                or {}
+                            )
+                            if (
+                                isinstance(cur_report_for_edit, dict)
+                                and cur_report_for_edit
+                            ):
+                                ok = await self._regenerate_analysis_report_with_feedback(
+                                    workspace_id=workspace_id,
+                                    user_id=user_id,
+                                    workspace_role=(
+                                        role_context.get("role") or "ADJUDICATOR"
+                                    ),
+                                    user_feedback=ar_slot["instruction"],
+                                    current_report=cur_report_for_edit,
+                                )
+                                if ok:
+                                    panel_edit_applied.append("analysis report")
+                                else:
+                                    logger.warning(
+                                        "Analysis report edit returned False — instruction={!r}",
+                                        (ar_slot.get("instruction") or "")[:200],
+                                    )
+
+                        # Mode 1 — name change propagates to List of Dates: replace
+                        # the person's name in the EXISTING dated events only (no
+                        # regeneration, no new/removed dates, relevance untouched).
+                        # listOfDates is flagged ONLY by the rename / name-assignment
+                        # rule (Rule 12), never by a general line edit.
+                        lod_slot = classification.get("listOfDates") or {}
+                        if lod_slot.get("shouldEdit") and lod_slot.get("instruction"):
+                            ok = await self._regenerate_list_of_dates_with_feedback(
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                workspace_role=(
+                                    role_context.get("role") or "ADJUDICATOR"
+                                ),
+                                user_feedback=lod_slot["instruction"],
+                            )
+                            if ok:
+                                panel_edit_applied.append("list of dates")
+                            else:
+                                logger.warning(
+                                    "List of dates name edit returned False — instruction={!r}",
+                                    (lod_slot.get("instruction") or "")[:200],
+                                )
+
+                        # Mode 1 (rename only) — propagate the name change to the
+                        # EXISTING Applicable Laws descriptions and the EXISTING
+                        # Upcoming Dates (Procedural Timeline) entries. Name-only,
+                        # no regeneration, no new/removed laws or milestones. Gated
+                        # on isRename so a normal line edit never touches them.
+                        if _is_rename and _rename_instr:
+                            ok = await self._regenerate_applicable_laws_with_feedback(
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                workspace_role=(
+                                    role_context.get("role") or "ADJUDICATOR"
+                                ),
+                                user_feedback=_rename_instr,
+                            )
+                            if ok:
+                                panel_edit_applied.append("applicable laws")
+                            ok = await self._regenerate_procedural_timeline_with_feedback(
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                workspace_role=(
+                                    role_context.get("role") or "ADJUDICATOR"
+                                ),
+                                user_feedback=_rename_instr,
+                            )
+                            if ok:
+                                panel_edit_applied.append("upcoming dates")
+
+                        # Coalesced strategy emit: the three strategy editors above
+                        # suppressed their own emits (emit_result=False), so the FE
+                        # now receives ONE strategy_objective update for the whole
+                        # edit instead of a partial snapshot per field — which is
+                        # what surfaced as several "Previous version" states during a
+                        # rename. (The analysis report is a separate featureType and
+                        # emits itself once.)
+                        _strategy_panels = (
+                            "strategic objective",
+                            "case summary",
+                            "possible next steps",
+                        )
+                        if (
+                            any(p in panel_edit_applied for p in _strategy_panels)
+                            and self._socket_client
+                        ):
+                            _final_strategy = self._workspace_strategy_payload.get(
+                                workspace_id
+                            )
+                            if isinstance(_final_strategy, dict) and _final_strategy:
+                                await self._socket_client.emit(
+                                    "document_feature_response",
+                                    {
+                                        "featureType": "strategy_objective",
+                                        "workspaceId": workspace_id,
+                                        "userId": user_id,
+                                        "payload": _final_strategy,
+                                    },
+                                )
+                                logger.success(
+                                    "✅ Strategy panel emitted once after edits {} (workspace={})",
+                                    [p for p in panel_edit_applied if p in _strategy_panels],
+                                    workspace_id[:12] if workspace_id else "",
                                 )
 
                         if panel_edit_applied:
@@ -16819,22 +18017,15 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 panel_edit_applied,
                                 workspace_id[:12] if workspace_id else "",
                             )
-                            # Cascade: trigger the existing analysis-report /
-                            # list-of-dates / applicable-laws reanalysis so
-                            # downstream panels reflect the edited strategy.
-                            # Matches the behaviour the user already expects
-                            # from the explicit objective-change flow.
-                            try:
-                                self._schedule_objective_change_reanalysis(
-                                    workspace_id=workspace_id,
-                                    user_id=user_id,
-                                    log_context=" (from chat panel edit)",
-                                )
-                            except Exception as cascade_err:
-                                logger.warning(
-                                    "Cascade reanalysis schedule failed (non-fatal): {}",
-                                    cascade_err,
-                                )
+                            # NOTE: intentionally NO _schedule_objective_change_reanalysis
+                            # here. These are SURGICAL edits — the strategy fields and
+                            # the analysis report were already edited in place above.
+                            # Running the doc-based reanalysis would regenerate the
+                            # analysis report from documents (clobbering the surgical
+                            # edit and re-introducing whatever the user just corrected,
+                            # e.g. a misspelled name). list_of_dates, applicable_laws,
+                            # procedural_timeline and document assessments are
+                            # deliberately left untouched by panel edits.
 
                 # User said yes after we asked whether to update the objective (informal discussion flow)
                 if (
@@ -16873,6 +18064,8 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                     "analysis_report",
                                     "list_of_dates",
                                     "applicable_laws",
+                                    "procedural_timeline",
+                                    "drafting_assistant",
                                 ],
                             )
                             regen_ok = (
@@ -16929,13 +18122,24 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                         if mode == "direct_update" and not is_question_like:
                             objective_instruction = norm_obj or combined_text_for_updates
                         elif mode == "ask_confirmation" and not is_question_like:
-                            implicit_objective_shift_text = (
+                            # Scoped Strategy & Objective chat: a clear objective
+                            # statement here is the user setting the objective, so
+                            # apply it DIRECTLY (regenerate + full 5-panel refresh)
+                            # rather than only offering "do you want to update?".
+                            # Questions are already filtered by
+                            # _is_pure_informational_query, so this won't fire on a
+                            # query. Without this, an ask_confirmation objective
+                            # change skipped the refresh and dates/laws/timeline
+                            # never showed the loader.
+                            objective_instruction = (
                                 norm_obj or combined_text_for_updates
                             )
+                            implicit_objective_shift_text = objective_instruction
                 if (
                     not objective_regen_ok
                     and objective_instruction
                     and chat_type_upper == "STRATEGY_OBJECTIVE"
+                    and not self._is_pure_informational_query(um_early)
                 ):
                     cur_strat = self._workspace_strategy_payload.get(workspace_id)
                     if isinstance(cur_strat, dict) and (
@@ -16950,6 +18154,8 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 "analysis_report",
                                 "list_of_dates",
                                 "applicable_laws",
+                                "procedural_timeline",
+                                "drafting_assistant",
                             ],
                         )
                         objective_regen_ok = (
@@ -17087,6 +18293,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                 if (
                     chat_type_upper == "STRATEGY_OBJECTIVE"
                     and detected_intent_upper == "STRATEGY_CHANGE"
+                    and not self._is_pure_informational_query(payload.content or "")
                 ):
                     cur_strat = self._workspace_strategy_payload.get(workspace_id)
                     if isinstance(cur_strat, dict) and (
@@ -17101,6 +18308,8 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
                                 "analysis_report",
                                 "list_of_dates",
                                 "applicable_laws",
+                                "procedural_timeline",
+                                "drafting_assistant",
                             ],
                         )
                         regen_ok = (

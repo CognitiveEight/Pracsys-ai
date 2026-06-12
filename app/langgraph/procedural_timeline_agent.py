@@ -158,13 +158,31 @@ class ProceduralTimelineState(TypedDict, total=False):
 # Extraction prompt (self-classifying, comprehensive)
 # ---------------------------------------------------------------------------
 
-_EXTRACTION_SYSTEM_INSTRUCTION = """You are an expert Indian legal analyst building the
-PROCEDURAL TIMELINE of a legal matter — the chronological list of KEY LEGAL MILESTONES
-that shape the case, from the earliest legally-relevant event to the latest deadline.
+_EXTRACTION_SYSTEM_INSTRUCTION = """You are an expert Indian legal analyst extracting the
+PROCEDURAL TIMELINE of a legal matter.
 
-The procedural timeline is broader than just "court deadlines". It is the **legal journey**
-of the matter: the critical moments a lawyer would mark on a case timeline when preparing
-a brief.
+PROCEDURAL DATES ONLY. Procedural dates are the timelines set BY A COURT / TRIBUNAL / FORUM
+or BY LAW that control HOW the case moves forward — they decide WHEN each step must happen,
+not who wins. Include ONLY these five kinds of dates:
+  1. Filing deadlines   — the date by which a complaint, written statement, reply, appeal,
+                          etc. must be filed.
+  2. Hearing dates      — dates a court/tribunal/forum has scheduled the matter to be heard
+                          (admission, arguments, evidence, final hearing).
+  3. Evidence deadlines — time limits to submit documents, witness lists, affidavits of
+                          evidence.
+  4. Compliance dates   — dates by which a party must comply with a court/tribunal order
+                          (e.g. "submit documents within 7 days").
+  5. Adjourned / next dates — when a hearing is postponed, the next scheduled date.
+
+DO NOT GENERATE OR INFER (CRITICAL):
+  • Output ONLY procedural dates that are EXPLICITLY present in the document. Do NOT invent,
+    guess, estimate, assume, or fabricate any date or any entry.
+  • Do NOT manufacture procedural dates out of non-court events (a legal/demand notice, a
+    service request, a grievance, a meeting, a purchase, an incident). Those are NOT
+    procedural dates.
+  • If the document contains NO court/law-set procedural date of the five kinds above,
+    return an EMPTY array []. Never pad the timeline — an empty timeline is the correct,
+    expected answer when there are no procedural dates. Quality over quantity.
 """ + "\n\n" + ENGLISH_ONLY_OUTPUT_DIRECTIVE + "\n\n" + APP_BRAND_EXCLUSION_DIRECTIVE + "\n\n" + NAME_CAPITALISATION_DIRECTIVE
 
 
@@ -198,90 +216,60 @@ One week from today: {next_week_str}
 Document name: {doc_name}
 {hint_block}
 ========================================================================
-FIRST — if this is a LEGAL NOTICE, extracting these TWO entries is MANDATORY
+INCLUDE — ONLY these five kinds of COURT / LAW-SET procedural dates
 ========================================================================
 
-If the document contains phrases like "LEGAL NOTICE", "DEMAND NOTICE", "NOTICE
-UNDER SECTION ...", "you are called upon to ...", "within N days from receipt
-of this notice" — you MUST output BOTH of these entries, no matter what else
-you find:
+Output ONLY dates that are EXPLICITLY present in the document and that fit one of these
+five categories. Use ONLY the two types shown ("Deadline" or "Court Hearing").
 
-  A. ISSUANCE OF LEGAL NOTICE (type="Other")
-     → date = the notice issue date.
-     → If the document body has a BLANK placeholder (e.g. "Date: __ March 2026",
-       "Date: ____") OR the date field is ambiguous, USE the FILENAME DATE HINT
-       above. Indian legal-notice filenames conventionally start with a YY-MM-DD,
-       YY MM DD, or YY.MM.DD prefix.
+1. FILING DEADLINES (type="Deadline"):
+   • The date by which a complaint, written statement, reply, appeal, or rejoinder must be
+     filed, as DIRECTED BY A COURT or fixed by law/procedure.
+   • Prefer an EXPLICIT date. Only when the court/law fixes a period anchored to an EXPLICIT
+     court date (e.g. "file the written statement within 30 days of the summons dated
+     12-03-2026") may you compute anchor + period. NEVER compute a deadline from a
+     pre-litigation notice — a notice is not a court date.
 
-  B. LEGAL NOTICE RESPONSE DEADLINE (type="Deadline")
-     → Extract the EXPLICIT deadline date if one is stated (e.g. "close of
-       business on 08 April 2026" → 2026-04-08). This is the preferred source.
-     → Otherwise compute: deadline = notice_date + response_period (e.g. +15 days).
-     → If both are present, the EXPLICIT date wins.
+2. HEARING DATES (type="Court Hearing"):
+   • Any date the matter is listed/scheduled before a court, tribunal, forum, or authority
+     (admission, arguments, evidence, final hearing).
 
-========================================================================
-INCLUDE — dates that belong on the procedural timeline
-========================================================================
+3. EVIDENCE DEADLINES (type="Deadline"):
+   • A court/law time limit to submit documents, witness lists, or affidavits of evidence.
 
-1. PRE-LITIGATION LEGAL MILESTONES (type="Other"):
-   Only events that are LEGALLY-SIGNIFICANT TURNING POINTS — not every documented
-   interaction. Pick at most 1-2 milestones per event-category.
-   Qualifying examples:
-     • The FIRST formal service/complaint request registered (SRF No., ticket no.)
-     • The FIRST formal grievance email/letter invoking legal rights / demanding remedy
-     • Date a statutory/regulatory complaint was lodged (RERA, Consumer Forum intake)
+4. COMPLIANCE DATES (type="Deadline"):
+   • A date by which a party must comply with a COURT / TRIBUNAL ORDER (e.g. "submit
+     documents within 7 days" computed from an EXPLICIT order date).
 
-   DO NOT classify as milestone:
-     • Shipping/courier events: "receipt of item", "return of product", "declaration of
-       return", "protest receipt" — these are commercial logistics, not legal milestones
-     • Intermediate service records, repair progress updates, diagnosis reports
-     • Follow-up emails that merely repeat an earlier grievance
-
-2. NOTICE ISSUANCE (type="Other"):
-   • Date a legal notice / demand notice / statutory notice was SENT by any party.
-   • Title example: "Issuance of Legal Notice".
-
-3. RESPONSE / FILING DEADLINE (type="Deadline"):
-   • Compute: response_deadline = notice_date + response_period (e.g. 30 days).
-     Example: notice dated 13-03-2026 + 26 days → 2026-04-08.
-   • Any court-directed filing deadline (written statement, reply, affidavit).
-   • Any "complaint will be filed within X days" window end date.
-
-4. COURT HEARING DATES (type="Court Hearing"):
-   • Any date the matter is listed before a court, tribunal, forum, or authority.
-   • Also use this type for ADJOURNMENT / NEXT DATE entries (next date set when
-     a matter is adjourned).
-
-5. EVIDENCE DEADLINES (type="Deadline"):
-   • Any deadline for submitting documents, witness lists, affidavits of evidence.
-
-6. COMPLIANCE DATES (type="Deadline"):
-   • Any date by which a party must comply with a court/tribunal order.
-
-7. ACTUAL COURT FILINGS (type="Filing"):
-   • Past dates on which a petition, complaint, written statement, or reply
-     was actually filed in a court / tribunal / forum.
-
-8. CLIENT MEETINGS / CONSULTATIONS (type="Meeting"):
-   • Scheduled meetings, mediation sessions, or consultations.
+5. ADJOURNED / NEXT DATES (type="Court Hearing"):
+   • When a hearing is postponed, the NEXT scheduled date.
 
 ========================================================================
-STRICTLY EXCLUDE — do NOT output any of the following
+STRICTLY EXCLUDE — never output these (they are NOT procedural dates)
 ========================================================================
 
-  ✗ Commercial / product dates:
-      purchase date, delivery date, warranty start/expiry, repair ETA, service warranty,
-      product launch, installation, shipment, account opening, insurance policy period.
-  ✗ Day-to-day events that are NOT legal milestones:
-      phone calls, internal meetings, staff assignments, courier tracking timestamps.
-  ✗ Statutory limitation periods stated abstractly (e.g. "2 years to sue", "3 years from
-      cause of action") — those are NOT concrete dates.
-  ✗ The underlying cause-of-action event itself (e.g. "date the product broke", "date of
-      accident", "date of alleged defect noticed") — unless that same event was formally
-      registered/documented with a reference number, in which case include the registration
-      as a "milestone" (not the occurrence).
-  ✗ Dates more than 3 years in the past OR more than 2 years in the future from today,
-      unless the document EXPLICITLY states that date as a scheduled court/hearing event.
+  ✗ Legal / demand / statutory NOTICE issuance, and any notice response window
+      (pre-litigation — not a court date). Do NOT output "Issuance of Legal Notice" or a
+      computed "notice response deadline".
+  ✗ POLICE-stage events: police complaint, FIR, General Diary (GD) entry, missing-person
+      report, complaint lodged at a police station. These are investigation steps, NOT
+      court/tribunal procedural dates.
+  ✗ LAWYER / CLIENT-side events: engaging or retaining a lawyer/counsel, a consultation or
+      meeting with a lawyer, and any lawyer's INTERNAL deadline (e.g. "consultation report
+      delivery deadline"). A "Deadline" qualifies ONLY if a COURT / TRIBUNAL / FORUM or a
+      STATUTE fixed it — never a lawyer's own/internal deadline.
+  ✗ Reconciliation / settlement attempts between the parties.
+  ✗ Service requests, complaints / grievances, ticket / SRF registrations, follow-up emails.
+  ✗ Client meetings, mediations, consultations, internal or phone calls.
+  ✗ Commercial / product dates: purchase, delivery, warranty start/expiry, repair ETA,
+      shipment, installation, account opening, insurance policy period.
+  ✗ The underlying incident / cause-of-action event itself (accident, defect noticed,
+      payment default, desertion, etc.).
+  ✗ Statutory limitation periods stated abstractly ("2 years to sue", "3 years from cause
+      of action") — those are not concrete dates.
+  ✗ ANY date you would have to GUESS, INFER, ESTIMATE, or FABRICATE. If a real court/law-set
+      procedural date of the five kinds above is not explicitly in the document, output
+      nothing for it.
 
 ========================================================================
 RULES
@@ -323,48 +311,41 @@ RULES
   1c. **Currency / money is NOT a year**. Numbers like "₹2000", "Rs. 7000",
      "$5000" are AMOUNTS in the case (salary, fines, transaction values), NOT
      year references. Never use a currency amount as a year for any date.
-  2. Include both past and future dates — past milestones give the case its chronology,
-     future dates are upcoming deadlines.
-  3. "Milestone vs. commercial event" test: ask "Did this date create a legal record,
-     or was it just a commercial transaction?" Only legal records qualify as milestones.
-  4. If the document is a photo / receipt / product spec / warranty card / internal memo
-     / chat log with no legal-milestone content, return [].
-  5. Output at most 8 entries per document — pick the most important ones.
+  2. Include both past and future procedural dates (a hearing already held, an upcoming
+     deadline) — but ONLY court/law-set procedural dates of the five kinds above.
+  3. Court-set-date test: ask "Did a COURT/TRIBUNAL or the LAW fix this date to control how
+     the case proceeds?" If not, it is NOT a procedural date — exclude it.
+  4. If the document contains no court/law-set procedural date (e.g. a photo, receipt,
+     product spec, warranty card, internal memo, chat log, or a pre-litigation notice),
+     return []. Do NOT invent entries to fill the timeline.
+  5. Output at most 8 entries per document — only genuine procedural dates.
 
 --- DOCUMENT START ---
 {excerpt}
 --- DOCUMENT END ---
 
 Return ONLY a JSON array. Each entry must have exactly these fields:
-  "title"       : 3–6 words naming the milestone/step
-                  (e.g. "Service Registration", "Formal Grievance Initiated",
-                        "Issuance of Legal Notice", "Legal Notice Response Deadline",
-                        "Next Hearing — Arguments")
-  "date"        : YYYY-MM-DD (computed if relative)
-  "description" : one sentence ≤ 20 words describing the event/obligation
-  "type"        : EXACTLY one of these five values (case-sensitive):
-                    "Court Hearing" — court / tribunal hearings, adjournments, next dates
-                    "Deadline"      — any obligation deadline (response, filing, evidence,
-                                       compliance, statutory response window)
-                    "Filing"        — an ACTUAL past filing event in a court / tribunal
-                                       (petition filed, written statement filed, reply filed)
-                    "Meeting"       — scheduled meetings, mediations, consultations
-                    "Other"         — pre-litigation milestones, legal-notice issuance,
-                                       service registrations, formal grievances, anything
-                                       that does not clearly fit the other four buckets
+  "title"       : 3–6 words naming the procedural step
+                  (e.g. "Next Hearing — Arguments", "Written Statement Deadline",
+                        "Evidence Submission Deadline", "Compliance — Document Submission",
+                        "Adjourned — Next Date")
+  "date"        : YYYY-MM-DD (computed only from an explicit court-set period anchored to an
+                  explicit court date)
+  "description" : one sentence ≤ 20 words describing the procedural obligation/hearing
+  "type"        : EXACTLY one of these two values (case-sensitive):
+                    "Court Hearing" — scheduled hearings, adjournments, next dates
+                    "Deadline"      — filing / evidence / compliance deadlines fixed by a
+                                       court or by law
   "pageNumber"  : OPTIONAL integer — when the document contains page markers
                    ("--- Page N ---" or "-- N of M --"), set this to the page
                    on which the supporting text for this entry appears. Omit
                    if the document has no page markers (e.g. an audio
                    transcript or a single-page note).
-  "isIncident"  : OPTIONAL boolean — true ONLY when this entry describes a
-                   factual past wrongdoing/incident (rare on a procedural
-                   timeline; usually false). Default false when omitted.
-  "relevance"   : OPTIONAL one of "High" | "Medium" | "Low" — High for
-                   imminent deadlines, hearings and notice issuance; Medium
-                   for general milestones; Low for ancillary steps.
+  "isIncident"  : OPTIONAL boolean — always false on a procedural timeline; omit.
+  "relevance"   : OPTIONAL one of "High" | "Medium" | "Low" — High for imminent
+                   deadlines and hearings; Medium otherwise.
 
-If no qualifying entries exist in this document, return [].
+If no qualifying procedural date exists in this document, return [].
 Output ONLY the JSON array — no markdown fences, no commentary."""
 
 
@@ -599,54 +580,43 @@ class ProceduralTimelineAgent:
             else "DOCUMENT INVENTORY: (no classified inventory available)\n\n"
         )
 
-        prompt = f"""You are consolidating a legal case timeline. Below is a RAW list of
-timeline entries extracted from multiple documents of the SAME legal matter. Many entries
-describe the SAME underlying event but were phrased differently across documents.
+        prompt = f"""You are consolidating a legal case PROCEDURAL TIMELINE. Below is a RAW list
+of entries extracted from multiple documents of the SAME legal matter. A procedural date is a
+timeline set BY A COURT / TRIBUNAL / FORUM or BY LAW that controls how the case moves forward —
+ONLY these five kinds qualify: (1) filing deadlines, (2) hearing dates, (3) evidence deadlines,
+(4) compliance dates, (5) adjourned / next dates.
 
 Today's date: {today_str}
 
-{inventory_block}TASK — produce the CLEAN legal timeline by:
-  1. MERGING near-duplicates: if two or more entries describe the same real-world event
-     (within ~10 days of each other AND semantically equivalent — e.g. "Service
-     Registration" vs "Formal Service Request Registered"), KEEP ONLY ONE. Pick the
-     clearest, most authoritative title and the most precise date.
-  2. DROPPING commercial/logistics events that slipped through:
-       • shipping/courier events (receipt of item, return of product, "under protest")
-       • intermediate repair/diagnosis updates
-       • warranty/delivery/purchase events
-  3. PRESERVING every unique legal-journey event:
-       • First service registration / first formal complaint  (type="Other")
-       • First formal grievance / demand letter               (type="Other")
-       • Legal notice issuance                                (type="Other")
-       • Response / filing / compliance / evidence deadlines  (type="Deadline")
-       • Court hearings, adjournments, next-date orders       (type="Court Hearing")
-       • Actual past court filings                            (type="Filing")
-       • Scheduled meetings / consultations                   (type="Meeting")
-  4. **MANDATORY** — if any raw entry concerns a LEGAL NOTICE (title contains
-     "Notice", description mentions a legal/demand/statutory notice), OR any
-     source-doc name starts with a legal-notice filename prefix
-     (e.g. "YY MM DD Legal Notice..."), the final timeline MUST contain BOTH:
-       (a) an "Issuance of Legal Notice" entry (type="Other") on the notice date.
-           If the notice date is not explicit in the raw entries, derive it from the
-           filename prefix (e.g. "26 03 13 Legal Notice ..." → 2026-03-13).
-       (b) a "Legal Notice Response Deadline" entry (type="Deadline"). Prefer any
-           explicit deadline mentioned in source descriptions; otherwise compute
-           notice_date + 15 days (common Indian statutory period) or + 30 days.
-     Do NOT skip these two entries even if no raw entry listed them — infer them.
-  5. Keep AT MOST 6-8 entries total. Prioritise events in this order:
-       response/filing deadlines > court hearings > legal-notice issuance >
-       first formal grievance > first service registration > everything else.
+{inventory_block}TASK — produce the CLEAN procedural timeline by:
+  1. MERGING near-duplicates: if two entries describe the same court/law-set procedural date
+     (within ~10 days AND semantically equivalent), KEEP ONLY ONE — the clearest title and the
+     most precise date.
+  2. DROPPING every entry that is NOT one of the five procedural kinds, including:
+       • legal/demand/statutory NOTICE issuance and notice response windows (pre-litigation)
+       • service requests, complaints/grievances, ticket/SRF registrations, follow-up emails
+       • client meetings, mediations, consultations
+       • commercial/logistics events (purchase, delivery, warranty, repair, shipping, "under protest")
+       • the underlying incident / cause of action
+  3. KEEPING ONLY genuine court/law-set procedural dates:
+       • Filing / evidence / compliance deadlines               (type="Deadline")
+       • Court hearings, adjournments, next-date orders          (type="Court Hearing")
+  4. DO NOT INVENT OR INFER any entry. Use ONLY dates explicitly present in the raw entries.
+     NEVER fabricate a "legal notice issuance" or a "notice response deadline", and never
+     compute a deadline from a notice date or a filename. If a raw entry is not one of the
+     five procedural kinds, drop it — do not convert it.
+  5. If NONE of the raw entries is a court/law-set procedural date, return an EMPTY array [].
+     An empty timeline is correct — never pad it.
 
 RAW ENTRIES:
 {entries_json}
 
-OUTPUT — ONLY a JSON array of the consolidated entries, sorted chronologically (oldest
-first). Each entry:
-  "title"       : 3–6 words (concise, authoritative)
+OUTPUT — ONLY a JSON array of the consolidated procedural entries, sorted chronologically
+(oldest first). Each entry:
+  "title"       : 3–6 words (concise)
   "date"        : YYYY-MM-DD
   "description" : one sentence ≤ 20 words
-  "type"        : EXACTLY one of (case-sensitive):
-                    "Court Hearing" | "Deadline" | "Filing" | "Meeting" | "Other"
+  "type"        : EXACTLY one of (case-sensitive): "Court Hearing" | "Deadline"
 
 Output ONLY the JSON array — no markdown fences, no commentary."""
 
@@ -993,6 +963,20 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
                     "Procedural timeline: ❌ dropped (unrecognised type '{}') "
                     "title='{}' date={}",
                     item.get("type", ""), title, date_val,
+                )
+                continue
+
+            # Procedural timeline carries ONLY court/law-set procedural dates
+            # (the five categories), which map to exactly these two types. Drop
+            # anything the model labelled Filing / Meeting / Other (notice
+            # issuance, grievances, service registrations, meetings, past
+            # filings) — defense-in-depth so a non-procedural entry can never
+            # reach the panel even if it slipped past the prompt.
+            if raw_type not in ("Court Hearing", "Deadline"):
+                logger.info(
+                    "Procedural timeline: ❌ dropped (non-procedural type '{}') "
+                    "title='{}' date={}",
+                    raw_type, title, date_val,
                 )
                 continue
 

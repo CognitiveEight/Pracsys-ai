@@ -5355,6 +5355,7 @@ DOCUMENTS (in upload order; last document is most recent):
 {}
 
 OBJECTIVE-ALIGNMENT RULES (MANDATORY):
+- The CURRENT STRATEGIC OBJECTIVE is the PRIMARY lens. EVERY strength, weakness, risk and missingInfo item MUST be about ACHIEVING THIS objective, using the annexures as evidence. Do NOT carry over or retain analysis framed for a different or earlier objective — if the objective is "divorce", analyse the divorce posture (grounds, cruelty/desertion, custody, maintenance, evidence of breakdown), NOT an unrelated factual angle (e.g. recovering stolen property) unless that fact directly advances the divorce objective.
 - If CURRENT STRATEGIC OBJECTIVE is provided, align analysis to it while staying faithful to annexure facts.
 - Evaluate objective feasibility using annexure evidence: strengths/weaknesses/risks must explicitly reflect what helps or blocks that objective.
 - missingInfo should prioritize gaps that are critical to execute that objective.
@@ -8322,10 +8323,16 @@ Example shape:
         targeted_acts_count = len(TARGETED_INDIAN_ACTS)
         objective_block = (
             (
-                "CURRENT STRATEGIC OBJECTIVE / CASE PERSPECTIVE — prioritise statutes that "
-                "serve THIS objective and DROP laws that only fit a different perspective "
-                "(e.g. for judicial separation, prefer the separation provisions over the "
-                "divorce ones):\n" + objective_context.strip()
+                "CURRENT STRATEGIC OBJECTIVE / CASE PERSPECTIVE — this is the PRIMARY lens for "
+                "selecting laws. Select ONLY statutes that ADVANCE this objective. Treat the case "
+                "facts/evidence as support for the objective — do NOT list statutes that merely "
+                "address the underlying factual incident (e.g. a theft, an accident) UNLESS they "
+                "directly serve the objective. When the objective is matrimonial (divorce, "
+                "judicial separation, custody, maintenance, restitution), prioritise "
+                "matrimonial/family law (e.g. Hindu Marriage Act, 1955; Guardians and Wards Act; "
+                "maintenance provisions) and DROP unrelated offence statutes. If the objective "
+                "shifts perspective, the law list must shift with it — drop laws that only fit the "
+                "earlier perspective:\n" + objective_context.strip()
             )
             if objective_context and objective_context.strip()
             else ""
@@ -10611,44 +10618,31 @@ Return ONLY this JSON, no commentary:
     ) -> None:
         ctx = log_context or " (objective change)"
 
-        # 1) Analysis report: regenerate on the new objective, then merge with
-        # the previous cached report using the SAME prev-vs-new LLM merge that
-        # the audio-edit / re-upload path uses. This replaces the older flat
-        # union+dedup logic that was inline here. Behaviour preserved:
-        #   - list fields (missingInfo, weaknesses, risks, pendingActions,
-        #     nextSteps, suggestedDrafts, relevantJurisdiction, strengths)
-        #     get a single Gemini merge per field that keeps prev verbatim and
-        #     appends only genuinely-new items;
-        #   - identity fields (caseTitle, caseCategory, subcategories,
-        #     description, caseType) are preserved from prev;
-        #   - caseResolutionScore / reportQualityScore are preserved from prev
-        #     (then re-capped against the merged list state);
-        #   - qualityScoreExplanation / reportQualityScoreExplanation are
-        #     regenerated from the merged state;
-        #   - rejected-item memory is honoured via `_filter_rejected` inside
-        #     the helper;
-        #   - timestamp + `_normalize_analysis_report_lists` are applied.
-        # Without this swap, paraphrased duplicates from the new objective
-        # generation could leak past the old union+flat-dedup pass.
+        # 1) Analysis report: REGENERATE for the new objective and REPLACE the old
+        # one — do NOT merge with the previous report. A change of objective is a
+        # change of legal PERSPECTIVE (e.g. jewellery-theft → divorce); merging
+        # with the prev report would keep the stale theft strengths/weaknesses/
+        # risks and PRESERVE the old quality score, producing a mixed,
+        # wrong-perspective analysis. The generator already (a) anchors to the new
+        # cached objective, (b) applies OBJECTIVE-ALIGNMENT rules, (c) runs
+        # `_normalize_analysis_report_lists` (which also scrubs the brand), and
+        # (d) computes a fresh caseResolutionScore — so used directly it yields a
+        # fully objective-aligned report with a fresh score and no carryover.
+        # (`_merge_analysis_report_with_previous` is unchanged and still used by
+        # the document re-upload / sync paths, where incremental merge is correct.)
         new_analysis = await self._generate_analysis_report_from_documents(
             workspace_id=workspace_id,
             user_id=user_id,
             workspace_role=workspace_role,
             batch_result=None,
-            is_update=True,
+            is_update=False,
         )
         if not (isinstance(new_analysis, dict) and new_analysis):
             new_analysis = self._analysis_report_fallback(
                 (workspace_role or "ADJUDICATOR").strip().upper()
             )
 
-        merged_analysis = await self._merge_analysis_report_with_previous(
-            workspace_id=workspace_id,
-            workspace_role=workspace_role,
-            new_analysis=new_analysis,
-            log_context=ctx,
-        )
-        self._workspace_analysis_payload[workspace_id] = merged_analysis
+        self._workspace_analysis_payload[workspace_id] = new_analysis
         if self._socket_client:
             await self._socket_client.emit(
                 "document_feature_response",
@@ -10656,12 +10650,12 @@ Return ONLY this JSON, no commentary:
                     "featureType": "analysis_report",
                     "workspaceId": workspace_id,
                     "userId": user_id,
-                    "payload": merged_analysis,
+                    "payload": new_analysis,
                 },
             )
             logger.success(
-                "✅ Objective-change incremental analysis update emitted "
-                "(prev preserved, new points merged, rejections respected){}",
+                "✅ Objective-change analysis update emitted "
+                "(fully regenerated for new objective, prev replaced){}",
                 ctx,
             )
             # Fresh objective-aligned report is emitted; lift suppression so future emits are allowed.

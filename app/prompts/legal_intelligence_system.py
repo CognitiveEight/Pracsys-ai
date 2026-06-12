@@ -749,6 +749,40 @@ def _litigation_framework_role_suffix(role_upper: str) -> str:
     )
 
 
+ENGLISH_ONLY_OUTPUT_DIRECTIVE = (
+    "OUTPUT LANGUAGE — MANDATORY (applies to every matter): Write ALL output in English "
+    "using Latin script ONLY. Source documents and transcripts may be in Hindi/Devanagari "
+    "or any mixed/non-Latin script. TRANSLITERATE every person name, place, organisation, "
+    "and document/exhibit reference into Latin characters, and TRANSLATE all other "
+    "non-English words and phrases into their English equivalent. Use standard, readable "
+    "romanisation for Indian names (illustrative only: a Devanagari name -> its common "
+    "English spelling). Do NOT emit any Devanagari or other non-Latin characters and do NOT "
+    "mix scripts within a sentence. Preserve statutory short-names (BNS, BNSS, BSA, IT Act) "
+    "as-is in English."
+)
+
+
+APP_BRAND_EXCLUSION_DIRECTIVE = (
+    "PLATFORM NAME — NEVER OUTPUT: \"SimplerToday\", \"Simpler Today\", and "
+    "\"simplertoday.ai\" are the names of the legal-technology PLATFORM the user used to reach "
+    "a lawyer. The platform is NEVER a party, employer, organisation, location, or fact in the "
+    "case. NEVER write these words in ANY field. If a document mentions it (e.g. \"Contacted "
+    "SimplerToday.ai on 21/04/2024\"), interpret it ONLY as \"the user contacted/approached a "
+    "lawyer\" — do not name the platform and do not treat it as the employer or any party."
+)
+
+
+NAME_CAPITALISATION_DIRECTIVE = (
+    "CAPITALISATION — NAMES & PLACES: Write every person name, place name, address, and "
+    "organisation in normal Title Case — capitalise ONLY the first letter of each word "
+    "(e.g. \"Rambir\", \"Sandhya\", \"Aarav\", \"Najafgarh\", \"Tilangpur Kotla\", \"Police "
+    "Enclave\"). NEVER render names, places, or addresses in ALL-CAPS, even if they appear in "
+    "ALL-CAPS in the source documents. PRESERVE genuine statutory short-forms and acronyms "
+    "exactly as-is (e.g. BNS, BNSS, BSA, IPC, CrPC, CPC, FIR, SHO, GD, PS, IT Act, GST, PAN, "
+    "HUF, NI Act, POCSO, NDPS)."
+)
+
+
 def get_structured_document_feature_system_instruction(
     current_role: Optional[str] = None,
 ) -> str:
@@ -770,6 +804,12 @@ def get_structured_document_feature_system_instruction(
         "NOT 'the petitioner files a petition' / 'we served a notice'. Avoid "
         "first-person and second-person voice, colloquialisms, and US-centric "
         "phrasing. "
+        + ENGLISH_ONLY_OUTPUT_DIRECTIVE
+        + " "
+        + APP_BRAND_EXCLUSION_DIRECTIVE
+        + " "
+        + NAME_CAPITALISATION_DIRECTIVE
+        + " "
         "Output only valid JSON exactly as specified in the user message (no markdown code fences)."
     )
 
@@ -817,6 +857,9 @@ def get_legal_intelligence_system_instruction(
     """
     instruction = LEGAL_INTELLIGENCE_SYSTEM_PROMPT
     instruction += "\n\n" + INDIAN_LITIGATION_REASONING_FRAMEWORK.strip()
+    instruction += "\n\n" + ENGLISH_ONLY_OUTPUT_DIRECTIVE
+    instruction += "\n\n" + APP_BRAND_EXCLUSION_DIRECTIVE
+    instruction += "\n\n" + NAME_CAPITALISATION_DIRECTIVE
 
     role_upper = (current_role or "").strip().upper() or "ADJUDICATOR"
 

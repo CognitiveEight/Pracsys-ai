@@ -48,6 +48,8 @@ from app.prompts.drafting import (
     TEMPLATE_FILL_INSTRUCTION,
     TEMPLATE_KICKOFF_INSTRUCTION,
     TEMPLATE_MATCH_INSTRUCTION,
+    TEMPLATE_PROFILE_INSTRUCTION,
+    TEMPLATE_VARIABLE_KINDS,
     build_chat_reply_prompt,
     build_draft_render_prompt,
     build_draft_translate_prompt,
@@ -58,6 +60,7 @@ from app.prompts.drafting import (
     build_template_fill_prompt,
     build_template_kickoff_prompt,
     build_template_match_prompt,
+    build_template_profile_prompt,
 )
 
 
@@ -258,11 +261,16 @@ def _normalize_suggestions(raw: List[Any]) -> List[Dict[str, Any]]:
         title = (item.get("title") or "").strip()
         if not title:
             continue
+        _desc = (item.get("description") or "").strip()
+        if len(_desc) > 220:
+            # Trim at a word boundary (never mid-word) so the card never shows a
+            # broken sentence fragment.
+            _desc = _desc[:220].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
         cleaned.append(
             {
                 "title": title,
                 "relevance": _normalize_relevance(item.get("relevance")),
-                "description": (item.get("description") or "").strip()[:160] or None,
+                "description": _desc or None,
                 # Template pre-match fields always present so the backend
                 # reliably receives both id and name (populated later by
                 # _attach_template_matches when user_id is supplied; left
@@ -922,6 +930,44 @@ class DraftingAgent:
                 document_purpose = classified.get("purpose", "") or ""
                 classified_at = now_iso
 
+        # Drafting blueprint profile — tone / filing_context / structure_outline
+        # / interactive_variables. Reuse the cached profile when the file hash
+        # is unchanged AND a previous profile exists; otherwise extract it from
+        # the freshly-extracted body. Never block ingest on profiler failure —
+        # the kickoff falls back to its freeform placeholder scan when absent.
+        interactive_variables: List[Dict[str, Any]] = []
+        template_tone = ""
+        filing_context = ""
+        structure_outline: List[str] = []
+        profiled_at = ""
+        if (
+            hash_stable
+            and previous_payload
+            and previous_payload.get("interactive_variables")
+        ):
+            interactive_variables = (
+                previous_payload.get("interactive_variables") or []
+            )
+            template_tone = (previous_payload.get("template_tone") or "").strip()
+            filing_context = (previous_payload.get("filing_context") or "").strip()
+            prev_outline = previous_payload.get("structure_outline") or []
+            if isinstance(prev_outline, list):
+                structure_outline = [str(s).strip() for s in prev_outline if str(s).strip()]
+            profiled_at = previous_payload.get("profiled_at") or ""
+        elif extraction_status == "ready" and extracted_text:
+            profile = await self._extract_template_profile(
+                name=name,
+                document_type=document_type,
+                extracted_text=extracted_text,
+                docx_bytes=downloaded_bytes if ext_lower == "docx" else None,
+            )
+            if profile:
+                interactive_variables = profile.get("interactive_variables") or []
+                template_tone = profile.get("tone") or ""
+                filing_context = profile.get("filing_context") or ""
+                structure_outline = profile.get("structure_outline") or []
+                profiled_at = now_iso
+
         payload: Dict[str, Any] = {
             "template_id": template_id,
             "user_id": user_id,
@@ -942,6 +988,13 @@ class DraftingAgent:
             "document_type_confidence": document_type_confidence,
             "document_purpose": document_purpose,
             "classified_at": classified_at,
+            # Drafting blueprint (used by the kickoff to ask the right
+            # fill-questions and to render in the template's tone).
+            "interactive_variables": interactive_variables,
+            "template_tone": template_tone,
+            "filing_context": filing_context,
+            "structure_outline": structure_outline,
+            "profiled_at": profiled_at,
         }
 
         try:
@@ -970,7 +1023,8 @@ class DraftingAgent:
 
         logger.success(
             "Template ingested (user={}, template={}, status={}, chars={}, "
-            "document_type={!r}, confidence={!r}, purpose={!r})",
+            "document_type={!r}, confidence={!r}, purpose={!r}, "
+            "variables={}, tone={!r}, filing_context={})",
             user_id,
             template_id,
             extraction_status,
@@ -978,6 +1032,9 @@ class DraftingAgent:
             document_type or "(unclassified)",
             document_type_confidence or "(n/a)",
             document_purpose or "(none)",
+            len(interactive_variables),
+            template_tone or "(none)",
+            "yes" if filing_context else "no",
         )
         return payload
 
@@ -1149,6 +1206,142 @@ class DraftingAgent:
             "aliases": aliases,
             "confidence": confidence,
             "purpose": purpose,
+        }
+
+    # How much of the template body to feed the profiler. Larger than the
+    # classifier window because placeholders / execution fields (signing
+    # date, witness, enrolment no.) commonly live at the very end of the
+    # document, and the variable registry must catch those too.
+    _PROFILE_CONTENT_CHARS = 16000
+    _MAX_INTERACTIVE_VARIABLES = 40
+
+    @staticmethod
+    def _deterministic_placeholders(docx_bytes: Optional[bytes]) -> List[str]:
+        """Best-effort literal-placeholder seed for the profiler.
+
+        Reuses the DOCX placeholder regex (`extract_placeholders`) so every
+        literal slot ([...], <...>, {{...}}, (Pascal_Case)) is guaranteed to
+        reach the profiler. Returns the raw slot strings, de-duplicated and
+        order-preserving. Never raises — returns [] when bytes are absent or
+        unparseable (PDF-only templates, etc.)."""
+        if not docx_bytes:
+            return []
+        try:
+            from app.processing.docx_template_filler import extract_placeholders
+
+            hits = extract_placeholders(docx_bytes)
+        except Exception as exc:
+            logger.debug("Profiler placeholder seed skipped: {}", exc)
+            return []
+        out: List[str] = []
+        seen: set = set()
+        for h in hits:
+            raw = (getattr(h, "raw", "") or "").strip()
+            if raw and raw not in seen:
+                seen.add(raw)
+                out.append(raw)
+        return out
+
+    def _normalize_interactive_variables(
+        self, raw: Any
+    ) -> List[Dict[str, Any]]:
+        """Coerce the profiler's `interactive_variables` into a clean list of
+        `{id, label, question, kind, fill_from_case, required}`. Drops empties,
+        de-dupes by id, caps the count."""
+        out: List[Dict[str, Any]] = []
+        seen_ids: set = set()
+        valid_kinds = set(TEMPLATE_VARIABLE_KINDS)
+        for item in raw or []:
+            if not isinstance(item, dict):
+                continue
+            label = (item.get("label") or "").strip()
+            question = (item.get("question") or "").strip()
+            if not (label or question):
+                continue
+            vid = (item.get("id") or "").strip().lower()
+            if not vid:
+                vid = re.sub(r"[^a-z0-9]+", "_", (label or question).lower()).strip("_")
+            vid = vid or f"var_{len(out) + 1}"
+            if vid in seen_ids:
+                continue
+            seen_ids.add(vid)
+            kind = (item.get("kind") or "").strip().lower()
+            if kind not in valid_kinds:
+                kind = "other"
+            out.append(
+                {
+                    "id": vid,
+                    "label": (label or question)[:80],
+                    "question": (question or label)[:240],
+                    "kind": kind,
+                    # Default to True so an ambiguous field is auto-filled from
+                    # the case rather than needlessly asked.
+                    "fill_from_case": bool(item.get("fill_from_case", True)),
+                    "required": bool(item.get("required", True)),
+                }
+            )
+            if len(out) >= self._MAX_INTERACTIVE_VARIABLES:
+                break
+        return out
+
+    async def _extract_template_profile(
+        self,
+        *,
+        name: str,
+        document_type: str,
+        extracted_text: str,
+        docx_bytes: Optional[bytes] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Extract the reusable "drafting blueprint" for a template: tone,
+        filing_context, structure_outline, and the interactive-variable
+        registry. Returns a dict on success, None on failure (callers treat
+        None as "no profile" and fall back to the freeform kickoff scan —
+        never block ingest on this)."""
+        body = (extracted_text or "").strip()
+        if not body:
+            return None
+        try:
+            prompt = build_template_profile_prompt(
+                name=name or "",
+                document_type=document_type or "",
+                content=body[: self._PROFILE_CONTENT_CHARS],
+                deterministic_placeholders=self._deterministic_placeholders(docx_bytes),
+            )
+            raw = await gemini_client.generate(
+                prompt,
+                system_instruction=TEMPLATE_PROFILE_INSTRUCTION,
+                temperature=0.1,
+                max_tokens=6000,
+                response_mime_type="application/json",
+            )
+        except Exception as e:
+            logger.warning("Template profile extraction LLM call failed: {}", e)
+            return None
+
+        parsed = _parse_json_object(raw) or {}
+        tone = " ".join(str(parsed.get("tone") or "").split())[:160]
+        filing_context = " ".join(
+            str(parsed.get("filing_context") or "").split()
+        )[:800]
+        raw_outline = parsed.get("structure_outline") or []
+        structure_outline: List[str] = []
+        if isinstance(raw_outline, list):
+            for s in raw_outline:
+                section = " ".join(str(s or "").split())[:120]
+                if section:
+                    structure_outline.append(section)
+                if len(structure_outline) >= 15:
+                    break
+        variables = self._normalize_interactive_variables(
+            parsed.get("interactive_variables")
+        )
+        if not (tone or filing_context or structure_outline or variables):
+            return None
+        return {
+            "tone": tone,
+            "filing_context": filing_context,
+            "structure_outline": structure_outline,
+            "interactive_variables": variables,
         }
 
     # ------------------------------------------------------------------
@@ -2702,6 +2895,53 @@ class DraftingAgent:
 
         # ---------- Template kick-off (analyze + open questions) ----------
         if template_payload and template_text:
+            # Lazy backfill: templates ingested before the blueprint feature
+            # (or whose profiling failed) carry no interactive_variables. Run
+            # the profiler once now and persist it so this and future clicks
+            # use the authoritative variable registry. Non-blocking — on
+            # failure the kickoff falls back to the freeform placeholder scan.
+            if not template_payload.get("interactive_variables"):
+                try:
+                    profile = await self._extract_template_profile(
+                        name=template_name or "",
+                        document_type=template_payload.get("document_type") or "",
+                        extracted_text=template_text,
+                        docx_bytes=None,
+                    )
+                except Exception as exc:
+                    logger.warning("Kickoff profile backfill raised: {}", exc)
+                    profile = None
+                if profile:
+                    template_payload = {
+                        **template_payload,
+                        "interactive_variables": profile.get("interactive_variables") or [],
+                        "template_tone": profile.get("tone") or "",
+                        "filing_context": profile.get("filing_context") or "",
+                        "structure_outline": profile.get("structure_outline") or [],
+                        "profiled_at": datetime.utcnow().isoformat(),
+                    }
+                    try:
+                        from app.langgraph.template_store import template_store
+
+                        await template_store.put(
+                            user_id=user_id,
+                            template_id=template_payload.get("template_id"),
+                            payload=template_payload,
+                        )
+                        logger.info(
+                            "Kickoff lazy-backfilled template blueprint "
+                            "(template={}, variables={})",
+                            template_payload.get("template_id"),
+                            len(template_payload.get("interactive_variables") or []),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Kickoff profile backfill persist failed: {}", exc
+                        )
+
+            template_tone = template_payload.get("template_tone") or ""
+            filing_context = template_payload.get("filing_context") or ""
+            structure_outline = template_payload.get("structure_outline") or []
             prompt = build_template_kickoff_prompt(
                 role=role,
                 case_summary=case_summary,
@@ -2711,6 +2951,10 @@ class DraftingAgent:
                 lawyer_instructions=lawyer_instructions,
                 draft_title_hint=suggestion_title,
                 template_match_note=template_match_note,
+                interactive_variables=template_payload.get("interactive_variables") or [],
+                template_tone=template_tone,
+                filing_context=filing_context,
+                structure_outline=structure_outline,
             )
             raw = await self._safe_llm_json(
                 prompt=prompt,
@@ -2739,6 +2983,11 @@ class DraftingAgent:
                 "source": "template",
                 "template_id": template_payload.get("template_id"),
                 "template_name": template_payload.get("name"),
+                # Carry the template's tone / filing context forward so the
+                # later render turn drafts in the template's voice.
+                "template_tone": template_tone,
+                "filing_context": filing_context,
+                "structure_outline": structure_outline,
                 "suggested_draft_id": request_fields.get("suggestedDraftId"),
                 "suggestion_title": suggestion_title,
                 "draft_title": draft_title,
@@ -5242,6 +5491,17 @@ OUTPUT FORMAT:
         )
         mode = mode_override or source_value or "blank"
 
+        # Template tone / filing context — drives the draft's voice (template
+        # tone wins over the default register). Prefer the values carried in
+        # session_state from kickoff; fall back to the freshly-loaded template
+        # payload (e.g. after a reconnect rebuilt the session).
+        template_tone = (session_state.get("template_tone") or "").strip()
+        filing_context = (session_state.get("filing_context") or "").strip()
+        if tpl and not template_tone:
+            template_tone = (tpl.get("template_tone") or "").strip()
+        if tpl and not filing_context:
+            filing_context = (tpl.get("filing_context") or "").strip()
+
         # Diagnostic: make it unambiguous whether this render is driven by a
         # template (and which one) or is a from-scratch generation. If
         # template_chars=0 here, the draft CANNOT mirror any template — the
@@ -5273,25 +5533,31 @@ OUTPUT FORMAT:
             mode=mode,
             previous_draft_markdown=session_state.get("last_draft_markdown") or None,
             revision_instruction=revision_instruction,
+            template_tone=template_tone or None,
+            filing_context=filing_context or None,
         )
         try:
-            # Long-form path (new google-genai SDK) with thinking_level=LOW:
-            # Gemini 3 bills thinking tokens against max_output_tokens. At
-            # HIGH/MEDIUM the reasoning pass was consuming ~60k of the 64k
-            # budget, so a 7-page template render truncated mid-sentence after
-            # only ~2-3k tokens of draft. LOW keeps reasoning cheap so almost
-            # the entire budget goes to the draft itself — the right trade-off
-            # for faithful, full-length template reproduction (fidelity matters
-            # more than deep synthesis here). generate_longform also auto-
-            # continues on MAX_TOKENS, so drafts longer than one 64k response
-            # (20+ pages) still finish. If legal reasoning quality regresses,
-            # step back to MEDIUM. Falls back to legacy generate() if SDK absent.
+            # Long-form path (new google-genai SDK) with thinking_level=MEDIUM:
+            # the render must DEVELOP sparse skeleton templates into full,
+            # multi-paragraph, professionally-argued documents (see the DEPTH /
+            # DEVELOPMENT + NARRATIVE DEVELOPMENT mandates in
+            # DRAFT_RENDER_INSTRUCTION) — that elaboration is synthesis-heavy,
+            # which LOW thinking suppressed (output stayed at terse bullet
+            # stubs). MEDIUM gives the reasoning budget needed for narrative
+            # depth and legal characterisation. Gemini 3 bills thinking tokens
+            # against max_output_tokens, so on very long ALREADY-detailed
+            # templates the reasoning pass can eat into the 64k budget — but
+            # generate_longform auto-continues on MAX_TOKENS so multi-response
+            # drafts still finish; a clean section-boundary continuation is
+            # acceptable. If long-template renders regress on truncation/cost,
+            # gate MEDIUM to skeleton templates only (keep LOW for already-
+            # detailed ones). Falls back to legacy generate() if SDK absent.
             raw = await gemini_client.generate_longform(
                 prompt,
                 system_instruction=DRAFT_RENDER_INSTRUCTION,
                 temperature=0.35,
                 max_tokens=65536,
-                thinking_level="LOW",
+                thinking_level="MEDIUM",
             )
         except Exception as e:
             logger.error("Draft render LLM call failed: {}", e)
@@ -5486,6 +5752,11 @@ OUTPUT FORMAT:
 
     # ------------------------------------------------------------------ utils
 
+    # Missing-Information Matrix priorities (engine analysis phase). Anything
+    # the model doesn't classify defaults to "Important" — askable but not a
+    # hard blocker.
+    _QUESTION_CLASSES = {"Critical", "Important", "Optional"}
+
     def _normalize_open_questions(self, raw: Any) -> List[Dict[str, str]]:
         if not isinstance(raw, list):
             return []
@@ -5503,7 +5774,14 @@ OUTPUT FORMAT:
             if qid in seen_ids or not label:
                 continue
             seen_ids.add(qid)
-            out.append({"id": qid, "label": label})
+            # Carry the Missing-Information Matrix priority through (optional,
+            # additive — frontend may ignore it). Default to "Important".
+            classification = (item.get("classification") or "").strip().title()
+            if classification not in self._QUESTION_CLASSES:
+                classification = "Important"
+            out.append(
+                {"id": qid, "label": label, "classification": classification}
+            )
         return out[:10]
 
     # Acknowledgement vocabulary used to detect "ok" / "thanks" replies after
@@ -5770,19 +6048,37 @@ OUTPUT FORMAT:
                 f"Generating the draft now."
             )
 
-        # Each label is expected to be "Title: question". When present,
-        # split on the first colon so the title can be bolded inline.
-        numbered_lines: List[str] = []
-        for i, q in enumerate(open_questions, start=1):
+        # Group by the Missing-Information Matrix priority, mirroring the
+        # layout enforced by TEMPLATE_KICKOFF_INSTRUCTION. Each label is
+        # expected to be "Title: question"; split on the first colon so the
+        # title can be bolded inline.
+        def _fmt(n: int, q: Dict[str, Any]) -> str:
             label = (q.get("label") or "").strip()
             if ":" in label:
                 title_part, question_part = label.split(":", 1)
-                numbered_lines.append(
-                    f"{i}. **{title_part.strip()}:** {question_part.strip()}"
-                )
-            else:
-                numbered_lines.append(f"{i}. {label}")
-        questions_block = "\n".join(numbered_lines)
+                return f"{n}. **{title_part.strip()}:** {question_part.strip()}"
+            return f"{n}. {label}"
+
+        group_labels = [
+            ("Critical", "**Critical (required to finalise the draft):**"),
+            ("Important", "**Important (would materially strengthen the draft):**"),
+            ("Optional", "**Optional (useful but not essential):**"),
+        ]
+        blocks: List[str] = []
+        counter = 1
+        for key, header in group_labels:
+            items = [
+                q for q in open_questions
+                if (q.get("classification") or "Important").title() == key
+            ]
+            if not items:
+                continue
+            lines = [header]
+            for q in items:
+                lines.append(_fmt(counter, q))
+                counter += 1
+            blocks.append("\n".join(lines))
+        questions_block = "\n\n".join(blocks)
 
         return (
             f"I have initiated the drafting of {draft_title} based on the "

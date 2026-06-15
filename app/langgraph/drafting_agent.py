@@ -132,6 +132,13 @@ _RELEVANCE_VALUES = {"High", "Medium", "Low"}
 _VALID_SOURCES = {"template", "suggestedDraft", "blank"}
 _MAX_SUGGESTIONS = 6
 
+# Version of the template "drafting blueprint" profiling schema. Bump this
+# whenever the profiler's variable-capture rules change so already-cached
+# templates (profiled under an older schema) are re-profiled on next use rather
+# than serving a stale registry. v2 adds capture of content/substantiation
+# clauses (grounds, claims/defences, heads of loss/relief, representations …).
+PROFILE_SCHEMA_VERSION = 2
+
 # Strip IPC / CrPC / Indian Evidence Act mentions defensively in case the
 # model slips. The existing applicable-laws normaliser already does this for
 # its own payload, but the drafting outputs are independent.
@@ -940,10 +947,12 @@ class DraftingAgent:
         filing_context = ""
         structure_outline: List[str] = []
         profiled_at = ""
+        profile_schema_version = 0
         if (
             hash_stable
             and previous_payload
             and previous_payload.get("interactive_variables")
+            and previous_payload.get("profile_schema_version") == PROFILE_SCHEMA_VERSION
         ):
             interactive_variables = (
                 previous_payload.get("interactive_variables") or []
@@ -954,6 +963,7 @@ class DraftingAgent:
             if isinstance(prev_outline, list):
                 structure_outline = [str(s).strip() for s in prev_outline if str(s).strip()]
             profiled_at = previous_payload.get("profiled_at") or ""
+            profile_schema_version = previous_payload.get("profile_schema_version") or 0
         elif extraction_status == "ready" and extracted_text:
             profile = await self._extract_template_profile(
                 name=name,
@@ -967,6 +977,9 @@ class DraftingAgent:
                 filing_context = profile.get("filing_context") or ""
                 structure_outline = profile.get("structure_outline") or []
                 profiled_at = now_iso
+                profile_schema_version = profile.get(
+                    "profile_schema_version", PROFILE_SCHEMA_VERSION
+                )
 
         payload: Dict[str, Any] = {
             "template_id": template_id,
@@ -995,6 +1008,7 @@ class DraftingAgent:
             "filing_context": filing_context,
             "structure_outline": structure_outline,
             "profiled_at": profiled_at,
+            "profile_schema_version": profile_schema_version,
         }
 
         try:
@@ -1342,6 +1356,7 @@ class DraftingAgent:
             "filing_context": filing_context,
             "structure_outline": structure_outline,
             "interactive_variables": variables,
+            "profile_schema_version": PROFILE_SCHEMA_VERSION,
         }
 
     # ------------------------------------------------------------------
@@ -2896,11 +2911,16 @@ class DraftingAgent:
         # ---------- Template kick-off (analyze + open questions) ----------
         if template_payload and template_text:
             # Lazy backfill: templates ingested before the blueprint feature
-            # (or whose profiling failed) carry no interactive_variables. Run
-            # the profiler once now and persist it so this and future clicks
-            # use the authoritative variable registry. Non-blocking — on
-            # failure the kickoff falls back to the freeform placeholder scan.
-            if not template_payload.get("interactive_variables"):
+            # (or whose profiling failed) carry no interactive_variables; and
+            # templates profiled under an OLDER schema version carry a stale
+            # registry. In both cases, run the profiler once now and persist it
+            # so this and future clicks use the up-to-date variable registry.
+            # Non-blocking — on failure the kickoff falls back to the freeform
+            # placeholder scan.
+            if (
+                not template_payload.get("interactive_variables")
+                or template_payload.get("profile_schema_version") != PROFILE_SCHEMA_VERSION
+            ):
                 try:
                     profile = await self._extract_template_profile(
                         name=template_name or "",
@@ -2919,6 +2939,9 @@ class DraftingAgent:
                         "filing_context": profile.get("filing_context") or "",
                         "structure_outline": profile.get("structure_outline") or [],
                         "profiled_at": datetime.utcnow().isoformat(),
+                        "profile_schema_version": profile.get(
+                            "profile_schema_version", PROFILE_SCHEMA_VERSION
+                        ),
                     }
                     try:
                         from app.langgraph.template_store import template_store

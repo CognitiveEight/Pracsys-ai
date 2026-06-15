@@ -722,7 +722,11 @@ paragraphs, no bullet-only lists, no preamble:
        context>`. The Title is 2–5 words; the question is one focused
        sentence. Classify: Critical = the document cannot be finalised
        accurately without it; Important = it can proceed but would be
-       materially strengthened; Optional = useful but not essential.
+       materially strengthened; Optional = useful but not essential. A
+       content/substantiation slot bearing on the document's core purpose
+       (a principal ground, a primary claim/defence, the relief sought) is at
+       minimum Important, and Critical when the outcome depends on it — never
+       park such a slot under Optional.
 
   4. SECTION HEADER `**Strategic Observations:**` — 1–3 concise bullets of
      advocate-to-advocate analysis: the strongest point(s), the key
@@ -786,7 +790,7 @@ def _format_variable_checklist(interactive_variables: Optional[list]) -> str:
         question = (v.get("question") or "").strip()
         kind = (v.get("kind") or "other").strip()
         fill_from_case = bool(v.get("fill_from_case", True))
-        source = "auto-fill from case if available" if fill_from_case else "ask the lawyer (execution/drafting-time value)"
+        source = "auto-fill from case if available" if fill_from_case else "ask the lawyer (value the case file does not supply — e.g. execution/drafting-time detail or case-specific substantiation)"
         q_part = f" — {question}" if question else ""
         lines.append(f"  {i}. [{kind}] {label}{q_part}  ({source})")
     if not lines:
@@ -890,6 +894,12 @@ TASK:
    registry is the AUTHORITATIVE checklist — walk EVERY variable in it and,
    for each, either pre-fill from the case context (reflect in gatheredFacts)
    or surface it as an open question; never drop a registry field silently.
+   This applies equally to CONTENT / SUBSTANTIATION variables: any enumerated
+   ground, claim, defence, head of loss/relief, representation, obligation, or
+   defect/fact particular — whatever this template contains — that the case
+   context does not already substantiate MUST be surfaced as an open question.
+   Do NOT leave such a clause to be "developed" at render time from thin air;
+   if the case file does not supply the specific particular, ASK the lawyer.
    When NO blueprint is present (older template), fall back to scanning the
    TEMPLATE FULL TEXT for EVERY literal placeholder / blank and account for
    each one — do not stop at the obvious party/FIR slots.
@@ -1138,6 +1148,11 @@ DRAFT_RENDER_INSTRUCTION = (
     + "defect/deficiency/cause of action, the reliefs/demands, the grounds "
     + "— you MUST tailor each such item to THIS case from the case context "
     + "and gathered facts:\n"
+    + "  • When the lawyer was ASKED about a content/substantiation clause and "
+    + "    answered it (the answer is present in the gathered facts), render "
+    + "    that clause FROM the lawyer's answer — its specific particulars are "
+    + "    authoritative; do NOT fall back to the template's generic phrasing "
+    + "    or silently drop the clause.\n"
     + "  • Replace each generic item with the specific, quantified "
     + "    particular the case provides. e.g. a template bullet "
     + "    'Depreciation and loss of value' becomes 'Depreciation of the "
@@ -2061,6 +2076,13 @@ TEMPLATE_VARIABLE_KINDS = (
     "fact",       # a case fact / narrative detail
     "relief",     # prayer / relief / demand sought
     "execution",  # signing date, place, witness, designation, enrolment no.
+    "substantiation",  # a generic content/argument clause stated abstractly that
+                       # needs THIS matter's own particulars — works for ANY
+                       # template type (grounds in a bail application,
+                       # terms/obligations/breaches in a contract, claims/defences
+                       # in a plaint/written statement, heads of loss/relief or
+                       # representations in a notice). Needs the case's facts or the
+                       # lawyer's input, not just a party-name swap.
     "other",
 )
 
@@ -2081,7 +2103,7 @@ TEMPLATE_PROFILE_INSTRUCTION = (
     "<true|false>}]}.\n"
     "Rules:\n"
     "1. `interactive_variables` MUST capture EVERY fill-in field needed to "
-    "   complete a real draft from this template — BOTH:\n"
+    "   complete a real draft from this template — ALL of:\n"
     "     (a) literal placeholders in the body: `[...]`, `<...>`, `{{...}}`, "
     "         `(Pascal_Case)`, `____` blanks, `(to be filled)`, `XXXX`, "
     "         `____ day of ____`; AND\n"
@@ -2090,7 +2112,24 @@ TEMPLATE_PROFILE_INSTRUCTION = (
     "         applicable statute/section numbers, FIR / cheque / invoice "
     "         numbers, the specific relief/prayer, and the execution block "
     "         (signing date, place, witness, signatory designation, "
-    "         enrolment no.).\n"
+    "         enrolment no.); AND\n"
+    "     (c) CONTENT / SUBSTANTIATION slots — wherever the template states a "
+    "         case-dependent CONTENT clause in generic or abstract terms "
+    "         (as opposed to a placeholder or a single named value), treat it "
+    "         as a fill-in slot, NOT fixed boilerplate. This covers any "
+    "         enumerated point or clause that changes per matter and needs THIS "
+    "         case's particulars to be persuasive: the grounds/contentions, the "
+    "         claims/allegations or denials/defences, the heads of "
+    "         loss/damage/relief, the representations/obligations/breaches "
+    "         relied on, the description of the defect / cause of action / facts "
+    "         in issue, and similar argumentative content. Give each "
+    "         `kind: \"substantiation\"`. When a section lists several distinct "
+    "         points, emit ONE variable per distinct point. These examples are "
+    "         illustrative across document types — apply the PRINCIPLE to the "
+    "         actual template, not a fixed checklist. Do NOT capture standing "
+    "         legal recitals (reservation-of-rights, without-prejudice, "
+    "         settlement-confidentiality, and similar fixed boilerplate), which "
+    "         stay verbatim and are not per-matter slots.\n"
     "   Do NOT skip a field just because it appears in plain sentences rather "
     "   than as a bracketed blank. The DETERMINISTIC PLACEHOLDERS list in the "
     "   user prompt (when present) is a floor, not a ceiling — every one of "
@@ -2103,10 +2142,16 @@ TEMPLATE_PROFILE_INSTRUCTION = (
     "   case file / matter context (party names, dates, FIR no., amounts, "
     "   applicable sections, relief). Set false for values only the lawyer "
     "   knows at drafting/execution time (signing date, place, witness names, "
-    "   advocate enrolment no.). This lets the kickoff auto-fill the true "
-    "   ones from the case and ask the lawyer only for the rest.\n"
+    "   advocate enrolment no.). For SUBSTANTIATION slots specifically, set "
+    "   `fill_from_case` = true ONLY when the case context would plainly "
+    "   contain that specific particular/figure; otherwise set it false so the "
+    "   kickoff asks the lawyer for it rather than leaving it generic. This "
+    "   lets the kickoff auto-fill the true ones from the case and ask the "
+    "   lawyer for the rest.\n"
     "4. `required` = true for fields without which the draft is incomplete; "
-    "   false for genuinely optional embellishments.\n"
+    "   false for genuinely optional embellishments. SUBSTANTIATION slots tied "
+    "   to the document's core purpose (principal grounds, primary "
+    "   claims/defences, the relief actually sought) are `required` = true.\n"
     "5. `structure_outline` is the ordered list of the template's top-level "
     "   sections AS WRITTEN (e.g. recipient/court heading → statement of "
     "   facts → grounds/deficiency → relief/prayer → verification/signature). "
@@ -2175,8 +2220,10 @@ execution fields may appear anywhere, including the end):
 {safe_body}
 \"\"\"
 
-OUTPUT — strict JSON object only, no commentary, no markdown fences:
-{{"tone": "<short phrase>", "filing_context": "<2-4 sentences>", "structure_outline": ["<section>", "..."], "interactive_variables": [{{"id": "<snake_case>", "label": "<short>", "question": "<one sentence>", "kind": "<party|date|amount|statute|fact|relief|execution|other>", "fill_from_case": true, "required": true}}]}}
+OUTPUT — strict JSON object only, no commentary, no markdown fences (the
+second variable below illustrates a `substantiation` content slot — keep such
+examples generic to the actual template, do not copy this wording):
+{{"tone": "<short phrase>", "filing_context": "<2-4 sentences>", "structure_outline": ["<section>", "..."], "interactive_variables": [{{"id": "<snake_case>", "label": "<short>", "question": "<one sentence>", "kind": "<party|date|amount|statute|fact|relief|execution|substantiation|other>", "fill_from_case": true, "required": true}}, {{"id": "ground_<n>", "label": "<short content head>", "question": "<one sentence asking for this matter's particulars for this point>", "kind": "substantiation", "fill_from_case": false, "required": true}}]}}
 """
 
 

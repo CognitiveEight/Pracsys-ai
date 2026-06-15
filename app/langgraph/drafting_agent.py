@@ -162,6 +162,45 @@ def _strip_code_fences(text: str) -> str:
     return raw
 
 
+# High-signal markers of a slot that was left UNFILLED in a rendered draft.
+# These are the placeholder shapes the render prompt is told to fall back to
+# when neither the case context nor the lawyer supplied a value — we scan the
+# finished draft for them so a draft with holes is never shipped as "complete"
+# without flagging exactly what is still missing.
+_RESIDUAL_PLACEHOLDER_PATTERNS = (
+    re.compile(r"<[^<>\n]{1,80}>"),            # <Client Address>, <Issuance Date>
+    re.compile(r"\{\{[^{}\n]{1,80}\}\}"),      # {{handlebars}}
+    re.compile(r"_{3,}"),                       # ____ underscore blanks
+    re.compile(r"X{4,}", re.IGNORECASE),        # XXXX
+    re.compile(r"\(\s*to be filled[^)]*\)", re.IGNORECASE),
+    re.compile(r"\[(?:[^\[\]\n]*?(?:address|name|number|date|amount|insert|"
+               r"to be filled|tbd|xxxx|placeholder)[^\[\]\n]*?)\]", re.IGNORECASE),
+)
+
+
+def _residual_placeholders(markdown: str) -> List[str]:
+    """Return the distinct unfilled-placeholder tokens left in a rendered draft.
+
+    Used as a post-render safety net: if the kickoff failed to ask for a slot
+    and neither the case nor the lawyer supplied it, the render leaves a marked
+    placeholder. We surface those so the draft is never silently shipped with
+    holes. Conservative by design — only high-signal markers (angle/handlebar
+    tokens, underscore blanks, XXXX, "to be filled", and bracket tokens whose
+    text names a slot) are matched, to avoid flagging ordinary legal prose."""
+    if not markdown:
+        return []
+    found: List[str] = []
+    seen: set = set()
+    for pat in _RESIDUAL_PLACEHOLDER_PATTERNS:
+        for m in pat.finditer(markdown):
+            tok = m.group(0).strip()
+            key = tok.lower()
+            if tok and key not in seen:
+                seen.add(key)
+                found.append(tok)
+    return found
+
+
 def _parse_json_object(text: str) -> Optional[Dict[str, Any]]:
     """Parse text expected to be a JSON object; return None on failure."""
     raw = _strip_code_fences(text)
@@ -5644,6 +5683,29 @@ OUTPUT FORMAT:
             lead_in = (
                 "I have revised the draft as requested. Let me know if any "
                 "further changes are needed."
+            )
+
+        # Safety net: if any slot survived into the finished draft as an
+        # unfilled placeholder (the kickoff failed to ask for it and neither
+        # the case nor the lawyer supplied it), surface it explicitly rather
+        # than presenting the draft as complete. Non-blocking — the draft still
+        # ships; the lawyer can fill the gaps in a follow-up turn.
+        residual = _residual_placeholders(markdown)
+        if residual:
+            preview = ", ".join(f"`{p}`" for p in residual[:12])
+            if len(residual) > 12:
+                preview += ", …"
+            lead_in = (
+                f"{lead_in}\n\n**Before this draft is filing-ready, a few "
+                f"details still need values:** {preview}. Reply with these and "
+                f"I will fill them in — I have left clearly-marked placeholders "
+                f"rather than invent them."
+            )
+            logger.info(
+                "Render left {} residual placeholder(s) (template={}): {}",
+                len(residual),
+                template_id or "(none)",
+                residual[:12],
             )
 
         # Embed the full draft Markdown inside the chat message body itself

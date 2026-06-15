@@ -886,14 +886,25 @@ TASK:
    matter (e.g. property/land facts in a reply-notice template, specific
    sale-deed numbers, original parties) and must be stripped or replaced
    when adapting to THIS case.
-3. Pre-fill any case-variable slot from the case context above whenever
-   possible (parties, role, statute citations applicable to this matter,
-   facts that are already in the case file).
+3. Pre-fill a case-variable slot into `gatheredFacts` ONLY when the case
+   context above ACTUALLY contains a concrete value for it (an explicit party
+   name, address, date, number, amount, statute, etc.). A slot's
+   `fill_from_case` flag is a HINT about where the value usually comes from —
+   it is NOT a promise the value exists here. If the case context does not
+   plainly state the value, you MUST NOT pre-fill it, MUST NOT guess it, and
+   MUST NOT assume it will appear later or be filled at render time — surface
+   it as an open question instead (step 4). Never put a slot in `gatheredFacts`
+   unless you can point to the exact value in the case context.
 4. List the SLOTS that still need the lawyer's input. When a STORED TEMPLATE
    BLUEPRINT with an INTERACTIVE VARIABLE REGISTRY is present above, that
    registry is the AUTHORITATIVE checklist — walk EVERY variable in it and,
-   for each, either pre-fill from the case context (reflect in gatheredFacts)
-   or surface it as an open question; never drop a registry field silently.
+   for each, either pre-fill from the case context when its concrete value is
+   present there (reflect in gatheredFacts) or surface it as an open question;
+   never drop a registry field silently. A variable marked
+   `fill_from_case=true` whose value is NOT actually in the case context is
+   STILL an open question — do not let it fall through to a render-time
+   `<placeholder>`. Literal template placeholders (`<...>`, `[...]`, blanks,
+   `XXXX`) that the case context does not answer MUST ALWAYS be asked.
    This applies equally to CONTENT / SUBSTANTIATION variables: any enumerated
    ground, claim, defence, head of loss/relief, representation, obligation, or
    defect/fact particular — whatever this template contains — that the case
@@ -1113,9 +1124,14 @@ DRAFT_RENDER_INSTRUCTION = (
     + "MUST be reproduced verbatim. Substitute case-specific facts into "
     + "the slots; strip any context-bound text from the template's "
     + "original matter that does not apply to THIS case. Never invent "
-    + "citations, case-law, monetary figures, court names, or party "
-    + "details. If the lawyer has not provided a slot value, leave a "
-    + "<placeholder> rather than fabricate it.\n\n"
+    + "citations, case-law, monetary figures, court names, party "
+    + "details, DATES (including the notice / issuance / execution date), "
+    + "INTEREST RATES, addresses, or invoice / reference numbers. If the "
+    + "lawyer has not provided a slot value and the case context does not "
+    + "supply it, leave a clearly-marked <placeholder> (e.g. "
+    + "`<Issuance Date>`, `<Interest Rate>`, `<Client Address>`) rather than "
+    + "fabricate it — a placeholder is always preferable to an invented "
+    + "value.\n\n"
     + "CONFLICT RESOLUTION — when a template is supplied, the template "
     + "WINS over your own structural habits and over the DOCUMENT-TYPE "
     + "REGISTRY in the base instruction (the registry applies ONLY in "
@@ -1180,6 +1196,18 @@ DRAFT_RENDER_INSTRUCTION = (
     + "    context plus the legal significance a reasonable advocate would "
     + "    articulate; do NOT invent new facts, figures, or representations "
     + "    the record does not support.\n"
+    + "  • A REPRESENTATIONS / RELIANCE / REPUTATION clause must be anchored to "
+    + "    a SPECIFIC representation actually made in THIS matter and its source "
+    + "    in the record (the exact specification promised, the warranty term, "
+    + "    the marketing or pre-sale communication, the assurance relied upon) — "
+    + "    NOT a generic string of adjectives. Replace an abstract adjective "
+    + "    pile (e.g. 'precision, reliability and superior craftsmanship') with "
+    + "    the concrete promise the record evidences and how the gathered facts "
+    + "    describe it. If the record supports no specific representation for a "
+    + "    given quality, OMIT that quality rather than assert a vague adjective. "
+    + "    Do NOT import general world-knowledge the record does not state — "
+    + "    brand reputation, founding year, market standing, awards and similar "
+    + "    background are usable ONLY when the case context provides them.\n"
     + "  • DROP generic items that do not apply to this case rather than "
     + "    carrying them as empty boilerplate. Never leave a generic "
     + "    boilerplate item un-grounded when the case context contains the "
@@ -1189,6 +1217,13 @@ DRAFT_RENDER_INSTRUCTION = (
     + "    restates an earlier descriptive section (e.g. Financial Loss), "
     + "    phrase the later one as the OPERATIVE demand — what is claimed and "
     + "    quantified — not a second identical list of descriptive heads.\n"
+    + "  • NO DUPLICATION WITHIN A LIST OR SECTION — never emit the same "
+    + "    bullet, clause or sentence more than once. Every item in a single "
+    + "    list must be distinct; do not repeat a representation, ground, loss "
+    + "    head, demand or recital that already appears earlier in that same "
+    + "    list. If two template bullets overlap, MERGE them into one "
+    + "    well-developed item rather than carrying both. Before finalising "
+    + "    each list, check that no two items say the same thing.\n"
     + "  • This particularisation may EXPAND a generic clause's prose — and "
     + "    add sub-points WITHIN that clause when the case warrants — to make "
     + "    it specific, detailed and persuasive. What it must NEVER do is add, "

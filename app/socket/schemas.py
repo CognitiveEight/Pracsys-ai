@@ -275,17 +275,79 @@ class UserMessageRequestPayload(BaseModel):
 # ============================================================================
 
 
+class TemplateBlueprintVariable(BaseModel):
+    """One interactive-variable inside a template's drafting blueprint.
+
+    May arrive fully specified (AI-proposed or echoed back after approval) or
+    as a near-empty row the lawyer typed in the dashboard (only `label` set) —
+    the drafting agent enriches name-only rows on the AI side.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: Optional[str] = None
+    label: Optional[str] = None
+    question: Optional[str] = None
+    kind: Optional[str] = None
+    fillFromCase: Optional[bool] = Field(
+        default=None,
+        validation_alias=AliasChoices("fillFromCase", "fill_from_case"),
+    )
+    required: Optional[bool] = None
+
+
+class TemplateBlueprint(BaseModel):
+    """The lawyer-approved (or AI-proposed) drafting blueprint for a template.
+
+    Mirrors the dashboard's *AI Drafting Blueprint & Variables Approval*
+    screen: persona/filing context, tone, structure style, draft depth, the
+    legal-guardrails level, and the interactive-variable registry.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    context: Optional[str] = None
+    tone: Optional[str] = None
+    structure: Optional[str] = None
+    depth: Optional[str] = None
+    legalGuardrails: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("legalGuardrails", "legal_guardrails"),
+    )
+    variables: List[TemplateBlueprintVariable] = []
+
+
+class TemplateFormatting(BaseModel):
+    """The `formatting` blob attached to a template_sync item.
+
+    `page`, `letterhead`, and `court` are free-form layout blobs used at DOCX
+    export (kept as opaque dicts). `blueprint` is the drafting config the AI
+    consumes for kickoff + render.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    page: Optional[Dict[str, Any]] = None
+    letterhead: Optional[Dict[str, Any]] = None
+    court: Optional[Dict[str, Any]] = None
+    blueprint: Optional[TemplateBlueprint] = None
+
+
 class TemplateSyncItem(BaseModel):
     """
     One template row inside a template_sync payload.
 
     Fields are populated based on the parent payload's `action`:
       - uploaded: id, name, category, extension, mimeType, size, fileHash,
-        fileUrl, path all present.
+        fileUrl, path all present; `formatting` optional.
       - renamed: id, name, previousName, category, extension, mimeType,
         fileHash, path present; size / fileUrl omitted (content unchanged).
       - deleted: id, name, category, extension, mimeType, fileHash, path
         present; size / fileUrl omitted.
+      - preset_created: kind="preset", no file fields; `formatting` carries
+        page / court / letterhead layout.
+      - formatting_updated: file unchanged (same fileHash); `formatting`
+        carries the approved `blueprint`.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -293,25 +355,33 @@ class TemplateSyncItem(BaseModel):
     id: str
     name: str
     previousName: Optional[str] = None
-    category: str  # "Letterhead" | "Folder" | "Document Draft"
-    extension: str  # pdf | doc | docx | txt
+    category: str  # "Letterhead" | "Folder" | "Document Draft" | court types
+    extension: str  # pdf | doc | docx | txt | "" (presets)
     mimeType: Optional[str] = None
     size: Optional[int] = None
     fileHash: Optional[str] = None
     fileUrl: Optional[str] = None
     path: Optional[str] = None
+    kind: Optional[str] = None  # "file" | "preset"
+    formatting: Optional[TemplateFormatting] = None
 
 
 class TemplateSyncPayload(BaseModel):
     """
     Schema for the template_sync event (Server → AI_Maverick).
-    Emitted when the lawyer uploads, renames, or deletes one or more
-    templates in the Template Library. Supports bulk operations.
+    Emitted when the lawyer uploads, renames, deletes, creates a preset, or
+    updates a template's formatting/blueprint. Supports bulk operations.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
-    action: Literal["uploaded", "deleted", "renamed"]
+    action: Literal[
+        "uploaded",
+        "deleted",
+        "renamed",
+        "preset_created",
+        "formatting_updated",
+    ]
     userId: str = Field(validation_alias=AliasChoices("userId", "user_id"))
     templates: List[TemplateSyncItem] = []
     timestamp: Optional[str] = None

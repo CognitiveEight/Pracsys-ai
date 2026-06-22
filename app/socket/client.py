@@ -601,6 +601,27 @@ class SocketClient:
                 logger.info("template_sync_response payload (repr): {}", repr(data))
             await event_handler.handle("template_sync_response", data)
 
+        @self.sio.event
+        async def request_blueprint_proposal(data):
+            """
+            Server → AI: the "Regenerate Extra Info" action on the dashboard's
+            blueprint-approval screen. The AI re-profiles the template and emits
+            a fresh template_blueprint_proposal. Without this explicit binding
+            the event falls through the catch-all and is silently dropped.
+            """
+            logger.info("📚 request_blueprint_proposal ← backend (socket received)")
+            try:
+                raw = json.dumps(data, default=str) if data is not None else "null"
+                logger.info(
+                    "request_blueprint_proposal payload (preview): {}",
+                    raw[:1200] + ("..." if len(raw) > 1200 else ""),
+                )
+            except Exception:
+                logger.info(
+                    "request_blueprint_proposal payload (repr): {}", repr(data)
+                )
+            await event_handler.handle("request_blueprint_proposal", data)
+
         @self.sio.on(AI_HEARTBEAT_PING)
         async def ai_heartbeat_ping(data):
             """

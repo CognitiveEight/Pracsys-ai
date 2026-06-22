@@ -272,6 +272,18 @@ REQUEST_TEMPLATE_SYNC = "request_template_sync"
 # REQUEST_TEMPLATE_SYNC. Same template shape as TEMPLATE_SYNC.
 TEMPLATE_SYNC_RESPONSE = "template_sync_response"
 
+# AI → Server: the AI's profiled "drafting blueprint" + interactive-variable
+# registry for a freshly-uploaded template, surfaced in the dashboard's
+# "AI Drafting Blueprint & Variables Approval" screen. The lawyer reviews /
+# edits it and the approved result returns via TEMPLATE_SYNC action
+# "formatting_updated".
+TEMPLATE_BLUEPRINT_PROPOSAL = "template_blueprint_proposal"
+
+# Server → AI: the dashboard's "Regenerate Extra Info" action — re-profile the
+# template and emit a fresh TEMPLATE_BLUEPRINT_PROPOSAL. Payload carries
+# {userId, templateId, fileHash, fileUrl, timestamp}.
+REQUEST_BLUEPRINT_PROPOSAL = "request_blueprint_proposal"
+
 
 class TemplateAction:
     """Action values for the template_sync event."""
@@ -279,6 +291,18 @@ class TemplateAction:
     UPLOADED = "uploaded"
     DELETED = "deleted"
     RENAMED = "renamed"
+    # New: a court/letterhead preset was created (no file body — carries a
+    # `formatting` layout blob), and the lawyer approved/edited a template's
+    # AI Blueprint (carries `formatting.blueprint`).
+    PRESET_CREATED = "preset_created"
+    FORMATTING_UPDATED = "formatting_updated"
+
+
+class TemplateKind:
+    """`kind` values for a template_sync item."""
+
+    FILE = "file"      # a file-backed template (has fileUrl / extracted text)
+    PRESET = "preset"  # a layout-only preset (court header / letterhead / page)
 
 
 class TemplateCategory:

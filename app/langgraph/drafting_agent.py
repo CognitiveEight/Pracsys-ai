@@ -139,6 +139,13 @@ _MAX_SUGGESTIONS = 6
 # clauses (grounds, claims/defences, heads of loss/relief, representations …).
 PROFILE_SCHEMA_VERSION = 2
 
+# Defaults for the drafting-blueprint controls the lawyer can override in the
+# dashboard. Used when we PROPOSE a fresh blueprint (the user then edits these
+# on the "AI Drafting Blueprint & Variables Approval" screen).
+_DEFAULT_DRAFT_DEPTH = "Detailed & Comprehensive"
+_DEFAULT_STRUCTURE_STYLE = "Sectioned Clauses"
+_DEFAULT_GUARDRAIL_LEVEL = "Comprehensive"
+
 # Strip IPC / CrPC / Indian Evidence Act mentions defensively in case the
 # model slips. The existing applicable-laws normaliser already does this for
 # its own payload, but the drafting outputs are independent.
@@ -199,6 +206,84 @@ def _residual_placeholders(markdown: str) -> List[str]:
                 seen.add(key)
                 found.append(tok)
     return found
+
+
+_PLACEHOLDER_TOKEN_RE = re.compile(r"<[^<>\n]{1,60}>")
+
+
+def _restore_regressed_values(
+    previous_md: str, new_md: str
+) -> "tuple[str, List[str]]":
+    """Repair a re-render that re-blanked an already-filled field — for ANY
+    field in ANY template, by aligning whole lines (layout-independent, no
+    field names or value patterns hard-coded).
+
+    A revision changes very little, so the new draft is nearly line-for-line
+    identical to the previous one. For each NEW-draft line that still contains a
+    `<placeholder>`, find the most similar PREVIOUS-draft line that is itself
+    placeholder-FREE (i.e. was filled). If they match closely enough, the field
+    regressed — restore the whole previous line. Lines that were empty in both
+    drafts have no placeholder-free counterpart, so they are left untouched.
+    Restoring the entire line (rather than a regex-extracted value) means it
+    works regardless of layout — `Survey No. 262/4`, `(GSTIN: …)`,
+    `Enrollment No.: …`, inline prose, etc. Deterministic safety net behind the
+    prompt-level preservation rule. Returns ``(repaired_md, restored_labels)``."""
+    if not previous_md or not new_md:
+        return new_md, []
+    import difflib
+
+    prev_lines = previous_md.splitlines()
+    # Candidate sources: previous lines that are filled (no placeholder) and
+    # carry enough text to match on.
+    prev_candidates = [
+        p for p in prev_lines
+        if p.strip() and not _PLACEHOLDER_TOKEN_RE.search(p)
+    ]
+    if not prev_candidates:
+        return new_md, []
+
+    def _tokens(s: str) -> List[str]:
+        return [t for t in re.split(r"\s+", s) if t]
+
+    new_lines = new_md.splitlines()
+    out_lines = list(new_lines)
+    restored: List[str] = []
+    for i, line in enumerate(new_lines):
+        if not _PLACEHOLDER_TOKEN_RE.search(line):
+            continue  # this line is fine — nothing re-blanked here
+        # The "scaffolding" around the placeholder (label / prose), minus the
+        # empty slot itself. The filled previous line must contain this text.
+        new_stable = _PLACEHOLDER_TOKEN_RE.sub("", line).strip()
+        nt = _tokens(new_stable)
+        if not nt or len(new_stable) < 3:
+            continue  # too little context to match safely
+        best = None
+        best_contained = 0.0
+        best_ratio = 0.0
+        for pline in prev_candidates:
+            pt = set(_tokens(pline))
+            # Fraction of the regressed line's scaffolding tokens present in the
+            # candidate — length-insensitive, so a long value doesn't lower it.
+            contained = sum(1 for t in nt if t in pt) / len(nt)
+            if contained < best_contained:
+                continue
+            ratio = difflib.SequenceMatcher(None, new_stable, pline.strip()).ratio()
+            if contained > best_contained or ratio > best_ratio:
+                best_contained = contained
+                best_ratio = ratio
+                best = pline
+        # The scaffolding fully matches a filled previous line ⇒ the field was
+        # filled before and got re-blanked. Restore the whole previous line.
+        # Single-token scaffolds need a stronger overall-similarity floor to
+        # avoid spurious matches.
+        if (
+            best is not None
+            and best_contained >= 0.8
+            and (len(nt) >= 2 or best_ratio >= 0.6)
+        ):
+            out_lines[i] = best
+            restored.append(new_stable[:48])
+    return "\n".join(out_lines), restored
 
 
 def _parse_json_object(text: str) -> Optional[Dict[str, Any]]:
@@ -398,6 +483,25 @@ class DraftingAgent:
         if not (user_id and title):
             return
         self._suggestion_prematch.pop(self._prematch_key(user_id, title), None)
+
+    def _forget_prematch_by_template_id(
+        self, user_id: str, template_id: str
+    ) -> int:
+        """Release EVERY pre-match lock (for this user) pointing at a given
+        template_id — used when that template is deleted so a later suggestion
+        click can never recall the dead id. Returns how many bindings were
+        dropped."""
+        if not (user_id and template_id):
+            return 0
+        prefix = f"{(user_id or '').strip()}::"
+        tid = template_id.strip()
+        stale_keys = [
+            k for k, v in self._suggestion_prematch.items()
+            if k.startswith(prefix) and v == tid
+        ]
+        for k in stale_keys:
+            self._suggestion_prematch.pop(k, None)
+        return len(stale_keys)
 
     def _recall_prematch(self, user_id: str, title: str) -> Optional[str]:
         """Return the pre-matched templateId for this suggestion title, or
@@ -767,12 +871,18 @@ class DraftingAgent:
         path: Optional[str],
         file_hash: Optional[str],
         previous_payload: Optional[Dict[str, Any]] = None,
+        kind: Optional[str] = None,
+        formatting: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Download a template, extract text, and persist under the user cache.
 
         Returns the cache payload on success, None on failure. If
         `previous_payload` has a matching `file_hash`, the existing
         extracted text is preserved (no re-download).
+
+        When `formatting.blueprint` is supplied (a re-upload of an
+        already-approved template), that lawyer-approved blueprint is stored as
+        authoritative and the AI profiler is NOT re-run.
         """
         if not file_url:
             logger.warning(
@@ -987,7 +1097,37 @@ class DraftingAgent:
         structure_outline: List[str] = []
         profiled_at = ""
         profile_schema_version = 0
-        if (
+        # "AI Suggested Fields" (quick-add chips) — carried forward, refreshed
+        # on a fresh profile. Approved-blueprint re-uploads keep the prior set.
+        quick_add: List[str] = list((previous_payload or {}).get("quick_add") or [])
+        # Lawyer-approved blueprint controls (override the AI's defaults). Carried
+        # forward from a previous payload, or set when an approved blueprint is
+        # supplied on this event.
+        draft_structure = (previous_payload or {}).get("draft_structure") or ""
+        draft_depth = (previous_payload or {}).get("draft_depth") or ""
+        guardrail_level = (previous_payload or {}).get("guardrail_level") or ""
+        blueprint_approved = bool((previous_payload or {}).get("blueprint_approved"))
+
+        supplied_blueprint = (formatting or {}).get("blueprint") if formatting else None
+        if supplied_blueprint:
+            # Scenario B: a re-upload that already carries the approved blueprint
+            # — store it authoritative, do NOT re-profile.
+            resolved = await self._resolve_approved_blueprint(
+                blueprint=supplied_blueprint,
+                existing_variables=(previous_payload or {}).get("interactive_variables") or [],
+                document_type=document_type,
+            )
+            interactive_variables = resolved["interactive_variables"]
+            template_tone = resolved["template_tone"]
+            filing_context = resolved["filing_context"]
+            structure_outline = resolved["structure_outline"]
+            draft_structure = resolved["draft_structure"]
+            draft_depth = resolved["draft_depth"]
+            guardrail_level = resolved["guardrail_level"]
+            blueprint_approved = True
+            profiled_at = now_iso
+            profile_schema_version = PROFILE_SCHEMA_VERSION
+        elif (
             hash_stable
             and previous_payload
             and previous_payload.get("interactive_variables")
@@ -1015,6 +1155,7 @@ class DraftingAgent:
                 template_tone = profile.get("tone") or ""
                 filing_context = profile.get("filing_context") or ""
                 structure_outline = profile.get("structure_outline") or []
+                quick_add = profile.get("quick_add") or []
                 profiled_at = now_iso
                 profile_schema_version = profile.get(
                     "profile_schema_version", PROFILE_SCHEMA_VERSION
@@ -1046,8 +1187,15 @@ class DraftingAgent:
             "template_tone": template_tone,
             "filing_context": filing_context,
             "structure_outline": structure_outline,
+            "quick_add": quick_add,
             "profiled_at": profiled_at,
             "profile_schema_version": profile_schema_version,
+            # Lawyer-approved blueprint controls (empty until approved).
+            "draft_structure": draft_structure,
+            "draft_depth": draft_depth,
+            "guardrail_level": guardrail_level,
+            "blueprint_approved": blueprint_approved,
+            "kind": (kind or "file"),
         }
 
         try:
@@ -1090,6 +1238,511 @@ class DraftingAgent:
             "yes" if filing_context else "no",
         )
         return payload
+
+    # ------------------------------------------------------------------
+    # Drafting-blueprint approval loop (dashboard ↔ AI)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _norm_label(text: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+
+    @staticmethod
+    def _slug(text: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", str(text or "").lower()).strip("_")
+
+    _EXECUTION_HINTS = (
+        "advocate", "enrol", "enroll", "designation", "issuance", "place of",
+        "witness", "signature", "signatory", "law firm", "letterhead",
+        "authority letter", "notice period", "compliance period",
+    )
+    _KIND_HINTS = (
+        ("date", "date"), ("dob", "date"), ("amount", "amount"),
+        ("rate", "amount"), ("salary", "amount"), ("rent", "amount"),
+        ("emi", "amount"), ("deposit", "amount"), ("compensation", "amount"),
+        ("damages", "amount"), ("balance", "amount"),
+        ("section", "statute"), ("act", "statute"), ("statute", "statute"),
+        ("relief", "relief"), ("prayer", "relief"), ("demand", "relief"),
+        ("name", "party"), ("client", "party"), ("recipient", "party"),
+        ("advocate", "party"), ("address", "party"), ("email", "party"),
+        ("phone", "party"), ("father", "party"), ("mother", "party"),
+        ("ground", "substantiation"), ("breach", "substantiation"),
+        ("misconduct", "substantiation"), ("cruelty", "substantiation"),
+        ("infringement", "substantiation"), ("defamatory", "substantiation"),
+        ("warranty", "substantiation"), ("representation", "substantiation"),
+        ("facts", "substantiation"), ("statement", "substantiation"),
+    )
+
+    def _heuristic_enrich_variable(self, label: str) -> Dict[str, Any]:
+        """Best-effort metadata for a name-only variable when LLM enrichment is
+        unavailable. Aligns to the canonical variable vocabulary by keyword."""
+        norm = self._norm_label(label)
+        kind = "fact"
+        for needle, k in self._KIND_HINTS:
+            if needle in norm:
+                kind = k
+                break
+        fill_from_case = not any(h in norm for h in self._EXECUTION_HINTS)
+        return {
+            "id": self._slug(label) or "var",
+            "label": (label or "").strip()[:80],
+            "question": f"What is the {(label or 'value').strip()}?"[:240],
+            "kind": kind,
+            "fill_from_case": fill_from_case,
+            "required": True,
+        }
+
+    async def _enrich_variables(
+        self, rows: List[Dict[str, Any]], document_type: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """LLM-enrich name-only variables (one batched call) → {id: enriched}.
+
+        Falls back to heuristics per row on any failure. `rows` carry at least a
+        `label` (and an `id`)."""
+        labels = [(r.get("id"), (r.get("label") or "").strip()) for r in rows if (r.get("label") or "").strip()]
+        out: Dict[str, Dict[str, Any]] = {}
+        if not labels:
+            return out
+        listing = "\n".join(f"- {lid}: {lab}" for lid, lab in labels)
+        prompt = (
+            f"DOCUMENT TYPE: {document_type or '(unclassified)'}\n"
+            "For each interactive-variable label below (a fill-in field a lawyer "
+            "added to an Indian legal-document template), return JSON. Keep ids "
+            "EXACTLY as given.\n\n"
+            f"VARIABLES:\n{listing}\n\n"
+            "Output strict JSON only: {\"variables\":[{\"id\":\"<same id>\","
+            "\"question\":\"<one focused question asking for this value>\","
+            "\"kind\":\"<party|date|amount|statute|fact|relief|execution|"
+            "substantiation|other>\",\"fillFromCase\":<true if normally in the "
+            "case file, false if only the lawyer knows it at drafting time>,"
+            "\"required\":<true|false>}]}"
+        )
+        try:
+            raw = await gemini_client.generate(
+                prompt,
+                system_instruction=(
+                    "You map legal-document template variable names to their "
+                    "drafting metadata. Indian-law grounding (BNS/BNSS/BSA). "
+                    "JSON only, no commentary."
+                ),
+                temperature=0.1,
+                max_tokens=4000,
+                response_mime_type="application/json",
+            )
+            parsed = _parse_json_object(raw) or {}
+            for item in parsed.get("variables") or []:
+                if not isinstance(item, dict):
+                    continue
+                vid = (item.get("id") or "").strip().lower()
+                if not vid:
+                    continue
+                fill = item.get("fillFromCase")
+                if fill is None:
+                    fill = item.get("fill_from_case")
+                out[vid] = {
+                    "question": (item.get("question") or "").strip(),
+                    "kind": (item.get("kind") or "").strip().lower(),
+                    "fill_from_case": bool(fill) if fill is not None else None,
+                    "required": item.get("required"),
+                }
+        except Exception as e:
+            logger.warning("Variable enrichment LLM call failed: {}", e)
+        return out
+
+    async def _autofill_variables_from_context(
+        self,
+        variables: List[Dict[str, Any]],
+        case_context: Dict[str, Any],
+    ) -> Dict[str, str]:
+        """Extract a value for every registry variable the CASE CONTEXT clearly
+        supports → ``{variable_id: value}``. One focused Gemini call so auto-fill
+        is reliable (the kickoff LLM recites facts in prose but under-populates
+        gatheredFacts). Omits variables the context does not clearly provide;
+        never guesses/fabricates. Returns ``{}`` on failure."""
+        vars_ = [v for v in (variables or []) if isinstance(v, dict) and v.get("id")]
+        if not vars_:
+            return {}
+        listing = "\n".join(
+            f"- {v.get('id')}: {(v.get('label') or '').strip()}"
+            f" — {(v.get('question') or '').strip()}"
+            for v in vars_
+        )
+        ctx_parts = [
+            ("CASE SUMMARY", case_context.get("case_summary")),
+            ("CASE FACTS / EVIDENCE", case_context.get("case_facts_brief")),
+            ("APPLICABLE LAWS", case_context.get("applicable_laws_brief")),
+            ("STRATEGY", case_context.get("strategy_brief")),
+        ]
+        context_block = "\n\n".join(
+            f"{label}:\n{(val or '').strip()}"
+            for label, val in ctx_parts
+            if (val or "").strip()
+        ) or "(no case context available)"
+        prompt = (
+            "From the CASE CONTEXT, extract the value for each VARIABLE below "
+            "that the context CLEARLY supports. Return strict JSON only: "
+            "{\"values\": {\"<variable id>\": \"<value exactly as the case "
+            "states it>\"}}. OMIT any variable the context does not clearly "
+            "provide — do NOT guess, infer loosely, or fabricate. Keep ids "
+            "EXACTLY as given. Values are concise and lifted from the case "
+            "(names, dates, numbers, amounts, short descriptions).\n\n"
+            f"VARIABLES:\n{listing}\n\n"
+            f"CASE CONTEXT:\n\"\"\"\n{context_block}\n\"\"\""
+        )
+        try:
+            raw = await gemini_client.generate(
+                prompt,
+                system_instruction=(
+                    "You extract case-variable values from an Indian legal "
+                    "matter's context for document drafting. Extract only what "
+                    "is clearly present; never fabricate. JSON only."
+                ),
+                temperature=0.1,
+                max_tokens=8000,
+                response_mime_type="application/json",
+            )
+        except Exception as e:
+            logger.warning("Auto-fill extraction LLM call failed: {}", e)
+            return {}
+        parsed = _parse_json_object(raw) or {}
+        values = parsed.get("values")
+        if not isinstance(values, dict):
+            # Tolerate a flat {id: value} object.
+            values = parsed if isinstance(parsed, dict) else {}
+        valid_ids = {(v.get("id") or "").strip().lower() for v in vars_}
+        out: Dict[str, str] = {}
+        for k, val in (values or {}).items():
+            kid = str(k).strip().lower()
+            if kid not in valid_ids:
+                continue
+            if isinstance(val, (str, int, float)):
+                sval = str(val).strip()
+                if sval and self._is_filled_value(sval):
+                    out[kid] = sval
+        return out
+
+    async def _reconcile_variables(
+        self,
+        approved: Any,
+        existing: List[Dict[str, Any]],
+        document_type: str,
+    ) -> List[Dict[str, Any]]:
+        """Merge the lawyer-approved variable set with our existing registry.
+
+        The approved list is the authoritative SET (added vars included,
+        removed vars dropped). Matched vars reuse our AI metadata; name-only
+        added vars are enriched. Returns normalized variable dicts."""
+        existing_by_id: Dict[str, Dict[str, Any]] = {}
+        existing_by_label: Dict[str, Dict[str, Any]] = {}
+        for v in existing or []:
+            if not isinstance(v, dict):
+                continue
+            vid = (v.get("id") or "").strip().lower()
+            lab = self._norm_label(v.get("label"))
+            if vid:
+                existing_by_id[vid] = v
+            if lab:
+                existing_by_label[lab] = v
+
+        rows: List[Dict[str, Any]] = []
+        incomplete: List[Dict[str, Any]] = []
+        for item in approved or []:
+            if isinstance(item, str):
+                item = {"label": item}
+            if not isinstance(item, dict):
+                continue
+            label = (item.get("label") or "").strip()
+            vid = (item.get("id") or "").strip().lower()
+            if not (label or vid):
+                continue
+            match = None
+            if vid and vid in existing_by_id:
+                match = existing_by_id[vid]
+            elif label and self._norm_label(label) in existing_by_label:
+                match = existing_by_label[self._norm_label(label)]
+            m = match or {}
+            fill = item.get("fillFromCase")
+            if fill is None:
+                fill = item.get("fill_from_case")
+            if fill is None:
+                fill = m.get("fill_from_case")
+            required = item.get("required")
+            if required is None:
+                required = m.get("required")
+            row = {
+                "id": vid or (m.get("id") or "").strip().lower() or self._slug(label) or f"var_{len(rows)+1}",
+                "label": label or m.get("label") or "",
+                "question": (item.get("question") or "").strip() or (m.get("question") or "").strip(),
+                "kind": (item.get("kind") or "").strip().lower() or (m.get("kind") or "").strip().lower(),
+                "fill_from_case": fill,
+                "required": required,
+            }
+            rows.append(row)
+            if not row["question"] or not row["kind"] or row["fill_from_case"] is None or row["required"] is None:
+                incomplete.append(row)
+
+        if incomplete:
+            enriched = await self._enrich_variables(incomplete, document_type)
+            for row in incomplete:
+                e = enriched.get(row["id"])
+                fallback = self._heuristic_enrich_variable(row["label"])
+                src = e or {}
+                if not row["question"]:
+                    row["question"] = src.get("question") or fallback["question"]
+                if not row["kind"]:
+                    row["kind"] = src.get("kind") or fallback["kind"]
+                if row["fill_from_case"] is None:
+                    fv = src.get("fill_from_case")
+                    row["fill_from_case"] = fv if fv is not None else fallback["fill_from_case"]
+                if row["required"] is None:
+                    rv = src.get("required")
+                    row["required"] = rv if rv is not None else fallback["required"]
+
+        # Final normalization (validates kind, caps count, de-dupes).
+        return self._normalize_interactive_variables(rows)
+
+    async def _resolve_approved_blueprint(
+        self,
+        *,
+        blueprint: Dict[str, Any],
+        existing_variables: List[Dict[str, Any]],
+        document_type: str,
+        existing_tone: str = "",
+        existing_context: str = "",
+        existing_outline: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Turn an approved blueprint dict into the internal stored fields."""
+        bp = blueprint or {}
+        variables = await self._reconcile_variables(
+            bp.get("variables"), existing_variables, document_type
+        )
+        tone = (bp.get("tone") or "").strip() or (existing_tone or "")
+        context = (bp.get("context") or "").strip() or (existing_context or "")
+        outline = existing_outline if existing_outline is not None else []
+        return {
+            "interactive_variables": variables,
+            "template_tone": tone[:160],
+            "filing_context": context[:800],
+            "structure_outline": [str(s).strip() for s in (outline or []) if str(s).strip()],
+            "draft_structure": (bp.get("structure") or "").strip(),
+            "draft_depth": (bp.get("depth") or "").strip(),
+            "guardrail_level": (bp.get("legalGuardrails") or bp.get("legal_guardrails") or "").strip(),
+        }
+
+    async def build_blueprint_proposal(
+        self, *, user_id: str, template_id: str, force_reprofile: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Build the AI's blueprint proposal for the dashboard approval screen.
+
+        Profiles the template on demand if it was not profiled at ingest.
+        When ``force_reprofile`` is True (the "Regenerate Extra Info" action),
+        the profiler is re-run from the cached text even if a profile already
+        exists, and any prior approval is reset (a fresh proposal supersedes it
+        until the lawyer re-approves). Returns the `template_blueprint_proposal`
+        payload, or None when the template is unknown."""
+        tpl = await self.get_template(user_id=user_id, template_id=template_id)
+        if not tpl:
+            logger.warning(
+                "build_blueprint_proposal: template not in store (user={}, template={})",
+                str(user_id)[:12],
+                template_id,
+            )
+            return None
+
+        variables = tpl.get("interactive_variables") or []
+        tone = (tpl.get("template_tone") or "").strip()
+        context = (tpl.get("filing_context") or "").strip()
+        outline = tpl.get("structure_outline") or []
+        # Profile now if ingest did not (profiler failed / older path), OR when a
+        # regenerate was explicitly requested (force a fresh profile).
+        if (force_reprofile or not variables) and (tpl.get("extracted_text") or "").strip():
+            profile = await self._extract_template_profile(
+                name=tpl.get("name") or "",
+                document_type=tpl.get("document_type") or "",
+                extracted_text=tpl.get("extracted_text") or "",
+                docx_bytes=None,
+            )
+            if profile:
+                variables = profile.get("interactive_variables") or []
+                tone = (profile.get("tone") or "").strip() or tone
+                context = (profile.get("filing_context") or "").strip() or context
+                outline = profile.get("structure_outline") or outline
+                updated = {
+                    **tpl,
+                    "interactive_variables": variables,
+                    "template_tone": tone,
+                    "filing_context": context,
+                    "structure_outline": outline,
+                    "quick_add": profile.get("quick_add") or [],
+                    "profiled_at": datetime.utcnow().isoformat(),
+                    "profile_schema_version": PROFILE_SCHEMA_VERSION,
+                }
+                # A regenerated proposal is no longer the previously-approved
+                # blueprint — reset the flag so it awaits fresh approval.
+                if force_reprofile:
+                    updated["blueprint_approved"] = False
+                try:
+                    from app.langgraph.template_store import template_store
+
+                    await template_store.put(
+                        user_id=user_id, template_id=template_id, payload=updated
+                    )
+                    tpl = updated
+                except Exception as e:
+                    logger.warning("build_blueprint_proposal: persist failed: {}", e)
+
+        proposal_vars = [
+            {
+                "id": v.get("id"),
+                "label": v.get("label"),
+                "question": v.get("question"),
+                "kind": v.get("kind"),
+                "fillFromCase": bool(v.get("fill_from_case", True)),
+                "required": bool(v.get("required", True)),
+            }
+            for v in variables
+            if isinstance(v, dict)
+        ]
+        quick_add = [
+            str(q).strip() for q in (tpl.get("quick_add") or []) if str(q).strip()
+        ]
+        status = "ready" if (proposal_vars or tone or context) else "failed"
+        return {
+            "userId": user_id,
+            "templateId": template_id,
+            "fileHash": tpl.get("file_hash") or "",
+            "status": status,
+            # Library pill grouping, derived from the classified document type.
+            "draftCategory": self._draft_category_for(tpl.get("document_type") or ""),
+            "blueprint": {
+                "context": context,
+                "tone": tone,
+                "structure": tpl.get("draft_structure") or _DEFAULT_STRUCTURE_STYLE,
+                "depth": tpl.get("draft_depth") or _DEFAULT_DRAFT_DEPTH,
+                "legalGuardrails": tpl.get("guardrail_level") or _DEFAULT_GUARDRAIL_LEVEL,
+                "variables": proposal_vars,
+                # Optional one-click "AI Suggested Fields" chips.
+                "quickAdd": quick_add,
+            },
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    @staticmethod
+    def _draft_category_for(document_type: str) -> str:
+        """Map a classified document type to a library-pill category
+        (Notice | Affidavit | Petition | Other). Keyword-based, order matters
+        (notice wins over petition for 'Reply Notice', etc.)."""
+        t = (document_type or "").strip().lower()
+        if not t:
+            return "Other"
+        if "notice" in t:
+            return "Notice"
+        if "affidavit" in t:
+            return "Affidavit"
+        if any(
+            w in t for w in (
+                "petition", "plaint", "written statement", "application",
+                "complaint", "appeal", "suit", "bail", "writ",
+            )
+        ):
+            return "Petition"
+        return "Other"
+
+    async def apply_approved_blueprint(
+        self, *, user_id: str, template_id: str, blueprint: Dict[str, Any]
+    ) -> bool:
+        """Store the lawyer-approved blueprint as authoritative (file unchanged).
+
+        Reconciles the approved variable set with our registry, enriches any
+        name-only added variables, and persists the controls (tone, context,
+        structure, depth, guardrails). Returns False when the template is
+        unknown (the snapshot will backfill it later)."""
+        tpl = await self.get_template(user_id=user_id, template_id=template_id)
+        if not tpl:
+            logger.warning(
+                "apply_approved_blueprint: template not in store (user={}, template={})",
+                str(user_id)[:12],
+                template_id,
+            )
+            return False
+        resolved = await self._resolve_approved_blueprint(
+            blueprint=blueprint or {},
+            existing_variables=tpl.get("interactive_variables") or [],
+            document_type=tpl.get("document_type") or "",
+            existing_tone=(tpl.get("template_tone") or ""),
+            existing_context=(tpl.get("filing_context") or ""),
+            existing_outline=tpl.get("structure_outline") or [],
+        )
+        updated = {
+            **tpl,
+            "interactive_variables": resolved["interactive_variables"],
+            "template_tone": resolved["template_tone"],
+            "filing_context": resolved["filing_context"],
+            "structure_outline": resolved["structure_outline"],
+            "draft_structure": resolved["draft_structure"],
+            "draft_depth": resolved["draft_depth"],
+            "guardrail_level": resolved["guardrail_level"],
+            "blueprint_approved": True,
+            "profile_schema_version": PROFILE_SCHEMA_VERSION,
+            "profiled_at": datetime.utcnow().isoformat(),
+        }
+        try:
+            from app.langgraph.template_store import template_store
+
+            await template_store.put(
+                user_id=user_id, template_id=template_id, payload=updated
+            )
+        except Exception as e:
+            logger.warning("apply_approved_blueprint: persist failed: {}", e)
+            return False
+        logger.success(
+            "Applied approved blueprint (template={}, vars={}, tone={!r}, "
+            "depth={!r}, structure={!r}, guardrails={!r})",
+            template_id,
+            len(resolved["interactive_variables"]),
+            resolved["template_tone"] or "(none)",
+            resolved["draft_depth"] or "(none)",
+            resolved["draft_structure"] or "(none)",
+            resolved["guardrail_level"] or "(none)",
+        )
+        return True
+
+    async def store_preset(
+        self,
+        *,
+        user_id: str,
+        template_id: str,
+        name: str,
+        category: str,
+        formatting: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Cache a court/letterhead PRESET (no file body) — its page/court/
+        letterhead layout is applied at DOCX export, not used as draft content."""
+        now_iso = datetime.utcnow().isoformat()
+        payload = {
+            "template_id": template_id,
+            "user_id": user_id,
+            "name": name or template_id,
+            "category": category or "Custom",
+            "kind": "preset",
+            "extension": "",
+            "extracted_text": "",
+            "extraction_status": "n/a",
+            "formatting": formatting or {},
+            "ingested_at": now_iso,
+        }
+        try:
+            from app.langgraph.template_store import template_store
+
+            await template_store.put(
+                user_id=user_id, template_id=template_id, payload=payload
+            )
+        except Exception as e:
+            logger.warning("store_preset: persist failed (template={}): {}", template_id, e)
+            return False
+        logger.success(
+            "Stored preset (template={}, category={!r})", template_id, category or "(none)"
+        )
+        return True
 
     async def rename_template(
         self,
@@ -1141,11 +1794,17 @@ class DraftingAgent:
             user_id=user_id,
             template_id=template_id,
         )
+        # Always release any suggestion pre-match locks pointing at this
+        # template — even if the store had already evicted it — so a later
+        # suggested-draft click can never recall the deleted id.
+        released = self._forget_prematch_by_template_id(user_id, template_id)
         if ok:
             logger.info(
-                "Template deleted from cache (user={}, template={})",
+                "Template deleted from cache (user={}, template={}, "
+                "prematch_locks_released={})",
                 user_id,
                 template_id,
+                released,
             )
         return ok
 
@@ -1388,6 +2047,23 @@ class DraftingAgent:
         variables = self._normalize_interactive_variables(
             parsed.get("interactive_variables")
         )
+        # Optional "AI Suggested Fields" — extra field NAMES the lawyer can
+        # one-click add; de-duped against the registry labels, capped.
+        quick_add: List[str] = []
+        existing_labels = {
+            (v.get("label") or "").strip().lower() for v in variables
+        }
+        raw_quick = parsed.get("quick_add") or []
+        if isinstance(raw_quick, list):
+            seen_q: set = set()
+            for q in raw_quick:
+                name = " ".join(str(q or "").split())[:60]
+                key = name.lower()
+                if name and key not in existing_labels and key not in seen_q:
+                    seen_q.add(key)
+                    quick_add.append(name)
+                if len(quick_add) >= 8:
+                    break
         if not (tone or filing_context or structure_outline or variables):
             return None
         return {
@@ -1395,6 +2071,7 @@ class DraftingAgent:
             "filing_context": filing_context,
             "structure_outline": structure_outline,
             "interactive_variables": variables,
+            "quick_add": quick_add,
             "profile_schema_version": PROFILE_SCHEMA_VERSION,
         }
 
@@ -2220,6 +2897,18 @@ class DraftingAgent:
                     case_context=case_context,
                     request_fields=request_fields,
                 )
+            elif (session_state or {}).get("awaiting_template_choice"):
+                # The matched template was deleted; we offered (use similar /
+                # upload / draft from case file) and are now routing the
+                # lawyer's choice. Explicit branch so the generic intent
+                # classifier never overrides it.
+                session_state = await self._handle_template_choice_reply(
+                    user_message=user_message,
+                    case_context=case_context,
+                    session_state=session_state or {},
+                    request_fields=request_fields,
+                    conversation_history=conversation_history,
+                )
             elif (session_state or {}).get("incompatible"):
                 # Incompatible-template flow — _handle_followup routes to
                 # _handle_incompatible_reply at its top, where the
@@ -2757,14 +3446,24 @@ class DraftingAgent:
         *,
         user_id: str,
         request_fields: Dict[str, Any],
+        allow_lazy_fetch: bool = True,
     ) -> Optional[Dict[str, Any]]:
-        """Return the cached template payload, lazy-fetching if missing."""
+        """Return the cached template payload, lazy-fetching if missing.
+
+        ``allow_lazy_fetch=False`` disables the ``templateUrl`` fallback — used
+        for suggested-draft clicks, where the store is already synced to the
+        backend's CURRENT library, so a templateId absent from the store means
+        the template was DELETED. Lazy-fetching it from the (stale) click URL
+        would resurrect a deleted template, so we must not."""
         template_id = (request_fields.get("templateId") or "").strip()
         if not template_id:
             return None
         cached = await self.get_template(user_id=user_id, template_id=template_id)
         if cached and (cached.get("extracted_text") or "").strip():
             return cached
+        if not allow_lazy_fetch:
+            # Deleted (absent from the synced store) — do NOT resurrect it.
+            return None
         # Cold cache: lazy-fetch using fields on the request.
         file_url = request_fields.get("templateUrl")
         if not file_url:
@@ -2882,32 +3581,37 @@ class DraftingAgent:
         ready_library_size = 0
         advertised_template_id = (request_fields.get("templateId") or "").strip()
         if source == "template" or advertised_template_id:
+            # Suggested-draft clicks must NOT resurrect a deleted template from
+            # the (stale) click URL — the store is already synced to the
+            # backend's current library, so absence = deleted. Explicit library
+            # opens (source="template") keep lazy-fetch.
             template_payload = await self._resolve_template(
-                user_id=user_id, request_fields=request_fields
+                user_id=user_id,
+                request_fields=request_fields,
+                allow_lazy_fetch=(source != "suggestedDraft"),
             )
-            # Advertised template is gone (deleted / unfetchable) on a
-            # suggested-draft click: honour the lawyer's intent without a
-            # silent wrong-template swap. Release the stale lock and draft
-            # from the case file with an honest note. NO fresh re-match —
-            # re-matching here is exactly what produced a different template
-            # than the card advertised.
+            # Advertised template is GONE (deleted) on a suggested-draft click:
+            # do not silently draft from scratch — inform the lawyer it was
+            # removed and offer to use a similar template, upload one, or draft
+            # from the case file. Wait for their choice.
             if (
                 template_payload is None
                 and source == "suggestedDraft"
                 and advertised_template_id
             ):
                 logger.info(
-                    "Advertised template {} no longer available for user {} "
-                    "— drafting from scratch (no re-match)",
+                    "Advertised template {} no longer in library for user {} "
+                    "— offering missing-template choice",
                     advertised_template_id,
                     (user_id or "")[:12],
                 )
                 self._forget_prematch(user_id, suggestion_title or "")
-                no_match_prefix = (
-                    "The template this draft was matched to is no longer in "
-                    "your library, so I'm drafting from your case file "
-                    "instead. If you have a replacement template, upload it "
-                    "or open it directly from the library."
+                return await self._build_missing_template_choice(
+                    user_id=user_id,
+                    request_fields=request_fields,
+                    suggestion_title=suggestion_title,
+                    suggestion_description=suggestion_description,
+                    user_message=user_message,
                 )
         elif source == "suggestedDraft":
             # `fallback_text` covers the case where BE has not yet shipped
@@ -2956,7 +3660,7 @@ class DraftingAgent:
             # so this and future clicks use the up-to-date variable registry.
             # Non-blocking — on failure the kickoff falls back to the freeform
             # placeholder scan.
-            if (
+            if not template_payload.get("blueprint_approved") and (
                 not template_payload.get("interactive_variables")
                 or template_payload.get("profile_schema_version") != PROFILE_SCHEMA_VERSION
             ):
@@ -3004,6 +3708,32 @@ class DraftingAgent:
             template_tone = template_payload.get("template_tone") or ""
             filing_context = template_payload.get("filing_context") or ""
             structure_outline = template_payload.get("structure_outline") or []
+            draft_depth = template_payload.get("draft_depth") or ""
+            draft_structure = template_payload.get("draft_structure") or ""
+            guardrail_level = template_payload.get("guardrail_level") or ""
+            registry_vars = template_payload.get("interactive_variables") or []
+
+            # Deterministic auto-fill FIRST: mine the full case context (incl.
+            # raw evidence) for every variable's value, so the kickoff treats
+            # those as known and asks the lawyer ONLY for what's genuinely
+            # absent — never for facts the case already supplies.
+            prefilled_facts: Dict[str, Any] = {}
+            if registry_vars:
+                try:
+                    prefilled_facts = await self._autofill_variables_from_context(
+                        registry_vars, case_context
+                    )
+                except Exception as exc:
+                    logger.warning("Kickoff auto-fill pass raised: {}", exc)
+                    prefilled_facts = {}
+                if prefilled_facts:
+                    logger.info(
+                        "Kickoff auto-filled {}/{} variable(s) from case context: {}",
+                        len(prefilled_facts),
+                        len(registry_vars),
+                        list(prefilled_facts.keys()),
+                    )
+
             prompt = build_template_kickoff_prompt(
                 role=role,
                 case_summary=case_summary,
@@ -3013,10 +3743,11 @@ class DraftingAgent:
                 lawyer_instructions=lawyer_instructions,
                 draft_title_hint=suggestion_title,
                 template_match_note=template_match_note,
-                interactive_variables=template_payload.get("interactive_variables") or [],
+                interactive_variables=registry_vars,
                 template_tone=template_tone,
                 filing_context=filing_context,
                 structure_outline=structure_outline,
+                prefilled_facts=prefilled_facts,
             )
             raw = await self._safe_llm_json(
                 prompt=prompt,
@@ -3029,14 +3760,63 @@ class DraftingAgent:
             draft_title = (parsed.get("draftTitle") or "").strip() or (
                 suggestion_title or template_name or "Untitled Draft"
             )
-            open_qs = self._normalize_open_questions(parsed.get("openQuestions"))
+            open_qs = self._normalize_open_questions(
+                parsed.get("openQuestions"), limit=self._MAX_INTERACTIVE_VARIABLES
+            )
             gathered = parsed.get("gatheredFacts")
             if not isinstance(gathered, dict):
                 gathered = {}
+            # Merge the deterministic auto-fill UNDER the LLM's gatheredFacts:
+            # start from the auto-filled values, then let the kickoff LLM add or
+            # override with its own REAL values (never overwrite an auto-filled
+            # value with an empty/placeholder one).
+            if prefilled_facts:
+                merged = dict(prefilled_facts)
+                for k, v in gathered.items():
+                    if self._is_filled_value(v):
+                        merged[k] = v
+                gathered = merged
             stripped_context = parsed.get("strippedContext") or []
             if not isinstance(stripped_context, list):
                 stripped_context = []
             incompatible = bool(parsed.get("incompatible"))
+
+            # Drop any open question the auto-fill/LLM already satisfied — never
+            # ask for a value the case context supplied.
+            if not incompatible and open_qs:
+                open_qs = [
+                    q for q in open_qs
+                    if not self._is_filled_value(gathered.get(q.get("id")))
+                ]
+
+            # Deterministic coverage guarantee: every registry variable must be
+            # auto-filled (real value in gathered) or asked. Catch any the LLM
+            # silently skipped and surface them as questions so nothing is left
+            # to render as a placeholder. Skipped when incompatible (no Qs then).
+            if not incompatible:
+                open_qs, _added_cov = self._ensure_registry_coverage(
+                    template_payload.get("interactive_variables") or [],
+                    gathered,
+                    open_qs,
+                )
+                if _added_cov:
+                    logger.info(
+                        "Kickoff coverage added {} unaddressed registry "
+                        "variable(s): {}",
+                        len(_added_cov),
+                        [q["id"] for q in _added_cov],
+                    )
+                # Present the COMPLETE question set as ONE grouped, numbered
+                # Critical/Important/Optional list — so the lawyer answers
+                # everything in a single round. The deterministic block (built
+                # from open_qs, the source of truth) replaces the model's prose
+                # question list, guaranteeing the chat matches the structured
+                # inputs and that coverage-added fields are never relegated to a
+                # confusing trailing addendum.
+                if open_qs:
+                    message = self._merge_full_questions_into_message(
+                        message, open_qs, draft_title
+                    )
 
             if not message:
                 message = self._compose_questions_message(open_qs, draft_title)
@@ -3045,11 +3825,15 @@ class DraftingAgent:
                 "source": "template",
                 "template_id": template_payload.get("template_id"),
                 "template_name": template_payload.get("name"),
-                # Carry the template's tone / filing context forward so the
-                # later render turn drafts in the template's voice.
+                # Carry the template's tone / filing context + approved drafting
+                # controls forward so the later render turn drafts in the
+                # template's voice, depth, and structure.
                 "template_tone": template_tone,
                 "filing_context": filing_context,
                 "structure_outline": structure_outline,
+                "draft_depth": draft_depth,
+                "draft_structure": draft_structure,
+                "guardrail_level": guardrail_level,
                 "suggested_draft_id": request_fields.get("suggestedDraftId"),
                 "suggestion_title": suggestion_title,
                 "draft_title": draft_title,
@@ -3418,6 +4202,228 @@ class DraftingAgent:
         session_state["open_questions"] = []
         session_state["last_assistant_message"] = (
             self._build_incompatible_options_message(draft_title)
+        )
+        return session_state
+
+    # ------------------------------------------------------------- missing template
+
+    def _compose_missing_template_message(
+        self, deleted_name: str, similar_name: Optional[str]
+    ) -> str:
+        """Inform the lawyer their matched template was removed and offer the
+        recovery options (use similar / upload / draft from case file)."""
+        name = (deleted_name or "the matched template").strip()
+        lines = [
+            f"The template **'{name}'** matched to this draft has been removed "
+            f"from your workspace.",
+            "",
+            "**How would you like to proceed?**",
+            "",
+        ]
+        opts: List[str] = []
+        if similar_name:
+            opts.append(
+                f"**Use '{similar_name}'** from your library — I'll draft using it."
+            )
+        opts.append("**Upload a template** that fits this matter.")
+        opts.append("**Draft from your case file** without a template.")
+        for letter, opt in zip("abc", opts):
+            lines.append(f"{letter}) {opt}")
+        lines.append("")
+        lines.append(
+            "Reply with **(a)**, **(b)**, or **(c)** — or tell me in your own words."
+        )
+        return "\n".join(lines)
+
+    async def _build_missing_template_choice(
+        self,
+        *,
+        user_id: str,
+        request_fields: Dict[str, Any],
+        suggestion_title: Optional[str],
+        suggestion_description: str,
+        user_message: str,
+    ) -> Dict[str, Any]:
+        """Build the routing turn shown when a suggested-draft click points at a
+        deleted template: find a similar template, offer the choices, and wait
+        for the lawyer's reply (handled by `_handle_template_choice_reply`)."""
+        deleted_name = (
+            (request_fields.get("templateOriginalName") or "").strip()
+            or (suggestion_title or "").strip()
+            or "the matched template"
+        )
+        similar_id: Optional[str] = None
+        similar_name: Optional[str] = None
+        try:
+            similar, _size = await self._find_matching_template_for_suggestion(
+                user_id=user_id,
+                suggestion_title=suggestion_title or "",
+                suggestion_description=suggestion_description or "",
+                fallback_text=(user_message or "").strip(),
+            )
+        except Exception as exc:
+            logger.warning("missing-template similar search failed: {}", exc)
+            similar = None
+        if similar:
+            similar_id = (similar.get("template_id") or "").strip() or None
+            similar_name = (similar.get("name") or "").strip() or None
+
+        options: List[str] = []
+        if similar_name:
+            options.append(f"Use '{similar_name}'")
+        options.append("Upload a template")
+        options.append("Draft from the case file")
+
+        logger.info(
+            "Missing-template choice offered (deleted={!r}, similar={!r}, user={})",
+            deleted_name,
+            similar_name or "(none)",
+            (user_id or "")[:12],
+        )
+        return {
+            "source": "suggestedDraft",
+            "template_id": None,
+            "template_name": None,
+            "suggested_draft_id": request_fields.get("suggestedDraftId"),
+            "suggestion_title": suggestion_title,
+            "suggestion_description": suggestion_description,
+            "draft_title": suggestion_title or "New Draft",
+            "gathered_facts": {},
+            "open_questions": [],
+            "draft_status": "analyzing",
+            "incompatible": False,
+            "awaiting_template_choice": True,
+            "missing_template_name": deleted_name,
+            "similar_template_id": similar_id,
+            "similar_template_name": similar_name,
+            "last_offered_options": options,
+            "current_draft_version": 0,
+            "last_draft_document": None,
+            "last_draft_markdown": "",
+            "last_assistant_message": self._compose_missing_template_message(
+                deleted_name, similar_name
+            ),
+            "created_at": datetime.utcnow().isoformat(),
+        }
+
+    def _classify_template_choice(self, text: str, has_similar: bool) -> str:
+        """Classify the lawyer's reply to the missing-template offer →
+        use_similar | upload | from_scratch | clarify. Deterministic; the
+        letter map shifts when there is no 'similar' option."""
+        t = (text or "").strip().lower()
+        if not t:
+            return "clarify"
+        m = re.match(r"^\(?\s*([abc])\s*\)?$", t) or re.match(r"^option\s+([abc])\b", t)
+        letter = m.group(1) if m else None
+        if has_similar:
+            letter_map = {"a": "use_similar", "b": "upload", "c": "from_scratch"}
+        else:
+            letter_map = {"a": "upload", "b": "from_scratch"}
+        if letter and letter in letter_map:
+            return letter_map[letter]
+        if "upload" in t:
+            return "upload"
+        if any(
+            w in t for w in (
+                "scratch", "case file", "from the case", "without", "blank", "fresh",
+            )
+        ):
+            return "from_scratch"
+        if has_similar and any(
+            w in t for w in ("use", "similar", "that one", "use it", "go with")
+        ):
+            return "use_similar"
+        if has_similar and self._is_pure_affirmation(t):
+            return "use_similar"
+        if self._is_pure_negation(t):
+            return "from_scratch"
+        return "clarify"
+
+    async def _handle_template_choice_reply(
+        self,
+        *,
+        user_message: str,
+        case_context: Dict[str, Any],
+        session_state: Dict[str, Any],
+        request_fields: Dict[str, Any],
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Route the lawyer's reply to the missing-template offer."""
+        text = (user_message or "").strip()
+        similar_id = (session_state.get("similar_template_id") or "").strip()
+        similar_name = session_state.get("similar_template_name") or ""
+        suggestion_title = (
+            session_state.get("suggestion_title")
+            or session_state.get("draft_title")
+            or ""
+        )
+        user_id = (
+            (request_fields.get("userId") or "").strip()
+            or (session_state.get("user_id") or "").strip()
+        )
+        intent = self._classify_template_choice(text, has_similar=bool(similar_id))
+
+        def _clear_choice(state: Dict[str, Any]) -> None:
+            for k in (
+                "awaiting_template_choice", "missing_template_name",
+                "similar_template_id", "similar_template_name",
+                "last_offered_options",
+            ):
+                state.pop(k, None)
+
+        if intent == "use_similar" and similar_id:
+            _clear_choice(session_state)
+            if suggestion_title:
+                self._remember_prematch(user_id, suggestion_title, similar_id)
+            new_state = await self._handle_kickoff(
+                user_message=user_message,
+                case_context=case_context,
+                request_fields={
+                    **(request_fields or {}),
+                    "source": "template",
+                    "templateId": similar_id,
+                    "suggestionTitle": suggestion_title,
+                    "suggestedDraftId": session_state.get("suggested_draft_id"),
+                },
+            )
+            for k in ("actionable_id", "user_id", "workspace_id", "created_at"):
+                if session_state.get(k):
+                    new_state[k] = session_state[k]
+            return new_state
+
+        if intent == "upload":
+            _clear_choice(session_state)
+            session_state["draft_status"] = "analyzing"
+            session_state["open_questions"] = []
+            session_state["last_assistant_message"] = (
+                "Understood. Please upload a template that fits this matter and "
+                "I will analyse it against the case context. You can also open a "
+                "template directly from your library."
+            )
+            return session_state
+
+        if intent == "from_scratch":
+            _clear_choice(session_state)
+            role = (case_context.get("role") or "ADJUDICATOR").upper()
+            new_state = await self._scope_blank_draft(
+                role=role,
+                case_summary=case_context.get("case_summary") or "",
+                case_facts=case_context.get("case_facts_brief") or "",
+                source="blank",
+                lawyer_instructions=None,
+                suggestion_title=suggestion_title or None,
+                suggested_draft_id=session_state.get("suggested_draft_id"),
+            )
+            for k in ("actionable_id", "user_id", "workspace_id", "created_at"):
+                if session_state.get(k):
+                    new_state[k] = session_state[k]
+            return new_state
+
+        # clarify / unknown — re-offer the same options.
+        session_state["draft_status"] = "analyzing"
+        session_state["last_assistant_message"] = self._compose_missing_template_message(
+            session_state.get("missing_template_name") or "the matched template",
+            similar_name or None,
         )
         return session_state
 
@@ -5564,6 +6570,17 @@ OUTPUT FORMAT:
         if tpl and not filing_context:
             filing_context = (tpl.get("filing_context") or "").strip()
 
+        # Lawyer-approved drafting controls (depth / structure / guardrails).
+        # Prefer the values carried in session_state from kickoff; fall back to
+        # the freshly-loaded template payload. Empty → render keeps its default.
+        draft_depth = (session_state.get("draft_depth") or "").strip()
+        draft_structure = (session_state.get("draft_structure") or "").strip()
+        guardrail_level = (session_state.get("guardrail_level") or "").strip()
+        if tpl:
+            draft_depth = draft_depth or (tpl.get("draft_depth") or "").strip()
+            draft_structure = draft_structure or (tpl.get("draft_structure") or "").strip()
+            guardrail_level = guardrail_level or (tpl.get("guardrail_level") or "").strip()
+
         # Diagnostic: make it unambiguous whether this render is driven by a
         # template (and which one) or is a from-scratch generation. If
         # template_chars=0 here, the draft CANNOT mirror any template — the
@@ -5597,6 +6614,9 @@ OUTPUT FORMAT:
             revision_instruction=revision_instruction,
             template_tone=template_tone or None,
             filing_context=filing_context or None,
+            draft_depth=draft_depth or None,
+            structure_style=draft_structure or None,
+            guardrail_level=guardrail_level or None,
         )
         try:
             # Long-form path (new google-genai SDK) with thinking_level=MEDIUM:
@@ -5638,6 +6658,21 @@ OUTPUT FORMAT:
                 "you have provided and try again."
             )
             return session_state
+
+        # Re-render safety net: a revision/re-render must never re-blank a field
+        # that was already filled (e.g. fill the execution date and lose the
+        # enrolment number). Restore any value the new draft turned back into a
+        # placeholder, using the previous draft as the source of truth.
+        prior_markdown = (session_state.get("last_draft_markdown") or "").strip()
+        if prior_markdown:
+            markdown, _restored = _restore_regressed_values(prior_markdown, markdown)
+            if _restored:
+                logger.info(
+                    "Re-render restored {} re-blanked field(s) from the prior "
+                    "draft: {}",
+                    len(_restored),
+                    _restored,
+                )
 
         # Generate the .docx artifact, upload to GCS, and collect the
         # download URL. Any failure here is non-fatal — markdown still
@@ -5842,7 +6877,90 @@ OUTPUT FORMAT:
     # hard blocker.
     _QUESTION_CLASSES = {"Critical", "Important", "Optional"}
 
-    def _normalize_open_questions(self, raw: Any) -> List[Dict[str, str]]:
+    @staticmethod
+    def _is_filled_value(v: Any) -> bool:
+        """True iff a gathered value is a real, usable answer (not blank / a
+        placeholder / a 'to be determined' stub)."""
+        if v is None:
+            return False
+        s = str(v).strip()
+        if not s:
+            return False
+        low = s.lower()
+        if low in ("tbd", "to be determined", "n/a", "na", "none", "null", "-", "—"):
+            return False
+        if s.startswith("<") and s.endswith(">"):
+            return False
+        return True
+
+    def _ensure_registry_coverage(
+        self,
+        interactive_variables: Any,
+        gathered: Dict[str, Any],
+        open_qs: List[Dict[str, str]],
+    ) -> "tuple[List[Dict[str, str]], List[Dict[str, str]]]":
+        """Deterministic guarantee that EVERY registry variable is either
+        auto-filled (a real value in `gathered`) or surfaced as an open
+        question. For any variable addressed by neither, append a question
+        built from the variable's stored `question` / `label`.
+
+        Returns ``(open_qs_complete, added)`` where ``added`` are the
+        coverage-injected questions (empty when the kickoff already covered
+        everything). Pure / deterministic — no LLM call."""
+        variables = [v for v in (interactive_variables or []) if isinstance(v, dict)]
+        if not variables:
+            return open_qs, []
+
+        def norm(s: Any) -> str:
+            return re.sub(r"[^a-z0-9]+", "_", str(s or "").lower()).strip("_")
+
+        addressed: set = set()
+        for k, val in (gathered or {}).items():
+            if self._is_filled_value(val):
+                addressed.add(norm(k))
+        existing_ids: set = set()
+        for q in open_qs or []:
+            if not isinstance(q, dict):
+                continue
+            qid = norm(q.get("id"))
+            addressed.add(qid)
+            existing_ids.add(qid)
+            head = (q.get("label") or "").split(":", 1)[0]
+            if head:
+                addressed.add(norm(head))
+
+        out = list(open_qs or [])
+        added: List[Dict[str, str]] = []
+        for var in variables:
+            vid = norm(var.get("id"))
+            vlabel = norm(var.get("label"))
+            if not (vid or vlabel):
+                continue
+            if (vid and vid in addressed) or (vlabel and vlabel in addressed):
+                continue
+            label = (var.get("label") or var.get("id") or "Detail").strip()
+            question = (var.get("question") or f"What is the {label}?").strip()
+            qid = (var.get("id") or "").strip() or norm(label) or f"var_{len(out) + 1}"
+            if norm(qid) in existing_ids:
+                continue
+            classification = "Critical" if var.get("required", True) else "Important"
+            entry = {
+                "id": qid,
+                "label": f"{label}: {question}",
+                "classification": classification,
+            }
+            out.append(entry)
+            added.append(entry)
+            existing_ids.add(norm(qid))
+            addressed.add(norm(qid))
+            if vlabel:
+                addressed.add(vlabel)
+
+        return out[: self._MAX_INTERACTIVE_VARIABLES], added
+
+    def _normalize_open_questions(
+        self, raw: Any, limit: int = 10
+    ) -> List[Dict[str, str]]:
         if not isinstance(raw, list):
             return []
         seen_ids: set = set()
@@ -5867,7 +6985,7 @@ OUTPUT FORMAT:
             out.append(
                 {"id": qid, "label": label, "classification": classification}
             )
-        return out[:10]
+        return out[: max(1, limit)]
 
     # Acknowledgement vocabulary used to detect "ok" / "thanks" replies after
     # a delivered draft so we do not spuriously re-render. Drafting-local on
@@ -6133,10 +7251,22 @@ OUTPUT FORMAT:
                 f"Generating the draft now."
             )
 
-        # Group by the Missing-Information Matrix priority, mirroring the
-        # layout enforced by TEMPLATE_KICKOFF_INSTRUCTION. Each label is
-        # expected to be "Title: question"; split on the first colon so the
-        # title can be bolded inline.
+        questions_block = self._questions_block(open_questions)
+        return (
+            f"I have initiated the drafting of {draft_title} based on the "
+            f"present case context.\n\n"
+            f"**Information Required to Complete the Draft:**\n"
+            f"To finalise the draft, please provide the following details so "
+            f"the document is complete and legally accurate:\n\n"
+            f"{questions_block}"
+        )
+
+    def _questions_block(self, open_questions: List[Dict[str, Any]]) -> str:
+        """Render open questions as ONE grouped, continuously-numbered list
+        (Critical → Important → Optional), mirroring the layout enforced by
+        TEMPLATE_KICKOFF_INSTRUCTION. Each label is "Title: question"; the
+        title is bolded inline. Shared by the fallback composer and the
+        full-question merge so every surface shows the same complete list."""
         def _fmt(n: int, q: Dict[str, Any]) -> str:
             label = (q.get("label") or "").strip()
             if ":" in label:
@@ -6163,16 +7293,67 @@ OUTPUT FORMAT:
                 lines.append(_fmt(counter, q))
                 counter += 1
             blocks.append("\n".join(lines))
-        questions_block = "\n\n".join(blocks)
+        return "\n\n".join(blocks)
 
-        return (
-            f"I have initiated the drafting of {draft_title} based on the "
-            f"present case context.\n\n"
-            f"**Information Required to Complete the Draft:**\n"
-            f"To finalise the draft, please provide the following details so "
-            f"the document is complete and legally accurate:\n\n"
-            f"{questions_block}"
+    def _merge_full_questions_into_message(
+        self,
+        message: str,
+        open_questions: List[Dict[str, Any]],
+        draft_title: str,
+    ) -> str:
+        """Splice the COMPLETE grouped question list (from open_questions, the
+        source of truth) into the model's kickoff message, so the chat shows
+        every unfilled variable in ONE numbered Critical/Important/Optional list
+        — never a separate round or a trailing run-on addendum.
+
+        Preserves the model's DOCUMENT UNDERSTANDING + Key Case Details head and
+        its Strategic Observations tail; replaces only the question list in
+        between. Falls back to the deterministic composer when the message is
+        empty or lacks the expected section header."""
+        if not open_questions:
+            return message
+        if not (message or "").strip():
+            return self._compose_questions_message(open_questions, draft_title)
+
+        info = "**Information Required to Complete the Draft:**"
+        strat = "**Strategic Observations:**"
+        block = self._questions_block(open_questions)
+        intro_default = (
+            "To finalise the draft, please provide the following details so "
+            "the document is complete and legally accurate:"
         )
+
+        if info not in message:
+            # Model didn't emit the section header — insert a clean one before
+            # any Strategic Observations, else append at the end.
+            if strat in message:
+                head, strat_part = message.split(strat, 1)
+                return (
+                    f"{head.rstrip()}\n\n{info}\n{intro_default}\n\n{block}\n\n"
+                    f"{strat}{strat_part}"
+                ).strip()
+            return f"{message.rstrip()}\n\n{info}\n{intro_default}\n\n{block}"
+
+        head, rest = message.split(info, 1)
+        strat_tail = ""
+        if strat in rest:
+            body, strat_part = rest.split(strat, 1)
+            strat_tail = f"{strat}{strat_part}"
+        else:
+            body = rest
+        # Keep the model's intro paragraph (what is preserved / stripped), which
+        # sits between the header and the first priority sub-label.
+        intro = body
+        for sub in ("**Critical", "**Important", "**Optional"):
+            if sub in intro:
+                intro = intro.split(sub, 1)[0]
+                break
+        intro = intro.strip() or intro_default
+
+        out = f"{head.rstrip()}\n\n{info}\n{intro}\n\n{block}"
+        if strat_tail.strip():
+            out = f"{out}\n\n{strat_tail.strip()}"
+        return out.strip()
 
     async def _safe_llm_json(
         self,

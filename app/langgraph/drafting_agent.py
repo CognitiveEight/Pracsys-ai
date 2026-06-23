@@ -2884,12 +2884,32 @@ class DraftingAgent:
                 conversation_history=conversation_history,
             )
         else:
-            # Explicit-action kickoff is only triggered by an unambiguous
-            # signal: a template upload (`templateId`) or a suggested-draft
-            # click (`suggestedDraftId`). `source="blank"` alone is too
-            # weak — the frontend may send it on panel open, which would
-            # otherwise force a kickoff on every fresh chat.
-            explicit_kickoff = not session_state and has_explicit_template
+            # Explicit-action kickoff is triggered by an unambiguous signal:
+            # a template upload (`templateId`) or a suggested-draft click
+            # (`suggestedDraftId`). `source="blank"` alone is too weak.
+            # Also re-kick when the incoming id differs from the session's
+            # current draft — handles clicking a different card after a
+            # previous draft was already rendered for the same actionable_id.
+            _incoming_suggestion = (
+                request_fields.get("suggestedDraftId") or ""
+            ).strip()
+            _incoming_template = (
+                request_fields.get("templateId") or ""
+            ).strip()
+            _session_suggestion = (session_state or {}).get(
+                "suggested_draft_id"
+            ) or ""
+            _session_template = (session_state or {}).get("template_id") or ""
+            _session_id_changed = (
+                _incoming_suggestion
+                and _incoming_suggestion != _session_suggestion
+            ) or (
+                _incoming_template
+                and _incoming_template != _session_template
+            )
+            explicit_kickoff = has_explicit_template and (
+                not session_state or _session_id_changed
+            )
 
             if explicit_kickoff:
                 session_state = await self._handle_kickoff(
@@ -5674,16 +5694,11 @@ OUTPUT FORMAT:
             "downloadUrl": translated_download_url,
         }
 
-        lead_in = (
-            f"I have translated the draft into {target}. Review the "
-            "document below — let me know if any term needs adjustment."
-        )
-
         session_state["draft_status"] = "ready"
         session_state["current_draft_version"] = new_version
         session_state["last_draft_markdown"] = translated
         session_state["last_draft_document"] = translated_doc
-        session_state["last_assistant_message"] = f"{lead_in}\n\n{translated}"
+        session_state["last_assistant_message"] = translated
         session_state["open_questions"] = []
         # Per-turn delivery flag — consumed in handle_turn so BE marks
         # this turn as a draft delivery (frontend re-renders the
@@ -6619,27 +6634,16 @@ OUTPUT FORMAT:
             guardrail_level=guardrail_level or None,
         )
         try:
-            # Long-form path (new google-genai SDK) with thinking_level=MEDIUM:
-            # the render must DEVELOP sparse skeleton templates into full,
-            # multi-paragraph, professionally-argued documents (see the DEPTH /
-            # DEVELOPMENT + NARRATIVE DEVELOPMENT mandates in
-            # DRAFT_RENDER_INSTRUCTION) — that elaboration is synthesis-heavy,
-            # which LOW thinking suppressed (output stayed at terse bullet
-            # stubs). MEDIUM gives the reasoning budget needed for narrative
-            # depth and legal characterisation. Gemini 3 bills thinking tokens
-            # against max_output_tokens, so on very long ALREADY-detailed
-            # templates the reasoning pass can eat into the 64k budget — but
-            # generate_longform auto-continues on MAX_TOKENS so multi-response
-            # drafts still finish; a clean section-boundary continuation is
-            # acceptable. If long-template renders regress on truncation/cost,
-            # gate MEDIUM to skeleton templates only (keep LOW for already-
-            # detailed ones). Falls back to legacy generate() if SDK absent.
+            # LOW thinking preserves the full 64k output budget for draft text;
+            # MEDIUM/HIGH consumes ~60k on reasoning leaving only ~2-3k visible,
+            # causing truncation. Matches the profile/kickoff long-form paths.
+            # Falls back to legacy generate() if SDK absent.
             raw = await gemini_client.generate_longform(
                 prompt,
                 system_instruction=DRAFT_RENDER_INSTRUCTION,
                 temperature=0.35,
                 max_tokens=65536,
-                thinking_level="MEDIUM",
+                thinking_level="LOW",
             )
         except Exception as e:
             logger.error("Draft render LLM call failed: {}", e)
@@ -6707,35 +6711,11 @@ OUTPUT FORMAT:
             "wordCount": _word_count(markdown),
             "downloadUrl": download_url,
         }
-        # Conversational lead-in mirroring the screenshots (
-        # "I have prepared the complete bail application below...")
-        lead_in = (
-            "I have prepared the complete draft below. "
-            "Review the document, and let me know if you would like any "
-            "edits — for example, adjusting the prayer or adding a clause."
-        )
-        if mode == "revision":
-            lead_in = (
-                "I have revised the draft as requested. Let me know if any "
-                "further changes are needed."
-            )
-
-        # Safety net: if any slot survived into the finished draft as an
-        # unfilled placeholder (the kickoff failed to ask for it and neither
-        # the case nor the lawyer supplied it), surface it explicitly rather
-        # than presenting the draft as complete. Non-blocking — the draft still
-        # ships; the lawyer can fill the gaps in a follow-up turn.
+        # Log any slots that survived as unfilled placeholders — diagnostic
+        # only; the draft ships regardless and the lawyer can fill gaps in a
+        # follow-up turn. Not surfaced in the user-facing message.
         residual = _residual_placeholders(markdown)
         if residual:
-            preview = ", ".join(f"`{p}`" for p in residual[:12])
-            if len(residual) > 12:
-                preview += ", …"
-            lead_in = (
-                f"{lead_in}\n\n**Before this draft is filing-ready, a few "
-                f"details still need values:** {preview}. Reply with these and "
-                f"I will fill them in — I have left clearly-marked placeholders "
-                f"rather than invent them."
-            )
             logger.info(
                 "Render left {} residual placeholder(s) (template={}): {}",
                 len(residual),
@@ -6743,18 +6723,11 @@ OUTPUT FORMAT:
                 residual[:12],
             )
 
-        # Embed the full draft Markdown inside the chat message body itself
-        # so it always renders inline in the chat surface (matches the
-        # reference UX in image (74).png — the bail-application body appears
-        # in the AI's chat bubble). `draftDocument` is still emitted as a
-        # structured payload for any dedicated editor surface that consumes
-        # it. Without this, frontends that only render `content` would show
-        # the lead-in but not the draft body.
         session_state["draft_status"] = "ready"
         session_state["current_draft_version"] = new_version
         session_state["last_draft_markdown"] = markdown
         session_state["last_draft_document"] = draft_document
-        session_state["last_assistant_message"] = f"{lead_in}\n\n{markdown}"
+        session_state["last_assistant_message"] = markdown
         session_state["open_questions"] = []
         # Transient flag — true ONLY on the turn that just produced a draft
         # body, so BE can distinguish draft delivery from acknowledgements /
@@ -6855,14 +6828,10 @@ OUTPUT FORMAT:
             "wordCount": _word_count(markdown),
             "downloadUrl": download_url,
         }
-        lead_in = (
-            "Here is the finalised draft, ready to download. Let me know "
-            "if you need any last edits before filing."
-        )
         session_state["draft_status"] = "ready"
         session_state["current_draft_version"] = new_version
         session_state["last_draft_document"] = draft_document
-        session_state["last_assistant_message"] = f"{lead_in}\n\n{markdown}"
+        session_state["last_assistant_message"] = markdown
         session_state["open_questions"] = []
         session_state["_draft_just_delivered"] = True
         # Any pending menu is moot now — the lawyer chose the finalise

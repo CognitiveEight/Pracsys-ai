@@ -6,7 +6,7 @@ Updated to match backend Socket.IO specification.
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 # ============================================================================
 # Backend Event Payload Schemas (Server → AI)
@@ -315,6 +315,24 @@ class TemplateBlueprint(BaseModel):
         validation_alias=AliasChoices("legalGuardrails", "legal_guardrails"),
     )
     variables: List[TemplateBlueprintVariable] = []
+
+    @field_validator("variables", mode="before")
+    @classmethod
+    def _coerce_string_variables(cls, v: Any) -> Any:
+        """Accept variables sent as plain strings (old backend format).
+
+        Converts each bare string into {'label': <string>} so downstream
+        code always gets TemplateBlueprintVariable objects regardless of
+        which backend version emitted the payload."""
+        if not isinstance(v, list):
+            return v
+        coerced = []
+        for item in v:
+            if isinstance(item, str):
+                coerced.append({"label": item.strip()})
+            else:
+                coerced.append(item)
+        return coerced
 
 
 class TemplateFormatting(BaseModel):

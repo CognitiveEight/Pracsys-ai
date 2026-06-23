@@ -1967,16 +1967,32 @@ ABSOLUTE STRUCTURE-PRESERVATION RULES:
   (e.g. `<applicant address>`) so the lawyer can spot exactly which
   slots still need filling in the translated draft. Do NOT translate
   the placeholder hint text.
-- Statute names, section numbers, citations, FIR numbers, monetary
-  amounts, dates, and addresses MUST be kept exactly as written in
-  the source. Do NOT translate statute names like "Bharatiya Nyaya
-  Sanhita", "BNSS", "NDPS Act", "BSA", "Constitution of India". Do
-  NOT change "Section 483 BNSS" to anything else. Do NOT change
-  "FIR No. 148/2026" or "18/04/2026". Do NOT change "₹12,000".
+- Legal citations MUST be kept exactly as written in the source:
+  statute names (e.g. "Bharatiya Nyaya Sanhita", "BNSS", "NDPS
+  Act", "BSA", "Constitution of India"), section/article references
+  (e.g. "Section 483 BNSS"), case numbers, FIR numbers (e.g.
+  "FIR No. 148/2026"), monetary amounts (e.g. "₹12,000"), and
+  institutional/party names when used as legal citations. Do NOT
+  alter ANY of these regardless of the target language.
+- Non-citation English abbreviations — official designations, police
+  ranks, court-officer titles, and similar (e.g. "S.S.P.", "D.M.",
+  "S.D.M.", "A.D.J.", "J.M.F.C.") — MUST be transliterated or
+  rendered in the target script as a native speaker would write them
+  in a formal filing. Do NOT leave them in Latin letters when the
+  target script has a standard equivalent.
+- Dates and numerals in signature/execution/verification blocks
+  (e.g. fields labelled "Date:", "Dated:", "Day/Month/Year") SHOULD
+  be rendered using the target script's standard numeral system where
+  that is the accepted convention for formal legal filings in that
+  language. Dates that are part of a legal citation or case number
+  MUST stay in their original form.
 - Party names: transliterate Indian names into the target script
   where culturally appropriate (e.g. "Mr. Aman Maurya" → "श्री अमन
   मौर्य" in Hindi) but keep them recognisable; do NOT translate
   surnames into target-language equivalents.
+- Addresses: transliterate street names and place names into the
+  target script; keep PIN codes and plot/house numbers in their
+  original numeral form.
 
 TRANSLATE-ONLY:
 

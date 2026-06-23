@@ -5593,6 +5593,13 @@ OUTPUT FORMAT:
         in the chat transcript for reference.
         """
         target = (target_language or "").strip() or "Hindi"
+        # Persist the active language so revision renders can re-apply it.
+        # Cleared when the user explicitly switches back to English so that
+        # subsequent revisions stay in English rather than re-translating.
+        if target.lower() == "english":
+            session_state.pop("draft_language", None)
+        else:
+            session_state["draft_language"] = target
         source_markdown = (session_state.get("last_draft_markdown") or "").strip()
         if not source_markdown:
             # Safety net — the dispatcher should already have ensured a
@@ -6676,6 +6683,46 @@ OUTPUT FORMAT:
                     "draft: {}",
                     len(_restored),
                     _restored,
+                )
+
+        # If the draft was previously translated, re-apply the same language so
+        # the revised draft is delivered in the user's chosen language rather than
+        # reverting to English. Non-fatal: on failure the English revision ships.
+        _active_lang = (session_state.get("draft_language") or "").strip()
+        if _active_lang and _active_lang.lower() not in ("", "english"):
+            _tr_prompt = build_draft_translate_prompt(
+                role=role,
+                case_summary=case_summary,
+                draft_markdown=markdown,
+                target_language=_active_lang,
+            )
+            try:
+                _tr_raw = await gemini_client.generate_longform(
+                    _tr_prompt,
+                    system_instruction=DRAFT_TRANSLATE_INSTRUCTION,
+                    temperature=0.2,
+                    max_tokens=65536,
+                    thinking_level="LOW",
+                )
+                _tr_text = _strip_code_fences(_tr_raw).strip()
+                if _tr_text:
+                    markdown = _tr_text
+                    logger.info(
+                        "Post-revision re-translation applied (lang={})",
+                        _active_lang,
+                    )
+                else:
+                    logger.warning(
+                        "Post-revision re-translation returned empty for lang={}; "
+                        "keeping English revision",
+                        _active_lang,
+                    )
+            except Exception as _tr_err:
+                logger.warning(
+                    "Post-revision re-translation failed (lang={}): {} — "
+                    "keeping English revision",
+                    _active_lang,
+                    _tr_err,
                 )
 
         # Generate the .docx artifact, upload to GCS, and collect the

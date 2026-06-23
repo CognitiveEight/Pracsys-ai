@@ -17286,6 +17286,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
             "templateUrl": payload.templateUrl,
             "templateOriginalName": payload.templateOriginalName,
             "templateMimeType": payload.templateMimeType,
+            "draftMode": (payload.draftMode or "").strip().lower() or None,
         }
 
         # When the turn may need to resolve/match a template (a suggested-draft

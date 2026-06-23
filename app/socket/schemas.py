@@ -268,6 +268,10 @@ class UserMessageRequestPayload(BaseModel):
         default=None,
         validation_alias=AliasChoices("templateMimeType", "template_mime_type"),
     )
+    draftMode: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("draftMode", "draft_mode"),
+    )
 
 
 # ============================================================================

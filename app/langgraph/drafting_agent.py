@@ -3599,6 +3599,25 @@ class DraftingAgent:
         # they expected to be reused wasn't picked.
         no_match_prefix: Optional[str] = None
         ready_library_size = 0
+
+        # draftMode="custom": lawyer chose "No, Custom AI Draft" — skip ALL
+        # template resolution (clearing templateId is not enough because
+        # `source == "template"` would still enter the template block below).
+        # Early-return directly to _scope_blank_draft so the draft is built
+        # purely from case context with no template structure imposed.
+        _draft_mode = (request_fields.get("draftMode") or "").strip().lower()
+        if _draft_mode == "custom":
+            return await self._scope_blank_draft(
+                role=role,
+                case_summary=case_summary,
+                case_facts=case_facts,
+                source="blank",
+                lawyer_instructions=lawyer_instructions,
+                suggestion_title=suggestion_title,
+                suggested_draft_id=request_fields.get("suggestedDraftId"),
+                no_match_prefix=None,
+            )
+
         advertised_template_id = (request_fields.get("templateId") or "").strip()
         if source == "template" or advertised_template_id:
             # Suggested-draft clicks must NOT resurrect a deleted template from

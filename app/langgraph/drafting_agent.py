@@ -1379,12 +1379,32 @@ class DraftingAgent:
         ) or "(no case context available)"
         prompt = (
             "From the CASE CONTEXT, extract the value for each VARIABLE below "
-            "that the context CLEARLY supports. Return strict JSON only: "
-            "{\"values\": {\"<variable id>\": \"<value exactly as the case "
-            "states it>\"}}. OMIT any variable the context does not clearly "
-            "provide — do NOT guess, infer loosely, or fabricate. Keep ids "
-            "EXACTLY as given. Values are concise and lifted from the case "
-            "(names, dates, numbers, amounts, short descriptions).\n\n"
+            "that the context CLEARLY and COMPLETELY supports. Return strict "
+            "JSON only: {\"values\": {\"<variable id>\": \"<value exactly as "
+            "the case states it>\"}}. OMIT any variable the context does not "
+            "clearly provide — do NOT guess, infer loosely, or fabricate. Keep "
+            "ids EXACTLY as given.\n\n"
+            "QUALITY GATE — a value is only valid when it is COMPLETE and PROPER "
+            "for a legal document. Reject and OMIT any variable whose extracted "
+            "value fails any of these checks:\n"
+            "• Names: must be a full legal name (first + last, or title + name). "
+            "OMIT if the context only has an informal label such as 'the client', "
+            "'the petitioner', 'the complainant', 'the respondent', 'the sister', "
+            "'the husband', 'the opposite party', or any other role-reference "
+            "without an actual name.\n"
+            "• Dates: must be an explicit calendar date in DD/MM/YYYY or "
+            "equivalent written form. OMIT if the context only says 'recently', "
+            "'shortly after', 'last month', or any relative/vague time reference.\n"
+            "• Amounts: must include both a currency symbol/code and a specific "
+            "figure. OMIT if the context only says 'a large sum', 'significant "
+            "amount', or any other non-specific monetary reference.\n"
+            "• Contact identifiers (phone numbers, WhatsApp numbers, email "
+            "addresses) are NEVER valid values for name, address, or "
+            "client-detail variables — OMIT those variables entirely when the "
+            "only identifier in context is a contact number or email.\n"
+            "• When in doubt about whether a value is complete, OMIT it — a "
+            "missing value triggers a question; a wrong value silently corrupts "
+            "the document.\n\n"
             f"VARIABLES:\n{listing}\n\n"
             f"CASE CONTEXT:\n\"\"\"\n{context_block}\n\"\"\""
         )
@@ -3752,10 +3772,10 @@ class DraftingAgent:
             guardrail_level = template_payload.get("guardrail_level") or ""
             registry_vars = template_payload.get("interactive_variables") or []
 
-            # Suggestion pass: mine the case context to get SUGGESTED values for
-            # template variables. These are shown to the lawyer as pre-filled hints
-            # in the kickoff questions so they can confirm or correct — every
-            # variable is still asked; none are silently skipped.
+            # Deterministic auto-fill FIRST: mine the full case context (incl.
+            # raw evidence) for every variable's value, so the kickoff treats
+            # those as known and asks the lawyer ONLY for what's genuinely
+            # absent — never for facts the case already supplies.
             prefilled_facts: Dict[str, Any] = {}
             if registry_vars:
                 try:
@@ -3767,15 +3787,11 @@ class DraftingAgent:
                     prefilled_facts = {}
                 if prefilled_facts:
                     logger.info(
-                        "Kickoff found suggested value(s) for {}/{} variable(s) "
-                        "from case context (will ask lawyer to confirm): {}",
+                        "Kickoff auto-filled {}/{} variable(s) from case context: {}",
                         len(prefilled_facts),
                         len(registry_vars),
                         list(prefilled_facts.keys()),
                     )
-            # Track which ids came from auto-suggestion so coverage check knows
-            # not to treat them as confirmed answers.
-            auto_filled_ids: set = set((prefilled_facts or {}).keys())
 
             prompt = build_template_kickoff_prompt(
                 role=role,
@@ -3809,23 +3825,38 @@ class DraftingAgent:
             gathered = parsed.get("gatheredFacts")
             if not isinstance(gathered, dict):
                 gathered = {}
-            # Keep suggested values available for final-draft rendering (used as
-            # defaults if the lawyer later skips a question), but do NOT merge
-            # them into gathered as confirmed answers — the lawyer must confirm.
+            # Merge the deterministic auto-fill UNDER the LLM's gatheredFacts:
+            # start from the auto-filled values, then let the kickoff LLM add or
+            # override with its own REAL values (never overwrite an auto-filled
+            # value with an empty/placeholder one).
+            if prefilled_facts:
+                merged = dict(prefilled_facts)
+                for k, v in gathered.items():
+                    if self._is_filled_value(v):
+                        merged[k] = v
+                gathered = merged
             stripped_context = parsed.get("strippedContext") or []
             if not isinstance(stripped_context, list):
                 stripped_context = []
             incompatible = bool(parsed.get("incompatible"))
 
+            # Drop any open question the auto-fill/LLM already satisfied — never
+            # ask for a value the case context supplied.
+            if not incompatible and open_qs:
+                open_qs = [
+                    q for q in open_qs
+                    if not self._is_filled_value(gathered.get(q.get("id")))
+                ]
+
             # Deterministic coverage guarantee: every registry variable must be
-            # asked. Pass auto_filled_ids so coverage doesn't treat suggestions
-            # as confirmed answers and silently drops their questions.
+            # auto-filled (real value in gathered) or asked. Catch any the LLM
+            # silently skipped and surface them as questions so nothing is left
+            # to render as a placeholder. Skipped when incompatible (no Qs then).
             if not incompatible:
                 open_qs, _added_cov = self._ensure_registry_coverage(
                     template_payload.get("interactive_variables") or [],
                     gathered,
                     open_qs,
-                    auto_filled_ids=auto_filled_ids,
                 )
                 if _added_cov:
                     logger.info(
@@ -3866,10 +3897,6 @@ class DraftingAgent:
                 "suggestion_title": suggestion_title,
                 "draft_title": draft_title,
                 "gathered_facts": gathered,
-                # Suggested values from case context — used as render-time
-                # defaults if the lawyer skips a question, but not counted
-                # as confirmed answers during question generation.
-                "context_suggestions": dict(prefilled_facts) if prefilled_facts else {},
                 "open_questions": open_qs,
                 "stripped_context": stripped_context,
                 "draft_status": (
@@ -6574,13 +6601,7 @@ OUTPUT FORMAT:
         case_summary = case_context.get("case_summary") or ""
         case_facts = case_context.get("case_facts_brief") or ""
         draft_title = session_state.get("draft_title") or "New Draft"
-        gathered = dict(session_state.get("gathered_facts") or {})
-        # Apply context_suggestions as fallback defaults: if the lawyer confirmed
-        # a value it's already in gathered_facts and takes priority; suggestions
-        # only fill slots the lawyer left blank.
-        for k, v in (session_state.get("context_suggestions") or {}).items():
-            if k not in gathered and v:
-                gathered[k] = v
+        gathered = session_state.get("gathered_facts") or {}
         user_id = session_state.get("user_id") or case_context.get("user_id") or ""
 
         # Resolve template text on render (cache may have been hydrated since kickoff).
@@ -6932,12 +6953,11 @@ OUTPUT FORMAT:
         interactive_variables: Any,
         gathered: Dict[str, Any],
         open_qs: List[Dict[str, str]],
-        auto_filled_ids: set = None,
     ) -> "tuple[List[Dict[str, str]], List[Dict[str, str]]]":
-        """Deterministic guarantee that EVERY registry variable is surfaced as
-        an open question. Variables in ``auto_filled_ids`` are suggestions from
-        case context that the lawyer must still confirm — they are NOT treated
-        as answered even if a value exists in ``gathered``.
+        """Deterministic guarantee that EVERY registry variable is either
+        auto-filled (a real value in `gathered`) or surfaced as an open
+        question. For any variable addressed by neither, append a question
+        built from the variable's stored `question` / `label`.
 
         Returns ``(open_qs_complete, added)`` where ``added`` are the
         coverage-injected questions (empty when the kickoff already covered
@@ -6949,14 +6969,8 @@ OUTPUT FORMAT:
         def norm(s: Any) -> str:
             return re.sub(r"[^a-z0-9]+", "_", str(s or "").lower()).strip("_")
 
-        # Normalised set of ids that came from auto-suggestion — these must still
-        # be asked even if gathered has a value for them.
-        suggestion_norm = {norm(k) for k in (auto_filled_ids or set())}
-
         addressed: set = set()
         for k, val in (gathered or {}).items():
-            if norm(k) in suggestion_norm:
-                continue  # suggestion, not a confirmed answer — must still be asked
             if self._is_filled_value(val):
                 addressed.add(norm(k))
         existing_ids: set = set()

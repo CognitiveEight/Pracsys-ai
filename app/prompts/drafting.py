@@ -841,11 +841,14 @@ def build_template_kickoff_prompt(
         ]
         if pf_lines:
             prefilled_block = (
-                "ALREADY AUTO-FILLED FROM THE CASE (these variable values are "
-                "KNOWN — treat each as gathered, reflect them in `gatheredFacts` "
-                "keyed by these exact ids, weave the important ones into the Key "
-                "Case Details, and DO NOT ask for any of them as an open "
-                "question):\n" + "\n".join(pf_lines) + "\n\n"
+                "SUGGESTED VALUES FROM CASE CONTEXT (these values were inferred "
+                "from the case documents — include EACH as an open question so "
+                "the lawyer can CONFIRM or CORRECT the suggestion. Show the "
+                "inferred value in the question text (e.g. \"We identified "
+                "'<value>' from your documents — please confirm or correct\"). "
+                "Do NOT put these in gatheredFacts; they MUST appear in "
+                "openQuestions so the lawyer validates every one):\n"
+                + "\n".join(pf_lines) + "\n\n"
             )
     title_hint = (
         f"DRAFT TITLE HINT (from the suggestion the lawyer picked): {draft_title_hint}\n"
@@ -924,8 +927,11 @@ TASK:
    MUST NOT assume it will appear later or be filled at render time — surface
    it as an open question instead (step 4). Never put a slot in `gatheredFacts`
    unless you can point to the exact value in the case context. Any variable
-   listed in the ALREADY AUTO-FILLED FROM THE CASE block above is KNOWN — put
-   it in `gatheredFacts` (keyed by its exact id) and NEVER ask for it.
+   listed in the SUGGESTED VALUES FROM CASE CONTEXT block above has an inferred
+   value — include it in openQuestions with the suggestion shown in the question
+   text (e.g. "We found 'Risha Singh' as the petitioner — please confirm or
+   provide the correct name"). NEVER put a suggested variable in gatheredFacts;
+   the lawyer must confirm every one.
 4. List the SLOTS that still need the lawyer's input. When a STORED TEMPLATE
    BLUEPRINT with an INTERACTIVE VARIABLE REGISTRY is present above, that
    registry is the AUTHORITATIVE checklist — walk EVERY variable in it and,

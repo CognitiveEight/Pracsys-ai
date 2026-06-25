@@ -913,8 +913,12 @@ TASK:
    final draft.
 2. Identify which facts in the template are context-bound to the ORIGINAL
    matter (e.g. property/land facts in a reply-notice template, specific
-   sale-deed numbers, original parties) and must be stripped or replaced
-   when adapting to THIS case.
+   sale-deed numbers, original parties; also: monetary amounts in demand /
+   compensation / costs clauses even when a specific figure is hardcoded —
+   those figures belong to the original case and must be recalculated for
+   THIS matter; email addresses in the sender/firm letterhead — the original
+   law firm's contact details must be replaced) and must be stripped or
+   replaced when adapting to THIS case.
 3. Pre-fill a case-variable slot into `gatheredFacts` ONLY when the case
    context above ACTUALLY contains a concrete value for it (an explicit party
    name, address, date, number, amount, statute, etc.). A slot's
@@ -966,10 +970,13 @@ TASK:
    left silently blank. Each open question must be focused and answerable in
    one short sentence (e.g. "What is the FIR number and date of
    registration?"), not a 5-part request.
-   EMAIL SLOTS: if the template text contains a placeholder for the
-   sender's, advocate's, or firm's email address (any blank, bracket, or
-   token adjacent to an email context), surface it as an open question
-   with id "email" unless an email is already in gatheredFacts.
+   EMAIL SLOTS: if the template text contains ANY email address — whether
+   as a blank placeholder OR as a concrete address already written (e.g.
+   business@firm.com) in the sender's / advocate's / firm letterhead or
+   signature block — treat it as a per-matter variable and surface it as
+   an open question with id "email" unless an email has already been
+   provided in gatheredFacts. The original firm's email is specific to the
+   template's source matter and must be replaced for every new draft.
    COST / LIABILITY HEADS: when the template contains a demand or
    liability clause that lists multiple cost heads (e.g. depreciation,
    loss of use, mental harassment, legal costs, interest), ask for EACH
@@ -2360,9 +2367,14 @@ TEMPLATE_PROFILE_INSTRUCTION = (
     "     (b) IMPLICIT case-variable fields the template states in prose that "
     "         change per matter: party names + addresses, dates, amounts, "
     "         applicable statute/section numbers, FIR / cheque / invoice "
-    "         numbers, the specific relief/prayer, and the execution block "
+    "         numbers, the specific relief/prayer, the execution block "
     "         (signing date, place, witness, signatory designation, "
-    "         enrolment no.); AND\n"
+    "         enrolment no.), AND email addresses appearing in the sender's / "
+    "         advocate's / firm's letterhead or signature block — ALWAYS treat "
+    "         an email address in the sender block as an implicit variable "
+    "         (id: 'email', fill_from_case: false) even when a concrete "
+    "         address is already written in the template (the original firm's "
+    "         email must be replaced for each new matter); AND\n"
     "     (c) CONTENT / SUBSTANTIATION slots — wherever the template states a "
     "         case-dependent CONTENT clause in generic or abstract terms "
     "         (as opposed to a placeholder or a single named value), treat it "
@@ -2380,6 +2392,15 @@ TEMPLATE_PROFILE_INSTRUCTION = (
     "         legal recitals (reservation-of-rights, without-prejudice, "
     "         settlement-confidentiality, and similar fixed boilerplate), which "
     "         stay verbatim and are not per-matter slots.\n"
+    "     HARDCODED AMOUNTS RULE: monetary amounts in demand / compensation / "
+    "         costs clauses are ALWAYS interactive variables even when a "
+    "         specific figure is already written in the template (e.g. "
+    "         'USD 1,000 towards costs', '₹3,00,000 for harassment'). Those "
+    "         figures belong to the ORIGINAL matter and must be recalculated "
+    "         for every new case. Capture every distinct cost head as a "
+    "         SEPARATE variable (kind: 'amount', fill_from_case: false, "
+    "         required: true). NEVER treat a hardcoded demand/compensation "
+    "         amount as fixed boilerplate — it is always a per-matter slot.\n"
     "   Do NOT skip a field just because it appears in plain sentences rather "
     "   than as a bracketed blank. The DETERMINISTIC PLACEHOLDERS list in the "
     "   user prompt (when present) is a floor, not a ceiling — every one of "
@@ -2393,15 +2414,21 @@ TEMPLATE_PROFILE_INSTRUCTION = (
     "   from the template — never force a slot into a listed name that does not "
     "   fit, and never add a listed field the template does not have.\n"
     "3. `fill_from_case` = true when the value is normally available from a "
-    "   case file / matter context (party names, dates, FIR no., amounts, "
-    "   applicable sections, relief). Set false for values only the lawyer "
-    "   knows at drafting/execution time (signing date, place, witness names, "
-    "   advocate enrolment no.). For SUBSTANTIATION slots specifically, set "
-    "   `fill_from_case` = true ONLY when the case context would plainly "
-    "   contain that specific particular/figure; otherwise set it false so the "
-    "   kickoff asks the lawyer for it rather than leaving it generic. This "
-    "   lets the kickoff auto-fill the true ones from the case and ask the "
-    "   lawyer for the rest.\n"
+    "   case file / matter context (party names, dates, FIR no., known "
+    "   transactional amounts such as invoice total / cheque amount / loan "
+    "   principal that are explicitly stated in the case file, applicable "
+    "   sections, relief). Set false for values only the lawyer knows at "
+    "   drafting/execution time (signing date, place, witness names, advocate "
+    "   enrolment no., email address). IMPORTANT: claimed / demanded amounts "
+    "   (legal costs, harassment damages, loss of use, depreciation — figures "
+    "   the lawyer decides strategically) are ALWAYS fill_from_case: false — "
+    "   never set them true even though they are 'amounts', because the case "
+    "   file does not tell the lawyer what to claim. For SUBSTANTIATION slots "
+    "   specifically, set `fill_from_case` = true ONLY when the case context "
+    "   would plainly contain that specific particular/figure; otherwise set "
+    "   it false so the kickoff asks the lawyer for it rather than leaving it "
+    "   generic. This lets the kickoff auto-fill the true ones from the case "
+    "   and ask the lawyer for the rest.\n"
     "4. `required` = true for fields without which the draft is incomplete; "
     "   false for genuinely optional embellishments. SUBSTANTIATION slots tied "
     "   to the document's core purpose (principal grounds, primary "

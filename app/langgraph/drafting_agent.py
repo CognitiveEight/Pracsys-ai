@@ -137,7 +137,9 @@ _MAX_SUGGESTIONS = 6
 # templates (profiled under an older schema) are re-profiled on next use rather
 # than serving a stale registry. v2 adds capture of content/substantiation
 # clauses (grounds, claims/defences, heads of loss/relief, representations …).
-PROFILE_SCHEMA_VERSION = 2
+# v3 adds: email in sender block always captured; hardcoded demand/compensation
+# amounts always captured as per-matter variables (fill_from_case: false).
+PROFILE_SCHEMA_VERSION = 3
 
 # Defaults for the drafting-blueprint controls the lawyer can override in the
 # dashboard. Used when we PROPOSE a fresh blueprint (the user then edits these

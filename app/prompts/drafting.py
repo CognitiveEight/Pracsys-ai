@@ -1596,6 +1596,21 @@ def build_draft_render_prompt(
             "from the bare TEMPLATE FULL TEXT: the previous draft's FILLED "
             "content always wins over the template's empty slots. Filling the "
             "requested slot must not cause any other slot to lose its value.\n"
+            "ENTITY-CHANGE RULE (non-negotiable): when the REVISION INSTRUCTION "
+            "changes a named entity — for example 'Advocate: X → Y' or 'Party: "
+            "A → B' — ALL secondary fields associated with that entity in the "
+            "PREVIOUS DRAFT (chamber/office address, enrollment number, firm "
+            "name, designation, phone, email, or any other dependent field) MUST "
+            "still be preserved VERBATIM from the PREVIOUS DRAFT. Do NOT reason "
+            "that a chamber address 'belongs to the old advocate' and must "
+            "therefore be cleared or replaced with `<placeholder>` because the "
+            "advocate name changed. Apparent inconsistency between the updated "
+            "primary field and an unchanged dependent field is NOT grounds for "
+            "clearing or replacing the dependent field. The lawyer will correct "
+            "dependent fields in a subsequent edit. Any field that has a concrete "
+            "value in the PREVIOUS DRAFT MUST appear with that exact value in "
+            "your output — `<placeholder>` is ONLY valid for fields that had no "
+            "value at all in the PREVIOUS DRAFT.\n"
             f'"""\n{previous_draft_markdown}\n"""\n\n'
             f"REVISION INSTRUCTION (apply ONLY this change): {revision_instruction or '(unspecified)'}\n"
         )
@@ -1731,6 +1746,35 @@ genuinely missing.
             "petition.\n"
         )
 
+    # In revision mode, gathered_facts may be stale (revisions never update
+    # gathered_facts, so a prior "Advocate: X → Y" instruction isn't reflected
+    # there). Label the block so the LLM knows the previous draft wins.
+    gathered_facts_label = (
+        "GATHERED FACTS FROM LAWYER — INITIAL CASE SETUP "
+        "[REVISION MODE: these values reflect the initial kickoff and may NOT "
+        "include changes made in prior revision turns (e.g. an advocate name "
+        "change, a court change). The PREVIOUS DRAFT below is the authoritative "
+        "source for all currently-filled field values. Use these facts ONLY to "
+        "fill <placeholder> slots that have no value in the PREVIOUS DRAFT — "
+        "NEVER use them to override a concrete value already present in the draft]"
+        if mode == "revision"
+        else "GATHERED FACTS FROM LAWYER (JSON)"
+    )
+
+    revision_constraint = (
+        "  - REVISION MODE — PREVIOUS DRAFT IS THE SINGLE SOURCE OF TRUTH: "
+        "the PREVIOUS DRAFT contains every field value as it stands after all "
+        "prior user edits. GATHERED FACTS above may be stale (they reflect the "
+        "initial kickoff only and do not track subsequent revision changes such "
+        "as advocate name, court, or case number updates). Where any field in "
+        "GATHERED FACTS conflicts with a filled value in the PREVIOUS DRAFT, "
+        "the PREVIOUS DRAFT value wins unconditionally — never use GATHERED "
+        "FACTS to override or revert a field that already has a concrete value "
+        "in the PREVIOUS DRAFT.\n"
+        if mode == "revision"
+        else ""
+    )
+
     return f"""WORKSPACE ROLE: {role_upper}
 MODE: {mode}
 
@@ -1740,7 +1784,7 @@ CASE SUMMARY:
 CASE FACTS / EVIDENCE BRIEF:
 {case_facts_brief or "(no facts brief)"}
 
-GATHERED FACTS FROM LAWYER (JSON):
+{gathered_facts_label}:
 {gathered_facts_json or "{{}}"}
 
 DRAFT TITLE: {draft_title}
@@ -1751,7 +1795,7 @@ TASK:
 Produce the complete draft as a single Markdown document.
 
 CONSTRAINTS:
-  - Indian legal register, passive voice, third person.
+{revision_constraint}  - Indian legal register, passive voice, third person.
   - No IPC / CrPC / Indian Evidence Act — use BNS / BNSS / BSA instead.
   - No invented citations, statute sections, court names, or monetary figures.
   - Where a slot value is missing, leave it as <placeholder> with a clear

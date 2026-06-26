@@ -43,6 +43,7 @@ from app.prompts.drafting import (
     DRAFTING_ROUTER_INSTRUCTION,
     SUGGESTED_DRAFTS_INSTRUCTION,
     TEMPLATE_APPLICABILITY_INSTRUCTION,
+    TEMPLATE_CLEANUP_INSTRUCTION,
     TEMPLATE_CLASSIFY_INSTRUCTION,
     TEMPLATE_DIFF_INSTRUCTION,
     TEMPLATE_DOCUMENT_TYPE_LABELS,
@@ -57,6 +58,7 @@ from app.prompts.drafting import (
     build_router_prompt,
     build_suggested_drafts_prompt,
     build_template_applicability_prompt,
+    build_template_cleanup_prompt,
     build_template_classify_prompt,
     build_template_diff_prompt,
     build_template_fill_prompt,
@@ -1124,6 +1126,9 @@ class DraftingAgent:
         # Skip re-extraction when content hash is stable.
         downloaded_bytes: Optional[bytes] = None
         ext_lower = (extension or "").lstrip(".").lower()
+        # True only when we just downloaded + extracted (vs. reused cached
+        # text); gates the one-time LLM OCR cleanup pass below.
+        fresh_extract = False
         if (
             previous_payload
             and file_hash
@@ -1176,6 +1181,7 @@ class DraftingAgent:
                 return None
             extracted_text = (extracted_text or "").strip()
             extraction_status = "ready" if extracted_text else "failed"
+            fresh_extract = True
 
         # Strip OCR per-page artifacts (`--- Page N ---` markers and the
         # letterhead/header that repeats at the top of every page) before the
@@ -1184,6 +1190,14 @@ class DraftingAgent:
         # every page of the generated draft. No-op for DOCX / single-page text.
         if extracted_text:
             extracted_text = self._normalize_template_text(extracted_text)
+            # LLM cleanup pass — removes scanned-document noise the
+            # deterministic normaliser cannot (garbled rubber-stamp/seal text,
+            # page-number footers, editorial margin notes). Only on a fresh
+            # extraction; cached text was already cleaned at its first ingest.
+            if fresh_extract:
+                extracted_text = await self._clean_template_ocr_text(
+                    name=name, extracted_text=extracted_text
+                )
 
         # Persist a DOCX skeleton to GCS so future drafts can reproduce
         # the lawyer's formatting under the llm_diff path. Native DOCX
@@ -2338,6 +2352,197 @@ class DraftingAgent:
             return text
         kept = [l for i, l in enumerate(lines) if i not in remove]
         return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+    # Target size of one OCR-cleanup chunk. Templates larger than this are
+    # split on line boundaries and cleaned chunk-by-chunk (in bounded parallel)
+    # so a long document is fully cleaned rather than skipped — output ≈ input,
+    # so this stays well under the model's output budget. Most templates fit a
+    # single chunk.
+    _OCR_CLEANUP_CHUNK_CHARS = 40000
+    # Max chunks cleaned concurrently, to bound LLM fan-out on a huge template.
+    _OCR_CLEANUP_CONCURRENCY = 4
+
+    def _accept_cleaned_template_text(
+        self, original: str, cleaned: str
+    ) -> bool:
+        """Guard the LLM cleanup output: accept only when it plausibly removed
+        just noise and kept the body intact.
+
+        Rejects (→ caller keeps the original) when the cleaned text is empty,
+        drastically shorter than the original (the model likely dropped real
+        paragraphs — cleanup only strips small artifacts), materially longer
+        (it added content), or dropped any literal placeholder. Conservative by
+        design: a wrong clean silently corrupts the template, a rejected clean
+        merely forgoes noise removal."""
+        orig = (original or "").strip()
+        clean = (cleaned or "").strip()
+        if not clean:
+            return False
+        o_words = _word_count(orig)
+        c_words = _word_count(clean)
+        if o_words and c_words < int(o_words * 0.65):
+            logger.warning(
+                "Template cleanup rejected: too short ({} -> {} words)",
+                o_words,
+                c_words,
+            )
+            return False
+        if o_words and c_words > int(o_words * 1.15) + 20:
+            logger.warning(
+                "Template cleanup rejected: longer than source ({} -> {} words)",
+                o_words,
+                c_words,
+            )
+            return False
+        # Every literal fill-in slot present before cleaning must survive.
+        orig_slots = {raw for raw, _l, _k in self._literal_placeholders_in_text(orig)}
+        if orig_slots:
+            missing = [s for s in orig_slots if s not in clean]
+            if missing:
+                logger.warning(
+                    "Template cleanup rejected: dropped placeholder(s) {}",
+                    missing[:8],
+                )
+                return False
+        return True
+
+    @staticmethod
+    def _chunk_text_for_cleanup(text: str, max_chars: int) -> List[str]:
+        """Split text into <= max_chars chunks on LINE boundaries (never
+        mid-line), packing greedily. Prefers to break at blank-line
+        (paragraph) boundaries so a chunk rarely splits a paragraph. Returns
+        ``[text]`` when it already fits."""
+        if len(text) <= max_chars:
+            return [text]
+        lines = text.split("\n")
+        chunks: List[str] = []
+        cur: List[str] = []
+        cur_len = 0
+        last_blank_idx = -1  # index in `cur` of the most recent blank line
+        for ln in lines:
+            add = len(ln) + 1
+            if cur and cur_len + add > max_chars:
+                # Prefer to cut at the last paragraph break inside `cur` so we
+                # don't split a paragraph; fall back to the hard line boundary.
+                if 0 <= last_blank_idx < len(cur) - 1:
+                    head = cur[: last_blank_idx + 1]
+                    tail = cur[last_blank_idx + 1 :]
+                    chunks.append("\n".join(head).strip("\n"))
+                    cur = tail + [ln]
+                else:
+                    chunks.append("\n".join(cur).strip("\n"))
+                    cur = [ln]
+                cur_len = sum(len(x) + 1 for x in cur)
+                last_blank_idx = -1
+            else:
+                cur.append(ln)
+                cur_len += add
+                if not ln.strip():
+                    last_blank_idx = len(cur) - 1
+        if cur:
+            chunks.append("\n".join(cur).strip("\n"))
+        return [c for c in chunks if c.strip()]
+
+    async def _clean_template_chunk(
+        self, *, name: str, chunk: str, is_fragment: bool
+    ) -> Optional[str]:
+        """Clean one chunk via the LLM. Returns the cleaned text, or ``None``
+        when the call fails or the result fails the safety gate (caller then
+        keeps the original chunk so content is never lost)."""
+        body = (chunk or "").strip()
+        if not body:
+            return chunk
+        try:
+            prompt = build_template_cleanup_prompt(
+                name=name, content=body, is_fragment=is_fragment
+            )
+            raw = await gemini_client.generate_longform(
+                prompt,
+                system_instruction=TEMPLATE_CLEANUP_INSTRUCTION,
+                temperature=0.0,
+                max_tokens=65536,
+                thinking_level="LOW",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Template cleanup chunk LLM call failed (non-fatal): {}", exc
+            )
+            return None
+        cleaned = _strip_code_fences(raw or "").strip()
+        if not self._accept_cleaned_template_text(body, cleaned):
+            return None
+        return cleaned
+
+    async def _clean_template_ocr_text(
+        self, *, name: str, extracted_text: str
+    ) -> str:
+        """LLM cleanup pass for OCR-extracted template text.
+
+        Removes scanned-document noise the deterministic normaliser cannot —
+        rubber-stamp / seal text (garbled differently on every page), page-
+        number footers, and editorial margin notes — while preserving every
+        paragraph, heading and literal placeholder verbatim.
+
+        Long templates are split on line boundaries and cleaned chunk-by-chunk
+        in bounded parallel (no size cap, nothing skipped). Each chunk that
+        fails its safety gate falls back to its own original text, and a final
+        whole-document gate falls back to the normalised text — so ingest never
+        breaks and never loses content."""
+        body = (extracted_text or "").strip()
+        if not body:
+            return extracted_text
+
+        chunks = self._chunk_text_for_cleanup(body, self._OCR_CLEANUP_CHUNK_CHARS)
+
+        if len(chunks) == 1:
+            cleaned = await self._clean_template_chunk(
+                name=name, chunk=body, is_fragment=False
+            )
+            result = cleaned if cleaned is not None else body
+            logger.info(
+                "Template cleanup ({} chunk) (template={!r}): {} -> {} chars",
+                "1",
+                (name or "")[:60],
+                len(body),
+                len(result),
+            )
+            return result
+
+        # Multiple chunks — clean concurrently with bounded fan-out. Chunk 0 is
+        # the document head (may keep one letterhead); the rest are mid-document
+        # fragments (strip all header/stamp/footer noise).
+        sem = asyncio.Semaphore(self._OCR_CLEANUP_CONCURRENCY)
+
+        async def _clean_idx(i: int, ch: str) -> str:
+            async with sem:
+                out = await self._clean_template_chunk(
+                    name=name, chunk=ch, is_fragment=(i > 0)
+                )
+            return out if out is not None else ch  # fall back to original chunk
+
+        results = await asyncio.gather(
+            *(_clean_idx(i, ch) for i, ch in enumerate(chunks))
+        )
+        merged = "\n".join(r.strip("\n") for r in results).strip()
+        # Whole-document safety gate: if the reassembly somehow lost too much or
+        # dropped a placeholder, fall back to the deterministically-normalised
+        # text rather than ship a damaged template.
+        if not self._accept_cleaned_template_text(body, merged):
+            logger.warning(
+                "Chunked template cleanup rejected at merge ({} chunks, "
+                "template={!r}); keeping normalised text",
+                len(chunks),
+                (name or "")[:60],
+            )
+            return body
+        logger.info(
+            "Template cleanup ({} chunks) (template={!r}): {} -> {} chars",
+            len(chunks),
+            (name or "")[:60],
+            len(body),
+            len(merged),
+        )
+        return merged
 
     @staticmethod
     def _literal_placeholders_in_text(

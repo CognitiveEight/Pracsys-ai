@@ -1261,13 +1261,16 @@ DRAFT_RENDER_INSTRUCTION = (
     + "below. Do NOT otherwise rewrite the template's fixed legal language. "
     + "The generic FORMATTING RULES section in the "
     + "base instruction does NOT apply when a template is in use.\n\n"
-    + "RUNNING HEADERS / LETTERHEAD — the template text is extracted from a "
-    + "multi-page document, so a letterhead or firm-name/address block that "
-    + "is a running page header may appear REPEATED near the top of several "
-    + "pages, and `--- Page N ---` page markers may be present. These are "
-    + "extraction artifacts, NOT body content: render the letterhead / header "
-    + "block ONCE at the top of the document, never repeat it mid-document, "
-    + "and never emit `--- Page N ---` markers.\n\n"
+    + "RUNNING HEADERS / LETTERHEAD / STAMPS — the template text is extracted "
+    + "from a scanned multi-page document, so it may carry extraction "
+    + "artifacts that are NOT body content: a letterhead / firm-name / address "
+    + "block repeated near the top of several pages; `--- Page N ---` markers "
+    + "and 'Page N of M' footers; and rubber-stamp / seal text OCR'd into "
+    + "scrambled fragments of the firm name plus a city / country (e.g. "
+    + "'SSOCIATES', 'ASSOCI', 'FUSKH', 'GURUGRAM', 'INDIA', a lone '★'), which "
+    + "may appear in the middle of the text between paragraphs. Render the "
+    + "letterhead ONCE at the top, and NEVER reproduce page markers, page-"
+    + "number footers, or garbled stamp/seal fragments anywhere in the draft.\n\n"
     + "Produce the complete draft as a single Markdown document. "
     + "When a template is supplied, the template's structural skeleton — "
     + "headings, section order, salutations, party-block layout, prayer "
@@ -2665,6 +2668,90 @@ OUTPUT — strict JSON object only, no commentary, no markdown fences (the
 second variable below illustrates a `substantiation` content slot — keep such
 examples generic to the actual template, do not copy this wording):
 {{"tone": "<short phrase>", "filing_context": "<2-4 sentences>", "structure_outline": ["<section>", "..."], "interactive_variables": [{{"id": "<snake_case>", "label": "<short>", "question": "<one sentence>", "kind": "<party|date|amount|statute|fact|relief|execution|substantiation|other>", "fill_from_case": true, "required": true}}, {{"id": "ground_<n>", "label": "<short content head>", "question": "<one sentence asking for this matter's particulars for this point>", "kind": "substantiation", "fill_from_case": false, "required": true}}], "quick_add": ["<optional suggested field name>", "..."]}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Template OCR cleanup (ingest-time) — strip scanned-document noise
+# ---------------------------------------------------------------------------
+
+TEMPLATE_CLEANUP_INSTRUCTION = (
+    "You clean OCR-extracted text of a legal-document TEMPLATE so it can be "
+    "reused as a drafting skeleton. The text was extracted from a scanned / "
+    "multi-page document, so it carries extraction noise that is NOT part of "
+    "the document body.\n\n"
+    "REMOVE the following noise:\n"
+    "  - Repeated page letterheads / running headers (firm name, advocate "
+    "    line, office address block) that recur at the top of pages — keep at "
+    "    most ONE copy at the very top of the document.\n"
+    "  - Rubber-stamp / seal text. A circular stamp is OCR'd into SCRAMBLED, "
+    "    out-of-order fragments of the firm name plus a city / country (e.g. "
+    "    'SSOCIATES', 'ASSOCI', 'FUSKH', 'GURUGRAM', 'INDIA', a lone '★'). "
+    "    Delete these fragmentary stamp echoes wherever they appear, including "
+    "    when they land in the middle of the text between paragraphs.\n"
+    "  - Page-number footers such as 'Page 2 of 7', 'Page 2', '2/7'.\n"
+    "  - Editorial / margin notes that are not part of the notice itself "
+    "    (e.g. 'Updated version: Pradeep Mehra -> Rahul Singh, IWC -> Titan').\n"
+    "  - Stray OCR artifacts: isolated single characters, scan-line debris, "
+    "    and '--- Page N ---' markers.\n\n"
+    "PRESERVE EXACTLY, verbatim and IN THE SAME ORDER:\n"
+    "  - The document title and all section headings.\n"
+    "  - The recipient / addressee block and the 'RE:' subject line.\n"
+    "  - EVERY numbered or lettered paragraph and sub-item, with its original "
+    "    numbering (1, 2, 3 …; a, b, c …; i, ii, iii …). Numbered paragraphs "
+    "    must read continuously (e.g. paragraph 8 immediately followed by 9).\n"
+    "  - The signature block.\n"
+    "  - EVERY literal fill-in placeholder, character-for-character: angle "
+    "    '<...>', bracket '[...]', handlebars '{{...}}', parenthesised labels, "
+    "    and underscore blanks '___'.\n\n"
+    "Do NOT rewrite, paraphrase, summarise, translate, reorder, renumber, "
+    "spell-correct, add, or fill anything. Your only job is to delete the "
+    "extraction noise listed above and return the remaining document text "
+    "unchanged. Output ONLY the cleaned document text — no commentary, no "
+    "explanations, no markdown code fences."
+)
+
+
+def build_template_cleanup_prompt(
+    *, name: str, content: str, is_fragment: bool = False
+) -> str:
+    """Build the user prompt for the ingest-time OCR cleanup pass.
+
+    `content` is the OCR-extracted template body (already deterministically
+    normalised). The model returns the same text with scanned-document noise
+    (letterheads, garbled seals/stamps, page footers, margin notes) removed
+    and all paragraphs / placeholders preserved verbatim.
+
+    `is_fragment` marks a MIDDLE chunk of a longer template that was split for
+    cleaning: such a chunk has no legitimate top letterhead, so the model must
+    strip ALL header/stamp/footer noise (keep none) and must not renumber or
+    add anything — its paragraphs continue from a previous chunk.
+    """
+    safe_name = (name or "").strip() or "(no name supplied)"
+    safe_body = (content or "").strip()
+    if is_fragment:
+        fragment_note = (
+            "\nNOTE: This is a MIDDLE FRAGMENT of a longer document (NOT the "
+            "beginning). It has no legitimate top letterhead — remove ALL "
+            "letterhead / header / stamp / seal / page-footer noise (keep "
+            "none), and do NOT add a header. Preserve the body paragraphs and "
+            "their existing numbering exactly as they appear; do not renumber "
+            "or treat the first lines as a heading.\n"
+        )
+    else:
+        fragment_note = ""
+    return f"""TEMPLATE FILE NAME: {safe_name}
+{fragment_note}
+Below is the raw OCR-extracted text of the template. Return the cleaned
+document text only, following the rules in your instructions (remove
+letterheads / stamps / seals / page-number footers / margin notes; preserve
+every paragraph, heading, recipient block, signature block and literal
+placeholder verbatim and in order).
+
+RAW OCR TEXT:
+\"\"\"
+{safe_body}
+\"\"\"
 """
 
 

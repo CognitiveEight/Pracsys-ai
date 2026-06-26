@@ -41,6 +41,7 @@ from app.prompts.drafting import (
     DRAFT_TRANSLATE_INSTRUCTION,
     DRAFTING_CHAT_INSTRUCTION,
     DRAFTING_ROUTER_INSTRUCTION,
+    QUESTION_DEDUP_INSTRUCTION,
     SUGGESTED_DRAFTS_INSTRUCTION,
     TEMPLATE_APPLICABILITY_INSTRUCTION,
     TEMPLATE_CLEANUP_INSTRUCTION,
@@ -56,6 +57,7 @@ from app.prompts.drafting import (
     build_draft_render_prompt,
     build_draft_translate_prompt,
     build_router_prompt,
+    build_question_dedup_prompt,
     build_suggested_drafts_prompt,
     build_template_applicability_prompt,
     build_template_cleanup_prompt,
@@ -4588,6 +4590,13 @@ class DraftingAgent:
                         len(_added_cov),
                         [q["id"] for q in _added_cov],
                     )
+                # Collapse semantically-equivalent questions so the lawyer is
+                # never asked the same thing twice (the LLM's own openQuestions
+                # and the registry-coverage additions can overlap — e.g. an
+                # umbrella 'Compensation Heads' vs separate heads, or 'Notice
+                # Reference & Date' vs separate 'Reference Number' + 'Date').
+                if open_qs:
+                    open_qs = await self._dedup_kickoff_questions(open_qs)
                 # Present the COMPLETE question set as ONE grouped, numbered
                 # Critical/Important/Optional list — so the lawyer answers
                 # everything in a single round. The deterministic block (built
@@ -7735,6 +7744,130 @@ OUTPUT FORMAT:
                 addressed.add(vlabel)
 
         return out[: self._MAX_INTERACTIVE_VARIABLES], added
+
+    # Words ignored when comparing question labels for duplication — generic
+    # connectors and slot-noise that don't carry the question's meaning.
+    _QUESTION_STOPWORDS = frozenset({
+        "the", "of", "for", "a", "an", "and", "or", "to", "is", "are", "what",
+        "this", "that", "details", "detail", "number", "no", "please",
+        "provide", "specific", "full", "client", "clients", "mr", "mrs", "ms",
+        "their", "his", "her", "name", "value", "amount",
+    })
+
+    @classmethod
+    def _question_tokens(cls, label: str) -> "set[str]":
+        """Significant token set of a question label (the part before ':'),
+        with stopwords and short noise removed — used to detect duplicates."""
+        head = (label or "").split(":", 1)[0]
+        toks = re.findall(r"[a-z0-9]+", head.lower())
+        return {t for t in toks if t not in cls._QUESTION_STOPWORDS and len(t) > 2}
+
+    def _dedup_questions_by_tokens(
+        self, qs: List[Dict[str, str]]
+    ) -> List[Dict[str, str]]:
+        """Deterministic safe de-dup: collapse questions whose significant
+        token sets are IDENTICAL (pure rephrasings, e.g. 'Client Professional
+        Background' vs 'Professional Background'). Keeps the most-critical of
+        each duplicate group (then the longest label), preserving order.
+        Equal-set only — subset/umbrella/synonym cases are left to the LLM
+        pass, which avoids dropping a genuinely-distinct value here."""
+        if len(qs) < 2:
+            return qs
+        rank = {"Critical": 0, "Important": 1, "Optional": 2}
+        best_by_key: "dict[frozenset, int]" = {}
+        order: List[int] = []
+        for i, q in enumerate(qs):
+            toks = self._question_tokens(q.get("label", ""))
+            if not toks:
+                order.append(i)  # keep label-less / tokenless questions as-is
+                continue
+            key = frozenset(toks)
+            cur = best_by_key.get(key)
+            if cur is None:
+                best_by_key[key] = i
+                order.append(i)
+            else:
+                # Duplicate token set — keep the better of the two.
+                cq, nq = qs[cur], q
+                better_new = (
+                    rank.get(nq.get("classification"), 1)
+                    < rank.get(cq.get("classification"), 1)
+                ) or (
+                    rank.get(nq.get("classification"), 1)
+                    == rank.get(cq.get("classification"), 1)
+                    and len(nq.get("label", "")) > len(cq.get("label", ""))
+                )
+                if better_new:
+                    best_by_key[key] = i
+                    order[order.index(cur)] = i
+        return [qs[i] for i in order]
+
+    async def _consolidate_questions_llm(
+        self, qs: List[Dict[str, str]]
+    ) -> List[Dict[str, str]]:
+        """LLM pass: drop semantically-redundant questions that share no words
+        (synonyms, and umbrellas that group more specific questions in the
+        list). Returns the list with the model-identified `dropIds` removed.
+
+        Safe by construction: it only ever DROPS ids that exist in the input;
+        ignores a suspicious result that would remove half or more of the
+        questions; and falls back to the input unchanged on any failure."""
+        if len(qs) < 2:
+            return qs
+        valid_ids = {(q.get("id") or "").strip() for q in qs if q.get("id")}
+        try:
+            raw = await gemini_client.generate(
+                build_question_dedup_prompt(qs),
+                system_instruction=QUESTION_DEDUP_INSTRUCTION,
+                temperature=0.0,
+                max_tokens=2000,
+                response_mime_type="application/json",
+            )
+        except Exception as exc:
+            logger.warning("Question de-dup LLM call failed (non-fatal): {}", exc)
+            return qs
+        parsed = _parse_json_object(raw) or {}
+        raw_drop = parsed.get("dropIds")
+        if not isinstance(raw_drop, list):
+            return qs
+        drop = {
+            str(d).strip()
+            for d in raw_drop
+            if str(d).strip() in valid_ids
+        }
+        if not drop:
+            return qs
+        if len(drop) >= len(qs):  # never drop everything
+            logger.warning(
+                "Question de-dup: model asked to drop all/most ({}/{}) — "
+                "ignoring",
+                len(drop),
+                len(qs),
+            )
+            return qs
+        kept = [q for q in qs if (q.get("id") or "").strip() not in drop]
+        logger.info(
+            "Question de-dup: removed {} redundant question(s): {}",
+            len(drop),
+            sorted(drop),
+        )
+        return kept or qs
+
+    async def _dedup_kickoff_questions(
+        self, qs: List[Dict[str, str]]
+    ) -> List[Dict[str, str]]:
+        """Hybrid de-dup of the final kickoff question set: a deterministic
+        identical-token pass (cheap, always safe) followed by an LLM pass for
+        synonym / umbrella-vs-parts duplicates that share no words. Never
+        raises and never returns an empty list when given input."""
+        if len(qs) < 2:
+            return qs
+        deduped = self._dedup_questions_by_tokens(qs)
+        try:
+            deduped = await self._consolidate_questions_llm(deduped)
+        except Exception as exc:
+            logger.warning("Kickoff question de-dup (LLM) failed: {}", exc)
+        return deduped or qs
 
     def _normalize_open_questions(
         self, raw: Any, limit: int = 10

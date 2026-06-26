@@ -2551,8 +2551,18 @@ TEMPLATE_PROFILE_INSTRUCTION = (
     "   than as a bracketed blank. The DETERMINISTIC PLACEHOLDERS list in the "
     "   user prompt (when present) is a floor, not a ceiling — every one of "
     "   them MUST appear as a variable, and you add the implicit ones too.\n"
-    "2. One variable per distinct value. Merge exact duplicates (the same "
-    "   slot appearing twice) into one. Give each a stable lowercase "
+    "2. One variable per distinct value — NO overlapping or redundant "
+    "   variables. Merge exact duplicates (the same slot appearing twice) into "
+    "   one. Also do NOT emit two variables that ask for the SAME underlying "
+    "   value in different words (e.g. both 'Notice Date' and 'Date of "
+    "   Issuance'). Do NOT emit BOTH an umbrella variable AND its component "
+    "   variables (e.g. NOT both 'Compensation Heads' and separate "
+    "   'Depreciation' / 'Loss of Use' / 'Harassment'); when a concept breaks "
+    "   into several distinct claimed values, emit ONLY the separate component "
+    "   variables, never the umbrella. Do NOT emit a COMBINED variable plus its "
+    "   split parts (e.g. NOT both 'Notice Reference & Date' and separate "
+    "   'Reference Number' + 'Notice Date'); split a combined slot into one "
+    "   variable per value. Give each a stable lowercase "
     "   snake_case `id`, a short human `label`, and a `question` that is "
     "   answerable in one sentence. For the `label`, prefer a canonical field "
     "   name from the NAMING REFERENCE in the user prompt when the slot clearly "
@@ -2752,6 +2762,61 @@ RAW OCR TEXT:
 \"\"\"
 {safe_body}
 \"\"\"
+"""
+
+
+# ---------------------------------------------------------------------------
+# Kickoff question de-duplication (collapse semantically-equivalent questions)
+# ---------------------------------------------------------------------------
+
+QUESTION_DEDUP_INSTRUCTION = (
+    "You de-duplicate a list of questions a lawyer will be asked in order to "
+    "fill a legal-document draft. Some questions are REDUNDANT: they ask for "
+    "the SAME underlying information in different words, or one is an UMBRELLA "
+    "that merely groups several more specific questions also present in the "
+    "list. Identify the questions to DROP.\n"
+    "Rules:\n"
+    "- Pure synonyms / rephrasings of the SAME single value (e.g. 'Notice "
+    "  Date' and 'Date of Issuance'; 'Client Professional Background' and "
+    "  'Professional Background'): keep the single clearest one, drop the "
+    "  rest.\n"
+    "- Umbrella vs specifics: when one question groups values that are ALSO "
+    "  asked by more specific questions in the list (e.g. 'Compensation Heads' "
+    "  vs separate 'Depreciation' + 'Loss of Use' + 'Mental Harassment'; or "
+    "  'Notice Reference & Date' vs separate 'Reference Number' + 'Notice "
+    "  Date'), DROP THE UMBRELLA and KEEP the specific questions, so every "
+    "  individual value is still captured.\n"
+    "- NEVER drop a question that asks for a value not covered by any kept "
+    "  question. When two questions are genuinely about different values, keep "
+    "  both. When unsure, keep both.\n"
+    "Output strict JSON ONLY: {\"dropIds\": [\"<id>\", ...]} — the ids of the "
+    "redundant questions to remove (may be empty). No commentary, no fences."
+)
+
+
+def build_question_dedup_prompt(questions: list) -> str:
+    """Build the user prompt for the kickoff question de-duplication pass.
+
+    `questions` is a list of {id, label, classification} dicts. Returns a
+    prompt asking which ids are redundant and should be dropped.
+    """
+    lines = []
+    for q in questions or []:
+        if not isinstance(q, dict):
+            continue
+        qid = (q.get("id") or "").strip()
+        label = (q.get("label") or "").strip()
+        if not qid or not label:
+            continue
+        cls = (q.get("classification") or "").strip()
+        lines.append(f"- id: {qid} | [{cls}] {label}")
+    listing = "\n".join(lines) or "(no questions)"
+    return f"""QUESTIONS TO REVIEW (one per line — `id` then label):
+{listing}
+
+Return the ids of redundant questions to drop, per your instructions.
+OUTPUT — strict JSON object only:
+{{"dropIds": ["<id>", "..."]}}
 """
 
 

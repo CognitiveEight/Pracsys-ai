@@ -149,7 +149,11 @@ _MAX_SUGGESTIONS_WITH_TEMPLATES = 8
 # clauses (grounds, claims/defences, heads of loss/relief, representations …).
 # v3 adds: email in sender block always captured; hardcoded demand/compensation
 # amounts always captured as per-matter variables (fill_from_case: false).
-PROFILE_SCHEMA_VERSION = 3
+# v4 adds: domain-neutral variable wording (labels/questions must not name the
+# template's original subject-matter or parties, e.g. "the watch") + no
+# overlapping/umbrella variables — forces re-profiling so reused templates ask
+# matter-agnostic questions.
+PROFILE_SCHEMA_VERSION = 4
 
 # Defaults for the drafting-blueprint controls the lawyer can override in the
 # dashboard. Used when we PROPOSE a fresh blueprint (the user then edits these

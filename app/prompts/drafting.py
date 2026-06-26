@@ -663,6 +663,98 @@ OUTPUT FORMAT — strict JSON array, no other text:
 
 
 # ---------------------------------------------------------------------------
+# 1b) Template applicability check (guarantees relevant templates surface)
+# ---------------------------------------------------------------------------
+
+TEMPLATE_APPLICABILITY_INSTRUCTION = (
+    DRAFTING_SYSTEM_INSTRUCTION
+    + "\n\n"
+    + "MODE: TEMPLATE-APPLICABILITY CHECK. "
+    + "You are deciding whether ONE of the lawyer's reusable templates is "
+    + "legally applicable to the current matter, judged by the template's "
+    + "LEGAL PURPOSE and document type — NOT by whether the parties or facts "
+    + "happen to match the template's original matter. A consumer-dispute "
+    + "legal notice is applicable to any consumer dispute; a bail application "
+    + "is not applicable to a pure consumer matter. "
+    + "If applicable, frame a one-line title and one-line description using "
+    + "ONLY this case's facts — never copy the template's original party "
+    + "names, dates, or facts. "
+    + "Output strict JSON only — a single object, no markdown fences, no commentary."
+)
+
+
+def build_template_applicability_prompt(
+    role: str,
+    case_summary: str,
+    applicable_laws_brief: str,
+    strategy_brief: str,
+    analysis_brief: str,
+    list_of_dates_brief: str,
+    template_document_type: str,
+    template_legal_purpose: str,
+) -> str:
+    """Build the prompt that decides whether a single template fits this case.
+
+    The decision is driven by the template's legal purpose / document type
+    against the case posture, so a template surfaces for any matter it
+    genuinely fits — independent of the original matter's party names/facts.
+    Returns a prompt asking for a single JSON object.
+    """
+    role_upper = (role or "ADJUDICATOR").strip().upper()
+    return f"""WORKSPACE ROLE: {role_upper}
+
+CASE SUMMARY:
+{case_summary or "(no summary available — derive from analysis report below)"}
+
+APPLICABLE LAWS (already identified for this case):
+{applicable_laws_brief or "(none yet)"}
+
+STRATEGY / OBJECTIVE:
+{strategy_brief or "(none yet)"}
+
+ANALYSIS REPORT (strengths, weaknesses, gaps, pending actions):
+{analysis_brief or "(none yet)"}
+
+LIST OF DATES (chronology):
+{list_of_dates_brief or "(none yet)"}
+
+CANDIDATE TEMPLATE:
+  - document type:  {template_document_type or "(unclassified)"}
+  - legal purpose:  {template_legal_purpose or "(not specified)"}
+
+TASK:
+Decide whether a draft of this template's TYPE and LEGAL PURPOSE is something
+this {role_upper} could genuinely prepare and use in THIS matter right now.
+Judge by legal applicability (does this kind of document advance or fit this
+case?), not by whether the original parties/facts match.
+
+Return a single JSON object:
+  - applicable:   true | false.
+  - title:        if applicable, a formal one-line name including the statute
+                  and section where known, framed to THIS case (e.g. "Legal
+                  Notice under Section 35 of the Consumer Protection Act,
+                  2019"). Empty string if not applicable.
+  - relevance:    "High" | "Medium" | "Low" — based on urgency and how
+                  directly this draft advances the case.
+  - description:  ONE short sentence (<= 160 characters) saying what the draft
+                  is for in THIS specific case. Empty string if not applicable.
+
+CONSTRAINTS:
+  - Judge applicability by legal purpose / document type, NOT by matching the
+    template's original party names or facts.
+  - Never copy the template's original party names, dates, or facts into the
+    title or description; use only this case's facts.
+  - No IPC, no CrPC, no Indian Evidence Act references. Use BNS / BNSS / BSA.
+  - No invented sections or acts. If unsure of a section, omit it from the
+    title rather than guess.
+  - When in genuine doubt about applicability, set applicable=false.
+
+OUTPUT FORMAT — strict JSON object, no other text:
+{{"applicable": true, "title": "...", "relevance": "High", "description": "..."}}
+"""
+
+
+# ---------------------------------------------------------------------------
 # 2) Template analysis (kick-off turn)
 # ---------------------------------------------------------------------------
 

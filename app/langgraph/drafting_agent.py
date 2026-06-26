@@ -42,6 +42,7 @@ from app.prompts.drafting import (
     DRAFTING_CHAT_INSTRUCTION,
     DRAFTING_ROUTER_INSTRUCTION,
     SUGGESTED_DRAFTS_INSTRUCTION,
+    TEMPLATE_APPLICABILITY_INSTRUCTION,
     TEMPLATE_CLASSIFY_INSTRUCTION,
     TEMPLATE_DIFF_INSTRUCTION,
     TEMPLATE_DOCUMENT_TYPE_LABELS,
@@ -55,6 +56,7 @@ from app.prompts.drafting import (
     build_draft_translate_prompt,
     build_router_prompt,
     build_suggested_drafts_prompt,
+    build_template_applicability_prompt,
     build_template_classify_prompt,
     build_template_diff_prompt,
     build_template_fill_prompt,
@@ -131,6 +133,10 @@ def _is_missing_object_error(exc: Exception) -> bool:
 _RELEVANCE_VALUES = {"High", "Medium", "Low"}
 _VALID_SOURCES = {"template", "suggestedDraft", "blank"}
 _MAX_SUGGESTIONS = 6
+# When the lawyer has reusable templates, the panel may carry a few extra
+# cards so every applicable template is guaranteed a slot without crowding
+# out the LLM's free case-driven suggestions. See _ensure_template_coverage.
+_MAX_SUGGESTIONS_WITH_TEMPLATES = 8
 
 # Version of the template "drafting blueprint" profiling schema. Bump this
 # whenever the profiler's variable-capture rules change so already-cached
@@ -603,6 +609,7 @@ class DraftingAgent:
         # existing template. Template-blind otherwise — see the empty
         # default in build_suggested_drafts_prompt.
         template_library_brief = ""
+        ready_templates: List[Dict[str, Any]] = []
         if user_id:
             try:
                 ready_templates, _ = await self._tm_gather(
@@ -675,6 +682,28 @@ class DraftingAgent:
                     "Pre-match for suggestions failed (non-fatal): {}", exc
                 )
 
+            # Guarantee that every reusable template whose LEGAL PURPOSE fits
+            # this case surfaces as a card — independent of whether the LLM
+            # happened to propose a draft of that type this round (the LLM
+            # step is non-deterministic and can silently drop an applicable
+            # template when case details change). See _ensure_template_coverage.
+            try:
+                suggestions = await self._ensure_template_coverage(
+                    user_id=user_id,
+                    role=role,
+                    suggestions=suggestions,
+                    ready_templates=ready_templates,
+                    case_summary=case_summary,
+                    applicable_laws_brief=applicable_laws_brief,
+                    strategy_brief=strategy_brief,
+                    analysis_brief=analysis_brief,
+                    list_of_dates_brief=list_of_dates_brief,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Template coverage pass failed (non-fatal): {}", exc
+                )
+
         logger.success(
             "Drafting suggestions: {} item(s) ready (pre-matched={})",
             len(suggestions),
@@ -701,10 +730,19 @@ class DraftingAgent:
         for t in ready[:cap]:
             payload = t.get("payload") or {}
             doc_type = (payload.get("document_type") or t.get("category") or "").strip()
-            purpose = (t.get("purpose") or "").strip()
+            # Prefer the fuller legal purpose (filing_context) over the coarse
+            # one-line document_purpose so the suggester understands what each
+            # template is actually for. Still TYPE/PURPOSE only — never the
+            # template's original party names or facts.
+            purpose = (
+                t.get("filing_context")
+                or payload.get("filing_context")
+                or t.get("purpose")
+                or ""
+            ).strip()
             label = doc_type or "Unclassified template"
             if purpose:
-                lines.append(f"- {label} (purpose: {purpose[:160]})")
+                lines.append(f"- {label} (purpose: {purpose[:240]})")
             else:
                 lines.append(f"- {label}")
         return "\n".join(lines)
@@ -759,6 +797,195 @@ class DraftingAgent:
             return enriched
 
         return await asyncio.gather(*(_match_one(s) for s in suggestions))
+
+    async def _ensure_template_coverage(
+        self,
+        *,
+        user_id: str,
+        role: str,
+        suggestions: List[Dict[str, Any]],
+        ready_templates: List[Dict[str, Any]],
+        case_summary: str,
+        applicable_laws_brief: str = "",
+        strategy_brief: str = "",
+        analysis_brief: str = "",
+        list_of_dates_brief: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Guarantee every reusable template whose LEGAL PURPOSE fits this
+        case surfaces as a suggested-draft card.
+
+        The LLM suggestion step is non-deterministic and judges by case
+        posture, so it can silently drop a perfectly applicable template when
+        case details change (different client / brand / matter). This pass
+        closes that gap: for every ready template NOT already bound to a
+        matched card, it runs a focused applicability check keyed on the
+        template's legal purpose + document type (never its original parties).
+        Applicable templates get a guaranteed, case-framed card with the
+        template pre-bound.
+
+        Template-backed cards take priority over AI-only suggestions so an
+        applicable template is never crowded out; the merged panel is capped
+        at ``_MAX_SUGGESTIONS_WITH_TEMPLATES``. Returns the input unchanged
+        when there is nothing to add.
+        """
+        if not user_id or not ready_templates:
+            return suggestions
+
+        # Templates already bound to a matched card need no separate coverage.
+        covered_ids = {
+            (s.get("templateId") or "").strip()
+            for s in suggestions
+            if isinstance(s, dict)
+            and s.get("matchMode") == "matched"
+            and (s.get("templateId") or "").strip()
+        }
+        uncovered = [
+            t
+            for t in ready_templates
+            if (t.get("templateId") or "").strip()
+            and (t.get("templateId") or "").strip() not in covered_ids
+        ]
+        if not uncovered:
+            return suggestions
+
+        async def _check_one(t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            tid = (t.get("templateId") or "").strip()
+            tname = (t.get("name") or "").strip()
+            payload = t.get("payload") or {}
+            doc_type = (
+                payload.get("document_type")
+                or t.get("document_type")
+                or t.get("category")
+                or ""
+            ).strip()
+            legal_purpose = (
+                t.get("filing_context")
+                or payload.get("filing_context")
+                or t.get("purpose")
+                or ""
+            ).strip()
+            prompt = build_template_applicability_prompt(
+                role=role,
+                case_summary=case_summary,
+                applicable_laws_brief=applicable_laws_brief,
+                strategy_brief=strategy_brief,
+                analysis_brief=analysis_brief,
+                list_of_dates_brief=list_of_dates_brief,
+                template_document_type=doc_type,
+                template_legal_purpose=legal_purpose,
+            )
+            try:
+                raw = await gemini_client.generate(
+                    prompt,
+                    system_instruction=TEMPLATE_APPLICABILITY_INSTRUCTION,
+                    temperature=0.1,
+                    max_tokens=2000,
+                    response_mime_type="application/json",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Template applicability check failed for {!r} "
+                    "(non-fatal): {}",
+                    tname[:60],
+                    exc,
+                )
+                return None
+            obj = _parse_json_object(raw)
+            if not isinstance(obj, dict):
+                return None
+            # Coerce defensively: the model occasionally returns the string
+            # "false" (truthy in Python) instead of a JSON boolean.
+            applicable = obj.get("applicable")
+            if isinstance(applicable, str):
+                applicable = applicable.strip().lower() in {"true", "yes", "1"}
+            if not applicable:
+                return None
+            title = (obj.get("title") or "").strip() or doc_type or tname
+            if not title:
+                return None
+            desc = (obj.get("description") or "").strip()
+            if len(desc) > 220:
+                desc = desc[:220].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
+            logger.info(
+                "Template coverage: template {} ({!r}) deemed applicable — "
+                "guaranteeing card {!r}",
+                tid,
+                tname[:50],
+                title[:80],
+            )
+            return {
+                "title": title,
+                "relevance": _normalize_relevance(obj.get("relevance")),
+                "description": desc or None,
+                "templateId": tid,
+                "templateName": tname or None,
+                "matchMode": "matched",
+            }
+
+        results = await asyncio.gather(*(_check_one(t) for t in uncovered))
+        guaranteed = _filter_forbidden_acts(
+            [r for r in results if isinstance(r, dict)]
+        )
+        if not guaranteed:
+            return suggestions
+
+        # Lock each guaranteed card's template so the kickoff click reuses
+        # the SAME template the panel advertised (mirrors suggest()).
+        for g in guaranteed:
+            self._remember_prematch(user_id, g.get("title") or "", g["templateId"])
+
+        # Merge in priority order so no template-backed card is crowded out
+        # by an AI-only suggestion: new guaranteed cards, then existing
+        # template-backed (matched) cards, then AI-only cards. Dedupe by
+        # templateId first, then by normalized title; cap the result.
+        existing_matched = [
+            s
+            for s in suggestions
+            if isinstance(s, dict)
+            and s.get("matchMode") == "matched"
+            and (s.get("templateId") or "").strip()
+        ]
+        existing_other = [
+            s
+            for s in suggestions
+            if not (
+                isinstance(s, dict)
+                and s.get("matchMode") == "matched"
+                and (s.get("templateId") or "").strip()
+            )
+        ]
+
+        merged: List[Dict[str, Any]] = []
+        seen_ids: set = set()
+        seen_titles: set = set()
+
+        def _push(item: Dict[str, Any]) -> None:
+            if not isinstance(item, dict):
+                return
+            tid = (item.get("templateId") or "").strip()
+            tkey = re.sub(r"\s+", " ", (item.get("title") or "").strip().lower())
+            if tid and tid in seen_ids:
+                return
+            if tkey and tkey in seen_titles:
+                return
+            if tid:
+                seen_ids.add(tid)
+            if tkey:
+                seen_titles.add(tkey)
+            merged.append(item)
+
+        for item in (*guaranteed, *existing_matched, *existing_other):
+            _push(item)
+
+        capped = merged[:_MAX_SUGGESTIONS_WITH_TEMPLATES]
+        logger.info(
+            "Template coverage: {} guaranteed template card(s) added; "
+            "panel {} -> {} card(s)",
+            len(guaranteed),
+            len(suggestions),
+            len(capped),
+        )
+        return capped
 
     async def rematch_unmatched_suggestions(
         self,
@@ -2414,6 +2641,12 @@ class DraftingAgent:
                     "name": name,
                     "category": data.get("category") or "",
                     "purpose": (data.get("document_purpose") or "").strip(),
+                    # Fuller legal purpose captured during template profiling
+                    # (2-4 sentences: purpose, governing statute, addressee,
+                    # filing posture). Richer than document_purpose; used to
+                    # inform suggestion generation and the applicability gate.
+                    "filing_context": (data.get("filing_context") or "").strip(),
+                    "document_type": (data.get("document_type") or "").strip(),
                     "match_blob": match_blob,
                     "content_head": content_head,
                     "payload": data,

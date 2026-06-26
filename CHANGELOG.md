@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guaranteed template coverage in AI Suggested Drafts** (`app/langgraph/drafting_agent.py`, `app/prompts/drafting.py`). Previously a reusable template surfaced as a suggested-draft card only when the (non-deterministic) suggestion LLM happened to propose a draft of that type for the current case posture — so changing case details (client / brand / new matter) could silently drop an applicable template even though its legal purpose still fit. Now `suggest()` runs a deterministic **template-coverage pass** (`_ensure_template_coverage`): for every ready template not already bound to a matched card, a focused **applicability check** (`build_template_applicability_prompt` / `TEMPLATE_APPLICABILITY_INSTRUCTION`) decides — by the template's **legal purpose + document type**, never its original parties/facts — whether a draft of that kind fits this matter. Applicable templates are **guaranteed** a case-framed card with the template pre-bound (`matchMode="matched"`, prematch locked for the kickoff click). Template-backed cards take priority and the panel cap is raised from 6 to 8 (`_MAX_SUGGESTIONS_WITH_TEMPLATES`) so applicable templates are never crowded out by AI-only suggestions. The suggestion prompt and matcher now also see the fuller `filing_context` (legal purpose) instead of only the coarse `document_purpose`.
 - (Document changes here before release)
 
 ### Changed

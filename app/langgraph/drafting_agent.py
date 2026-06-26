@@ -1177,6 +1177,14 @@ class DraftingAgent:
             extracted_text = (extracted_text or "").strip()
             extraction_status = "ready" if extracted_text else "failed"
 
+        # Strip OCR per-page artifacts (`--- Page N ---` markers and the
+        # letterhead/header that repeats at the top of every page) before the
+        # text drives profiling, type classification, matching, and the render
+        # "structural contract" — otherwise the running header is reproduced on
+        # every page of the generated draft. No-op for DOCX / single-page text.
+        if extracted_text:
+            extracted_text = self._normalize_template_text(extracted_text)
+
         # Persist a DOCX skeleton to GCS so future drafts can reproduce
         # the lawyer's formatting under the llm_diff path. Native DOCX
         # templates are stored as-is. PDF templates are converted to a
@@ -2176,6 +2184,267 @@ class DraftingAgent:
     _PROFILE_CONTENT_CHARS = 16000
     _MAX_INTERACTIVE_VARIABLES = 40
 
+    # Matches the per-page markers the PDF OCR extractor inserts
+    # (`--- Page 1 ---`). See app/processing/file_handlers.py.
+    _PAGE_MARKER_RE = re.compile(
+        r"^[ \t]*-{2,}[ \t]*Page[ \t]+\d+[ \t]*-{2,}[ \t]*$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    @staticmethod
+    def _normalize_template_text(text: str) -> str:
+        """Strip OCR per-page artifacts from a template's extracted text.
+
+        PDF OCR (``file_handlers._extract_text_from_pdf_with_ocr``) concatenates
+        pages with ``--- Page N ---`` markers, and a letterhead/header that is a
+        *running header* in the source PDF is OCR'd into the body of EVERY page.
+        Fed verbatim to the render LLM as the structural contract, that makes the
+        firm letterhead repeat at the top of every page of the generated draft.
+
+        This collapses the artifact: it removes the page markers and the header
+        block that repeats at the start of the majority of pages, keeping a
+        single copy at the top. No-op for text without page markers (DOCX /
+        single-page extracts), so it is safe to call unconditionally.
+        """
+        if not text:
+            return text
+        marker = DraftingAgent._PAGE_MARKER_RE
+        if not marker.search(text):
+            # No page markers: either a DOCX / single-page extract (nothing to
+            # do) or a TEXT-LAYER PDF whose running header was extracted into
+            # every page's text without markers — handle the latter generically.
+            return DraftingAgent._dedupe_leading_repeated_block(text)
+        pages = [seg.strip("\n") for seg in marker.split(text)]
+        pages = [p for p in pages if p.strip()]
+        if len(pages) < 2:
+            # Only markers to strip (e.g. one real page) — drop them and return.
+            return marker.sub("", text).strip()
+
+        def _norm_line(s: str) -> str:
+            return re.sub(r"\s+", " ", s.strip()).lower()
+
+        page_lines = [p.split("\n") for p in pages]
+        first = page_lines[0]
+        # The running header = the longest leading run of (non-blank) lines from
+        # the first page that also opens the majority of the later pages.
+        need = max(1, (len(page_lines) - 1) // 2)
+        common = 0
+        for n in range(1, min(len(first), 15) + 1):
+            head = [_norm_line(l) for l in first[:n] if _norm_line(l)]
+            if not head:
+                continue
+            matches = 0
+            for lines in page_lines[1:]:
+                cand = [_norm_line(l) for l in lines if _norm_line(l)][: len(head)]
+                if cand == head:
+                    matches += 1
+            if matches >= need:
+                common = n
+            else:
+                break
+        if common == 0:
+            # No per-page header detected via the markers — drop the markers
+            # and still try the marker-independent block dedup as a backstop.
+            return DraftingAgent._dedupe_leading_repeated_block(
+                "\n\n".join(pages)
+            )
+
+        header_norm = [_norm_line(l) for l in first[:common] if _norm_line(l)]
+        cleaned = [pages[0]]
+        for lines in page_lines[1:]:
+            idx = 0
+            hi = 0
+            # Consume the leading header run (tolerating interleaved blanks).
+            while idx < len(lines) and hi < len(header_norm):
+                if not _norm_line(lines[idx]):
+                    idx += 1
+                    continue
+                if _norm_line(lines[idx]) == header_norm[hi]:
+                    idx += 1
+                    hi += 1
+                else:
+                    break
+            body = "\n".join(lines[idx:]).strip("\n")
+            if body.strip():
+                cleaned.append(body)
+        return "\n\n".join(cleaned).strip()
+
+    @staticmethod
+    def _dedupe_leading_repeated_block(text: str) -> str:
+        """Collapse a running-header block that repeats from the top of the
+        text, WITHOUT relying on page markers.
+
+        This is the text-layer-PDF counterpart of the marker-based dedup in
+        :meth:`_normalize_template_text`: a Word-exported PDF read via the
+        PyPDF2 text layer (``file_handlers.extract_text_from_pdf``) has no
+        ``--- Page N ---`` markers, but its running letterhead is still
+        extracted into each page's text, so the firm header recurs through the
+        body. We find the LONGEST leading run of lines that recurs as a
+        consecutive block later in the document and remove every occurrence
+        after the first. Conservative by construction: only the *leading*
+        block is a removal candidate (a genuine running header), and it must
+        recur verbatim — so ordinary body prose is never touched. No-op when no
+        such repetition exists (the normal DOCX / single-page case)."""
+        if not text:
+            return text
+        lines = text.split("\n")
+
+        def _norm_line(s: str) -> str:
+            return re.sub(r"\s+", " ", s.strip()).lower()
+
+        # Work over non-blank lines (keep a map back to original indices).
+        nb_idx = [i for i, l in enumerate(lines) if _norm_line(l)]
+        seq = [_norm_line(lines[i]) for i in nb_idx]
+        if len(seq) < 4:
+            return text
+
+        def _count_occurrences(head_len: int) -> int:
+            head = seq[:head_len]
+            count = 0
+            j = 0
+            while j + head_len <= len(seq):
+                if seq[j : j + head_len] == head:
+                    count += 1
+                    j += head_len
+                else:
+                    j += 1
+            return count
+
+        # Longest leading block (2..12 non-blank lines) that appears 2+ times.
+        best_len = 0
+        for head_len in range(min(12, len(seq) // 2), 1, -1):
+            if _count_occurrences(head_len) >= 2:
+                best_len = head_len
+                break
+        if best_len == 0:
+            return text
+
+        head = seq[:best_len]
+        remove: set = set()
+        j = 0
+        occ = 0
+        while j + best_len <= len(seq):
+            if seq[j : j + best_len] == head:
+                occ += 1
+                if occ >= 2:  # keep the first occurrence, drop the rest
+                    start_orig = nb_idx[j]
+                    end_orig = nb_idx[j + best_len - 1]
+                    for k in range(start_orig, end_orig + 1):
+                        remove.add(k)
+                j += best_len
+            else:
+                j += 1
+        if not remove:
+            return text
+        kept = [l for i, l in enumerate(lines) if i not in remove]
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+    @staticmethod
+    def _literal_placeholders_in_text(
+        text: str,
+    ) -> List["tuple[str, str, str]"]:
+        """Detect literal fill-in slots in PLAIN extracted text — the PDF / text
+        counterpart of the DOCX-only :meth:`_deterministic_placeholders`.
+
+        Reuses the same delimiter patterns the DOCX placeholder extractor uses
+        (``<...>``, ``[label]``, ``{{...}}``, ``(Pascal_Case)``) so a template
+        uploaded as a PDF still seeds the profiler with its literal slots.
+        Returns deduped ``(raw, inner_label, kind)`` tuples."""
+        if not text:
+            return []
+        try:
+            from app.processing.docx_template_filler import PLACEHOLDER_PATTERNS
+        except Exception:
+            return []
+        out: List["tuple[str, str, str]"] = []
+        seen: set = set()
+        for pattern, kind in PLACEHOLDER_PATTERNS:
+            for m in pattern.finditer(text):
+                raw = (m.group(0) or "").strip()
+                label = (m.group(1) or "").strip()
+                if not raw or not label or raw in seen:
+                    continue
+                seen.add(raw)
+                out.append((raw, label, kind))
+        return out
+
+    def _ensure_placeholder_variables(
+        self, variables: List[Dict[str, Any]], extracted_text: str
+    ) -> List[Dict[str, Any]]:
+        """Deterministic safety net: guarantee every literal fill-in slot the
+        template carries reaches the interactive-variable registry.
+
+        The profiler LLM occasionally misses a literal placeholder stated in
+        prose (e.g. ``resident of <Client Address>``), especially for PDF
+        templates where the DOCX placeholder seed is unavailable. A missed slot
+        is never asked at kickoff and ships as a literal hole in the draft.
+        For every high-signal slot (``<...>`` / ``{{...}}`` / ``(Pascal_Case)``)
+        not already represented in the registry, synthesise a variable so
+        ``_ensure_registry_coverage`` surfaces it as a question.
+
+        Conservative: bracket ``[...]`` slots are intentionally excluded here
+        (they are too common in ordinary legal prose to synthesise blindly) —
+        they still reach the profiler via the seed."""
+        placeholders = self._literal_placeholders_in_text(extracted_text)
+        if not placeholders:
+            return variables
+
+        def norm(s: Any) -> str:
+            return re.sub(r"[^a-z0-9]+", "_", str(s or "").lower()).strip("_")
+
+        covered: set = set()
+        for v in variables:
+            covered.add(norm(v.get("id")))
+            covered.add(norm(v.get("label")))
+        covered.discard("")
+
+        def _infer_kind(label_l: str) -> str:
+            if any(w in label_l for w in ("date", "deadline", "dated")):
+                return "date"
+            if any(w in label_l for w in ("amount", "price", "rs", "rupees", "fee", "cost", "sum")):
+                return "amount"
+            if any(w in label_l for w in ("name", "address", "advocate", "client", "firm", "party")):
+                return "party"
+            return "other"
+
+        out = list(variables)
+        for raw, label, kind in placeholders:
+            if kind not in ("angle", "handlebar", "paren_label"):
+                continue
+            # Humanise Pascal/snake labels (ClientAddress / Client_Address).
+            clean = re.sub(r"[_]+", " ", label)
+            clean = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", clean).strip()
+            nlabel = norm(clean)
+            if not nlabel or nlabel in covered:
+                continue
+            # Skip if an existing variable already covers these words.
+            words = set(nlabel.split("_"))
+            if any(words and words <= set(c.split("_")) for c in covered if c):
+                continue
+            covered.add(nlabel)
+            out.append(
+                {
+                    "id": nlabel,
+                    "label": clean[:80] or label[:80],
+                    "question": f"What is the {clean or label}?"[:240],
+                    "kind": _infer_kind(nlabel.replace("_", " ")),
+                    # The profiler did not even recognise this slot, so do NOT
+                    # risk a wrong auto-fill — always ask the lawyer.
+                    "fill_from_case": False,
+                    "required": True,
+                }
+            )
+            if len(out) >= self._MAX_INTERACTIVE_VARIABLES:
+                break
+        if len(out) > len(variables):
+            logger.info(
+                "Template profile: synthesised {} literal-placeholder "
+                "variable(s) the profiler missed: {}",
+                len(out) - len(variables),
+                [v["label"] for v in out[len(variables):]],
+            )
+        return out
+
     @staticmethod
     def _deterministic_placeholders(docx_bytes: Optional[bytes]) -> List[str]:
         """Best-effort literal-placeholder seed for the profiler.
@@ -2261,12 +2530,22 @@ class DraftingAgent:
         body = (extracted_text or "").strip()
         if not body:
             return None
+        # Seed the profiler with every literal slot we can detect
+        # deterministically — from the DOCX body when available AND from the
+        # plain extracted text (the only source for PDF-only templates, where
+        # `_deterministic_placeholders` returns []). Order-preserving union.
+        seed: List[str] = list(self._deterministic_placeholders(docx_bytes))
+        _seen_seed = set(seed)
+        for raw, _label, _kind in self._literal_placeholders_in_text(body):
+            if raw not in _seen_seed:
+                _seen_seed.add(raw)
+                seed.append(raw)
         try:
             prompt = build_template_profile_prompt(
                 name=name or "",
                 document_type=document_type or "",
                 content=body[: self._PROFILE_CONTENT_CHARS],
-                deterministic_placeholders=self._deterministic_placeholders(docx_bytes),
+                deterministic_placeholders=seed,
             )
             raw = await gemini_client.generate(
                 prompt,
@@ -2296,6 +2575,10 @@ class DraftingAgent:
         variables = self._normalize_interactive_variables(
             parsed.get("interactive_variables")
         )
+        # Safety net: guarantee every literal fill-in slot in the body reaches
+        # the registry even if the profiler LLM missed it, so the kickoff asks
+        # for it rather than shipping a literal hole (e.g. `<Client Address>`).
+        variables = self._ensure_placeholder_variables(variables, body)
         # Optional "AI Suggested Fields" — extra field NAMES the lawyer can
         # one-click add; de-duped against the registry labels, capped.
         quick_add: List[str] = []

@@ -1126,6 +1126,11 @@ class SocketEventHandler:
         self.register("template_sync", self.on_template_sync)
         # Reply to our AI-initiated request_template_sync (full snapshot).
         self.register("template_sync_response", self.on_template_sync_response)
+        # "Regenerate Extra Info" — backend asks the AI to re-profile a template
+        # and emit a fresh blueprint proposal for the approval screen.
+        self.register(
+            "request_blueprint_proposal", self.on_request_blueprint_proposal
+        )
 
         # Legacy event handlers
         self.register("workspace_updated", self.on_workspace_updated)
@@ -8770,6 +8775,49 @@ Indian Kanoon / case-law search results:
     # Drafting Assistant — suggested drafts panel
     # ------------------------------------------------------------------
 
+    async def _evidence_brief_for_drafting(
+        self, workspace_id: str, cap: int = 40000
+    ) -> str:
+        """Concatenate the workspace's uploaded documents (capped) so the
+        drafting agent can auto-fill variables from the raw evidence — not just
+        the panel summaries. Reuses the per-doc-cap + `_format_document_for_prompt`
+        pattern used by strategy/analysis. Returns '' on failure / no docs."""
+        try:
+            from app.vectorstore.qdrant import vector_store
+
+            all_docs = await vector_store.get_all_documents(workspace_id=workspace_id)
+        except Exception as e:
+            logger.warning(
+                "drafting evidence fetch failed (workspace={}): {}", workspace_id, e
+            )
+            return ""
+        valid = [
+            d for d in (all_docs or [])
+            if (d.get("content") or "").strip()
+            and len((d.get("content") or "").strip()) >= 20
+        ]
+        if not valid:
+            return ""
+        per_doc = max(800, cap // max(1, len(valid)))
+        parts: List[str] = []
+        for i, doc in enumerate(valid, 1):
+            content = (doc.get("content") or "").strip()
+            if len(content) > per_doc:
+                content = content[:per_doc] + "\n[... truncated for length ...]"
+            doc_clip = dict(doc)
+            doc_clip["content"] = content
+            parts.append(_format_document_for_prompt(doc_clip, i, len(valid)))
+        out = "\n\n".join(parts)
+        if len(out) > cap:
+            out = out[:cap] + "\n[... content truncated ...]"
+        logger.info(
+            "drafting evidence brief built (workspace={}, docs={}, chars={})",
+            workspace_id,
+            len(valid),
+            len(out),
+        )
+        return out
+
     def _build_case_brief_for_drafting(
         self, workspace_id: str
     ) -> Dict[str, str]:
@@ -8997,15 +9045,17 @@ Indian Kanoon / case-law search results:
             logger.warning("Drafting suggestions emit failed: {}", e)
 
     async def _maybe_reemit_drafting_on_templates(self, user_id: str) -> None:
-        """Self-heal the Drafting Assistant panel after a template lands late.
+        """Self-heal the Drafting Assistant panel after the template library
+        CHANGES — a template lands late (upload) OR a template is removed
+        (delete).
 
-        When a template finishes ingesting (e.g. a slow scanned-PDF OCR that
-        missed the original ``request_template_sync`` window), the suggestions
-        already emitted for this user's workspace(s) were pre-matched against a
-        smaller / empty library and carry no template. Regenerate those panels
-        when the user's ready-template count has grown since the panel was last
-        built. The ``lib_count`` comparison debounces this so rename/delete
-        deltas and no-op snapshots don't trigger redundant regeneration.
+        On UPLOAD a card that had no match can pick up the new template; on
+        DELETE a card matched to the now-gone template is demoted (its stale
+        lock released) and re-matched against the current library — so a
+        deleted template can never keep driving a suggestion. Matched cards
+        whose template still exists stay frozen. The ``lib_count`` comparison
+        fires on any COUNT CHANGE (grow or shrink) and debounces no-op
+        snapshots (unchanged count) so reconnect re-sends don't churn.
         """
         user_id = (user_id or "").strip()
         if not user_id:
@@ -9026,20 +9076,21 @@ Indian Kanoon / case-law search results:
             if (meta or {}).get("user_id") != user_id:
                 continue
             prev_count = int((meta or {}).get("lib_count") or 0)
-            if current_count <= prev_count:
-                continue  # library didn't grow — nothing new to match
+            if current_count == prev_count:
+                continue  # library unchanged — no-op snapshot, nothing to do
             role = (meta or {}).get("role") or "ADJUDICATOR"
             logger.info(
-                "🔁 Template library grew ({}→{}) — refreshing drafting "
-                "suggestions for workspace={} (user={}) — matched cards "
-                "are frozen, only unmatched cards re-match",
+                "🔁 Template library changed ({}→{}) — refreshing drafting "
+                "suggestions for workspace={} (user={}) — matched cards whose "
+                "template still exists stay frozen; deleted-template cards are "
+                "demoted and re-matched",
                 prev_count,
                 current_count,
                 workspace_id,
                 user_id[:12],
             )
             # Bump the recorded count up front so a burst of template events
-            # can't queue duplicate refreshes for the same growth.
+            # can't queue duplicate refreshes for the same change.
             self._drafting_meta_by_workspace[workspace_id] = {
                 **(meta or {}),
                 "lib_count": current_count,
@@ -13687,6 +13738,46 @@ Indian Kanoon / search results (titles and snippets):
             # A newly-ingested template may match suggestions that were built
             # before it was ready — regenerate the panel if the library grew.
             await self._maybe_reemit_drafting_on_templates(user_id)
+            # Emit the AI's blueprint proposal for the dashboard approval screen,
+            # for each freshly-uploaded file-template that did NOT already carry
+            # an approved blueprint (scenario B re-uploads skip this).
+            await self._emit_blueprint_proposals(user_id, templates)
+        elif action == "formatting_updated":
+            # The lawyer approved / edited a template's AI blueprint in the
+            # dashboard. File content is unchanged — store the approved
+            # blueprint as authoritative (no re-download / re-extract).
+            for tpl in templates:
+                if not tpl.id:
+                    continue
+                blueprint = None
+                if getattr(tpl, "formatting", None) is not None and tpl.formatting.blueprint is not None:
+                    blueprint = tpl.formatting.blueprint.model_dump()
+                if blueprint is None:
+                    logger.info(
+                        "formatting_updated: no blueprint on item {} — skipping",
+                        tpl.id,
+                    )
+                    continue
+                await drafting_agent.apply_approved_blueprint(
+                    user_id=user_id, template_id=tpl.id, blueprint=blueprint
+                )
+        elif action == "preset_created":
+            # A court / letterhead preset (no file body) — cache its layout for
+            # use at DOCX export.
+            for tpl in templates:
+                if not tpl.id:
+                    continue
+                await drafting_agent.store_preset(
+                    user_id=user_id,
+                    template_id=tpl.id,
+                    name=tpl.name or tpl.id,
+                    category=tpl.category or "Custom",
+                    formatting=(
+                        tpl.formatting.model_dump()
+                        if getattr(tpl, "formatting", None) is not None
+                        else None
+                    ),
+                )
         elif action == "renamed":
             for tpl in templates:
                 if not tpl.id or not tpl.name:
@@ -13704,8 +13795,66 @@ Indian Kanoon / search results (titles and snippets):
                 await drafting_agent.delete_template(
                     user_id=user_id, template_id=tpl.id
                 )
+            # Self-heal the drafting panel: demote any suggestion card that was
+            # matched to a now-deleted template and re-match it against the
+            # current library, so a deleted template can never drive a kickoff.
+            await self._maybe_reemit_drafting_on_templates(user_id)
         else:
             logger.warning("template_sync: unknown action {!r}", action)
+
+    async def _emit_blueprint_proposals(
+        self, user_id: str, templates: List[Any]
+    ) -> None:
+        """Emit a ``template_blueprint_proposal`` for each freshly-uploaded
+        file-template that did NOT already carry an approved blueprint.
+
+        The AI profiles the template at ingest; here we package that into the
+        proposal the dashboard renders on its approval screen. Per-item failures
+        are isolated and non-fatal."""
+        if not self._socket_client:
+            return
+        try:
+            from app.langgraph.drafting_agent import drafting_agent
+        except Exception as e:
+            logger.error("_emit_blueprint_proposals: drafting agent unavailable: {}", e)
+            return
+        for tpl in templates:
+            # Skip presets (no draft body) and re-uploads that already shipped an
+            # approved blueprint (those are stored authoritative at ingest).
+            if getattr(tpl, "kind", None) == "preset":
+                continue
+            if (
+                getattr(tpl, "formatting", None) is not None
+                and tpl.formatting.blueprint is not None
+            ):
+                continue
+            if not tpl.id:
+                continue
+            try:
+                proposal = await drafting_agent.build_blueprint_proposal(
+                    user_id=user_id, template_id=tpl.id
+                )
+            except Exception as e:
+                logger.warning(
+                    "blueprint proposal build failed (template={}): {}", tpl.id, e
+                )
+                continue
+            if not proposal:
+                continue
+            try:
+                await self._socket_client.emit(
+                    "template_blueprint_proposal", proposal
+                )
+                logger.success(
+                    "📤 template_blueprint_proposal emitted (template={}, status={}, vars={})",
+                    tpl.id,
+                    proposal.get("status"),
+                    len((proposal.get("blueprint") or {}).get("variables") or []),
+                )
+            except Exception as e:
+                logger.warning(
+                    "blueprint proposal emit failed (template={}): {}", tpl.id, e
+                )
 
     async def _ingest_template_items(
         self, user_id: str, templates: List[Any]
@@ -13749,6 +13898,12 @@ Indian Kanoon / search results (titles and snippets):
                     path=tpl.path,
                     file_hash=tpl.fileHash,
                     previous_payload=previous if isinstance(previous, dict) else None,
+                    kind=getattr(tpl, "kind", None),
+                    formatting=(
+                        tpl.formatting.model_dump()
+                        if getattr(tpl, "formatting", None) is not None
+                        else None
+                    ),
                 )
                 ingested += 1
             except Exception as e:
@@ -13834,6 +13989,111 @@ Indian Kanoon / search results (titles and snippets):
         # were built against the smaller/empty library.
         if user_id:
             await self._maybe_reemit_drafting_on_templates(user_id)
+
+    async def on_request_blueprint_proposal(self, data: Dict[str, Any]) -> None:
+        """Handle request_blueprint_proposal (Server → AI), the "Regenerate
+        Extra Info" action on the dashboard's blueprint-approval screen.
+
+        Re-profiles the template (forcing a fresh profile even if one exists)
+        and emits a fresh ``template_blueprint_proposal`` back. Ingests the
+        template from ``fileUrl`` first when the in-memory store is cold."""
+        payload_in = data if isinstance(data, dict) else {}
+        user_id = str(payload_in.get("userId") or "").strip()
+        template_id = str(payload_in.get("templateId") or "").strip()
+        file_url = payload_in.get("fileUrl") or ""
+        file_hash = payload_in.get("fileHash") or ""
+        logger.info(
+            "📥 request_blueprint_proposal RECEIVED: userId={} templateId={} hasFileUrl={}",
+            user_id[:12],
+            template_id,
+            bool(file_url),
+        )
+        if not user_id or not template_id:
+            logger.warning(
+                "request_blueprint_proposal: missing userId/templateId — dropping event"
+            )
+            return
+        try:
+            from app.langgraph.drafting_agent import drafting_agent
+        except Exception as e:
+            logger.error(
+                "request_blueprint_proposal: drafting agent unavailable: {}", e
+            )
+            return
+
+        # Ensure the template is in the store with extracted text. On a cold
+        # cache (AI restart) the template may be absent — ingest it from the
+        # supplied fileUrl, deriving name/extension from the object path.
+        try:
+            tpl = await drafting_agent.get_template(
+                user_id=user_id, template_id=template_id
+            )
+        except Exception:
+            tpl = None
+        if (not tpl or not (tpl.get("extracted_text") or "").strip()) and file_url:
+            url_path = file_url.split("?", 1)[0]
+            fname = url_path.rsplit("/", 1)[-1] if url_path else ""
+            ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+            try:
+                await drafting_agent.ingest_template(
+                    user_id=user_id,
+                    template_id=template_id,
+                    name=fname or template_id,
+                    category=(tpl.get("category") if isinstance(tpl, dict) else None)
+                    or "Document Draft",
+                    extension=ext,
+                    mime_type=None,
+                    file_url=file_url,
+                    path=None,
+                    file_hash=file_hash,
+                    previous_payload=tpl if isinstance(tpl, dict) else None,
+                )
+            except Exception as e:
+                logger.warning(
+                    "request_blueprint_proposal: cold ingest failed (template={}): {}",
+                    template_id,
+                    e,
+                )
+
+        try:
+            proposal = await drafting_agent.build_blueprint_proposal(
+                user_id=user_id, template_id=template_id, force_reprofile=True
+            )
+        except Exception as e:
+            logger.warning(
+                "request_blueprint_proposal: proposal build failed (template={}): {}",
+                template_id,
+                e,
+            )
+            proposal = None
+        if not proposal:
+            logger.warning(
+                "request_blueprint_proposal: no proposal produced (template={})",
+                template_id,
+            )
+            return
+        if not self._socket_client:
+            logger.warning(
+                "request_blueprint_proposal: no socket client — cannot emit proposal"
+            )
+            return
+        try:
+            await self._socket_client.emit(
+                "template_blueprint_proposal", proposal
+            )
+            logger.success(
+                "📤 template_blueprint_proposal (regenerated) emitted "
+                "(template={}, status={}, vars={})",
+                template_id,
+                proposal.get("status"),
+                len((proposal.get("blueprint") or {}).get("variables") or []),
+            )
+        except Exception as e:
+            logger.warning(
+                "request_blueprint_proposal: emit failed (template={}): {}",
+                template_id,
+                e,
+            )
 
     async def ensure_templates_synced(
         self, user_id: str, *, timeout: Optional[float] = None
@@ -16977,6 +17237,29 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
             "strategy_brief": brief.get("strategy_brief") or "",
         }
 
+        # On kickoff-type turns, enrich the context with the RAW uploaded
+        # evidence (not just panel summaries) so the drafting agent can auto-fill
+        # variables whose values live only in the documents (invoice numbers,
+        # marketing claims, warranty terms, etc.) instead of asking the lawyer
+        # for facts the case already contains. Non-fatal — falls back to briefs.
+        _kickoffish = (
+            (payload.source or "").strip().lower()
+            in ("template", "suggesteddraft", "blank")
+            or bool(payload.templateId)
+            or bool(payload.suggestedDraftId)
+        )
+        if _kickoffish:
+            evidence = await self._evidence_brief_for_drafting(workspace_id)
+            if evidence:
+                case_context["evidence_brief"] = evidence
+                case_context["case_facts_brief"] = "\n\n".join(
+                    x for x in [
+                        case_context.get("case_facts_brief") or "",
+                        "UPLOADED CASE DOCUMENTS (raw evidence — extract any "
+                        "case-variable values from here):\n" + evidence,
+                    ] if x
+                )
+
         conversation_history: List[Dict[str, Any]] = []
         for item in payload.conversation_history or []:
             role_str = getattr(item, "role", None) or (
@@ -17003,6 +17286,7 @@ Return ONLY the title in format "Name1 vs Name2" or "Name vs Issue", no other te
             "templateUrl": payload.templateUrl,
             "templateOriginalName": payload.templateOriginalName,
             "templateMimeType": payload.templateMimeType,
+            "draftMode": (payload.draftMode or "").strip().lower() or None,
         }
 
         # When the turn may need to resolve/match a template (a suggested-draft

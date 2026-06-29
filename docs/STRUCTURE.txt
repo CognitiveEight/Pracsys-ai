@@ -143,6 +143,8 @@ Key Features:
 ✓ Document embedding and semantic search
 ✓ AI agent framework with routing
 ✓ Procedural timeline agent and socket payload emission
+✓ Drafting assistant: lawyer-scoped template library + multi-turn drafting chat
+✓ Chat-driven panel editing (surgical rename vs objective-change regeneration)
 ✓ Comprehensive logging and audit trails
 ✓ Distributed tracing
 ✓ Security utilities (JWT, encryption)
@@ -181,6 +183,6 @@ STRUCTURE.txt       - This file (structure)
 
 
 Status: ✅ ACTIVE & RELEASED
-Version: 3.0.0
-Updated: April 2026
+Version: 4.2.0
+Updated: June 2026
 

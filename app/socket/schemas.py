@@ -556,6 +556,15 @@ class DraftingSuggestionItem(BaseModel):
     # suitable template; None when matching was not attempted (e.g.
     # legacy callers or empty library).
     matchMode: Optional[str] = None
+    # Template ↔ case fit, 0-100. How well the bound template's document
+    # type / legal purpose fits THIS case posture (NOT urgency — that's
+    # `relevance`). Populated only on template-backed cards; None when no
+    # template is bound (AI-only suggestion) or scoring was not attempted.
+    # The frontend renders it as a "NN% match" badge.
+    matchScore: Optional[int] = None
+    # One-line rationale (<= 120 chars) explaining the matchScore. None when
+    # no template is bound.
+    matchReason: Optional[str] = None
 
 
 class DraftingSuggestionsPayload(BaseModel):

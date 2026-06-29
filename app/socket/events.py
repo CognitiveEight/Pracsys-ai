@@ -9005,11 +9005,12 @@ Indian Kanoon / case-law search results:
                     logger.info("   ✏️ [{}] (non-dict: {})", idx, type(s).__name__)
                     continue
                 logger.info(
-                    "   ✏️ [{}] title={!r} relevance={} matchMode={} "
+                    "   ✏️ [{}] title={!r} relevance={} matchScore={} matchMode={} "
                     "templateId={} templateName={!r}",
                     idx,
                     s.get("title"),
                     s.get("relevance"),
+                    s.get("matchScore"),
                     s.get("matchMode"),
                     s.get("templateId"),
                     s.get("templateName"),
@@ -9138,9 +9139,17 @@ Indian Kanoon / case-law search results:
         try:
             from app.langgraph.drafting_agent import drafting_agent
 
+            role_upper = (workspace_role or "ADJUDICATOR").strip().upper() or "ADJUDICATOR"
+            brief = self._build_case_brief_for_drafting(workspace_id)
             refreshed = await drafting_agent.rematch_unmatched_suggestions(
                 user_id=user_id,
                 suggestions=prior_cards,
+                role=role_upper,
+                case_summary=brief["case_summary"],
+                applicable_laws_brief=brief["applicable_laws_brief"],
+                strategy_brief=brief["strategy_brief"],
+                analysis_brief=brief["analysis_brief"],
+                list_of_dates_brief=brief["list_of_dates_brief"],
             )
             payload = {"suggestedDrafts": refreshed or []}
             self._workspace_drafting_payload[workspace_id] = payload
@@ -9149,10 +9158,11 @@ Indian Kanoon / case-law search results:
                 if not isinstance(s, dict):
                     continue
                 logger.info(
-                    "   ✏️ [{}] title={!r} matchMode={} templateId={} "
+                    "   ✏️ [{}] title={!r} matchScore={} matchMode={} templateId={} "
                     "templateName={!r}",
                     idx,
                     s.get("title"),
+                    s.get("matchScore"),
                     s.get("matchMode"),
                     s.get("templateId"),
                     s.get("templateName"),

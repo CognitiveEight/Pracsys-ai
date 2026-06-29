@@ -51,6 +51,7 @@ from app.prompts.drafting import (
     TEMPLATE_FILL_INSTRUCTION,
     TEMPLATE_KICKOFF_INSTRUCTION,
     TEMPLATE_MATCH_INSTRUCTION,
+    TEMPLATE_MATCH_SCORE_INSTRUCTION,
     TEMPLATE_PROFILE_INSTRUCTION,
     TEMPLATE_VARIABLE_KINDS,
     build_chat_reply_prompt,
@@ -60,6 +61,7 @@ from app.prompts.drafting import (
     build_question_dedup_prompt,
     build_suggested_drafts_prompt,
     build_template_applicability_prompt,
+    build_template_match_score_prompt,
     build_template_cleanup_prompt,
     build_template_classify_prompt,
     build_template_diff_prompt,
@@ -141,6 +143,12 @@ _MAX_SUGGESTIONS = 6
 # cards so every applicable template is guaranteed a slot without crowding
 # out the LLM's free case-driven suggestions. See _ensure_template_coverage.
 _MAX_SUGGESTIONS_WITH_TEMPLATES = 8
+
+# Template-backed cards whose template ↔ case match score falls below this are
+# hidden from the panel (the lawyer's "10 notices" collapse to only the ones
+# that genuinely fit this matter). AI-only cards (no template, matchScore None)
+# are never dropped by this gate. See _threshold_and_rank.
+_MIN_TEMPLATE_MATCH_SCORE = 50
 
 # Version of the template "drafting blueprint" profiling schema. Bump this
 # whenever the profiler's variable-capture rules change so already-cached
@@ -367,6 +375,26 @@ def _normalize_relevance(value: Any) -> str:
     return s if s in _RELEVANCE_VALUES else "Medium"
 
 
+def _normalize_match_score(value: Any) -> Optional[int]:
+    """Coerce a model-supplied match score to an int in [0, 100].
+
+    Accepts ints, floats, and numeric strings (the model occasionally returns
+    "82" or "82%"). Returns None for anything unparseable so the card simply
+    carries no score rather than a bogus one.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip().rstrip("%").strip()
+        if not value:
+            return None
+    try:
+        n = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(100, n))
+
+
 def _dedupe_suggestions(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Drop near-duplicates by lowercased, whitespace-collapsed title."""
     seen: set = set()
@@ -425,6 +453,15 @@ def _normalize_suggestions(raw: List[Any]) -> List[Dict[str, Any]]:
                 "templateId": None,
                 "templateName": None,
                 "matchMode": None,
+                # Template ↔ case match score + rationale. Populated later by
+                # _attach_match_scores once a template is bound; None for
+                # AI-only cards. See DraftingSuggestionItem in schemas.py.
+                "matchScore": _normalize_match_score(item.get("matchScore")),
+                "matchReason": (
+                    (str(item.get("matchReason")).strip() or None)
+                    if item.get("matchReason") is not None
+                    else None
+                ),
             }
         )
     cleaned = _filter_forbidden_acts(_dedupe_suggestions(cleaned))
@@ -450,6 +487,13 @@ class DraftingAgent:
         # (user_id, normalized title) so the kickoff reuses the SAME
         # template the panel advertised.
         self._suggestion_prematch: "OrderedDict[str, str]" = OrderedDict()
+        # Template ↔ case match scores keyed by (user_id, templateId, title) so
+        # a reconnect re-emit (or a rematch pass) reuses the score the panel
+        # already advertised instead of re-calling the LLM. Mirrors the
+        # _suggestion_prematch LRU discipline.
+        self._match_score_cache: "OrderedDict[str, Tuple[Optional[int], Optional[str]]]" = (
+            OrderedDict()
+        )
 
     @staticmethod
     def _prematch_key(user_id: str, title: str) -> str:
@@ -712,6 +756,29 @@ class DraftingAgent:
                     "Template coverage pass failed (non-fatal): {}", exc
                 )
 
+            # Score every template-backed card on template ↔ case fit (0-100),
+            # then hide weak fits and rank survivors by score. This is what
+            # collapses "10 uploaded notices" down to the ones that genuinely
+            # fit this matter, each carrying a "% match" badge. Non-fatal: a
+            # failure here leaves the cards unscored but still shown.
+            try:
+                suggestions = await self._attach_match_scores(
+                    user_id=user_id,
+                    role=role,
+                    suggestions=suggestions,
+                    ready_templates=ready_templates,
+                    case_summary=case_summary,
+                    applicable_laws_brief=applicable_laws_brief,
+                    strategy_brief=strategy_brief,
+                    analysis_brief=analysis_brief,
+                    list_of_dates_brief=list_of_dates_brief,
+                )
+                suggestions = self._threshold_and_rank(suggestions)
+            except Exception as exc:
+                logger.warning(
+                    "Match-score / ranking pass failed (non-fatal): {}", exc
+                )
+
         logger.success(
             "Drafting suggestions: {} item(s) ready (pre-matched={})",
             len(suggestions),
@@ -928,6 +995,10 @@ class DraftingAgent:
                 "templateId": tid,
                 "templateName": tname or None,
                 "matchMode": "matched",
+                # Filled by the _attach_match_scores pass that runs after
+                # coverage; present here so the key shape is uniform.
+                "matchScore": None,
+                "matchReason": None,
             }
 
         results = await asyncio.gather(*(_check_one(t) for t in uncovered))
@@ -995,11 +1066,254 @@ class DraftingAgent:
         )
         return capped
 
+    # ------------------------------------------------------------------
+    # Template ↔ case match scoring (the "% match" badge)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _score_cache_key(user_id: str, template_id: str, title: str) -> str:
+        norm_title = re.sub(r"\s+", " ", (title or "").strip().lower())
+        return (
+            f"{(user_id or '').strip()}::{(template_id or '').strip()}::{norm_title}"
+        )
+
+    def _remember_match_score(
+        self,
+        user_id: str,
+        template_id: str,
+        title: str,
+        score: Optional[int],
+        reason: Optional[str],
+    ) -> None:
+        """Cache a (score, reason) for a (user, template, title) card, LRU-bounded.
+        No-op when the key parts or the score are missing."""
+        if not (user_id and template_id) or score is None:
+            return
+        key = self._score_cache_key(user_id, template_id, title)
+        cache = self._match_score_cache
+        cache[key] = (score, reason)
+        cache.move_to_end(key)
+        while len(cache) > self._PREMATCH_CACHE_MAX:
+            cache.popitem(last=False)
+
+    def _recall_match_score(
+        self, user_id: str, template_id: str, title: str
+    ) -> Optional[Tuple[Optional[int], Optional[str]]]:
+        if not (user_id and template_id):
+            return None
+        return self._match_score_cache.get(
+            self._score_cache_key(user_id, template_id, title)
+        )
+
+    async def _score_one_card(
+        self,
+        *,
+        role: str,
+        case_summary: str,
+        applicable_laws_brief: str,
+        strategy_brief: str,
+        analysis_brief: str,
+        list_of_dates_brief: str,
+        suggestion_title: str,
+        suggestion_description: str,
+        template_document_type: str,
+        template_legal_purpose: str,
+    ) -> Tuple[Optional[int], Optional[str]]:
+        """Single LLM call returning (match_score 0-100, match_reason) for one
+        template-backed card. Non-fatal: returns (None, None) on any failure so
+        the card simply shows no badge rather than blocking the panel."""
+        prompt = build_template_match_score_prompt(
+            role=role,
+            case_summary=case_summary,
+            applicable_laws_brief=applicable_laws_brief,
+            strategy_brief=strategy_brief,
+            analysis_brief=analysis_brief,
+            list_of_dates_brief=list_of_dates_brief,
+            suggestion_title=suggestion_title,
+            suggestion_description=suggestion_description,
+            template_document_type=template_document_type,
+            template_legal_purpose=template_legal_purpose,
+        )
+        try:
+            raw = await gemini_client.generate(
+                prompt,
+                system_instruction=TEMPLATE_MATCH_SCORE_INSTRUCTION,
+                temperature=0.1,
+                max_tokens=600,
+                response_mime_type="application/json",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Template match-score call failed for {!r} (non-fatal): {}",
+                (suggestion_title or "")[:60],
+                exc,
+            )
+            return None, None
+        obj = _parse_json_object(raw)
+        if not isinstance(obj, dict):
+            return None, None
+        score = _normalize_match_score(obj.get("match_score"))
+        reason = " ".join(str(obj.get("match_reason") or "").split())[:120] or None
+        return score, reason
+
+    async def _attach_match_scores(
+        self,
+        *,
+        user_id: str,
+        role: str,
+        suggestions: List[Dict[str, Any]],
+        ready_templates: List[Dict[str, Any]],
+        case_summary: str,
+        applicable_laws_brief: str = "",
+        strategy_brief: str = "",
+        analysis_brief: str = "",
+        list_of_dates_brief: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Attach ``matchScore`` / ``matchReason`` to every template-backed card.
+
+        Scores how well each bound template fits THIS case (0-100). Runs in
+        parallel; per-item failures degrade gracefully (the card keeps a None
+        score). Cards with no ``templateId`` are left untouched. Reuses cached
+        scores keyed by (user, template, title) so reconnect re-emits don't
+        re-call the LLM. Template document-type / legal-purpose come from the
+        gathered ``ready_templates`` (see _tm_gather)."""
+        if not suggestions:
+            return suggestions
+
+        # Index the gathered templates by id so we can recover document_type /
+        # legal_purpose for each bound card without re-listing the store.
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for t in ready_templates or []:
+            tid = (t.get("templateId") or "").strip()
+            if tid:
+                by_id[tid] = t
+
+        def _template_dims(tid: str) -> Tuple[str, str]:
+            t = by_id.get(tid) or {}
+            payload = t.get("payload") or {}
+            doc_type = (
+                payload.get("document_type")
+                or t.get("document_type")
+                or t.get("category")
+                or ""
+            ).strip()
+            legal_purpose = (
+                t.get("filing_context")
+                or payload.get("filing_context")
+                or t.get("purpose")
+                or ""
+            ).strip()
+            return doc_type, legal_purpose
+
+        async def _score(item: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(item, dict):
+                return item
+            tid = (item.get("templateId") or "").strip()
+            if not tid:
+                # AI-only card — no template, no score.
+                return item
+            title = (item.get("title") or "").strip()
+            description = (item.get("description") or "").strip()
+
+            cached = self._recall_match_score(user_id, tid, title)
+            if cached is not None and cached[0] is not None:
+                enriched = dict(item)
+                enriched["matchScore"], enriched["matchReason"] = cached
+                return enriched
+
+            doc_type, legal_purpose = _template_dims(tid)
+            try:
+                score, reason = await self._score_one_card(
+                    role=role,
+                    case_summary=case_summary,
+                    applicable_laws_brief=applicable_laws_brief,
+                    strategy_brief=strategy_brief,
+                    analysis_brief=analysis_brief,
+                    list_of_dates_brief=list_of_dates_brief,
+                    suggestion_title=title,
+                    suggestion_description=description,
+                    template_document_type=doc_type,
+                    template_legal_purpose=legal_purpose,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Match-score for card {!r} failed (non-fatal): {}",
+                    title[:60],
+                    exc,
+                )
+                return item
+            enriched = dict(item)
+            enriched["matchScore"] = score
+            enriched["matchReason"] = reason
+            self._remember_match_score(user_id, tid, title, score, reason)
+            return enriched
+
+        return list(await asyncio.gather(*(_score(s) for s in suggestions)))
+
+    def _threshold_and_rank(
+        self, suggestions: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Drop weakly-fitting template-backed cards and rank survivors by score.
+
+        - Template-backed cards (have a ``templateId``) with a non-None
+          ``matchScore`` below ``_MIN_TEMPLATE_MATCH_SCORE`` are hidden — this is
+          what collapses "10 uploaded notices" to only the ones that fit.
+        - A template-backed card whose score is None (scoring failed) is kept so
+          a transient LLM hiccup never silently removes an applicable template.
+        - Template-backed cards are sorted by ``matchScore`` desc (None last),
+          then placed ahead of AI-only cards (which keep their relative order).
+        - The panel is re-capped at ``_MAX_SUGGESTIONS_WITH_TEMPLATES``.
+        """
+        templated: List[Dict[str, Any]] = []
+        ai_only: List[Dict[str, Any]] = []
+        dropped = 0
+        for s in suggestions:
+            if not isinstance(s, dict):
+                continue
+            tid = (s.get("templateId") or "").strip()
+            if not tid:
+                ai_only.append(s)
+                continue
+            score = s.get("matchScore")
+            if isinstance(score, int) and score < _MIN_TEMPLATE_MATCH_SCORE:
+                dropped += 1
+                logger.info(
+                    "Match-score gate: dropped template card {!r} (score {} < {})",
+                    (s.get("title") or "")[:60],
+                    score,
+                    _MIN_TEMPLATE_MATCH_SCORE,
+                )
+                continue
+            templated.append(s)
+
+        # Highest match first; cards with no score (None) sort last among
+        # template-backed cards but still ahead of AI-only suggestions.
+        templated.sort(
+            key=lambda s: s.get("matchScore") if isinstance(s.get("matchScore"), int) else -1,
+            reverse=True,
+        )
+
+        ranked = (templated + ai_only)[:_MAX_SUGGESTIONS_WITH_TEMPLATES]
+        if dropped:
+            logger.info(
+                "Match-score gate: {} card(s) dropped below threshold; "
+                "panel now {} card(s)",
+                dropped,
+                len(ranked),
+            )
+        return ranked
+
     async def rematch_unmatched_suggestions(
         self,
         *,
         user_id: str,
         suggestions: List[Dict[str, Any]],
+        role: str = "ADJUDICATOR",
+        case_summary: str = "",
+        applicable_laws_brief: str = "",
+        strategy_brief: str = "",
+        analysis_brief: str = "",
+        list_of_dates_brief: str = "",
     ) -> List[Dict[str, Any]]:
         """Refresh an *already-emitted* suggestions panel after the lawyer's
         template library grew, WITHOUT disturbing matched cards.
@@ -1007,19 +1321,22 @@ class DraftingAgent:
         Freeze semantics (the lawyer's requested behaviour):
           - A card with ``matchMode == "matched"`` whose ``templateId`` still
             exists in the library is kept verbatim — the template it
-            advertised stays its template, even though a new template was
-            just uploaded.
+            advertised stays its template (and its existing ``matchScore``),
+            even though a new template was just uploaded.
           - A matched card whose ``templateId`` was deleted is demoted to
             unmatched (its stale prematch lock is released) so it can pick up
             a current template.
           - Only the unmatched cards are re-run through
             ``_attach_template_matches`` against the now-larger library, so a
             freshly-uploaded template can fill in a card that previously had
-            no match.
+            no match. Any card that newly acquires a template is then scored on
+            template ↔ case fit (when case context is supplied) so it carries a
+            "% match" badge like the cards from the initial generation.
 
-        Order is preserved. Used by the socket re-emit path instead of a
-        full LLM regeneration, which would re-roll the cards and lose their
-        bindings. Falls back to returning the input unchanged on any error.
+        Order is preserved (no re-ranking — frozen cards must not move). Used by
+        the socket re-emit path instead of a full LLM regeneration, which would
+        re-roll the cards and lose their bindings. Falls back to returning the
+        input unchanged on any error.
         """
         if not suggestions:
             return suggestions
@@ -1075,6 +1392,37 @@ class DraftingAgent:
                 ):
                     self._remember_prematch(
                         user_id, enriched.get("title") or "", enriched["templateId"]
+                    )
+
+            # Score the cards that newly acquired a template so they carry a
+            # match badge like the initial-generation cards. Frozen cards keep
+            # their prior score untouched; we never re-rank here (freeze
+            # semantics). Non-fatal — a failure just leaves the new card
+            # unscored. Skipped when no case context was supplied (legacy call).
+            if case_summary or applicable_laws_brief or analysis_brief:
+                try:
+                    ready_templates, _ = await self._tm_gather(
+                        user_id=user_id, suggestion_text=""
+                    )
+                    ordered_idx = [idx for idx, _ in to_match]
+                    scored = await self._attach_match_scores(
+                        user_id=user_id,
+                        role=role,
+                        suggestions=[rematched[i] for i in ordered_idx],
+                        ready_templates=ready_templates,
+                        case_summary=case_summary,
+                        applicable_laws_brief=applicable_laws_brief,
+                        strategy_brief=strategy_brief,
+                        analysis_brief=analysis_brief,
+                        list_of_dates_brief=list_of_dates_brief,
+                    )
+                    for i, card in zip(ordered_idx, scored):
+                        rematched[i] = card
+                except Exception as exc:
+                    logger.warning(
+                        "rematch_unmatched_suggestions: match-score pass failed "
+                        "(non-fatal): {}",
+                        exc,
                     )
 
         merged: List[Dict[str, Any]] = []

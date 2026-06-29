@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- (Document changes here before release)
+- **Decomposed `app/socket/events.py` (20,987 lines) into per-feature mixins — no behaviour change.** The monolithic `SocketEventHandler` is now a thin composition root (`app/socket/events.py`, ~444 lines) that owns `__init__` state + `register`/`handle`/`set_socket_client` + the `event_handler` singleton, and is composed from 21 feature mixin classes under `app/socket/handlers/` (case_laws, relevant_parties, applicable_laws, analysis_report, strategy, chat, workspace_events, objective_change, …). Pure module-level helpers/constants/regexes moved to `app/socket/event_utils.py`. Method bodies were relocated verbatim — verified by an AST method-body equality check (218/218 nodes identical) plus a runtime diff (222 methods + 21 `_handlers` keys unchanged, same singleton object). Public surface is unchanged: `event_handler` is still the only symbol other modules import. Inline prompts stay with their methods. See `docs/SOCKET_EVENTS_ARCHITECTURE.md`.
 
 ### Fixed
 

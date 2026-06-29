@@ -30,11 +30,7 @@ _AI_PROCESS_START_MONO = time.monotonic()
 def _utc_iso_ms_z() -> str:
     """UTC ISO-8601 with millisecond precision and Z suffix."""
     now = datetime.now(timezone.utc)
-    return (
-        now.strftime("%Y-%m-%dT%H:%M:%S.")
-        + f"{now.microsecond // 1000:03d}"
-        + "Z"
-    )
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}" + "Z"
 
 
 class SocketClient:
@@ -329,9 +325,7 @@ class SocketClient:
         await self.emit("unsubscribe", {"workspace_id": workspace_id})
         logger.info("Unsubscribed from workspace: {}", workspace_id)
 
-    def _heartbeat_pong_payload(
-        self, payload_in: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def _heartbeat_pong_payload(self, payload_in: Dict[str, Any]) -> Dict[str, Any]:
         """Build pong body; echoes requestId/serverSentAt from Node when present."""
         return {
             "requestId": payload_in.get("requestId"),
@@ -381,6 +375,10 @@ class SocketClient:
             logger.info("   - analysis_report_feedback")
             logger.info("   - added_missing_information")
             logger.info("   - applicable_law_relevance_request")
+            logger.info("   - add_case_law")
+            logger.info("   - add_relevant_party")
+            logger.info("   - edit_relevant_party")
+            logger.info("   - delete_relevant_party")
             logger.info("   - analysis_docx_generate_request")
             logger.info("   - template_sync")
             logger.info("   - template_sync_response")
@@ -524,9 +522,7 @@ class SocketClient:
                     raw[:1800] + ("..." if len(raw) > 1800 else ""),
                 )
             except Exception:
-                logger.info(
-                    "added_missing_information payload (repr): {}", repr(data)
-                )
+                logger.info("added_missing_information payload (repr): {}", repr(data))
             await event_handler.handle("added_missing_information", data)
 
         @self.sio.event
@@ -535,7 +531,9 @@ class SocketClient:
             Handle applicable_law_relevance_request (Server → AI_Maverick).
             Lawyer-selected law; AI returns applicability as applicable_law_relevance_response.
             """
-            logger.info("⚖️ applicable_law_relevance_request ← backend (socket received)")
+            logger.info(
+                "⚖️ applicable_law_relevance_request ← backend (socket received)"
+            )
             try:
                 raw = json.dumps(data, default=str) if data is not None else "null"
                 logger.info(
@@ -543,8 +541,48 @@ class SocketClient:
                     raw[:1800] + ("..." if len(raw) > 1800 else ""),
                 )
             except Exception:
-                logger.info("applicable_law_relevance_request payload (repr): {}", repr(data))
+                logger.info(
+                    "applicable_law_relevance_request payload (repr): {}", repr(data)
+                )
             await event_handler.handle("applicable_law_relevance_request", data)
+
+        @self.sio.event
+        async def add_case_law(data):
+            """
+            Handle add_case_law (App → Backend → AI_Maverick).
+            User manually adds a case-law precedent via the "Add Case Law" button
+            by supplying a citation, a source URL, or free text. AI resolves and
+            verifies a real source, assesses relevance, appends to the Case Laws
+            panel, and re-emits featureType=case_laws.
+            """
+            logger.info("📚 Received add_case_law event")
+            try:
+                raw = json.dumps(data, default=str) if data is not None else "null"
+                logger.info(
+                    "add_case_law payload (preview): {}",
+                    raw[:1800] + ("..." if len(raw) > 1800 else ""),
+                )
+            except Exception:
+                logger.info("add_case_law payload (repr): {}", repr(data))
+            await event_handler.handle("add_case_law", data)
+
+        @self.sio.event
+        async def add_relevant_party(data):
+            """Handle add_relevant_party (App → Backend → AI). User adds a party."""
+            logger.info("👥 Received add_relevant_party event")
+            await event_handler.handle("add_relevant_party", data)
+
+        @self.sio.event
+        async def edit_relevant_party(data):
+            """Handle edit_relevant_party (App → Backend → AI). Edit a party by id."""
+            logger.info("👥 Received edit_relevant_party event")
+            await event_handler.handle("edit_relevant_party", data)
+
+        @self.sio.event
+        async def delete_relevant_party(data):
+            """Handle delete_relevant_party (App → Backend → AI). Delete a party by id."""
+            logger.info("👥 Received delete_relevant_party event")
+            await event_handler.handle("delete_relevant_party", data)
 
         @self.sio.event
         async def analysis_docx_generate_request(data):
@@ -552,7 +590,9 @@ class SocketClient:
             Handle analysis_docx_generate_request (Server -> AI_Maverick).
             AI returns processed document text via analysis_docx_generate_response.
             """
-            logger.info("📝 analysis_docx_generate_request <- backend (socket received)")
+            logger.info(
+                "📝 analysis_docx_generate_request <- backend (socket received)"
+            )
             try:
                 raw = json.dumps(data, default=str) if data is not None else "null"
                 logger.info(
@@ -560,7 +600,9 @@ class SocketClient:
                     raw[:1800] + ("..." if len(raw) > 1800 else ""),
                 )
             except Exception:
-                logger.info("analysis_docx_generate_request payload (repr): {}", repr(data))
+                logger.info(
+                    "analysis_docx_generate_request payload (repr): {}", repr(data)
+                )
             await event_handler.handle("analysis_docx_generate_request", data)
 
         @self.sio.event
@@ -617,9 +659,7 @@ class SocketClient:
                     raw[:1200] + ("..." if len(raw) > 1200 else ""),
                 )
             except Exception:
-                logger.info(
-                    "request_blueprint_proposal payload (repr): {}", repr(data)
-                )
+                logger.info("request_blueprint_proposal payload (repr): {}", repr(data))
             await event_handler.handle("request_blueprint_proposal", data)
 
         @self.sio.on(AI_HEARTBEAT_PING)
@@ -631,7 +671,9 @@ class SocketClient:
             try:
                 out = self._heartbeat_pong_payload(payload_in)
             except Exception as e:
-                logger.warning("heartbeat ping payload build failed, sending minimal pong: {}", e)
+                logger.warning(
+                    "heartbeat ping payload build failed, sending minimal pong: {}", e
+                )
                 out = {
                     "aiTimestamp": _utc_iso_ms_z(),
                     "status": "ok",

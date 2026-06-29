@@ -6,7 +6,14 @@ Updated to match backend Socket.IO specification.
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, HttpUrl, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    field_validator,
+)
 
 # ============================================================================
 # Backend Event Payload Schemas (Server → AI)
@@ -139,9 +146,7 @@ class ApplicableLawItemInRequest(BaseModel):
     id: Optional[str] = None
     act: str = Field(..., validation_alias=AliasChoices("act", "Act"))
     section: str = Field(..., validation_alias=AliasChoices("section", "Section"))
-    title: Optional[str] = Field(
-        None, validation_alias=AliasChoices("title", "Title")
-    )
+    title: Optional[str] = Field(None, validation_alias=AliasChoices("title", "Title"))
     description: Optional[str] = Field(
         None, validation_alias=AliasChoices("description", "Description")
     )
@@ -248,7 +253,9 @@ class UserMessageRequestPayload(BaseModel):
     )  # Echo of the clicked suggestion's title — drives template matching.
     suggestionDescription: Optional[str] = Field(
         default=None,
-        validation_alias=AliasChoices("suggestionDescription", "suggestion_description"),
+        validation_alias=AliasChoices(
+            "suggestionDescription", "suggestion_description"
+        ),
     )  # Echo of the clicked suggestion's description — extra signal for matching.
     templateId: Optional[str] = Field(
         default=None,
@@ -260,9 +267,7 @@ class UserMessageRequestPayload(BaseModel):
     )  # Lazy-fetch fallback when AI's template cache is cold.
     templateOriginalName: Optional[str] = Field(
         default=None,
-        validation_alias=AliasChoices(
-            "templateOriginalName", "template_original_name"
-        ),
+        validation_alias=AliasChoices("templateOriginalName", "template_original_name"),
     )
     templateMimeType: Optional[str] = Field(
         default=None,
@@ -512,7 +517,9 @@ class AIResponsePayload(BaseModel):
     # Drafting Assistant fields (omitted for other chat types).
     actionableId: Optional[str] = None
     chat_type: Optional[str] = None
-    isDraft: Optional[bool] = None  # True only on the turn that just delivered a draft body inline.
+    isDraft: Optional[bool] = (
+        None  # True only on the turn that just delivered a draft body inline.
+    )
     draftStatus: Optional[
         Literal["analyzing", "gathering_info", "ready", "revising"]
     ] = None
@@ -573,6 +580,189 @@ class DraftingSuggestionsPayload(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     suggestedDrafts: List[DraftingSuggestionItem] = []
+
+
+class CaseLawItem(BaseModel):
+    """
+    One relevant case-law precedent in the Case Laws panel.
+
+    Emitted inside document_feature_response payload.caseLaws[] under
+    featureType="case_laws". Every item is source-backed: ``sourceUrl`` always
+    points to the real judgment/source the citation was drawn from (Indian
+    Kanoon, Vertex AI Search, or a Google-Search-grounded web result). Items
+    without a verifiable source are dropped before emit, so ``verified`` is
+    True for everything that reaches the client.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    # --- Identity (from the judgment / source) ---
+    id: str
+    title: str  # e.g. "Arnesh Kumar v. State of Bihar"
+    citation: Optional[str] = None  # primary citation, e.g. "(2014) 8 SCC 273"
+    equivalentCitation: Optional[str] = None  # e.g. "AIR 2014 SC 2756"
+    court: Optional[str] = None  # e.g. "Supreme Court of India"
+    bench: List[str] = []  # judges, when stated in the judgment
+    date: Optional[str] = None  # decision date (ISO or "18 July 2006")
+
+    # --- Precedential weight (derived deterministically from the court) ---
+    bindingStrength: Optional[str] = (
+        None  # "Binding" | "Highly Persuasive" | "Persuasive"
+    )
+    bindingStars: Optional[int] = None  # 1-5, for a quick visual weight badge
+
+    # --- Substance of the judgment (extracted from the real judgment text) ---
+    areaOfLaw: List[str] = []  # e.g. ["Consumer Protection", "Warranty"]
+    legalIssues: List[str] = []  # the questions the judgment answered
+    materialFacts: List[str] = []  # 3-5 legally relevant facts
+    ratio: Optional[str] = None  # ratio decidendi — the binding legal principle
+    holding: Optional[str] = None  # the outcome / disposition
+    relief: List[str] = []  # e.g. ["Refund", "Replacement", "Compensation"]
+
+    # --- AI value-add: how this precedent maps to the user's matter ---
+    summary: str  # one-line holding + relevance (kept for back-compat)
+    relevance: Literal["High", "Medium", "Low"] = "Medium"
+    matchedFacts: List[str] = []  # facts shared with the user's case
+    applicabilityReason: Optional[str] = None  # why it applies to THIS matter
+    distinguishing: List[str] = []  # ways the precedent can be distinguished
+    adverseImpact: Optional[str] = None  # how it may weaken the user's position
+    confidence: Optional[int] = None  # 0-100, AI confidence in the match
+
+    # --- Provenance & status ---
+    sourceUrl: str  # real URL the case was retrieved from / verified against
+    sourceName: Optional[str] = None  # "Indian Kanoon" | "Web (Google Search)" | ...
+    # Good-law status is NOT asserted unless there is real evidence; default is an
+    # honest "not verified" so a lawyer confirms on SCC Online / Manupatra.
+    legalStatus: str = "Not independently verified"
+    verified: bool = True
+
+
+class CaseLawsPayload(BaseModel):
+    """Inner `payload` shape for featureType=case_laws."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    caseLaws: List[CaseLawItem] = []
+
+
+class AddCaseLawRequest(BaseModel):
+    """
+    Payload for add_case_law event (App → Backend → AI service).
+
+    User manually adds a precedent via the "Add Case Law" button by supplying
+    ANY one of: a citation, a source URL, or free-text description. The AI
+    resolves/verifies a real source, assesses relevance to the case, and
+    appends the case (re-emitting featureType=case_laws). If no real source can
+    be resolved, the cached panel is re-emitted unchanged.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    workspaceId: str = Field(
+        ..., validation_alias=AliasChoices("workspaceId", "workspace_id")
+    )
+    userId: str = Field(..., validation_alias=AliasChoices("userId", "user_id"))
+    workspaceRole: Optional[str] = Field(
+        None, validation_alias=AliasChoices("workspaceRole", "workspace_role")
+    )
+    citation: Optional[str] = None
+    url: Optional[str] = None
+    text: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+# Normalized party-role vocabulary the frontend colour-codes into badges.
+# Covers Indian criminal + civil/tribunal roles; anything else → OTHER.
+PartyRole = Literal[
+    "PETITIONER",
+    "RESPONDENT",
+    "COMPLAINANT",
+    "ACCUSED",
+    "VICTIM",
+    "WITNESS",
+    "ADVOCATE",
+    "AUTHORITY",
+    "OTHER",
+]
+
+
+class RelevantPartyItem(BaseModel):
+    """
+    One party in the Relevant Parties panel.
+
+    Emitted inside document_feature_response payload.parties[] under
+    featureType="relevant_parties". Names are taken verbatim from the uploaded
+    documents (never invented); ``role`` is a normalized enum the frontend
+    colour-codes, while ``rawDesignation`` preserves the document's own wording.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: str
+    name: str  # exact name/title as written, e.g. "Rajesh Kumar", "President, BCCI"
+    role: PartyRole = "OTHER"
+    rawDesignation: Optional[str] = None  # role/status as written in the document
+    description: str  # one neutral sentence on this party's role in the matter
+    sourceDoc: Optional[str] = None  # where first mentioned, e.g. "Annexure 2"
+
+
+class RelevantPartiesPayload(BaseModel):
+    """Inner `payload` shape for featureType=relevant_parties."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    parties: List[RelevantPartyItem] = []
+
+
+class AddRelevantPartyRequest(BaseModel):
+    """Payload for add_relevant_party (App → Backend → AI). User adds a party."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    workspaceId: str = Field(
+        ..., validation_alias=AliasChoices("workspaceId", "workspace_id")
+    )
+    userId: str = Field(..., validation_alias=AliasChoices("userId", "user_id"))
+    workspaceRole: Optional[str] = Field(
+        None, validation_alias=AliasChoices("workspaceRole", "workspace_role")
+    )
+    name: str
+    role: Optional[str] = None  # coerced to PartyRole; AI infers when omitted
+    description: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+class EditRelevantPartyRequest(BaseModel):
+    """Payload for edit_relevant_party (App → Backend → AI). Edit a party by id."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    workspaceId: str = Field(
+        ..., validation_alias=AliasChoices("workspaceId", "workspace_id")
+    )
+    userId: str = Field(..., validation_alias=AliasChoices("userId", "user_id"))
+    partyId: str = Field(
+        ..., validation_alias=AliasChoices("partyId", "party_id", "id")
+    )
+    name: Optional[str] = None
+    role: Optional[str] = None
+    description: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+class DeleteRelevantPartyRequest(BaseModel):
+    """Payload for delete_relevant_party (App → Backend → AI). Delete by id."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    workspaceId: str = Field(
+        ..., validation_alias=AliasChoices("workspaceId", "workspace_id")
+    )
+    userId: str = Field(..., validation_alias=AliasChoices("userId", "user_id"))
+    partyId: str = Field(
+        ..., validation_alias=AliasChoices("partyId", "party_id", "id")
+    )
+    timestamp: Optional[str] = None
 
 
 # ============================================================================

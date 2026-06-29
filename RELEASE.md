@@ -1,3 +1,86 @@
+# Release v4.2.0 - 2026-06-29
+
+This release (`v4.2.0`) hardens the **Drafting Assistant** end-to-end so that AI suggested drafts and template-backed drafts are reliable, faithful to the lawyer's templates, and free of extraction noise. It is backward compatible with `v4.1.0` — no socket event or payload-shape changes.
+
+## Highlights
+
+- **Applicable templates are now guaranteed a suggested-draft card.** A deterministic template-coverage pass checks each ready template's legal purpose against the matter and surfaces it as a case-framed card with the template pre-bound, instead of relying on the suggestion LLM to happen to propose it. The suggestions panel cap is raised from 6 to 8 so templates are never crowded out.
+- **New Custom AI Draft mode (`draftMode="custom"`)** lets a lawyer generate a case-framed draft directly from case context when no suitable template exists, bypassing template resolution.
+- **Every template variable is confirmed by the lawyer** — nothing is silently auto-filled. A global auto-fill quality gate rejects informal labels, contact ids, and vague values, and recipient email and each cost/compensation head are always asked individually.
+- **Cleaner, more faithful rendered drafts.** Repeated PDF letterheads, scanned-template OCR noise (seal/stamp garble, page footers, margin notes), and the template's original subject matter no longer leak into the generated draft, literal placeholders (e.g. `<Client Address>`) are always captured and asked, and duplicate kickoff questions are de-duplicated.
+- **Faster long-draft rendering.** Draft render and translation now run at `thinking_level="LOW"`, removing a latency/truncation regression while preserving the full 64k output ceiling. Draft language now persists across revision turns.
+
+## Features Delivered
+
+- Deterministic template-coverage pass (`_ensure_template_coverage`) with a per-template applicability check (`build_template_applicability_prompt` / `TEMPLATE_APPLICABILITY_INSTRUCTION`); panel cap raised to 8 (`_MAX_SUGGESTIONS_WITH_TEMPLATES`).
+- `draftMode="custom"` kickoff path that skips template resolution/profiling and drafts from case context.
+- Content/substantiation clauses captured as interactive template variables; profile schema bumped to **v4** so cached templates auto re-profile on the next template sync / reconnect.
+
+## Quality and Stability Improvements
+
+- One-time LLM template-text cleanup at ingest (`_clean_template_ocr_text`) that strips letterheads, seal garble, page footers, and margin notes while preserving every numbered paragraph, heading, recipient/signature block, and literal placeholder verbatim, with an accept/reject gate and chunked processing for long templates.
+- Verbatim letterhead/page-marker de-duplication (`_normalize_template_text`, `_dedupe_leading_repeated_block`) on both the OCR and text-layer extraction paths.
+- Literal placeholder capture for PDF templates (`_literal_placeholders_in_text`, `_ensure_placeholder_variables`) so high-signal slots always reach the kickoff questions.
+- Domain-neutral kickoff wording (no leaking the template's original product/brand/party into an unrelated matter) and hybrid kickoff question de-duplication (`_dedup_kickoff_questions`).
+
+## Bug Fixes
+
+- Recipient email and hardcoded demand/compensation amounts are always captured as per-matter variables and asked, never carried over from the template.
+- Draft language persists across revisions; translate instruction tightened for abbreviations and numerals.
+- Draft render no longer emits preamble text; clicking a different suggested-draft/template card re-kicks the conversation cleanly.
+
+## Compatibility Notes
+
+- Drop-in replacement for `v4.1.0`. No new or changed socket events or payload shapes — all changes are internal to the Drafting Assistant generation and template-profiling paths.
+- Cached templates are automatically re-profiled under the new profile schema (**v4**) on the next `template_sync` or reconnect; no manual migration is required.
+
+---
+
+# Release v4.1.0 - 2026-06-12
+
+This release (`v4.1.0`) adds chat-driven panel editing from the Strategy & Objective chat and hardens legal-intelligence outputs (English-only, Title-case names, brand exclusion, robust quality score), plus Gemini thinking-budget control to keep responses fast and complete.
+
+## Highlights
+
+- **Edit panels from chat**, with two clearly separated modes: a surgical **name / word / line edit** applied workspace-wide across all panels with no regeneration, and an **objective / case-perspective change** that re-derives the strategic objective, analysis report, applicable laws, quality score, and drafting suggestions for the new objective.
+- **Output guardrails** shared across every panel and chat: English/Latin-script output only (non-Latin names transliterated), the platform's own name never surfaced as a case party, and person/place names in normal Title Case.
+- **Procedural Timeline scope narrowed** to genuine court/law procedural dates only (filing deadlines, hearings, evidence deadlines, compliance dates, adjourned/next dates); the agent never invents dates.
+- **Gemini latency/completeness governed by `thinking_level`** (default `LOW`) on `GeminiClient.generate()` rather than by inflating the output ceiling, fixing `MAX_TOKENS` truncation of large structured outputs.
+
+## Bug Fixes
+
+- Objective change now replaces (not merges) the Analysis Report and re-derives Applicable Laws for the new objective.
+- Intermittent 0% quality score on a populated report fixed (robust score parsing + content-derived fallback).
+- Mid-sentence truncation of panel descriptions fixed (trim only at a word boundary, not at abbreviation periods).
+- Informational questions in the Strategy & Objective chat no longer trigger an objective regeneration.
+
+## Compatibility Notes
+
+- Backward compatible with `v4.0.0`. No new feature payload types; behavior changes are in chat-driven editing and output formatting.
+
+---
+
+# Release v4.0.0 - 2026-06-08
+
+This major release (`v4.0.0`) introduces the **Drafting Assistant** — a lawyer-scoped Template Library plus an in-workspace drafting panel and multi-turn drafting chat.
+
+## Highlights
+
+- New **Drafting Assistant** feature: proactive suggested drafts per workspace and a multi-turn drafting chat that gathers missing facts and renders full Markdown drafts.
+- New lawyer-scoped **Template Library** with a new inbound `template_sync` event (uploaded / renamed / deleted) and lawyer-scoped Qdrant state cache; uploaded templates are reused as a verbatim structural skeleton.
+- New outbound `document_feature_response` with `featureType: "drafting_assistant"`, cached and re-emitted on reconnect.
+- Dedicated long-form generation path `GeminiClient.generate_longform()` on the `google-genai` SDK (64k output ceiling, explicit thinking control) plus per-call generation diagnostics (`finish_reason` + token usage).
+
+## Bug Fixes
+
+- Fixed incomplete / truncated long drafts by migrating the draft path to the `google-genai` SDK with explicit thinking control and raising the output ceiling to 64k.
+
+## Compatibility Notes
+
+- Major release: a new `drafting_assistant` feature type and a new `template_sync` inbound event are added. Backend/frontend consumers that maintain feature/event allow-lists must include them.
+
+---
+
 # Release v3.0.0 - 2026-04-27
 
 This major release (`v3.0.0`) introduces the new procedural timeline capability and upgrades legal reasoning behavior across agents to consistently evaluate both civil-law and criminal-law branches where facts support both.

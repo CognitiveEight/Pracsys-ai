@@ -17,7 +17,7 @@ model does not invent IPC sections.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 
 DRAFTING_SYSTEM_INSTRUCTION = """You are an expert Indian legal drafting assistant trained to generate professional, court-ready legal drafts in the style, tone, structure, and language commonly used by experienced Indian advocates and law firms.
@@ -663,6 +663,98 @@ OUTPUT FORMAT — strict JSON array, no other text:
 
 
 # ---------------------------------------------------------------------------
+# 1b) Template applicability check (guarantees relevant templates surface)
+# ---------------------------------------------------------------------------
+
+TEMPLATE_APPLICABILITY_INSTRUCTION = (
+    DRAFTING_SYSTEM_INSTRUCTION
+    + "\n\n"
+    + "MODE: TEMPLATE-APPLICABILITY CHECK. "
+    + "You are deciding whether ONE of the lawyer's reusable templates is "
+    + "legally applicable to the current matter, judged by the template's "
+    + "LEGAL PURPOSE and document type — NOT by whether the parties or facts "
+    + "happen to match the template's original matter. A consumer-dispute "
+    + "legal notice is applicable to any consumer dispute; a bail application "
+    + "is not applicable to a pure consumer matter. "
+    + "If applicable, frame a one-line title and one-line description using "
+    + "ONLY this case's facts — never copy the template's original party "
+    + "names, dates, or facts. "
+    + "Output strict JSON only — a single object, no markdown fences, no commentary."
+)
+
+
+def build_template_applicability_prompt(
+    role: str,
+    case_summary: str,
+    applicable_laws_brief: str,
+    strategy_brief: str,
+    analysis_brief: str,
+    list_of_dates_brief: str,
+    template_document_type: str,
+    template_legal_purpose: str,
+) -> str:
+    """Build the prompt that decides whether a single template fits this case.
+
+    The decision is driven by the template's legal purpose / document type
+    against the case posture, so a template surfaces for any matter it
+    genuinely fits — independent of the original matter's party names/facts.
+    Returns a prompt asking for a single JSON object.
+    """
+    role_upper = (role or "ADJUDICATOR").strip().upper()
+    return f"""WORKSPACE ROLE: {role_upper}
+
+CASE SUMMARY:
+{case_summary or "(no summary available — derive from analysis report below)"}
+
+APPLICABLE LAWS (already identified for this case):
+{applicable_laws_brief or "(none yet)"}
+
+STRATEGY / OBJECTIVE:
+{strategy_brief or "(none yet)"}
+
+ANALYSIS REPORT (strengths, weaknesses, gaps, pending actions):
+{analysis_brief or "(none yet)"}
+
+LIST OF DATES (chronology):
+{list_of_dates_brief or "(none yet)"}
+
+CANDIDATE TEMPLATE:
+  - document type:  {template_document_type or "(unclassified)"}
+  - legal purpose:  {template_legal_purpose or "(not specified)"}
+
+TASK:
+Decide whether a draft of this template's TYPE and LEGAL PURPOSE is something
+this {role_upper} could genuinely prepare and use in THIS matter right now.
+Judge by legal applicability (does this kind of document advance or fit this
+case?), not by whether the original parties/facts match.
+
+Return a single JSON object:
+  - applicable:   true | false.
+  - title:        if applicable, a formal one-line name including the statute
+                  and section where known, framed to THIS case (e.g. "Legal
+                  Notice under Section 35 of the Consumer Protection Act,
+                  2019"). Empty string if not applicable.
+  - relevance:    "High" | "Medium" | "Low" — based on urgency and how
+                  directly this draft advances the case.
+  - description:  ONE short sentence (<= 160 characters) saying what the draft
+                  is for in THIS specific case. Empty string if not applicable.
+
+CONSTRAINTS:
+  - Judge applicability by legal purpose / document type, NOT by matching the
+    template's original party names or facts.
+  - Never copy the template's original party names, dates, or facts into the
+    title or description; use only this case's facts.
+  - No IPC, no CrPC, no Indian Evidence Act references. Use BNS / BNSS / BSA.
+  - No invented sections or acts. If unsure of a section, omit it from the
+    title rather than guess.
+  - When in genuine doubt about applicability, set applicable=false.
+
+OUTPUT FORMAT — strict JSON object, no other text:
+{{"applicable": true, "title": "...", "relevance": "High", "description": "..."}}
+"""
+
+
+# ---------------------------------------------------------------------------
 # 2) Template analysis (kick-off turn)
 # ---------------------------------------------------------------------------
 
@@ -722,7 +814,11 @@ paragraphs, no bullet-only lists, no preamble:
        context>`. The Title is 2–5 words; the question is one focused
        sentence. Classify: Critical = the document cannot be finalised
        accurately without it; Important = it can proceed but would be
-       materially strengthened; Optional = useful but not essential.
+       materially strengthened; Optional = useful but not essential. A
+       content/substantiation slot bearing on the document's core purpose
+       (a principal ground, a primary claim/defence, the relief sought) is at
+       minimum Important, and Critical when the outcome depends on it — never
+       park such a slot under Optional.
 
   4. SECTION HEADER `**Strategic Observations:**` — 1–3 concise bullets of
      advocate-to-advocate analysis: the strongest point(s), the key
@@ -740,6 +836,16 @@ bold / number), and `classification` MUST match the group the question is
 listed under in section 3. The frontend re-renders these as inputs; the
 title, question, and classification must stay identical across the two
 surfaces.
+
+COVERAGE + EXACT-ID RULE (when an INTERACTIVE VARIABLE REGISTRY is provided):
+account for EVERY registry variable — each one MUST appear in EXACTLY ONE of
+`gatheredFacts` (auto-filled from the case) or `openQuestions` (asked of the
+lawyer), never both and never neither. Key every `gatheredFacts` entry by the
+registry variable's EXACT `id`, and set each `openQuestions[].id` to the
+registry variable's EXACT `id`, so the two map 1:1 to the registry. Do not
+omit a variable, do not invent ids outside the registry, and do not put a
+variable in `gatheredFacts` unless the case context supplies a real value for
+it (no blanks, no "TBD", no `<placeholder>` — if uncertain, ask it instead).
 
 INCOMPATIBLE-TEMPLATE LAYOUT (when, and only when, `incompatible: true`):
 the `message` MUST NOT follow the two-section layout above. Instead:
@@ -786,7 +892,7 @@ def _format_variable_checklist(interactive_variables: Optional[list]) -> str:
         question = (v.get("question") or "").strip()
         kind = (v.get("kind") or "other").strip()
         fill_from_case = bool(v.get("fill_from_case", True))
-        source = "auto-fill from case if available" if fill_from_case else "ask the lawyer (execution/drafting-time value)"
+        source = "auto-fill from case if available" if fill_from_case else "ask the lawyer (value the case file does not supply — e.g. execution/drafting-time detail or case-specific substantiation)"
         q_part = f" — {question}" if question else ""
         lines.append(f"  {i}. [{kind}] {label}{q_part}  ({source})")
     if not lines:
@@ -807,6 +913,7 @@ def build_template_kickoff_prompt(
     template_tone: Optional[str] = None,
     filing_context: Optional[str] = None,
     structure_outline: Optional[list] = None,
+    prefilled_facts: Optional[Dict[str, Any]] = None,
 ) -> str:
     role_upper = (role or "ADJUDICATOR").strip().upper()
     instructions_block = (
@@ -814,6 +921,24 @@ def build_template_kickoff_prompt(
         if lawyer_instructions
         else ""
     )
+    # Values already auto-filled from the case (deterministic extraction pass).
+    # The kickoff MUST treat these as known (reflect in Key Case Details) and
+    # MUST NOT ask for them again.
+    prefilled_block = ""
+    if isinstance(prefilled_facts, dict) and prefilled_facts:
+        pf_lines = [
+            f"  - {k}: {str(v).strip()}"
+            for k, v in prefilled_facts.items()
+            if str(v).strip()
+        ]
+        if pf_lines:
+            prefilled_block = (
+                "ALREADY AUTO-FILLED FROM THE CASE (these variable values are "
+                "KNOWN — treat each as gathered, reflect them in `gatheredFacts` "
+                "keyed by these exact ids, weave the important ones into the Key "
+                "Case Details, and DO NOT ask for any of them as an open "
+                "question):\n" + "\n".join(pf_lines) + "\n\n"
+            )
     title_hint = (
         f"DRAFT TITLE HINT (from the suggestion the lawyer picked): {draft_title_hint}\n"
         if draft_title_hint
@@ -871,7 +996,7 @@ TEMPLATE FULL TEXT (this is the structural contract for the new draft):
 {template_text or "(template text unavailable)"}
 \"\"\"
 
-{title_hint}{match_note_block}{blueprint_block}{instructions_block}
+{title_hint}{match_note_block}{blueprint_block}{prefilled_block}{instructions_block}
 
 TASK:
 1. Identify the template's structural skeleton — headers, salutations
@@ -880,16 +1005,43 @@ TASK:
    final draft.
 2. Identify which facts in the template are context-bound to the ORIGINAL
    matter (e.g. property/land facts in a reply-notice template, specific
-   sale-deed numbers, original parties) and must be stripped or replaced
-   when adapting to THIS case.
-3. Pre-fill any case-variable slot from the case context above whenever
-   possible (parties, role, statute citations applicable to this matter,
-   facts that are already in the case file).
+   sale-deed numbers, original parties; also: monetary amounts in demand /
+   compensation / costs clauses even when a specific figure is hardcoded —
+   those figures belong to the original case and must be recalculated for
+   THIS matter; email addresses in the sender/firm letterhead — the original
+   law firm's contact details must be replaced) and must be stripped or
+   replaced when adapting to THIS case.
+3. Pre-fill a case-variable slot into `gatheredFacts` ONLY when the case
+   context above ACTUALLY contains a concrete value for it (an explicit party
+   name, address, date, number, amount, statute, etc.). A slot's
+   `fill_from_case` flag is a HINT about where the value usually comes from —
+   it is NOT a promise the value exists here. If the case context does not
+   plainly state the value, you MUST NOT pre-fill it, MUST NOT guess it, and
+   MUST NOT assume it will appear later or be filled at render time — surface
+   it as an open question instead (step 4). Never put a slot in `gatheredFacts`
+   unless you can point to the exact value in the case context. Any variable
+   listed in the ALREADY AUTO-FILLED FROM THE CASE block above is KNOWN — put
+   it in `gatheredFacts` (keyed by its exact id) and NEVER ask for it.
 4. List the SLOTS that still need the lawyer's input. When a STORED TEMPLATE
    BLUEPRINT with an INTERACTIVE VARIABLE REGISTRY is present above, that
    registry is the AUTHORITATIVE checklist — walk EVERY variable in it and,
-   for each, either pre-fill from the case context (reflect in gatheredFacts)
-   or surface it as an open question; never drop a registry field silently.
+   for each, either pre-fill from the case context when its concrete value is
+   present there (reflect in gatheredFacts) or surface it as an open question;
+   never drop a registry field silently. EXACT-ID RULE: key each gatheredFacts
+   entry by the registry variable's EXACT `id`, and set each open question's
+   `id` to the registry variable's EXACT `id`. Every registry variable MUST
+   appear in EXACTLY ONE of the two — gatheredFacts (filled) or openQuestions
+   (asked) — never both and never neither. A variable marked
+   `fill_from_case=true` whose value is NOT actually in the case context is
+   STILL an open question — do not let it fall through to a render-time
+   `<placeholder>`. Literal template placeholders (`<...>`, `[...]`, blanks,
+   `XXXX`) that the case context does not answer MUST ALWAYS be asked.
+   This applies equally to CONTENT / SUBSTANTIATION variables: any enumerated
+   ground, claim, defence, head of loss/relief, representation, obligation, or
+   defect/fact particular — whatever this template contains — that the case
+   context does not already substantiate MUST be surfaced as an open question.
+   Do NOT leave such a clause to be "developed" at render time from thin air;
+   if the case file does not supply the specific particular, ASK the lawyer.
    When NO blueprint is present (older template), fall back to scanning the
    TEMPLATE FULL TEXT for EVERY literal placeholder / blank and account for
    each one — do not stop at the obvious party/FIR slots.
@@ -910,6 +1062,19 @@ TASK:
    left silently blank. Each open question must be focused and answerable in
    one short sentence (e.g. "What is the FIR number and date of
    registration?"), not a 5-part request.
+   EMAIL SLOTS: if the template text contains ANY email address — whether
+   as a blank placeholder OR as a concrete address already written (e.g.
+   business@firm.com) in the sender's / advocate's / firm letterhead or
+   signature block — treat it as a per-matter variable and surface it as
+   an open question with id "email" unless an email has already been
+   provided in gatheredFacts. The original firm's email is specific to the
+   template's source matter and must be replaced for every new draft.
+   COST / LIABILITY HEADS: when the template contains a demand or
+   liability clause that lists multiple cost heads (e.g. depreciation,
+   loss of use, mental harassment, legal costs, interest), ask for EACH
+   head as a SEPARATE open question — one question per head, naming the
+   specific head and asking for the amount. Never bundle multiple cost
+   heads into a single "Compensation Heads" question.
 5. If the template's structural skeleton is fundamentally incompatible
    with this case (e.g. a property dispute template for a corporate
    matter with no structural overlap, or a school-admission affidavit
@@ -1096,6 +1261,16 @@ DRAFT_RENDER_INSTRUCTION = (
     + "below. Do NOT otherwise rewrite the template's fixed legal language. "
     + "The generic FORMATTING RULES section in the "
     + "base instruction does NOT apply when a template is in use.\n\n"
+    + "RUNNING HEADERS / LETTERHEAD / STAMPS — the template text is extracted "
+    + "from a scanned multi-page document, so it may carry extraction "
+    + "artifacts that are NOT body content: a letterhead / firm-name / address "
+    + "block repeated near the top of several pages; `--- Page N ---` markers "
+    + "and 'Page N of M' footers; and rubber-stamp / seal text OCR'd into "
+    + "scrambled fragments of the firm name plus a city / country (e.g. "
+    + "'SSOCIATES', 'ASSOCI', 'FUSKH', 'GURUGRAM', 'INDIA', a lone '★'), which "
+    + "may appear in the middle of the text between paragraphs. Render the "
+    + "letterhead ONCE at the top, and NEVER reproduce page markers, page-"
+    + "number footers, or garbled stamp/seal fragments anywhere in the draft.\n\n"
     + "Produce the complete draft as a single Markdown document. "
     + "When a template is supplied, the template's structural skeleton — "
     + "headings, section order, salutations, party-block layout, prayer "
@@ -1103,9 +1278,14 @@ DRAFT_RENDER_INSTRUCTION = (
     + "MUST be reproduced verbatim. Substitute case-specific facts into "
     + "the slots; strip any context-bound text from the template's "
     + "original matter that does not apply to THIS case. Never invent "
-    + "citations, case-law, monetary figures, court names, or party "
-    + "details. If the lawyer has not provided a slot value, leave a "
-    + "<placeholder> rather than fabricate it.\n\n"
+    + "citations, case-law, monetary figures, court names, party "
+    + "details, DATES (including the notice / issuance / execution date), "
+    + "INTEREST RATES, addresses, or invoice / reference numbers. If the "
+    + "lawyer has not provided a slot value and the case context does not "
+    + "supply it, leave a clearly-marked <placeholder> (e.g. "
+    + "`<Issuance Date>`, `<Interest Rate>`, `<Client Address>`) rather than "
+    + "fabricate it — a placeholder is always preferable to an invented "
+    + "value.\n\n"
     + "CONFLICT RESOLUTION — when a template is supplied, the template "
     + "WINS over your own structural habits and over the DOCUMENT-TYPE "
     + "REGISTRY in the base instruction (the registry applies ONLY in "
@@ -1138,6 +1318,11 @@ DRAFT_RENDER_INSTRUCTION = (
     + "defect/deficiency/cause of action, the reliefs/demands, the grounds "
     + "— you MUST tailor each such item to THIS case from the case context "
     + "and gathered facts:\n"
+    + "  • When the lawyer was ASKED about a content/substantiation clause and "
+    + "    answered it (the answer is present in the gathered facts), render "
+    + "    that clause FROM the lawyer's answer — its specific particulars are "
+    + "    authoritative; do NOT fall back to the template's generic phrasing "
+    + "    or silently drop the clause.\n"
     + "  • Replace each generic item with the specific, quantified "
     + "    particular the case provides. e.g. a template bullet "
     + "    'Depreciation and loss of value' becomes 'Depreciation of the "
@@ -1165,6 +1350,18 @@ DRAFT_RENDER_INSTRUCTION = (
     + "    context plus the legal significance a reasonable advocate would "
     + "    articulate; do NOT invent new facts, figures, or representations "
     + "    the record does not support.\n"
+    + "  • A REPRESENTATIONS / RELIANCE / REPUTATION clause must be anchored to "
+    + "    a SPECIFIC representation actually made in THIS matter and its source "
+    + "    in the record (the exact specification promised, the warranty term, "
+    + "    the marketing or pre-sale communication, the assurance relied upon) — "
+    + "    NOT a generic string of adjectives. Replace an abstract adjective "
+    + "    pile (e.g. 'precision, reliability and superior craftsmanship') with "
+    + "    the concrete promise the record evidences and how the gathered facts "
+    + "    describe it. If the record supports no specific representation for a "
+    + "    given quality, OMIT that quality rather than assert a vague adjective. "
+    + "    Do NOT import general world-knowledge the record does not state — "
+    + "    brand reputation, founding year, market standing, awards and similar "
+    + "    background are usable ONLY when the case context provides them.\n"
     + "  • DROP generic items that do not apply to this case rather than "
     + "    carrying them as empty boilerplate. Never leave a generic "
     + "    boilerplate item un-grounded when the case context contains the "
@@ -1174,6 +1371,13 @@ DRAFT_RENDER_INSTRUCTION = (
     + "    restates an earlier descriptive section (e.g. Financial Loss), "
     + "    phrase the later one as the OPERATIVE demand — what is claimed and "
     + "    quantified — not a second identical list of descriptive heads.\n"
+    + "  • NO DUPLICATION WITHIN A LIST OR SECTION — never emit the same "
+    + "    bullet, clause or sentence more than once. Every item in a single "
+    + "    list must be distinct; do not repeat a representation, ground, loss "
+    + "    head, demand or recital that already appears earlier in that same "
+    + "    list. If two template bullets overlap, MERGE them into one "
+    + "    well-developed item rather than carrying both. Before finalising "
+    + "    each list, check that no two items say the same thing.\n"
     + "  • This particularisation may EXPAND a generic clause's prose — and "
     + "    add sub-points WITHIN that clause when the case warrants — to make "
     + "    it specific, detailed and persuasive. What it must NEVER do is add, "
@@ -1331,6 +1535,95 @@ def _infer_document_type_label(draft_title: Optional[str]) -> str:
     return "OTHER"
 
 
+def _build_style_block(
+    draft_depth: Optional[str],
+    structure_style: Optional[str],
+    guardrail_level: Optional[str],
+) -> str:
+    """Render the lawyer-approved depth / structure / guardrail controls as an
+    authoritative instruction block for the draft renderer. Returns '' when no
+    control is set (older templates / blank drafts), so behaviour is unchanged.
+
+    The matching is keyword-based (the dashboard values may be edited / custom),
+    so a custom string is passed through verbatim as an explicit instruction
+    rather than dropped."""
+    lines: List[str] = []
+
+    depth = (draft_depth or "").strip()
+    if depth:
+        low = depth.lower()
+        if "concise" in low or "summary" in low or "brief" in low:
+            lines.append(
+                "DRAFT DEPTH = CONCISE: keep to the essential clauses only, with "
+                "minimal elaboration. This OVERRIDES the DEPTH / DEVELOPMENT and "
+                "length-floor mandates below — do NOT expand sparse clauses into "
+                "multi-paragraph prose; a shorter draft is correct here. Still "
+                "ground every clause in the case facts; just do not pad."
+            )
+        elif "standard" in low or "balanced" in low:
+            lines.append(
+                "DRAFT DEPTH = STANDARD: develop each section adequately and "
+                "professionally, but do not exhaustively elaborate every clause — "
+                "aim for a balanced, filing-ready length, not maximal."
+            )
+        elif "detailed" in low or "comprehensive" in low:
+            lines.append(
+                "DRAFT DEPTH = DETAILED & COMPREHENSIVE: fully develop each content "
+                "section to the depth a finished, partner-reviewed document demands "
+                "(the default — apply the DEPTH / DEVELOPMENT mandate in full)."
+            )
+        else:
+            lines.append(f"DRAFT DEPTH (lawyer-specified): {depth}")
+
+    structure = (structure_style or "").strip()
+    if structure:
+        low = structure.lower()
+        base = (
+            "PREFERRED STRUCTURE STYLE — apply this layout for the body. When a "
+            "template is in use its structural skeleton STILL wins; use this as the "
+            "within-section style and for any section the template does not fix. "
+        )
+        if "numbered" in low:
+            lines.append(base + "Style = NUMBERED CLAUSES: present the body as a "
+                         "numbered clause list (1., 2., 3. …).")
+        elif "sectioned" in low:
+            lines.append(base + "Style = SECTIONED CLAUSES: group the body under "
+                         "titled sections / headed clauses.")
+        elif "chronological" in low or "recital" in low:
+            lines.append(base + "Style = CHRONOLOGICAL FACT RECITALS: present the "
+                         "factual narrative in strict date order.")
+        elif "paragraph" in low or "standard" in low:
+            lines.append(base + "Style = STANDARD PARAGRAPHS: flowing prose "
+                         "paragraphs rather than enumerated clauses.")
+        else:
+            lines.append(base + f"Style (lawyer-specified): {structure}")
+
+    guardrails = (guardrail_level or "").strip()
+    if guardrails:
+        low = guardrails.lower()
+        if "comprehensive" in low or "strict" in low or "high" in low:
+            lines.append(
+                "LEGAL GUARDRAILS = COMPREHENSIVE: apply full legal-soundness "
+                "review — verify every statute/section citation, flag risks, and "
+                "ensure each contention is legally supported."
+            )
+        elif "standard" in low or "moderate" in low or "basic" in low or "light" in low:
+            lines.append(
+                "LEGAL GUARDRAILS = STANDARD: apply the core soundness checks; "
+                "lighter review depth is acceptable."
+            )
+        else:
+            lines.append(f"LEGAL GUARDRAILS (lawyer-specified): {guardrails}")
+        # Never relaxable, regardless of level.
+        lines.append(
+            "REGARDLESS OF GUARDRAIL LEVEL: the IPC→BNS / CrPC→BNSS / Evidence "
+            "Act→BSA modernisation rule and the no-fabrication rule remain "
+            "mandatory."
+        )
+
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
 def build_draft_render_prompt(
     role: str,
     case_summary: str,
@@ -1345,10 +1638,17 @@ def build_draft_render_prompt(
     revision_instruction: Optional[str] = None,
     template_tone: Optional[str] = None,
     filing_context: Optional[str] = None,
+    draft_depth: Optional[str] = None,
+    structure_style: Optional[str] = None,
+    guardrail_level: Optional[str] = None,
 ) -> str:
     """Build the user prompt for final draft rendering.
 
     mode ∈ {"template", "suggestedDraft", "blank", "revision"}.
+
+    `draft_depth` / `structure_style` / `guardrail_level` come from the
+    lawyer-approved template blueprint (see TemplateBlueprint). They are
+    no-ops when absent (older templates / blank drafts).
     """
     role_upper = (role or "ADJUDICATOR").strip().upper()
 
@@ -1368,6 +1668,10 @@ def build_draft_render_prompt(
             tone_lines.append(f"FILING CONTEXT / LEGAL PERSONA: {filing_context}")
         tone_block = "\n".join(tone_lines) + "\n"
 
+    # Lawyer-approved drafting controls (depth / structure / guardrails). These
+    # are AUTHORITATIVE preferences from the template blueprint. Absent → no-op.
+    style_block = _build_style_block(draft_depth, structure_style, guardrail_level)
+
     template_block = ""
     if template_text:
         template_block = (
@@ -1379,11 +1683,38 @@ def build_draft_render_prompt(
     revision_block = ""
     if mode == "revision" and previous_draft_markdown:
         revision_block = (
-            "PREVIOUS DRAFT (the lawyer asked for a revision; preserve the "
-            "template skeleton and previously-substituted facts, then apply "
-            "the revision instruction below):\n"
+            "PREVIOUS DRAFT — THIS IS THE AUTHORITATIVE BASE for the revision. "
+            "Reproduce it EXACTLY, changing ONLY what the REVISION INSTRUCTION "
+            "requires, plus (optionally) filling any remaining `<placeholder>` "
+            "whose value the instruction or case context now supplies. "
+            "PRESERVATION RULE (non-negotiable): every CONCRETE value already "
+            "present in this draft — ANY filled field this template uses "
+            "(names, dates, numbers, addresses, enrolment/registration "
+            "numbers, amounts, citations, party details, and any other "
+            "case-variable slot) — MUST reappear VERBATIM in your output. "
+            "NEVER replace an "
+            "already-filled value with a `<placeholder>`, never blank it, and "
+            "never regenerate a section (e.g. the signature / execution block) "
+            "from the bare TEMPLATE FULL TEXT: the previous draft's FILLED "
+            "content always wins over the template's empty slots. Filling the "
+            "requested slot must not cause any other slot to lose its value.\n"
+            "ENTITY-CHANGE RULE (non-negotiable): when the REVISION INSTRUCTION "
+            "changes a named entity — for example 'Advocate: X → Y' or 'Party: "
+            "A → B' — ALL secondary fields associated with that entity in the "
+            "PREVIOUS DRAFT (chamber/office address, enrollment number, firm "
+            "name, designation, phone, email, or any other dependent field) MUST "
+            "still be preserved VERBATIM from the PREVIOUS DRAFT. Do NOT reason "
+            "that a chamber address 'belongs to the old advocate' and must "
+            "therefore be cleared or replaced with `<placeholder>` because the "
+            "advocate name changed. Apparent inconsistency between the updated "
+            "primary field and an unchanged dependent field is NOT grounds for "
+            "clearing or replacing the dependent field. The lawyer will correct "
+            "dependent fields in a subsequent edit. Any field that has a concrete "
+            "value in the PREVIOUS DRAFT MUST appear with that exact value in "
+            "your output — `<placeholder>` is ONLY valid for fields that had no "
+            "value at all in the PREVIOUS DRAFT.\n"
             f'"""\n{previous_draft_markdown}\n"""\n\n'
-            f"REVISION INSTRUCTION: {revision_instruction or '(unspecified)'}\n"
+            f"REVISION INSTRUCTION (apply ONLY this change): {revision_instruction or '(unspecified)'}\n"
         )
 
     instructions_block = (
@@ -1517,6 +1848,35 @@ genuinely missing.
             "petition.\n"
         )
 
+    # In revision mode, gathered_facts may be stale (revisions never update
+    # gathered_facts, so a prior "Advocate: X → Y" instruction isn't reflected
+    # there). Label the block so the LLM knows the previous draft wins.
+    gathered_facts_label = (
+        "GATHERED FACTS FROM LAWYER — INITIAL CASE SETUP "
+        "[REVISION MODE: these values reflect the initial kickoff and may NOT "
+        "include changes made in prior revision turns (e.g. an advocate name "
+        "change, a court change). The PREVIOUS DRAFT below is the authoritative "
+        "source for all currently-filled field values. Use these facts ONLY to "
+        "fill <placeholder> slots that have no value in the PREVIOUS DRAFT — "
+        "NEVER use them to override a concrete value already present in the draft]"
+        if mode == "revision"
+        else "GATHERED FACTS FROM LAWYER (JSON)"
+    )
+
+    revision_constraint = (
+        "  - REVISION MODE — PREVIOUS DRAFT IS THE SINGLE SOURCE OF TRUTH: "
+        "the PREVIOUS DRAFT contains every field value as it stands after all "
+        "prior user edits. GATHERED FACTS above may be stale (they reflect the "
+        "initial kickoff only and do not track subsequent revision changes such "
+        "as advocate name, court, or case number updates). Where any field in "
+        "GATHERED FACTS conflicts with a filled value in the PREVIOUS DRAFT, "
+        "the PREVIOUS DRAFT value wins unconditionally — never use GATHERED "
+        "FACTS to override or revert a field that already has a concrete value "
+        "in the PREVIOUS DRAFT.\n"
+        if mode == "revision"
+        else ""
+    )
+
     return f"""WORKSPACE ROLE: {role_upper}
 MODE: {mode}
 
@@ -1526,18 +1886,18 @@ CASE SUMMARY:
 CASE FACTS / EVIDENCE BRIEF:
 {case_facts_brief or "(no facts brief)"}
 
-GATHERED FACTS FROM LAWYER (JSON):
+{gathered_facts_label}:
 {gathered_facts_json or "{{}}"}
 
 DRAFT TITLE: {draft_title}
-{tone_block}{doc_type_block}
+{tone_block}{style_block}{doc_type_block}
 {template_block}{instructions_block}{revision_block}{template_example_block}
 
 TASK:
 Produce the complete draft as a single Markdown document.
 
 CONSTRAINTS:
-  - Indian legal register, passive voice, third person.
+{revision_constraint}  - Indian legal register, passive voice, third person.
   - No IPC / CrPC / Indian Evidence Act — use BNS / BNSS / BSA instead.
   - No invented citations, statute sections, court names, or monetary figures.
   - Where a slot value is missing, leave it as <placeholder> with a clear
@@ -1770,16 +2130,32 @@ ABSOLUTE STRUCTURE-PRESERVATION RULES:
   (e.g. `<applicant address>`) so the lawyer can spot exactly which
   slots still need filling in the translated draft. Do NOT translate
   the placeholder hint text.
-- Statute names, section numbers, citations, FIR numbers, monetary
-  amounts, dates, and addresses MUST be kept exactly as written in
-  the source. Do NOT translate statute names like "Bharatiya Nyaya
-  Sanhita", "BNSS", "NDPS Act", "BSA", "Constitution of India". Do
-  NOT change "Section 483 BNSS" to anything else. Do NOT change
-  "FIR No. 148/2026" or "18/04/2026". Do NOT change "₹12,000".
+- Legal citations MUST be kept exactly as written in the source:
+  statute names (e.g. "Bharatiya Nyaya Sanhita", "BNSS", "NDPS
+  Act", "BSA", "Constitution of India"), section/article references
+  (e.g. "Section 483 BNSS"), case numbers, FIR numbers (e.g.
+  "FIR No. 148/2026"), monetary amounts (e.g. "₹12,000"), and
+  institutional/party names when used as legal citations. Do NOT
+  alter ANY of these regardless of the target language.
+- Non-citation English abbreviations — official designations, police
+  ranks, court-officer titles, and similar (e.g. "S.S.P.", "D.M.",
+  "S.D.M.", "A.D.J.", "J.M.F.C.") — MUST be transliterated or
+  rendered in the target script as a native speaker would write them
+  in a formal filing. Do NOT leave them in Latin letters when the
+  target script has a standard equivalent.
+- Dates and numerals in signature/execution/verification blocks
+  (e.g. fields labelled "Date:", "Dated:", "Day/Month/Year") SHOULD
+  be rendered using the target script's standard numeral system where
+  that is the accepted convention for formal legal filings in that
+  language. Dates that are part of a legal citation or case number
+  MUST stay in their original form.
 - Party names: transliterate Indian names into the target script
   where culturally appropriate (e.g. "Mr. Aman Maurya" → "श्री अमन
   मौर्य" in Hindi) but keep them recognisable; do NOT translate
   surnames into target-language equivalents.
+- Addresses: transliterate street names and place names into the
+  target script; keep PIN codes and plot/house numbers in their
+  original numeral form.
 
 TRANSLATE-ONLY:
 
@@ -2061,7 +2437,55 @@ TEMPLATE_VARIABLE_KINDS = (
     "fact",       # a case fact / narrative detail
     "relief",     # prayer / relief / demand sought
     "execution",  # signing date, place, witness, designation, enrolment no.
+    "substantiation",  # a generic content/argument clause stated abstractly that
+                       # needs THIS matter's own particulars — works for ANY
+                       # template type (grounds in a bail application,
+                       # terms/obligations/breaches in a contract, claims/defences
+                       # in a plaint/written statement, heads of loss/relief or
+                       # representations in a notice). Needs the case's facts or the
+                       # lawyer's input, not just a party-name swap.
     "other",
+)
+
+
+# A GUIDE (not a limit) of common Indian legal-drafting field names, grouped by
+# matter type. Fed to the profiler so extracted variable labels align with the
+# names the dashboard expects — WITHOUT constraining extraction: the profiler
+# must still capture every variable the actual template needs (including names
+# not listed) and name template-specific slots naturally.
+CANONICAL_VARIABLE_NAME_REFERENCE = (
+    "- Universal / party & advocate: Advocate Details, Advocate Name, "
+    "Enrollment Number, Law Firm, Designation, Authority Letter, Power of "
+    "Attorney Details, Client Details, Recipient Details, Full Name, "
+    "Father/Mother Name, Address, Email, Phone Number, Occupation, Date of Birth\n"
+    "- Facts / relief / procedure: General Facts, Statement, Relief, Relief "
+    "Sought, Jurisdiction, Court / Forum, Cause of Action Date, Cause of Action "
+    "Location, Effective Date, Notice Period, Compliance Period, Limitation "
+    "Notes, Settlement Attempts, Supporting Documents, Evidence Description, "
+    "Witness Details, Legal Basis / Applicable Statute\n"
+    "- Notice / service: Notice Date, Notice Number, Mode of Service, Prior "
+    "Demand Reference, Previous Notice Reference\n"
+    "- Attestation / banking: Notary / Attestation Details, Bank Details of Client\n"
+    "- Cheque bounce (NI Act s.138): Cheque Number, Cheque Date, Cheque Amount, "
+    "Amount, Dishonour Date, Return Memo, Return Memo Reason, Due Date\n"
+    "- Commercial / money recovery: Invoice No., Invoice Number, Invoice Date, "
+    "Outstanding Amount, Outstanding Balance, Interest, Interest Rate, Agreement "
+    "Number, Agreement Date, Breach, Breach Date, Loan Account Number, EMI "
+    "Amount, Security Details, Damages, Damages Claimed, Compensation, "
+    "Compensation Amount\n"
+    "- Employment: Employee ID, Joining Date, Salary, Misconduct\n"
+    "- Rent / tenancy: Property Address, Rent, Deposit, Default Months, "
+    "Possession, Possession Date\n"
+    "- Consumer / product: Product Details, Invoice, Warranty\n"
+    "- Defamation: Defamatory Statement, Publication Date, URL, Screenshots\n"
+    "- Matrimonial: Marriage Date, Children, Children Details, Cruelty, "
+    "Maintenance, Maintenance Amount, Stridhan Details\n"
+    "- IP: Registration No., Infringement, Trademark Registration Number, "
+    "Copyright Registration Number, Domain Name\n"
+    "- Property / title: Survey No., Survey Number, Plot Number, Title Chain, "
+    "Title Deed Number, Registration No.\n"
+    "- Arbitration: Arbitration Clause, Seat of Arbitration, Proposed Arbitrator\n"
+    "- Statutory IDs: GSTIN, CIN, DIN, PAN, Aadhaar (if disclosed)"
 )
 
 
@@ -2077,36 +2501,104 @@ TEMPLATE_PROFILE_INSTRUCTION = (
     "\"interactive_variables\": [{\"id\": \"<snake_case_id>\", \"label\": "
     "\"<2-4 word field name>\", \"question\": \"<one focused question asking "
     "for this value>\", \"kind\": \"<party|date|amount|statute|fact|relief|"
-    "execution|other>\", \"fill_from_case\": <true|false>, \"required\": "
-    "<true|false>}]}.\n"
+    "execution|substantiation|other>\", \"fill_from_case\": <true|false>, "
+    "\"required\": <true|false>}], "
+    "\"quick_add\": [\"<optional suggested field name>\", ...]}.\n"
     "Rules:\n"
     "1. `interactive_variables` MUST capture EVERY fill-in field needed to "
-    "   complete a real draft from this template — BOTH:\n"
+    "   complete a real draft from this template — ALL of:\n"
     "     (a) literal placeholders in the body: `[...]`, `<...>`, `{{...}}`, "
     "         `(Pascal_Case)`, `____` blanks, `(to be filled)`, `XXXX`, "
     "         `____ day of ____`; AND\n"
     "     (b) IMPLICIT case-variable fields the template states in prose that "
     "         change per matter: party names + addresses, dates, amounts, "
     "         applicable statute/section numbers, FIR / cheque / invoice "
-    "         numbers, the specific relief/prayer, and the execution block "
+    "         numbers, the specific relief/prayer, the execution block "
     "         (signing date, place, witness, signatory designation, "
-    "         enrolment no.).\n"
+    "         enrolment no.), AND email addresses appearing in the sender's / "
+    "         advocate's / firm's letterhead or signature block — ALWAYS treat "
+    "         an email address in the sender block as an implicit variable "
+    "         (id: 'email', fill_from_case: false) even when a concrete "
+    "         address is already written in the template (the original firm's "
+    "         email must be replaced for each new matter); AND\n"
+    "     (c) CONTENT / SUBSTANTIATION slots — wherever the template states a "
+    "         case-dependent CONTENT clause in generic or abstract terms "
+    "         (as opposed to a placeholder or a single named value), treat it "
+    "         as a fill-in slot, NOT fixed boilerplate. This covers any "
+    "         enumerated point or clause that changes per matter and needs THIS "
+    "         case's particulars to be persuasive: the grounds/contentions, the "
+    "         claims/allegations or denials/defences, the heads of "
+    "         loss/damage/relief, the representations/obligations/breaches "
+    "         relied on, the description of the defect / cause of action / facts "
+    "         in issue, and similar argumentative content. Give each "
+    "         `kind: \"substantiation\"`. When a section lists several distinct "
+    "         points, emit ONE variable per distinct point. These examples are "
+    "         illustrative across document types — apply the PRINCIPLE to the "
+    "         actual template, not a fixed checklist. Do NOT capture standing "
+    "         legal recitals (reservation-of-rights, without-prejudice, "
+    "         settlement-confidentiality, and similar fixed boilerplate), which "
+    "         stay verbatim and are not per-matter slots.\n"
+    "     HARDCODED AMOUNTS RULE: monetary amounts in demand / compensation / "
+    "         costs clauses are ALWAYS interactive variables even when a "
+    "         specific figure is already written in the template (e.g. "
+    "         'USD 1,000 towards costs', '₹3,00,000 for harassment'). Those "
+    "         figures belong to the ORIGINAL matter and must be recalculated "
+    "         for every new case. Capture every distinct cost head as a "
+    "         SEPARATE variable (kind: 'amount', fill_from_case: false, "
+    "         required: true). NEVER treat a hardcoded demand/compensation "
+    "         amount as fixed boilerplate — it is always a per-matter slot.\n"
     "   Do NOT skip a field just because it appears in plain sentences rather "
     "   than as a bracketed blank. The DETERMINISTIC PLACEHOLDERS list in the "
     "   user prompt (when present) is a floor, not a ceiling — every one of "
     "   them MUST appear as a variable, and you add the implicit ones too.\n"
-    "2. One variable per distinct value. Merge exact duplicates (the same "
-    "   slot appearing twice) into one. Give each a stable lowercase "
+    "2. One variable per distinct value — NO overlapping or redundant "
+    "   variables. Merge exact duplicates (the same slot appearing twice) into "
+    "   one. Also do NOT emit two variables that ask for the SAME underlying "
+    "   value in different words (e.g. both 'Notice Date' and 'Date of "
+    "   Issuance'). Do NOT emit BOTH an umbrella variable AND its component "
+    "   variables (e.g. NOT both 'Compensation Heads' and separate "
+    "   'Depreciation' / 'Loss of Use' / 'Harassment'); when a concept breaks "
+    "   into several distinct claimed values, emit ONLY the separate component "
+    "   variables, never the umbrella. Do NOT emit a COMBINED variable plus its "
+    "   split parts (e.g. NOT both 'Notice Reference & Date' and separate "
+    "   'Reference Number' + 'Notice Date'); split a combined slot into one "
+    "   variable per value. Give each a stable lowercase "
     "   snake_case `id`, a short human `label`, and a `question` that is "
-    "   answerable in one sentence.\n"
+    "   answerable in one sentence. For the `label`, prefer a canonical field "
+    "   name from the NAMING REFERENCE in the user prompt when the slot clearly "
+    "   matches one (for consistency); otherwise use a concise natural label "
+    "   from the template — never force a slot into a listed name that does not "
+    "   fit, and never add a listed field the template does not have.\n"
+    "   DOMAIN-NEUTRAL WORDING (critical for reuse): a template is reused for "
+    "   OTHER matters, so a `label` and `question` MUST NOT name the template's "
+    "   own original subject-matter, product, brand, or parties. Refer to the "
+    "   subject generically — 'the product', 'the goods', 'the asset', 'the "
+    "   item', 'the subject goods/property'. E.g. write \"What is the serial / "
+    "   identification number of the product?\" NOT \"...of the watch\"; \"On "
+    "   what date did the product fail again after repair?\" NOT \"...did the "
+    "   watch break down again\". Never bake the original matter's specific "
+    "   product noun (watch, vehicle, …), brand name, or client/party names "
+    "   into any label or question.\n"
     "3. `fill_from_case` = true when the value is normally available from a "
-    "   case file / matter context (party names, dates, FIR no., amounts, "
-    "   applicable sections, relief). Set false for values only the lawyer "
-    "   knows at drafting/execution time (signing date, place, witness names, "
-    "   advocate enrolment no.). This lets the kickoff auto-fill the true "
-    "   ones from the case and ask the lawyer only for the rest.\n"
+    "   case file / matter context (party names, dates, FIR no., known "
+    "   transactional amounts such as invoice total / cheque amount / loan "
+    "   principal that are explicitly stated in the case file, applicable "
+    "   sections, relief). Set false for values only the lawyer knows at "
+    "   drafting/execution time (signing date, place, witness names, advocate "
+    "   enrolment no., email address). IMPORTANT: claimed / demanded amounts "
+    "   (legal costs, harassment damages, loss of use, depreciation — figures "
+    "   the lawyer decides strategically) are ALWAYS fill_from_case: false — "
+    "   never set them true even though they are 'amounts', because the case "
+    "   file does not tell the lawyer what to claim. For SUBSTANTIATION slots "
+    "   specifically, set `fill_from_case` = true ONLY when the case context "
+    "   would plainly contain that specific particular/figure; otherwise set "
+    "   it false so the kickoff asks the lawyer for it rather than leaving it "
+    "   generic. This lets the kickoff auto-fill the true ones from the case "
+    "   and ask the lawyer for the rest.\n"
     "4. `required` = true for fields without which the draft is incomplete; "
-    "   false for genuinely optional embellishments.\n"
+    "   false for genuinely optional embellishments. SUBSTANTIATION slots tied "
+    "   to the document's core purpose (principal grounds, primary "
+    "   claims/defences, the relief actually sought) are `required` = true.\n"
     "5. `structure_outline` is the ordered list of the template's top-level "
     "   sections AS WRITTEN (e.g. recipient/court heading → statement of "
     "   facts → grounds/deficiency → relief/prayer → verification/signature). "
@@ -2124,9 +2616,15 @@ TEMPLATE_PROFILE_INSTRUCTION = (
     "8. Indian-law grounding: BNS / BNSS / BSA / IT Act — never IPC, CrPC, or "
     "   the Indian Evidence Act. A \"Section 138\" reference is a Negotiable "
     "   Instruments Act cheque-bounce signal.\n"
-    "9. No commentary, no markdown fences — JSON object only. If the body is "
-    "   empty or unreadable, return all four keys with empty values "
-    "   (\"\"/[]).\n"
+    "9. `quick_add` is 0-8 OPTIONAL extra field NAMES (short labels, not "
+    "   questions) that are commonly relevant to THIS document type but are NOT "
+    "   already in `interactive_variables` — offered to the lawyer as one-click "
+    "   \"AI Suggested Fields\". Prefer canonical names from the NAMING "
+    "   REFERENCE in the user prompt. Do NOT duplicate any interactive_variables "
+    "   label, and do NOT include fields the matter clearly does not need. "
+    "   Return [] when nothing useful to suggest.\n"
+    "10. No commentary, no markdown fences — JSON object only. If the body is "
+    "   empty or unreadable, return all keys with empty values (\"\"/[]).\n"
 )
 
 
@@ -2163,20 +2661,172 @@ def build_template_profile_prompt(
             "fill-in fields from the body, including implicit case-variable "
             "fields stated in prose)\n\n"
         )
+    naming_reference_section = (
+        "NAMING REFERENCE (a GUIDE for variable labels — NOT a checklist and "
+        "NOT a limit): when a fill-in slot you find matches one of these common "
+        "Indian legal-drafting field names, prefer that standard label for "
+        "consistency. You MUST still capture EVERY variable the actual template "
+        "needs — INCLUDING fields not in this list — and name any "
+        "template-specific slot naturally from the document. Do NOT force a "
+        "template's real slot into a listed name when it does not fit, and do "
+        "NOT invent listed fields the template does not contain:\n"
+        f"{CANONICAL_VARIABLE_NAME_REFERENCE}\n\n"
+    )
     return f"""You are profiling an UPLOADED TEMPLATE FILE from an Indian
 lawyer's Template Library into a reusable drafting blueprint.
 
 TEMPLATE FILE NAME: {safe_name}
 DOCUMENT TYPE (already classified): {safe_type}
 
-{placeholder_section}TEMPLATE BODY (source of truth — read all of it; placeholders and
+{placeholder_section}{naming_reference_section}TEMPLATE BODY (source of truth — read all of it; placeholders and
 execution fields may appear anywhere, including the end):
 \"\"\"
 {safe_body}
 \"\"\"
 
-OUTPUT — strict JSON object only, no commentary, no markdown fences:
-{{"tone": "<short phrase>", "filing_context": "<2-4 sentences>", "structure_outline": ["<section>", "..."], "interactive_variables": [{{"id": "<snake_case>", "label": "<short>", "question": "<one sentence>", "kind": "<party|date|amount|statute|fact|relief|execution|other>", "fill_from_case": true, "required": true}}]}}
+OUTPUT — strict JSON object only, no commentary, no markdown fences (the
+second variable below illustrates a `substantiation` content slot — keep such
+examples generic to the actual template, do not copy this wording):
+{{"tone": "<short phrase>", "filing_context": "<2-4 sentences>", "structure_outline": ["<section>", "..."], "interactive_variables": [{{"id": "<snake_case>", "label": "<short>", "question": "<one sentence>", "kind": "<party|date|amount|statute|fact|relief|execution|substantiation|other>", "fill_from_case": true, "required": true}}, {{"id": "ground_<n>", "label": "<short content head>", "question": "<one sentence asking for this matter's particulars for this point>", "kind": "substantiation", "fill_from_case": false, "required": true}}], "quick_add": ["<optional suggested field name>", "..."]}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Template OCR cleanup (ingest-time) — strip scanned-document noise
+# ---------------------------------------------------------------------------
+
+TEMPLATE_CLEANUP_INSTRUCTION = (
+    "You clean OCR-extracted text of a legal-document TEMPLATE so it can be "
+    "reused as a drafting skeleton. The text was extracted from a scanned / "
+    "multi-page document, so it carries extraction noise that is NOT part of "
+    "the document body.\n\n"
+    "REMOVE the following noise:\n"
+    "  - Repeated page letterheads / running headers (firm name, advocate "
+    "    line, office address block) that recur at the top of pages — keep at "
+    "    most ONE copy at the very top of the document.\n"
+    "  - Rubber-stamp / seal text. A circular stamp is OCR'd into SCRAMBLED, "
+    "    out-of-order fragments of the firm name plus a city / country (e.g. "
+    "    'SSOCIATES', 'ASSOCI', 'FUSKH', 'GURUGRAM', 'INDIA', a lone '★'). "
+    "    Delete these fragmentary stamp echoes wherever they appear, including "
+    "    when they land in the middle of the text between paragraphs.\n"
+    "  - Page-number footers such as 'Page 2 of 7', 'Page 2', '2/7'.\n"
+    "  - Editorial / margin notes that are not part of the notice itself "
+    "    (e.g. 'Updated version: Pradeep Mehra -> Rahul Singh, IWC -> Titan').\n"
+    "  - Stray OCR artifacts: isolated single characters, scan-line debris, "
+    "    and '--- Page N ---' markers.\n\n"
+    "PRESERVE EXACTLY, verbatim and IN THE SAME ORDER:\n"
+    "  - The document title and all section headings.\n"
+    "  - The recipient / addressee block and the 'RE:' subject line.\n"
+    "  - EVERY numbered or lettered paragraph and sub-item, with its original "
+    "    numbering (1, 2, 3 …; a, b, c …; i, ii, iii …). Numbered paragraphs "
+    "    must read continuously (e.g. paragraph 8 immediately followed by 9).\n"
+    "  - The signature block.\n"
+    "  - EVERY literal fill-in placeholder, character-for-character: angle "
+    "    '<...>', bracket '[...]', handlebars '{{...}}', parenthesised labels, "
+    "    and underscore blanks '___'.\n\n"
+    "Do NOT rewrite, paraphrase, summarise, translate, reorder, renumber, "
+    "spell-correct, add, or fill anything. Your only job is to delete the "
+    "extraction noise listed above and return the remaining document text "
+    "unchanged. Output ONLY the cleaned document text — no commentary, no "
+    "explanations, no markdown code fences."
+)
+
+
+def build_template_cleanup_prompt(
+    *, name: str, content: str, is_fragment: bool = False
+) -> str:
+    """Build the user prompt for the ingest-time OCR cleanup pass.
+
+    `content` is the OCR-extracted template body (already deterministically
+    normalised). The model returns the same text with scanned-document noise
+    (letterheads, garbled seals/stamps, page footers, margin notes) removed
+    and all paragraphs / placeholders preserved verbatim.
+
+    `is_fragment` marks a MIDDLE chunk of a longer template that was split for
+    cleaning: such a chunk has no legitimate top letterhead, so the model must
+    strip ALL header/stamp/footer noise (keep none) and must not renumber or
+    add anything — its paragraphs continue from a previous chunk.
+    """
+    safe_name = (name or "").strip() or "(no name supplied)"
+    safe_body = (content or "").strip()
+    if is_fragment:
+        fragment_note = (
+            "\nNOTE: This is a MIDDLE FRAGMENT of a longer document (NOT the "
+            "beginning). It has no legitimate top letterhead — remove ALL "
+            "letterhead / header / stamp / seal / page-footer noise (keep "
+            "none), and do NOT add a header. Preserve the body paragraphs and "
+            "their existing numbering exactly as they appear; do not renumber "
+            "or treat the first lines as a heading.\n"
+        )
+    else:
+        fragment_note = ""
+    return f"""TEMPLATE FILE NAME: {safe_name}
+{fragment_note}
+Below is the raw OCR-extracted text of the template. Return the cleaned
+document text only, following the rules in your instructions (remove
+letterheads / stamps / seals / page-number footers / margin notes; preserve
+every paragraph, heading, recipient block, signature block and literal
+placeholder verbatim and in order).
+
+RAW OCR TEXT:
+\"\"\"
+{safe_body}
+\"\"\"
+"""
+
+
+# ---------------------------------------------------------------------------
+# Kickoff question de-duplication (collapse semantically-equivalent questions)
+# ---------------------------------------------------------------------------
+
+QUESTION_DEDUP_INSTRUCTION = (
+    "You de-duplicate a list of questions a lawyer will be asked in order to "
+    "fill a legal-document draft. Some questions are REDUNDANT: they ask for "
+    "the SAME underlying information in different words, or one is an UMBRELLA "
+    "that merely groups several more specific questions also present in the "
+    "list. Identify the questions to DROP.\n"
+    "Rules:\n"
+    "- Pure synonyms / rephrasings of the SAME single value (e.g. 'Notice "
+    "  Date' and 'Date of Issuance'; 'Client Professional Background' and "
+    "  'Professional Background'): keep the single clearest one, drop the "
+    "  rest.\n"
+    "- Umbrella vs specifics: when one question groups values that are ALSO "
+    "  asked by more specific questions in the list (e.g. 'Compensation Heads' "
+    "  vs separate 'Depreciation' + 'Loss of Use' + 'Mental Harassment'; or "
+    "  'Notice Reference & Date' vs separate 'Reference Number' + 'Notice "
+    "  Date'), DROP THE UMBRELLA and KEEP the specific questions, so every "
+    "  individual value is still captured.\n"
+    "- NEVER drop a question that asks for a value not covered by any kept "
+    "  question. When two questions are genuinely about different values, keep "
+    "  both. When unsure, keep both.\n"
+    "Output strict JSON ONLY: {\"dropIds\": [\"<id>\", ...]} — the ids of the "
+    "redundant questions to remove (may be empty). No commentary, no fences."
+)
+
+
+def build_question_dedup_prompt(questions: list) -> str:
+    """Build the user prompt for the kickoff question de-duplication pass.
+
+    `questions` is a list of {id, label, classification} dicts. Returns a
+    prompt asking which ids are redundant and should be dropped.
+    """
+    lines = []
+    for q in questions or []:
+        if not isinstance(q, dict):
+            continue
+        qid = (q.get("id") or "").strip()
+        label = (q.get("label") or "").strip()
+        if not qid or not label:
+            continue
+        cls = (q.get("classification") or "").strip()
+        lines.append(f"- id: {qid} | [{cls}] {label}")
+    listing = "\n".join(lines) or "(no questions)"
+    return f"""QUESTIONS TO REVIEW (one per line — `id` then label):
+{listing}
+
+Return the ids of redundant questions to drop, per your instructions.
+OUTPUT — strict JSON object only:
+{{"dropIds": ["<id>", "..."]}}
 """
 
 

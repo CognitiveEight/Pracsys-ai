@@ -16,6 +16,7 @@ SimplerToday is the **AI engine** that connects to your application backend over
 | **Procedural timeline** | A dedicated **procedural timeline** feature that models the case journey (events, filings, hearings, orders) and emits structured timeline entries for downstream UI/workflows. |
 | **Applicable laws** | Suggestions for **relevant legal frameworks** tied to the matter (for research direction, not as final legal advice). |
 | **Intelligence chat** | A **chat** where lawyers ask follow‑ups (explain a risk, compare options, procedural questions, hypotheticals). Replies aim to be **balanced and accurate** and evaluate both **civil-law** and **criminal-law** implications when both are factually live; workspace role mainly affects **panel** drafts, not an automatic advocacy slant in chat. |
+| **Drafting assistant** | Prepares case-specific **pleadings, applications, legal notices, and replies** — from a **Blank Draft**, an **AI-suggested draft**, a reused **uploaded template** (whose structure is preserved verbatim, only case facts substituted), or a **Custom AI Draft** built straight from case context. A multi-turn chat first **confirms every fill-in value with the lawyer** (it never silently auto-fills), then renders the full draft. Applicable templates are always offered as suggestions. |
 | **Edit panels from chat** | From the Strategy & Objective chat a lawyer can **correct a name / word / line** (applied across all panels' existing content with nothing regenerated) or **change the objective / case perspective** (e.g. recovery → divorce), which **re-derives** the strategic objective, analysis report, applicable laws, and drafting suggestions for the new objective. |
 | **Responsive during generation** | Long jobs (strategy, analysis, dates, laws) run in the background when possible so **chat can still answer** while other outputs are being prepared. |
 
@@ -37,6 +38,7 @@ Nothing here replaces a qualified lawyer or predicts court outcomes. Outputs sup
 - For case-specific legal reasoning, the system applies a **civil + criminal dual-track check** when facts support both branches; if facts support only one branch, it remains in that branch.
 - All panel and chat output is produced in **English** (non-English names are transliterated), in normal Title Case, and never references the SimplerToday platform itself as a case party.
 - When the **objective changes**, downstream panels (analysis report, applicable laws, quality score, drafting) are re-derived for the **new** objective so they stay consistent with it.
+- For drafting, the lawyer **confirms every fill-in value** before a draft is rendered — the assistant does not silently auto-fill facts, amounts, or party details from case context. When a template is reused, its structure and language are preserved and only case-specific facts are substituted.
 - Use generated content as **drafting and thinking support**, subject to review by qualified counsel and local rules.
 
 ---
@@ -95,7 +97,7 @@ simplertoday/
 |------|----------------|
 | `main.py` | Starts the program and handles graceful shutdown. |
 | `socket/` | Socket.IO **client**: connect to your backend, handle events, emit AI results. |
-| `langgraph/` | **Strategy generation**, **intelligence chat**, and **procedural timeline** workflows (step-by-step AI). |
+| `langgraph/` | **Strategy generation**, **intelligence chat**, **procedural timeline**, and the **drafting assistant** workflows (step-by-step AI). |
 | `prompts/` | Legal system prompts (chat behaviour, guardrails, role context). |
 | `ai/` | **Google Gemini** client: text generation, chat, embeddings. |
 | `processing/` | Document download, text extraction, batch processing, readability. |

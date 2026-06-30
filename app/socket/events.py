@@ -420,17 +420,37 @@ class SocketEventHandler(
         "annexures": [],
     }
 
+    # Canonical Title-Case party roles the backend/frontend expect.
     _PARTY_ROLES = {
-        "PETITIONER",
-        "RESPONDENT",
-        "COMPLAINANT",
-        "ACCUSED",
-        "VICTIM",
-        "WITNESS",
-        "ADVOCATE",
-        "AUTHORITY",
-        "OTHER",
+        "Petitioner",
+        "Respondent",
+        "Witness",
+        "Victim",
+        "Accused",
+        "Other",
     }
+
+    # Maps any (legacy/synonym) role wording → a canonical role above. Keyed by
+    # UPPERCASE input; anything not present resolves to "Other".
+    _PARTY_ROLE_MAP = {
+        "PETITIONER": "Petitioner",
+        "APPELLANT": "Petitioner",
+        "COMPLAINANT": "Petitioner",
+        "PLAINTIFF": "Petitioner",
+        "RESPONDENT": "Respondent",
+        "DEFENDANT": "Respondent",
+        "WITNESS": "Witness",
+        "VICTIM": "Victim",
+        "ACCUSED": "Accused",
+        "ADVOCATE": "Other",
+        "AUTHORITY": "Other",
+        "OTHER": "Other",
+    }
+
+    @classmethod
+    def _normalize_party_role(cls, raw: Any) -> str:
+        """Map any role wording to a canonical Title-Case role; default 'Other'."""
+        return cls._PARTY_ROLE_MAP.get(str(raw or "").strip().upper(), "Other")
 
     _ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT = 4
 

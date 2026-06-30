@@ -278,8 +278,8 @@ recall citations that are not listed here.
         party_lines = []
         for p in relevant_parties[:20]:
             name = (p.get("name") or "N/A").strip()
-            role = (p.get("role") or "OTHER").strip()
-            desc = (p.get("description") or "").strip()
+            role = (p.get("role") or "Other").strip()
+            desc = (p.get("details") or p.get("description") or "").strip()
             party_lines.append(f"- {name} [{role}]: {desc}".rstrip(": "))
         parties_section = f"""
 RELEVANT PARTIES ({len(relevant_parties)} identified):

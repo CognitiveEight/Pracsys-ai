@@ -48,6 +48,7 @@ class TemplateMatchState(TypedDict, total=False):
     ready_size: int
     suggestion_class: Optional[Dict[str, Any]]
     result: Optional[Dict[str, Any]]
+    candidates: List[Dict[str, Any]]
 
 
 async def _gather_node(state: TemplateMatchState) -> Dict[str, Any]:
@@ -73,7 +74,7 @@ async def _understand_node(state: TemplateMatchState) -> Dict[str, Any]:
 
 async def _decide_node(state: TemplateMatchState) -> Dict[str, Any]:
     agent = state["agent"]
-    result = await agent._tm_decide(
+    result, candidates = await agent._tm_decide(
         user_id=state["user_id"],
         suggestion_title=state["suggestion_title"],
         suggestion_description=state["suggestion_description"],
@@ -82,7 +83,7 @@ async def _decide_node(state: TemplateMatchState) -> Dict[str, Any]:
         ready_size=state["ready_size"],
         suggestion_class=state.get("suggestion_class"),
     )
-    return {"result": result}
+    return {"result": result, "candidates": candidates}
 
 
 def _route_after_gather(state: TemplateMatchState) -> str:
@@ -119,11 +120,13 @@ async def run_template_match(
     suggestion_title: str,
     suggestion_description: str,
     fallback_text: str = "",
-) -> Tuple[Optional[Dict[str, Any]], int]:
-    """Run the template-match graph and return ``(payload, ready_size)``.
+) -> Tuple[Optional[Dict[str, Any]], int, List[Dict[str, Any]]]:
+    """Run the template-match graph and return ``(payload, ready_size, candidates)``.
 
-    Returns ``(None, 0)`` on empty input or any graph error so callers can
-    degrade gracefully to AI generation.
+    ``candidates`` is the full set of matching ``ready`` entries (the same-
+    document-type group, or the single anchor winner) for the "matched drafts"
+    modal. Returns ``(None, 0, [])`` on empty input or any graph error so
+    callers can degrade gracefully to AI generation.
     """
     suggestion_text = " ".join(
         s for s in (suggestion_title, suggestion_description, fallback_text) if s
@@ -135,7 +138,7 @@ async def run_template_match(
                 "match (user={})",
                 (user_id or "")[:12],
             )
-        return None, 0
+        return None, 0, []
 
     initial: TemplateMatchState = {
         "agent": agent,
@@ -148,10 +151,15 @@ async def run_template_match(
         "ready_size": 0,
         "suggestion_class": None,
         "result": None,
+        "candidates": [],
     }
     try:
         final = await _TEMPLATE_MATCH_GRAPH.ainvoke(initial)
     except Exception as e:
         logger.warning("Template match graph failed (user={}): {}", (user_id or "")[:12], e)
-        return None, 0
-    return final.get("result"), int(final.get("ready_size") or 0)
+        return None, 0, []
+    return (
+        final.get("result"),
+        int(final.get("ready_size") or 0),
+        final.get("candidates") or [],
+    )

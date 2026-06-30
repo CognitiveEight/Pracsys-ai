@@ -346,7 +346,7 @@ class DraftingMixin:
                     continue
                 logger.info(
                     "   ✏️ [{}] title={!r} relevance={} matchScore={} matchMode={} "
-                    "templateId={} templateName={!r}",
+                    "templateId={} templateName={!r} matchedDrafts={}",
                     idx,
                     s.get("title"),
                     s.get("relevance"),
@@ -354,6 +354,7 @@ class DraftingMixin:
                     s.get("matchMode"),
                     s.get("templateId"),
                     s.get("templateName"),
+                    len(s.get("matchedDrafts") or []),
                 )
 
             response_body = {

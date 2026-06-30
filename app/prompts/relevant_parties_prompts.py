@@ -17,10 +17,8 @@ Return ONLY one valid JSON object with this exact shape:
   "parties": [
     {{
       "name": "exact name as given below (copy VERBATIM)",
-      "role": "ACCUSED",
-      "rawDesignation": "the designation/status as written in the documents",
-      "description": "One neutral sentence on this party's role in the matter.",
-      "sourceDoc": "first_mention value if any, else empty"
+      "role": "Accused",
+      "details": "One neutral sentence on this party's role in the matter."
     }}
   ]
 }}
@@ -28,15 +26,17 @@ Return ONLY one valid JSON object with this exact shape:
 HARD RULES:
 - Use ONLY the parties listed below. Copy each `name` VERBATIM. Do NOT invent,
   merge, split, or rename parties, and do NOT add anyone not listed.
-- `role` MUST be exactly one of: PETITIONER, RESPONDENT, COMPLAINANT, ACCUSED,
-  VICTIM, WITNESS, ADVOCATE, AUTHORITY, OTHER.
-  Guidance: the person/state prosecuting or alleging → COMPLAINANT/PETITIONER;
-  the person defending/charged → ACCUSED (criminal) or RESPONDENT/DEFENDANT-side
-  (civil → RESPONDENT); the wronged person → VICTIM; police/expert/officer giving
-  evidence → WITNESS; counsel/advocate → ADVOCATE; courts, commissions, boards,
-  government bodies and regulators → AUTHORITY; anything unclear → OTHER.
-- `description` is ONE neutral sentence, English only, no app/brand name, no
-  advocacy. `rawDesignation` keeps the document's own wording.
+- `role` MUST be exactly one of: Petitioner, Respondent, Witness, Victim,
+  Accused, Other.
+  Guidance: the person/state prosecuting, complaining or alleging → Petitioner;
+  the person defending/charged → Accused (criminal) or Respondent (civil/
+  defendant-side); the wronged person → Victim; police/expert/officer giving
+  evidence → Witness; counsel, courts, commissions, boards, regulators or
+  anything unclear → Other.
+- `details` is ONE neutral sentence, English only, no app/brand name, no
+  advocacy.
+- Do NOT include contact numbers, emails, ID numbers or any other personal
+  contact details — those are supplied separately by the user.
 - Keep every distinct party; do not drop anyone.
 
 Workspace role: {workspace_role}

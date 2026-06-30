@@ -165,6 +165,22 @@ class CaseLawsMixin:
                 break
         return out
 
+    @staticmethod
+    def _combine_case_citation(title: str, citation: Optional[str]) -> str:
+        """Backend-contract `citation` = "Title, Citation". Idempotent.
+
+        Returns the title alone when no citation is present; the citation alone
+        when the title is already embedded in it (so re-applying never double-
+        prepends the title); otherwise "Title, Citation".
+        """
+        title = (title or "").strip()
+        raw_cit = (citation or "").strip()
+        if not raw_cit:
+            return title
+        if title and title.lower() not in raw_cit.lower():
+            return f"{title}, {raw_cit}"
+        return raw_cit
+
     def _normalize_case_laws_payload(
         self, raw: Any, allowed_urls: Optional[set] = None
     ) -> Dict[str, Any]:
@@ -223,11 +239,15 @@ class CaseLawsMixin:
             except (TypeError, ValueError):
                 confidence = None
             status = str(item.get("legalStatus") or "").strip()
+            # Conform to the backend contract: `citation` carries the full
+            # "Title, Citation" string (the separate `title` field is retained).
             out.append(
                 {
-                    "id": f"case_{len(out) + 1}",
+                    "id": f"caselaw_{len(out) + 1}",
                     "title": title,
-                    "citation": _opt(item.get("citation")),
+                    "citation": self._combine_case_citation(
+                        title, _opt(item.get("citation"))
+                    ),
                     "equivalentCitation": _opt(item.get("equivalentCitation")),
                     "court": court,
                     "bench": self._as_str_list(item.get("bench"), limit=5),
@@ -374,7 +394,7 @@ class CaseLawsMixin:
                     off_topic,
                 )
         for i, c in enumerate(kept):
-            c["id"] = f"case_{i + 1}"
+            c["id"] = f"caselaw_{i + 1}"
         normalized = {"caseLaws": kept}
         logger.info(
             "Case laws: {} verified digest(s) from {} source(s)",
@@ -546,7 +566,11 @@ class CaseLawsMixin:
             if len(merged) >= max_items:
                 break
         for i, c in enumerate(merged):
-            c["id"] = f"case_{i + 1}"
+            c["id"] = f"caselaw_{i + 1}"
+            # Recombine so legacy-cached entries (separate citation) also conform.
+            c["citation"] = self._combine_case_citation(
+                c.get("title") or "", c.get("citation")
+            )
         return {"caseLaws": merged}
 
     async def _generate_and_emit_case_laws(

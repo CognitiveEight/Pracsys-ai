@@ -535,6 +535,26 @@ class AIResponsePayload(BaseModel):
 # ============================================================================
 
 
+class MatchedDraftItem(BaseModel):
+    """
+    One library draft matched to a suggested draft.
+
+    A suggestion can match MULTIPLE library drafts of the same document type
+    (e.g. two uploaded Legal Notices). Each match carries its own
+    ``matchScore`` so the frontend can render a "N DRAFTS FOUND" badge and a
+    selection modal listing every matching draft with a "% Match" badge, and
+    pass the chosen ``templateId`` straight through on click.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    templateId: str
+    templateName: Optional[str] = None
+    category: Optional[str] = None  # library category, e.g. "Document Draft"
+    matchScore: Optional[int] = None  # 0-100, this draft's fit to the case
+    matchReason: Optional[str] = None  # <= 120 chars
+
+
 class DraftingSuggestionItem(BaseModel):
     """
     One suggested draft in the proactive Drafting Assistant panel.
@@ -549,6 +569,12 @@ class DraftingSuggestionItem(BaseModel):
     skips a second matcher round-trip. When unset (None), the click
     flow falls back to a blank-source kickoff and the AI infers a
     standard Indian-advocate skeleton from the case context alone.
+
+    When more than one library draft matches, ``matchedDrafts`` lists them
+    all (sorted by ``matchScore`` desc); the top-level ``templateId`` /
+    ``templateName`` / ``matchScore`` / ``matchReason`` mirror
+    ``matchedDrafts[0]`` (the best match) for back-compat and the
+    single-draft "DRAFT AVAILABLE" badge.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -567,11 +593,15 @@ class DraftingSuggestionItem(BaseModel):
     # type / legal purpose fits THIS case posture (NOT urgency — that's
     # `relevance`). Populated only on template-backed cards; None when no
     # template is bound (AI-only suggestion) or scoring was not attempted.
-    # The frontend renders it as a "NN% match" badge.
+    # The frontend renders it as a "NN% match" badge. Mirrors matchedDrafts[0].
     matchScore: Optional[int] = None
     # One-line rationale (<= 120 chars) explaining the matchScore. None when
     # no template is bound.
     matchReason: Optional[str] = None
+    # All library drafts that match this suggestion (same document type),
+    # sorted by matchScore desc. Empty for AI-only suggestions. The frontend
+    # shows "N DRAFTS FOUND" + a pick-one modal when len > 1.
+    matchedDrafts: List["MatchedDraftItem"] = []
 
 
 class DraftingSuggestionsPayload(BaseModel):
@@ -672,17 +702,14 @@ class AddCaseLawRequest(BaseModel):
 
 
 # Normalized party-role vocabulary the frontend colour-codes into badges.
-# Covers Indian criminal + civil/tribunal roles; anything else → OTHER.
+# Anything outside this set is mapped to "Other" by ``_normalize_party_role``.
 PartyRole = Literal[
-    "PETITIONER",
-    "RESPONDENT",
-    "COMPLAINANT",
-    "ACCUSED",
-    "VICTIM",
-    "WITNESS",
-    "ADVOCATE",
-    "AUTHORITY",
-    "OTHER",
+    "Petitioner",
+    "Respondent",
+    "Witness",
+    "Victim",
+    "Accused",
+    "Other",
 ]
 
 
@@ -693,17 +720,20 @@ class RelevantPartyItem(BaseModel):
     Emitted inside document_feature_response payload.parties[] under
     featureType="relevant_parties". Names are taken verbatim from the uploaded
     documents (never invented); ``role`` is a normalized enum the frontend
-    colour-codes, while ``rawDesignation`` preserves the document's own wording.
+    colour-codes. Contact fields are PII: they are emitted empty on
+    document-driven auto-generation and only populated when the user supplies
+    them via the add/edit_relevant_party panel-edit events.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     id: str
     name: str  # exact name/title as written, e.g. "Rajesh Kumar", "President, BCCI"
-    role: PartyRole = "OTHER"
-    rawDesignation: Optional[str] = None  # role/status as written in the document
-    description: str  # one neutral sentence on this party's role in the matter
-    sourceDoc: Optional[str] = None  # where first mentioned, e.g. "Annexure 2"
+    role: PartyRole = "Other"
+    details: str  # one neutral sentence on this party's role in the matter
+    contactNumber: str = ""  # user-supplied (panel edit); "" on auto-gen
+    email: str = ""  # user-supplied (panel edit); "" on auto-gen
+    officialIdUrl: str = ""  # user-supplied (panel edit); "" on auto-gen
 
 
 class RelevantPartiesPayload(BaseModel):
@@ -728,7 +758,11 @@ class AddRelevantPartyRequest(BaseModel):
     )
     name: str
     role: Optional[str] = None  # coerced to PartyRole; AI infers when omitted
+    details: Optional[str] = None  # contract field; `description` kept for back-compat
     description: Optional[str] = None
+    contactNumber: Optional[str] = None
+    email: Optional[str] = None
+    officialIdUrl: Optional[str] = None
     timestamp: Optional[str] = None
 
 
@@ -746,7 +780,11 @@ class EditRelevantPartyRequest(BaseModel):
     )
     name: Optional[str] = None
     role: Optional[str] = None
+    details: Optional[str] = None  # contract field; `description` kept for back-compat
     description: Optional[str] = None
+    contactNumber: Optional[str] = None
+    email: Optional[str] = None
+    officialIdUrl: Optional[str] = None
     timestamp: Optional[str] = None
 
 

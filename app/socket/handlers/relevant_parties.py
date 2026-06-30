@@ -141,25 +141,25 @@ class RelevantPartiesMixin:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name") or "").strip()
-            description = str(item.get("description") or "").strip()
+            # `details` is the contract field; fall back to legacy `description`.
+            details = str(item.get("details") or item.get("description") or "").strip()
             if not name:
                 continue
             key = self._party_name_key(name)
             if not key or key in seen:
                 continue
             seen.add(key)
-            role = str(item.get("role") or "").strip().upper()
-            if role not in self._PARTY_ROLES:
-                role = "OTHER"
             out.append(
                 {
                     "id": f"party_{len(out) + 1}",
                     "name": name,
-                    "role": role,
-                    "rawDesignation": str(item.get("rawDesignation") or "").strip()
-                    or None,
-                    "description": description,
-                    "sourceDoc": str(item.get("sourceDoc") or "").strip() or None,
+                    "role": self._normalize_party_role(item.get("role")),
+                    "details": details,
+                    # PII — empty on auto-gen; only the user fills these in via
+                    # the add/edit_relevant_party panel-edit events.
+                    "contactNumber": str(item.get("contactNumber") or "").strip(),
+                    "email": str(item.get("email") or "").strip(),
+                    "officialIdUrl": str(item.get("officialIdUrl") or "").strip(),
                 }
             )
             if len(out) >= 30:
@@ -237,7 +237,21 @@ class RelevantPartiesMixin:
             if not key or key in seen or key in deleted:
                 continue
             seen.add(key)
-            merged.append(dict(p))
+            # Coerce to the contract shape so legacy-cached entries (old
+            # `description`, no PII keys) survive a regeneration consistently.
+            merged.append(
+                {
+                    "id": p.get("id") or "",
+                    "name": str(p.get("name") or "").strip(),
+                    "role": self._normalize_party_role(p.get("role")),
+                    "details": str(
+                        p.get("details") or p.get("description") or ""
+                    ).strip(),
+                    "contactNumber": str(p.get("contactNumber") or "").strip(),
+                    "email": str(p.get("email") or "").strip(),
+                    "officialIdUrl": str(p.get("officialIdUrl") or "").strip(),
+                }
+            )
             if len(merged) >= 30:
                 break
         for i, p in enumerate(merged):

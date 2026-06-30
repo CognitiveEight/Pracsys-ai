@@ -267,15 +267,13 @@ class PanelEditsMixin:
             return
         await self._hydrate_workspace_caches(workspace_id, user_id=user_id)
 
-        role = str(payload.get("role") or "").strip().upper()
-        if role not in self._PARTY_ROLES:
-            role = "OTHER"
         new_party = {
             "name": name,
-            "role": role,
-            "rawDesignation": (payload.get("rawDesignation") or "").strip() or None,
-            "description": (payload.get("description") or "").strip(),
-            "sourceDoc": None,
+            "role": self._normalize_party_role(payload.get("role")),
+            "details": (payload.get("details") or payload.get("description") or "").strip(),
+            "contactNumber": (payload.get("contactNumber") or "").strip(),
+            "email": (payload.get("email") or "").strip(),
+            "officialIdUrl": (payload.get("officialIdUrl") or "").strip(),
         }
         current = self._workspace_relevant_parties_payload.get(workspace_id) or {
             "parties": []
@@ -327,14 +325,19 @@ class PanelEditsMixin:
                 if (payload.get("name") or "").strip():
                     p["name"] = payload["name"].strip()
                 if payload.get("role") is not None:
-                    role = str(payload.get("role") or "").strip().upper()
-                    p["role"] = role if role in self._PARTY_ROLES else "OTHER"
-                if payload.get("description") is not None:
-                    p["description"] = (payload.get("description") or "").strip()
-                if payload.get("rawDesignation") is not None:
-                    p["rawDesignation"] = (
-                        payload.get("rawDesignation") or ""
-                    ).strip() or None
+                    p["role"] = self._normalize_party_role(payload.get("role"))
+                if payload.get("details") is not None or payload.get("description") is not None:
+                    p["details"] = (
+                        payload.get("details")
+                        if payload.get("details") is not None
+                        else payload.get("description") or ""
+                    ).strip()
+                if payload.get("contactNumber") is not None:
+                    p["contactNumber"] = (payload.get("contactNumber") or "").strip()
+                if payload.get("email") is not None:
+                    p["email"] = (payload.get("email") or "").strip()
+                if payload.get("officialIdUrl") is not None:
+                    p["officialIdUrl"] = (payload.get("officialIdUrl") or "").strip()
                 found = True
                 break
         if not found:

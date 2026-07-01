@@ -5,6 +5,7 @@ __all__ = [
     "derive_case_law_query_prompt",
     "select_case_laws_prompt",
     "extract_judgment_digest_prompt",
+    "classify_and_extract_uploaded_case_law_prompt",
 ]
 
 
@@ -126,6 +127,62 @@ PRESENT MATTER:
 {signals.get("evidenceSnippet", "")}
 
 JUDGMENT TEXT:
+{judgment_text}
+"""
+    )
+
+
+def classify_and_extract_uploaded_case_law_prompt(*, judgment_text, signals):
+    return (
+f"""
+A user has UPLOADED a document. First DECIDE whether it is a genuine case law
+(a judicial judgment / court order / legal precedent). If — and only if — it is,
+extract a legal digest AND assess how it bears on the PRESENT MATTER below.
+
+STEP 1 — CLASSIFY (be strict):
+- A case law is a judgment/order of a court or tribunal: it has parties, a court,
+  legal issues, reasoning, and a disposition. Statutes, contracts, notices,
+  invoices, resumes, coding assignments, articles, and forms are NOT case law.
+- If it is NOT a case law, set "isCaseLaw": false and give a concrete, specific
+  "rejectionReason" that names what the document actually is (e.g. "The uploaded
+  document is a technical coding assignment titled '...'. It does not contain a
+  judicial judgment, legal precedent, or any case law information."). Leave
+  "caseLaw" as null.
+
+STEP 2 — EXTRACT (only when isCaseLaw is true), STRICTLY from the DOCUMENT TEXT
+(no outside knowledge, no fabrication; empty string / empty list if absent):
+  title ("X v. Y" — the actual case name, never the court/commission as a party),
+  citation, equivalentCitation, court, bench[], date, areaOfLaw[], legalIssues[],
+  materialFacts[] (3-5 short bullets), ratio (ratio decidendi, 1-3 sentences),
+  holding (the disposition — allowed / dismissed / partly allowed, etc.), relief[].
+
+STEP 3 — ASSESS against the PRESENT MATTER, grounded in the REAL holding (be
+candid: if the judgment cuts against the present party, say so in adverseImpact
+and lower relevance/confidence):
+  relevance (High|Medium|Low), confidence (0-100), matchedFacts[],
+  applicabilityReason, distinguishing[], adverseImpact, summary (one sentence:
+  the holding + why it matters to the present matter).
+
+Return ONLY one valid JSON object with exactly these keys:
+{{
+  "isCaseLaw": true,
+  "rejectionReason": "",
+  "caseLaw": {{
+    "title": "", "citation": "", "equivalentCitation": "", "court": "",
+    "bench": [], "date": "", "areaOfLaw": [], "legalIssues": [],
+    "materialFacts": [], "ratio": "", "holding": "", "relief": [],
+    "legalStatus": "ONLY if the TEXT itself states overruled/affirmed/followed; else empty",
+    "relevance": "High", "confidence": 80, "matchedFacts": [],
+    "applicabilityReason": "", "distinguishing": [], "adverseImpact": "",
+    "summary": ""
+  }}
+}}
+When "isCaseLaw" is false, set "caseLaw" to null and fill "rejectionReason".
+
+PRESENT MATTER:
+{signals.get("evidenceSnippet", "")}
+
+DOCUMENT TEXT:
 {judgment_text}
 """
     )

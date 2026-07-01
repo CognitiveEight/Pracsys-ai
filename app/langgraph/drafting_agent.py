@@ -4805,12 +4805,9 @@ class DraftingAgent:
         #  - blank: no template lookup.
         template_payload: Optional[Dict[str, Any]] = None
         template_match_note: Optional[str] = None
-        # When the suggested-draft path runs but no template matches AND
-        # the library is non-empty, surface a short explanatory prefix on
-        # the assistant's first reply so the lawyer learns why the upload
-        # they expected to be reused wasn't picked.
+        # Reserved for the no-template fallback kickoff below; the 0-match
+        # suggested-draft path now early-returns to _scope_blank_draft.
         no_match_prefix: Optional[str] = None
-        ready_library_size = 0
 
         # draftMode="custom": lawyer chose "No, Custom AI Draft" — skip ALL
         # template resolution (clearing templateId is not enough because
@@ -4865,35 +4862,25 @@ class DraftingAgent:
                     user_message=user_message,
                 )
         elif source == "suggestedDraft":
-            # `fallback_text` covers the case where BE has not yet shipped
-            # `suggestionTitle` / `suggestionDescription` on
-            # `user_message_request` — the lawyer's kickoff content often
-            # still names the document type ("draft a bail application
-            # ...") and is enough to drive matching deterministically.
-            template_payload, ready_library_size, _candidates = await self._find_matching_template_for_suggestion(
-                user_id=user_id,
-                suggestion_title=suggestion_title or "",
-                suggestion_description=suggestion_description,
-                fallback_text=(user_message or "").strip(),
+            # 0-match suggested-draft click. If the panel had advertised a
+            # matching library draft, the pre-match recall bridge above would
+            # already have populated `templateId` (routing us into the template
+            # block). Reaching here means the card genuinely had `matches: []`
+            # — there is nothing to follow. The frontend's match list is
+            # authoritative, so do NOT re-scan the library (which could
+            # spuriously bind a template or prepend a "no close match" note);
+            # produce a clean generic AI draft from the case context, exactly
+            # like the `draftMode == "custom"` path.
+            return await self._scope_blank_draft(
+                role=role,
+                case_summary=case_summary,
+                case_facts=case_facts,
+                source="blank",
+                lawyer_instructions=lawyer_instructions,
+                suggestion_title=suggestion_title,
+                suggested_draft_id=request_fields.get("suggestedDraftId"),
+                no_match_prefix=None,
             )
-            if template_payload:
-                matched_name = template_payload.get("name") or ""
-                template_match_note = (
-                    f"Matched the lawyer's template '{matched_name}' from the "
-                    f"library based on the suggested draft "
-                    f"'{suggestion_title or 'New Draft'}'."
-                )
-            elif ready_library_size > 0:
-                # Library has usable templates but none was a close enough
-                # match. Tell the lawyer plainly so they can either pick a
-                # template directly or upload a closer one.
-                pretty_title = (suggestion_title or "this draft").strip() or "this draft"
-                no_match_prefix = (
-                    f"I couldn't find a close match in your Template Library "
-                    f"for *{pretty_title}*, so I'm drafting this from "
-                    f"scratch. If you have a closer template, upload it or "
-                    f"open it directly from the library."
-                )
 
         # Without a template / suggestion / instruction, we still kick off
         # but ask a broader scoping question.

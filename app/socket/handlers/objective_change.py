@@ -180,40 +180,8 @@ class ObjectiveChangeMixin:
                     ctx,
                     laws_err,
                 )
-            try:
-                logger.info(
-                    "Case laws: invoking (background{}) for workspace {}",
-                    ctx,
-                    workspace_id[:12] if workspace_id else "",
-                )
-                await self._generate_and_emit_case_laws(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    workspace_role=workspace_role,
-                )
-            except Exception as case_err:
-                logger.warning(
-                    "Case laws (background{}) failed: {}",
-                    ctx,
-                    case_err,
-                )
-            try:
-                logger.info(
-                    "Relevant parties: invoking (background{}) for workspace {}",
-                    ctx,
-                    workspace_id[:12] if workspace_id else "",
-                )
-                await self._generate_and_emit_relevant_parties(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    workspace_role=workspace_role,
-                )
-            except Exception as parties_err:
-                logger.warning(
-                    "Relevant parties (background{}) failed: {}",
-                    ctx,
-                    parties_err,
-                )
+            # Order (per product): applicable_laws → upcoming dates
+            # (procedural_timeline) → relevant_parties → case_laws → drafting.
             try:
                 logger.info(
                     "Procedural timeline: invoking (background{}) for workspace {}",
@@ -235,6 +203,60 @@ class ObjectiveChangeMixin:
                 )
             try:
                 logger.info(
+                    "Relevant parties: invoking (background{}) for workspace {}",
+                    ctx,
+                    workspace_id[:12] if workspace_id else "",
+                )
+                await self._generate_and_emit_relevant_parties(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=workspace_role,
+                )
+            except Exception as parties_err:
+                logger.warning(
+                    "Relevant parties (background{}) failed: {}",
+                    ctx,
+                    parties_err,
+                )
+            try:
+                logger.info(
+                    "Case laws: invoking (background{}) for workspace {}",
+                    ctx,
+                    workspace_id[:12] if workspace_id else "",
+                )
+                await self._generate_and_emit_case_laws(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=workspace_role,
+                )
+            except Exception as case_err:
+                logger.warning(
+                    "Case laws (background{}) failed: {}",
+                    ctx,
+                    case_err,
+                )
+                # Never leave the panel stuck on "Analysis is in progress":
+                # emit the cached-or-empty payload as a terminal state.
+                if self._socket_client:
+                    fallback = self._workspace_case_laws_payload.get(
+                        workspace_id
+                    ) or {"caseLaws": []}
+                    try:
+                        await self._socket_client.emit(
+                            "document_feature_response",
+                            {
+                                "featureType": "case_laws",
+                                "workspaceId": workspace_id,
+                                "userId": user_id,
+                                "payload": fallback,
+                            },
+                        )
+                    except Exception as emit_err:
+                        logger.warning(
+                            "Case laws fallback emit failed{}: {}", ctx, emit_err
+                        )
+            try:
+                logger.info(
                     "Drafting suggestions: invoking (background{}) for workspace {}",
                     ctx,
                     workspace_id[:12] if workspace_id else "",
@@ -254,7 +276,8 @@ class ObjectiveChangeMixin:
         try:
             asyncio.create_task(_runner())
             logger.debug(
-                "Scheduled list_of_dates + applicable_laws + procedural_timeline + drafting_suggestions{} for workspace {}",
+                "Scheduled list_of_dates + applicable_laws + procedural_timeline + "
+                "relevant_parties + case_laws + drafting_suggestions{} for workspace {}",
                 ctx,
                 workspace_id[:12] if workspace_id else "",
             )
@@ -1576,46 +1599,11 @@ class ObjectiveChangeMixin:
                     ctx,
                 )
 
-        # 3b) Case laws: REGENERATE for the new objective/perspective — the
-        # objective steers the precedent search + selection, and
-        # merge_with_previous=False replaces stale cases. Preserve-and-re-emit
-        # on failure so the panel never goes blank.
-        cases_done = False
-        try:
-            await self._generate_and_emit_case_laws(
-                workspace_id=workspace_id,
-                user_id=user_id,
-                workspace_role=workspace_role,
-                objective_context=new_objective_text or None,
-                merge_with_previous=False,
-            )
-            cases_done = True
-        except Exception as case_err:
-            logger.warning("Case laws regeneration failed{}: {}", ctx, case_err)
-        if not cases_done:
-            preserved_cases = self._workspace_case_laws_payload.get(workspace_id) or {}
-            if not isinstance(preserved_cases, dict):
-                preserved_cases = {}
-            self._workspace_case_laws_payload[workspace_id] = preserved_cases
-            if self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "case_laws",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": preserved_cases,
-                    },
-                )
-                logger.success(
-                    "✅ Objective-change case_laws preserved (regeneration skipped){}",
-                    ctx,
-                )
-
-        # 4) Upcoming dates (procedural timeline): preserve existing payload on
+        # 3b) Upcoming dates (procedural timeline): preserve existing payload on
         # objective change — same preserve-and-re-emit pattern as list_of_dates /
         # applicable_laws above. Only regenerate the timeline when documents are
-        # uploaded/deleted, never on an objective change.
+        # uploaded/deleted, never on an objective change. Runs before case laws so
+        # the panel order matches the main flow (upcoming dates → case laws).
         preserved_timeline = (
             self._workspace_procedural_timeline_payload.get(workspace_id) or []
         )
@@ -1637,22 +1625,47 @@ class ObjectiveChangeMixin:
                 ctx,
             )
 
-        # 5) Drafting Assistant suggested drafts: REGENERATE for the new objective
-        # (Mode 2). It rebuilds its brief from the now-updated caches (case
-        # summary + regenerated strategy/objective + analysis + applicable laws +
-        # dates), so the suggested drafts realign with the new perspective.
+        # 3c) Relevant parties: PRESERVE on objective change. Who the parties are
+        # does not change with the legal objective; re-emit the cached payload so
+        # the panel stays stable (and any FE loader clears). Only regenerate when
+        # documents are added/deleted (handled by the document-sync scheduler).
         try:
-            await self._generate_and_emit_drafting_suggestions(
-                workspace_id=workspace_id,
-                user_id=user_id,
-                workspace_role=workspace_role,
-            )
+            await self._emit_relevant_parties(workspace_id, user_id)
             logger.success(
-                "✅ Objective-change drafting suggestions regenerated{}", ctx
+                "✅ Objective-change relevant_parties preserved (regeneration skipped){}",
+                ctx,
             )
+        except Exception as parties_err:
+            logger.warning(
+                "Objective-change relevant_parties preserve failed{}: {}",
+                ctx,
+                parties_err,
+            )
+
+        # 3d) Case laws: PRESERVE on objective change. The precedents that were
+        # uploaded/found don't change with the legal objective, so re-emit the
+        # cached payload rather than regenerating. Only regenerate on document
+        # add/delete (handled by the document-sync scheduler).
+        try:
+            await self._reemit_case_laws_unchanged(workspace_id, user_id)
+            logger.success(
+                "✅ Objective-change case_laws preserved (regeneration skipped){}",
+                ctx,
+            )
+        except Exception as case_err:
+            logger.warning(
+                "Objective-change case_laws preserve failed{}: {}", ctx, case_err
+            )
+
+        # 5) Drafting Assistant suggested drafts: PRESERVE on objective change.
+        # The lawyer's curated/suggested drafts and template library are unchanged
+        # by an objective shift, so re-emit the cached suggestions (clears the FE
+        # loader) instead of regenerating. Only regenerate on document add/delete.
+        try:
+            await self._reemit_drafting_unchanged(workspace_id, user_id)
         except Exception as draft_err:
             logger.warning(
-                "Objective-change drafting regeneration failed{}: {}",
+                "Objective-change drafting preserve failed{}: {}",
                 ctx,
                 draft_err,
             )

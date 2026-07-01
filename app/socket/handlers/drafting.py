@@ -109,6 +109,7 @@ from app.socket.event_utils import (
     _normalize_report_mobile_from_overview,
     _overview_conversation_date_to_iso,
     extract_overview_conversation_report_contact_meta,
+    drafting_payload_to_wire,
 )
 
 
@@ -357,11 +358,13 @@ class DraftingMixin:
                     len(s.get("matchedDrafts") or []),
                 )
 
+            # Cache keeps the internal shape (drives freeze/rematch on growth);
+            # the wire goes out in the narrower matches/matchPercent contract.
             response_body = {
                 "featureType": "drafting_assistant",
                 "workspaceId": workspace_id,
                 "userId": user_id,
-                "payload": payload,
+                "payload": drafting_payload_to_wire(payload),
             }
             # Full dump of the exact response body sent to the backend for
             # end-to-end verification (titles/descriptions/templateId/
@@ -385,6 +388,34 @@ class DraftingMixin:
             await asyncio.sleep(0.05)
         except Exception as e:
             logger.warning("Drafting suggestions emit failed: {}", e)
+
+    async def _reemit_drafting_unchanged(
+        self, workspace_id: str, user_id: str
+    ) -> None:
+        """Re-emit the cached drafting suggestions (clears a FE loader) without
+        regenerating — used on objective-only changes, where the suggested
+        drafts must be preserved (they only regenerate on document add/delete).
+
+        The cache holds the rich internal card shape; the wire goes out in the
+        narrower matches/matchPercent contract via ``drafting_payload_to_wire``,
+        matching the reconnect re-emit path."""
+        if not self._socket_client:
+            return
+        cached = self._workspace_drafting_payload.get(workspace_id)
+        if cached is None:
+            return
+        await self._socket_client.emit(
+            "document_feature_response",
+            {
+                "featureType": "drafting_assistant",
+                "workspaceId": workspace_id,
+                "userId": user_id,
+                "payload": drafting_payload_to_wire(cached),
+            },
+        )
+        logger.success(
+            "✅ Objective-change drafting suggestions preserved (regeneration skipped)"
+        )
 
     async def _maybe_reemit_drafting_on_templates(self, user_id: str) -> None:
         """Self-heal the Drafting Assistant panel after the template library
@@ -513,7 +544,7 @@ class DraftingMixin:
                 "featureType": "drafting_assistant",
                 "workspaceId": workspace_id,
                 "userId": user_id,
-                "payload": payload,
+                "payload": drafting_payload_to_wire(payload),
             }
             await self._socket_client.emit(
                 "document_feature_response",

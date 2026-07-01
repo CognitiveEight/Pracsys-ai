@@ -277,6 +277,13 @@ class UserMessageRequestPayload(BaseModel):
         default=None,
         validation_alias=AliasChoices("draftMode", "draft_mode"),
     )
+    # Optional layout hint sent by the frontend (reserved). Parsed and threaded
+    # through to the drafting agent for future layout-aware rendering; not yet
+    # consumed. Shape is frontend-defined — kept opaque here.
+    formatLayout: Optional[Any] = Field(
+        default=None,
+        validation_alias=AliasChoices("formatLayout", "format_layout"),
+    )
 
 
 # ============================================================================
@@ -535,13 +542,13 @@ class AIResponsePayload(BaseModel):
 # ============================================================================
 
 
-class MatchedDraftItem(BaseModel):
+class MatchItem(BaseModel):
     """
     One library draft matched to a suggested draft.
 
     A suggestion can match MULTIPLE library drafts of the same document type
     (e.g. two uploaded Legal Notices). Each match carries its own
-    ``matchScore`` so the frontend can render a "N DRAFTS FOUND" badge and a
+    ``matchPercent`` so the frontend can render a "N DRAFTS FOUND" badge and a
     selection modal listing every matching draft with a "% Match" badge, and
     pass the chosen ``templateId`` straight through on click.
     """
@@ -551,8 +558,7 @@ class MatchedDraftItem(BaseModel):
     templateId: str
     templateName: Optional[str] = None
     category: Optional[str] = None  # library category, e.g. "Document Draft"
-    matchScore: Optional[int] = None  # 0-100, this draft's fit to the case
-    matchReason: Optional[str] = None  # <= 120 chars
+    matchPercent: Optional[int] = None  # 0-100, this draft's fit to the case
 
 
 class DraftingSuggestionItem(BaseModel):
@@ -561,20 +567,16 @@ class DraftingSuggestionItem(BaseModel):
 
     Emitted inside document_feature_response payload.suggestedDrafts[].
 
-    Template pre-match fields (``templateId`` / ``templateName`` /
-    ``matchMode``) are populated by ``DraftingAgent.suggest()`` when a
-    template in the lawyer's library matches the suggestion. When set,
-    the frontend can render a "Uses <template name>" badge and pass
-    ``templateId`` straight through on click so the kickoff handler
-    skips a second matcher round-trip. When unset (None), the click
-    flow falls back to a blank-source kickoff and the AI infers a
-    standard Indian-advocate skeleton from the case context alone.
+    ``matches`` lists every library draft that matches this suggestion (same
+    document type), sorted by ``matchPercent`` desc. It is ``[]`` for AI-only
+    suggestions with no library match. The frontend renders a "DRAFT AVAILABLE"
+    badge for a single match and "N DRAFTS FOUND" + a pick-one modal when
+    len > 1, and passes the chosen ``templateId`` straight through on click.
 
-    When more than one library draft matches, ``matchedDrafts`` lists them
-    all (sorted by ``matchScore`` desc); the top-level ``templateId`` /
-    ``templateName`` / ``matchScore`` / ``matchReason`` mirror
-    ``matchedDrafts[0]`` (the best match) for back-compat and the
-    single-draft "DRAFT AVAILABLE" badge.
+    Note: the drafting agent works with a richer internal card shape
+    (``matchedDrafts`` / ``matchScore`` plus mirrored top-level template
+    fields); it is serialized to this wire shape at the emit boundary via
+    ``event_utils.drafting_payload_to_wire``.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -582,26 +584,7 @@ class DraftingSuggestionItem(BaseModel):
     title: str
     relevance: Literal["High", "Medium", "Low"] = "Medium"
     description: Optional[str] = None  # one-line summary, <= 160 chars
-    templateId: Optional[str] = None
-    templateName: Optional[str] = None
-    # Debug / UX hint — "type-match", "anchor-match", "tiebreak" when
-    # a template was matched; "no-match" when the library had no
-    # suitable template; None when matching was not attempted (e.g.
-    # legacy callers or empty library).
-    matchMode: Optional[str] = None
-    # Template ↔ case fit, 0-100. How well the bound template's document
-    # type / legal purpose fits THIS case posture (NOT urgency — that's
-    # `relevance`). Populated only on template-backed cards; None when no
-    # template is bound (AI-only suggestion) or scoring was not attempted.
-    # The frontend renders it as a "NN% match" badge. Mirrors matchedDrafts[0].
-    matchScore: Optional[int] = None
-    # One-line rationale (<= 120 chars) explaining the matchScore. None when
-    # no template is bound.
-    matchReason: Optional[str] = None
-    # All library drafts that match this suggestion (same document type),
-    # sorted by matchScore desc. Empty for AI-only suggestions. The frontend
-    # shows "N DRAFTS FOUND" + a pick-one modal when len > 1.
-    matchedDrafts: List["MatchedDraftItem"] = []
+    matches: List["MatchItem"] = []
 
 
 class DraftingSuggestionsPayload(BaseModel):
@@ -661,6 +644,10 @@ class CaseLawItem(BaseModel):
     # --- Provenance & status ---
     sourceUrl: str  # real URL the case was retrieved from / verified against
     sourceName: Optional[str] = None  # "Indian Kanoon" | "Web (Google Search)" | ...
+    # Backend/FE contract fields for the clickable source link; mirror
+    # sourceUrl/sourceName. Kept alongside them for back-compat.
+    referenceUrl: Optional[str] = None  # e.g. "https://indiankanoon.org/doc/123456/"
+    referenceName: Optional[str] = None  # e.g. "Full judgment (Indian Kanoon)"
     # Good-law status is NOT asserted unless there is real evidence; default is an
     # honest "not verified" so a lawyer confirms on SCC Online / Manupatra.
     legalStatus: str = "Not independently verified"
@@ -699,6 +686,71 @@ class AddCaseLawRequest(BaseModel):
     url: Optional[str] = None
     text: Optional[str] = None
     timestamp: Optional[str] = None
+
+
+class CaseLawDocumentRequest(BaseModel):
+    """
+    Payload for case_law_document_request (Server → AI).
+
+    Emitted to the ai_service room right after a lawyer's file is stored in GCS.
+    The AI fetches ``documentUrl``, decides whether the document is a case law,
+    and replies with case_law_document_response echoing the same ``requestId``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    requestId: Optional[str] = Field(
+        None, validation_alias=AliasChoices("requestId", "request_id")
+    )
+    workspaceId: str = Field(
+        ..., validation_alias=AliasChoices("workspaceId", "workspace_id")
+    )
+    userId: str = Field(..., validation_alias=AliasChoices("userId", "user_id"))
+    documentUrl: str = Field(
+        ..., validation_alias=AliasChoices("documentUrl", "document_url")
+    )
+    documentName: Optional[str] = Field(
+        None, validation_alias=AliasChoices("documentName", "document_name")
+    )
+    mimeType: Optional[str] = Field(
+        None, validation_alias=AliasChoices("mimeType", "mime_type")
+    )
+    workspaceRole: Optional[str] = Field(
+        None, validation_alias=AliasChoices("workspaceRole", "workspace_role")
+    )
+    timestamp: Optional[str] = None
+
+
+class UploadedCaseLaw(BaseModel):
+    """Minimal case-law item returned in case_law_document_response.caseLaw."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    citation: Optional[str] = None
+    court: Optional[str] = None
+    summary: Optional[str] = None
+    relevance: Literal["High", "Medium", "Low"] = "Medium"
+    referenceUrl: Optional[str] = None  # e.g. "https://indiankanoon.org/doc/123456/"
+    referenceName: Optional[str] = None  # e.g. "Full judgment (Indian Kanoon)"
+
+
+class CaseLawDocumentResponse(BaseModel):
+    """
+    Payload for case_law_document_response (AI → Server).
+
+    Echoes ``requestId``/``workspaceId``/``userId``. On acceptance ``caseLaw`` is
+    populated; on rejection ``rejectionReason`` explains why the uploaded
+    document is not a case law.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    requestId: Optional[str] = None
+    workspaceId: str
+    userId: str
+    accepted: bool
+    caseLaw: Optional[UploadedCaseLaw] = None
+    rejectionReason: Optional[str] = None
 
 
 # Normalized party-role vocabulary the frontend colour-codes into badges.

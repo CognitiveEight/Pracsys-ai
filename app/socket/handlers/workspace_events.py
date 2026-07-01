@@ -109,6 +109,7 @@ from app.socket.event_utils import (
     _normalize_report_mobile_from_overview,
     _overview_conversation_date_to_iso,
     extract_overview_conversation_report_contact_meta,
+    drafting_payload_to_wire,
 )
 
 
@@ -279,13 +280,15 @@ class WorkspaceEventsMixin:
             # 8) Drafting Assistant — proactive suggestions panel
             drafting_payload = self._workspace_drafting_payload.get(workspace_id)
             if drafting_payload is not None:
+                # Cache holds the internal card shape; serialize to the
+                # matches/matchPercent wire contract on re-emit.
                 await self._socket_client.emit(
                     "document_feature_response",
                     {
                         "featureType": "drafting_assistant",
                         "workspaceId": workspace_id,
                         "userId": user_id,
-                        "payload": drafting_payload,
+                        "payload": drafting_payload_to_wire(drafting_payload),
                     },
                 )
                 logger.success(
@@ -1149,6 +1152,11 @@ class WorkspaceEventsMixin:
                             "list_of_dates",
                             "applicable_laws",
                             "procedural_timeline",
+                            # Document delete regenerates these too (facts changed),
+                            # so show their loaders as well.
+                            "relevant_parties",
+                            "case_laws",
+                            "drafting_assistant",
                         ],
                     )
 
@@ -1382,6 +1390,11 @@ class WorkspaceEventsMixin:
                                     "list_of_dates",
                                     "applicable_laws",
                                     "procedural_timeline",
+                                    # New-document upload regenerates these too
+                                    # (facts changed), so show their loaders as well.
+                                    "relevant_parties",
+                                    "case_laws",
+                                    "drafting_assistant",
                                 ],
                             )
                         except Exception as refresh_err:

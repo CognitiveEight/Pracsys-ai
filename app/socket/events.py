@@ -351,6 +351,10 @@ class SocketEventHandler(
         )
         # Case Laws — user manually adds a precedent (citation / url / text).
         self.register("add_case_law", self.on_add_case_law)
+        # Case Laws — lawyer uploads a document; AI classifies + extracts it.
+        self.register(
+            "case_law_document_request", self.on_case_law_document_request
+        )
         # Relevant Parties — user add / edit / delete of panel items.
         self.register("add_relevant_party", self.on_add_relevant_party)
         self.register("edit_relevant_party", self.on_edit_relevant_party)

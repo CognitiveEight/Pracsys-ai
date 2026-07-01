@@ -50,6 +50,7 @@ __all__ = [
     '_normalize_report_mobile_from_overview',
     '_overview_conversation_date_to_iso',
     'extract_overview_conversation_report_contact_meta',
+    'drafting_payload_to_wire',
 ]
 
 
@@ -639,3 +640,68 @@ def extract_overview_conversation_report_contact_meta(
         )
         return mobile, iso_date
     return None, None
+
+
+def drafting_payload_to_wire(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Serialize the internal drafting-suggestions payload to the wire contract.
+
+    The drafting agent works with a richer internal card shape (``matchedDrafts``
+    with ``matchScore``/``matchReason`` plus mirrored top-level ``templateId`` /
+    ``matchMode`` fields) which the ranking, freeze, and reconnect-cache logic
+    depend on. The backend/frontend contract is narrower: each suggested draft
+    carries only ``{title, relevance, description, matches[]}`` where every match
+    is ``{templateId, templateName, category, matchPercent}`` and ``matches`` is
+    ``[]`` when nothing matched.
+
+    This transform runs only at the emit boundary — the in-memory cache keeps the
+    internal shape. Pure and defensive: unknown/non-dict entries are skipped and
+    match entries without a ``templateId`` are dropped.
+    """
+    out_cards: List[Dict[str, Any]] = []
+    for card in (payload or {}).get("suggestedDrafts") or []:
+        if not isinstance(card, dict):
+            continue
+
+        raw_matches = card.get("matchedDrafts")
+        if isinstance(raw_matches, list) and raw_matches:
+            source_matches = raw_matches
+        elif (card.get("templateId") or "").strip():
+            # Legacy single-template card (no matchedDrafts list): synthesize a
+            # one-item matches array from the top-level template fields.
+            source_matches = [
+                {
+                    "templateId": card.get("templateId"),
+                    "templateName": card.get("templateName"),
+                    "category": card.get("category"),
+                    "matchScore": card.get("matchScore"),
+                }
+            ]
+        else:
+            source_matches = []
+
+        matches: List[Dict[str, Any]] = []
+        for md in source_matches:
+            if not isinstance(md, dict):
+                continue
+            tid = (md.get("templateId") or "").strip()
+            if not tid:
+                continue
+            matches.append(
+                {
+                    "templateId": tid,
+                    "templateName": md.get("templateName"),
+                    "category": md.get("category"),
+                    "matchPercent": md.get("matchScore"),
+                }
+            )
+
+        out_cards.append(
+            {
+                "title": card.get("title"),
+                "relevance": card.get("relevance") or "Medium",
+                "description": card.get("description"),
+                "matches": matches,
+            }
+        )
+
+    return {"suggestedDrafts": out_cards}

@@ -376,6 +376,7 @@ class SocketClient:
             logger.info("   - added_missing_information")
             logger.info("   - applicable_law_relevance_request")
             logger.info("   - add_case_law")
+            logger.info("   - case_law_document_request")
             logger.info("   - add_relevant_party")
             logger.info("   - edit_relevant_party")
             logger.info("   - delete_relevant_party")
@@ -565,6 +566,29 @@ class SocketClient:
             except Exception:
                 logger.info("add_case_law payload (repr): {}", repr(data))
             await event_handler.handle("add_case_law", data)
+
+        @self.sio.event
+        async def case_law_document_request(data):
+            """
+            Handle case_law_document_request (Server → AI_Maverick).
+            A lawyer uploaded a document (stored in GCS). AI fetches documentUrl,
+            decides whether it is a case law, and replies with
+            case_law_document_response echoing requestId (accepted + caseLaw, or
+            rejected + rejectionReason). Accepted cases also update the Case Laws
+            panel via document_feature_response (featureType=case_laws).
+            """
+            logger.info("📄 Received case_law_document_request event")
+            try:
+                raw = json.dumps(data, default=str) if data is not None else "null"
+                logger.info(
+                    "case_law_document_request payload (preview): {}",
+                    raw[:1800] + ("..." if len(raw) > 1800 else ""),
+                )
+            except Exception:
+                logger.info(
+                    "case_law_document_request payload (repr): {}", repr(data)
+                )
+            await event_handler.handle("case_law_document_request", data)
 
         @self.sio.event
         async def add_relevant_party(data):

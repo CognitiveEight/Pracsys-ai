@@ -58,6 +58,7 @@ from app.socket.schemas import (
     AIResponsePayload,
     AnalysisDocxGenerateRequestPayload,
     ApplicableLawRelevanceRequestPayload,
+    CaseLawDocumentRequest,
     TemplateSyncPayload,
     TemplateSyncResponsePayload,
     UserMessageRequestPayload,
@@ -116,6 +117,7 @@ from app.prompts.case_laws_prompts import (
     derive_case_law_query_prompt,
     select_case_laws_prompt,
     extract_judgment_digest_prompt,
+    classify_and_extract_uploaded_case_law_prompt,
 )
 
 
@@ -206,6 +208,13 @@ class CaseLawsMixin:
         def _opt(value: Any) -> Optional[str]:
             return str(value or "").strip() or None
 
+        def _reference_name(source_name: Optional[str]) -> str:
+            # Human-facing label for the source link, e.g.
+            # "Full judgment (Indian Kanoon)"; plain "Full judgment" when the
+            # provenance tag is unknown.
+            sn = (source_name or "").strip()
+            return f"Full judgment ({sn})" if sn else "Full judgment"
+
         restrict_to_sources = bool(allowed_urls)
         allowed_norm = {_norm_url(u) for u in (allowed_urls or [])}
 
@@ -269,6 +278,11 @@ class CaseLawsMixin:
                     "confidence": confidence,
                     "sourceUrl": source_url,
                     "sourceName": _opt(item.get("sourceName")),
+                    # Backend/FE contract fields for the clickable source link.
+                    # Mirror sourceUrl/sourceName; kept alongside them for
+                    # back-compat.
+                    "referenceUrl": source_url,
+                    "referenceName": _reference_name(item.get("sourceName")),
                     "legalStatus": status or "Not independently verified",
                     "verified": True,
                 }
@@ -571,6 +585,13 @@ class CaseLawsMixin:
             c["citation"] = self._combine_case_citation(
                 c.get("title") or "", c.get("citation")
             )
+            # Backfill the source-link contract fields for legacy/cached entries
+            # produced before referenceUrl/referenceName existed (idempotent).
+            if not (c.get("referenceUrl") or "").strip():
+                c["referenceUrl"] = c.get("sourceUrl") or ""
+            if not (c.get("referenceName") or "").strip():
+                sn = (c.get("sourceName") or "").strip()
+                c["referenceName"] = f"Full judgment ({sn})" if sn else "Full judgment"
         return {"caseLaws": merged}
 
     async def _generate_and_emit_case_laws(
@@ -616,6 +637,17 @@ class CaseLawsMixin:
         self._workspace_case_laws_payload[workspace_id] = payload
         if not self._socket_client:
             return
+        n = len(payload.get("caseLaws", []))
+        if n == 0:
+            # Distinguish "found nothing" from a hard failure so the empty panel
+            # is greppable: pair this with the source-count logs above and the
+            # per-card drop logs in _generate_case_laws_from_sources.
+            logger.warning(
+                "Case laws: emitting EMPTY payload for workspace {} (sources={}, "
+                "check Kanoon scrape / grounding / judgment-fetch quality gate)",
+                workspace_id[:12] if workspace_id else "",
+                len(search_results),
+            )
         await self._socket_client.emit(
             "document_feature_response",
             {
@@ -627,6 +659,261 @@ class CaseLawsMixin:
         )
         logger.success(
             "✅ Case laws sent to backend ({} cases)",
-            len(payload.get("caseLaws", [])),
+            n,
         )
         await asyncio.sleep(0.1)
+
+    async def _emit_case_law_document_response(
+        self,
+        *,
+        request_id: Optional[str],
+        workspace_id: str,
+        user_id: str,
+        accepted: bool,
+        case_law: Optional[Dict[str, Any]] = None,
+        rejection_reason: Optional[str] = None,
+    ) -> None:
+        """Emit case_law_document_response (AI → Server), echoing requestId."""
+        if not self._socket_client:
+            return
+        body: Dict[str, Any] = {
+            "requestId": request_id,
+            "workspaceId": workspace_id,
+            "userId": user_id,
+            "accepted": accepted,
+        }
+        if accepted and case_law is not None:
+            body["caseLaw"] = case_law
+        if not accepted:
+            body["rejectionReason"] = (
+                rejection_reason or "The uploaded document is not a case law."
+            )
+        await self._socket_client.emit("case_law_document_response", body)
+        logger.success(
+            "✅ case_law_document_response emitted (accepted={}) requestId={}",
+            accepted,
+            request_id,
+        )
+
+    async def on_case_law_document_request(self, data: Dict[str, Any]) -> None:
+        """
+        Server → AI: a lawyer uploaded a document (stored in GCS). Fetch it,
+        decide whether it is a case law, and reply with
+        case_law_document_response echoing requestId. On acceptance the case is
+        also merged into the Case Laws panel (featureType=case_laws), mirroring
+        on_add_case_law. Any failure still emits a terminal accepted:false reply
+        so the request is never left unanswered.
+        """
+        payload_in = data if isinstance(data, dict) else {}
+        try:
+            req = CaseLawDocumentRequest(**payload_in)
+        except Exception as e:
+            logger.warning("case_law_document_request: invalid payload: {}", e)
+            await self._emit_case_law_document_response(
+                request_id=(
+                    payload_in.get("requestId") or payload_in.get("request_id")
+                ),
+                workspace_id=(
+                    payload_in.get("workspaceId")
+                    or payload_in.get("workspace_id")
+                    or ""
+                ),
+                user_id=(
+                    payload_in.get("userId") or payload_in.get("user_id") or ""
+                ),
+                accepted=False,
+                rejection_reason="Invalid case_law_document_request payload.",
+            )
+            return
+
+        request_id = req.requestId
+        workspace_id = (req.workspaceId or "").strip()
+        user_id = (req.userId or "").strip()
+        document_url = (req.documentUrl or "").strip()
+        document_name = (req.documentName or "").strip() or "case-law-document"
+        role = (req.workspaceRole or "ADJUDICATOR").strip().upper()
+
+        logger.info(
+            "📄 case_law_document_request: workspace={} doc={} requestId={}",
+            workspace_id[:12] if workspace_id else "",
+            document_name,
+            request_id,
+        )
+
+        if not workspace_id or not document_url:
+            await self._emit_case_law_document_response(
+                request_id=request_id,
+                workspace_id=workspace_id,
+                user_id=user_id,
+                accepted=False,
+                rejection_reason="Missing workspaceId or documentUrl.",
+            )
+            return
+
+        try:
+            try:
+                await self._hydrate_workspace_caches(workspace_id, user_id=user_id)
+            except Exception as e:  # pragma: no cover - best-effort
+                logger.debug(
+                    "case_law_document_request: hydration failed (workspace={}): {}",
+                    workspace_id,
+                    e,
+                )
+
+            # 1) Fetch + extract text from the signed URL (PII-redacted; no vector
+            # store / no scoring side effects — same path as chat attachments).
+            text = await document_processor.download_and_extract_text(
+                document_url, document_name
+            )
+            if not text or len(text.strip()) < 100:
+                await self._emit_case_law_document_response(
+                    request_id=request_id,
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    accepted=False,
+                    rejection_reason=(
+                        "The uploaded document could not be read or contains too "
+                        "little text to assess as a case law."
+                    ),
+                )
+                return
+
+            # 2) One LLM pass: classify (is it a case law?) + extract the digest.
+            from app.ai.gemini_client import gemini_client
+
+            signals = await self._extract_case_signals_from_documents(
+                workspace_id, user_id
+            )
+            prompt = classify_and_extract_uploaded_case_law_prompt(
+                judgment_text=text, signals=signals
+            )
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                system_instruction=get_structured_document_feature_system_instruction(
+                    role
+                ),
+                temperature=0.1,
+                max_tokens=12000,
+                response_mime_type="application/json",
+            )
+            parsed_text = (
+                self._prepare_json_candidate(raw or "", prefer="object") or ""
+            )
+            try:
+                parsed = json.loads(parsed_text)
+            except Exception:
+                parsed = {}
+            if not isinstance(parsed, dict):
+                parsed = {}
+
+            is_case_law = bool(parsed.get("isCaseLaw"))
+            case = (
+                parsed.get("caseLaw")
+                if isinstance(parsed.get("caseLaw"), dict)
+                else {}
+            )
+
+            if not is_case_law or not case:
+                reason = (parsed.get("rejectionReason") or "").strip() or (
+                    "The uploaded document does not appear to be a judicial "
+                    "judgment or legal precedent."
+                )
+                await self._emit_case_law_document_response(
+                    request_id=request_id,
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    accepted=False,
+                    rejection_reason=reason,
+                )
+                return
+
+            # 3) Resolve a stable public source URL from the extracted citation;
+            # fall back to the (expiring) upload URL when none resolves.
+            citation = (case.get("citation") or case.get("title") or "").strip()
+            reference_url = document_url
+            source_name = "Uploaded document"
+            if citation:
+                try:
+                    sources, _ = await find_case_law_sources(citation, limit=3)
+                except Exception as e:
+                    logger.debug(
+                        "case_law_document_request: source resolve failed: {}", e
+                    )
+                    sources = []
+                for row in sources or []:
+                    resolved = (row.get("url") or "").strip()
+                    if resolved:
+                        reference_url = resolved
+                        source_name = (
+                            row.get("sourceName") or ""
+                        ).strip() or "Indian Kanoon"
+                        break
+
+            # 4) Normalize (trusted upload — no strict allowed_urls gate). This
+            # stamps referenceUrl/referenceName and the rich digest fields.
+            case_item = dict(case)
+            case_item["sourceUrl"] = reference_url
+            case_item["sourceName"] = source_name
+            normalized = self._normalize_case_laws_payload({"caseLaws": [case_item]})
+            items = normalized.get("caseLaws", [])
+            if not items:
+                await self._emit_case_law_document_response(
+                    request_id=request_id,
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    accepted=False,
+                    rejection_reason=(
+                        "The uploaded document was recognised as a case law but "
+                        "could not be digested into a usable precedent."
+                    ),
+                )
+                return
+            item = items[0]
+
+            # 5) Merge into the panel + re-emit (same as on_add_case_law).
+            merged = self._merge_case_laws_with_previous(
+                workspace_id, {"caseLaws": items}
+            )
+            self._workspace_case_laws_payload[workspace_id] = merged
+            if self._socket_client:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "case_laws",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": merged,
+                    },
+                )
+                logger.success(
+                    "✅ case_law_document_request: appended 1 case; panel now has "
+                    "{} (workspace={})",
+                    len(merged.get("caseLaws", [])),
+                    workspace_id[:12] if workspace_id else "",
+                )
+
+            # 6) Reply with the minimal contract item.
+            await self._emit_case_law_document_response(
+                request_id=request_id,
+                workspace_id=workspace_id,
+                user_id=user_id,
+                accepted=True,
+                case_law={
+                    "citation": item.get("citation"),
+                    "court": item.get("court"),
+                    "summary": item.get("summary"),
+                    "relevance": item.get("relevance") or "Medium",
+                    "referenceUrl": item.get("referenceUrl"),
+                    "referenceName": item.get("referenceName"),
+                },
+            )
+        except Exception as e:
+            logger.warning("case_law_document_request failed: {}", e)
+            logger.exception(e)
+            await self._emit_case_law_document_response(
+                request_id=request_id,
+                workspace_id=workspace_id,
+                user_id=user_id,
+                accepted=False,
+                rejection_reason="Failed to process the uploaded document.",
+            )

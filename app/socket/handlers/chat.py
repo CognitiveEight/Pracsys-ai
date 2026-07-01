@@ -222,6 +222,9 @@ class ChatMixin:
             "templateOriginalName": payload.templateOriginalName,
             "templateMimeType": payload.templateMimeType,
             "draftMode": (payload.draftMode or "").strip().lower() or None,
+            # Reserved layout hint — threaded through for future layout-aware
+            # rendering; the drafting agent does not consume it yet.
+            "formatLayout": payload.formatLayout,
         }
 
         # When the turn may need to resolve/match a template (a suggested-draft

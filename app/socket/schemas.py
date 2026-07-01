@@ -6,7 +6,14 @@ Updated to match backend Socket.IO specification.
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, HttpUrl, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    field_validator,
+)
 
 # ============================================================================
 # Backend Event Payload Schemas (Server → AI)
@@ -139,9 +146,7 @@ class ApplicableLawItemInRequest(BaseModel):
     id: Optional[str] = None
     act: str = Field(..., validation_alias=AliasChoices("act", "Act"))
     section: str = Field(..., validation_alias=AliasChoices("section", "Section"))
-    title: Optional[str] = Field(
-        None, validation_alias=AliasChoices("title", "Title")
-    )
+    title: Optional[str] = Field(None, validation_alias=AliasChoices("title", "Title"))
     description: Optional[str] = Field(
         None, validation_alias=AliasChoices("description", "Description")
     )
@@ -248,7 +253,9 @@ class UserMessageRequestPayload(BaseModel):
     )  # Echo of the clicked suggestion's title — drives template matching.
     suggestionDescription: Optional[str] = Field(
         default=None,
-        validation_alias=AliasChoices("suggestionDescription", "suggestion_description"),
+        validation_alias=AliasChoices(
+            "suggestionDescription", "suggestion_description"
+        ),
     )  # Echo of the clicked suggestion's description — extra signal for matching.
     templateId: Optional[str] = Field(
         default=None,
@@ -260,9 +267,7 @@ class UserMessageRequestPayload(BaseModel):
     )  # Lazy-fetch fallback when AI's template cache is cold.
     templateOriginalName: Optional[str] = Field(
         default=None,
-        validation_alias=AliasChoices(
-            "templateOriginalName", "template_original_name"
-        ),
+        validation_alias=AliasChoices("templateOriginalName", "template_original_name"),
     )
     templateMimeType: Optional[str] = Field(
         default=None,
@@ -271,6 +276,13 @@ class UserMessageRequestPayload(BaseModel):
     draftMode: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("draftMode", "draft_mode"),
+    )
+    # Optional layout hint sent by the frontend (reserved). Parsed and threaded
+    # through to the drafting agent for future layout-aware rendering; not yet
+    # consumed. Shape is frontend-defined — kept opaque here.
+    formatLayout: Optional[Any] = Field(
+        default=None,
+        validation_alias=AliasChoices("formatLayout", "format_layout"),
     )
 
 
@@ -512,7 +524,9 @@ class AIResponsePayload(BaseModel):
     # Drafting Assistant fields (omitted for other chat types).
     actionableId: Optional[str] = None
     chat_type: Optional[str] = None
-    isDraft: Optional[bool] = None  # True only on the turn that just delivered a draft body inline.
+    isDraft: Optional[bool] = (
+        None  # True only on the turn that just delivered a draft body inline.
+    )
     draftStatus: Optional[
         Literal["analyzing", "gathering_info", "ready", "revising"]
     ] = None
@@ -528,20 +542,41 @@ class AIResponsePayload(BaseModel):
 # ============================================================================
 
 
+class MatchItem(BaseModel):
+    """
+    One library draft matched to a suggested draft.
+
+    A suggestion can match MULTIPLE library drafts of the same document type
+    (e.g. two uploaded Legal Notices). Each match carries its own
+    ``matchPercent`` so the frontend can render a "N DRAFTS FOUND" badge and a
+    selection modal listing every matching draft with a "% Match" badge, and
+    pass the chosen ``templateId`` straight through on click.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    templateId: str
+    templateName: Optional[str] = None
+    category: Optional[str] = None  # library category, e.g. "Document Draft"
+    matchPercent: Optional[int] = None  # 0-100, this draft's fit to the case
+
+
 class DraftingSuggestionItem(BaseModel):
     """
     One suggested draft in the proactive Drafting Assistant panel.
 
     Emitted inside document_feature_response payload.suggestedDrafts[].
 
-    Template pre-match fields (``templateId`` / ``templateName`` /
-    ``matchMode``) are populated by ``DraftingAgent.suggest()`` when a
-    template in the lawyer's library matches the suggestion. When set,
-    the frontend can render a "Uses <template name>" badge and pass
-    ``templateId`` straight through on click so the kickoff handler
-    skips a second matcher round-trip. When unset (None), the click
-    flow falls back to a blank-source kickoff and the AI infers a
-    standard Indian-advocate skeleton from the case context alone.
+    ``matches`` lists every library draft that matches this suggestion (same
+    document type), sorted by ``matchPercent`` desc. It is ``[]`` for AI-only
+    suggestions with no library match. The frontend renders a "DRAFT AVAILABLE"
+    badge for a single match and "N DRAFTS FOUND" + a pick-one modal when
+    len > 1, and passes the chosen ``templateId`` straight through on click.
+
+    Note: the drafting agent works with a richer internal card shape
+    (``matchedDrafts`` / ``matchScore`` plus mirrored top-level template
+    fields); it is serialized to this wire shape at the emit boundary via
+    ``event_utils.drafting_payload_to_wire``.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -549,22 +584,7 @@ class DraftingSuggestionItem(BaseModel):
     title: str
     relevance: Literal["High", "Medium", "Low"] = "Medium"
     description: Optional[str] = None  # one-line summary, <= 160 chars
-    templateId: Optional[str] = None
-    templateName: Optional[str] = None
-    # Debug / UX hint — "type-match", "anchor-match", "tiebreak" when
-    # a template was matched; "no-match" when the library had no
-    # suitable template; None when matching was not attempted (e.g.
-    # legacy callers or empty library).
-    matchMode: Optional[str] = None
-    # Template ↔ case fit, 0-100. How well the bound template's document
-    # type / legal purpose fits THIS case posture (NOT urgency — that's
-    # `relevance`). Populated only on template-backed cards; None when no
-    # template is bound (AI-only suggestion) or scoring was not attempted.
-    # The frontend renders it as a "NN% match" badge.
-    matchScore: Optional[int] = None
-    # One-line rationale (<= 120 chars) explaining the matchScore. None when
-    # no template is bound.
-    matchReason: Optional[str] = None
+    matches: List["MatchItem"] = []
 
 
 class DraftingSuggestionsPayload(BaseModel):
@@ -573,6 +593,266 @@ class DraftingSuggestionsPayload(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     suggestedDrafts: List[DraftingSuggestionItem] = []
+
+
+class CaseLawItem(BaseModel):
+    """
+    One relevant case-law precedent in the Case Laws panel.
+
+    Emitted inside document_feature_response payload.caseLaws[] under
+    featureType="case_laws". Every item is source-backed: ``sourceUrl`` always
+    points to the real judgment/source the citation was drawn from (Indian
+    Kanoon, Vertex AI Search, or a Google-Search-grounded web result). Items
+    without a verifiable source are dropped before emit, so ``verified`` is
+    True for everything that reaches the client.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    # --- Identity (from the judgment / source) ---
+    id: str
+    title: str  # e.g. "Arnesh Kumar v. State of Bihar"
+    citation: Optional[str] = None  # primary citation, e.g. "(2014) 8 SCC 273"
+    equivalentCitation: Optional[str] = None  # e.g. "AIR 2014 SC 2756"
+    court: Optional[str] = None  # e.g. "Supreme Court of India"
+    bench: List[str] = []  # judges, when stated in the judgment
+    date: Optional[str] = None  # decision date (ISO or "18 July 2006")
+
+    # --- Precedential weight (derived deterministically from the court) ---
+    bindingStrength: Optional[str] = (
+        None  # "Binding" | "Highly Persuasive" | "Persuasive"
+    )
+    bindingStars: Optional[int] = None  # 1-5, for a quick visual weight badge
+
+    # --- Substance of the judgment (extracted from the real judgment text) ---
+    areaOfLaw: List[str] = []  # e.g. ["Consumer Protection", "Warranty"]
+    legalIssues: List[str] = []  # the questions the judgment answered
+    materialFacts: List[str] = []  # 3-5 legally relevant facts
+    ratio: Optional[str] = None  # ratio decidendi — the binding legal principle
+    holding: Optional[str] = None  # the outcome / disposition
+    relief: List[str] = []  # e.g. ["Refund", "Replacement", "Compensation"]
+
+    # --- AI value-add: how this precedent maps to the user's matter ---
+    summary: str  # one-line holding + relevance (kept for back-compat)
+    relevance: Literal["High", "Medium", "Low"] = "Medium"
+    matchedFacts: List[str] = []  # facts shared with the user's case
+    applicabilityReason: Optional[str] = None  # why it applies to THIS matter
+    distinguishing: List[str] = []  # ways the precedent can be distinguished
+    adverseImpact: Optional[str] = None  # how it may weaken the user's position
+    confidence: Optional[int] = None  # 0-100, AI confidence in the match
+
+    # --- Provenance & status ---
+    sourceUrl: str  # real URL the case was retrieved from / verified against
+    sourceName: Optional[str] = None  # "Indian Kanoon" | "Web (Google Search)" | ...
+    # Backend/FE contract fields for the clickable source link; mirror
+    # sourceUrl/sourceName. Kept alongside them for back-compat.
+    referenceUrl: Optional[str] = None  # e.g. "https://indiankanoon.org/doc/123456/"
+    referenceName: Optional[str] = None  # e.g. "Full judgment (Indian Kanoon)"
+    # Good-law status is NOT asserted unless there is real evidence; default is an
+    # honest "not verified" so a lawyer confirms on SCC Online / Manupatra.
+    legalStatus: str = "Not independently verified"
+    verified: bool = True
+
+
+class CaseLawsPayload(BaseModel):
+    """Inner `payload` shape for featureType=case_laws."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    caseLaws: List[CaseLawItem] = []
+
+
+class AddCaseLawRequest(BaseModel):
+    """
+    Payload for add_case_law event (App → Backend → AI service).
+
+    User manually adds a precedent via the "Add Case Law" button by supplying
+    ANY one of: a citation, a source URL, or free-text description. The AI
+    resolves/verifies a real source, assesses relevance to the case, and
+    appends the case (re-emitting featureType=case_laws). If no real source can
+    be resolved, the cached panel is re-emitted unchanged.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    workspaceId: str = Field(
+        ..., validation_alias=AliasChoices("workspaceId", "workspace_id")
+    )
+    userId: str = Field(..., validation_alias=AliasChoices("userId", "user_id"))
+    workspaceRole: Optional[str] = Field(
+        None, validation_alias=AliasChoices("workspaceRole", "workspace_role")
+    )
+    citation: Optional[str] = None
+    url: Optional[str] = None
+    text: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+class CaseLawDocumentRequest(BaseModel):
+    """
+    Payload for case_law_document_request (Server → AI).
+
+    Emitted to the ai_service room right after a lawyer's file is stored in GCS.
+    The AI fetches ``documentUrl``, decides whether the document is a case law,
+    and replies with case_law_document_response echoing the same ``requestId``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    requestId: Optional[str] = Field(
+        None, validation_alias=AliasChoices("requestId", "request_id")
+    )
+    workspaceId: str = Field(
+        ..., validation_alias=AliasChoices("workspaceId", "workspace_id")
+    )
+    userId: str = Field(..., validation_alias=AliasChoices("userId", "user_id"))
+    documentUrl: str = Field(
+        ..., validation_alias=AliasChoices("documentUrl", "document_url")
+    )
+    documentName: Optional[str] = Field(
+        None, validation_alias=AliasChoices("documentName", "document_name")
+    )
+    mimeType: Optional[str] = Field(
+        None, validation_alias=AliasChoices("mimeType", "mime_type")
+    )
+    workspaceRole: Optional[str] = Field(
+        None, validation_alias=AliasChoices("workspaceRole", "workspace_role")
+    )
+    timestamp: Optional[str] = None
+
+
+class UploadedCaseLaw(BaseModel):
+    """Minimal case-law item returned in case_law_document_response.caseLaw."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    citation: Optional[str] = None
+    court: Optional[str] = None
+    summary: Optional[str] = None
+    relevance: Literal["High", "Medium", "Low"] = "Medium"
+    referenceUrl: Optional[str] = None  # e.g. "https://indiankanoon.org/doc/123456/"
+    referenceName: Optional[str] = None  # e.g. "Full judgment (Indian Kanoon)"
+
+
+class CaseLawDocumentResponse(BaseModel):
+    """
+    Payload for case_law_document_response (AI → Server).
+
+    Echoes ``requestId``/``workspaceId``/``userId``. On acceptance ``caseLaw`` is
+    populated; on rejection ``rejectionReason`` explains why the uploaded
+    document is not a case law.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    requestId: Optional[str] = None
+    workspaceId: str
+    userId: str
+    accepted: bool
+    caseLaw: Optional[UploadedCaseLaw] = None
+    rejectionReason: Optional[str] = None
+
+
+# Normalized party-role vocabulary the frontend colour-codes into badges.
+# Anything outside this set is mapped to "Other" by ``_normalize_party_role``.
+PartyRole = Literal[
+    "Petitioner",
+    "Respondent",
+    "Witness",
+    "Victim",
+    "Accused",
+    "Other",
+]
+
+
+class RelevantPartyItem(BaseModel):
+    """
+    One party in the Relevant Parties panel.
+
+    Emitted inside document_feature_response payload.parties[] under
+    featureType="relevant_parties". Names are taken verbatim from the uploaded
+    documents (never invented); ``role`` is a normalized enum the frontend
+    colour-codes. Contact fields are PII: they are emitted empty on
+    document-driven auto-generation and only populated when the user supplies
+    them via the add/edit_relevant_party panel-edit events.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: str
+    name: str  # exact name/title as written, e.g. "Rajesh Kumar", "President, BCCI"
+    role: PartyRole = "Other"
+    details: str  # one neutral sentence on this party's role in the matter
+    contactNumber: str = ""  # user-supplied (panel edit); "" on auto-gen
+    email: str = ""  # user-supplied (panel edit); "" on auto-gen
+    officialIdUrl: str = ""  # user-supplied (panel edit); "" on auto-gen
+
+
+class RelevantPartiesPayload(BaseModel):
+    """Inner `payload` shape for featureType=relevant_parties."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    parties: List[RelevantPartyItem] = []
+
+
+class AddRelevantPartyRequest(BaseModel):
+    """Payload for add_relevant_party (App → Backend → AI). User adds a party."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    workspaceId: str = Field(
+        ..., validation_alias=AliasChoices("workspaceId", "workspace_id")
+    )
+    userId: str = Field(..., validation_alias=AliasChoices("userId", "user_id"))
+    workspaceRole: Optional[str] = Field(
+        None, validation_alias=AliasChoices("workspaceRole", "workspace_role")
+    )
+    name: str
+    role: Optional[str] = None  # coerced to PartyRole; AI infers when omitted
+    details: Optional[str] = None  # contract field; `description` kept for back-compat
+    description: Optional[str] = None
+    contactNumber: Optional[str] = None
+    email: Optional[str] = None
+    officialIdUrl: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+class EditRelevantPartyRequest(BaseModel):
+    """Payload for edit_relevant_party (App → Backend → AI). Edit a party by id."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    workspaceId: str = Field(
+        ..., validation_alias=AliasChoices("workspaceId", "workspace_id")
+    )
+    userId: str = Field(..., validation_alias=AliasChoices("userId", "user_id"))
+    partyId: str = Field(
+        ..., validation_alias=AliasChoices("partyId", "party_id", "id")
+    )
+    name: Optional[str] = None
+    role: Optional[str] = None
+    details: Optional[str] = None  # contract field; `description` kept for back-compat
+    description: Optional[str] = None
+    contactNumber: Optional[str] = None
+    email: Optional[str] = None
+    officialIdUrl: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+class DeleteRelevantPartyRequest(BaseModel):
+    """Payload for delete_relevant_party (App → Backend → AI). Delete by id."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    workspaceId: str = Field(
+        ..., validation_alias=AliasChoices("workspaceId", "workspace_id")
+    )
+    userId: str = Field(..., validation_alias=AliasChoices("userId", "user_id"))
+    partyId: str = Field(
+        ..., validation_alias=AliasChoices("partyId", "party_id", "id")
+    )
+    timestamp: Optional[str] = None
 
 
 # ============================================================================

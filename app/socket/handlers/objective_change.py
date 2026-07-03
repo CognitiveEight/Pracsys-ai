@@ -147,6 +147,14 @@ class ObjectiveChangeMixin:
         existing lenient mode.
         """
         ctx = log_context or ""
+        # On a document DELETION (deleted_doc_ids present) the web-search-derived
+        # panels must REFLECT the reduced document set, not accumulate on top of
+        # it. Case laws / applicable laws have no per-document linkage, so they
+        # can't be purged selectively like list_of_dates — instead we replace the
+        # cached set with the freshly-derived one. Uploads (no deleted_doc_ids)
+        # keep the merge/accumulate behaviour ("keep what the user has seen +
+        # fold in new").
+        replace_derived = bool(deleted_doc_ids)
 
         async def _runner() -> None:
             try:
@@ -173,6 +181,7 @@ class ObjectiveChangeMixin:
                     workspace_id=workspace_id,
                     user_id=user_id,
                     workspace_role=workspace_role,
+                    merge_with_previous=not replace_derived,
                 )
             except Exception as laws_err:
                 logger.warning(
@@ -228,6 +237,7 @@ class ObjectiveChangeMixin:
                     workspace_id=workspace_id,
                     user_id=user_id,
                     workspace_role=workspace_role,
+                    merge_with_previous=not replace_derived,
                 )
             except Exception as case_err:
                 logger.warning(

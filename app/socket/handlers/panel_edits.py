@@ -274,13 +274,20 @@ class PanelEditsMixin:
             "contactNumber": (payload.get("contactNumber") or "").strip(),
             "email": (payload.get("email") or "").strip(),
             "officialIdUrl": (payload.get("officialIdUrl") or "").strip(),
+            # No document provenance — flag it so per-document purging on a
+            # document delete never removes a manually-added party.
+            "sourceDocIds": [],
+            "userAdded": True,
         }
         current = self._workspace_relevant_parties_payload.get(workspace_id) or {
             "parties": []
         }
         parties = [p for p in (current.get("parties") or []) if isinstance(p, dict)]
         key = self._party_name_key(name)
-        if any(self._party_name_key(p.get("name")) == key for p in parties):
+        if any(
+            self._party_names_match(key, self._party_name_key(p.get("name")))
+            for p in parties
+        ):
             logger.info("add_relevant_party: duplicate name – re-emitting unchanged")
             await self._emit_relevant_parties(workspace_id, user_id)
             return

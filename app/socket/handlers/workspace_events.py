@@ -1227,22 +1227,19 @@ class WorkspaceEventsMixin:
                         analysis_report = self._analysis_report_fallback(
                             (workspace_role or "ADJUDICATOR").strip().upper()
                         )
-                    # Merge with previous so post-deletion regeneration doesn't
-                    # re-emit duplicates of items the user already saw.
-                    if isinstance(analysis_report, dict):
-                        try:
-                            analysis_report = await self._merge_analysis_report_with_previous(
-                                workspace_id=str(payload.workspaceId),
-                                workspace_role=workspace_role,
-                                new_analysis=analysis_report,
-                                log_context=" (post-delete)",
-                            )
-                        except Exception as merge_err:
-                            logger.warning(
-                                "Analysis report merge after delete failed: {}; "
-                                "emitting unmerged",
-                                merge_err,
-                            )
+                    # Document deletion REPLACES the analysis report with the
+                    # freshly-regenerated one (derived from the remaining docs)
+                    # instead of unioning with the previous version. Analysis
+                    # items are free-text with no linkage to a source document,
+                    # so a merge would keep strengths/weaknesses/risks derived
+                    # from the just-deleted document (same grow-only-on-delete
+                    # issue as case_laws / applicable_laws). Uploads / other
+                    # regenerations still merge (see the sync path below).
+                    logger.info(
+                        "Analysis report: replacing (not merging) after document "
+                        "deletion for workspace {}",
+                        str(payload.workspaceId)[:12],
+                    )
                     try:
                         if self._socket_client:
                             await self._socket_client.emit(

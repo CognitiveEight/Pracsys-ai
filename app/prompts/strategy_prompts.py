@@ -77,7 +77,7 @@ f"""You are a legal strategy analyst for Indian law. Analyze the following docum
     )
 
 
-def generate_strategies_from_documents_prompt2(*, SPEAKER_LABEL_GUARDRAIL, _entities_block, annexure_limit_block, combined_document_content, strategy_inventory, workspace_role):
+def generate_strategies_from_documents_prompt2(*, SPEAKER_LABEL_GUARDRAIL, _entities_block, annexure_limit_block, combined_document_content, strategy_inventory, workspace_role, current_year, today_str):
     return (
 f"""Analyze these legal documents and provide a JSON response.
 
@@ -113,6 +113,8 @@ TRUNCATED-TEXT AND PERIPHERAL-ENTITY RULES (CRITICAL — applies to caseSummary,
 5. If after filtering you have NO concrete case facts left in a section, state that limitation explicitly per the INSUFFICIENT DATA rule below — do NOT fill the gap with peripheral biller / vendor / payee listings.
 
 {SPEAKER_LABEL_GUARDRAIL}
+
+DATE INTERPRETATION (CRITICAL): Today is {today_str} (current year {current_year}). If the source states a date together with its year, use that exact year. If a date is stated WITHOUT a year (e.g. "25 May", "26 tareekh", "last month"), use the CURRENT YEAR ({current_year}); step back one year only if the current year would place the event in the future. Never default to 2024 or any other legacy year for a date whose year was not stated in the source. Statute years (e.g. "Information Technology Act, 2000", "BNS, 2023") are fixed by law and MUST NOT be changed by this rule.
 
 YOUR ROLE: {workspace_role}
 

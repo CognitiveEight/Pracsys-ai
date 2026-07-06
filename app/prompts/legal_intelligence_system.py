@@ -4,6 +4,7 @@ Governs the Intelligence Chat module: annexure upload gate, role conditioning,
 evidence referencing, and role-specific behavior (Adjudicator, Petitioner, Respondent, Mediator).
 """
 
+from datetime import datetime
 from typing import Optional
 
 # Four roles supported by the workspace (New Workspace modal).
@@ -793,11 +794,23 @@ def get_structured_document_feature_system_instruction(
     JSON instructions and produces generic fallbacks.
     """
     role_upper = (current_role or "").strip().upper() or "ADJUDICATOR"
+    today = datetime.utcnow()
+    today_str = today.strftime("%Y-%m-%d")
+    current_year = today.strftime("%Y")
     return (
         "You are a backend structured-output module for Indian legal workspaces. "
         f"The workspace role is already selected: {role_upper}. "
         "Never ask the user to choose a role. Never output annexure-upload gate messages, "
         "onboarding text, or conversational preambles. "
+        "DATE INTERPRETATION — "
+        f"Today's date is {today_str} (current year is {current_year}). "
+        "If the source states a date together with its year, use that exact year unchanged. "
+        "When a source mentions a day and/or month WITHOUT an explicit year, assume the "
+        f"CURRENT YEAR ({current_year}); only if the current year would place the event in "
+        "the future should the previous year be used. Do not default to any fixed past year "
+        "(e.g. 2024) for a date whose year was not stated in the source — always anchor to "
+        "the current year given above. Treat currency amounts (e.g. ₹2000, Rs. 2000) as "
+        "money, never as a year. "
         "WRITING STYLE — passive voice in formal Indian legal register, as used "
         "in pleadings, judgments, and statutory drafting. Examples: 'A petition "
         "has been filed', 'the notice was served', 'compensation is sought' — "

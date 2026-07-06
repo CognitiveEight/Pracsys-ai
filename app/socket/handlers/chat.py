@@ -1193,6 +1193,98 @@ class ChatMixin:
                             if ok:
                                 panel_edit_applied.append("upcoming dates")
 
+                        # Terminal-emit guard (rename path). The workspace:refresh
+                        # above turned the FE spinner ON for list_of_dates,
+                        # applicable_laws and procedural_timeline. Each
+                        # _regenerate_*_with_feedback helper emits ONLY when it
+                        # actually changed the payload and returns False WITHOUT
+                        # emitting on a no-op (the renamed token — e.g. a year like
+                        # "2024" — is usually absent from laws/timeline). Without a
+                        # completion emit the spinner never clears. So for every
+                        # doc-derived panel whose spinner we lit but which did NOT
+                        # emit, re-emit the preserved cached payload — the same
+                        # preserve-and-re-emit contract as
+                        # _run_objective_change_incremental_refresh.
+                        if _is_rename and _any_should_edit and self._socket_client:
+                            try:
+                                if "list of dates" not in panel_edit_applied:
+                                    _preserved_lod = (
+                                        self._workspace_list_of_dates_payload.get(
+                                            workspace_id
+                                        )
+                                        or []
+                                    )
+                                    if not isinstance(_preserved_lod, list):
+                                        _preserved_lod = []
+                                    await self._socket_client.emit(
+                                        "document_feature_response",
+                                        {
+                                            "featureType": "list_of_dates",
+                                            "workspaceId": workspace_id,
+                                            "userId": user_id,
+                                            "payload": {
+                                                "workspaceId": workspace_id,
+                                                "userId": user_id,
+                                                "listOfDates": _preserved_lod,
+                                            },
+                                        },
+                                    )
+                                    logger.success(
+                                        "✅ Rename: preserved list_of_dates re-emitted (no-op edit) workspace={}",
+                                        workspace_id[:12] if workspace_id else "",
+                                    )
+                                if "applicable laws" not in panel_edit_applied:
+                                    _preserved_laws = (
+                                        self._workspace_applicable_laws_payload.get(
+                                            workspace_id
+                                        )
+                                        or {}
+                                    )
+                                    if not isinstance(_preserved_laws, dict):
+                                        _preserved_laws = {}
+                                    await self._socket_client.emit(
+                                        "document_feature_response",
+                                        {
+                                            "featureType": "applicable_laws",
+                                            "workspaceId": workspace_id,
+                                            "userId": user_id,
+                                            "payload": _preserved_laws,
+                                        },
+                                    )
+                                    logger.success(
+                                        "✅ Rename: preserved applicable_laws re-emitted (no-op edit) workspace={}",
+                                        workspace_id[:12] if workspace_id else "",
+                                    )
+                                if "upcoming dates" not in panel_edit_applied:
+                                    _preserved_timeline = (
+                                        self._workspace_procedural_timeline_payload.get(
+                                            workspace_id
+                                        )
+                                        or []
+                                    )
+                                    if not isinstance(_preserved_timeline, list):
+                                        _preserved_timeline = []
+                                    await self._socket_client.emit(
+                                        "document_feature_response",
+                                        {
+                                            "featureType": "procedural_timeline",
+                                            "workspaceId": workspace_id,
+                                            "userId": user_id,
+                                            "payload": {
+                                                "proceduralTimeline": _preserved_timeline
+                                            },
+                                        },
+                                    )
+                                    logger.success(
+                                        "✅ Rename: preserved procedural_timeline re-emitted (no-op edit) workspace={}",
+                                        workspace_id[:12] if workspace_id else "",
+                                    )
+                            except Exception as _preserve_err:
+                                logger.warning(
+                                    "Rename preserve-and-re-emit fallback failed (non-fatal): {}",
+                                    _preserve_err,
+                                )
+
                         # Coalesced strategy emit: the three strategy editors above
                         # suppressed their own emits (emit_result=False), so the FE
                         # now receives ONE strategy_objective update for the whole

@@ -15,7 +15,7 @@ __all__ = [
 
 def regenerate_list_of_dates_with_feedback_prompt(*, current_json, instruction):
     return (
-f"""You are editing a legal case's LIST OF DATES (a JSON array of dated events). Apply ONLY the user's name change to the EXISTING entries and return the FULL array.
+f"""You are editing a legal case's LIST OF DATES (a JSON array of dated events). Apply ONLY the user's find-and-replace / correction instruction to the EXISTING entries and return the FULL array. This is a surgical edit, NOT a regeneration.
 
 **User's edit instruction** (apply EXACTLY as worded):
 {instruction}
@@ -24,10 +24,12 @@ CURRENT list of dates (edit THIS array in place):
 {current_json}
 
 STRICT RULES:
-1. This is a NAME change ONLY. Replace the renamed party's name wherever it appears in each entry's "title", "description", and "evidenceSnippet". If the party is referenced by ROLE or DESCRIPTION (e.g. "the wife", "the female employee", "the petitioner", "she"), use the role / gender / description context to identify her and apply the supplied name there too — a literal matching token is NOT required.
+1. Apply ONLY what the instruction specifies — a correction of a NAME, TERM, DATE, or YEAR:
+   - NAME change: replace the party's name wherever it appears in each entry's "title", "description", and "evidenceSnippet". If the party is referenced by ROLE or DESCRIPTION (e.g. "the wife", "the female employee", "the petitioner", "she"), use the role / gender / description context to identify her and apply the supplied name there too — a literal matching token is NOT required.
+   - DATE or YEAR change: apply it to the "date" field as well. "date" is an ISO value "YYYY-MM-DD"; when the instruction replaces a year (e.g. 2024 → 2026), rewrite the year of EVERY "date" that carries the old year ("2024-05-25" → "2026-05-25"), and also update any date/year text that appears in "title", "description", and "evidenceSnippet".
 2. Keep the SAME number of entries in the SAME order. Do NOT add, remove, merge, or reorder entries.
-3. Do NOT change any other field — "date", "relevance", "sourceDocId", "sourceDocName", "eventType", "pageNumber", "isIncident" must be reproduced EXACTLY as-is for every entry.
-4. Change nothing except the renamed name. Every other word stays verbatim.
+3. Reproduce "relevance", "sourceDocId", "sourceDocName", "eventType", "pageNumber", and "isIncident" EXACTLY as-is for every entry. Change "date" ONLY when the instruction targets a date or year; otherwise reproduce it unchanged.
+4. Change nothing except what the instruction specifies. Every other word / value stays verbatim.
 
 Return ONLY the complete, valid JSON array (no markdown code fences, no commentary)."""
     )

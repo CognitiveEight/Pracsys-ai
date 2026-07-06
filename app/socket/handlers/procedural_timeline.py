@@ -130,12 +130,13 @@ class ProceduralTimelineMixin:
         emit_result: bool = True,
     ) -> bool:
         """
-        Apply a NAME change to the EXISTING Procedural Timeline (Upcoming Dates)
-        entries (Mode 1 rename). Surgical only: replaces the renamed party's name
-        in each entry's ``title`` / ``description`` and preserves ``date`` /
-        ``type`` and the entry set. Never regenerates the timeline. Operates on
-        the cached ``_workspace_procedural_timeline_payload`` and re-emits
-        featureType=procedural_timeline.
+        Apply a surgical find-and-replace / correction to the EXISTING Procedural
+        Timeline (Upcoming Dates) entries (Mode 1) — a NAME, TERM, DATE, or YEAR
+        change. Surgical only: applies the instruction to each entry's ``title`` /
+        ``description`` (and, for a date/year change, the ISO ``date`` field too)
+        and preserves ``type`` and the entry set. Never regenerates the timeline.
+        Operates on the cached ``_workspace_procedural_timeline_payload`` and
+        re-emits featureType=procedural_timeline.
         """
         try:
             from app.ai.gemini_client import gemini_client

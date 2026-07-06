@@ -132,13 +132,15 @@ class ListOfDatesMixin:
         emit_result: bool = True,
     ) -> bool:
         """
-        Apply a NAME change to the EXISTING List of Dates entries (Mode 1).
+        Apply a surgical find-and-replace / correction to the EXISTING List of
+        Dates entries (Mode 1) — a NAME, TERM, DATE, or YEAR change.
 
-        Surgical only: it replaces the renamed party's name in each entry's
-        title / description / evidenceSnippet and changes NOTHING else — no new
-        or removed entries, and date / relevance / sourceDocId / sourceDocName /
-        eventType / pageNumber / isIncident are all preserved. It never
-        regenerates the list from documents. Operates on the cached
+        Surgical only: it applies the instruction to each entry's
+        title / description / evidenceSnippet (and, for a date/year change, the
+        ISO ``date`` field too) and changes NOTHING else — no new or removed
+        entries, and relevance / sourceDocId / sourceDocName / eventType /
+        pageNumber / isIncident are all preserved. It never regenerates the list
+        from documents. Operates on the cached
         ``_workspace_list_of_dates_payload`` and re-emits featureType=list_of_dates.
         """
         try:

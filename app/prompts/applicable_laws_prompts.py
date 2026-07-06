@@ -9,7 +9,7 @@ __all__ = [
 
 def regenerate_applicable_laws_with_feedback_prompt(*, current_json, instruction):
     return (
-f"""You are editing a case's APPLICABLE LAWS (JSON object {{"laws": [...]}}). Apply ONLY the user's name change to the EXISTING law entries and return the FULL object.
+f"""You are editing a case's APPLICABLE LAWS (JSON object {{"laws": [...]}}). Apply ONLY the user's find-and-replace / correction instruction to the EXISTING law entries and return the FULL object. This is a surgical edit, NOT a regeneration.
 
 **User's edit instruction** (apply EXACTLY as worded):
 {instruction}
@@ -18,10 +18,12 @@ CURRENT applicable laws (edit THIS object in place):
 {current_json}
 
 STRICT RULES:
-1. This is a NAME change ONLY. Replace the renamed party's name wherever it appears in each law's "description". If the party is referenced by ROLE or DESCRIPTION (e.g. "the wife", "the female employee", "the petitioner", "she"), use the role / gender / description context to identify her and apply the supplied name there too — a literal matching token is NOT required.
+1. Apply ONLY what the instruction specifies — a correction of a NAME, TERM, DATE, or YEAR, and ONLY inside each law's "description":
+   - NAME change: replace the party's name wherever it appears in "description". If the party is referenced by ROLE or DESCRIPTION (e.g. "the wife", "the female employee", "the petitioner", "she"), use the role / gender / description context to identify her and apply the supplied name there too — a literal matching token is NOT required.
+   - DATE or YEAR change: update any date/year that appears in "description" (e.g. replace 2024 with 2026). Do NOT alter a statute's own year (those live in "act"/"section", which are fixed by rule 3).
 2. Keep the SAME laws in the SAME order. Do NOT add, remove, merge, or reorder laws.
-3. Do NOT change "id", "act", "section", or "relevance" for any law — reproduce them EXACTLY.
-4. Change nothing except the renamed name inside "description". Statute names / section numbers stay verbatim.
+3. Do NOT change "id", "act", "section", or "relevance" for any law — reproduce them EXACTLY. Statute names / section numbers stay verbatim.
+4. Change nothing except what the instruction specifies inside "description".
 
 Return ONLY the complete, valid JSON object (no markdown code fences, no commentary)."""
     )

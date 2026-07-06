@@ -52,6 +52,7 @@ from app.langgraph.chat_nodes import (
 from app.langgraph.list_of_dates_agent import (
     list_of_dates_temporal_agent,
     snap_hallucinated_year,
+    snap_years_in_text,
 )
 from app.socket.schemas import (
     AIResponseMetadata,
@@ -432,6 +433,12 @@ class AnalysisReportMixin:
             except Exception:
                 _entities_block_ar = "{}"
 
+            # Current-date context for year resolution: a source date stated
+            # without a year defaults to the current year (mirrors list_of_dates).
+            _today_ar = datetime.utcnow()
+            today_str_ar = _today_ar.strftime("%Y-%m-%d")
+            current_year_ar = _today_ar.strftime("%Y")
+
             analysis_prompt = (
                 """You are a senior legal analyst specializing in Indian law. Your task is to produce a structured legal analysis based ONLY on the uploaded documents.
 
@@ -746,6 +753,7 @@ No extra text.
 
 ENTITY-GROUNDING RULE (CRITICAL):
 - Every entry in `strengths` (the `point` field), `weaknesses`, `risks`, and `missingInfo` MUST cite at least one named party, specific date (DD/MM/YYYY), exact amount, suit/case/FIR number, or Annexure reference taken from EXTRACTED FACTS — never generic categories.
+- DATE INTERPRETATION: Today is {current_year_ar}. When a date appears in EXTRACTED FACTS without an explicit year, render it in DD/MM/YYYY using the CURRENT YEAR ({current_year_ar}); step back one year only if the current year would place the event in the future. Never default to 2024 or any other legacy year for a date whose year is not stated in the source. Statute years (e.g. "Information Technology Act, 2000", "BNS, 2023") are fixed by law and MUST NOT be changed by this rule.
 - Do NOT use "Party No. 1" / "Party No. 2" / "the plaintiff" / "the respondent" / "the petitioner" anywhere in `strengths`, `weaknesses`, `risks`, `missingInfo`, `pendingActions`, `nextSteps`, `suggestedDrafts`, or the explanation strings. Always use the exact names listed in EXTRACTED FACTS.
 - The `relevantJurisdiction` array is EXEMPT from this rule: it follows the strict COURT/FORUM-by-location format defined above and lists only jurisdiction/forum names — no party names, no dates, no amounts.
 """
@@ -758,6 +766,7 @@ ENTITY-GROUNDING RULE (CRITICAL):
                 combined_document_content,
                 entities_block_ar=_entities_block_ar,
                 annexure_limit_block=annexure_limit_block,
+                current_year_ar=current_year_ar,
             )
 
             custom_suffix = build_custom_instruction_suffix(workspace_id)
@@ -1370,6 +1379,26 @@ Rules:
             if not isinstance(suggested_drafts, list):
                 suggested_drafts = [suggested_drafts] if suggested_drafts else []
             suggested_drafts = [str(x).strip() for x in suggested_drafts if x][:6]
+
+            # Deterministic year backstop: snap any FULL date whose year is a
+            # hallucinated legacy year (e.g. 2024 on a year-less transcript) to
+            # the current year, across every free-text field. Only full dates
+            # are touched — statute years ("IT Act, 2000", "BNS, 2023") and
+            # amounts are preserved; an explicit source year is kept. Mirrors the
+            # list_of_dates guard so all panels agree on year resolution.
+            def _snap(_t):
+                return snap_years_in_text(
+                    _t, today_iso=today_str_ar, document_text=combined_document_content
+                )
+
+            missing_info = [_snap(x) for x in missing_info]
+            for _s in strengths:
+                if isinstance(_s, dict) and isinstance(_s.get("point"), str):
+                    _s["point"] = _snap(_s["point"])
+            weaknesses = [_snap(x) for x in weaknesses]
+            risks = [_snap(x) for x in risks]
+            quality_score_explanation = _snap(quality_score_explanation)
+            report_quality_score_explanation = _snap(report_quality_score_explanation)
 
             payload = {
                 "missingInfo": missing_info,

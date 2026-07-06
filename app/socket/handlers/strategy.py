@@ -52,6 +52,7 @@ from app.langgraph.chat_nodes import (
 from app.langgraph.list_of_dates_agent import (
     list_of_dates_temporal_agent,
     snap_hallucinated_year,
+    snap_years_in_text,
 )
 from app.socket.schemas import (
     AIResponseMetadata,
@@ -330,6 +331,12 @@ class StrategyMixin:
                 "🤖 Generating AI-powered case analysis (all documents, upload order)..."
             )
 
+            # Current-date context for year resolution: a source date stated
+            # without a year defaults to the current year (mirrors list_of_dates).
+            _today = datetime.utcnow()
+            today_str = _today.strftime("%Y-%m-%d")
+            current_year = _today.strftime("%Y")
+
             analysis_prompt = generate_strategies_from_documents_prompt(combined_document_content=combined_document_content, workspace_role=workspace_role)
 
             try:
@@ -342,7 +349,7 @@ class StrategyMixin:
                 except Exception:
                     _entities_block = "{}"
                 # Improved prompt for better JSON generation
-                structured_prompt = generate_strategies_from_documents_prompt2(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, _entities_block=_entities_block, annexure_limit_block=annexure_limit_block, combined_document_content=combined_document_content, strategy_inventory=strategy_inventory, workspace_role=workspace_role)
+                structured_prompt = generate_strategies_from_documents_prompt2(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, _entities_block=_entities_block, annexure_limit_block=annexure_limit_block, combined_document_content=combined_document_content, strategy_inventory=strategy_inventory, workspace_role=workspace_role, current_year=current_year, today_str=today_str)
                 custom_suffix = build_custom_instruction_suffix(workspace_id)
                 if custom_suffix:
                     structured_prompt = (
@@ -947,6 +954,26 @@ class StrategyMixin:
             suggestion_chips = [
                 _clamp_annexure_references(s, num_annexures)
                 for s in (suggestion_chips or [])
+            ]
+
+            # Deterministic year backstop: after all generation/recovery/verifier
+            # merges, snap any FULL date whose year is a hallucinated legacy year
+            # (e.g. 2024 on a year-less transcript) to the current year. Only full
+            # dates are touched — statute years ("IT Act, 2000", "BNS, 2023") and
+            # amounts are preserved; an explicit source year is kept. Mirrors the
+            # list_of_dates guard so all panels agree on year resolution.
+            case_summary = snap_years_in_text(
+                case_summary, today_iso=today_str, document_text=combined_document_content
+            )
+            report_case_summary = snap_years_in_text(
+                report_case_summary, today_iso=today_str, document_text=combined_document_content
+            )
+            strategic_objective = snap_years_in_text(
+                strategic_objective, today_iso=today_str, document_text=combined_document_content
+            )
+            possible_next_steps = [
+                snap_years_in_text(s, today_iso=today_str, document_text=combined_document_content)
+                for s in possible_next_steps
             ]
 
             # Format the response (use doc_count from vector store when batch_result not provided, e.g. after delete)

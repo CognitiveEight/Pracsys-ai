@@ -131,11 +131,11 @@ class ApplicableLawsMixin:
         emit_result: bool = True,
     ) -> bool:
         """
-        Apply a NAME change to the EXISTING Applicable Laws entries (Mode 1
-        rename). Surgical only: replaces the renamed party's name in each law's
-        ``description`` and changes NOTHING else — same laws, same count/order,
-        and `id` / `act` / `section` / `relevance` preserved. Never regenerates
-        laws from documents. Operates on the cached
+        Apply a surgical find-and-replace / correction to the EXISTING Applicable
+        Laws entries (Mode 1) — a NAME, TERM, DATE, or YEAR change, applied ONLY
+        inside each law's ``description``. Same laws, same count/order, and
+        `id` / `act` / `section` / `relevance` preserved (statute years are never
+        altered). Never regenerates laws from documents. Operates on the cached
         ``_workspace_applicable_laws_payload`` and re-emits featureType=applicable_laws.
         """
         try:

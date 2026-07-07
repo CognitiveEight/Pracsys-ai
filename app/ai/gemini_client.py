@@ -223,9 +223,7 @@ class GeminiClient:
             fr_repr = getattr(finish_reason, "name", None) or str(finish_reason)
         except Exception:
             fr_repr = "unknown"
-        logger.debug(
-            "Gemini returned no usable text (finish_reason={})", fr_repr
-        )
+        logger.debug("Gemini returned no usable text (finish_reason={})", fr_repr)
         return ""
 
     @staticmethod
@@ -633,6 +631,123 @@ class GeminiClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
+
+    @staticmethod
+    def _extract_grounding_sources(response: Any) -> List[Dict[str, str]]:
+        """Pull web sources out of a grounded response's grounding metadata.
+
+        Returns a list of ``{"title", "url"}`` dicts (deduped by URL). The
+        grounding metadata shape varies across SDK versions and is frequently
+        absent (model answered without searching), so every access is guarded
+        and an empty list is the safe default.
+        """
+        sources: List[Dict[str, str]] = []
+        seen: set = set()
+        try:
+            candidates = list(getattr(response, "candidates", None) or [])
+            if not candidates:
+                return sources
+            meta = getattr(candidates[0], "grounding_metadata", None)
+            chunks = list(getattr(meta, "grounding_chunks", None) or [])
+            for chunk in chunks:
+                web = getattr(chunk, "web", None)
+                if web is None:
+                    continue
+                url = str(getattr(web, "uri", "") or "").strip()
+                title = str(getattr(web, "title", "") or "").strip()
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                sources.append({"title": title, "url": url})
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Failed to extract grounding sources: {}", exc)
+        return sources
+
+    @tracer.trace("gemini_generate_grounded")
+    async def generate_grounded(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        temperature: float = 0.2,
+        max_tokens: int = 12000,
+        thinking_level: str = "LOW",
+    ) -> tuple[str, List[Dict[str, str]]]:
+        """Generate text grounded in real-time Google Search results.
+
+        Uses the new google-genai SDK's ``google_search`` tool so the model
+        searches the live web and returns both prose AND the source URLs it
+        relied on (via ``grounding_metadata``). This is the "latest case law"
+        channel for the Case Laws feature.
+
+        Returns ``(text, [{"title", "url"}, ...])``. Grounding is only
+        available on the new SDK, so when it is unavailable (or any error
+        occurs) this returns ``("", [])`` and callers fall back to other
+        search sources. ``response_mime_type=application/json`` is intentionally
+        NOT set — the search tool returns prose plus grounding metadata, and the
+        two cannot be combined.
+        """
+        client = self._get_ng_client()
+        if client is None:
+            logger.info("google-genai unavailable; grounded generation skipped")
+            return "", []
+        try:
+            safety = [
+                genai_ng_types.SafetySetting(
+                    category=cat,
+                    threshold=genai_ng_types.HarmBlockThreshold.BLOCK_NONE,
+                )
+                for cat in (
+                    genai_ng_types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                    genai_ng_types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                    genai_ng_types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                    genai_ng_types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                )
+            ]
+            cfg_kwargs: Dict[str, Any] = dict(
+                temperature=temperature,
+                max_output_tokens=max(int(max_tokens or 0), 16000),
+                safety_settings=safety,
+                tools=[
+                    genai_ng_types.Tool(google_search=genai_ng_types.GoogleSearch())
+                ],
+                thinking_config=genai_ng_types.ThinkingConfig(
+                    thinking_level=self._ng_thinking_level(thinking_level),
+                ),
+            )
+            if system_instruction:
+                cfg_kwargs["system_instruction"] = system_instruction
+            config = genai_ng_types.GenerateContentConfig(**cfg_kwargs)
+
+            # Use the SYNCHRONOUS client in a worker thread rather than
+            # ``client.aio`` deliberately: the google-genai async transport runs
+            # on aiohttp, and with the search tool enabled it references
+            # ``aiohttp.ClientConnectorDNSError`` (added in aiohttp 3.10+). This
+            # service pins aiohttp 3.9.5 (for python-socketio), so the async path
+            # raises AttributeError before the request is even sent. The sync
+            # client uses httpx and is unaffected; running it via to_thread keeps
+            # the event loop responsive.
+            def _sync_grounded():
+                return client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=config,
+                )
+
+            response = await asyncio.to_thread(_sync_grounded)
+            self._log_generation_diagnostics(
+                response, label=f"{self.model_name}/grounded"
+            )
+            text = self._safe_extract_text(response) or ""
+            sources = self._extract_grounding_sources(response)
+            logger.info(
+                "Grounded generation: {} chars, {} source(s)",
+                len(text),
+                len(sources),
+            )
+            return text, sources
+        except Exception as exc:
+            logger.warning("Grounded generation failed: {}", exc)
+            return "", []
 
     @tracer.trace("gemini_chat")
     async def chat(

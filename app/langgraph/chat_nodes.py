@@ -11,14 +11,20 @@ from loguru import logger
 
 from app.agents.role_models import RoleEnum
 from app.ai.gemini_client import gemini_client
-from app.langgraph.chat_models import (ChatIntent, ChatIntentEnum,
-                                       ConfidenceLevel,
-                                       GovernanceValidationResult,
-                                       IntentClassificationResult,
-                                       SourceReference, get_module_focus)
+from app.langgraph.chat_models import (
+    ChatIntent,
+    ChatIntentEnum,
+    ConfidenceLevel,
+    GovernanceValidationResult,
+    IntentClassificationResult,
+    SourceReference,
+    get_module_focus,
+)
 from app.prompts.legal_intelligence_system import (
-    ANNEXURE_UPLOAD_GATE_MESSAGE, ROLES,
-    get_legal_intelligence_system_instruction)
+    ANNEXURE_UPLOAD_GATE_MESSAGE,
+    ROLES,
+    get_legal_intelligence_system_instruction,
+)
 
 
 def _strip_trailing_sources_block(text: str) -> str:
@@ -95,10 +101,15 @@ def is_user_affirmation_to_continue(msg: str) -> bool:
         return False
     if n in _AFFIRMATION_CONTINUE_PHRASES:
         return True
-    if (
-        len(n) < 48
-        and n.split()[0] in {"yes", "yeah", "yep", "yup", "ok", "okay", "sure"}
-    ):
+    if len(n) < 48 and n.split()[0] in {
+        "yes",
+        "yeah",
+        "yep",
+        "yup",
+        "ok",
+        "okay",
+        "sure",
+    }:
         return True
     return False
 
@@ -240,6 +251,43 @@ APPLICABLE LAWS ({len(applicable_laws)} available):
 """
         context_sections.append(laws_section)
 
+    # 5z. Case Laws (relevant precedents shown in the Case Laws panel). Each is
+    # source-backed — reference them by citation/title; do not invent new ones.
+    case_laws = chat_context.get("case_laws", [])
+    if case_laws:
+        case_lines = []
+        for c in case_laws[:8]:
+            citation = (c.get("citation") or "").strip()
+            court = (c.get("court") or "").strip()
+            title = (c.get("title") or "N/A").strip()
+            summary = (c.get("summary") or "").strip()
+            head = " — ".join([p for p in [title, citation, court] if p])
+            case_lines.append(f"- {head}: {summary}".rstrip(": "))
+        case_section = f"""
+CASE LAWS — RELEVANT PRECEDENTS ({len(case_laws)} available, source-verified):
+{chr(10).join(case_lines)}
+When discussing precedents, rely ONLY on the cases above. Do NOT fabricate or
+recall citations that are not listed here.
+"""
+        context_sections.append(case_section)
+
+    # 5y. Relevant Parties (people/organisations extracted from the documents,
+    # classified by role). Reference these by name/role; do not invent parties.
+    relevant_parties = chat_context.get("relevant_parties", [])
+    if relevant_parties:
+        party_lines = []
+        for p in relevant_parties[:20]:
+            name = (p.get("name") or "N/A").strip()
+            role = (p.get("role") or "Other").strip()
+            desc = (p.get("details") or p.get("description") or "").strip()
+            party_lines.append(f"- {name} [{role}]: {desc}".rstrip(": "))
+        parties_section = f"""
+RELEVANT PARTIES ({len(relevant_parties)} identified):
+{chr(10).join(party_lines)}
+Refer to parties ONLY as listed above; do not invent parties or roles.
+"""
+        context_sections.append(parties_section)
+
     # 5a. ANALYSIS REPORT (cached panel snapshot – use for Analysis Report chat, score explanation, strengths/risks)
     workspace_state = chat_context.get("workspace_state") or {}
     analysis_report = workspace_state.get("analysis_report")
@@ -368,7 +416,9 @@ CACHED ANALYSIS REPORT (same data as the Analysis Report panel; use for question
     chat_history = chat_context.get("chat_history", [])
     if chat_history:
         history_section = "RECENT CONVERSATION:\n"
-        for msg in chat_history[-12:]:  # enough context for "yes" following a prior offer
+        for msg in chat_history[
+            -12:
+        ]:  # enough context for "yes" following a prior offer
             if msg.get("role") and msg.get("content") is not None:
                 label = "User" if (msg.get("role") == "USER") else "Assistant"
                 content = (msg.get("content") or "").strip()
@@ -822,9 +872,7 @@ PREVIOUS ASSISTANT MESSAGE:
                 explanation = ""
             else:
                 explanation = (
-                    "Short reply - user may ask for more detail."
-                    if stripped
-                    else ""
+                    "Short reply - user may ask for more detail." if stripped else ""
                 )
             sources_text = ""
             confidence_text = "MEDIUM"

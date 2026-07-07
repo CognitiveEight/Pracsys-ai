@@ -171,6 +171,8 @@ class ChatContext:
     approved_facts: List[Dict[str, Any]] = field(default_factory=list)
     confidence_scores: Dict[str, float] = field(default_factory=dict)
     applicable_laws: List[Dict[str, Any]] = field(default_factory=list)
+    case_laws: List[Dict[str, Any]] = field(default_factory=list)
+    relevant_parties: List[Dict[str, Any]] = field(default_factory=list)
     timelines: List[Dict[str, Any]] = field(default_factory=list)
     templates: List[Dict[str, Any]] = field(default_factory=list)
     user_plan: Optional[Dict[str, Any]] = None
@@ -209,6 +211,8 @@ class ChatContext:
             "workspace_state": self.workspace_state,
             "approved_facts": self.approved_facts,
             "applicable_laws": self.applicable_laws,
+            "case_laws": self.case_laws,
+            "relevant_parties": self.relevant_parties,
             "active_module": self.active_module,
             "chat_history_length": len(self.chat_history),
             "custom_instruction_suffix": self.custom_instruction_suffix,
@@ -274,6 +278,7 @@ MODULE_FOCUS_MAP: Dict[str, str] = {
     "applicable_laws": "section interpretation and legal provisions",
     "drafting_assistant": "drafting requirements and template selection",
     "case_laws": "precedent explanation and citation analysis",
+    "relevant_parties": "parties, their roles, and relationships in the matter",
     "supporting_material": "document quality and evidence completeness",
 }
 

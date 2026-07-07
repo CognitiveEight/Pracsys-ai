@@ -35,6 +35,17 @@ class CacheKinds:
     WORKSPACE_META = "workspace_meta"
     ANALYSIS_REPORT = "analysis_report"
     APPLICABLE_LAWS = "applicable_laws"
+    # Relevant case-law precedents panel (judgments matched to the workspace,
+    # each backed by a real source URL). Generated on workspace_created /
+    # workspace_sync alongside applicable_laws and re-emitted on reconnect.
+    CASE_LAWS = "case_laws"
+    # Relevant parties panel (people/organisations extracted from the documents
+    # and classified into a role enum). Document-driven: regenerated on
+    # create/sync/doc-delete, re-emitted on reconnect.
+    RELEVANT_PARTIES = "relevant_parties"
+    # Per-workspace memory of parties the user has deleted, so a later
+    # regeneration does not silently re-add them (mirrors REJECTED_ANALYSIS_ITEMS).
+    DELETED_PARTIES = "deleted_parties"
     PROCEDURAL_TIMELINE = "procedural_timeline"
     CUSTOM_INSTRUCTIONS = "custom_instructions"
     LIST_OF_DATES = "list_of_dates"
@@ -57,6 +68,9 @@ WORKSPACE_HYDRATION_KINDS = (
     CacheKinds.WORKSPACE_META,
     CacheKinds.ANALYSIS_REPORT,
     CacheKinds.APPLICABLE_LAWS,
+    CacheKinds.CASE_LAWS,
+    CacheKinds.RELEVANT_PARTIES,
+    CacheKinds.DELETED_PARTIES,
     CacheKinds.PROCEDURAL_TIMELINE,
     CacheKinds.CUSTOM_INSTRUCTIONS,
     CacheKinds.LIST_OF_DATES,
@@ -178,10 +192,7 @@ async def hydrate_workspace_state(
     if not kind_list:
         return {}
     results = await asyncio.gather(
-        *[
-            restore_state(workspace_id=workspace_id, kind=k)
-            for k in kind_list
-        ],
+        *[restore_state(workspace_id=workspace_id, kind=k) for k in kind_list],
         return_exceptions=True,
     )
     out: Dict[str, Any] = {}

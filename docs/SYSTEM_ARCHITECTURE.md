@@ -41,9 +41,10 @@ This document describes the **current system architecture** and **multi-agent fl
                                             │
                                             ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│  Emits: document_feature_response (strategy_objective, document_assessments,     │
-│         analysis_report, list_of_dates, procedural_timeline, applicable_laws) |  │
-│         ai_response (chat)                                                        │
+│  Emits: document_feature_response (document_assessments, workspace_metadata,     │
+│         strategy_objective, analysis_report, list_of_dates, applicable_laws,     │
+│         procedural_timeline, case_laws, relevant_parties, drafting_assistant) |  │
+│         ai_response (chat) | case_law_document_response                           │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -55,20 +56,25 @@ The AI service is driven by **Socket.IO** events from the backend. Main events:
 
 | Event                        | Direction   | Purpose |
 |-----------------------------|------------|---------|
-| `workspace_created`         | Backend → AI | New workspace: init role, process evidence files, generate strategy & metadata |
-| `workspace_sync`            | Backend → AI | Workspace updated: re-run doc processing / strategy / analysis when docs change |
-| `user_message_request`      | Backend → AI | User chat message: build context, run Intelligence Chat Agent, return reply |
+| `workspace_created`         | Backend → AI | New workspace: init role, process evidence files, generate the full feature suite |
+| `workspace_sync`            | Backend → AI | Workspace updated: re-run doc processing / regeneration when docs change |
+| `user_message_request`      | Backend → AI | User chat message: build context, run Intelligence Chat Agent (or the Drafting Assistant when `chat_type="DRAFTING_ASSISTANT"`), return reply |
+| `template_sync`             | Backend → AI | Lawyer's template library changed (uploaded / renamed / deleted) |
+| `add_case_law`              | Backend → AI | Add a precedent by citation / URL / pasted text ("Add Case Law" button) |
+| `case_law_document_request` | Backend → AI | Lawyer uploaded a judgment file (GCS); classify + extract it, reply with `case_law_document_response` |
+| `add_relevant_party` / `edit_relevant_party` / `delete_relevant_party` | Backend → AI | Relevant Parties panel CRUD (card add/edit/delete icons) |
 | `probing_prompts_request`   | Backend → AI | Suggestion chips for strategy or chat |
 | `analysis_report_feedback`  | Backend → AI | User feedback on report; recalc and re-emit analysis |
+| `applicable_law_relevance_request` | Backend → AI | Re-assess one law's relevance to the matter |
 
 **Outbound (AI → Backend):**
 
 | Event                      | When |
 |----------------------------|------|
-| `document_feature_response` | After document assessments, strategy/objective, analysis report, list_of_dates, or applicable_laws |
-| `ai_response`              | After processing a user chat message |
-
-`document_feature_response` now also includes `procedural_timeline` as a first-class feature payload type.
+| `document_feature_response` | Feature payloads — `featureType` ∈ `document_assessments`, `workspace_metadata`, `strategy_objective`, `analysis_report`, `list_of_dates`, `applicable_laws`, `procedural_timeline`, `case_laws`, `relevant_parties`, `drafting_assistant` |
+| `ai_response`              | After processing a user chat message (augmented with draft fields for the drafting assistant) |
+| `case_law_document_response` | Accept/reject verdict for an uploaded judgment; echoes `requestId`, always terminal |
+| `workspace:refresh`        | Turns on frontend loaders before a regeneration cascade (e.g. an objective change) |
 
 ---
 
@@ -103,7 +109,7 @@ START → role_gate → [blocked?] → role_selection → role_context_builder �
 
 ### 3.2 Strategy & Objective Generation (Document-Based)
 
-**Location:** Socket handler helper `_generate_strategies_from_documents()` in `app/socket/events.py` (and `ex_event.py`).  
+**Location:** Socket handler helper `_generate_strategies_from_documents()` in `app/socket/handlers/strategy.py` (a mixin of `SocketEventHandler`; `app/socket/events.py` is the thin composition root — see `docs/SOCKET_EVENTS_ARCHITECTURE.md`).  
 **Not used from socket:** The **Strategy Agent** in `app/langgraph/strategy_agent.py` (LangGraph: suggest → map_objective → validate → lock) is available for programmatic use (e.g. `strategy_example.py`) but the **socket flow does not call it**. Instead, the socket flow uses **Gemini + vector store** to generate one-shot strategy/objective from document content.
 
 **Flow:**
@@ -152,7 +158,7 @@ context_builder → intent_classifier → explain_why → action_dispatcher → 
 
 ### 3.4 Applicable Laws Generation
 
-**Location:** `app/socket/events.py` — `_generate_and_emit_applicable_laws`, `_generate_applicable_laws_from_sources`, `_extract_case_signals_from_documents`, `_search_indiankanoon`, `_search_google_cse_for_indiankanoon`, helpers `_normalize_applicable_laws_payload`, `_heuristic_applicable_laws_fallback`.
+**Location:** `app/socket/handlers/applicable_laws.py` — `_generate_and_emit_applicable_laws`, `_generate_applicable_laws_from_sources`, `_extract_case_signals_from_documents`, `_search_indiankanoon`, helpers `_normalize_applicable_laws_payload`, `_heuristic_applicable_laws_fallback`; fallback search in `app/search/vertex_ai_search.py`.
 
 **Role:** Populate the **Applicable Laws** panel with a structured list of **potentially relevant Indian statutes and sections**, grounded in workspace documents and external search snippets. Outputs support **research and drafting direction**, not definitive legal advice.
 
@@ -161,7 +167,7 @@ context_builder → intent_classifier → explain_why → action_dispatcher → 
 1. **Case signals** (`_extract_case_signals_from_documents`): Read up to the first five documents from the **vector store**; build `workspaceTitle`, a **search query** (title + frequent keywords from text), `keywords`, and a **document evidence snippet** (concatenated excerpts).
 2. **Search (Indian Kanoon–oriented)**:
    - **Primary:** HTTP GET to `indiankanoon.org` search HTML; parse result links/titles (`_search_indiankanoon`).
-   - **Fallback:** **Google Custom Search API** with `site:indiankanoon.org` (`_search_google_cse_for_indiankanoon`) when `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` are set; otherwise skip.
+   - **Fallback:** **Google Vertex AI Search** (`app/search/vertex_ai_search.py`) when `GCP_PROJECT_ID` and `VERTEX_SEARCH_DATA_STORE_ID` are set; otherwise skip. (Replaced the deprecated Google Custom Search / CSE integration.)
 3. **Synthesis** (`_generate_applicable_laws_from_sources`): Single **Gemini** call (`application/json`) with case signals + search result titles/snippets. System instruction uses `get_structured_document_feature_system_instruction` so output stays structured (no chat gate text). Model returns JSON: `laws[]` entries with `act`, `section`, `description`, `relevance` (`High` / `Medium` / `Low`). Prompt rules: Indian law focus, **no IPC** in output (prefer BNS where relevant), concise case-tied descriptions. **Objective-steered:** an optional `objective_context` (the current strategic objective) makes the objective the **primary law-selection lens** — used on an objective change so the statute list shifts to the new objective (with `merge_with_previous=False` to replace, not union, stale laws). See **§3.6a**.
 4. **Normalize** (`_normalize_applicable_laws_payload`): Validates fields, maps relevance, **drops IPC-labelled rows**, caps list at **12** items, assigns stable `id` fields (`law_1`, …).
 5. **Heuristic fallback** (`_heuristic_applicable_laws_fallback`): If the model returns no laws, optional keyword-based stubs (e.g. IT Act, BNS, Companies Act, GST) from the evidence snippet.
@@ -218,7 +224,7 @@ Two surfaces:
    **Template ingest is noise-hardened.** Extracted template text is normalised before it is cached so extraction artifacts never reach the render LLM: a verbatim de-dup (`_normalize_template_text` / `_dedupe_leading_repeated_block`) collapses repeated PDF letterheads and `--- Page N ---` markers on both the OCR and text-layer paths, and a one-time LLM cleanup at ingest (`_clean_template_ocr_text`, chunked for long templates with an accept/reject gate) strips scanned-template seal/stamp garble, page footers, and margin notes while preserving every numbered paragraph, heading, recipient/signature block, and literal placeholder verbatim.
 
 2. **Drafting Assistant panel** inside a workspace —
-   - Proactive **suggested drafts** generated at `workspace_created` / `workspace_sync` via `drafting_agent.suggest(...)`, scheduled after `list_of_dates` / `applicable_laws` / `procedural_timeline`. The result (`{title, relevance, description}` items, no IPC references) is cached in `_workspace_drafting_payload` and emitted as `document_feature_response` with `featureType: "drafting_assistant"`. Re-emitted on reconnect like other panel features. A deterministic **template-coverage pass** (`_ensure_template_coverage`) runs after the LLM suggestions: for every ready template not already bound to a card, a focused applicability check (`build_template_applicability_prompt` / `TEMPLATE_APPLICABILITY_INSTRUCTION`) decides — by the template's **legal purpose + document type**, never its original parties/facts — whether a draft of that kind fits this matter, and any applicable template is **guaranteed** a case-framed card with the template pre-bound (`matchMode="matched"`). Template-backed cards take priority and the panel cap is raised from 6 to 8 (`_MAX_SUGGESTIONS_WITH_TEMPLATES`).
+   - Proactive **suggested drafts** generated at `workspace_created` / `workspace_sync` via `drafting_agent.suggest(...)`, scheduled after `list_of_dates` / `applicable_laws` / `procedural_timeline`. The result (`{title, relevance, description}` items, no IPC references) is cached in `_workspace_drafting_payload` and emitted as `document_feature_response` with `featureType: "drafting_assistant"`. Re-emitted on reconnect like other panel features. A deterministic **template-coverage pass** (`_ensure_template_coverage`) runs after the LLM suggestions: for every ready template not already bound to a card, a focused applicability check (`build_template_applicability_prompt` / `TEMPLATE_APPLICABILITY_INSTRUCTION`) decides — by the template's **legal purpose + document type**, never its original parties/facts — whether a draft of that kind fits this matter, and any applicable template **type group** is **guaranteed** a case-framed card (same-type drafts share one card rather than spawning duplicates). Template-backed cards take priority and the panel cap is raised from 6 to 8 (`_MAX_SUGGESTIONS_WITH_TEMPLATES`). **Multi-draft matching:** a card surfaces **every** matching library draft, each scored 0–100 for its fit to this case — on the wire, `suggestedDrafts[].matches[]` of `{templateId, templateName, category, matchPercent}` sorted by score (serialized from the agent's richer internal shape by `event_utils.drafting_payload_to_wire`). There is no minimum-score gate: weak fits are shown with their honest score, and the frontend renders "DRAFT AVAILABLE" for one match or "N DRAFTS FOUND" + a pick-one modal for several.
    - On lawyer click ("Start a New Draft" → pick template / suggestion / Blank Draft / Custom AI Draft), BE emits the existing `user_message_request` event with `chat_type="DRAFTING_ASSISTANT"` plus optional drafting fields (`actionableId`, `source`, `draftMode`, `templateId` / `suggestedDraftId`, `templateUrl`, `templateOriginalName`, `templateMimeType`). The AI short-circuits the general intelligence chat and routes the turn to `drafting_agent.handle_turn(...)`. When `draftMode="custom"` ("No, Custom AI Draft") the kickoff **bypasses all template resolution / profiling** and drafts directly from case context, still gathering any missing lawyer-input slots through the same `openQuestions` flow.
 
 **Conversation lifecycle (per `actionableId`):**
@@ -232,21 +238,22 @@ Two surfaces:
 
 ### 3.6a Chat-Driven Panel Editing & Objective Change
 
-**Location:** `app/socket/events.py` — the `user_message_request` handler for `chat_type="STRATEGY_OBJECTIVE"`, classifiers `_llm_classify_panel_edit_intent` / `_llm_classify_objective_change_intent`, the per-panel surgical editors, and the objective-change cascade `_run_objective_change_incremental_refresh` (scheduled by `_schedule_objective_change_reanalysis`).
+**Location:** `app/socket/handlers/chat.py` (the `user_message_request` handler for `chat_type="STRATEGY_OBJECTIVE"`, classifiers `_llm_classify_panel_edit_intent` / `_llm_classify_objective_change_intent`), the per-panel surgical editors in each feature mixin, and the objective-change cascade `_run_objective_change_incremental_refresh` in `app/socket/handlers/objective_change.py` (scheduled by `_schedule_objective_change_reanalysis`).
 
 A chat message in the Strategy & Objective panel is routed into one of three intents, decided by the LLM with a deterministic question guard (`_is_pure_informational_query`) in front so a plain question never edits a panel:
 
 1. **Informational question** → answered normally; no panel changes.
-2. **Mode 1 — surgical name / word / line edit** (`isRename` or a per-panel edit slot). A NAME change is treated as an exhaustive, workspace-wide **rename of EXISTING content** across all panels — Case Summary, Report Summary, Strategic Objective, Possible Next Steps, Analysis Report, List of Dates, Applicable Laws, Upcoming Dates — with **no regeneration** (no new/removed dates, laws, or items). The dispatch fans one rename instruction to every panel editor deterministically (not relying on per-panel LLM flags), and names are applied **semantically** (a party referenced by role/description is named correctly even where it appears as "the Petitioner"). The strategy fields emit a single coalesced `strategy_objective` payload; other panels emit their own `document_feature_response`.
+2. **Mode 1 — surgical name / term / date / year edit** (`isRename` or a per-panel edit slot). The correction is applied as an exhaustive, workspace-wide **find-and-replace over EXISTING content** across all panels — Case Summary, Report Summary, Strategic Objective, Possible Next Steps, Analysis Report, List of Dates, Applicable Laws, Upcoming Dates — with **no regeneration** (no new/removed dates, laws, or items). A NAME is applied **semantically** (a party referenced by role/description is named correctly even where it appears as "the Petitioner"); a DATE/YEAR correction also rewrites the ISO `date` field of List-of-Dates / Upcoming-Dates entries, while statute names and section numbers stay verbatim. The dispatch fans one instruction to every panel editor deterministically. The strategy fields emit a single coalesced `strategy_objective` payload; other panels emit their own `document_feature_response`. A **terminal-emit guard** re-emits the preserved cached payload for any doc-derived panel whose edit was a no-op (the token didn't appear there), so the loaders lit by `workspace:refresh` always clear.
 3. **Mode 2 — objective / case-perspective change** (`direct_update`). Declaring a new objective runs `_regenerate_strategy_objective_preserving_case_summary` then the cascade, which:
    - **regenerates + REPLACES the Analysis Report** for the new objective (it does NOT merge with the prior report — a perspective change must drop the old framing and old quality score; `_merge_analysis_report_with_previous` is reserved for the document re-upload / `workspace_sync` paths);
    - **re-scores List of Dates relevance** only (`_reeval_list_of_dates_relevance` — same entries, no new/removed dates);
    - **regenerates Applicable Laws** with the objective as the primary law-selection lens (`_generate_and_emit_applicable_laws(objective_context=…, merge_with_previous=False)`);
-   - **regenerates Drafting suggestions** (`_generate_and_emit_drafting_suggestions`, rebuilt from the now-updated caches);
-   - **preserves** the Case Summary and Upcoming Dates.
-   An up-front `workspace:refresh` (`reason="objective_change_regeneration_started"`) shows the loader across `strategy_objective`, `analysis_report`, `list_of_dates`, `applicable_laws`, `procedural_timeline`, `drafting_assistant`.
+   - **preserves and re-emits from cache** the Case Summary, Upcoming Dates (procedural timeline), **Relevant Parties**, **Case Laws**, and **Drafting suggestions** — who the parties are, which precedents were found/uploaded, the court dates, and the template library don't change with the legal objective; those panels regenerate only on document add/delete.
+   An up-front `workspace:refresh` (`reason="objective_change_regeneration_started"`) shows the loader across the affected panels; every preserved panel re-emits its cached payload as the terminal state so no loader is left stuck (a failed regeneration also falls back to a cached-or-empty terminal emit).
 
-So a name correction stays surgical and consistent everywhere, while an objective change re-derives the whole downstream intelligence (objective, analysis, score, laws, drafting) for the new perspective.
+So a name correction stays surgical and consistent everywhere, while an objective change re-derives the objective-dependent intelligence (objective, analysis, score, laws) and leaves the document-derived panels stable.
+
+**Document deletion** (a `workspace_sync` with removed docs) is the opposite of an objective change: the derived panels must reflect the reduced document set, so the regenerated Analysis Report **replaces** the previous one and the web-search-derived panels (Case Laws, Applicable Laws) are re-derived with `merge_with_previous=False`; uploads keep the merge/accumulate behaviour.
 
 ### 3.6b Output Guardrails & Generation Controls
 
@@ -285,6 +292,41 @@ So a name correction stays surgical and consistent everywhere, while an objectiv
 
 ---
 
+### 3.7 Case Laws (Source-Verified Precedents)
+
+**Location:** `app/socket/handlers/case_laws.py` + `app/search/case_law_finder.py` + `app/prompts/case_laws_prompts.py`.
+
+**Role:** Populate the **Case Laws** panel with prior court judgments relevant to the workspace, each carrying a real, clickable **source link** (`sourceUrl` + contract mirrors `referenceUrl` / `referenceName`), citation, court, headnote fields, and a High/Medium/Low relevance badge. Emitted as `featureType: "case_laws"` (`payload.caseLaws[]`, capped at 8, stable `caselaw_N` ids; `citation` carries the combined `"Title, Citation"` string per the backend contract).
+
+**Retrieval (`find_case_law_sources()`)** aggregates three channels: Indian Kanoon direct search (a legal-issue query derived from the matter with party/brand names stripped), **Vertex AI Search** fallback, and **Gemini `google_search` grounding** (`gemini_client.generate_grounded()`, real-time web; grounding redirect URLs are resolved to their real destinations). The selection is **strict source-verified**: the LLM ranks and summarizes only retrieved judgments and may not invent citations.
+
+**Two-pass legal digest:** Pass 1 selects relevant precedents and produces the case-vs-matter comparison fields (`relevance`, `matchedFacts`, `applicabilityReason`, `distinguishing`, `adverseImpact`, `confidence`). Pass 2 **fetches the actual judgment text** (`fetch_judgment_text()`, Indian Kanoon `/doc/` page preferred) and extracts the judgment-intrinsic headnote fields strictly from it (`citation`, `court`, `bench`, `date`, `legalIssues`, `materialFacts`, `ratio`, `holding`, `relief`, …). `bindingStrength`/`bindingStars` are derived deterministically from the court; `legalStatus` defaults to **"Not independently verified"**. A quality gate drops cards that failed enrichment or are off-topic.
+
+**Manual additions:**
+
+- `add_case_law` — by citation / URL / pasted text; the AI resolves and verifies a real source, assesses relevance, appends (deduped by URL), and re-emits. No real source → cached panel re-emitted unchanged.
+- `case_law_document_request` → `case_law_document_response` — a lawyer-uploaded judgment file (GCS). The AI fetches `documentUrl`, **classifies whether it is a case law**, extracts `{citation, court, summary, relevance, referenceUrl, referenceName}` on acceptance and merges it into the panel; otherwise replies `accepted:false` with a `rejectionReason`. Every path (including failure) emits a terminal response echoing `requestId`.
+
+**Lifecycle:** generated on `workspace_created` / `workspace_sync`, cached per-workspace (`CacheKinds.CASE_LAWS`), re-emitted on reconnect, **preserved on objective change**, re-derived (replace, not merge) on document deletion. Chat scope `chat_type:"CASE_LAWS"` injects the cached precedents into `ChatContext.case_laws`.
+
+---
+
+### 3.8 Relevant Parties
+
+**Location:** `app/socket/handlers/relevant_parties.py` + `app/socket/handlers/panel_edits.py` + `app/prompts/relevant_parties_prompts.py`.
+
+**Role:** A directory of the **key people/organisations actually party to the matter**, emitted as `featureType: "relevant_parties"` (`payload.parties[]`, capped at 30): `{ id, name, role, details, contactNumber, email, officialIdUrl }`. `role` is a normalized Title-Case enum — `Petitioner | Respondent | Witness | Victim | Accused | Other` (legacy/synonym wordings are mapped via `_normalize_party_role`). Contact fields are **PII: always empty on auto-generation**, populated only by the user through panel edits.
+
+**Pipeline:** reuses the cached party extraction (`_extract_parties_subagent`) and classifies each party into the role enum (`_classify_relevant_parties`) **using only document-grounded names**, with a **relevance filter** that drops comparative/example-only or tangential entities while keeping genuine parties, counsel, and the adjudicating authority.
+
+**Per-document provenance:** each auto-extracted party carries `sourceDocIds`. Deleting a document purges exactly that document's parties; a new upload extracts parties **only from the unseen document(s)**; missing/stale provenance triggers a one-time full refresh that keeps only user-added parties. Identity is a canonical name key (honorifics, corporate prefixes/suffixes, parentheticals, punctuation stripped) plus a guarded fuzzy match (`_party_names_match`) so re-extraction variants of the same entity never duplicate, and user-deleted parties stay deleted.
+
+**CRUD events:** `add_relevant_party` (append, fuzzy-deduped, flagged `userAdded` so purging never removes it), `edit_relevant_party` (by `partyId`), `delete_relevant_party` (records the name in a deleted-set so regeneration won't re-add it). Each mutates the cache and re-emits.
+
+**Lifecycle:** generated on `workspace_created` / `workspace_sync` (document-driven), cached (`CacheKinds.RELEVANT_PARTIES`), re-emitted on reconnect, **preserved on objective change**. Chat scope `chat_type:"RELEVANT_PARTIES"` injects the cached parties into `ChatContext.relevant_parties`.
+
+---
+
 ## 4. End-to-End Data Flows
 
 ### 4.1 workspace_created
@@ -304,13 +346,17 @@ Backend emits workspace_created (workspaceId, userId, evidenceFiles, role, ...)
     → _emit_analysis_report(...) / _generate_and_emit_analysis_report_for_sync(...)
         → _generate_analysis_report_from_documents(...)   [Gemini]
         → emit document_feature_response (analysis_report)
-        → schedule background: list_of_dates then applicable_laws (see §3.4)
-    → list_of_dates (scheduled) → emit document_feature_response (list_of_dates)
-    → applicable_laws (scheduled): signals from vector store → Kanoon / CSE → Gemini JSON → normalize / heuristic
-        → emit document_feature_response (applicable_laws)
+        → schedule background chain (asyncio.create_task; chat is never blocked):
+            list_of_dates → emit document_feature_response (list_of_dates)
+            applicable_laws: signals from vector store → Kanoon / Vertex AI Search → Gemini JSON → normalize / heuristic
+                → emit document_feature_response (applicable_laws)
+            procedural_timeline → emit document_feature_response (procedural_timeline)
+            relevant_parties (per-doc extraction + classification) → emit document_feature_response (relevant_parties)
+            case_laws (Kanoon + Vertex + Gemini grounding, two-pass digest) → emit document_feature_response (case_laws)
+            drafting suggestions (template matching + scoring) → emit document_feature_response (drafting_assistant)
 ```
 
-Caches (`_workspace_document_assessments_payload`, `_workspace_strategy_payload`, `_workspace_analysis_payload`, `_workspace_list_of_dates_payload`, `_workspace_applicable_laws_payload`, etc.) allow re-emitting after socket reconnect.
+Caches (`_workspace_document_assessments_payload`, `_workspace_strategy_payload`, `_workspace_analysis_payload`, `_workspace_list_of_dates_payload`, `_workspace_applicable_laws_payload`, `_workspace_procedural_timeline_payload`, `_workspace_relevant_parties_payload`, `_workspace_case_laws_payload`, `_workspace_drafting_payload`) allow re-emitting after socket reconnect.
 
 ### 4.2 workspace_sync
 
@@ -361,8 +407,8 @@ Backend emits template_sync (action: uploaded|renamed|deleted, userId, templates
 
 | Component | Path / Responsibility |
 |-----------|------------------------|
-| **Socket handler** | `app/socket/events.py` — Maps socket events to workspace init, document processing, strategy generation, analysis report, applicable laws, chat. Emits `document_feature_response` and `ai_response`. |
-| **Socket client** | `app/socket/client.py` — Registers Socket.IO listeners (workspace_created, workspace_sync, user_message_request, etc.) and delegates to handler. |
+| **Socket handler** | `app/socket/events.py` — thin composition root: `SocketEventHandler` = 21 per-feature mixin classes from `app/socket/handlers/` (strategy, analysis_report, list_of_dates, applicable_laws, procedural_timeline, case_laws, relevant_parties, drafting, chat, objective_change, workspace_events, panel_edits, …) + `register`/`handle` + the `event_handler` singleton. Pure helpers/constants in `app/socket/event_utils.py`. See `docs/SOCKET_EVENTS_ARCHITECTURE.md`. |
+| **Socket client** | `app/socket/client.py` — Registers Socket.IO listeners (workspace_created, workspace_sync, user_message_request, template_sync, add_case_law, case_law_document_request, party CRUD, etc.) and delegates to handler. |
 | **Workspace manager / context** | `app/workspace/` — In-memory workspace and context; stores role, evidence files, metadata. Integration syncs role from LangGraph state via `workspace_role_integration`. |
 | **Role-Based Agent** | `app/langgraph/role_agent.py` — Root LangGraph: role gate → role_selection / role_context_builder → role_validation. Output: validated `WorkspaceState` and `role_context` for downstream agents. |
 | **Strategy generation (socket path)** | `app/socket/events.py` → `_generate_strategies_from_documents()` — Uses vector store + Gemini to produce case summary, strategic objective, recommendations. Emits `strategy_objective` feature. |
@@ -370,8 +416,11 @@ Backend emits template_sync (action: uploaded|renamed|deleted, userId, templates
 | **Intelligence Chat Agent** | `app/langgraph/intelligence_chat_agent.py` — LangGraph: context_builder → intent_classifier → explain_why (Gemini) → action_dispatcher → response_formatter → governance_validator. Used for every `user_message_request`. |
 | **Document processing** | `app/processing/document_processor.py` — Batch download and text extraction; stores content in vector store (Qdrant). |
 | **Vector store** | `app/vectorstore/qdrant.py` — Stores document content by workspace; used by strategy generation and chat context. |
-| **Gemini client** | `app/ai/gemini_client.py` — Used for strategy prompt, chat “explain_why”, analysis report generation, and applicable-laws JSON synthesis. `generate()` runs primarily on the **`google-genai`** SDK with explicit **`thinking_level`** control (default `LOW`) and a moderate output ceiling, falling back to the legacy `google-generativeai` SDK; long-form draft render / translation use `generate_longform()` (`thinking_level="LOW"`, 64k ceiling). Bounding the thinking budget (rather than inflating `max_output_tokens`) keeps gemini-3 responses fast and avoids `MAX_TOKENS` truncation. All calls log `finish_reason` + token usage via `_log_generation_diagnostics`. Model is configurable via `GEMINI_MODEL` (e.g. `gemini-3-flash-preview`). |
-| **Applicable laws (socket)** | `app/socket/events.py` — `_generate_and_emit_applicable_laws` and helpers: vector-store signals, Indian Kanoon + optional Google CSE search, Gemini normalization, heuristic fallback; see **§3.4**. |
+| **Gemini client** | `app/ai/gemini_client.py` — Used for strategy prompt, chat “explain_why”, analysis report generation, and applicable-laws JSON synthesis. `generate()` runs primarily on the **`google-genai`** SDK with explicit **`thinking_level`** control (default `LOW`) and a moderate output ceiling, falling back to the legacy `google-generativeai` SDK; long-form draft render / translation use `generate_longform()` (`thinking_level="LOW"`, 64k ceiling); case-law research uses `generate_grounded()` (`google_search` grounding, returns text + source URLs; runs the sync google-genai client in a worker thread to avoid an aiohttp-version conflict). Bounding the thinking budget (rather than inflating `max_output_tokens`) keeps gemini-3 responses fast and avoids `MAX_TOKENS` truncation. All calls log `finish_reason` + token usage via `_log_generation_diagnostics`. Model is configurable via `GEMINI_MODEL` (e.g. `gemini-3-flash-preview`). |
+| **Applicable laws (socket)** | `app/socket/handlers/applicable_laws.py` — `_generate_and_emit_applicable_laws` and helpers: vector-store signals, Indian Kanoon + optional Vertex AI Search fallback, Gemini normalization, heuristic fallback; see **§3.4**. |
+| **Case laws** | `app/socket/handlers/case_laws.py` + `app/search/case_law_finder.py` — source aggregation (Kanoon / Vertex AI Search / Gemini `google_search` grounding), two-pass judgment-grounded digest, manual add & upload verification; see **§3.7**. |
+| **Relevant parties** | `app/socket/handlers/relevant_parties.py` + `app/socket/handlers/panel_edits.py` — per-document provenance extraction, role classification, fuzzy identity dedup, CRUD events; see **§3.8**. |
+| **Legal search** | `app/search/vertex_ai_search.py` — Google Vertex AI Search client used as the retrieval fallback for applicable laws and case laws (replaced Google CSE). |
 | **Integration** | `app/langgraph/integration.py` — `WorkspaceRoleIntegration`: init workspace with role, sync role to workspace context, handle role change, process user message through role agent. |
 | **Chat integration** | `app/langgraph/chat_integration.py` — `process_workspace_chat()` builds `ChatContext` from workspace and calls `intelligence_chat_agent.process_message()`. |
 | **Observability** | `app/observability/` — Audit and tracing for role gate, role agent, strategy, and chat. |
@@ -381,7 +430,7 @@ Backend emits template_sync (action: uploaded|renamed|deleted, userId, templates
 ## 6. State and Context Summary
 
 - **WorkspaceState (LangGraph):** `workspace_id`, `user_id`, `role_state` (role, role_context, role_selected_at, role_history, role_validated), `messages`, `user_input`, `agent_output`, `metadata`, `error`, `next`. Used by Role-Based Agent.
-- **ChatContext (input to Chat Agent):** `workspace_id`, `user_id`, `role_context`, `workspace_state`, `active_strategy`, `approved_facts`, `applicable_laws`, `active_module`, `chat_history`, `custom_instruction_suffix`, and for socket path: `uploaded_documents`, `chat_attachment`. Built in socket handler and optionally via `chat_integration.create_chat_context_from_state()`.
+- **ChatContext (input to Chat Agent):** `workspace_id`, `user_id`, `role_context`, `workspace_state`, `active_strategy`, `approved_facts`, `applicable_laws`, `case_laws`, `relevant_parties`, `active_module`, `chat_history`, `custom_instruction_suffix`, and for socket path: `uploaded_documents`, `chat_attachment`. Built in socket handler and optionally via `chat_integration.create_chat_context_from_state()`. Scoped chats (`chat_type` `CASE_LAWS` / `RELEVANT_PARTIES`) reason only over the corresponding cached panel content.
 - **Strategy payload (output):** `caseSummary`, `strategicObjective`, `recommendations`, `possibleNextSteps`, `suggestionChips`, `role`, `isUpdate`, `analysis`, `timestamp`. Sent as `document_feature_response` with `featureType: "strategy_objective"`.
 - **Applicable laws payload (cached / emitted):** `{ "laws": [ { "id", "act", "section", "description", "relevance" }, ... ] }` with `featureType: "applicable_laws"`. See **§3.4**.
 
@@ -428,9 +477,11 @@ Backend emits template_sync (action: uploaded|renamed|deleted, userId, templates
                                                  │
                                                  ▼
                     ┌─────────────────────────────────────────────────────────┐
-                    │  document_feature_response (assessments, strategy_       │
-                    │  objective, analysis_report, list_of_dates, applicable_laws)│
-                    │  | ai_response                                     │
+                    │  document_feature_response (assessments, metadata,       │
+                    │  strategy_objective, analysis_report, list_of_dates,     │
+                    │  applicable_laws, procedural_timeline, case_laws,        │
+                    │  relevant_parties, drafting_assistant) | ai_response |   │
+                    │  case_law_document_response                              │
                     └─────────────────────────────────────────────────────────┘
 ```
 

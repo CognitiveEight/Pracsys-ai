@@ -2,6 +2,8 @@ SimplerToday Project Structure
 ================================
 
 NOTE: For tables, setup steps, and current feature list, see README.md.
+      For event flow and multi-agent design, see docs/SYSTEM_ARCHITECTURE.md.
+      For the socket handler module map, see docs/SOCKET_EVENTS_ARCHITECTURE.md.
       This file is an ASCII tree for quick reference in any editor.
 
 simplertoday/
@@ -10,108 +12,191 @@ simplertoday/
 │   ├── __init__.py                         # Package initialization
 │   ├── main.py                             # Application entry point
 │   │
-│   ├── agents/                             # AI Agent System
-│   │   ├── __init__.py                     # Agent exports
+│   ├── agents/                             # AI agent framework
 │   │   ├── base.py                         # Base agent class & interfaces
 │   │   ├── router.py                       # Agent routing logic
+│   │   ├── role_models.py                  # Role models shared with role agent
 │   │   └── chat_agent.py                   # Chat agent implementation
 │   │
-│   ├── ai/                                 # Gemini client (generation, embed)
-│   ├── langgraph/                          # Strategy + intelligence chat graphs
-│   ├── prompts/                            # Legal intelligence system prompts
-│   ├── processing/                         # Document extraction & batch processing
+│   ├── ai/                                 # LLM layer
+│   │   └── gemini_client.py                # Gemini client: generate / generate_longform
+│   │                                       #   (64k, thinking control) / generate_grounded
+│   │                                       #   (google_search) / chat / embeddings
 │   │
-│   ├── core/                               # Core Application Layer
-│   │   ├── __init__.py                     # Core exports
+│   ├── langgraph/                          # LangGraph agent workflows
+│   │   ├── role_agent.py                   # Root role gate (non-bypassable)
+│   │   ├── state.py, integration.py        # WorkspaceState + role integration
+│   │   ├── intelligence_chat_agent.py      # Governed chat graph
+│   │   ├── chat_nodes.py, chat_models.py,  # Chat graph nodes, ChatContext,
+│   │   │   chat_state.py, chat_integration.py  #   state and integration helpers
+│   │   ├── strategy_agent.py               # LangGraph strategy pipeline
+│   │   │                                   #   (programmatic only — socket flow
+│   │   │                                   #   uses handlers/strategy.py instead)
+│   │   ├── strategy_nodes.py, strategy_models.py
+│   │   ├── list_of_dates_agent.py          # Date extraction + year-snap guards
+│   │   ├── procedural_timeline_agent.py    # Court/law procedural dates only
+│   │   ├── drafting_agent.py               # Drafting assistant (templates,
+│   │   │                                   #   kickoff questions, render)
+│   │   ├── template_match_graph.py         # Suggestion ↔ template matching graph
+│   │   ├── template_store.py               # Lawyer-scoped template cache access
+│   │   ├── guards.py, nodes.py             # Shared graph guards/nodes
+│   │   └── *_example.py                    # Programmatic usage examples
+│   │
+│   ├── prompts/                            # Prompt scaffolding (one file per feature)
+│   │   ├── legal_intelligence_system.py    # Shared system instructions + output
+│   │   │                                   #   guardrails (English-only, brand scrub,
+│   │   │                                   #   Title Case, date interpretation)
+│   │   ├── applicable_acts.py              # Indian-law grounding (BNS/BNSS/BSA/IT Act)
+│   │   ├── strategy_prompts.py             # Strategy / objective generation
+│   │   ├── analysis_report_prompts.py      # Analysis report
+│   │   ├── list_of_dates_prompts.py        # List of dates + surgical edits
+│   │   ├── procedural_timeline_prompts.py  # Upcoming dates + surgical edits
+│   │   ├── applicable_laws_prompts.py      # Applicable laws + surgical edits
+│   │   ├── case_laws_prompts.py            # Case-law select/enrich/upload classify
+│   │   ├── relevant_parties_prompts.py     # Party classification + relevance filter
+│   │   ├── objective_change_prompts.py     # Objective-change classification
+│   │   ├── extraction_prompts.py           # Entity/fact extraction
+│   │   ├── law_relevance_prompts.py        # Per-law relevance re-assessment
+│   │   ├── suggestion_chips_prompts.py     # Chat suggestion chips
+│   │   ├── workspace_metadata_prompts.py   # Category / subcategory
+│   │   └── drafting.py                     # Drafting assistant prompts
+│   │
+│   ├── search/                             # External legal search
+│   │   ├── case_law_finder.py              # Indian Kanoon scrape + Vertex + Gemini
+│   │   │                                   #   grounding; judgment text fetch
+│   │   └── vertex_ai_search.py             # Google Vertex AI Search fallback
+│   │                                       #   (replaced Google CSE)
+│   │
+│   ├── processing/                         # Document ingestion
+│   │   ├── document_processor.py           # Batch download + extract + vector store
+│   │   ├── file_handlers.py                # Per-extension text extraction / OCR
+│   │   ├── audio_transcription.py          # Chirp 3 / Speech V2 + diarization
+│   │   ├── document_classifier.py          # Document type classification
+│   │   ├── docx_generator.py               # DOCX report/draft generation
+│   │   ├── docx_template_filler.py         # Template slot filling
+│   │   ├── pdf_to_docx.py                  # PDF → DOCX conversion
+│   │   ├── pii_detector.py                 # PII detection
+│   │   └── readability.py                  # Readability scoring
+│   │
+│   ├── socket/                             # Socket.IO CLIENT (outbound connection)
+│   │   ├── client.py                       # Connection, reconnection, event listeners
+│   │   ├── events.py                       # Thin composition root: SocketEventHandler
+│   │   │                                   #   = handler mixins + register/handle +
+│   │   │                                   #   event_handler singleton
+│   │   ├── event_utils.py                  # Pure helpers/constants (incl. drafting
+│   │   │                                   #   wire serialization)
+│   │   ├── schemas.py                      # Pydantic payload schemas (the contract)
+│   │   ├── ai_service.py                   # AI service bootstrap
+│   │   ├── backend_events.py               # Backend event helpers
+│   │   └── handlers/                       # Per-feature mixins (verbatim split of
+│   │       │                               #   the old monolithic events.py)
+│   │       ├── _shared.py                  # Cross-mixin shared helpers
+│   │       ├── workspace_events.py         # workspace_created / sync / deleted
+│   │       ├── documents.py                # Document assessments
+│   │       ├── workspace_metadata.py       # Category / subcategory
+│   │       ├── strategy.py                 # Strategy & objective (socket path)
+│   │       ├── analysis_report.py          # Analysis report + quality score
+│   │       ├── list_of_dates.py            # List of dates
+│   │       ├── applicable_laws.py          # Applicable laws (Kanoon + Vertex)
+│   │       ├── procedural_timeline.py      # Upcoming dates
+│   │       ├── case_laws.py                # Case laws + add/upload verification
+│   │       ├── relevant_parties.py         # Relevant parties (provenance model)
+│   │       ├── panel_edits.py              # Party CRUD panel-edit events
+│   │       ├── objective_change.py         # Mode-2 objective-change cascade
+│   │       ├── chat.py                     # user_message_request + Mode-1 edits
+│   │       ├── drafting.py                 # Drafting assistant socket surface
+│   │       ├── template_sync.py            # Template library sync
+│   │       ├── extraction.py               # Entity/fact extraction
+│   │       ├── law_relevance.py            # applicable_law_relevance_request
+│   │       ├── suggestion_chips.py         # Suggestion chips
+│   │       ├── docx_export.py              # analysis_docx_generate_request
+│   │       └── state_roles.py              # Role/state helpers
+│   │
+│   ├── storage/                            # Cloud storage helpers
+│   │   └── gcs.py                          # Google Cloud Storage (audio diarization)
+│   │
+│   ├── vectorstore/                        # Vector database layer
+│   │   ├── qdrant.py                       # Qdrant: per-workspace docs + workspace/
+│   │   │                                   #   lawyer state caches (zero-vector)
+│   │   └── memory.py                       # Conversation memory
+│   │
+│   ├── workspace/                          # Workspace management
+│   │   ├── context.py                      # Workspace context & state
+│   │   ├── manager.py                      # Workspace CRUD operations
+│   │   ├── persistence.py                  # Payload cache persistence (CacheKinds)
+│   │   └── custom_instructions.py          # Per-workspace instruction suffixes
+│   │
+│   ├── core/                               # Core application layer
 │   │   ├── config.py                       # Configuration management (Pydantic)
-│   │   ├── lifecycle.py                    # Application startup/shutdown
+│   │   ├── lifecycle.py                    # Startup/shutdown orchestration
 │   │   └── security.py                     # Security utilities (JWT, hashing)
 │   │
-│   ├── observability/                      # Monitoring & Logging
-│   │   ├── __init__.py                     # Observability exports
+│   ├── observability/                      # Monitoring & logging
 │   │   ├── logger.py                       # Logging configuration (Loguru)
 │   │   ├── audit.py                        # Audit trail logging
 │   │   └── trace.py                        # Distributed tracing
 │   │
-│   ├── socket/                             # Socket.IO Client
-│   │   ├── __init__.py                     # Socket exports
-│   │   ├── ai_service.py                   # AI service bootstrap
-│   │   ├── client.py                       # Socket client with reconnection
-│   │   ├── events.py                       # Event handlers
-│   │   ├── schemas.py                      # Pydantic data schemas
-│   │   └── backend_events.py               # Backend event helpers
-│   │
-│   ├── utils/                              # Utility Functions
-│   │   ├── __init__.py                     # Utils exports
-│   │   └── exceptions.py                   # Custom exception classes
-│   │
-│   ├── vectorstore/                        # Vector Database Layer
-│   │   ├── __init__.py                     # Vector store exports
-│   │   ├── qdrant.py                       # Qdrant integration
-│   │   └── memory.py                       # Conversation memory
-│   │
-│   └── workspace/                          # Workspace Management
-│       ├── __init__.py                     # Workspace exports
-│       ├── context.py                      # Workspace context & state
-│       └── manager.py                      # Workspace CRUD operations
+│   └── utils/                              # Utilities
+│       └── exceptions.py                   # Custom exception classes
+│
+├── docs/                                   # Living documentation
+│   ├── SYSTEM_ARCHITECTURE.md              # Event flow & multi-agent design
+│   ├── SOCKET_EVENTS_ARCHITECTURE.md       # Socket handler module map
+│   ├── socket-reconnection-and-stability.md
+│   └── STRUCTURE.txt                       # This file
+│
+├── deploy/                                 # Deployment assets
+├── scripts/                                # Maintenance / one-off scripts
 │
 ├── logs/                                   # Log files (auto-generated)
 │   ├── app.log                             # All application logs
 │   ├── errors.log                          # Error logs only
 │   ├── structured.log                      # JSON structured logs
-│   └── audit/                              # Audit logs
-│       └── audit.log                       # Audit trail
+│   └── audit/audit.log                     # Audit trail
 │
 ├── data/                                   # Data storage (auto-generated)
-│   └── workspaces/                         # Workspace files
-│       └── {workspace_id}/                 # Per-workspace directory
-│           └── evidence_files/             # Downloaded files
+│   └── workspaces/{workspace_id}/          # Per-workspace file cache
 │
 ├── .dockerignore                           # Docker ignore rules
 ├── .gitignore                              # Git ignore rules
-├── ARCHITECTURE.md                         # Architecture documentation
 ├── docker-compose.yml                      # Services (Qdrant, Redis)
 ├── Dockerfile                              # Docker container image
-├── env.example                             # Environment variables template
+├── env.example                             # Environment variables template (never
+│                                           #   commit .env or credential JSONs)
 ├── Makefile                                # Development commands
-├── PROJECT_SUMMARY.md                      # Project summary
-├── QUICKSTART.md                           # Quick start guide
-├── README.md                               # Main documentation
+├── dev.sh / run.sh                         # Shell helpers to start the service
 ├── requirements.txt                        # Python dependencies
-├── run.sh                                  # Startup script (executable)
-├── STRUCTURE.txt                           # This file
-└── test_setup.py                           # Setup verification script
-
-
-File Count Summary:
--------------------
-Python Files: 26
-Documentation: 5
-Configuration: 7
-Total Files: 38+
+├── requirements.lock.txt                   # Pinned dependency versions
+├── CHANGELOG.md                            # Release history (Keep a Changelog)
+├── CLAUDE.md                               # AI-assistant working notes for this repo
+└── README.md                               # Main documentation
 
 
 Key Directories:
 ----------------
-app/agents/         - Agent implementations and routing
-app/ai/             - Gemini client
-app/langgraph/      - Strategy & intelligence chat workflows
-app/prompts/        - Legal intelligence prompts
-app/processing/     - Document processing
-app/core/           - Core application infrastructure
-app/observability/  - Logging, audit, tracing
-app/socket/         - Socket.IO client and events
-app/utils/          - Utilities and exceptions
-app/vectorstore/    - Vector store and memory
-app/workspace/      - Workspace management
+app/socket/          - Socket.IO client, schemas, per-feature handler mixins
+app/langgraph/       - Role gate, chat, strategy, dates, timeline, drafting graphs
+app/prompts/         - Legal prompts, one module per feature + shared guardrails
+app/search/          - Indian Kanoon + Vertex AI Search retrieval
+app/ai/              - Gemini client
+app/processing/      - Document/audio ingestion, OCR, DOCX generation
+app/vectorstore/     - Qdrant documents + state caches
+app/workspace/       - Workspace state, persistence, custom instructions
+app/storage/         - Google Cloud Storage helpers
+app/core/            - Config, lifecycle, security
+app/observability/   - Logging, audit, tracing
 
 
 External Dependencies:
 ----------------------
-- Qdrant (Vector Store)
+- Socket.IO Server (Required — the app backend; this service is a CLIENT)
+- Google Gemini (LLM - primary; GOOGLE_API_KEY, model via GEMINI_MODEL)
+- Qdrant (Vector store; QDRANT_URL)
 - Redis (Caching - optional)
-- Socket.IO Server (Required)
-- Google Gemini (LLM - primary; see GOOGLE_API_KEY)
+- Google Vertex AI Search (optional fallback; GCP_PROJECT_ID +
+  VERTEX_SEARCH_DATA_STORE_ID — replaced Google CSE)
+- GCP Vision / Speech-to-Text V2 / GCS (optional: OCR, audio diarization;
+  GCS_BUCKET_NAME + ffmpeg on PATH for full diarization)
 
 
 Auto-Generated Directories:
@@ -124,65 +209,61 @@ data/workspaces/    - Created on first run
 Entry Points:
 -------------
 python -m app.main              - Direct execution
-./run.sh                        - Using startup script
+./run.sh / ./dev.sh start       - Using startup scripts
 make run                        - Using Makefile
 docker build && docker run      - Using Docker
 
 
 Configuration:
 --------------
-Environment: .env file (copy from env.example)
+Environment: .env file (copy from env.example; never commit)
 Settings: app/core/config.py
 Validation: Pydantic Settings
 
 
 Key Features:
 -------------
-✓ Socket.IO client with auto-reconnection
-✓ Workspace lifecycle management
-✓ Document embedding and semantic search
-✓ AI agent framework with routing
-✓ Procedural timeline agent and socket payload emission
-✓ Drafting assistant: lawyer-scoped template library + multi-turn drafting chat
-✓ Chat-driven panel editing (surgical rename vs objective-change regeneration)
-✓ Comprehensive logging and audit trails
-✓ Distributed tracing
-✓ Security utilities (JWT, encryption)
-✓ Type-safe with Pydantic
-✓ Async/await throughout
-✓ Production-ready error handling
+✓ Socket.IO client with auto-reconnection and reconnect-safe payload caches
+✓ Role-gated multi-agent pipeline (no downstream agent runs without a role)
+✓ Document embedding and semantic search per workspace (Qdrant)
+✓ Audio evidence transcription with speaker diarization
+✓ Strategy & objective, analysis report + quality score, list of dates
+✓ Procedural timeline (court/law procedural dates only)
+✓ Applicable laws (Indian Kanoon + Vertex AI Search, BNS/BNSS/BSA — no IPC)
+✓ Case laws: source-verified precedents with clickable judgment links,
+  manual add (citation/URL/text) and upload verification
+✓ Relevant parties: role-badged party directory with per-document provenance
+✓ Drafting assistant: lawyer-scoped template library, multi-draft % matching,
+  confirm-every-variable kickoff, 64k long-form render
+✓ Chat-driven panel editing (surgical name/term/date/year edit vs
+  objective-change regeneration with panel preservation)
 ✓ Dual-track legal reasoning (civil + criminal where applicable)
-
-
-Ready for Integration:
-----------------------
-- LLM providers (OpenAI, Anthropic)
-- Custom agents
-- Additional event handlers
-- REST API endpoints
-- WebSocket server
-- Custom storage backends
+✓ Output guardrails: English-only, Title Case, brand scrub, current-year
+  anchoring for dateless source dates
+✓ Comprehensive logging, audit trails, distributed tracing
+✓ Type-safe with Pydantic; async/await throughout
 
 
 Development Tools:
 ------------------
-make setup          - Complete setup
-make test           - Run tests
+make setup          - Complete setup (venv, deps, .env, folders)
 make run            - Start application
-make docker-up      - Start services
+make docker-up      - Start services (Qdrant, Redis)
+make lint / format  - pylint / black (if installed)
 make clean          - Clean temp files
+(No working test target: make test expects a test_setup.py that does not
+exist — validate via make run against a connected backend.)
 
 
 Documentation:
 --------------
-README.md           - Comprehensive guide
-QUICKSTART.md       - 5-minute setup
-ARCHITECTURE.md     - System design
-PROJECT_SUMMARY.md  - Project overview
-STRUCTURE.txt       - This file (structure)
+README.md                          - Comprehensive guide
+docs/SYSTEM_ARCHITECTURE.md        - Event flow & multi-agent design
+docs/SOCKET_EVENTS_ARCHITECTURE.md - Socket handler module map
+CHANGELOG.md                       - Release history
+docs/STRUCTURE.txt                 - This file (structure)
 
 
 Status: ✅ ACTIVE & RELEASED
-Version: 4.2.0
-Updated: June 2026
-
+Version: 5.0.0
+Updated: July 2026

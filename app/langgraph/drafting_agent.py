@@ -51,6 +51,7 @@ from app.prompts.drafting import (
     TEMPLATE_FILL_INSTRUCTION,
     TEMPLATE_KICKOFF_INSTRUCTION,
     TEMPLATE_MATCH_INSTRUCTION,
+    TEMPLATE_MATCH_SCORE_INSTRUCTION,
     TEMPLATE_PROFILE_INSTRUCTION,
     TEMPLATE_VARIABLE_KINDS,
     build_chat_reply_prompt,
@@ -60,6 +61,7 @@ from app.prompts.drafting import (
     build_question_dedup_prompt,
     build_suggested_drafts_prompt,
     build_template_applicability_prompt,
+    build_template_match_score_prompt,
     build_template_cleanup_prompt,
     build_template_classify_prompt,
     build_template_diff_prompt,
@@ -141,6 +143,11 @@ _MAX_SUGGESTIONS = 6
 # cards so every applicable template is guaranteed a slot without crowding
 # out the LLM's free case-driven suggestions. See _ensure_template_coverage.
 _MAX_SUGGESTIONS_WITH_TEMPLATES = 8
+
+# Retained for reference / potential reuse. Template-backed cards are no longer
+# hidden by a score gate: every matching draft is surfaced (with its % score)
+# so the lawyer picks one from the selection modal. See _threshold_and_rank.
+_MIN_TEMPLATE_MATCH_SCORE = 50
 
 # Version of the template "drafting blueprint" profiling schema. Bump this
 # whenever the profiler's variable-capture rules change so already-cached
@@ -367,6 +374,26 @@ def _normalize_relevance(value: Any) -> str:
     return s if s in _RELEVANCE_VALUES else "Medium"
 
 
+def _normalize_match_score(value: Any) -> Optional[int]:
+    """Coerce a model-supplied match score to an int in [0, 100].
+
+    Accepts ints, floats, and numeric strings (the model occasionally returns
+    "82" or "82%"). Returns None for anything unparseable so the card simply
+    carries no score rather than a bogus one.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip().rstrip("%").strip()
+        if not value:
+            return None
+    try:
+        n = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(100, n))
+
+
 def _dedupe_suggestions(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Drop near-duplicates by lowercased, whitespace-collapsed title."""
     seen: set = set()
@@ -425,6 +452,15 @@ def _normalize_suggestions(raw: List[Any]) -> List[Dict[str, Any]]:
                 "templateId": None,
                 "templateName": None,
                 "matchMode": None,
+                # Template ↔ case match score + rationale. Populated later by
+                # _attach_match_scores once a template is bound; None for
+                # AI-only cards. See DraftingSuggestionItem in schemas.py.
+                "matchScore": _normalize_match_score(item.get("matchScore")),
+                "matchReason": (
+                    (str(item.get("matchReason")).strip() or None)
+                    if item.get("matchReason") is not None
+                    else None
+                ),
             }
         )
     cleaned = _filter_forbidden_acts(_dedupe_suggestions(cleaned))
@@ -450,6 +486,13 @@ class DraftingAgent:
         # (user_id, normalized title) so the kickoff reuses the SAME
         # template the panel advertised.
         self._suggestion_prematch: "OrderedDict[str, str]" = OrderedDict()
+        # Template ↔ case match scores keyed by (user_id, templateId, title) so
+        # a reconnect re-emit (or a rematch pass) reuses the score the panel
+        # already advertised instead of re-calling the LLM. Mirrors the
+        # _suggestion_prematch LRU discipline.
+        self._match_score_cache: "OrderedDict[str, Tuple[Optional[int], Optional[str]]]" = (
+            OrderedDict()
+        )
 
     @staticmethod
     def _prematch_key(user_id: str, title: str) -> str:
@@ -712,6 +755,29 @@ class DraftingAgent:
                     "Template coverage pass failed (non-fatal): {}", exc
                 )
 
+            # Score every template-backed card on template ↔ case fit (0-100),
+            # then hide weak fits and rank survivors by score. This is what
+            # collapses "10 uploaded notices" down to the ones that genuinely
+            # fit this matter, each carrying a "% match" badge. Non-fatal: a
+            # failure here leaves the cards unscored but still shown.
+            try:
+                suggestions = await self._attach_match_scores(
+                    user_id=user_id,
+                    role=role,
+                    suggestions=suggestions,
+                    ready_templates=ready_templates,
+                    case_summary=case_summary,
+                    applicable_laws_brief=applicable_laws_brief,
+                    strategy_brief=strategy_brief,
+                    analysis_brief=analysis_brief,
+                    list_of_dates_brief=list_of_dates_brief,
+                )
+                suggestions = self._threshold_and_rank(suggestions)
+            except Exception as exc:
+                logger.warning(
+                    "Match-score / ranking pass failed (non-fatal): {}", exc
+                )
+
         logger.success(
             "Drafting suggestions: {} item(s) ready (pre-matched={})",
             len(suggestions),
@@ -775,11 +841,13 @@ class DraftingAgent:
             title = (item.get("title") or "").strip()
             description = (item.get("description") or "").strip()
             try:
-                payload, library_size = await self._find_matching_template_for_suggestion(
-                    user_id=user_id,
-                    suggestion_title=title,
-                    suggestion_description=description,
-                    fallback_text="",
+                payload, library_size, candidates = (
+                    await self._find_matching_template_for_suggestion(
+                        user_id=user_id,
+                        suggestion_title=title,
+                        suggestion_description=description,
+                        fallback_text="",
+                    )
                 )
             except Exception as exc:
                 logger.warning(
@@ -788,9 +856,41 @@ class DraftingAgent:
                 return item  # leave fields unset; click-time matcher will retry
 
             enriched = dict(item)
-            if payload and isinstance(payload, dict):
-                enriched["templateId"] = payload.get("template_id") or None
-                enriched["templateName"] = payload.get("name") or None
+            # Every matching library draft becomes an entry in matchedDrafts
+            # (scores filled in by the later _attach_match_scores pass). Dedupe
+            # by templateId, preserving order.
+            matched_drafts: List[Dict[str, Any]] = []
+            seen_tids: set = set()
+            for c in candidates or []:
+                tid = (c.get("templateId") or "").strip()
+                if not tid or tid in seen_tids:
+                    continue
+                seen_tids.add(tid)
+                matched_drafts.append(
+                    {
+                        "templateId": tid,
+                        "templateName": c.get("name") or None,
+                        "category": c.get("category") or None,
+                        "matchScore": None,
+                        "matchReason": None,
+                    }
+                )
+            enriched["matchedDrafts"] = matched_drafts
+
+            if matched_drafts:
+                # Primary mirrors the LLM-chosen winner when present, else the
+                # first candidate; _attach_match_scores re-sets it to the
+                # top-scored draft once every entry is scored.
+                primary_id = None
+                primary_name = None
+                if payload and isinstance(payload, dict):
+                    primary_id = payload.get("template_id") or None
+                    primary_name = payload.get("name") or None
+                if not primary_id:
+                    primary_id = matched_drafts[0]["templateId"]
+                    primary_name = matched_drafts[0]["templateName"]
+                enriched["templateId"] = primary_id
+                enriched["templateName"] = primary_name
                 enriched["matchMode"] = "matched"
             elif library_size > 0:
                 enriched["templateId"] = None
@@ -839,14 +939,21 @@ class DraftingAgent:
         if not user_id or not ready_templates:
             return suggestions
 
-        # Templates already bound to a matched card need no separate coverage.
-        covered_ids = {
-            (s.get("templateId") or "").strip()
-            for s in suggestions
-            if isinstance(s, dict)
-            and s.get("matchMode") == "matched"
-            and (s.get("templateId") or "").strip()
-        }
+        # Templates already surfaced on a card need no separate coverage — this
+        # includes every draft listed in a card's matchedDrafts (not just the
+        # primary), so same-type drafts grouped under one card never also spawn
+        # a duplicate standalone card.
+        covered_ids: set = set()
+        for s in suggestions:
+            if not isinstance(s, dict):
+                continue
+            tid = (s.get("templateId") or "").strip()
+            if tid:
+                covered_ids.add(tid)
+            for md in s.get("matchedDrafts") or []:
+                mid = (md.get("templateId") or "").strip() if isinstance(md, dict) else ""
+                if mid:
+                    covered_ids.add(mid)
         uncovered = [
             t
             for t in ready_templates
@@ -856,20 +963,38 @@ class DraftingAgent:
         if not uncovered:
             return suggestions
 
-        async def _check_one(t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            tid = (t.get("templateId") or "").strip()
-            tname = (t.get("name") or "").strip()
+        # Group uncovered templates by document type so same-type drafts share
+        # ONE guaranteed card (all of them in matchedDrafts) rather than each
+        # spawning a duplicate card. Unclassified templates (no type) key by id
+        # so they remain individual cards.
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for t in uncovered:
             payload = t.get("payload") or {}
-            doc_type = (
+            gkey = (
                 payload.get("document_type")
                 or t.get("document_type")
                 or t.get("category")
                 or ""
+            ).strip().lower()
+            if not gkey:
+                gkey = "id::" + (t.get("templateId") or "").strip()
+            groups.setdefault(gkey, []).append(t)
+
+        async def _check_group(members: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+            rep = members[0]
+            tid = (rep.get("templateId") or "").strip()
+            tname = (rep.get("name") or "").strip()
+            payload = rep.get("payload") or {}
+            doc_type = (
+                payload.get("document_type")
+                or rep.get("document_type")
+                or rep.get("category")
+                or ""
             ).strip()
             legal_purpose = (
-                t.get("filing_context")
+                rep.get("filing_context")
                 or payload.get("filing_context")
-                or t.get("purpose")
+                or rep.get("purpose")
                 or ""
             ).strip()
             prompt = build_template_applicability_prompt(
@@ -914,11 +1039,29 @@ class DraftingAgent:
             desc = (obj.get("description") or "").strip()
             if len(desc) > 220:
                 desc = desc[:220].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
+            # Every member of the type group is a matched draft (scores filled
+            # in by the _attach_match_scores pass), so the modal lists them all.
+            matched_drafts: List[Dict[str, Any]] = []
+            seen_tids: set = set()
+            for m in members:
+                mid = (m.get("templateId") or "").strip()
+                if not mid or mid in seen_tids:
+                    continue
+                seen_tids.add(mid)
+                matched_drafts.append(
+                    {
+                        "templateId": mid,
+                        "templateName": m.get("name") or None,
+                        "category": m.get("category") or None,
+                        "matchScore": None,
+                        "matchReason": None,
+                    }
+                )
             logger.info(
-                "Template coverage: template {} ({!r}) deemed applicable — "
-                "guaranteeing card {!r}",
-                tid,
-                tname[:50],
+                "Template coverage: type group {!r} ({} draft(s)) deemed "
+                "applicable — guaranteeing card {!r}",
+                doc_type or tname[:50],
+                len(matched_drafts),
                 title[:80],
             )
             return {
@@ -928,9 +1071,14 @@ class DraftingAgent:
                 "templateId": tid,
                 "templateName": tname or None,
                 "matchMode": "matched",
+                # Filled by the _attach_match_scores pass that runs after
+                # coverage; present here so the key shape is uniform.
+                "matchScore": None,
+                "matchReason": None,
+                "matchedDrafts": matched_drafts,
             }
 
-        results = await asyncio.gather(*(_check_one(t) for t in uncovered))
+        results = await asyncio.gather(*(_check_group(m) for m in groups.values()))
         guaranteed = _filter_forbidden_acts(
             [r for r in results if isinstance(r, dict)]
         )
@@ -995,11 +1143,285 @@ class DraftingAgent:
         )
         return capped
 
+    # ------------------------------------------------------------------
+    # Template ↔ case match scoring (the "% match" badge)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _score_cache_key(user_id: str, template_id: str, title: str) -> str:
+        norm_title = re.sub(r"\s+", " ", (title or "").strip().lower())
+        return (
+            f"{(user_id or '').strip()}::{(template_id or '').strip()}::{norm_title}"
+        )
+
+    def _remember_match_score(
+        self,
+        user_id: str,
+        template_id: str,
+        title: str,
+        score: Optional[int],
+        reason: Optional[str],
+    ) -> None:
+        """Cache a (score, reason) for a (user, template, title) card, LRU-bounded.
+        No-op when the key parts or the score are missing."""
+        if not (user_id and template_id) or score is None:
+            return
+        key = self._score_cache_key(user_id, template_id, title)
+        cache = self._match_score_cache
+        cache[key] = (score, reason)
+        cache.move_to_end(key)
+        while len(cache) > self._PREMATCH_CACHE_MAX:
+            cache.popitem(last=False)
+
+    def _recall_match_score(
+        self, user_id: str, template_id: str, title: str
+    ) -> Optional[Tuple[Optional[int], Optional[str]]]:
+        if not (user_id and template_id):
+            return None
+        return self._match_score_cache.get(
+            self._score_cache_key(user_id, template_id, title)
+        )
+
+    async def _score_one_card(
+        self,
+        *,
+        role: str,
+        case_summary: str,
+        applicable_laws_brief: str,
+        strategy_brief: str,
+        analysis_brief: str,
+        list_of_dates_brief: str,
+        suggestion_title: str,
+        suggestion_description: str,
+        template_document_type: str,
+        template_legal_purpose: str,
+    ) -> Tuple[Optional[int], Optional[str]]:
+        """Single LLM call returning (match_score 0-100, match_reason) for one
+        template-backed card. Non-fatal: returns (None, None) on any failure so
+        the card simply shows no badge rather than blocking the panel."""
+        prompt = build_template_match_score_prompt(
+            role=role,
+            case_summary=case_summary,
+            applicable_laws_brief=applicable_laws_brief,
+            strategy_brief=strategy_brief,
+            analysis_brief=analysis_brief,
+            list_of_dates_brief=list_of_dates_brief,
+            suggestion_title=suggestion_title,
+            suggestion_description=suggestion_description,
+            template_document_type=template_document_type,
+            template_legal_purpose=template_legal_purpose,
+        )
+        try:
+            raw = await gemini_client.generate(
+                prompt,
+                system_instruction=TEMPLATE_MATCH_SCORE_INSTRUCTION,
+                temperature=0.1,
+                max_tokens=600,
+                response_mime_type="application/json",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Template match-score call failed for {!r} (non-fatal): {}",
+                (suggestion_title or "")[:60],
+                exc,
+            )
+            return None, None
+        obj = _parse_json_object(raw)
+        if not isinstance(obj, dict):
+            return None, None
+        score = _normalize_match_score(obj.get("match_score"))
+        reason = " ".join(str(obj.get("match_reason") or "").split())[:120] or None
+        return score, reason
+
+    async def _attach_match_scores(
+        self,
+        *,
+        user_id: str,
+        role: str,
+        suggestions: List[Dict[str, Any]],
+        ready_templates: List[Dict[str, Any]],
+        case_summary: str,
+        applicable_laws_brief: str = "",
+        strategy_brief: str = "",
+        analysis_brief: str = "",
+        list_of_dates_brief: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Attach ``matchScore`` / ``matchReason`` to every template-backed card.
+
+        Scores how well each bound template fits THIS case (0-100). Runs in
+        parallel; per-item failures degrade gracefully (the card keeps a None
+        score). Cards with no ``templateId`` are left untouched. Reuses cached
+        scores keyed by (user, template, title) so reconnect re-emits don't
+        re-call the LLM. Template document-type / legal-purpose come from the
+        gathered ``ready_templates`` (see _tm_gather)."""
+        if not suggestions:
+            return suggestions
+
+        # Index the gathered templates by id so we can recover document_type /
+        # legal_purpose for each bound card without re-listing the store.
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for t in ready_templates or []:
+            tid = (t.get("templateId") or "").strip()
+            if tid:
+                by_id[tid] = t
+
+        def _template_dims(tid: str) -> Tuple[str, str]:
+            t = by_id.get(tid) or {}
+            payload = t.get("payload") or {}
+            doc_type = (
+                payload.get("document_type")
+                or t.get("document_type")
+                or t.get("category")
+                or ""
+            ).strip()
+            legal_purpose = (
+                t.get("filing_context")
+                or payload.get("filing_context")
+                or t.get("purpose")
+                or ""
+            ).strip()
+            return doc_type, legal_purpose
+
+        async def _score_pair(title: str, description: str, tid: str) -> Tuple[Optional[int], Optional[str]]:
+            """Score one (card title, template) pair, served from cache when warm."""
+            cached = self._recall_match_score(user_id, tid, title)
+            if cached is not None and cached[0] is not None:
+                return cached
+            doc_type, legal_purpose = _template_dims(tid)
+            score, reason = await self._score_one_card(
+                role=role,
+                case_summary=case_summary,
+                applicable_laws_brief=applicable_laws_brief,
+                strategy_brief=strategy_brief,
+                analysis_brief=analysis_brief,
+                list_of_dates_brief=list_of_dates_brief,
+                suggestion_title=title,
+                suggestion_description=description,
+                template_document_type=doc_type,
+                template_legal_purpose=legal_purpose,
+            )
+            self._remember_match_score(user_id, tid, title, score, reason)
+            return score, reason
+
+        async def _score(item: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(item, dict):
+                return item
+            title = (item.get("title") or "").strip()
+            description = (item.get("description") or "").strip()
+            drafts = item.get("matchedDrafts")
+
+            if isinstance(drafts, list) and drafts:
+                # Score every matching draft, then sort by % match (None last)
+                # and mirror the top one into the card's primary fields.
+                async def _score_draft(md: Dict[str, Any]) -> Dict[str, Any]:
+                    if not isinstance(md, dict):
+                        return md
+                    tid = (md.get("templateId") or "").strip()
+                    if not tid:
+                        return md
+                    try:
+                        score, reason = await _score_pair(title, description, tid)
+                    except Exception as exc:
+                        logger.warning(
+                            "Match-score for draft {!r} of card {!r} failed "
+                            "(non-fatal): {}",
+                            tid,
+                            title[:60],
+                            exc,
+                        )
+                        return md
+                    out = dict(md)
+                    out["matchScore"] = score
+                    out["matchReason"] = reason
+                    return out
+
+                scored_drafts = list(
+                    await asyncio.gather(*(_score_draft(d) for d in drafts))
+                )
+                scored_drafts.sort(
+                    key=lambda d: d.get("matchScore")
+                    if isinstance(d.get("matchScore"), int)
+                    else -1,
+                    reverse=True,
+                )
+                enriched = dict(item)
+                enriched["matchedDrafts"] = scored_drafts
+                top = scored_drafts[0]
+                enriched["templateId"] = top.get("templateId") or enriched.get("templateId")
+                enriched["templateName"] = top.get("templateName") or enriched.get("templateName")
+                enriched["matchScore"] = top.get("matchScore")
+                enriched["matchReason"] = top.get("matchReason")
+                return enriched
+
+            # Legacy single-template card (no matchedDrafts list).
+            tid = (item.get("templateId") or "").strip()
+            if not tid:
+                # AI-only card — no template, no score.
+                return item
+            try:
+                score, reason = await _score_pair(title, description, tid)
+            except Exception as exc:
+                logger.warning(
+                    "Match-score for card {!r} failed (non-fatal): {}",
+                    title[:60],
+                    exc,
+                )
+                return item
+            enriched = dict(item)
+            enriched["matchScore"] = score
+            enriched["matchReason"] = reason
+            return enriched
+
+        return list(await asyncio.gather(*(_score(s) for s in suggestions)))
+
+    def _threshold_and_rank(
+        self, suggestions: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Rank template-backed cards ahead of AI-only ones, by match score.
+
+        Cards that match one or more library drafts are NEVER hidden: every
+        matching draft (and its % score) is surfaced so the lawyer can pick one
+        from the selection modal — including weak fits (e.g. 34% / 25%). What
+        used to collapse "10 uploaded notices" to a single card is now the
+        per-card ``matchedDrafts`` list + modal, not a hard score gate.
+
+        - A card is "template-backed" if it has any ``matchedDrafts`` or a
+          ``templateId``; these sort by ``matchScore`` desc (None last) ahead of
+          AI-only cards (which keep their relative order).
+        - The panel is re-capped at ``_MAX_SUGGESTIONS_WITH_TEMPLATES``.
+        """
+        templated: List[Dict[str, Any]] = []
+        ai_only: List[Dict[str, Any]] = []
+        for s in suggestions:
+            if not isinstance(s, dict):
+                continue
+            has_drafts = bool(s.get("matchedDrafts"))
+            tid = (s.get("templateId") or "").strip()
+            if has_drafts or tid:
+                templated.append(s)
+            else:
+                ai_only.append(s)
+
+        # Highest match first; cards with no score (None) sort last among
+        # template-backed cards but still ahead of AI-only suggestions.
+        templated.sort(
+            key=lambda s: s.get("matchScore") if isinstance(s.get("matchScore"), int) else -1,
+            reverse=True,
+        )
+
+        return (templated + ai_only)[:_MAX_SUGGESTIONS_WITH_TEMPLATES]
+
     async def rematch_unmatched_suggestions(
         self,
         *,
         user_id: str,
         suggestions: List[Dict[str, Any]],
+        role: str = "ADJUDICATOR",
+        case_summary: str = "",
+        applicable_laws_brief: str = "",
+        strategy_brief: str = "",
+        analysis_brief: str = "",
+        list_of_dates_brief: str = "",
     ) -> List[Dict[str, Any]]:
         """Refresh an *already-emitted* suggestions panel after the lawyer's
         template library grew, WITHOUT disturbing matched cards.
@@ -1007,19 +1429,22 @@ class DraftingAgent:
         Freeze semantics (the lawyer's requested behaviour):
           - A card with ``matchMode == "matched"`` whose ``templateId`` still
             exists in the library is kept verbatim — the template it
-            advertised stays its template, even though a new template was
-            just uploaded.
+            advertised stays its template (and its existing ``matchScore``),
+            even though a new template was just uploaded.
           - A matched card whose ``templateId`` was deleted is demoted to
             unmatched (its stale prematch lock is released) so it can pick up
             a current template.
           - Only the unmatched cards are re-run through
             ``_attach_template_matches`` against the now-larger library, so a
             freshly-uploaded template can fill in a card that previously had
-            no match.
+            no match. Any card that newly acquires a template is then scored on
+            template ↔ case fit (when case context is supplied) so it carries a
+            "% match" badge like the cards from the initial generation.
 
-        Order is preserved. Used by the socket re-emit path instead of a
-        full LLM regeneration, which would re-roll the cards and lose their
-        bindings. Falls back to returning the input unchanged on any error.
+        Order is preserved (no re-ranking — frozen cards must not move). Used by
+        the socket re-emit path instead of a full LLM regeneration, which would
+        re-roll the cards and lose their bindings. Falls back to returning the
+        input unchanged on any error.
         """
         if not suggestions:
             return suggestions
@@ -1075,6 +1500,37 @@ class DraftingAgent:
                 ):
                     self._remember_prematch(
                         user_id, enriched.get("title") or "", enriched["templateId"]
+                    )
+
+            # Score the cards that newly acquired a template so they carry a
+            # match badge like the initial-generation cards. Frozen cards keep
+            # their prior score untouched; we never re-rank here (freeze
+            # semantics). Non-fatal — a failure just leaves the new card
+            # unscored. Skipped when no case context was supplied (legacy call).
+            if case_summary or applicable_laws_brief or analysis_brief:
+                try:
+                    ready_templates, _ = await self._tm_gather(
+                        user_id=user_id, suggestion_text=""
+                    )
+                    ordered_idx = [idx for idx, _ in to_match]
+                    scored = await self._attach_match_scores(
+                        user_id=user_id,
+                        role=role,
+                        suggestions=[rematched[i] for i in ordered_idx],
+                        ready_templates=ready_templates,
+                        case_summary=case_summary,
+                        applicable_laws_brief=applicable_laws_brief,
+                        strategy_brief=strategy_brief,
+                        analysis_brief=analysis_brief,
+                        list_of_dates_brief=list_of_dates_brief,
+                    )
+                    for i, card in zip(ordered_idx, scored):
+                        rematched[i] = card
+                except Exception as exc:
+                    logger.warning(
+                        "rematch_unmatched_suggestions: match-score pass failed "
+                        "(non-fatal): {}",
+                        exc,
                     )
 
         merged: List[Dict[str, Any]] = []
@@ -3026,9 +3482,13 @@ class DraftingAgent:
         suggestion_title: str,
         suggestion_description: str,
         fallback_text: str = "",
-    ) -> Tuple[Optional[Dict[str, Any]], int]:
+    ) -> Tuple[Optional[Dict[str, Any]], int, List[Dict[str, Any]]]:
         """Pick a template from the lawyer's library that matches a clicked
-        suggestion. Returns ``(payload, ready_library_size)``.
+        suggestion. Returns ``(payload, ready_library_size, candidates)``.
+
+        ``candidates`` is the full set of matching library entries (same
+        document type, or the single anchor winner) for the "matched drafts"
+        modal; kickoff callers that only need the primary can ignore it.
 
         Match strategy (in order):
           1. **Type-first**: classify the suggestion into a canonical
@@ -3285,11 +3745,17 @@ class DraftingAgent:
         ready: List[Dict[str, Any]],
         ready_size: int,
         suggestion_class: Optional[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
         """Phase 3 — pick the matching template: type-first (with LLM
         applicability verification) then anchor-overlap fallback, with an
-        LLM tiebreaker on ambiguous shortlists. Returns the chosen template
-        payload, or None when nothing applicable is found."""
+        LLM tiebreaker on ambiguous shortlists.
+
+        Returns ``(chosen_payload, candidates)`` where ``chosen_payload`` is
+        the primary template payload (or None when nothing applicable was
+        verified) and ``candidates`` is the full set of matching ``ready``
+        entries to surface in the "matched drafts" modal (the same-document-
+        type group, or the single anchor winner). Each entry carries
+        ``templateId`` / ``name`` / ``category`` / ``payload``."""
         sugg_type = (
             (suggestion_class or {}).get("documentType") or ""
         ) if suggestion_class else ""
@@ -3298,48 +3764,41 @@ class DraftingAgent:
             ready=ready,
             suggestion_class=suggestion_class,
         )
-        if type_match_payload is not None and len(type_match_payload) == 1:
-            # A shared document_type is NOT sufficient proof of a match —
-            # the type buckets are coarse ("Miscellaneous Application"
-            # lumps a CCTV-preservation plea with a consumer evidence
-            # affidavit). Verify applicability with the LLM even for a
-            # single type-match; on rejection, fall through to the
-            # anchor path (which may find a genuinely-applicable template
-            # of a different type) and ultimately to no-match.
-            verified = await self._llm_tiebreak_template(
-                user_id=user_id,
-                suggestion_title=suggestion_title,
-                suggestion_description=suggestion_description,
-                candidates=type_match_payload,
-                snippet_chars=1500,
-                mode_label="type-verify",
-            )
-            if verified is not None:
-                return verified["payload"]
-            logger.info(
-                "Drafting suggestion: single type-match (type={!r}) failed "
-                "LLM applicability check — falling through to anchor/none",
-                sugg_type,
-            )
-        elif type_match_payload is not None and len(type_match_payload) > 1:
-            # Multiple templates share the suggestion's document type —
-            # tiebreak with the LLM. 1500-char snippets give it enough body
-            # to distinguish variants (e.g. Section 138 vs general dispute
-            # notice).
-            chosen = await self._llm_tiebreak_template(
-                user_id=user_id,
-                suggestion_title=suggestion_title,
-                suggestion_description=suggestion_description,
-                candidates=type_match_payload,
-                snippet_chars=1500,
-                mode_label="type-tiebreak",
-            )
-            if chosen is not None:
-                return chosen["payload"]
-            # LLM tiebreaker on the type-matched shortlist gave us nothing
-            # usable; fall through to the anchor-overlap path below.
+        if type_match_payload:
+            # Every template sharing the suggestion's document type is a
+            # candidate for the "matched drafts" modal — we surface them ALL
+            # (scored later, sorted by % match), not just one winner. The LLM
+            # still picks a `chosen` primary for the badge / kickoff pre-match;
+            # when it declines, the primary is set from the top-scored draft.
+            candidates = list(type_match_payload)
+            if len(type_match_payload) == 1:
+                # A shared document_type is NOT sufficient proof of a match —
+                # the type buckets are coarse. Verify applicability so the
+                # primary badge is honest; the draft still appears in the
+                # modal regardless, carrying its own (possibly low) score.
+                verified = await self._llm_tiebreak_template(
+                    user_id=user_id,
+                    suggestion_title=suggestion_title,
+                    suggestion_description=suggestion_description,
+                    candidates=type_match_payload,
+                    snippet_chars=1500,
+                    mode_label="type-verify",
+                )
+                chosen = verified["payload"] if verified is not None else None
+            else:
+                # Multiple templates share the type — tiebreak for the primary.
+                tb = await self._llm_tiebreak_template(
+                    user_id=user_id,
+                    suggestion_title=suggestion_title,
+                    suggestion_description=suggestion_description,
+                    candidates=type_match_payload,
+                    snippet_chars=1500,
+                    mode_label="type-tiebreak",
+                )
+                chosen = tb["payload"] if tb is not None else None
+            return chosen, candidates
 
-        # ---- 2) Anchor-overlap fallback ---------------------------------
+        # ---- 2) Anchor-overlap fallback (no same-type template) ----------
         suggestion_anchors = self._anchor_tokens(suggestion_text)
         suggestion_phrases = self._anchor_phrases_in(suggestion_text)
 
@@ -3379,7 +3838,7 @@ class DraftingAgent:
                 ready_size,
                 sugg_type or "(unclassified)",
             )
-            return None
+            return None, []
 
         if len(with_signal) == 1:
             entry, tok, phr = with_signal[0]
@@ -3406,7 +3865,9 @@ class DraftingAgent:
                     phr,
                     tok,
                 )
-                return verified["payload"]
+                # Anchor matches are single-document by nature (different types
+                # share only stray tokens) — the modal lists just this one.
+                return verified["payload"], [verified]
             logger.warning(
                 "Drafting suggestion matcher: single anchor candidate "
                 "(template={}, tok={}, phr={}) failed LLM applicability "
@@ -3415,15 +3876,15 @@ class DraftingAgent:
                 tok,
                 phr,
             )
-            return None
+            return None, []
 
         # Multiple candidates with anchor signal — tiebreak via LLM.
-        candidates = [t for t, _tok, _phr in with_signal]
+        anchor_candidates = [t for t, _tok, _phr in with_signal]
         chosen = await self._llm_tiebreak_template(
             user_id=user_id,
             suggestion_title=suggestion_title,
             suggestion_description=suggestion_description,
-            candidates=candidates,
+            candidates=anchor_candidates,
             snippet_chars=1500,
             mode_label="anchor-tiebreak",
         )
@@ -3432,10 +3893,12 @@ class DraftingAgent:
                 "Drafting suggestion matcher: LLM tiebreaker returned no "
                 "match from {} anchor-overlapping candidate(s); falling "
                 "back to AI generation",
-                len(candidates),
+                len(anchor_candidates),
             )
-            return None
-        return chosen["payload"]
+            return None, []
+        # Anchor candidates may be of mixed document types; surface only the
+        # chosen one so the modal never mixes unrelated draft types.
+        return chosen["payload"], [chosen]
 
     def _select_by_type(
         self,
@@ -4342,12 +4805,9 @@ class DraftingAgent:
         #  - blank: no template lookup.
         template_payload: Optional[Dict[str, Any]] = None
         template_match_note: Optional[str] = None
-        # When the suggested-draft path runs but no template matches AND
-        # the library is non-empty, surface a short explanatory prefix on
-        # the assistant's first reply so the lawyer learns why the upload
-        # they expected to be reused wasn't picked.
+        # Reserved for the no-template fallback kickoff below; the 0-match
+        # suggested-draft path now early-returns to _scope_blank_draft.
         no_match_prefix: Optional[str] = None
-        ready_library_size = 0
 
         # draftMode="custom": lawyer chose "No, Custom AI Draft" — skip ALL
         # template resolution (clearing templateId is not enough because
@@ -4402,35 +4862,25 @@ class DraftingAgent:
                     user_message=user_message,
                 )
         elif source == "suggestedDraft":
-            # `fallback_text` covers the case where BE has not yet shipped
-            # `suggestionTitle` / `suggestionDescription` on
-            # `user_message_request` — the lawyer's kickoff content often
-            # still names the document type ("draft a bail application
-            # ...") and is enough to drive matching deterministically.
-            template_payload, ready_library_size = await self._find_matching_template_for_suggestion(
-                user_id=user_id,
-                suggestion_title=suggestion_title or "",
-                suggestion_description=suggestion_description,
-                fallback_text=(user_message or "").strip(),
+            # 0-match suggested-draft click. If the panel had advertised a
+            # matching library draft, the pre-match recall bridge above would
+            # already have populated `templateId` (routing us into the template
+            # block). Reaching here means the card genuinely had `matches: []`
+            # — there is nothing to follow. The frontend's match list is
+            # authoritative, so do NOT re-scan the library (which could
+            # spuriously bind a template or prepend a "no close match" note);
+            # produce a clean generic AI draft from the case context, exactly
+            # like the `draftMode == "custom"` path.
+            return await self._scope_blank_draft(
+                role=role,
+                case_summary=case_summary,
+                case_facts=case_facts,
+                source="blank",
+                lawyer_instructions=lawyer_instructions,
+                suggestion_title=suggestion_title,
+                suggested_draft_id=request_fields.get("suggestedDraftId"),
+                no_match_prefix=None,
             )
-            if template_payload:
-                matched_name = template_payload.get("name") or ""
-                template_match_note = (
-                    f"Matched the lawyer's template '{matched_name}' from the "
-                    f"library based on the suggested draft "
-                    f"'{suggestion_title or 'New Draft'}'."
-                )
-            elif ready_library_size > 0:
-                # Library has usable templates but none was a close enough
-                # match. Tell the lawyer plainly so they can either pick a
-                # template directly or upload a closer one.
-                pretty_title = (suggestion_title or "this draft").strip() or "this draft"
-                no_match_prefix = (
-                    f"I couldn't find a close match in your Template Library "
-                    f"for *{pretty_title}*, so I'm drafting this from "
-                    f"scratch. If you have a closer template, upload it or "
-                    f"open it directly from the library."
-                )
 
         # Without a template / suggestion / instruction, we still kick off
         # but ask a broader scoping question.
@@ -5050,7 +5500,7 @@ class DraftingAgent:
         similar_id: Optional[str] = None
         similar_name: Optional[str] = None
         try:
-            similar, _size = await self._find_matching_template_for_suggestion(
+            similar, _size, _candidates = await self._find_matching_template_for_suggestion(
                 user_id=user_id,
                 suggestion_title=suggestion_title or "",
                 suggestion_description=suggestion_description or "",

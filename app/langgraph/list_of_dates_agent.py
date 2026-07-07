@@ -21,7 +21,7 @@ def snap_hallucinated_year(
     document_text: str,
     today_iso: str,
     anchor_year: Optional[int] = None,
-    slack_years: int = 3,
+    slack_years: int = 0,
     future_tolerance_days: int = 365,
     log_prefix: str = "Date guard",
 ) -> str:
@@ -29,10 +29,18 @@ def snap_hallucinated_year(
 
     Used as a post-LLM defense for list-of-dates / procedural-timeline
     extractors. Gemini sometimes ignores the prompt's "use current year" rule
-    and stamps recent partial dates ("2 February", "21 तारीख") with a wildly
-    wrong year (commonly 2000). This helper snaps such dates back to the
-    current year when there's no anchor, the year is well in the past, and
-    the suspicious 4-digit year does not appear anywhere in the source text.
+    and stamps recent partial dates ("2 February", "21 तारीख") with a wrong
+    year — either a wildly wrong one (commonly 2000) or a near-past training-era
+    year (e.g. 2024 for a 2026 conversation). This helper snaps such dates back
+    to the current year when there's no anchor, the year predates the current
+    year (see ``slack_years``), and the suspicious 4-digit year does not appear
+    anywhere in the source text.
+
+    ``slack_years`` defaults to ``0`` so that only the current year (and the
+    future) is trusted for an ungrounded date — the product rule is "a date
+    with no year in the source belongs to the current year". A near-past year
+    like 2024 is therefore corrected rather than left to slip through. Explicit
+    source years and an ``anchor_year`` still win over the snap (see below).
 
     When the snap to the current year produces a date in the FUTURE, we keep
     it as long as it's within ``future_tolerance_days`` of today — these
@@ -110,6 +118,110 @@ def snap_hallucinated_year(
         log_prefix, year, snapped_year, date_iso,
     )
     return snapped
+
+
+_MONTH_NAME_TO_NUM = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+    "december": 12, "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7,
+    "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def snap_years_in_text(
+    text: str,
+    *,
+    today_iso: str,
+    document_text: str = "",
+    log_prefix: str = "Free-text date guard",
+) -> str:
+    """Snap hallucinated years on FULL dates embedded in free-text output.
+
+    Companion to :func:`snap_hallucinated_year` for the narrative panels
+    (case summary, strategic objective, next steps, analysis report) where the
+    model tends to stamp a training-era year (e.g. 2024) on dates the source
+    stated without a year. Only FULL dates are rewritten — numeric
+    ``DD/MM/YYYY`` (``/`` ``-`` ``.`` separators), ISO ``YYYY-MM-DD``, and textual
+    ``D Month YYYY`` / ``Month D, YYYY``. Bare years (statute years like
+    "Act, 2000" / "BNS, 2023") and currency ("₹2000") are never matched, so they
+    are preserved. Each match is delegated to :func:`snap_hallucinated_year`
+    (no anchor), which keeps any year literally present in ``document_text``.
+
+    Returns ``text`` with only the year of ungrounded full dates rewritten;
+    all other characters are left byte-for-byte unchanged.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+
+    def _new_year(year_str: str, month: int, day: int) -> Optional[str]:
+        try:
+            int(year_str)
+        except ValueError:
+            return None
+        month = min(max(month, 1), 12)
+        day = min(max(day, 1), 28)  # a valid, harmless day — only the year matters
+        iso = f"{int(year_str):04d}-{month:02d}-{day:02d}"
+        snapped = snap_hallucinated_year(
+            date_iso=iso,
+            document_text=document_text or "",
+            today_iso=today_iso,
+            anchor_year=None,
+            log_prefix=log_prefix,
+        )
+        new = snapped[:4]
+        return new if new != year_str else None
+
+    # 1) Numeric DD/MM/YYYY (day-first, Indian convention) with a matching separator.
+    def _numeric(m: "re.Match") -> str:
+        d, sep, mo, y = m.group(1), m.group(2), m.group(3), m.group(4)
+        try:
+            day_i, month_i = int(d), int(mo)
+        except ValueError:
+            return m.group(0)
+        if month_i > 12 and day_i <= 12:  # tolerate a swapped-looking date
+            day_i, month_i = month_i, day_i
+        ny = _new_year(y, month_i, day_i)
+        return f"{d}{sep}{mo}{sep}{ny}" if ny else m.group(0)
+
+    text = re.sub(r"\b(\d{1,2})([/.\-])(\d{1,2})\2(\d{4})\b", _numeric, text)
+
+    # 2) ISO YYYY-MM-DD
+    def _iso(m: "re.Match") -> str:
+        y, mo, d = m.group(1), m.group(2), m.group(3)
+        ny = _new_year(y, int(mo), int(d))
+        return f"{ny}-{mo}-{d}" if ny else m.group(0)
+
+    text = re.sub(r"\b(\d{4})-(\d{2})-(\d{2})\b", _iso, text)
+
+    # 3) Textual "27 May 2026" / "27 May, 2026" (prefix captured; only the year is rewritten).
+    def _dmy(m: "re.Match") -> str:
+        prefix, y = m.group(1), m.group(2)
+        inner = re.match(r"(\d{1,2})\s+([A-Za-z]{3,9})", prefix)
+        if not inner:
+            return m.group(0)
+        month_i = _MONTH_NAME_TO_NUM.get(inner.group(2).lower())
+        if not month_i:
+            return m.group(0)
+        ny = _new_year(y, month_i, int(inner.group(1)))
+        return f"{prefix}{ny}" if ny else m.group(0)
+
+    text = re.sub(r"\b(\d{1,2}\s+[A-Za-z]{3,9},?\s+)(\d{4})\b", _dmy, text)
+
+    # 4) Textual "May 27, 2026" / "May 27 2026"
+    def _mdy(m: "re.Match") -> str:
+        prefix, y = m.group(1), m.group(2)
+        inner = re.match(r"([A-Za-z]{3,9})\s+(\d{1,2})", prefix)
+        if not inner:
+            return m.group(0)
+        month_i = _MONTH_NAME_TO_NUM.get(inner.group(1).lower())
+        if not month_i:
+            return m.group(0)
+        ny = _new_year(y, month_i, int(inner.group(2)))
+        return f"{prefix}{ny}" if ny else m.group(0)
+
+    text = re.sub(r"\b([A-Za-z]{3,9}\s+\d{1,2},?\s+)(\d{4})\b", _mdy, text)
+
+    return text
 
 
 class TemporalInferenceState(TypedDict, total=False):

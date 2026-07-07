@@ -755,6 +755,98 @@ OUTPUT FORMAT — strict JSON object, no other text:
 
 
 # ---------------------------------------------------------------------------
+# 1c) Template ↔ case match score (the "% match" badge on each card)
+# ---------------------------------------------------------------------------
+
+TEMPLATE_MATCH_SCORE_INSTRUCTION = (
+    DRAFTING_SYSTEM_INSTRUCTION
+    + "\n\n"
+    + "MODE: TEMPLATE-MATCH SCORE. "
+    + "You are scoring, on a 0-100 scale, how well ONE of the lawyer's "
+    + "reusable templates fits the current matter — judged by the template's "
+    + "DOCUMENT TYPE and LEGAL PURPOSE against the case posture, NOT by whether "
+    + "the template's original parties or facts happen to match. A "
+    + "consumer-dispute legal notice is a strong fit for any consumer dispute; "
+    + "a bail application is a poor fit for a pure consumer matter. "
+    + "0 = wrong kind of document for this case; 100 = exactly the document "
+    + "this matter needs right now. Be calibrated, not generous — reserve "
+    + "scores above 80 for documents this case genuinely calls for. "
+    + "Output strict JSON only — a single object, no markdown fences, no commentary."
+)
+
+
+def build_template_match_score_prompt(
+    role: str,
+    case_summary: str,
+    applicable_laws_brief: str,
+    strategy_brief: str,
+    analysis_brief: str,
+    list_of_dates_brief: str,
+    suggestion_title: str,
+    suggestion_description: str,
+    template_document_type: str,
+    template_legal_purpose: str,
+) -> str:
+    """Build the prompt that scores how well a single template fits this case.
+
+    The score is driven by the template's document type / legal purpose against
+    the case posture (and the specific draft the card proposes), never by the
+    original matter's party names or facts. Returns a prompt asking for a single
+    JSON object ``{"match_score": <int 0-100>, "match_reason": "<= 120 chars"}``.
+    """
+    role_upper = (role or "ADJUDICATOR").strip().upper()
+    return f"""WORKSPACE ROLE: {role_upper}
+
+CASE SUMMARY:
+{case_summary or "(no summary available — derive from analysis report below)"}
+
+APPLICABLE LAWS (already identified for this case):
+{applicable_laws_brief or "(none yet)"}
+
+STRATEGY / OBJECTIVE:
+{strategy_brief or "(none yet)"}
+
+ANALYSIS REPORT (strengths, weaknesses, gaps, pending actions):
+{analysis_brief or "(none yet)"}
+
+LIST OF DATES (chronology):
+{list_of_dates_brief or "(none yet)"}
+
+PROPOSED DRAFT (the card this template would back):
+  - title:        {suggestion_title or "(untitled)"}
+  - description:  {suggestion_description or "(none)"}
+
+CANDIDATE TEMPLATE:
+  - document type:  {template_document_type or "(unclassified)"}
+  - legal purpose:  {template_legal_purpose or "(not specified)"}
+
+TASK:
+Score 0-100 how well this template fits THIS matter — i.e. how directly a draft
+of this template's TYPE and LEGAL PURPOSE serves this {role_upper}'s case right
+now. Judge by legal fit (does this kind of document advance or suit this case?),
+not by whether the template's original parties/facts match this case.
+
+Return a single JSON object:
+  - match_score:   integer 0-100. 0 = wrong kind of document for this case;
+                   100 = exactly the document this matter needs now.
+  - match_reason:  ONE short clause (<= 120 characters) explaining the score in
+                   terms of this case (e.g. "consumer notice fits the deficiency
+                   claim and 30-day demand window").
+
+CONSTRAINTS:
+  - Score by legal purpose / document type vs. case posture, NOT by matching the
+    template's original party names or facts.
+  - Never copy the template's original party names, dates, or facts into the
+    reason; refer only to this case.
+  - Be calibrated: a clearly off-topic template scores low (< 40); a borderline
+    fit lands mid-range; reserve > 80 for documents this case genuinely needs.
+
+OUTPUT FORMAT — strict JSON object, no other text:
+{{"match_score": 82, "match_reason": "..."}}
+"""
+
+
+# ---------------------------------------------------------------------------
 # 2) Template analysis (kick-off turn)
 # ---------------------------------------------------------------------------
 

@@ -129,6 +129,7 @@ from app.prompts.strategy_prompts import (
     llm_classify_objective_change_intent_prompt,
     llm_classify_panel_edit_intent_prompt,
     llm_classify_panel_edit_intent_prompt2,
+    panel_edit_ack_prompt,
 )
 
 
@@ -2266,6 +2267,57 @@ class StrategyMixin:
         except Exception as e:
             logger.warning("Panel-edit intent classifier failed: {}", e)
             return empty
+
+    async def _build_panel_edit_ack(
+        self,
+        *,
+        workspace_id: str,
+        user_message: str,
+        panels: List[str],
+        instructions: Dict[str, str],
+        is_rename: bool = False,
+    ) -> str:
+        """
+        Compose the chat confirmation after surgical panel edits were applied.
+
+        Returns a short natural-language message describing what changed (and,
+        for possible-next-steps edits, the resulting list state), or "" so the
+        caller falls back to a templated acknowledgement.
+        """
+        try:
+            from app.ai.gemini_client import gemini_client
+
+            edits = [
+                (panel, (instructions.get(panel) or "").strip())
+                for panel in panels
+            ]
+            edits = [(p, i) for p, i in edits if i]
+            if not edits:
+                return ""
+
+            updated_next_steps: List[str] = []
+            if "possible next steps" in panels:
+                cur_strategy = self._workspace_strategy_payload.get(workspace_id)
+                if isinstance(cur_strategy, dict):
+                    steps = cur_strategy.get("possibleNextSteps") or []
+                    if isinstance(steps, list):
+                        updated_next_steps = [str(s).strip() for s in steps if s]
+
+            prompt = panel_edit_ack_prompt(
+                user_message=(user_message or "").strip(),
+                edits=edits,
+                updated_next_steps=updated_next_steps,
+                is_rename=is_rename,
+            )
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.2,
+                max_tokens=500,
+            )
+            return (raw or "").strip()
+        except Exception as e:
+            logger.warning("Panel-edit ack generation failed (non-fatal): {}", e)
+            return ""
 
     def _strategy_objective_fallback(
         self,

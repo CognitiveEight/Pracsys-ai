@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [5.0.1] - 2026-07-09
+
+### Fixed
+
+- **Surgical panel edits from chat now reply with a real confirmation instead of the terse `"Updated: <panel>."` one-liner** (`app/socket/handlers/chat.py`, `app/socket/handlers/strategy.py`, `app/prompts/strategy_prompts.py`). When a lawyer's message is routed to the free-form panel-edit path (e.g. *"remove 1. … from possible next steps"*), the intelligence chat agent is intentionally skipped — but the acknowledgement was a bare `"Updated: possible next steps."`, which read as the AI not responding. The pre-dispatcher now records each applied per-panel edit instruction (`panel_edit_instructions`), and a new helper `_build_panel_edit_ack` (prompt: `panel_edit_ack_prompt`) makes one small Gemini call to compose a 2–4 sentence plain-text confirmation stating **what** was changed and the resulting panel state (e.g. how many next steps remain and which is now first; renames confirm the replacement across the affected panels). On any generation failure it falls back to a templated acknowledgement — never worse than before. The `ai_response` shape, the surgical-edit routing, the skip of the full chat graph, and the no-cascade rule for panel edits are all unchanged.
+
+---
+
 ## [5.0.0] - 2026-07-07
 
 Two new intelligence panels (**Case Laws** and **Relevant Parties**), manual case-law upload, multi-draft template matching in the Drafting Assistant, and a large no-behaviour-change decomposition of the socket layer. **Major version bump: several socket payload contracts changed shape** (party role vocabulary and field names, drafting-suggestion match fields, case-law item ids) — the backend/frontend must be released in step.

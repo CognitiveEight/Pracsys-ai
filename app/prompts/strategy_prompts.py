@@ -857,3 +857,47 @@ def llm_classify_panel_edit_intent_prompt2(*, _PANEL_LABELS, default_panel):
                     "so the objective-change flow handles it.\n"
     )
 
+
+def panel_edit_ack_prompt(*, user_message, edits, updated_next_steps, is_rename):
+    """Confirmation message after a surgical panel edit was applied.
+
+    edits: list of (panel_human_name, instruction) pairs that actually applied.
+    updated_next_steps: the post-edit possibleNextSteps list when that panel
+    was touched (empty list otherwise).
+    """
+    edits_block = "\n".join(
+        f"- {panel}: {instruction}" for panel, instruction in edits
+    )
+    next_steps_block = ""
+    if updated_next_steps:
+        steps = "\n".join(f"{i}. {s}" for i, s in enumerate(updated_next_steps, 1))
+        next_steps_block = (
+            f"\nUPDATED \"POSSIBLE NEXT STEPS\" PANEL (after the edit):\n{steps}\n"
+        )
+    rename_block = (
+        "\nThis was a workspace-wide NAME correction: the same replacement was "
+        "applied across every affected panel. Confirm the name change once and "
+        "list the panels it touched — do not repeat the instruction per panel.\n"
+        if is_rename
+        else ""
+    )
+    return (
+f"""You are the assistant in a legal-strategy workspace chat. The user asked for an edit, and it has ALREADY been applied to the panels — the updated panels are already visible to the user. Write the short chat confirmation.
+
+USER'S EDIT REQUEST:
+\"\"\"{user_message[:2000]}\"\"\"
+
+EDITS THAT WERE APPLIED (panel: instruction):
+{edits_block}
+{next_steps_block}{rename_block}
+WRITE THE CONFIRMATION MESSAGE. RULES:
+- Plain text only: no JSON, no markdown headings, no bullet lists.
+- 2 to 4 sentences.
+- State concretely WHAT was changed, briefly quoting or paraphrasing the removed/changed/added content (a short fragment is enough — never reproduce a whole panel).
+- When possible next steps were edited, mention the resulting state (e.g. how many steps the panel now lists, or what the first step now is).
+- Past tense, first person ("I've removed…", "I've updated…"). Neutral and factual — no legal advice, no advocacy, no new suggestions.
+- Do NOT mention any product, company, or brand name, and do not mention internal terms like "payload", "regeneration", or "classifier".
+- End by inviting further adjustments in a single short clause.
+"""
+    )
+

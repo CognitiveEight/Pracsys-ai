@@ -869,6 +869,11 @@ class ChatMixin:
                 # AND one panel-name token do we ask the classifier.
                 # -------------------------------------------------------------
                 panel_edit_applied: List[str] = []
+                # Per-panel edit instructions that actually applied — feeds the
+                # confirmation message so the chat reply can say WHAT changed
+                # instead of a bare "Updated: <panel>." one-liner.
+                panel_edit_instructions: Dict[str, str] = {}
+                panel_edit_is_rename = False
                 _edit_verbs = (
                     "remove", "delete", "drop", "change", "replace", "edit",
                     "modify", "rewrite", "rephrase", "add", "append", "insert",
@@ -932,6 +937,7 @@ class ChatMixin:
                         # panel — force the SAME rename instruction onto all of
                         # them so coverage is exhaustive and deterministic.
                         _is_rename = bool(classification.get("isRename"))
+                        panel_edit_is_rename = _is_rename
                         if _is_rename:
                             _rename_instr = next(
                                 (
@@ -1046,6 +1052,9 @@ class ChatMixin:
                             )
                             if ok:
                                 panel_edit_applied.append("strategic objective")
+                                panel_edit_instructions["strategic objective"] = (
+                                    so_slot["instruction"]
+                                )
                                 cur_strat_for_edit = (
                                     self._workspace_strategy_payload.get(workspace_id)
                                     or cur_strat_for_edit
@@ -1086,6 +1095,9 @@ class ChatMixin:
                                 )
                                 if ok:
                                     panel_edit_applied.append("case summary")
+                                    panel_edit_instructions["case summary"] = (
+                                        _combined_instr
+                                    )
                                     cur_strat_for_edit = (
                                         self._workspace_strategy_payload.get(workspace_id)
                                         or cur_strat_for_edit
@@ -1110,6 +1122,9 @@ class ChatMixin:
                             )
                             if ok:
                                 panel_edit_applied.append("possible next steps")
+                                panel_edit_instructions["possible next steps"] = (
+                                    ns_slot["instruction"]
+                                )
                             else:
                                 logger.warning(
                                     "Possible next steps edit returned False — instruction={!r}",
@@ -1137,6 +1152,9 @@ class ChatMixin:
                                 )
                                 if ok:
                                     panel_edit_applied.append("analysis report")
+                                    panel_edit_instructions["analysis report"] = (
+                                        ar_slot["instruction"]
+                                    )
                                 else:
                                     logger.warning(
                                         "Analysis report edit returned False — instruction={!r}",
@@ -1160,6 +1178,9 @@ class ChatMixin:
                             )
                             if ok:
                                 panel_edit_applied.append("list of dates")
+                                panel_edit_instructions["list of dates"] = (
+                                    lod_slot["instruction"]
+                                )
                             else:
                                 logger.warning(
                                     "List of dates name edit returned False — instruction={!r}",
@@ -1182,6 +1203,7 @@ class ChatMixin:
                             )
                             if ok:
                                 panel_edit_applied.append("applicable laws")
+                                panel_edit_instructions["applicable laws"] = _rename_instr
                             ok = await self._regenerate_procedural_timeline_with_feedback(
                                 workspace_id=workspace_id,
                                 user_id=user_id,
@@ -1192,6 +1214,7 @@ class ChatMixin:
                             )
                             if ok:
                                 panel_edit_applied.append("upcoming dates")
+                                panel_edit_instructions["upcoming dates"] = _rename_instr
 
                         # Terminal-emit guard (rename path). The workspace:refresh
                         # above turned the FE spinner ON for list_of_dates,
@@ -1567,10 +1590,24 @@ class ChatMixin:
                 )
                 ack_parts: List[str] = []
                 if objective_ack_kind == "panel_edit_direct" and panel_edit_applied:
-                    # Free-form panel edit. Short, factual ack — the panel
-                    # itself was already emitted via document_feature_response.
-                    _fields_human = ", ".join(panel_edit_applied)
-                    ack_parts.append(f"Updated: {_fields_human}.")
+                    # Free-form panel edit. The panel itself was already emitted
+                    # via document_feature_response; the chat reply must still
+                    # tell the lawyer WHAT changed, not just name the panel.
+                    ack_text = await self._build_panel_edit_ack(
+                        workspace_id=workspace_id,
+                        user_message=um_early,
+                        panels=panel_edit_applied,
+                        instructions=panel_edit_instructions,
+                        is_rename=panel_edit_is_rename,
+                    )
+                    if not ack_text:
+                        _fields_human = ", ".join(panel_edit_applied)
+                        ack_text = (
+                            f"I've updated the {_fields_human} as you asked. "
+                            "The refreshed panel is now available — let me know "
+                            "if you'd like any further adjustments."
+                        )
+                    ack_parts.append(ack_text)
                 elif objective_ack_kind == "followup_clarify":
                     ack_parts.append(
                         "I could not infer a clear new strategic objective from our discussion. "

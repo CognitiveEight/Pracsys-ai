@@ -1031,15 +1031,6 @@ class WorkspaceEventsMixin:
                     ):
                         continue
                     evidence_for_context.append(f)
-            context_manager.upsert_workspace(
-                payload.workspaceId,
-                payload.userId,
-                title=payload.title,
-                status=payload.status,
-                workspace_role=payload.workspaceRole,
-                evidence_files=evidence_for_context,
-                updated_at=updated_at,
-            )
             # Capture the previously-stored role BEFORE _remember_workspace_role
             # overwrites the cache, so we can detect a role-only change below.
             previous_role: Optional[str] = None
@@ -1059,6 +1050,10 @@ class WorkspaceEventsMixin:
                     str(payload.userId),
                     str(payload.workspaceRole),
                 )
+            # Resolve the role BEFORE upserting the context: a doc-upload sync
+            # carries no workspaceRole, and upserting first on cold memory
+            # would fabricate an ADJUDICATOR context that shadows the
+            # Qdrant-persisted role during resolution.
             resolved_workspace_role = await self._resolve_workspace_role(
                 workspace_id=str(payload.workspaceId),
                 user_id=str(payload.userId),
@@ -1067,6 +1062,15 @@ class WorkspaceEventsMixin:
             logger.info(
                 "Resolved workspace role for sync generation: {}",
                 resolved_workspace_role,
+            )
+            context_manager.upsert_workspace(
+                payload.workspaceId,
+                payload.userId,
+                title=payload.title,
+                status=payload.status,
+                workspace_role=payload.workspaceRole or resolved_workspace_role,
+                evidence_files=evidence_for_context,
+                updated_at=updated_at,
             )
             _valid_roles_for_change = {"ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"}
             _prev_upper = (previous_role or "").strip().upper()

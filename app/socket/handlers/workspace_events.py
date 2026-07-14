@@ -1386,6 +1386,9 @@ class WorkspaceEventsMixin:
                                 user_id=str(payload.userId),
                                 reason="ai_update_started",
                                 feature_types=[
+                                    # Re-uploads rebuild the assessments payload
+                                    # below, so surface its loader too.
+                                    "document_assessments",
                                     "strategy_objective",
                                     "analysis_report",
                                     "list_of_dates",

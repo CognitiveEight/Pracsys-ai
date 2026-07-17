@@ -451,6 +451,29 @@ class ContextManager:
         context._persist_meta()
         return context
 
+    def transfer_ownership(
+        self, workspace_id: str, new_user_id: str
+    ) -> Optional[WorkspaceContext]:
+        """Re-own an in-memory workspace context after workspace_transferred.
+
+        upsert_workspace deliberately never changes user_id for an existing
+        context (chat paths call it with the message's userId); this is the
+        one sanctioned path that does. Returns None when the context is cold —
+        the caller's upsert_workspace already creates it with the new owner.
+        """
+        context = self._contexts.get(workspace_id)
+        if not context:
+            return None
+        context.user_id = new_user_id
+        context.updated_at = datetime.utcnow()
+        context._persist_meta()
+        logger.info(
+            "Workspace {} context re-owned to user {}",
+            workspace_id,
+            (new_user_id or "")[:12],
+        )
+        return context
+
     async def hydrate_context_from_cache(
         self,
         workspace_id: str,

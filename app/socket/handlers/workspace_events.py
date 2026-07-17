@@ -63,6 +63,7 @@ from app.socket.schemas import (
     UserMessageRequestPayload,
     WorkspaceCreatedPayload,
     WorkspaceSyncPayload,
+    WorkspaceTransferredPayload,
 )
 from app.utils.exceptions import SocketEventError
 from app.workspace.custom_instructions import (build_custom_instruction_suffix,
@@ -117,9 +118,11 @@ class WorkspaceEventsMixin:
     """Connection lifecycle, reconnect re-emit, workspace_created/sync."""
 
     async def _do_reemit_after_reconnect(self) -> None:
-        """Re-emit cached document_feature_response payloads for the pending workspace after reconnect.
-        This covers: document_assessments, workspace_metadata, strategy_objective, analysis_report, list_of_dates.
-        Clears pending state so it only runs once per disconnect/reconnect cycle."""
+        """Schedule a re-emit of cached document_feature_response payloads for the pending workspace after reconnect.
+        Covers all ten feature panels in product order (see _reemit_cached_features).
+        Clears pending state synchronously so it only runs once per disconnect/reconnect
+        cycle; the emits themselves run in a detached task under the workspace
+        pipeline lock so they never interleave a live generation chain."""
         if (
             not self._had_disconnect
             or not self._pending_reemit_workspace_id
@@ -131,6 +134,22 @@ class WorkspaceEventsMixin:
         self._had_disconnect = False
         self._pending_reemit_workspace_id = None
         self._pending_reemit_user_id = None
+
+        async def _locked_reemit() -> None:
+            # Queue behind any in-flight generation chain so cached snapshots
+            # never interleave a live pipeline's emits. Runs detached so
+            # on_connect/on_connected return immediately.
+            async with self._workspace_pipeline_lock(workspace_id):
+                await self._reemit_cached_features(workspace_id, user_id)
+
+        try:
+            asyncio.create_task(_locked_reemit())
+        except RuntimeError as rt_err:
+            logger.error("Could not schedule reconnect re-emit: {}", rt_err)
+
+    async def _reemit_cached_features(self, workspace_id: str, user_id: str) -> None:
+        """Replay cached feature payloads for one workspace in product order.
+        Caller must hold the workspace pipeline lock."""
         try:
             # 1) Document assessments (if available). Heal any cached
             # Devanagari transcripts to Hinglish first so workspaces processed
@@ -232,37 +251,7 @@ class WorkspaceEventsMixin:
                 logger.success(
                     "✅ Applicable laws re-emitted to backend after reconnect"
                 )
-            # 6b) Case laws
-            case_laws = self._workspace_case_laws_payload.get(workspace_id)
-            if case_laws is not None:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "case_laws",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": case_laws,
-                    },
-                )
-                logger.success(
-                    "✅ Case laws re-emitted to backend after reconnect"
-                )
-            # 6c) Relevant parties
-            relevant_parties = self._workspace_relevant_parties_payload.get(workspace_id)
-            if relevant_parties is not None:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "relevant_parties",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": relevant_parties,
-                    },
-                )
-                logger.success(
-                    "✅ Relevant parties re-emitted to backend after reconnect"
-                )
-            # 7) Procedural timeline
+            # 7) Procedural timeline (product order: timeline → parties → case laws)
             procedural_timeline = self._workspace_procedural_timeline_payload.get(workspace_id)
             if procedural_timeline is not None:
                 await self._socket_client.emit(
@@ -277,7 +266,37 @@ class WorkspaceEventsMixin:
                 logger.success(
                     "✅ Procedural timeline re-emitted to backend after reconnect"
                 )
-            # 8) Drafting Assistant — proactive suggestions panel
+            # 8) Relevant parties
+            relevant_parties = self._workspace_relevant_parties_payload.get(workspace_id)
+            if relevant_parties is not None:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "relevant_parties",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": relevant_parties,
+                    },
+                )
+                logger.success(
+                    "✅ Relevant parties re-emitted to backend after reconnect"
+                )
+            # 9) Case laws
+            case_laws = self._workspace_case_laws_payload.get(workspace_id)
+            if case_laws is not None:
+                await self._socket_client.emit(
+                    "document_feature_response",
+                    {
+                        "featureType": "case_laws",
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "payload": case_laws,
+                    },
+                )
+                logger.success(
+                    "✅ Case laws re-emitted to backend after reconnect"
+                )
+            # 10) Drafting Assistant — proactive suggestions panel
             drafting_payload = self._workspace_drafting_payload.get(workspace_id)
             if drafting_payload is not None:
                 # Cache holds the internal card shape; serialize to the
@@ -1031,15 +1050,6 @@ class WorkspaceEventsMixin:
                     ):
                         continue
                     evidence_for_context.append(f)
-            context_manager.upsert_workspace(
-                payload.workspaceId,
-                payload.userId,
-                title=payload.title,
-                status=payload.status,
-                workspace_role=payload.workspaceRole,
-                evidence_files=evidence_for_context,
-                updated_at=updated_at,
-            )
             # Capture the previously-stored role BEFORE _remember_workspace_role
             # overwrites the cache, so we can detect a role-only change below.
             previous_role: Optional[str] = None
@@ -1059,6 +1069,10 @@ class WorkspaceEventsMixin:
                     str(payload.userId),
                     str(payload.workspaceRole),
                 )
+            # Resolve the role BEFORE upserting the context: a doc-upload sync
+            # carries no workspaceRole, and upserting first on cold memory
+            # would fabricate an ADJUDICATOR context that shadows the
+            # Qdrant-persisted role during resolution.
             resolved_workspace_role = await self._resolve_workspace_role(
                 workspace_id=str(payload.workspaceId),
                 user_id=str(payload.userId),
@@ -1067,6 +1081,15 @@ class WorkspaceEventsMixin:
             logger.info(
                 "Resolved workspace role for sync generation: {}",
                 resolved_workspace_role,
+            )
+            context_manager.upsert_workspace(
+                payload.workspaceId,
+                payload.userId,
+                title=payload.title,
+                status=payload.status,
+                workspace_role=payload.workspaceRole or resolved_workspace_role,
+                evidence_files=evidence_for_context,
+                updated_at=updated_at,
             )
             _valid_roles_for_change = {"ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"}
             _prev_upper = (previous_role or "").strip().upper()
@@ -1382,6 +1405,9 @@ class WorkspaceEventsMixin:
                                 user_id=str(payload.userId),
                                 reason="ai_update_started",
                                 feature_types=[
+                                    # Re-uploads rebuild the assessments payload
+                                    # below, so surface its loader too.
+                                    "document_assessments",
                                     "strategy_objective",
                                     "analysis_report",
                                     "list_of_dates",
@@ -1761,38 +1787,9 @@ class WorkspaceEventsMixin:
                         logger.success(
                             "✅ Applicable laws re-emitted to backend (from cache)"
                         )
-                    case_laws = self._workspace_case_laws_payload.get(workspace_id)
-                    if case_laws is not None:
-                        await self._socket_client.emit(
-                            "document_feature_response",
-                            {
-                                "featureType": "case_laws",
-                                "workspaceId": workspace_id,
-                                "userId": user_id,
-                                "payload": case_laws,
-                            },
-                        )
-                        logger.success(
-                            "✅ Case laws re-emitted to backend (from cache)"
-                        )
-                    relevant_parties = self._workspace_relevant_parties_payload.get(
-                        workspace_id
-                    )
-                    if relevant_parties is not None:
-                        await self._socket_client.emit(
-                            "document_feature_response",
-                            {
-                                "featureType": "relevant_parties",
-                                "workspaceId": workspace_id,
-                                "userId": user_id,
-                                "payload": relevant_parties,
-                            },
-                        )
-                        logger.success(
-                            "✅ Relevant parties re-emitted to backend (from cache)"
-                        )
                     # Procedural timeline ("Upcoming Dates"): re-emit from
-                    # cache if present, then schedule a refresh so the FE
+                    # cache if present (product order: timeline → parties →
+                    # case laws); a refresh is scheduled below so the FE
                     # reflects any newly-uploaded docs even when the
                     # vector-store said "no new content". Without this the
                     # user saw the four other panels refresh and "Upcoming
@@ -1814,6 +1811,36 @@ class WorkspaceEventsMixin:
                         )
                         logger.success(
                             "✅ Procedural timeline re-emitted to backend (from cache)"
+                        )
+                    relevant_parties = self._workspace_relevant_parties_payload.get(
+                        workspace_id
+                    )
+                    if relevant_parties is not None:
+                        await self._socket_client.emit(
+                            "document_feature_response",
+                            {
+                                "featureType": "relevant_parties",
+                                "workspaceId": workspace_id,
+                                "userId": user_id,
+                                "payload": relevant_parties,
+                            },
+                        )
+                        logger.success(
+                            "✅ Relevant parties re-emitted to backend (from cache)"
+                        )
+                    case_laws = self._workspace_case_laws_payload.get(workspace_id)
+                    if case_laws is not None:
+                        await self._socket_client.emit(
+                            "document_feature_response",
+                            {
+                                "featureType": "case_laws",
+                                "workspaceId": workspace_id,
+                                "userId": user_id,
+                                "payload": case_laws,
+                            },
+                        )
+                        logger.success(
+                            "✅ Case laws re-emitted to backend (from cache)"
                         )
                     self._schedule_list_of_dates_and_applicable_laws(
                         workspace_id=workspace_id,
@@ -2156,6 +2183,295 @@ class WorkspaceEventsMixin:
             logger.error("Error processing workspace_sync event: {}", str(e))
             logger.exception(e)
             raise
+
+    async def on_workspace_transferred(self, data: Dict[str, Any]) -> None:
+        """
+        Handle workspace_transferred event (Server → AI_Maverick).
+
+        Workspace ownership moved from previousUserId to newUserId. The backend
+        keeps all workspace data (documents/vectors/panels) — do NOT reprocess
+        documents or regenerate the full suite. Only:
+        1. Re-key per-workspace owner state (context, role caches, drafting
+           provenance, cached wrappers that embed userId).
+        2. For each feature in reEmitFeatures: regenerate + re-emit under the
+           new owner. drafting_assistant is template-matched, so it is rebuilt
+           against the new lawyer's template library (force-synced first).
+        """
+        try:
+            payload = WorkspaceTransferredPayload(**data)
+        except Exception as e:
+            logger.error(
+                "workspace_transferred: invalid payload (keys={}): {}",
+                list((data or {}).keys()) if isinstance(data, dict) else type(data).__name__,
+                e,
+            )
+            return
+
+        workspace_id = str(payload.workspaceId or "").strip()
+        prev_user_id = str(payload.previousUserId or "").strip()
+        new_user_id = str(payload.newUserId or "").strip()
+        if not workspace_id or not new_user_id:
+            logger.warning(
+                "workspace_transferred: missing workspaceId/newUserId — dropping event"
+            )
+            return
+
+        # De-dup guard for replayed transfers (e.g. reconnect replay), same
+        # 180s fingerprint window as workspace_sync.
+        try:
+            fingerprint = json.dumps(
+                {
+                    "workspaceId": workspace_id,
+                    "previousUserId": prev_user_id,
+                    "newUserId": new_user_id,
+                    "transferredAt": str(payload.transferredAt or ""),
+                },
+                sort_keys=True,
+                default=str,
+            )
+            now_ts = time.time()
+            last = self._last_workspace_transfer_fingerprint.get(workspace_id)
+            if (
+                last
+                and last.get("fingerprint") == fingerprint
+                and (now_ts - float(last.get("ts") or 0.0)) < 180.0
+            ):
+                logger.info(
+                    "Skipping duplicate/replayed workspace_transferred for workspace {} "
+                    "(same fingerprint within 180s)",
+                    workspace_id,
+                )
+                return
+            self._last_workspace_transfer_fingerprint[workspace_id] = {
+                "fingerprint": fingerprint,
+                "ts": now_ts,
+            }
+        except Exception as fp_err:
+            logger.debug(
+                "workspace_transferred: idempotency guard skipped: {}", fp_err
+            )
+
+        same_owner = bool(prev_user_id) and prev_user_id == new_user_id
+        logger.info(
+            "🔁 Workspace transferred: {} — {} → {} (role={}, status={}, files={}, reEmit={})",
+            workspace_id,
+            prev_user_id[:12],
+            new_user_id[:12],
+            payload.workspaceRole,
+            payload.status,
+            len(payload.evidenceFiles or []),
+            payload.reEmitFeatures,
+        )
+
+        # Reconnect safety: from now on any post-disconnect re-emit for this
+        # workspace must carry the NEW owner (mirrors on_workspace_created).
+        self._pending_reemit_workspace_id = workspace_id
+        self._pending_reemit_user_id = new_user_id
+
+        # Resolve role for the new owner: payload → context → Qdrant → ADJUDICATOR.
+        workspace_role = await self._resolve_workspace_role(
+            workspace_id, new_user_id, preferred_role=payload.workspaceRole
+        )
+
+        # ---- STEP 1: re-key owner state (each block isolated, non-fatal) ----
+
+        # 1a. Workspace context: metadata refresh + explicit re-own
+        #     (upsert_workspace never changes user_id on an existing context).
+        try:
+            from datetime import datetime as dt
+
+            from app.workspace.context import context_manager as ctx_mgr
+
+            try:
+                transferred_at = (
+                    dt.fromisoformat(str(payload.transferredAt).replace("Z", "+00:00"))
+                    if payload.transferredAt
+                    else dt.utcnow()
+                )
+            except Exception:
+                transferred_at = dt.utcnow()
+            ctx_mgr.upsert_workspace(
+                workspace_id,
+                new_user_id,
+                title=payload.title,
+                status=payload.status,
+                workspace_role=workspace_role,
+                evidence_files=(
+                    list(payload.evidenceFiles) if payload.evidenceFiles else None
+                ),
+                updated_at=transferred_at,
+            )
+            ctx_mgr.transfer_ownership(workspace_id, new_user_id)
+        except Exception as e:
+            logger.warning(
+                "workspace_transferred: context re-own failed (workspace={}): {}",
+                workspace_id,
+                e,
+            )
+
+        # 1b. Role memory + role-gate init for the new owner (non-fatal, like
+        #     on_workspace_created — drafting regen only needs a valid role).
+        try:
+            await self._remember_workspace_role(
+                workspace_id, new_user_id, workspace_role
+            )
+        except Exception as e:
+            logger.warning(
+                "workspace_transferred: role remember failed (workspace={}): {}",
+                workspace_id,
+                e,
+            )
+        try:
+            await workspace_role_integration.initialize_workspace_with_role(
+                workspace_id=workspace_id,
+                user_id=new_user_id,
+                initial_role=workspace_role,
+            )
+        except Exception as role_error:
+            logger.error(
+                "workspace_transferred: role agent init failed (non-fatal): {}",
+                role_error,
+            )
+
+        if prev_user_id and not same_owner:
+            # 1c. Evict previous owner's in-memory role-cache keys. The
+            #     Qdrant-persisted (workspace, prev_user) role row stays —
+            #     lookups are user-keyed so it is never consulted for the
+            #     new owner.
+            try:
+                self._role_cache_by_user_workspace.pop(
+                    f"{workspace_id}:{prev_user_id}", None
+                )
+                chat_prefix = f"{workspace_id}:{prev_user_id}:"
+                for key in [
+                    k for k in self._role_cache_by_chat if k.startswith(chat_prefix)
+                ]:
+                    self._role_cache_by_chat.pop(key, None)
+            except Exception as e:
+                logger.warning(
+                    "workspace_transferred: role-cache eviction failed (workspace={}): {}",
+                    workspace_id,
+                    e,
+                )
+
+            # 1d. Re-point drafting provenance NOW, before the regen task runs,
+            #     so a template event from the previous owner can't refresh this
+            #     workspace against their library (see
+            #     _maybe_reemit_drafting_on_templates user_id filter).
+            self._drafting_meta_by_workspace[workspace_id] = {
+                "user_id": new_user_id,
+                "role": workspace_role,
+                "lib_count": 0,
+            }
+
+            # 1e. document_assessments and workspace_metadata are cached as full
+            #     wrappers embedding userId and re-emitted verbatim on reconnect
+            #     — patch them to the new owner (reassign so the persistent
+            #     dict's write-through fires).
+            for cache in (
+                self._workspace_document_assessments_payload,
+                self._workspace_metadata_payload,
+            ):
+                try:
+                    cached = cache.get(workspace_id)
+                    if isinstance(cached, dict) and cached.get("userId") != new_user_id:
+                        cache[workspace_id] = {**cached, "userId": new_user_id}
+                except Exception as e:
+                    logger.warning(
+                        "workspace_transferred: cached wrapper userId patch failed "
+                        "(workspace={}): {}",
+                        workspace_id,
+                        e,
+                    )
+
+        audit_logger.log_event(
+            "workspace_transferred",
+            {
+                "workspace_id": workspace_id,
+                "previous_user_id": prev_user_id,
+                "new_user_id": new_user_id,
+                "status": payload.status,
+                "re_emit_features": list(payload.reEmitFeatures or []),
+            },
+        )
+
+        # evidenceFiles is the full active file set — informational only; the
+        # documents are already processed/vectorized (workspace data unchanged).
+        logger.info(
+            "workspace_transferred: {} active evidence file(s) reported; "
+            "documents unchanged — no reprocessing",
+            len(payload.evidenceFiles or []),
+        )
+
+        # ---- STEP 2: feature re-emits under the new owner ----
+        re_emit_features = [
+            str(f or "").strip().lower()
+            for f in (payload.reEmitFeatures or [])
+            if str(f or "").strip()
+        ]
+        if not re_emit_features:
+            logger.info(
+                "workspace_transferred: empty reEmitFeatures — ownership re-keyed only "
+                "(workspace={})",
+                workspace_id,
+            )
+            return
+        if (payload.status or "").strip().lower() == "archived":
+            logger.info(
+                "workspace_transferred: workspace {} is archived — ownership re-keyed, "
+                "skipping feature re-emit (regenerates on next sync/unarchive)",
+                workspace_id,
+            )
+            return
+
+        async def _runner() -> None:
+            for feature in re_emit_features:
+                try:
+                    if feature == "drafting_assistant":
+                        if same_owner:
+                            # Owner unchanged — template library identical;
+                            # re-emit the cached panel to satisfy the backend,
+                            # regenerating only when nothing is cached.
+                            await self._reemit_drafting_unchanged(
+                                workspace_id, new_user_id
+                            )
+                            if self._workspace_drafting_payload.get(workspace_id):
+                                continue
+                        else:
+                            # Force a fresh snapshot of the new owner's library
+                            # (the reply also reconciles deletions) so the regen
+                            # below matches against current templates.
+                            await self.ensure_templates_synced(
+                                new_user_id, force=True
+                            )
+                        await self._generate_and_emit_drafting_suggestions(
+                            workspace_id=workspace_id,
+                            user_id=new_user_id,
+                            workspace_role=workspace_role,
+                        )
+                    else:
+                        logger.warning(
+                            "workspace_transferred: unknown reEmitFeatures entry "
+                            "{!r} — skipped (workspace={})",
+                            feature,
+                            workspace_id,
+                        )
+                except Exception as feature_error:
+                    logger.warning(
+                        "workspace_transferred: re-emit of {!r} failed (workspace={}): {}",
+                        feature,
+                        workspace_id,
+                        feature_error,
+                    )
+
+        # Never block the socket loop — the forced template sync awaits a full
+        # snapshot ingest and suggestion generation is an LLM call.
+        asyncio.create_task(_runner())
+        logger.success(
+            "✅ workspace_transferred processed for {} — {} feature re-emit(s) scheduled",
+            workspace_id,
+            len(re_emit_features),
+        )
 
     async def on_workspace_updated(self, data: Dict[str, Any]) -> None:
         """Handle workspace update event (legacy)."""

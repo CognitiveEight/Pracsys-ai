@@ -285,6 +285,13 @@ class SocketEventHandler(
         # item at once and emitting ONE updated report. The lock still guards
         # the flush itself so a re-burst can't race a flush in flight.
         self._analysis_feedback_locks: Dict[str, asyncio.Lock] = {}
+        # Serializes the feature generation/emit pipeline per workspace so the
+        # intelligence panels always arrive in product order (assessments →
+        # metadata → strategy → analysis → list_of_dates → applicable_laws →
+        # procedural_timeline → relevant_parties → case_laws → drafting).
+        # New triggers QUEUE behind the in-flight chain (FIFO); cross-workspace
+        # runs stay concurrent because locks are keyed by workspace_id.
+        self._workspace_pipeline_locks: Dict[str, asyncio.Lock] = {}
         self._pending_feedback_queue: Dict[str, List[Dict[str, Any]]] = {}
         self._pending_feedback_task: Dict[str, asyncio.Task] = {}
         # Window for collecting bulk-reject bursts before flushing.
@@ -307,6 +314,9 @@ class SocketEventHandler(
         # De-dup guard for replayed workspace_sync events (e.g., reconnect replay).
         # workspace_id -> {"fingerprint": str, "ts": float}
         self._last_workspace_sync_fingerprint: Dict[str, Dict[str, Any]] = {}
+        # De-dup guard for replayed workspace_transferred events (same shape).
+        # workspace_id -> {"fingerprint": str, "ts": float}
+        self._last_workspace_transfer_fingerprint: Dict[str, Dict[str, Any]] = {}
         # Guard against overlapping analysis-report refresh tasks from chat marker misses.
         self._analysis_refresh_inflight: Set[str] = set()
         # During objective-change regeneration, suppress stale background analysis_report emits
@@ -338,6 +348,9 @@ class SocketEventHandler(
         # Backend-specified events (AI_Maverick listens to these)
         self.register("workspace_created", self.on_workspace_created)
         self.register("workspace_sync", self.on_workspace_sync)
+        # Workspace ownership moved to another lawyer — re-key owner state and
+        # re-emit the features listed in reEmitFeatures (drafting_assistant).
+        self.register("workspace_transferred", self.on_workspace_transferred)
         self.register("user_message_request", self.on_user_message_request)
         self.register("probing_prompts_request", self.on_probing_prompts_request)
         self.register("analysis_report_feedback", self.on_analysis_report_feedback)

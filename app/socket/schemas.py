@@ -100,6 +100,43 @@ class WorkspaceSyncPayload(BaseModel):
         populate_by_name = True
 
 
+class TransferredUserInfo(BaseModel):
+    """New owner details embedded in workspace_transferred."""
+
+    id: str
+    name: Optional[str] = None
+    email: Optional[str] = None
+
+    class Config:
+        populate_by_name = True
+
+
+class WorkspaceTransferredPayload(BaseModel):
+    """
+    Schema for workspace_transferred event (Server → AI_Maverick).
+    Workspace ownership moved from previousUserId to newUserId. Backend keeps
+    all workspace data; AI only re-keys owner state and re-emits the features
+    named in reEmitFeatures (currently ["drafting_assistant"], which must be
+    rebuilt against the new owner's template library).
+    evidenceFiles is the full active file set — informational only, the
+    documents are already processed/vectorized.
+    """
+
+    workspaceId: str
+    previousUserId: str
+    newUserId: str
+    newUser: Optional[TransferredUserInfo] = None
+    title: Optional[str] = None
+    workspaceRole: Optional[str] = None
+    status: Optional[str] = None  # active | archived
+    evidenceFiles: List[EvidenceFilePayload] = []
+    reEmitFeatures: List[str] = []
+    transferredAt: Optional[str] = None  # ISO timestamp
+
+    class Config:
+        populate_by_name = True
+
+
 class AnalysisReportFeedbackPayload(BaseModel):
     """
     Payload for analysis_report_feedback event (App → Backend → AI service).

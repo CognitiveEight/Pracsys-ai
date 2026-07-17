@@ -370,6 +370,7 @@ class SocketClient:
             logger.info("📡 Listening for events:")
             logger.info("   - workspace_created")
             logger.info("   - workspace_sync")
+            logger.info("   - workspace_transferred")
             logger.info("   - user_message_request")
             logger.info("   - probing_prompts_request")
             logger.info("   - analysis_report_feedback")
@@ -479,6 +480,29 @@ class SocketClient:
             except Exception:
                 logger.info("📥 workspace_sync RAW payload (repr): {}", repr(data))
             await event_handler.handle("workspace_sync", data)
+
+        @self.sio.event
+        async def workspace_transferred(data):
+            """
+            Handle workspace_transferred event (Server → AI_Maverick).
+            Workspace ownership moved to another lawyer; AI re-keys owner state
+            and re-emits the features listed in reEmitFeatures against the new
+            owner's template library (drafting_assistant).
+            """
+            logger.info("🔁 Received workspace_transferred event")
+            try:
+                import json
+
+                raw = json.dumps(data, default=str) if data is not None else "null"
+                logger.info(
+                    "📥 workspace_transferred RAW payload: {}",
+                    raw[:2000] + ("..." if len(raw) > 2000 else ""),
+                )
+            except Exception:
+                logger.info(
+                    "📥 workspace_transferred RAW payload (repr): {}", repr(data)
+                )
+            await event_handler.handle("workspace_transferred", data)
 
         @self.sio.event
         async def user_message_request(data):

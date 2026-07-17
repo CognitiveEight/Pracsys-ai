@@ -264,9 +264,12 @@ Document excerpt:
                         "audio_error": audio_result.error or "transcription_failed",
                     }
             else:
-                # Extract text using GCP-powered file processor
-                extracted_text = file_processor.process_file_by_extension(
-                    file_content, filename
+                # Extract text using GCP-powered file processor.
+                # Run in a worker thread: PDF rendering + per-page OCR can block
+                # for minutes, which starves the Socket.IO heartbeat and drops
+                # the connection if run on the event loop.
+                extracted_text = await asyncio.to_thread(
+                    file_processor.process_file_by_extension, file_content, filename
                 )
 
             # Create extraction metadata
@@ -772,7 +775,11 @@ Document excerpt:
         """
         try:
             file_content, _ = await self._download_file(url, filename)
-            text = file_processor.process_file_by_extension(file_content, filename)
+            # Threaded for the same reason as process_document: extraction can
+            # block long enough to starve the Socket.IO heartbeat.
+            text = await asyncio.to_thread(
+                file_processor.process_file_by_extension, file_content, filename
+            )
             if not text or not isinstance(text, str):
                 return ""
             text = scan_text(text.strip()).redacted_text

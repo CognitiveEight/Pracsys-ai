@@ -147,144 +147,34 @@ class ObjectiveChangeMixin:
         existing lenient mode.
         """
         ctx = log_context or ""
-        # On a document DELETION (deleted_doc_ids present) the web-search-derived
-        # panels must REFLECT the reduced document set, not accumulate on top of
-        # it. Case laws / applicable laws have no per-document linkage, so they
-        # can't be purged selectively like list_of_dates — instead we replace the
-        # cached set with the freshly-derived one. Uploads (no deleted_doc_ids)
-        # keep the merge/accumulate behaviour ("keep what the user has seen +
-        # fold in new").
-        replace_derived = bool(deleted_doc_ids)
 
-        async def _runner() -> None:
-            try:
-                await self._generate_and_emit_list_of_dates(
+        async def _locked_runner() -> None:
+            # Queue behind any in-flight generation chain for this workspace so
+            # feature panels always reach the frontend in product order.
+            lock = self._workspace_pipeline_lock(workspace_id)
+            if lock.locked():
+                logger.debug(
+                    "pipeline lock: waiting{} for workspace {}",
+                    ctx,
+                    workspace_id[:12] if workspace_id else "",
+                )
+            async with lock:
+                logger.debug(
+                    "pipeline lock: acquired{} for workspace {}",
+                    ctx,
+                    workspace_id[:12] if workspace_id else "",
+                )
+                await self._run_list_of_dates_and_applicable_laws(
                     workspace_id=workspace_id,
                     user_id=user_id,
                     workspace_role=workspace_role,
                     batch_result=batch_result,
+                    log_context=log_context,
                     deleted_doc_ids=deleted_doc_ids,
-                )
-            except Exception as lod_err:
-                logger.warning(
-                    "List of dates (background{}) failed: {}",
-                    ctx,
-                    lod_err,
-                )
-            try:
-                logger.info(
-                    "Applicable laws: invoking (background{}) for workspace {}",
-                    ctx,
-                    workspace_id[:12] if workspace_id else "",
-                )
-                await self._generate_and_emit_applicable_laws(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    workspace_role=workspace_role,
-                    merge_with_previous=not replace_derived,
-                )
-            except Exception as laws_err:
-                logger.warning(
-                    "Applicable laws (background{}) failed: {}",
-                    ctx,
-                    laws_err,
-                )
-            # Order (per product): applicable_laws → upcoming dates
-            # (procedural_timeline) → relevant_parties → case_laws → drafting.
-            try:
-                logger.info(
-                    "Procedural timeline: invoking (background{}) for workspace {}",
-                    ctx,
-                    workspace_id[:12] if workspace_id else "",
-                )
-                await self._generate_and_emit_procedural_timeline(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    workspace_role=workspace_role,
-                    batch_result=batch_result,
-                    deleted_doc_ids=deleted_doc_ids,
-                )
-            except Exception as pt_err:
-                logger.warning(
-                    "Procedural timeline (background{}) failed: {}",
-                    ctx,
-                    pt_err,
-                )
-            try:
-                logger.info(
-                    "Relevant parties: invoking (background{}) for workspace {}",
-                    ctx,
-                    workspace_id[:12] if workspace_id else "",
-                )
-                await self._generate_and_emit_relevant_parties(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    workspace_role=workspace_role,
-                )
-            except Exception as parties_err:
-                logger.warning(
-                    "Relevant parties (background{}) failed: {}",
-                    ctx,
-                    parties_err,
-                )
-            try:
-                logger.info(
-                    "Case laws: invoking (background{}) for workspace {}",
-                    ctx,
-                    workspace_id[:12] if workspace_id else "",
-                )
-                await self._generate_and_emit_case_laws(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    workspace_role=workspace_role,
-                    merge_with_previous=not replace_derived,
-                )
-            except Exception as case_err:
-                logger.warning(
-                    "Case laws (background{}) failed: {}",
-                    ctx,
-                    case_err,
-                )
-                # Never leave the panel stuck on "Analysis is in progress":
-                # emit the cached-or-empty payload as a terminal state.
-                if self._socket_client:
-                    fallback = self._workspace_case_laws_payload.get(
-                        workspace_id
-                    ) or {"caseLaws": []}
-                    try:
-                        await self._socket_client.emit(
-                            "document_feature_response",
-                            {
-                                "featureType": "case_laws",
-                                "workspaceId": workspace_id,
-                                "userId": user_id,
-                                "payload": fallback,
-                            },
-                        )
-                    except Exception as emit_err:
-                        logger.warning(
-                            "Case laws fallback emit failed{}: {}", ctx, emit_err
-                        )
-            try:
-                logger.info(
-                    "Drafting suggestions: invoking (background{}) for workspace {}",
-                    ctx,
-                    workspace_id[:12] if workspace_id else "",
-                )
-                await self._generate_and_emit_drafting_suggestions(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    workspace_role=workspace_role,
-                )
-            except Exception as draft_err:
-                logger.warning(
-                    "Drafting suggestions (background{}) failed: {}",
-                    ctx,
-                    draft_err,
                 )
 
         try:
-            asyncio.create_task(_runner())
+            asyncio.create_task(_locked_runner())
             logger.debug(
                 "Scheduled list_of_dates + applicable_laws + procedural_timeline + "
                 "relevant_parties + case_laws + drafting_suggestions{} for workspace {}",
@@ -296,6 +186,162 @@ class ObjectiveChangeMixin:
                 "Could not schedule timeline/laws task{}: {}",
                 ctx,
                 rt_err,
+            )
+
+    def _workspace_pipeline_lock(self, workspace_id: str) -> asyncio.Lock:
+        """Per-workspace lock serializing the feature generation/emit pipeline
+        so overlapping triggers cannot interleave their panel emits."""
+        return self._workspace_pipeline_locks.setdefault(workspace_id, asyncio.Lock())
+
+    async def _run_list_of_dates_and_applicable_laws(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        batch_result: Optional[Dict[str, Any]],
+        *,
+        log_context: str = "",
+        deleted_doc_ids: Optional[List[str]] = None,
+    ) -> None:
+        """Sequential pipeline tail: list_of_dates → applicable_laws →
+        procedural_timeline → relevant_parties → case_laws → drafting.
+
+        Caller must hold the workspace pipeline lock. Each step traps its own
+        errors so one failure never skips the remaining panels.
+        """
+        ctx = log_context or ""
+        # On a document DELETION (deleted_doc_ids present) the web-search-derived
+        # panels must REFLECT the reduced document set, not accumulate on top of
+        # it. Case laws / applicable laws have no per-document linkage, so they
+        # can't be purged selectively like list_of_dates — instead we replace the
+        # cached set with the freshly-derived one. Uploads (no deleted_doc_ids)
+        # keep the merge/accumulate behaviour ("keep what the user has seen +
+        # fold in new").
+        replace_derived = bool(deleted_doc_ids)
+        try:
+            await self._generate_and_emit_list_of_dates(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+                batch_result=batch_result,
+                deleted_doc_ids=deleted_doc_ids,
+            )
+        except Exception as lod_err:
+            logger.warning(
+                "List of dates (background{}) failed: {}",
+                ctx,
+                lod_err,
+            )
+        try:
+            logger.info(
+                "Applicable laws: invoking (background{}) for workspace {}",
+                ctx,
+                workspace_id[:12] if workspace_id else "",
+            )
+            await self._generate_and_emit_applicable_laws(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+                merge_with_previous=not replace_derived,
+            )
+        except Exception as laws_err:
+            logger.warning(
+                "Applicable laws (background{}) failed: {}",
+                ctx,
+                laws_err,
+            )
+        # Order (per product): applicable_laws → upcoming dates
+        # (procedural_timeline) → relevant_parties → case_laws → drafting.
+        try:
+            logger.info(
+                "Procedural timeline: invoking (background{}) for workspace {}",
+                ctx,
+                workspace_id[:12] if workspace_id else "",
+            )
+            await self._generate_and_emit_procedural_timeline(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+                batch_result=batch_result,
+                deleted_doc_ids=deleted_doc_ids,
+            )
+        except Exception as pt_err:
+            logger.warning(
+                "Procedural timeline (background{}) failed: {}",
+                ctx,
+                pt_err,
+            )
+        try:
+            logger.info(
+                "Relevant parties: invoking (background{}) for workspace {}",
+                ctx,
+                workspace_id[:12] if workspace_id else "",
+            )
+            await self._generate_and_emit_relevant_parties(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+            )
+        except Exception as parties_err:
+            logger.warning(
+                "Relevant parties (background{}) failed: {}",
+                ctx,
+                parties_err,
+            )
+        try:
+            logger.info(
+                "Case laws: invoking (background{}) for workspace {}",
+                ctx,
+                workspace_id[:12] if workspace_id else "",
+            )
+            await self._generate_and_emit_case_laws(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+                merge_with_previous=not replace_derived,
+            )
+        except Exception as case_err:
+            logger.warning(
+                "Case laws (background{}) failed: {}",
+                ctx,
+                case_err,
+            )
+            # Never leave the panel stuck on "Analysis is in progress":
+            # emit the cached-or-empty payload as a terminal state.
+            if self._socket_client:
+                fallback = self._workspace_case_laws_payload.get(
+                    workspace_id
+                ) or {"caseLaws": []}
+                try:
+                    await self._socket_client.emit(
+                        "document_feature_response",
+                        {
+                            "featureType": "case_laws",
+                            "workspaceId": workspace_id,
+                            "userId": user_id,
+                            "payload": fallback,
+                        },
+                    )
+                except Exception as emit_err:
+                    logger.warning(
+                        "Case laws fallback emit failed{}: {}", ctx, emit_err
+                    )
+        try:
+            logger.info(
+                "Drafting suggestions: invoking (background{}) for workspace {}",
+                ctx,
+                workspace_id[:12] if workspace_id else "",
+            )
+            await self._generate_and_emit_drafting_suggestions(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+            )
+        except Exception as draft_err:
+            logger.warning(
+                "Drafting suggestions (background{}) failed: {}",
+                ctx,
+                draft_err,
             )
 
     def _schedule_applicable_laws_only(
@@ -310,11 +356,14 @@ class ObjectiveChangeMixin:
 
         async def _runner() -> None:
             try:
-                await self._generate_and_emit_applicable_laws(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    workspace_role=workspace_role,
-                )
+                # Queue behind any in-flight generation chain so this single
+                # panel refresh cannot interleave a live pipeline's emits.
+                async with self._workspace_pipeline_lock(workspace_id):
+                    await self._generate_and_emit_applicable_laws(
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        workspace_role=workspace_role,
+                    )
             except Exception as laws_err:
                 logger.warning(
                     "Applicable laws only (background{}) failed: {}",
@@ -1812,6 +1861,7 @@ class ObjectiveChangeMixin:
             batch_result=batch_result,
             is_update=is_update,
             log_context=analysis_log_context,
+            tail_inline=True,
         )
 
     def _schedule_strategy_analysis_pipeline(
@@ -1826,14 +1876,29 @@ class ObjectiveChangeMixin:
     ) -> None:
         async def _runner() -> None:
             try:
-                await self._run_strategy_analysis_timeline_pipeline(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    workspace_role=workspace_role,
-                    batch_result=batch_result,
-                    is_update=is_update,
-                    analysis_log_context=analysis_log_context,
-                )
+                # Serialize per workspace: with tail_inline=True downstream,
+                # this lock covers strategy → analysis → list_of_dates → laws →
+                # timeline → parties → case_laws → drafting as ONE critical
+                # section, so overlapping triggers cannot interleave emits.
+                lock = self._workspace_pipeline_lock(workspace_id)
+                if lock.locked():
+                    logger.debug(
+                        "pipeline lock: waiting (strategy pipeline) for workspace {}",
+                        workspace_id[:12] if workspace_id else "",
+                    )
+                async with lock:
+                    logger.debug(
+                        "pipeline lock: acquired (strategy pipeline) for workspace {}",
+                        workspace_id[:12] if workspace_id else "",
+                    )
+                    await self._run_strategy_analysis_timeline_pipeline(
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        workspace_role=workspace_role,
+                        batch_result=batch_result,
+                        is_update=is_update,
+                        analysis_log_context=analysis_log_context,
+                    )
             except Exception as e:
                 logger.exception(
                     "Background strategy/analysis pipeline failed for workspace {}: {}",
@@ -1858,10 +1923,19 @@ class ObjectiveChangeMixin:
         batch_result: Optional[Dict[str, Any]] = None,
         is_update: bool = False,
         log_context: str = "",
+        *,
+        tail_inline: bool = False,
     ) -> bool:
         """
         Generate analysis report (or use fallback on error), then emit to backend and cache.
         Emit is done outside try/except so it always runs and errors propagate.
+
+        ``tail_inline=True`` runs the list_of_dates→drafting tail inline instead
+        of scheduling it as a detached task — only for callers that already hold
+        the workspace pipeline lock (the background pipeline runner), so the
+        whole strategy→drafting sequence is one critical section. Callers under
+        a timeout (e.g. the 35s chat refresh in analysis_report.py) must keep
+        the default False.
         """
         if not self._socket_client:
             return False
@@ -1954,14 +2028,26 @@ class ObjectiveChangeMixin:
                 )
         except Exception as chip_err:
             logger.warning("Analysis report chips generation failed: {}", chip_err)
-        # List of Dates + Applicable laws: background so intelligence chat can proceed
-        self._schedule_list_of_dates_and_applicable_laws(
-            workspace_id=workspace_id,
-            user_id=user_id,
-            workspace_role=workspace_role,
-            batch_result=batch_result,
-            log_context=log_context or " (after analysis)",
-        )
+        if tail_inline:
+            # Caller (pipeline runner) already holds the workspace pipeline
+            # lock; run the tail inline so strategy→drafting emits as one
+            # uninterrupted sequence.
+            await self._run_list_of_dates_and_applicable_laws(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+                batch_result=batch_result,
+                log_context=log_context or " (after analysis)",
+            )
+        else:
+            # List of Dates + Applicable laws: background so intelligence chat can proceed
+            self._schedule_list_of_dates_and_applicable_laws(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+                batch_result=batch_result,
+                log_context=log_context or " (after analysis)",
+            )
         return True
 
     async def _generate_and_emit_analysis_report_for_sync(

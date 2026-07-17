@@ -464,6 +464,45 @@ class TemplateSyncMixin:
                     len(templates),
                     user_id[:12],
                 )
+                # A requested snapshot is the user's FULL library — reconcile
+                # deletions so cached templates the backend no longer reports
+                # (e.g. deleted while a `deleted` delta event was missed) are
+                # dropped. Ingest merges only, so without this a forced sync
+                # would leave the store a stale superset. Only replies to our
+                # own request_template_sync (requestId set) are authoritative.
+                if request_id:
+                    try:
+                        from app.langgraph.template_store import template_store
+
+                        snapshot_ids = {
+                            str(tpl.id) for tpl in templates if tpl.id
+                        }
+                        stale_ids = [
+                            str(cached.get("template_id"))
+                            for cached in await template_store.list_for_user(
+                                user_id=user_id
+                            )
+                            if cached.get("template_id")
+                            and str(cached.get("template_id")) not in snapshot_ids
+                        ]
+                        for stale_id in stale_ids:
+                            await template_store.delete(
+                                user_id=user_id, template_id=stale_id
+                            )
+                        if stale_ids:
+                            logger.info(
+                                "🧹 template_sync_response reconciled {} stale "
+                                "template(s) for user={} (absent from snapshot)",
+                                len(stale_ids),
+                                user_id[:12],
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "template_sync_response: stale-template reconcile "
+                            "failed (user={}): {}",
+                            user_id[:12],
+                            e,
+                        )
         finally:
             # Always resolve the awaiting future — even if ingestion raised — so
             # ensure_templates_synced (which now waits with no hard time cap)
@@ -586,7 +625,7 @@ class TemplateSyncMixin:
             )
 
     async def ensure_templates_synced(
-        self, user_id: str, *, timeout: Optional[float] = None
+        self, user_id: str, *, timeout: Optional[float] = None, force: bool = False
     ) -> None:
         """Make sure the in-memory template store is warm for ``user_id``.
 
@@ -597,6 +636,12 @@ class TemplateSyncMixin:
         templates finish ingesting), so a cold cache (e.g. right after an AI
         restart) is fully filled before template matching runs.
 
+        ``force=True`` skips the warm-cache short-circuit and always requests a
+        fresh snapshot (used by workspace_transferred so the new owner's
+        library is guaranteed current before suggestions are re-matched). The
+        snapshot reply also reconciles deletions, so a forced sync makes the
+        store authoritative, not just a superset.
+
         ``timeout`` is ``None`` by default: there is NO hard time cap, because a
         template PDF can take longer than any fixed limit to OCR/ingest, and
         cutting off early made matching run against an empty library. The future
@@ -606,13 +651,14 @@ class TemplateSyncMixin:
         """
         if not user_id or not self._socket_client:
             return
-        try:
-            from app.langgraph.template_store import template_store
+        if not force:
+            try:
+                from app.langgraph.template_store import template_store
 
-            if await template_store.count_for_user(user_id=user_id) > 0:
-                return  # already warm this session
-        except Exception:
-            pass
+                if await template_store.count_for_user(user_id=user_id) > 0:
+                    return  # already warm this session
+            except Exception:
+                pass
 
         request_id = f"tmpl-{(user_id or '')[:8]}-{uuid.uuid4().hex[:12]}"
         loop = asyncio.get_event_loop()

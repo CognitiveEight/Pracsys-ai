@@ -228,6 +228,12 @@ class SocketEventHandler(
         self._workspace_rejected_analysis_items: Dict[str, Dict[str, List[str]]] = (
             PersistentWorkspaceDict(CacheKinds.REJECTED_ANALYSIS_ITEMS)
         )
+        # Per-workspace memory of missingInfo entries the user added via
+        # added_missing_information — protected from the answered-by-upload
+        # resolution pass (only analysis_report_feedback removes them).
+        self._workspace_user_added_missing_info: Dict[str, List[str]] = (
+            PersistentWorkspaceDict(CacheKinds.USER_ADDED_MISSING_INFO)
+        )
         # List of Dates timeline per workspace (chronological events from case documents)
         self._workspace_list_of_dates_payload: Dict[str, List[Dict[str, Any]]] = (
             PersistentWorkspaceDict(CacheKinds.LIST_OF_DATES)

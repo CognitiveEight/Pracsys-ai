@@ -3306,6 +3306,12 @@ Rules:
         if not already_present and new_entry:
             current_missing = list(current_missing) + [new_entry]
             report[missing_list_key] = current_missing
+            # Remember user-added entries so the answered-by-upload resolution
+            # pass never auto-removes them (only analysis_report_feedback can).
+            bucket = list(self._workspace_user_added_missing_info.get(workspace_id) or [])
+            if new_entry not in bucket:
+                bucket.append(new_entry)
+                self._workspace_user_added_missing_info[workspace_id] = bucket[-50:]
             logger.info(
                 "added_missing_information: appended new entry to missingInfo "
                 "(workspace={}, total={})",

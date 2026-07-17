@@ -200,6 +200,7 @@ class StateRolesMixin:
             CacheKinds.DOCUMENT_ASSESSMENTS: self._workspace_document_assessments_payload,
             CacheKinds.STRATEGY_PAYLOAD: self._workspace_strategy_payload,
             CacheKinds.REJECTED_ANALYSIS_ITEMS: self._workspace_rejected_analysis_items,
+            CacheKinds.USER_ADDED_MISSING_INFO: self._workspace_user_added_missing_info,
             CacheKinds.DRAFTING_SUGGESTIONS: self._workspace_drafting_payload,
         }
         for kind, target in kind_to_dict.items():

@@ -119,6 +119,7 @@ from app.prompts.objective_change_prompts import (
     llm_merge_dated_entries_against_previous_prompt,
     llm_classify_factual_vs_procedural_prompt,
     merge_applicable_laws_with_previous_prompt,
+    llm_resolve_answered_missing_info_prompt,
 )
 
 
@@ -723,6 +724,121 @@ class ObjectiveChangeMixin:
                 if len(fallback) >= max_keep:
                     break
             return fallback[:max_keep]
+
+    async def _llm_resolve_answered_missing_info(
+        self,
+        workspace_id: str,
+        merged_missing: List[str],
+        fresh_missing: List[str],
+        *,
+        log_context: str = "",
+    ) -> List[str]:
+        """Post-merge resolution pass: drop merged missingInfo items that are
+        now ANSWERED by the uploaded documents (the grow-only merge never
+        removes items, so an item asking for e.g. a cheque number would stay
+        forever after the user uploads the cheque).
+
+        Fail-open: any error returns the input list unchanged. Never drops
+        items the fresh regeneration still flags as missing, nor entries the
+        user added via added_missing_information.
+        """
+        items = [s for s in (merged_missing or []) if isinstance(s, str) and s.strip()]
+        if not items:
+            return merged_missing
+        try:
+            from app.ai.gemini_client import gemini_client
+            from app.vectorstore.qdrant import vector_store
+
+            # Guard 1: the fresh generation just re-verified these against ALL
+            # documents (missing-info verification step) and still flagged
+            # them — never contradict it.
+            fresh_lower = {
+                s.strip().lower() for s in (fresh_missing or []) if isinstance(s, str)
+            }
+            # Guard 2: user-added entries are only removable by the user via
+            # analysis_report_feedback.
+            user_added = self._workspace_user_added_missing_info.get(workspace_id) or []
+
+            def _protected(item: str) -> bool:
+                if item.strip().lower() in fresh_lower:
+                    return True
+                return any(
+                    self._match_rejected_value(item, ua)
+                    for ua in user_added
+                    if isinstance(ua, str) and ua.strip()
+                )
+
+            candidate_idx = {i for i, s in enumerate(items) if not _protected(s)}
+            if not candidate_idx:
+                return items
+
+            cached = self._workspace_case_entities_cache.get(workspace_id)
+            entities = cached[1] if cached and isinstance(cached[1], dict) else {}
+            entities_block = (
+                json.dumps(entities, indent=2, ensure_ascii=False)
+                if entities
+                else "(none)"
+            )
+            docs = await vector_store.get_all_documents(workspace_id=workspace_id)
+            with_content = [d for d in docs if (d.get("content") or "").strip()]
+            budget = 40000
+            per_doc = budget // max(1, len(with_content))
+            doc_parts = []
+            for i, d in enumerate(with_content, 1):
+                content = (d.get("content") or "").strip()[:per_doc]
+                doc_parts.append(
+                    f"--- Document {i} (id: {d.get('document_id') or ''}) ---\n{content}"
+                )
+            document_content = (
+                "\n\n".join(doc_parts) or "No document content available."
+            )
+
+            numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(items))
+            prompt = llm_resolve_answered_missing_info_prompt(
+                numbered_items=numbered,
+                entities_block=entities_block,
+                document_content=document_content,
+            )
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=4000,
+                response_mime_type="application/json",
+            )
+            candidate = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            parsed = json.loads(candidate) if candidate else json.loads((raw or "").strip())
+            answered = parsed.get("answered") if isinstance(parsed, dict) else None
+            if not isinstance(answered, list):
+                return items
+            drop: Set[int] = set()
+            for a in answered:
+                if not isinstance(a, dict):
+                    continue
+                try:
+                    n = int(a.get("index"))
+                except (TypeError, ValueError):
+                    continue
+                # Evidence quote is mandatory — an index without evidence is
+                # not a confirmed resolution.
+                if not str(a.get("evidence") or "").strip():
+                    continue
+                if 1 <= n <= len(items) and (n - 1) in candidate_idx:
+                    drop.add(n - 1)
+            if drop:
+                logger.info(
+                    "Analysis missingInfo resolution{}: dropping {} answered item(s): {}",
+                    log_context,
+                    len(drop),
+                    [items[i] for i in sorted(drop)],
+                )
+            return [s for i, s in enumerate(items) if i not in drop]
+        except Exception as e:
+            logger.warning(
+                "missingInfo resolution pass failed{}: {}; keeping grow-only merge result",
+                log_context,
+                e,
+            )
+            return merged_missing
 
     async def _llm_merge_strengths_against_previous(
         self,
@@ -1336,6 +1452,15 @@ class ObjectiveChangeMixin:
             new_missing_filtered,
             item_type="missing information items",
             max_keep=10,
+        )
+        # The merge above is grow-only; drop items now ANSWERED by the
+        # uploaded documents (must run before the score block so the score
+        # cap sees the cleaned list).
+        merged["missingInfo"] = await self._llm_resolve_answered_missing_info(
+            workspace_id,
+            merged.get("missingInfo") or [],
+            new_missing_filtered,
+            log_context=ctx,
         )
         merged["weaknesses"] = await self._llm_merge_against_previous(
             _str_list(prev_analysis.get("weaknesses")),

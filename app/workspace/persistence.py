@@ -65,6 +65,10 @@ class CacheKinds:
     # workspace, regenerated on workspace_created / workspace_sync, re-emitted
     # on reconnect like analysis_report).
     DRAFTING_SUGGESTIONS = "drafting_suggestions"
+    # Latest currentState echoed back by the frontend on workspace_sync — the
+    # previously-emitted, user-curated panel state used to tag regenerated items
+    # as matched (carried over) vs new. See schemas.WorkspaceCurrentState.
+    CURRENT_STATE = "current_state"
 
 
 # All workspace-scoped cache kinds we routinely read on hydrate.
@@ -84,6 +88,7 @@ WORKSPACE_HYDRATION_KINDS = (
     CacheKinds.REJECTED_ANALYSIS_ITEMS,
     CacheKinds.USER_ADDED_MISSING_INFO,
     CacheKinds.DRAFTING_SUGGESTIONS,
+    CacheKinds.CURRENT_STATE,
 )
 
 

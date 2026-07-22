@@ -591,6 +591,33 @@ class ApplicableLawsMixin:
                 return heuristic
         return normalized
 
+    def _tag_laws_against_current_state(
+        self, workspace_id: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Tag each applicable-law with ``isMatched`` against the frontend's
+        currentState.applicableLaws (matched by act + section). currentState
+        laws have no id, so the law keeps its ``law_N`` id and only gains the
+        flag. Deterministic — no LLM call needed.
+        """
+        if not isinstance(payload, dict):
+            return payload
+        current_state = self._workspace_current_state_payload.get(workspace_id) or {}
+        cs_laws = (
+            current_state.get("applicableLaws")
+            if isinstance(current_state, dict)
+            else None
+        )
+        prev_sigs: Set[str] = set()
+        for it in cs_laws or []:
+            if isinstance(it, dict):
+                sig = self._law_signature(it)
+                if sig and sig != "|":
+                    prev_sigs.add(sig)
+        for law in payload.get("laws") or []:
+            if isinstance(law, dict):
+                law["isMatched"] = self._law_signature(law) in prev_sigs
+        return payload
+
     async def _generate_and_emit_applicable_laws(
         self,
         workspace_id: str,
@@ -646,6 +673,10 @@ class ApplicableLawsMixin:
         else:
             # Objective change: replace stale laws with the freshly-derived set.
             payload = new_payload
+        # Tag each law matched vs new against the frontend's currentState
+        # (match by act + section). Cache the tagged payload so reconnect
+        # re-emits the same flags.
+        payload = self._tag_laws_against_current_state(workspace_id, payload)
         self._workspace_applicable_laws_payload[workspace_id] = payload
         if not self._socket_client:
             return

@@ -4,6 +4,7 @@ Feature mixin extracted from events.py — methods moved verbatim.
 """
 
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -861,6 +862,19 @@ class WorkspaceEventsMixin:
             # Validate and parse payload
             payload = WorkspaceSyncPayload(**data)
 
+            # Cache the previously-emitted, user-curated panel state so every
+            # regeneration path (upload/delete here AND the chat-triggered
+            # objective-change path) can tag regenerated items as matched vs
+            # new. Only overwrite when present so a plain rename/reset (which
+            # omits currentState) does NOT clobber the last curated state.
+            if payload.currentState is not None:
+                try:
+                    self._workspace_current_state_payload[str(payload.workspaceId)] = (
+                        payload.currentState.model_dump()
+                    )
+                except Exception as cs_err:
+                    logger.debug("Failed to cache currentState: {}", cs_err)
+
             # -----------------------------------------------------------------
             # Idempotency guard: skip duplicate/replayed workspace_sync payloads.
             # This prevents duplicate strategy/analysis/list generation when
@@ -886,6 +900,21 @@ class WorkspaceEventsMixin:
                 file_facts.sort(
                     key=lambda x: (x.get("id") or "", x.get("uploadedAt") or "")
                 )
+                # Include a compact hash of currentState so a curate-then-resync
+                # of the SAME files within the 180s window is not swallowed by
+                # the replay guard (the curated state genuinely changed).
+                current_state_fp = ""
+                if payload.currentState is not None:
+                    try:
+                        current_state_fp = hashlib.sha1(
+                            json.dumps(
+                                payload.currentState.model_dump(),
+                                sort_keys=True,
+                                default=str,
+                            ).encode("utf-8")
+                        ).hexdigest()
+                    except Exception:
+                        current_state_fp = ""
                 fp_obj = {
                     "workspaceId": workspace_id_for_fp,
                     "updatedAt": str(payload.updatedAt or ""),
@@ -896,6 +925,7 @@ class WorkspaceEventsMixin:
                     "workspaceRole": str(payload.workspaceRole or ""),
                     "title": str(payload.title or ""),
                     "status": str(payload.status or ""),
+                    "currentState": current_state_fp,
                 }
                 fingerprint = json.dumps(fp_obj, sort_keys=True, default=str)
                 now_ts = time.time()
@@ -1251,18 +1281,28 @@ class WorkspaceEventsMixin:
                             (workspace_role or "ADJUDICATOR").strip().upper()
                         )
                     # Document deletion REPLACES the analysis report with the
-                    # freshly-regenerated one (derived from the remaining docs)
-                    # instead of unioning with the previous version. Analysis
-                    # items are free-text with no linkage to a source document,
-                    # so a merge would keep strengths/weaknesses/risks derived
-                    # from the just-deleted document (same grow-only-on-delete
-                    # issue as case_laws / applicable_laws). Uploads / other
-                    # regenerations still merge (see the sync path below).
+                    # freshly-regenerated one (derived from the remaining docs).
+                    # Tag it against currentState so surviving items keep their
+                    # id (isMatched=True) and items tied to the deleted doc drop.
                     logger.info(
                         "Analysis report: replacing (not merging) after document "
                         "deletion for workspace {}",
                         str(payload.workspaceId)[:12],
                     )
+                    try:
+                        analysis_report = (
+                            await self._tag_analysis_report_against_current_state(
+                                str(payload.workspaceId),
+                                analysis_report,
+                                log_context=" (delete)",
+                            )
+                        )
+                    except Exception as tag_err:
+                        logger.warning(
+                            "Analysis report currentState tagging after delete "
+                            "failed: {}; emitting untagged",
+                            tag_err,
+                        )
                     try:
                         if self._socket_client:
                             await self._socket_client.emit(
@@ -1997,18 +2037,18 @@ class WorkspaceEventsMixin:
                 if isinstance(analysis_report, dict):
                     try:
                         analysis_report = (
-                            await self._merge_analysis_report_with_previous(
-                                workspace_id=str(workspace_id),
-                                workspace_role=workspace_role,
-                                new_analysis=analysis_report,
+                            await self._tag_analysis_report_against_current_state(
+                                str(workspace_id),
+                                analysis_report,
                                 log_context=log_ctx,
                             )
                         )
-                    except Exception as merge_err:
+                    except Exception as tag_err:
                         logger.warning(
-                            "Analysis report merge{} failed: {}; emitting unmerged",
+                            "Analysis report currentState tagging{} failed: {}; "
+                            "emitting untagged",
                             log_ctx,
-                            merge_err,
+                            tag_err,
                         )
                 await self._socket_client.emit(
                     "document_feature_response",

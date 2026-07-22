@@ -10,6 +10,7 @@ __all__ = [
     "generate_strategies_from_documents_prompt5",
     "generate_strategies_from_documents_prompt6",
     "regenerate_strategy_objective_preserving_case_summary_prompt",
+    "reground_strategy_objective_prompt",
     "regenerate_case_summary_with_feedback_prompt",
     "regenerate_next_steps_with_feedback_prompt",
     "regenerate_strategic_objective_with_feedback_prompt",
@@ -276,7 +277,7 @@ def generate_strategies_from_documents_prompt6(*, workspace_role):
     )
 
 
-def regenerate_strategy_objective_preserving_case_summary_prompt(*, SPEAKER_LABEL_GUARDRAIL, case_summary, combined_document_content, current_strategy, report_case_summary, role, user_objective_instruction):
+def regenerate_strategy_objective_preserving_case_summary_prompt(*, SPEAKER_LABEL_GUARDRAIL, case_summary, combined_document_content, current_strategy, report_case_summary, role, user_objective_instruction, entities_block="{}"):
     return (
 f"""You are a legal strategy analyst for Indian law.
 
@@ -299,6 +300,9 @@ Current possible next steps (to replace):
 
 **Role**: {role}
 
+EXTRACTED FACTS (authoritative entities pulled from the documents — the ONLY organisations, authorities, bodies, parties, and places you may name):
+{entities_block}
+
 **Document content** (for fact consistency only; do not rewrite the case summaries):
 {combined_document_content}
 
@@ -313,9 +317,55 @@ Rules:
 - Do not restate or replace caseSummary/reportCaseSummary in the output.
 - The new strategicObjective and possibleNextSteps MUST reflect the new user instruction and MUST NOT just repeat the current objective/steps.
 - BNS/BNSS/BSA naming (not IPC/CrPC/IEA where replaced).
-- No invented facts; if the instruction conflicts with documents, note the tension in strategicObjective.
+- GROUNDING (MANDATORY): Do NOT name any organisation, authority, board, association, committee, party, or place that does not appear in EXTRACTED FACTS or the document content above. Use only the real entities from this case — never introduce a new body or location to fit the instruction.
+- FORUM/VENUE instructions: when the user's instruction only names a place, court, or body (e.g. "file in Patna", "file to ICC"), treat it STRICTLY as a forum preference. Do NOT invent local organisations, offices, tournaments, or a local "leg"/branch of an event to match that place. Keep the actual parties and bodies named in the documents (e.g. a national board or a specific state association) — do NOT rename or relocate them.
+- CONFLICT (MANDATORY): the chosen forum may be unsuitable in TWO ways — state the tension explicitly in strategicObjective, never paper over it:
+   (a) TERRITORIAL — the forum's location has no factual nexus to the documents (no party, event, cause of action, or property there). Say that territorial jurisdiction must first be established.
+   (b) AUTHORITY / SUBJECT-MATTER — the named forum has no power to grant the requested relief for this kind of matter (e.g. an international or global body, a regulator, or a wrong-tier forum that does not adjudicate this domestic dispute). Name which forum actually has jurisdiction, and describe the ONLY realistic route to the requested forum if one exists (e.g. a representation citing breach of that body's guidelines, or an internal referral) — do NOT present it as a straightforward "filing" when it is not.
+- ALIGN next steps to the realistic route implied by the CONFLICT analysis. Do NOT silently revert possibleNextSteps to the previous forum's domestic steps while claiming to pursue the new forum — every step must be consistent with what is actually possible before the chosen forum.
+- No invented facts of any kind.
 - {SPEAKER_LABEL_GUARDRAIL}
 - JSON only; complete strings and arrays."""
+    )
+
+
+def reground_strategy_objective_prompt(*, strategic_objective, possible_next_steps, ungrounded_terms, combined_document_content, user_objective_instruction, entities_block, role):
+    """One corrective pass: rewrite the objective/next-steps to remove any
+    organisation/body/place that is NOT present in the documents/entities.
+    Triggered by the deterministic ungrounded-entity backstop."""
+    return (
+f"""You are correcting a legal strategic objective that introduced entities NOT supported by the case documents.
+
+FLAGGED terms that appear NOWHERE in the documents or extracted facts (remove or replace each — they were invented):
+{json.dumps(ungrounded_terms, ensure_ascii=True)}
+
+EXTRACTED FACTS (the ONLY organisations, authorities, bodies, parties, and places you may name):
+{entities_block}
+
+Document content (ground truth):
+{combined_document_content}
+
+User's venue/strategic instruction (a filing preference — a place/court here is a VENUE only, NOT a licence to invent local entities or events):
+{user_objective_instruction.strip()}
+
+Objective to correct:
+{strategic_objective}
+
+Possible next steps to correct:
+{json.dumps(possible_next_steps, ensure_ascii=True)}
+
+RULES:
+- Rewrite so that EVERY named organisation, authority, board, association, party, and place appears in EXTRACTED FACTS or the document content. Delete or replace every flagged term.
+- Keep the user's chosen forum/venue (e.g. a High Court at a named city) — that is allowed as a venue — but do NOT invent any local body, office, tournament, or "leg" tied to it.
+- If the chosen venue has no factual nexus to the documents, state that tension plainly (e.g. jurisdiction must be established) instead of fabricating a connection.
+- Preserve the legal intent and role framing ({role}); do not weaken the objective, only de-fabricate it.
+- BNS/BNSS/BSA naming (not IPC/CrPC/IEA).
+
+Return JSON ONLY:
+{{
+  "strategicObjective": "corrected 5-6 sentences",
+  "possibleNextSteps": ["corrected 3-5 concrete actions; Annexure N for uploads"]
+}}"""
     )
 
 

@@ -450,10 +450,14 @@ class SuggestionChipsMixin:
             gemini_client.initialize()
             role_upper = (role or "ADJUDICATOR").upper()
             # Build short context from report for the prompt
-            missing = report.get("missingInfo") or report.get("missing_info") or []
+            # missingInfo / weaknesses / risks are now {id,text,isMatched} dicts
+            # (were plain strings) — coerce to text so chips never embed dict reprs.
+            missing = _coerce_analysis_text_list(
+                report.get("missingInfo") or report.get("missing_info") or []
+            )
             strengths = report.get("strengths") or []
-            weak = report.get("weaknesses") or []
-            risks = report.get("risks") or []
+            weak = _coerce_analysis_text_list(report.get("weaknesses") or [])
+            risks = _coerce_analysis_text_list(report.get("risks") or [])
             next_steps = report.get("nextSteps") or report.get("next_steps") or []
             drafts = (
                 report.get("suggestedDrafts") or report.get("suggested_drafts") or []

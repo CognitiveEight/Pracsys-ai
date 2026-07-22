@@ -4,12 +4,89 @@ File handlers for processing different file types using GCP Vision OCR.
 
 import base64
 import os
+import re
 import subprocess
 import tempfile
 from io import BytesIO
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from loguru import logger
+
+# Known legal-database / publisher watermark patterns that appear on every page
+# of exports from SCC Online (TruePrint), Manupatra, Indian Kanoon, etc. These
+# supplement the generic cross-page repeated-line detection in
+# ``_strip_repeated_pdf_boilerplate`` so the publisher header/footer never
+# dominates extracted content (which previously caused image-only judgments to
+# skip OCR and be rejected as "repetitive headers").
+_PDF_BOILERPLATE_PATTERNS = [
+    re.compile(r"scc\s*online", re.I),
+    re.compile(r"trueprint", re.I),
+    re.compile(r"printed\s+for\s*:", re.I),
+    re.compile(r"printed\s+by\s*:", re.I),
+    re.compile(r"scconline\.com", re.I),
+    re.compile(r"eastern\s+book\s+company", re.I),
+    re.compile(r"ebc\s+publishing", re.I),
+    re.compile(r"manupatra", re.I),
+    re.compile(r"indiankanoon", re.I),
+    re.compile(r"downloaded\s+on", re.I),
+    re.compile(r"^\s*page\s+\d+\s*$", re.I),
+    re.compile(r"^\s*-{20,}\s*$"),
+    re.compile(r"^\s*_{20,}\s*$"),
+    # Copyright citation line, e.g. "... v. D.B. Modak, (2008) 1 SCC 1 ..."
+    re.compile(r"\(20\d\d\)\s+\d+\s+scc\s+\d+", re.I),
+]
+
+
+def _strip_repeated_pdf_boilerplate(page_texts: List[str]) -> str:
+    """Remove per-page publisher header/footer boilerplate from extracted PDF text.
+
+    Two signals, combined:
+      1. Cross-page repetition (publisher-agnostic): a normalized non-empty line
+         that recurs on ``>= max(3, 0.4 * num_pages)`` pages is treated as a
+         running header/footer and dropped.
+      2. Known legal-database watermark patterns (``_PDF_BOILERPLATE_PATTERNS``)
+         are always dropped, so even a single-page export is cleaned.
+
+    Returns the cleaned text (pages rejoined). Deterministic and idempotent.
+    Only whole recurring lines are removed — never paragraphs — so legitimate
+    body text is preserved.
+    """
+    pages = [p or "" for p in (page_texts or [])]
+    num_pages = len(pages)
+    if num_pages == 0:
+        return ""
+
+    def _norm(line: str) -> str:
+        return re.sub(r"\s+", " ", line.strip()).lower()
+
+    # Count how many pages each normalized line appears on.
+    line_page_count: Dict[str, int] = {}
+    for page in pages:
+        seen_on_page = set()
+        for raw_line in page.splitlines():
+            norm = _norm(raw_line)
+            if not norm or norm in seen_on_page:
+                continue
+            seen_on_page.add(norm)
+            line_page_count[norm] = line_page_count.get(norm, 0) + 1
+
+    repeat_threshold = max(3, int(0.4 * num_pages))
+
+    def _is_boilerplate(raw_line: str) -> bool:
+        norm = _norm(raw_line)
+        if not norm:
+            return False
+        if line_page_count.get(norm, 0) >= repeat_threshold:
+            return True
+        return any(pat.search(raw_line) for pat in _PDF_BOILERPLATE_PATTERNS)
+
+    cleaned_pages: List[str] = []
+    for page in pages:
+        kept = [ln for ln in page.splitlines() if not _is_boilerplate(ln)]
+        page_body = "\n".join(kept).strip()
+        if page_body:
+            cleaned_pages.append(page_body)
+    return "\n".join(cleaned_pages).strip()
 
 try:
     from google.auth.exceptions import DefaultCredentialsError
@@ -153,27 +230,46 @@ class FileProcessor:
             return "[PDF content - PDF processing not available]"
 
         try:
-            # First try traditional text extraction
+            # First try traditional text extraction, keeping per-page text so we
+            # can detect (and strip) repeated publisher header/footer boilerplate.
             pdf_file = BytesIO(pdf_data)
             pdf_reader = PyPDF2.PdfReader(pdf_file)
-            text = ""
+            page_texts = []
 
             for page in pdf_reader.pages:
                 page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
+                page_texts.append(page_text or "")
 
-            # If we got substantial text, return it
-            if text.strip() and len(text.strip()) > 50:
+            num_pages = max(1, len(page_texts))
+            # Strip per-page publisher watermark so a boilerplate-only text layer
+            # (e.g. an SCC Online / TruePrint image scan whose only text is the
+            # repeated header) does not masquerade as real content and skip OCR.
+            scrubbed = _strip_repeated_pdf_boilerplate(page_texts)
+
+            # Keep the text layer ONLY when it carries meaningful body: a decent
+            # absolute amount AND a reasonable average of real chars per page.
+            # Otherwise the text layer is boilerplate-dominated / image-only and
+            # we must OCR the page images to read the actual document.
+            has_real_text = (
+                len(scrubbed) >= 200 and (len(scrubbed) / num_pages) >= 40
+            )
+            if has_real_text:
                 logger.success(
-                    f"Extracted {len(text)} characters from PDF using text extraction"
+                    "Extracted {} characters from PDF using text extraction "
+                    "({} chars after boilerplate strip, {} pages)",
+                    sum(len(t) for t in page_texts),
+                    len(scrubbed),
+                    num_pages,
                 )
-                return text.strip()
+                return scrubbed
 
-            # If no text or very little text, try OCR on PDF pages
+            # Boilerplate-dominated / image-based → OCR the page images.
             if PDF2IMAGE_AVAILABLE and GCP_OCR_AVAILABLE:
                 logger.info(
-                    "Text extraction yielded minimal results, attempting OCR on PDF pages"
+                    "Text layer is boilerplate-dominated ({} real chars over {} "
+                    "pages); attempting OCR on PDF pages",
+                    len(scrubbed),
+                    num_pages,
                 )
                 return FileProcessor._extract_text_from_pdf_with_ocr(pdf_data)
             else:
@@ -181,8 +277,8 @@ class FileProcessor:
                     "PDF appears to be image-based but pdf2image or GCP Vision API not available"
                 )
                 return (
-                    text.strip()
-                    if text.strip()
+                    scrubbed
+                    if scrubbed
                     else "[PDF appears to contain images but OCR not available]"
                 )
 
@@ -252,10 +348,14 @@ class FileProcessor:
                     and not page_text.startswith("[Error")
                     and not page_text.startswith("[No text")
                 ):
-                    extracted_texts.append(f"--- Page {i+1} ---\n{page_text}")
+                    extracted_texts.append(page_text)
 
             if extracted_texts:
-                full_text = "\n\n".join(extracted_texts)
+                # OCR also reads the publisher header/footer imprinted on each
+                # page image, so strip the repeated boilerplate here too.
+                full_text = _strip_repeated_pdf_boilerplate(extracted_texts)
+                if not full_text:
+                    full_text = "\n\n".join(extracted_texts)
                 logger.success(
                     f"Extracted {len(full_text)} characters from PDF using OCR"
                 )

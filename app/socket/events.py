@@ -266,6 +266,14 @@ class SocketEventHandler(
         self._workspace_drafting_payload: Dict[str, Dict[str, Any]] = (
             PersistentWorkspaceDict(CacheKinds.DRAFTING_SUGGESTIONS)
         )
+        # Latest currentState echoed back by the frontend on workspace_sync — the
+        # previously-emitted, user-curated panel state used to tag regenerated
+        # items as matched (carried over from before) vs new. Read by every
+        # regeneration path (sync upload/delete AND the chat-triggered
+        # objective-change path). Shape mirrors schemas.WorkspaceCurrentState.
+        self._workspace_current_state_payload: Dict[str, Any] = (
+            PersistentWorkspaceDict(CacheKinds.CURRENT_STATE)
+        )
         # In-flight request_template_sync correlations: requestId -> Future,
         # resolved by on_template_sync_response once the snapshot is ingested
         # into the in-memory template store. Lets the suggestion/kickoff path

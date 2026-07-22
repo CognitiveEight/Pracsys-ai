@@ -211,11 +211,17 @@ class DraftingMixin:
                     if strength_pts:
                         lines.append("Strengths: " + " | ".join(strength_pts))
                 if isinstance(weaknesses, list) and weaknesses:
-                    weak_pts = [str(w).strip() for w in weaknesses[:4] if w]
+                    # Items are now {id,text,isMatched} dicts (were plain
+                    # strings) — coerce to text so we never render dict reprs.
+                    weak_pts = [
+                        s for s in _coerce_analysis_text_list(weaknesses[:4]) if s
+                    ]
                     if weak_pts:
                         lines.append("Weaknesses: " + " | ".join(weak_pts))
                 if isinstance(missing, list) and missing:
-                    miss_pts = [str(m).strip() for m in missing[:4] if m]
+                    miss_pts = [
+                        s for s in _coerce_analysis_text_list(missing[:4]) if s
+                    ]
                     if miss_pts:
                         lines.append("Missing info: " + " | ".join(miss_pts))
                 if isinstance(pending, list) and pending:

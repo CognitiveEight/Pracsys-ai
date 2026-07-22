@@ -143,6 +143,15 @@ STEP 1 — CLASSIFY (be strict):
 - A case law is a judgment/order of a court or tribunal: it has parties, a court,
   legal issues, reasoning, and a disposition. Statutes, contracts, notices,
   invoices, resumes, coding assignments, articles, and forms are NOT case law.
+- IGNORE publisher header/footer metadata. Legal-database exports (SCC Online,
+  TruePrint, Manupatra, Indian Kanoon, etc.) stamp EVERY page with boilerplate
+  such as "SCC Online Web Edition", "TruePrint™ source: Supreme Court Cases",
+  "Printed For: ...", "Page N", and copyright lines like "Eastern Book Company
+  v. D.B. Modak, (2008) 1 SCC 1". This boilerplate is NOT the document's content
+  — judge "isCaseLaw" ONLY on the substantive body (case title, bench, headnotes,
+  issues, reasoning, holding). NEVER reject a document as "just repeated headers"
+  or "a legal database search result" merely because such boilerplate is present;
+  if any judgment body exists, classify it as a case law.
 - If it is NOT a case law, set "isCaseLaw": false and give a concrete, specific
   "rejectionReason" that names what the document actually is (e.g. "The uploaded
   document is a technical coding assignment titled '...'. It does not contain a

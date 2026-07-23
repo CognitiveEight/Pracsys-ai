@@ -119,6 +119,7 @@ from app.prompts.objective_change_prompts import (
     llm_merge_dated_entries_against_previous_prompt,
     llm_classify_factual_vs_procedural_prompt,
     merge_applicable_laws_with_previous_prompt,
+    llm_resolve_answered_missing_info_prompt,
 )
 
 
@@ -724,6 +725,121 @@ class ObjectiveChangeMixin:
                     break
             return fallback[:max_keep]
 
+    async def _llm_resolve_answered_missing_info(
+        self,
+        workspace_id: str,
+        merged_missing: List[str],
+        fresh_missing: List[str],
+        *,
+        log_context: str = "",
+    ) -> List[str]:
+        """Post-merge resolution pass: drop merged missingInfo items that are
+        now ANSWERED by the uploaded documents (the grow-only merge never
+        removes items, so an item asking for e.g. a cheque number would stay
+        forever after the user uploads the cheque).
+
+        Fail-open: any error returns the input list unchanged. Never drops
+        items the fresh regeneration still flags as missing, nor entries the
+        user added via added_missing_information.
+        """
+        items = [s for s in (merged_missing or []) if isinstance(s, str) and s.strip()]
+        if not items:
+            return merged_missing
+        try:
+            from app.ai.gemini_client import gemini_client
+            from app.vectorstore.qdrant import vector_store
+
+            # Guard 1: the fresh generation just re-verified these against ALL
+            # documents (missing-info verification step) and still flagged
+            # them — never contradict it.
+            fresh_lower = {
+                s.strip().lower() for s in (fresh_missing or []) if isinstance(s, str)
+            }
+            # Guard 2: user-added entries are only removable by the user via
+            # analysis_report_feedback.
+            user_added = self._workspace_user_added_missing_info.get(workspace_id) or []
+
+            def _protected(item: str) -> bool:
+                if item.strip().lower() in fresh_lower:
+                    return True
+                return any(
+                    self._match_rejected_value(item, ua)
+                    for ua in user_added
+                    if isinstance(ua, str) and ua.strip()
+                )
+
+            candidate_idx = {i for i, s in enumerate(items) if not _protected(s)}
+            if not candidate_idx:
+                return items
+
+            cached = self._workspace_case_entities_cache.get(workspace_id)
+            entities = cached[1] if cached and isinstance(cached[1], dict) else {}
+            entities_block = (
+                json.dumps(entities, indent=2, ensure_ascii=False)
+                if entities
+                else "(none)"
+            )
+            docs = await vector_store.get_all_documents(workspace_id=workspace_id)
+            with_content = [d for d in docs if (d.get("content") or "").strip()]
+            budget = 40000
+            per_doc = budget // max(1, len(with_content))
+            doc_parts = []
+            for i, d in enumerate(with_content, 1):
+                content = (d.get("content") or "").strip()[:per_doc]
+                doc_parts.append(
+                    f"--- Document {i} (id: {d.get('document_id') or ''}) ---\n{content}"
+                )
+            document_content = (
+                "\n\n".join(doc_parts) or "No document content available."
+            )
+
+            numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(items))
+            prompt = llm_resolve_answered_missing_info_prompt(
+                numbered_items=numbered,
+                entities_block=entities_block,
+                document_content=document_content,
+            )
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=4000,
+                response_mime_type="application/json",
+            )
+            candidate = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            parsed = json.loads(candidate) if candidate else json.loads((raw or "").strip())
+            answered = parsed.get("answered") if isinstance(parsed, dict) else None
+            if not isinstance(answered, list):
+                return items
+            drop: Set[int] = set()
+            for a in answered:
+                if not isinstance(a, dict):
+                    continue
+                try:
+                    n = int(a.get("index"))
+                except (TypeError, ValueError):
+                    continue
+                # Evidence quote is mandatory — an index without evidence is
+                # not a confirmed resolution.
+                if not str(a.get("evidence") or "").strip():
+                    continue
+                if 1 <= n <= len(items) and (n - 1) in candidate_idx:
+                    drop.add(n - 1)
+            if drop:
+                logger.info(
+                    "Analysis missingInfo resolution{}: dropping {} answered item(s): {}",
+                    log_context,
+                    len(drop),
+                    [items[i] for i in sorted(drop)],
+                )
+            return [s for i, s in enumerate(items) if i not in drop]
+        except Exception as e:
+            logger.warning(
+                "missingInfo resolution pass failed{}: {}; keeping grow-only merge result",
+                log_context,
+                e,
+            )
+            return merged_missing
+
     async def _llm_merge_strengths_against_previous(
         self,
         prev_strengths: List[Dict[str, Any]],
@@ -1269,6 +1385,60 @@ class ObjectiveChangeMixin:
             law["id"] = f"law_{i+1}"
         return {"laws": merged[:max_laws]}
 
+    # Analysis-report text sections that get {id, text, isMatched} tagging, and
+    # the currentState key + rejected-memory section each maps to.
+    _ANALYSIS_TAGGED_SECTIONS = (
+        # (report_field, currentState_key, rejected_section_or_None)
+        ("missingInfo", "missingInfo", "missingInfo"),
+        ("weaknesses", "weaknesses", "riskOrWeakness"),
+        ("risks", "risks", "riskOrWeakness"),
+        ("relevantJurisdiction", "relevantJurisdiction", None),
+    )
+
+    async def _tag_analysis_report_against_current_state(
+        self,
+        workspace_id: str,
+        analysis_report: Dict[str, Any],
+        *,
+        log_context: str = "",
+    ) -> Dict[str, Any]:
+        """Tag the four analysis text sections against the frontend's
+        currentState so each item is emitted as ``{id, text, isMatched}``.
+
+        Replaces the old grow-only merge (`_merge_analysis_report_with_previous`)
+        and answered-item drop (`_llm_resolve_answered_missing_info`): the fresh
+        report is authoritative for content, and reconciliation only stamps
+        identity (matched → carry prior id; new → mint id; prev-only → dropped).
+        Rejected-item memory is still honoured. Runs on every emit (create and
+        sync); with no currentState every item is emitted new with a minted id
+        so the shape is uniform from the first emit.
+        """
+        if not isinstance(analysis_report, dict):
+            return analysis_report
+        current_state = self._workspace_current_state_payload.get(workspace_id) or {}
+        if not isinstance(current_state, dict):
+            current_state = {}
+        for report_field, cs_key, reject_section in self._ANALYSIS_TAGGED_SECTIONS:
+            fresh = _coerce_analysis_text_list(analysis_report.get(report_field))
+            # Honour rejected-item memory: never re-surface a dismissed item.
+            if reject_section:
+                fresh = [
+                    s
+                    for s in fresh
+                    if not self._is_previously_rejected_analysis_item(
+                        workspace_id=workspace_id,
+                        section=reject_section,
+                        candidate=s,
+                    )
+                ]
+            prev_items = current_state.get(cs_key) if current_state else None
+            analysis_report[report_field] = await self._reconcile_against_current_state(
+                fresh=fresh,
+                prev_items=prev_items if isinstance(prev_items, list) else None,
+                section=report_field,
+            )
+        return analysis_report
+
     async def _merge_analysis_report_with_previous(
         self,
         workspace_id: str,
@@ -1336,6 +1506,15 @@ class ObjectiveChangeMixin:
             new_missing_filtered,
             item_type="missing information items",
             max_keep=10,
+        )
+        # The merge above is grow-only; drop items now ANSWERED by the
+        # uploaded documents (must run before the score block so the score
+        # cap sees the cleaned list).
+        merged["missingInfo"] = await self._llm_resolve_answered_missing_info(
+            workspace_id,
+            merged.get("missingInfo") or [],
+            new_missing_filtered,
+            log_context=ctx,
         )
         merged["weaknesses"] = await self._llm_merge_against_previous(
             _str_list(prev_analysis.get("weaknesses")),
@@ -1544,6 +1723,23 @@ class ObjectiveChangeMixin:
             new_analysis = self._analysis_report_fallback(
                 (workspace_role or "ADJUDICATOR").strip().upper()
             )
+
+        # Tag the objective-aligned report against the frontend's currentState
+        # so items that still textually match the previously-curated ones carry
+        # their id (isMatched=True) and genuinely new objective-driven items get
+        # a minted id (isMatched=False). This is identity-tagging only — content
+        # is fully replaced by the objective-driven regeneration above.
+        if isinstance(new_analysis, dict):
+            try:
+                new_analysis = await self._tag_analysis_report_against_current_state(
+                    workspace_id, new_analysis, log_context=ctx,
+                )
+            except Exception as tag_err:
+                logger.warning(
+                    "Objective-change analysis currentState tagging failed{}: {}; "
+                    "emitting untagged",
+                    ctx, tag_err,
+                )
 
         self._workspace_analysis_payload[workspace_id] = new_analysis
         if self._socket_client:
@@ -1960,27 +2156,24 @@ class ObjectiveChangeMixin:
             analysis_report = self._analysis_report_fallback(
                 (workspace_role or "ADJUDICATOR").strip().upper()
             )
-        # Merge with the previously cached version when this is a regeneration
-        # (audio re-uploaded, transcript edited, sync after add/edit). Without
-        # this, the FE sees v1 from the first emit AND v2 from the second emit
-        # with overlapping items — e.g. "Name of the Petitioner's bank and
-        # specific branch" (v1) plus "Name of the Petitioner's bank" (v2).
-        # The merge unions prev + new and runs LLM semantic dedup so each
-        # emitted report is the cumulative state with no semantic duplicates,
-        # rejection memory preserved, and identity/score from prev kept.
-        if is_update and isinstance(analysis_report, dict):
+        # Tag the fresh report's text sections against the frontend's
+        # currentState so each item carries {id, text, isMatched}: items that
+        # match the previously-curated state keep their id (isMatched=True),
+        # genuinely new items get a minted id (isMatched=False), and prev-only
+        # items are dropped. Runs on every emit (create + sync) so the shape is
+        # uniform; with no currentState every item is emitted new.
+        if isinstance(analysis_report, dict):
             try:
-                analysis_report = await self._merge_analysis_report_with_previous(
-                    workspace_id=workspace_id,
-                    workspace_role=workspace_role,
-                    new_analysis=analysis_report,
+                analysis_report = await self._tag_analysis_report_against_current_state(
+                    workspace_id,
+                    analysis_report,
                     log_context=log_context or " (emit)",
                 )
-            except Exception as merge_err:
+            except Exception as tag_err:
                 logger.warning(
-                    "Analysis report merge with previous failed{}: {}; "
-                    "emitting unmerged",
-                    log_context, merge_err,
+                    "Analysis report currentState tagging failed{}: {}; "
+                    "emitting untagged",
+                    log_context, tag_err,
                 )
         # Guard: if objective-change refresh is active, skip stale background emits
         # so workspace sees only objective-aligned analysis report.
@@ -2074,16 +2267,13 @@ class ObjectiveChangeMixin:
                 analysis_report = self._analysis_report_fallback(
                     (workspace_role or "ADJUDICATOR").strip().upper()
                 )
-            # Merge with the previous cached version: drops items the user
-            # already saw, preserves rejection memory, keeps identity + score.
-            # Without this, a transcript-edit re-upload re-emits the prev
-            # missingInfo / weaknesses / risks alongside any new ones, doubling
-            # up the list visible in the UI.
+            # Tag the fresh report against the frontend's currentState so items
+            # carry {id, text, isMatched} (matched → prior id; new → minted id;
+            # prev-only → dropped). Rejection memory is still honoured.
             if isinstance(analysis_report, dict):
-                analysis_report = await self._merge_analysis_report_with_previous(
-                    workspace_id=workspace_id,
-                    workspace_role=workspace_role,
-                    new_analysis=analysis_report,
+                analysis_report = await self._tag_analysis_report_against_current_state(
+                    workspace_id,
+                    analysis_report,
                     log_context=" (sync)",
                 )
             if self._socket_client and analysis_report:

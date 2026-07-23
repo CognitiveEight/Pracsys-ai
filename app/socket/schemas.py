@@ -70,6 +70,90 @@ class WorkspaceCreatedPayload(BaseModel):
         populate_by_name = True
 
 
+# ============================================================================
+# currentState — the previously-emitted, user-curated panel state the frontend
+# sends back inside workspace_sync so regeneration can tag each item as matched
+# (carried over from before) vs new. Present only on a re-run trigger
+# (upload/transcript/remove/objective change); omitted on plain rename/reset.
+# Each sub-block is omitted when that feature is empty. The ``status`` field
+# (approved/pending/rejected) is parsed but intentionally ignored — matching is
+# by text/content only.
+# ============================================================================
+
+
+class CurrentStateTextItem(BaseModel):
+    """One curated text item (missingInfo/risks/weaknesses/relevantJurisdiction)."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: str
+    text: str
+    status: Optional[str] = None  # approved | pending | rejected (ignored on match)
+
+
+class CurrentStatePartyItem(BaseModel):
+    """One curated relevant-party (matched by name)."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: str
+    name: str
+
+
+class CurrentStatePartiesGroup(BaseModel):
+    """Relevant-parties grouped by curation status; flattened on match."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    approved: List[CurrentStatePartyItem] = []
+    pending: List[CurrentStatePartyItem] = []
+
+
+class CurrentStateDateItem(BaseModel):
+    """One curated list-of-dates entry (matched by date + title)."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: str
+    date: str
+    title: str
+
+
+class CurrentStateDatesGroup(BaseModel):
+    """List-of-dates grouped by curation status; flattened on match."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    approved: List[CurrentStateDateItem] = []
+    pending: List[CurrentStateDateItem] = []
+
+
+class CurrentStateLawItem(BaseModel):
+    """One curated applicable-law (matched by act + section; no prior id)."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    act: str
+    section: Optional[str] = None
+
+
+class WorkspaceCurrentState(BaseModel):
+    """
+    Previously-emitted, user-curated panel state echoed back by the frontend.
+    Every sub-block is optional (omitted when that feature is empty).
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    missingInfo: Optional[List[CurrentStateTextItem]] = None
+    risks: Optional[List[CurrentStateTextItem]] = None
+    weaknesses: Optional[List[CurrentStateTextItem]] = None
+    relevantJurisdiction: Optional[List[CurrentStateTextItem]] = None
+    relevantParties: Optional[CurrentStatePartiesGroup] = None
+    listOfDates: Optional[CurrentStateDatesGroup] = None
+    applicableLaws: Optional[List[CurrentStateLawItem]] = None
+
+
 class WorkspaceSyncPayload(BaseModel):
     """
     Schema for workspace_sync event (Server → AI_Maverick).
@@ -78,6 +162,8 @@ class WorkspaceSyncPayload(BaseModel):
     deletedDocumentIds so AI can remove them from vector store and regenerate strategy.
     workspaceRole is sent when user changes role (e.g. Edit Workspace → Mediator).
     Optional custom instructions: structure, tone, description (same as workspace_created).
+    ``currentState`` carries the previously-emitted panel state so regeneration
+    can tag items as matched vs new (see WorkspaceCurrentState).
     """
 
     workspaceId: str
@@ -95,6 +181,9 @@ class WorkspaceSyncPayload(BaseModel):
     structure: Optional[str] = None
     tone: Optional[str] = None
     description: Optional[str] = None
+    currentState: Optional[WorkspaceCurrentState] = (
+        None  # Previously-curated panel state (present only on re-run triggers)
+    )
 
     class Config:
         populate_by_name = True
@@ -823,6 +912,7 @@ class RelevantPartyItem(BaseModel):
     contactNumber: str = ""  # user-supplied (panel edit); "" on auto-gen
     email: str = ""  # user-supplied (panel edit); "" on auto-gen
     officialIdUrl: str = ""  # user-supplied (panel edit); "" on auto-gen
+    isMatched: bool = False  # True when this party carried over from currentState
 
 
 class RelevantPartiesPayload(BaseModel):

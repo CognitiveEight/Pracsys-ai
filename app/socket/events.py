@@ -228,6 +228,12 @@ class SocketEventHandler(
         self._workspace_rejected_analysis_items: Dict[str, Dict[str, List[str]]] = (
             PersistentWorkspaceDict(CacheKinds.REJECTED_ANALYSIS_ITEMS)
         )
+        # Per-workspace memory of missingInfo entries the user added via
+        # added_missing_information — protected from the answered-by-upload
+        # resolution pass (only analysis_report_feedback removes them).
+        self._workspace_user_added_missing_info: Dict[str, List[str]] = (
+            PersistentWorkspaceDict(CacheKinds.USER_ADDED_MISSING_INFO)
+        )
         # List of Dates timeline per workspace (chronological events from case documents)
         self._workspace_list_of_dates_payload: Dict[str, List[Dict[str, Any]]] = (
             PersistentWorkspaceDict(CacheKinds.LIST_OF_DATES)
@@ -259,6 +265,14 @@ class SocketEventHandler(
         # Shape: {"suggestedDrafts": [{"title","relevance","description"}, ...]}
         self._workspace_drafting_payload: Dict[str, Dict[str, Any]] = (
             PersistentWorkspaceDict(CacheKinds.DRAFTING_SUGGESTIONS)
+        )
+        # Latest currentState echoed back by the frontend on workspace_sync — the
+        # previously-emitted, user-curated panel state used to tag regenerated
+        # items as matched (carried over from before) vs new. Read by every
+        # regeneration path (sync upload/delete AND the chat-triggered
+        # objective-change path). Shape mirrors schemas.WorkspaceCurrentState.
+        self._workspace_current_state_payload: Dict[str, Any] = (
+            PersistentWorkspaceDict(CacheKinds.CURRENT_STATE)
         )
         # In-flight request_template_sync correlations: requestId -> Future,
         # resolved by on_template_sync_response once the snapshot is ingested

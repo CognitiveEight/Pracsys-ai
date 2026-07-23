@@ -102,6 +102,8 @@ from app.socket.event_utils import (
     _strip_ui_truncated_tokens,
     scrub_app_brand,
     _coerce_analysis_text_list,
+    _mint_item_id,
+    _normalize_match_text,
     _strip_strength_point_statute_boilerplate,
     _annexure_wording_for_next_steps,
     _clamp_annexure_references,
@@ -192,3 +194,163 @@ class JsonHelpersMixin:
             candidate += "}" * open_braces
         candidate = re.sub(r",\s*([\]}])", r"\1", candidate)
         return candidate.strip()
+
+    # ------------------------------------------------------------------
+    # currentState reconciliation
+    #
+    # The frontend echoes the previously-emitted, user-curated panel state
+    # back on workspace_sync (see schemas.WorkspaceCurrentState). When a panel
+    # regenerates, each fresh item is tagged so the frontend knows what carried
+    # over vs what is new:
+    #   - a fresh item whose CONTENT matches a previous item -> isMatched=True,
+    #     and it CARRIES the previous item's id;
+    #   - a brand-new fresh item -> isMatched=False, server mints a new id;
+    #   - previous-only items the fresh run did not regenerate are DROPPED.
+    # Matching is by text/content only; the curation ``status`` is ignored.
+    # ------------------------------------------------------------------
+
+    async def _match_items_to_previous(
+        self,
+        fresh_texts: List[str],
+        prev_pool: List[Dict[str, Any]],
+        *,
+        item_type: str,
+        enable_llm: bool = True,
+    ) -> Dict[int, str]:
+        """Map fresh item indexes to a previous item's id, by meaning.
+
+        ``fresh_texts`` — the match text for each fresh item (index == position).
+        ``prev_pool``   — previous items, each ``{"id": str, "text": str}``.
+
+        Returns ``{fresh_index: prev_id}`` for the fresh items that matched a
+        previous one (each previous id used at most once). A deterministic
+        normalized-text pass runs first; any still-unmatched fresh items go
+        through one fail-open Gemini semantic pass when ``enable_llm``.
+        """
+        matches: Dict[int, str] = {}
+        if not fresh_texts or not prev_pool:
+            return matches
+
+        consumed: Set[str] = set()  # prev ids already claimed
+        # 1) Deterministic normalized-text pass.
+        prev_norm = [
+            (str(p.get("id") or ""), _normalize_match_text(p.get("text")))
+            for p in prev_pool
+        ]
+        for fi, ftext in enumerate(fresh_texts):
+            fkey = _normalize_match_text(ftext)
+            if not fkey:
+                continue
+            for pid, pkey in prev_norm:
+                if not pid or pid in consumed or not pkey:
+                    continue
+                if pkey == fkey:
+                    matches[fi] = pid
+                    consumed.add(pid)
+                    break
+
+        # 2) Fail-open LLM semantic pass over the leftovers.
+        remaining_fresh = [
+            (fi, ftext)
+            for fi, ftext in enumerate(fresh_texts)
+            if fi not in matches and str(ftext or "").strip()
+        ]
+        remaining_prev = [
+            p for p in prev_pool if str(p.get("id") or "") not in consumed
+        ]
+        if not enable_llm or not remaining_fresh or not remaining_prev:
+            return matches
+
+        try:
+            from app.ai.gemini_client import gemini_client
+            from app.prompts.objective_change_prompts import (
+                llm_match_fresh_against_previous_prompt,
+            )
+
+            numbered_fresh = "\n".join(
+                f"{local + 1}. {ftext}" for local, (_fi, ftext) in enumerate(remaining_fresh)
+            )
+            numbered_prev = "\n".join(
+                f"{i + 1}. [{p.get('id')}] {p.get('text')}"
+                for i, p in enumerate(remaining_prev)
+            )
+            prompt = llm_match_fresh_against_previous_prompt(
+                item_type=item_type,
+                numbered_fresh=numbered_fresh,
+                numbered_prev=numbered_prev,
+            )
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=4000,
+                response_mime_type="application/json",
+            )
+            candidate = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            parsed = json.loads(candidate) if candidate else json.loads((raw or "").strip())
+            pairs = parsed.get("matches") if isinstance(parsed, dict) else None
+            valid_prev_ids = {str(p.get("id") or "") for p in remaining_prev}
+            for pair in pairs or []:
+                try:
+                    local = int(pair.get("freshIndex")) - 1
+                    pid = str(pair.get("prevId") or "")
+                except (TypeError, ValueError):
+                    continue
+                if local < 0 or local >= len(remaining_fresh):
+                    continue
+                if not pid or pid in consumed or pid not in valid_prev_ids:
+                    continue
+                fi = remaining_fresh[local][0]
+                if fi in matches:
+                    continue
+                matches[fi] = pid
+                consumed.add(pid)
+        except Exception as e:
+            logger.debug(
+                "currentState semantic match ({}) failed; using deterministic only: {}",
+                item_type, e,
+            )
+        return matches
+
+    async def _reconcile_against_current_state(
+        self,
+        *,
+        fresh: List[str],
+        prev_items: Optional[List[Dict[str, Any]]],
+        section: str,
+        text_key: str = "text",
+        enable_llm: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Tag a fresh text list against previously-curated items.
+
+        Returns ``[{id, text, isMatched}]`` in fresh order. Matched items carry
+        the previous id (``isMatched=True``); new items get a freshly minted id
+        (``isMatched=False``). Previous-only items are dropped. When
+        ``prev_items`` is empty/None (e.g. first workspace_created, or no
+        currentState) every item is emitted new with a minted id — so the shape
+        is uniform from the very first emit.
+        """
+        fresh_clean = [
+            s.strip() for s in (fresh or []) if isinstance(s, str) and s.strip()
+        ]
+        prev_pool: List[Dict[str, Any]] = []
+        for p in prev_items or []:
+            if not isinstance(p, dict):
+                continue
+            pid = str(p.get("id") or "").strip()
+            ptext = p.get(text_key) or p.get("text") or ""
+            if pid and str(ptext).strip():
+                prev_pool.append({"id": pid, "text": str(ptext).strip()})
+
+        matches = await self._match_items_to_previous(
+            fresh_clean, prev_pool, item_type=section, enable_llm=enable_llm
+        )
+        out: List[Dict[str, Any]] = []
+        for fi, text in enumerate(fresh_clean):
+            prev_id = matches.get(fi)
+            if prev_id:
+                out.append({"id": prev_id, "text": text, "isMatched": True})
+            else:
+                out.append(
+                    {"id": _mint_item_id(section), "text": text, "isMatched": False}
+                )
+        return out

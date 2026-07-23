@@ -103,6 +103,7 @@ from app.socket.event_utils import (
     _strip_ui_truncated_tokens,
     scrub_app_brand,
     _coerce_analysis_text_list,
+    find_ungrounded_proper_nouns,
     _strip_strength_point_statute_boilerplate,
     _annexure_wording_for_next_steps,
     _clamp_annexure_references,
@@ -121,6 +122,7 @@ from app.prompts.strategy_prompts import (
     generate_strategies_from_documents_prompt5,
     generate_strategies_from_documents_prompt6,
     regenerate_strategy_objective_preserving_case_summary_prompt,
+    reground_strategy_objective_prompt,
     regenerate_case_summary_with_feedback_prompt,
     regenerate_next_steps_with_feedback_prompt,
     regenerate_strategic_objective_with_feedback_prompt,
@@ -1308,7 +1310,25 @@ class StrategyMixin:
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
                 role = "ADJUDICATOR"
 
-            prompt = regenerate_strategy_objective_preserving_case_summary_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, case_summary=case_summary, combined_document_content=combined_document_content, current_strategy=current_strategy, report_case_summary=report_case_summary, role=role, user_objective_instruction=user_objective_instruction)
+            # Extracted-entities allow-list (cached; cheap) — the only bodies/
+            # parties/places the regenerated objective may name. Grounds the
+            # prompt AND seeds the deterministic fabrication backstop below.
+            try:
+                case_entities = await self._extract_case_entities(
+                    workspace_id=workspace_id,
+                    combined_document_content=combined_document_content,
+                )
+            except Exception as ent_err:
+                logger.debug("Objective regen: entity extraction failed: {}", ent_err)
+                case_entities = {}
+            try:
+                entities_block = json.dumps(
+                    case_entities or {}, indent=2, ensure_ascii=False
+                )
+            except Exception:
+                entities_block = "{}"
+
+            prompt = regenerate_strategy_objective_preserving_case_summary_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, case_summary=case_summary, combined_document_content=combined_document_content, current_strategy=current_strategy, report_case_summary=report_case_summary, role=role, user_objective_instruction=user_objective_instruction, entities_block=entities_block)
 
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
@@ -1341,6 +1361,89 @@ class StrategyMixin:
                 for s in possible_next_steps
                 if s
             ][:5]
+
+            # Deterministic anti-fabrication backstop: the objective must not
+            # name any organisation/body/place absent from the documents,
+            # extracted entities, or the user's own instruction (a forum/venue
+            # the user chose is allowed). If a fabricated entity slipped through
+            # (e.g. "Bihar Cricket Association" for a Karnataka/national case),
+            # run ONE corrective re-prompt to re-ground the text.
+            try:
+                allowed_texts = [
+                    combined_document_content,
+                    user_objective_instruction,
+                    entities_block,
+                    case_summary,
+                    report_case_summary,
+                ]
+                ungrounded = find_ungrounded_proper_nouns(
+                    strategic_objective + "\n" + "\n".join(possible_next_steps),
+                    allowed_texts,
+                )
+                if ungrounded:
+                    logger.warning(
+                        "Objective regen: ungrounded entities detected {} for "
+                        "workspace {} — running one corrective re-prompt",
+                        ungrounded,
+                        workspace_id[:12] if workspace_id else "",
+                    )
+                    reground_prompt = reground_strategy_objective_prompt(
+                        strategic_objective=strategic_objective,
+                        possible_next_steps=possible_next_steps,
+                        ungrounded_terms=ungrounded,
+                        combined_document_content=combined_document_content,
+                        user_objective_instruction=user_objective_instruction,
+                        entities_block=entities_block,
+                        role=role,
+                    )
+                    raw2 = await gemini_client.generate(
+                        prompt=reground_prompt,
+                        system_instruction=get_structured_document_feature_system_instruction(
+                            role
+                        ),
+                        temperature=0.0,
+                        max_tokens=8000,
+                        response_mime_type="application/json",
+                    )
+                    json2 = self._prepare_json_candidate(
+                        (raw2 or "").strip(), prefer="object"
+                    )
+                    data2 = json.loads(json2) if json2 else {}
+                    if isinstance(data2, dict):
+                        so2 = (data2.get("strategicObjective") or "").strip()
+                        ns2 = (
+                            data2.get("possibleNextSteps")
+                            or data2.get("possible_next_steps")
+                            or []
+                        )
+                        if isinstance(ns2, str):
+                            ns2 = [ns2] if ns2 else []
+                        if so2:
+                            strategic_objective = so2
+                        if ns2:
+                            possible_next_steps = [
+                                _annexure_wording_for_next_steps(str(s).strip())
+                                for s in ns2
+                                if s
+                            ][:5]
+                        still_ungrounded = find_ungrounded_proper_nouns(
+                            strategic_objective + "\n" + "\n".join(possible_next_steps),
+                            allowed_texts,
+                        )
+                        if still_ungrounded:
+                            logger.warning(
+                                "Objective regen: entities still ungrounded after "
+                                "re-prompt {} (workspace {})",
+                                still_ungrounded,
+                                workspace_id[:12] if workspace_id else "",
+                            )
+            except Exception as reground_err:
+                logger.debug(
+                    "Objective regen fabrication backstop failed: {}; keeping "
+                    "original objective",
+                    reground_err,
+                )
+
             suggestion_chips = (
                 data.get("suggestionChips") or data.get("suggestion_chips") or []
             )

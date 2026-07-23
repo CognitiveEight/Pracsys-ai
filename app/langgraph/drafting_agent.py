@@ -309,6 +309,96 @@ def _restore_regressed_values(
     return "\n".join(out_lines), restored
 
 
+# Matches a literal decimal enumerator at the start of a line:
+#   "8. That due to..."      -> num="8"
+#   "**8.** That due to..."  -> num="8" (bold-wrapped)
+#   "9) Whereas..."          -> num="9" (paren style)
+#   "  8. Indented item"     -> num="8" (up to 3 leading spaces)
+# Must NOT match:
+#   "22.07.2026"   — no whitespace boundary after the punctuation
+#   "1.1 Sub-para" — same reason
+_ENUM_RE = re.compile(
+    r"^(?P<indent>[ \t]{0,3})"
+    r"(?P<bopen>\*\*)?"
+    r"(?P<num>\d{1,3})"
+    r"(?P<punct>[.)])"
+    r"(?P<bclose>\*\*)?"
+    r"(?P<sp>[ \t]+)"
+    r"(?!\d)"
+)
+
+
+def _renumber_draft_markdown(markdown: str) -> "tuple[str, int]":
+    """Deterministically repair a numbered sequence that resets mid-document
+    to stale source-boilerplate numbers (e.g. '...20., 21., 8., 9....').
+
+    Tracks one running "active sequence" over literal decimal enumerators at
+    the start of a markdown line (plain-paragraph numbering — real Markdown
+    ordered-list blocks are auto-renumbered by Word on export regardless, so
+    touching them here is a harmless no-op):
+
+      - N == 1        -> always starts a NEW sequence. This alone covers
+                          every legitimate restart (PRAYER/RELIEF list,
+                          AFFIDAVIT, VAKALATNAMA, LIST OF ASSETS) with no
+                          heading/section detection needed.
+      - N == last + 1 -> continues the active sequence untouched.
+      - anything else -> gap, repeat, or backslide (the exact defect).
+                          Rewritten to last + 1, sequence continues from there.
+
+    Fenced code blocks are passed through untouched. Only the enumerator's
+    digits are replaced — indentation, bold wrapper, punctuation style, and
+    all following text are preserved. Idempotent.
+
+    Returns (fixed_markdown, count_of_rewritten_enumerators).
+    """
+    lines = markdown.split("\n")
+    out: List[str] = []
+    in_fence = False
+    active = False
+    last = 0
+    rewritten = 0
+
+    for line in lines:
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            continue
+
+        m = _ENUM_RE.match(line)
+        if not m:
+            # Blank lines, prose, roman/letter sub-items, ALL-CAPS structural
+            # lines (VERSUS, VERIFICATION), and markdown headings fall through
+            # here and neither reset nor break the active sequence.
+            out.append(line)
+            continue
+
+        n = int(m.group("num"))
+        if n == 1:
+            active, last = True, 1
+            out.append(line)
+            continue
+        if active and n == last + 1:
+            last = n
+            out.append(line)
+            continue
+        if active:
+            new_n = last + 1
+            start, end = m.span("num")
+            out.append(line[:start] + str(new_n) + line[end:])
+            last = new_n
+            rewritten += 1
+            continue
+        # First enumerator in the whole doc and it isn't "1" — start
+        # tracking from whatever it is rather than force a baseless rewrite.
+        active, last = True, n
+        out.append(line)
+
+    return "\n".join(out), rewritten
+
+
 def _parse_json_object(text: str) -> Optional[Dict[str, Any]]:
     """Parse text expected to be a JSON object; return None on failure."""
     raw = _strip_code_fences(text)
@@ -6874,6 +6964,17 @@ OUTPUT FORMAT:
             )
             return session_state
 
+        # Deterministic numbering repair — translation is its own LLM pass
+        # over the full draft and can reintroduce a broken numbered sequence
+        # the same way the original render can (see _render_and_attach).
+        translated, _renumbered = _renumber_draft_markdown(translated)
+        if _renumbered:
+            logger.info(
+                "Renumbered {} paragraph enumerator(s) in the translated "
+                "draft to repair a broken sequence",
+                _renumbered,
+            )
+
         prev_version = int(session_state.get("current_draft_version") or 0)
         new_version = prev_version + 1
         prev_doc = session_state.get("last_draft_document") or {}
@@ -7949,6 +8050,22 @@ OUTPUT FORMAT:
                     _active_lang,
                     _tr_err,
                 )
+
+        # Deterministic numbering repair — runs LAST, after any
+        # re-translation, because translation is itself another LLM pass
+        # that can reintroduce the same reset-to-stale-boilerplate-numbers
+        # defect it would be fixing. This is the single point all
+        # render/revision/re-translation branches converge on before the
+        # markdown is shipped to draftDocument.content, exported to .docx,
+        # and cached as last_draft_markdown for the next revision's
+        # "previous draft" input.
+        markdown, _renumbered = _renumber_draft_markdown(markdown)
+        if _renumbered:
+            logger.info(
+                "Renumbered {} paragraph enumerator(s) to repair a broken "
+                "sequence in the rendered draft",
+                _renumbered,
+            )
 
         # Generate the .docx artifact, upload to GCS, and collect the
         # download URL. Any failure here is non-fatal — markdown still

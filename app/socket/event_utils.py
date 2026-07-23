@@ -43,6 +43,9 @@ __all__ = [
     '_strip_ui_truncated_tokens',
     'scrub_app_brand',
     '_coerce_analysis_text_list',
+    '_mint_item_id',
+    '_normalize_match_text',
+    'find_ungrounded_proper_nouns',
     '_strip_strength_point_statute_boilerplate',
     '_annexure_wording_for_next_steps',
     '_clamp_annexure_references',
@@ -345,6 +348,121 @@ def _coerce_analysis_text_list(items: Any) -> List[str]:
         if s:
             out.append(s)
     return out
+
+
+# Non-word runs collapsed to a single space when building a match key, so that
+# "S. 125 CrPC" and "Section 125 Cr.P.C." normalize toward the same shape.
+_MATCH_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _mint_item_id(section: str) -> str:
+    """Mint a stable server-side id for a NEW reconciled item.
+
+    Shape mirrors the frontend id scheme (e.g. ``missingInfo_ab12cd34ef56``):
+    the panel/section slug, an underscore, and 12 hex chars. Used for the four
+    analysis text sections (missingInfo/risks/weaknesses/relevantJurisdiction)
+    and for list-of-dates entries. Parties keep ``party_N`` and laws keep
+    ``law_N`` (their existing id schemes) — reconciliation only carries a prior
+    id / sets ``isMatched`` for those.
+    """
+    slug = (section or "item").strip() or "item"
+    return f"{slug}_{uuid.uuid4().hex[:12]}"
+
+
+def _normalize_match_text(text: Any) -> str:
+    """Deterministic first-pass match key: lowercase, strip punctuation, and
+    collapse whitespace. Two items with the same normalized key are treated as
+    the same content without needing an LLM call. Returns ``""`` for empties.
+    """
+    if not text:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    return _MATCH_NORMALIZE_RE.sub(" ", text.lower()).strip()
+
+
+# Generic legal / forum / connector / honorific tokens that are NOT distinctive
+# proper nouns. A multi-word Capitalised phrase is treated as a potential
+# fabrication only when, after removing these, it still carries a distinctive
+# token that appears in NONE of the allowed source texts.
+_GROUNDING_STOPWORDS = frozenset({
+    "the", "of", "and", "for", "at", "in", "to", "a", "an", "by", "on", "with",
+    "or", "high", "court", "supreme", "district", "sessions", "magistrate",
+    "family", "tribunal", "commission", "bench", "judicature", "civil",
+    "criminal", "side", "authority", "board", "association", "committee",
+    "panel", "council", "office", "bureau", "department", "ministry",
+    "government", "state", "union", "territory", "territories", "national",
+    "central", "regional", "hon", "ble", "honble", "honourable", "honorable",
+    "shri", "smt", "dr", "mr", "ms", "mrs", "secretary", "chairman",
+    "chairperson", "president", "convenor", "convener", "member", "members",
+    "officer", "general", "manager", "director", "act", "section", "article",
+    "annexure", "law", "india", "indian", "petitioner", "respondent",
+    "complainant", "accused", "applicant", "appellant", "plaintiff",
+    "defendant", "trust", "limited", "ltd", "pvt", "private", "company",
+    "corporation", "authority's", "writ", "petition", "case", "matter",
+})
+
+# A capitalised head word followed by 1+ more capitalised words (or the
+# lowercase connectors of/and/for/the/&/at), e.g. "Bihar Cricket Association",
+# "High Court of Judicature at Patna". Single capitalised words are never
+# flagged (too noisy / too risky).
+_PROPER_NOUN_CANDIDATE_RE = re.compile(
+    r"\b[A-Z][A-Za-z&./'-]+(?:\s+(?:of|and|for|the|&|at|[A-Z][A-Za-z&./'-]+)){1,6}"
+)
+_GROUNDING_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _grounding_token_set(*texts: str) -> set:
+    """Lowercase word-token set built from the allowed source texts."""
+    tokens: set = set()
+    for t in texts:
+        if t:
+            tokens.update(_GROUNDING_WORD_RE.findall(t.lower()))
+    return tokens
+
+
+def find_ungrounded_proper_nouns(
+    text: Any,
+    allowed_texts: Optional[List[str]] = None,
+    *,
+    max_results: int = 12,
+) -> List[str]:
+    """Return distinct multi-word proper-noun phrases in ``text`` that name an
+    entity / organisation / place absent from every allowed source text
+    (documents, extracted entities, the user's own instruction, case summaries).
+
+    Mirrors the document-grounding test used by ``snap_hallucinated_year``: a
+    phrase is flagged only when, after dropping generic legal / forum /
+    connector words, it still carries a distinctive token that appears in NONE
+    of the allowed texts. Conservative by design (multi-word phrases and
+    distinctive tokens only) so legitimate forum names and user-chosen venues
+    are not flagged. Used to TRIGGER a corrective re-prompt, not to delete text.
+    """
+    if not text or not isinstance(text, str):
+        return []
+    allowed = _grounding_token_set(*(allowed_texts or []))
+    if not allowed:
+        return []
+    flagged: List[str] = []
+    seen: set = set()
+    for m in _PROPER_NOUN_CANDIDATE_RE.finditer(text):
+        phrase = re.sub(r"\s+", " ", m.group(0)).strip(" .,;:'\"-")
+        key = phrase.lower()
+        if key in seen or len(phrase) < 4:
+            continue
+        distinctive = [
+            w for w in _GROUNDING_WORD_RE.findall(key)
+            if w not in _GROUNDING_STOPWORDS and len(w) > 2
+        ]
+        if not distinctive:
+            continue
+        # Flag when ANY distinctive token is absent from every allowed source.
+        if any(w not in allowed for w in distinctive):
+            seen.add(key)
+            flagged.append(phrase)
+        if len(flagged) >= max_results:
+            break
+    return flagged
 
 
 def _strip_strength_point_statute_boilerplate(text: str) -> str:

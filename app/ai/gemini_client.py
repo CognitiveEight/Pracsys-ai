@@ -26,6 +26,7 @@ except Exception:  # pragma: no cover - depends on installed deps
     genai_ng_types = None  # type: ignore
     _NG_SDK_AVAILABLE = False
 
+from app.ai.usage import record_usage
 from app.core.config import settings
 from app.observability.trace import tracer
 
@@ -173,6 +174,27 @@ class GeminiClient:
             )
         except Exception as exc:  # diagnostics must never break generation
             logger.debug("Gemini diagnostics logging failed: {}", exc)
+
+    @staticmethod
+    def _record_usage(response: Any) -> None:
+        """Report this response's token usage to the active capture scope.
+
+        Reads ``usage_metadata`` defensively (field names vary by SDK version /
+        model, mirroring ``_log_generation_diagnostics``) and folds thinking
+        tokens (``thoughts_token_count``) into output because Gemini bills them
+        as output. No-op when no ``capture_usage`` scope is open. Best-effort:
+        never raises, so it can be dropped into every generate path.
+        """
+        try:
+            usage = getattr(response, "usage_metadata", None)
+            if usage is None:
+                return
+            prompt_t = int(getattr(usage, "prompt_token_count", 0) or 0)
+            out_t = int(getattr(usage, "candidates_token_count", 0) or 0)
+            think_t = int(getattr(usage, "thoughts_token_count", 0) or 0)
+            record_usage(prompt_t, out_t + think_t)
+        except Exception as exc:  # usage tracking must never break generation
+            logger.debug("Gemini usage recording failed: {}", exc)
 
     @staticmethod
     def _safe_extract_text(response: Any) -> str:
@@ -334,6 +356,7 @@ class GeminiClient:
                     self._log_generation_diagnostics(
                         ng_response, label=f"{self.model_name}/ng"
                     )
+                    self._record_usage(ng_response)
                     result = self._safe_extract_text(ng_response)
                 except Exception as ng_err:
                     logger.warning(
@@ -369,6 +392,7 @@ class GeminiClient:
 
                 response = await asyncio.to_thread(_sync_generate)
                 self._log_generation_diagnostics(response, label=self.model_name)
+                self._record_usage(response)
                 result = self._safe_extract_text(response)
 
             # Global guardrail: when caller requests JSON mode, ensure we return valid JSON.
@@ -547,6 +571,7 @@ class GeminiClient:
             self._log_generation_diagnostics(
                 response, label=f"{self.model_name}/longform"
             )
+            self._record_usage(response)
             result = self._safe_extract_text(response)
             if not result:
                 # Empty (blocked / truncated-to-nothing) — fall back so the
@@ -597,6 +622,7 @@ class GeminiClient:
                 self._log_generation_diagnostics(
                     response, label=f"{self.model_name}/longform-cont{rounds}"
                 )
+                self._record_usage(response)
                 piece = self._safe_extract_text(response)
                 if not piece:
                     logger.warning(
@@ -737,6 +763,7 @@ class GeminiClient:
             self._log_generation_diagnostics(
                 response, label=f"{self.model_name}/grounded"
             )
+            self._record_usage(response)
             text = self._safe_extract_text(response) or ""
             sources = self._extract_grounding_sources(response)
             logger.info(

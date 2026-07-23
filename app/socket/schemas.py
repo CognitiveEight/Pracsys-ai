@@ -583,9 +583,26 @@ class AIResponseMetadata(BaseModel):
 
     messageId: Optional[str] = None  # Optional message identifier
     aiModel: Optional[str] = None  # AI model name (e.g., "gemini-pro")
-    tokensUsed: Optional[int] = None  # Number of tokens used
+    tokensUsed: Optional[int] = None  # Total tokens for THIS response (input+output)
     responseTime: Optional[float] = None  # Response time in milliseconds
     error: Optional[str] = None  # Error message if any
+
+    # --- Per-response token usage & cost (this response only) ---
+    # Thinking tokens are folded into outputTokens (Gemini bills them as output).
+    # Prices are USD, computed from the active model's rate (app/ai/pricing.py).
+    inputTokens: Optional[int] = None
+    outputTokens: Optional[int] = None
+    totalTokens: Optional[int] = None
+    inputPrice: Optional[float] = None
+    outputPrice: Optional[float] = None
+    price: Optional[float] = None  # inputPrice + outputPrice for this response
+
+    # --- Cumulative per-workspace totals (incremented on every response) ---
+    totalInputTokens: Optional[int] = None
+    totalOutputTokens: Optional[int] = None
+    totalInputPrice: Optional[float] = None
+    totalOutputPrice: Optional[float] = None
+    totalPrice: Optional[float] = None  # running total cost for the workspace
 
     # Additional fields for internal use (not in backend spec)
     confidence: Optional[str] = None

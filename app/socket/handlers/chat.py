@@ -115,6 +115,70 @@ from app.socket.event_utils import (
 class ChatMixin:
     """Intelligence chat, drafting-assistant chat, probing prompts."""
 
+    def _token_usage_metadata(
+        self, workspace_id: str, usage: Any
+    ) -> Dict[str, Any]:
+        """Build the token/price metadata fields for one ai_response.
+
+        Prices this turn's accumulated tokens with the active model's rate,
+        increments the workspace's cumulative totals (persisted to Qdrant), and
+        returns a dict merged into ``AIResponseMetadata``. Best-effort: returns
+        ``{}`` if anything fails so a pricing hiccup never blocks a response.
+        Call exactly once per emitted response (one ai_response per turn).
+        """
+        try:
+            from app.ai.pricing import price_for
+            from app.workspace.context import context_manager
+
+            input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+            output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+            model = settings.gemini_model
+            price = price_for(model, input_tokens, output_tokens)
+            total_tokens = input_tokens + output_tokens
+
+            fields: Dict[str, Any] = {
+                "inputTokens": input_tokens,
+                "outputTokens": output_tokens,
+                "totalTokens": total_tokens,
+                "tokensUsed": total_tokens,
+                "inputPrice": price["inputPrice"],
+                "outputPrice": price["outputPrice"],
+                "price": price["price"],
+            }
+
+            ctx = context_manager.get_context(workspace_id)
+            if ctx is not None:
+                already_counted = bool(getattr(usage, "counted", False))
+                if already_counted:
+                    # Second emit in the same turn — don't bill again; report the
+                    # totals as they already stand.
+                    totals = ctx.get_metadata("token_usage") or {}
+                else:
+                    totals = ctx.add_token_usage(input_tokens, output_tokens, price)
+                    try:
+                        usage.counted = True
+                    except Exception:
+                        pass
+                fields.update(
+                    {
+                        "totalInputTokens": totals.get("totalInputTokens", 0),
+                        "totalOutputTokens": totals.get("totalOutputTokens", 0),
+                        "totalInputPrice": totals.get("totalInputPrice", 0.0),
+                        "totalOutputPrice": totals.get("totalOutputPrice", 0.0),
+                        "totalPrice": totals.get("totalPrice", 0.0),
+                    }
+                )
+            else:
+                logger.debug(
+                    "No workspace context for {}; emitting per-response token "
+                    "usage without cumulative totals",
+                    workspace_id,
+                )
+            return fields
+        except Exception as exc:  # pricing must never break a response
+            logger.warning("Failed to build token usage metadata: {}", exc)
+            return {}
+
     async def _handle_drafting_assistant_message(
         self,
         *,
@@ -261,6 +325,8 @@ class ChatMixin:
             logger.error("Socket client unavailable; cannot emit drafting ai_response")
             return
 
+        from app.ai.usage import current_usage
+
         ai_response_payload: Dict[str, Any] = {
             "chatId": chat_id,
             "workspaceId": workspace_id,
@@ -275,6 +341,9 @@ class ChatMixin:
             "metadata": {
                 "messageId": chat_id,
                 "aiModel": settings.gemini_model,
+                # Per-response token/price + incremented workspace totals for
+                # this drafting turn (scope opened in on_user_message_request).
+                **self._token_usage_metadata(workspace_id, current_usage()),
             },
         }
         if ai_response_payload["draftDocument"] is None:
@@ -387,6 +456,14 @@ class ChatMixin:
         Args:
             data: User message request payload
         """
+        # Open a per-turn token-usage capture scope. Every GeminiClient.generate*
+        # call made while this is open (agent workflow, suggestion chips, role
+        # detection, drafting agent, …) accumulates here via ContextVar, and the
+        # single ai_response emitted for this turn reads the totals. Reset in the
+        # finally so the scope never leaks into another task/turn.
+        from app.ai.usage import begin_usage, current_usage, reset_usage
+
+        usage_token, _usage_acc = begin_usage()
         try:
             # Validate and parse payload
             payload = UserMessageRequestPayload(**data)
@@ -588,6 +665,9 @@ class ChatMixin:
                                 metadata=AIResponseMetadata(
                                     messageId=chat_id,
                                     aiModel=settings.gemini_model,
+                                    **self._token_usage_metadata(
+                                        workspace_id, current_usage()
+                                    ),
                                 ),
                             )
                             payload_dict = ai_response.dict(by_alias=True)
@@ -1845,7 +1925,6 @@ class ChatMixin:
                 metadata=AIResponseMetadata(
                     messageId=response.message_id,
                     aiModel=settings.gemini_model,
-                    tokensUsed=response.tokens_used,
                     responseTime=processing_time,
                     confidence=(
                         response.confidence.value
@@ -1853,6 +1932,9 @@ class ChatMixin:
                         else str(response.confidence)
                     ),
                     detectedIntent=response.detected_intent,
+                    # Per-response token/price + incremented workspace totals.
+                    # tokensUsed is set here too (total tokens for this response).
+                    **self._token_usage_metadata(workspace_id, current_usage()),
                 ),
                 suggestionChips=(
                     suggestion_chips_for_payload
@@ -1930,16 +2012,18 @@ class ChatMixin:
                 user_id = data.get("userId", "unknown")
 
                 if self._socket_client and chat_id:
+                    error_meta = AIResponseMetadata(
+                        messageId=chat_id,
+                        aiModel=settings.gemini_model,
+                        error=str(e),
+                        **self._token_usage_metadata(workspace_id, current_usage()),
+                    )
                     error_response = AIResponsePayload(
                         chatId=chat_id,
                         workspaceId=workspace_id,
                         userId=user_id,
                         content=f"I apologize, but I encountered an error processing your message: {str(e)}",
-                        metadata=AIResponseMetadata(
-                            messageId=chat_id,
-                            aiModel=settings.gemini_model,
-                            error=str(e),
-                        ),
+                        metadata=error_meta,
                     )
                     await self._socket_client.emit_ai_response(
                         error_response.dict(by_alias=True)
@@ -1947,6 +2031,12 @@ class ChatMixin:
                     logger.info("Error response sent to user")
             except Exception as emit_error:
                 logger.error(f"Failed to emit error response: {emit_error}")
+        finally:
+            # Always close the per-turn usage scope opened above.
+            try:
+                reset_usage(usage_token)
+            except Exception:
+                pass
 
     async def on_probing_prompts_request(self, data: Dict[str, Any]) -> None:
         """

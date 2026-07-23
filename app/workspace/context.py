@@ -159,6 +159,49 @@ class WorkspaceContext:
         logger.debug("Set metadata {} for workspace {}", key, self.workspace_id)
         self._persist_meta()
 
+    def add_token_usage(
+        self, input_tokens: int, output_tokens: int, price: Dict[str, float]
+    ) -> Dict[str, float]:
+        """Increment the workspace's cumulative token/price totals and persist.
+
+        Stores the running totals under ``metadata["token_usage"]`` so they ride
+        the existing WORKSPACE_META Qdrant cache (see ``to_cache_dict`` /
+        ``apply_cache_dict``) and survive an AI-service restart. ``price`` is the
+        per-response cost dict from ``app.ai.pricing.price_for`` (keys
+        ``inputPrice``, ``outputPrice``, ``price``).
+
+        Returns the updated cumulative snapshot:
+        ``totalInputTokens``, ``totalOutputTokens``, ``totalTokens``,
+        ``totalInputPrice``, ``totalOutputPrice``, ``totalPrice``.
+        """
+        in_tok = max(int(input_tokens or 0), 0)
+        out_tok = max(int(output_tokens or 0), 0)
+        in_price = float(price.get("inputPrice", 0.0) or 0.0)
+        out_price = float(price.get("outputPrice", 0.0) or 0.0)
+        total_price = float(price.get("price", in_price + out_price) or 0.0)
+
+        current = self.metadata.get("token_usage") or {}
+        totals = {
+            "totalInputTokens": int(current.get("totalInputTokens", 0) or 0) + in_tok,
+            "totalOutputTokens": int(current.get("totalOutputTokens", 0) or 0)
+            + out_tok,
+            "totalInputPrice": round(
+                float(current.get("totalInputPrice", 0.0) or 0.0) + in_price, 6
+            ),
+            "totalOutputPrice": round(
+                float(current.get("totalOutputPrice", 0.0) or 0.0) + out_price, 6
+            ),
+            "totalPrice": round(
+                float(current.get("totalPrice", 0.0) or 0.0) + total_price, 6
+            ),
+        }
+        totals["totalTokens"] = (
+            totals["totalInputTokens"] + totals["totalOutputTokens"]
+        )
+        # set_metadata persists the whole context (fire-and-forget to Qdrant).
+        self.set_metadata("token_usage", totals)
+        return totals
+
     def get_metadata(self, key: str, default: Any = None) -> Any:
         """
         Get metadata value.

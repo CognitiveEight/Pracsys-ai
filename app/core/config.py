@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     google_api_key: Optional[str] = None
     gemini_model: str = "gemini-2.5-flash"
 
+    # Token pricing overrides (USD per 1,000,000 tokens). When BOTH are set they
+    # take precedence over the built-in per-model table in app/ai/pricing.py, so
+    # ops can retune costs without a code change. Leave unset to price by model.
+    token_price_input_per_million: Optional[float] = None
+    token_price_output_per_million: Optional[float] = None
+
     # Google Cloud Platform
     google_application_credentials: Optional[str] = None
     # Separate service-account for Speech-to-Text V2 (Chirp 3) + audio GCS bucket.

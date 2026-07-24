@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -127,6 +128,7 @@ from app.prompts.analysis_report_prompts import (
 class AnalysisReportMixin:
     """Analysis report generation, scoring, feedback, and rejection memory."""
 
+    @meter_usage
     async def _regenerate_analysis_report_with_feedback(
         self,
         *,
@@ -236,14 +238,12 @@ class AnalysisReportMixin:
             self._workspace_analysis_payload[workspace_id] = edited
 
             if self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "analysis_report",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": edited,
-                    },
+                await self._emit_document_feature(
+                    feature_type="analysis_report",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=edited,
+                    usage=current_usage(),
                 )
                 logger.success(
                     "✅ Analysis report surgical edit emitted workspace={}",
@@ -2239,14 +2239,12 @@ Rules:
                             fallback_payload["timestamp"] = (
                                 datetime.utcnow().isoformat() + "Z"
                             )
-                            await self._socket_client.emit(
-                                "document_feature_response",
-                                {
-                                    "featureType": "analysis_report",
-                                    "workspaceId": workspace_id,
-                                    "userId": user_id,
-                                    "payload": fallback_payload,
-                                },
+                            await self._emit_document_feature(
+                                feature_type="analysis_report",
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                payload=fallback_payload,
+                                usage=None,
                             )
                             logger.info(
                                 "Cached analysis report emitted after no-emit refresh (workspace={})",
@@ -2263,14 +2261,12 @@ Rules:
                         fallback_payload["timestamp"] = (
                             datetime.utcnow().isoformat() + "Z"
                         )
-                        await self._socket_client.emit(
-                            "document_feature_response",
-                            {
-                                "featureType": "analysis_report",
-                                "workspaceId": workspace_id,
-                                "userId": user_id,
-                                "payload": fallback_payload,
-                            },
+                        await self._emit_document_feature(
+                            feature_type="analysis_report",
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            payload=fallback_payload,
+                            usage=None,
                         )
                         logger.info(
                             "Cached analysis report emitted after timeout (workspace={})",
@@ -2335,14 +2331,12 @@ Rules:
                 current_strategy["timestamp"] = datetime.utcnow().isoformat()
                 self._workspace_strategy_payload[workspace_id] = current_strategy
                 applied_any = True
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "strategy_objective",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": current_strategy,
-                    },
+                await self._emit_document_feature(
+                    feature_type="strategy_objective",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=current_strategy,
+                    usage=None,
                 )
                 response_parts.append("Strategy objective text updated")
 
@@ -2458,14 +2452,12 @@ Rules:
                 current_report["timestamp"] = datetime.utcnow().isoformat() + "Z"
 
                 self._workspace_analysis_payload[workspace_id] = current_report
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "analysis_report",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": current_report,
-                    },
+                await self._emit_document_feature(
+                    feature_type="analysis_report",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=current_report,
+                    usage=None,
                 )
                 applied_any = True
                 response_parts.append(
@@ -2821,6 +2813,7 @@ Rules:
                     exc,
                 )
 
+    @meter_usage
     async def _apply_batched_feedback(
         self, workspace_id: str, events: List[Dict[str, Any]]
     ) -> None:
@@ -2939,14 +2932,12 @@ Rules:
             report = await self._retag_analysis_report_safe(workspace_id, report)
             self._workspace_analysis_payload[workspace_id] = report
             if self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "analysis_report",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": report,
-                    },
+                await self._emit_document_feature(
+                    feature_type="analysis_report",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=report,
+                    usage=current_usage(),
                 )
             return
 
@@ -3036,14 +3027,12 @@ Rules:
         self._workspace_analysis_payload[workspace_id] = report
 
         if self._socket_client:
-            await self._socket_client.emit(
-                "document_feature_response",
-                {
-                    "featureType": "analysis_report",
-                    "workspaceId": workspace_id,
-                    "userId": user_id,
-                    "payload": report,
-                },
+            await self._emit_document_feature(
+                feature_type="analysis_report",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=report,
+                usage=current_usage(),
             )
             logger.success(
                 "✅ analysis_report_feedback batch applied: {} rejections, score {}% → {}% (delta +{})",
@@ -3220,6 +3209,7 @@ Rules:
             )
             return (False, 0, "")
 
+    @meter_usage
     async def on_added_missing_information(self, data: Dict[str, Any]) -> None:
         """
         Handle added_missing_information: user manually supplies title+description
@@ -3314,14 +3304,12 @@ Rules:
             report = await self._retag_analysis_report_safe(workspace_id, report)
             self._workspace_analysis_payload[workspace_id] = report
             if self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "analysis_report",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": report,
-                    },
+                await self._emit_document_feature(
+                    feature_type="analysis_report",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=report,
+                    usage=current_usage(),
                 )
                 logger.success(
                     "✅ added_missing_information no-op: re-emitted unchanged analysis_report (score stays at {}%)",
@@ -3413,14 +3401,12 @@ Rules:
         self._workspace_analysis_payload[workspace_id] = report
 
         if self._socket_client:
-            await self._socket_client.emit(
-                "document_feature_response",
-                {
-                    "featureType": "analysis_report",
-                    "workspaceId": workspace_id,
-                    "userId": user_id,
-                    "payload": report,
-                },
+            await self._emit_document_feature(
+                feature_type="analysis_report",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=report,
+                usage=current_usage(),
             )
             logger.success(
                 "✅ added_missing_information applied: score {}% → {}% (-{}), re-emitted analysis_report",

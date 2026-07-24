@@ -19,6 +19,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -470,6 +471,7 @@ class RelevantPartiesMixin:
                 party["isMatched"] = False
         return payload
 
+    @meter_usage
     async def _generate_and_emit_relevant_parties(
         self,
         workspace_id: str,
@@ -626,14 +628,12 @@ class RelevantPartiesMixin:
         )
         if not self._socket_client:
             return
-        await self._socket_client.emit(
-            "document_feature_response",
-            {
-                "featureType": "relevant_parties",
-                "workspaceId": workspace_id,
-                "userId": user_id,
-                "payload": payload,
-            },
+        await self._emit_document_feature(
+            feature_type="relevant_parties",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            payload=payload,
+            usage=current_usage(),
         )
         logger.success(
             "✅ Relevant parties sent to backend ({} parties)",

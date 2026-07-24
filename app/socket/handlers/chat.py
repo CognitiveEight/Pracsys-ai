@@ -179,6 +179,91 @@ class ChatMixin:
             logger.warning("Failed to build token usage metadata: {}", exc)
             return {}
 
+    def _cumulative_usage_metadata(self, workspace_id: str) -> Dict[str, Any]:
+        """Usage metadata for a RE-EMIT (no new LLM call this time).
+
+        Per-response fields are zero; cumulative fields report the workspace's
+        current running totals WITHOUT incrementing them (reconnect replay,
+        cached/no-op re-emit). Best-effort: returns ``{}`` if anything fails so a
+        re-emit is never blocked.
+        """
+        try:
+            from app.workspace.context import context_manager
+
+            fields: Dict[str, Any] = {
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "totalTokens": 0,
+                "tokensUsed": 0,
+                "inputPrice": 0.0,
+                "outputPrice": 0.0,
+                "price": 0.0,
+            }
+            ctx = context_manager.get_context(workspace_id)
+            if ctx is not None:
+                totals = ctx.get_metadata("token_usage") or {}
+                fields.update(
+                    {
+                        "totalInputTokens": totals.get("totalInputTokens", 0),
+                        "totalOutputTokens": totals.get("totalOutputTokens", 0),
+                        "totalInputPrice": totals.get("totalInputPrice", 0.0),
+                        "totalOutputPrice": totals.get("totalOutputPrice", 0.0),
+                        "totalPrice": totals.get("totalPrice", 0.0),
+                    }
+                )
+            return fields
+        except Exception as exc:
+            logger.warning("Failed to build cumulative usage metadata: {}", exc)
+            return {}
+
+    async def _emit_document_feature(
+        self,
+        *,
+        feature_type: str,
+        workspace_id: str,
+        user_id: str,
+        payload: Any,
+        usage: Any = None,
+    ) -> None:
+        """Emit a ``document_feature_response`` with a top-level token-usage metadata block.
+
+        ``usage`` is the ``capture_usage()`` accumulator for a FRESH generation —
+        its tokens are priced and the workspace cumulative is incremented exactly
+        once (guarded by the accumulator's ``counted`` flag). Pass ``usage=None``
+        for a re-emit (reconnect replay, cached / no-op re-emit): the block reports
+        per-response zeros plus the current cumulative, with no increment.
+
+        The metadata block uses the same field names as ``AIResponseMetadata`` so
+        the backend reads it identically to the chat ``ai_response`` contract.
+        Best-effort throughout: a pricing hiccup never blocks the emit.
+        """
+        if not self._socket_client:
+            return
+        try:
+            if usage is not None:
+                metadata = self._token_usage_metadata(workspace_id, usage)
+            else:
+                metadata = self._cumulative_usage_metadata(workspace_id)
+            if isinstance(metadata, dict) and metadata:
+                metadata.setdefault("aiModel", settings.gemini_model)
+        except Exception as exc:
+            logger.warning(
+                "Feature usage metadata build failed for {} (non-fatal): {}",
+                feature_type,
+                exc,
+            )
+            metadata = {}
+        await self._socket_client.emit(
+            "document_feature_response",
+            {
+                "featureType": feature_type,
+                "workspaceId": workspace_id,
+                "userId": user_id,
+                "payload": payload,
+                "metadata": metadata,
+            },
+        )
+
     async def _handle_drafting_assistant_message(
         self,
         *,
@@ -1011,6 +1096,146 @@ class ChatMixin:
                         classification = {}
 
                     if classification and not classification.get("isQuestionLike"):
+                        # ADVOCACY-ROLE REASSIGNMENT (Rule 13): the user corrected
+                        # WHICH named party holds a litigation role (e.g. "the
+                        # respondent is Pradeep Mehra" / "we represent X"). This is
+                        # NOT a cosmetic rename — the whole strategy must be
+                        # RE-ORIENTED to advocate for the correct party. Route the
+                        # objective through the full-regeneration path (which flips
+                        # advocacy) instead of the word-for-word surgical editor,
+                        # persist the mapping so later syncs keep it, and short-
+                        # circuit: the classifier already forced every panel
+                        # shouldEdit=false + isRename=false, so the surgical
+                        # dispatch below harmlessly no-ops.
+                        if (
+                            classification.get("isRoleReassignment")
+                            and (classification.get("reassignParty") or "").strip()
+                        ):
+                            _ws_role = (
+                                role_context.get("role") or "ADJUDICATOR"
+                            ).strip().upper()
+                            _reassign_role = (
+                                classification.get("reassignRole") or ""
+                            ).strip().upper()
+                            _reassign_party = (
+                                classification.get("reassignParty") or ""
+                            ).strip()
+                            # Only advocacy roles re-orient; ADJUDICATOR/MEDIATOR
+                            # are neutral and have no party to advocate for.
+                            if _ws_role in ("PETITIONER", "RESPONDENT"):
+                                _pet_side = {
+                                    "PETITIONER", "APPELLANT", "COMPLAINANT", "PLAINTIFF",
+                                }
+                                _res_side = {"RESPONDENT", "DEFENDANT"}
+                                _ws_side = (
+                                    _pet_side if _ws_role == "PETITIONER" else _res_side
+                                )
+                                # Did the user name OUR side (a confirmable party)
+                                # or the OPPOSING side?
+                                _names_our_side = (
+                                    _reassign_role in ("", "CLIENT")
+                                    or _reassign_role in _ws_side
+                                )
+                                _confirmed_party = (
+                                    _reassign_party if _names_our_side else None
+                                )
+                                if _confirmed_party:
+                                    _reorient_instr = (
+                                        f"The {_ws_role} in this matter is "
+                                        f"{_confirmed_party}. Re-orient the ENTIRE "
+                                        f"strategic objective, possible next steps and "
+                                        f"suggestion chips to advocate FOR "
+                                        f"{_confirmed_party} as the {_ws_role} in the "
+                                        f"live/dominant proceeding. Do NOT change any "
+                                        f"case facts — only change whose side the "
+                                        f"advocacy is written for."
+                                    )
+                                else:
+                                    _reorient_instr = (
+                                        f"{_reassign_party} is the "
+                                        f"{_reassign_role or 'opposing party'}. Therefore "
+                                        f"the {_ws_role} we represent is the party "
+                                        f"OPPOSING {_reassign_party}. Re-orient the "
+                                        f"ENTIRE strategic objective, possible next steps "
+                                        f"and suggestion chips to advocate FOR the "
+                                        f"{_ws_role} (the party opposing "
+                                        f"{_reassign_party}) in the live/dominant "
+                                        f"proceeding. Do NOT change any case facts."
+                                    )
+                                # Persist the confirmed role->party so later
+                                # regenerations (e.g. a document-upload sync) keep
+                                # advocating for the pinned party.
+                                if _confirmed_party:
+                                    try:
+                                        from app.workspace.context import (
+                                            context_manager as _cm,
+                                        )
+
+                                        _rctx = _cm.get_context(workspace_id)
+                                        if _rctx is not None:
+                                            _rctx.set_metadata(
+                                                "confirmed_role_party",
+                                                {
+                                                    "role": _ws_role,
+                                                    "party": _confirmed_party,
+                                                },
+                                            )
+                                            _rctx._persist_meta()
+                                    except Exception as _persist_err:
+                                        logger.warning(
+                                            "Persist confirmed role->party failed (non-fatal): {}",
+                                            _persist_err,
+                                        )
+                                _cur_strat_reassign = (
+                                    self._workspace_strategy_payload.get(workspace_id)
+                                    or cur_strat_for_edit
+                                )
+                                if isinstance(_cur_strat_reassign, dict) and (
+                                    _cur_strat_reassign.get("caseSummary") or ""
+                                ).strip():
+                                    await self._emit_workspace_refresh(
+                                        workspace_id=workspace_id,
+                                        user_id=user_id,
+                                        reason="objective_change_regeneration_started",
+                                        feature_types=[
+                                            "strategy_objective",
+                                            "analysis_report",
+                                            "list_of_dates",
+                                            "applicable_laws",
+                                            "procedural_timeline",
+                                            "drafting_assistant",
+                                        ],
+                                    )
+                                    _reassign_ok = await self._regenerate_strategy_objective_preserving_case_summary(
+                                        workspace_id=workspace_id,
+                                        user_id=user_id,
+                                        workspace_role=_ws_role,
+                                        user_objective_instruction=_reorient_instr,
+                                        current_strategy=_cur_strat_reassign,
+                                        confirmed_party=_confirmed_party,
+                                    )
+                                    if _reassign_ok:
+                                        objective_regen_ok = True
+                                        objective_ack_kind = "direct"
+                                        self._schedule_objective_change_reanalysis(
+                                            workspace_id=workspace_id,
+                                            user_id=user_id,
+                                            log_context=(
+                                                " (role reassignment re-orientation)"
+                                            ),
+                                        )
+                                        logger.success(
+                                            "✅ Role reassignment re-oriented objective: {}={} (workspace={})",
+                                            _ws_role,
+                                            _confirmed_party
+                                            or f"opposing {_reassign_party}",
+                                            workspace_id[:12] if workspace_id else "",
+                                        )
+                                    else:
+                                        logger.warning(
+                                            "Role reassignment re-orientation returned False (workspace={})",
+                                            workspace_id[:12] if workspace_id else "",
+                                        )
                         # WORKSPACE-WIDE RENAME: a name change must replace the
                         # party's name in the EXISTING content of EVERY panel
                         # (no regeneration). Don't rely on the LLM flagging each
@@ -1319,18 +1544,16 @@ class ChatMixin:
                                     )
                                     if not isinstance(_preserved_lod, list):
                                         _preserved_lod = []
-                                    await self._socket_client.emit(
-                                        "document_feature_response",
-                                        {
-                                            "featureType": "list_of_dates",
+                                    await self._emit_document_feature(
+                                        feature_type="list_of_dates",
+                                        workspace_id=workspace_id,
+                                        user_id=user_id,
+                                        payload={
                                             "workspaceId": workspace_id,
                                             "userId": user_id,
-                                            "payload": {
-                                                "workspaceId": workspace_id,
-                                                "userId": user_id,
-                                                "listOfDates": _preserved_lod,
-                                            },
+                                            "listOfDates": _preserved_lod,
                                         },
+                                        usage=None,
                                     )
                                     logger.success(
                                         "✅ Rename: preserved list_of_dates re-emitted (no-op edit) workspace={}",
@@ -1345,14 +1568,12 @@ class ChatMixin:
                                     )
                                     if not isinstance(_preserved_laws, dict):
                                         _preserved_laws = {}
-                                    await self._socket_client.emit(
-                                        "document_feature_response",
-                                        {
-                                            "featureType": "applicable_laws",
-                                            "workspaceId": workspace_id,
-                                            "userId": user_id,
-                                            "payload": _preserved_laws,
-                                        },
+                                    await self._emit_document_feature(
+                                        feature_type="applicable_laws",
+                                        workspace_id=workspace_id,
+                                        user_id=user_id,
+                                        payload=_preserved_laws,
+                                        usage=None,
                                     )
                                     logger.success(
                                         "✅ Rename: preserved applicable_laws re-emitted (no-op edit) workspace={}",
@@ -1367,16 +1588,14 @@ class ChatMixin:
                                     )
                                     if not isinstance(_preserved_timeline, list):
                                         _preserved_timeline = []
-                                    await self._socket_client.emit(
-                                        "document_feature_response",
-                                        {
-                                            "featureType": "procedural_timeline",
-                                            "workspaceId": workspace_id,
-                                            "userId": user_id,
-                                            "payload": {
-                                                "proceduralTimeline": _preserved_timeline
-                                            },
+                                    await self._emit_document_feature(
+                                        feature_type="procedural_timeline",
+                                        workspace_id=workspace_id,
+                                        user_id=user_id,
+                                        payload={
+                                            "proceduralTimeline": _preserved_timeline
                                         },
+                                        usage=None,
                                     )
                                     logger.success(
                                         "✅ Rename: preserved procedural_timeline re-emitted (no-op edit) workspace={}",
@@ -1408,14 +1627,12 @@ class ChatMixin:
                                 workspace_id
                             )
                             if isinstance(_final_strategy, dict) and _final_strategy:
-                                await self._socket_client.emit(
-                                    "document_feature_response",
-                                    {
-                                        "featureType": "strategy_objective",
-                                        "workspaceId": workspace_id,
-                                        "userId": user_id,
-                                        "payload": _final_strategy,
-                                    },
+                                await self._emit_document_feature(
+                                    feature_type="strategy_objective",
+                                    workspace_id=workspace_id,
+                                    user_id=user_id,
+                                    payload=_final_strategy,
+                                    usage=None,
                                 )
                                 logger.success(
                                     "✅ Strategy panel emitted once after edits {} (workspace={})",

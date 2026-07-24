@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -121,6 +122,7 @@ from app.prompts.applicable_laws_prompts import (
 class ApplicableLawsMixin:
     """Applicable laws (acts/sections) generation and feedback."""
 
+    @meter_usage
     async def _regenerate_applicable_laws_with_feedback(
         self,
         *,
@@ -191,14 +193,12 @@ class ApplicableLawsMixin:
             self._workspace_applicable_laws_payload[workspace_id] = edited
 
             if emit_result and self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "applicable_laws",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": edited,
-                    },
+                await self._emit_document_feature(
+                    feature_type="applicable_laws",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=edited,
+                    usage=current_usage(),
                 )
                 logger.success(
                     "✅ Applicable laws name edit emitted workspace={}",
@@ -618,6 +618,7 @@ class ApplicableLawsMixin:
                 law["isMatched"] = self._law_signature(law) in prev_sigs
         return payload
 
+    @meter_usage
     async def _generate_and_emit_applicable_laws(
         self,
         workspace_id: str,
@@ -680,14 +681,12 @@ class ApplicableLawsMixin:
         self._workspace_applicable_laws_payload[workspace_id] = payload
         if not self._socket_client:
             return
-        await self._socket_client.emit(
-            "document_feature_response",
-            {
-                "featureType": "applicable_laws",
-                "workspaceId": workspace_id,
-                "userId": user_id,
-                "payload": payload,
-            },
+        await self._emit_document_feature(
+            feature_type="applicable_laws",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            payload=payload,
+            usage=current_usage(),
         )
         logger.success(
             "✅ Applicable laws sent to backend ({} laws)",

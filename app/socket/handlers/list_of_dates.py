@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -123,6 +124,7 @@ from app.prompts.list_of_dates_prompts import (
 class ListOfDatesMixin:
     """List of Dates (chronology) generation and feedback."""
 
+    @meter_usage
     async def _regenerate_list_of_dates_with_feedback(
         self,
         *,
@@ -197,18 +199,16 @@ class ListOfDatesMixin:
             self._workspace_list_of_dates_payload[workspace_id] = edited
 
             if emit_result and self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "list_of_dates",
+                await self._emit_document_feature(
+                    feature_type="list_of_dates",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload={
                         "workspaceId": workspace_id,
                         "userId": user_id,
-                        "payload": {
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "listOfDates": edited,
-                        },
+                        "listOfDates": edited,
                     },
+                    usage=current_usage(),
                 )
                 logger.success(
                     "✅ List of dates name edit emitted workspace={}",
@@ -219,6 +219,7 @@ class ListOfDatesMixin:
             logger.warning("List of dates name edit failed: {}", e)
             return False
 
+    @meter_usage
     async def _reeval_list_of_dates_relevance(
         self,
         *,
@@ -293,18 +294,16 @@ class ListOfDatesMixin:
             self._workspace_list_of_dates_payload[workspace_id] = edited
 
             if emit_result and self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "list_of_dates",
+                await self._emit_document_feature(
+                    feature_type="list_of_dates",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload={
                         "workspaceId": workspace_id,
                         "userId": user_id,
-                        "payload": {
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "listOfDates": edited,
-                        },
+                        "listOfDates": edited,
                     },
+                    usage=current_usage(),
                 )
                 logger.success(
                     "✅ List of dates relevance re-evaluated for new objective workspace={}",
@@ -1295,6 +1294,7 @@ class ListOfDatesMixin:
                 e["isMatched"] = False
         return entries
 
+    @meter_usage
     async def _generate_and_emit_list_of_dates(
         self,
         workspace_id: str,
@@ -1374,14 +1374,12 @@ class ListOfDatesMixin:
                 "userId": user_id,
                 "listOfDates": prior_fast,
             }
-            await self._socket_client.emit(
-                "document_feature_response",
-                {
-                    "featureType": "list_of_dates",
-                    "workspaceId": workspace_id,
-                    "userId": user_id,
-                    "payload": payload_fast,
-                },
+            await self._emit_document_feature(
+                feature_type="list_of_dates",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=payload_fast,
+                usage=current_usage(),
             )
             logger.success(
                 "✅ List of dates filtered+emitted after deletion (no LLM regen): "
@@ -1496,14 +1494,12 @@ class ListOfDatesMixin:
             "userId": user_id,
             "listOfDates": list_of_dates,
         }
-        await self._socket_client.emit(
-            "document_feature_response",
-            {
-                "featureType": "list_of_dates",
-                "workspaceId": workspace_id,
-                "userId": user_id,
-                "payload": payload,
-            },
+        await self._emit_document_feature(
+            feature_type="list_of_dates",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            payload=payload,
+            usage=current_usage(),
         )
         logger.success(
             "✅ List of dates sent to backend ({} entries)", len(list_of_dates)

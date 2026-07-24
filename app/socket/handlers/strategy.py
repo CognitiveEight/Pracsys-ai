@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -351,8 +352,14 @@ class StrategyMixin:
                     )
                 except Exception:
                     _entities_block = "{}"
-                # Improved prompt for better JSON generation
-                structured_prompt = generate_strategies_from_documents_prompt2(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, _entities_block=_entities_block, annexure_limit_block=annexure_limit_block, combined_document_content=combined_document_content, strategy_inventory=strategy_inventory, workspace_role=workspace_role, current_year=current_year, today_str=today_str)
+                # Improved prompt for better JSON generation. Inject any
+                # user-confirmed role->party anchor so a later regeneration
+                # (e.g. after a document-upload sync) keeps advocating for the
+                # party the user pinned via chat, instead of re-guessing.
+                _confirmed_party = self._resolve_confirmed_role_party(
+                    workspace_id, (workspace_role or "").strip().upper()
+                )
+                structured_prompt = generate_strategies_from_documents_prompt2(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, _entities_block=_entities_block, annexure_limit_block=annexure_limit_block, combined_document_content=combined_document_content, strategy_inventory=strategy_inventory, workspace_role=workspace_role, current_year=current_year, today_str=today_str, confirmed_party=_confirmed_party)
                 custom_suffix = build_custom_instruction_suffix(workspace_id)
                 if custom_suffix:
                     structured_prompt = (
@@ -1232,6 +1239,38 @@ class StrategyMixin:
             return None
         return raw
 
+    def _resolve_confirmed_role_party(
+        self,
+        workspace_id: str,
+        role: str,
+        *,
+        explicit: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the user-confirmed named party for ``role`` in this workspace.
+
+        Prefers an explicit value; otherwise reads the ``confirmed_role_party``
+        mapping persisted in the workspace context metadata (set on a
+        role-reassignment). Only returns a party when its stored role matches the
+        role we are generating for, so a stale mapping for a different role never
+        leaks in.
+        """
+        if explicit and str(explicit).strip():
+            return str(explicit).strip()
+        try:
+            from app.workspace.context import context_manager
+
+            ctx = context_manager.get_context(workspace_id)
+            crp = (getattr(ctx, "metadata", None) or {}).get("confirmed_role_party")
+            if isinstance(crp, dict):
+                stored_role = str(crp.get("role") or "").strip().upper()
+                stored_party = str(crp.get("party") or "").strip()
+                if stored_role == (role or "").strip().upper() and stored_party:
+                    return stored_party
+        except Exception:
+            pass
+        return None
+
+    @meter_usage
     async def _regenerate_strategy_objective_preserving_case_summary(
         self,
         workspace_id: str,
@@ -1239,10 +1278,16 @@ class StrategyMixin:
         workspace_role: str,
         user_objective_instruction: str,
         current_strategy: Dict[str, Any],
+        confirmed_party: Optional[str] = None,
     ) -> bool:
         """
         Regenerate strategicObjective, possibleNextSteps, and suggestionChips from the user's new
         objective instruction. Keeps caseSummary and reportCaseSummary unchanged; emits strategy_objective.
+
+        ``confirmed_party`` is the user-confirmed named party who holds the workspace role
+        (from a role-reassignment). When set, it is injected as an authoritative anchor so the
+        regenerated objective advocates for that specific party. Falls back to the party persisted
+        in the workspace context metadata when not explicitly passed.
         """
         try:
             from app.ai.gemini_client import gemini_client
@@ -1309,6 +1354,9 @@ class StrategyMixin:
             role = (workspace_role or "ADJUDICATOR").strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
                 role = "ADJUDICATOR"
+            confirmed_party = self._resolve_confirmed_role_party(
+                workspace_id, role, explicit=confirmed_party
+            )
 
             # Extracted-entities allow-list (cached; cheap) — the only bodies/
             # parties/places the regenerated objective may name. Grounds the
@@ -1328,7 +1376,7 @@ class StrategyMixin:
             except Exception:
                 entities_block = "{}"
 
-            prompt = regenerate_strategy_objective_preserving_case_summary_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, case_summary=case_summary, combined_document_content=combined_document_content, current_strategy=current_strategy, report_case_summary=report_case_summary, role=role, user_objective_instruction=user_objective_instruction, entities_block=entities_block)
+            prompt = regenerate_strategy_objective_preserving_case_summary_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, case_summary=case_summary, combined_document_content=combined_document_content, current_strategy=current_strategy, report_case_summary=report_case_summary, role=role, user_objective_instruction=user_objective_instruction, entities_block=entities_block, confirmed_party=confirmed_party)
 
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
@@ -1497,14 +1545,12 @@ class StrategyMixin:
             self._last_workspace_id_with_chips = workspace_id
 
             if self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "strategy_objective",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": merged,
-                    },
+                await self._emit_document_feature(
+                    feature_type="strategy_objective",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=merged,
+                    usage=current_usage(),
                 )
                 logger.success(
                     "✅ Strategy objective regen emitted (case summary preserved) workspace={}",
@@ -1515,6 +1561,7 @@ class StrategyMixin:
             logger.warning("Strategy objective regen failed: {}", e)
             return False
 
+    @meter_usage
     async def _regenerate_case_summary_with_feedback(
         self,
         *,
@@ -1646,14 +1693,12 @@ class StrategyMixin:
             self._workspace_strategy_payload[workspace_id] = merged
 
             if emit_result and self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "strategy_objective",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": merged,
-                    },
+                await self._emit_document_feature(
+                    feature_type="strategy_objective",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=merged,
+                    usage=current_usage(),
                 )
                 logger.success(
                     "✅ Case summary regen emitted (other fields preserved) workspace={}",
@@ -1664,6 +1709,7 @@ class StrategyMixin:
             logger.warning("Case summary regen failed: {}", e)
             return False
 
+    @meter_usage
     async def _regenerate_next_steps_with_feedback(
         self,
         *,
@@ -1776,14 +1822,12 @@ class StrategyMixin:
             self._last_workspace_id_with_chips = workspace_id
 
             if emit_result and self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "strategy_objective",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": merged,
-                    },
+                await self._emit_document_feature(
+                    feature_type="strategy_objective",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=merged,
+                    usage=current_usage(),
                 )
                 logger.success(
                     "✅ Possible next steps regen emitted (other fields preserved) workspace={}",
@@ -1794,6 +1838,7 @@ class StrategyMixin:
             logger.warning("Possible next steps regen failed: {}", e)
             return False
 
+    @meter_usage
     async def _regenerate_strategic_objective_with_feedback(
         self,
         *,
@@ -1882,14 +1927,12 @@ class StrategyMixin:
             self._workspace_strategy_payload[workspace_id] = merged
 
             if emit_result and self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "strategy_objective",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": merged,
-                    },
+                await self._emit_document_feature(
+                    feature_type="strategy_objective",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=merged,
+                    usage=current_usage(),
                 )
                 logger.success(
                     "✅ Strategic objective surgical edit emitted (other fields preserved) workspace={}",
@@ -2265,6 +2308,9 @@ class StrategyMixin:
             "analysisReport": {"shouldEdit": False, "instruction": ""},
             "listOfDates": {"shouldEdit": False, "instruction": ""},
             "isRename": False,
+            "isRoleReassignment": False,
+            "reassignRole": "",
+            "reassignParty": "",
             "isQuestionLike": False,
         }
         msg = (user_message or "").strip()
@@ -2340,8 +2386,30 @@ class StrategyMixin:
                 "analysisReport": _slot("analysisReport"),
                 "listOfDates": _slot("listOfDates"),
                 "isRename": bool(data.get("isRename") is True),
+                "isRoleReassignment": bool(data.get("isRoleReassignment") is True),
+                "reassignRole": str(data.get("reassignRole") or "").strip().upper(),
+                "reassignParty": str(data.get("reassignParty") or "").strip(),
                 "isQuestionLike": bool(data.get("isQuestionLike") is True),
             }
+            # A role reassignment re-orients advocacy via a dedicated flow — it is
+            # never a cosmetic rename and never a surgical per-panel edit. Enforce
+            # that here so a stray classifier flag can't double-dispatch.
+            if result["isRoleReassignment"] and result["reassignParty"]:
+                result["isRename"] = False
+                for k in (
+                    "caseSummary",
+                    "reportCaseSummary",
+                    "strategicObjective",
+                    "possibleNextSteps",
+                    "analysisReport",
+                    "listOfDates",
+                ):
+                    result[k] = {"shouldEdit": False, "instruction": ""}
+            else:
+                # Guard against a partial classification (flag set, party missing).
+                result["isRoleReassignment"] = False
+                result["reassignRole"] = ""
+                result["reassignParty"] = ""
             # If the model marked it as a question AND also flagged an edit,
             # trust the question signal and drop the edit flags — safer
             # default for "explain X" / "what about X" style messages.
@@ -2356,9 +2424,12 @@ class StrategyMixin:
                 ):
                     result[k] = {"shouldEdit": False, "instruction": ""}
             logger.info(
-                "Panel-edit classifier: msg_len={} isQuestion={} caseSummary={} reportCaseSummary={} strategicObjective={} possibleNextSteps={} analysisReport={} listOfDates={}",
+                "Panel-edit classifier: msg_len={} isQuestion={} isRoleReassignment={} reassign={}:{} caseSummary={} reportCaseSummary={} strategicObjective={} possibleNextSteps={} analysisReport={} listOfDates={}",
                 len(msg),
                 result["isQuestionLike"],
+                result["isRoleReassignment"],
+                result["reassignRole"] or "-",
+                result["reassignParty"] or "-",
                 "yes" if result["caseSummary"]["shouldEdit"] else "no",
                 "yes" if result["reportCaseSummary"]["shouldEdit"] else "no",
                 "yes" if result["strategicObjective"]["shouldEdit"] else "no",

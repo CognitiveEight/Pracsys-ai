@@ -838,6 +838,7 @@ class GeminiClient:
 
             response = await asyncio.to_thread(_sync_chat)
 
+            self._record_usage(response)
             result = self._safe_extract_text(response)
 
             logger.success("✅ Chat response: {} characters", len(result))

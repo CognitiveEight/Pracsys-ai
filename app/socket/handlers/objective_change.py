@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import capture_usage, current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -314,14 +315,12 @@ class ObjectiveChangeMixin:
                     workspace_id
                 ) or {"caseLaws": []}
                 try:
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "case_laws",
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "payload": fallback,
-                        },
+                    await self._emit_document_feature(
+                        feature_type="case_laws",
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        payload=fallback,
+                        usage=None,
                     )
                 except Exception as emit_err:
                     logger.warning(
@@ -1712,13 +1711,14 @@ class ObjectiveChangeMixin:
         # fully objective-aligned report with a fresh score and no carryover.
         # (`_merge_analysis_report_with_previous` is unchanged and still used by
         # the document re-upload / sync paths, where incremental merge is correct.)
-        new_analysis = await self._generate_analysis_report_from_documents(
-            workspace_id=workspace_id,
-            user_id=user_id,
-            workspace_role=workspace_role,
-            batch_result=None,
-            is_update=False,
-        )
+        with capture_usage() as _u_obj_analysis:
+            new_analysis = await self._generate_analysis_report_from_documents(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+                batch_result=None,
+                is_update=False,
+            )
         if not (isinstance(new_analysis, dict) and new_analysis):
             new_analysis = self._analysis_report_fallback(
                 (workspace_role or "ADJUDICATOR").strip().upper()
@@ -1743,14 +1743,12 @@ class ObjectiveChangeMixin:
 
         self._workspace_analysis_payload[workspace_id] = new_analysis
         if self._socket_client:
-            await self._socket_client.emit(
-                "document_feature_response",
-                {
-                    "featureType": "analysis_report",
-                    "workspaceId": workspace_id,
-                    "userId": user_id,
-                    "payload": new_analysis,
-                },
+            await self._emit_document_feature(
+                feature_type="analysis_report",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=new_analysis,
+                usage=_u_obj_analysis,
             )
             logger.success(
                 "✅ Objective-change analysis update emitted "
@@ -1795,18 +1793,16 @@ class ObjectiveChangeMixin:
                 preserved_dates = []
             self._workspace_list_of_dates_payload[workspace_id] = preserved_dates
             if self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "list_of_dates",
+                await self._emit_document_feature(
+                    feature_type="list_of_dates",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload={
                         "workspaceId": workspace_id,
                         "userId": user_id,
-                        "payload": {
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "listOfDates": preserved_dates,
-                        },
+                        "listOfDates": preserved_dates,
                     },
+                    usage=None,
                 )
                 logger.success(
                     "✅ Objective-change list_of_dates preserved (relevance re-eval skipped){}",
@@ -1840,14 +1836,12 @@ class ObjectiveChangeMixin:
                 preserved_laws = {}
             self._workspace_applicable_laws_payload[workspace_id] = preserved_laws
             if self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "applicable_laws",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": preserved_laws,
-                    },
+                await self._emit_document_feature(
+                    feature_type="applicable_laws",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=preserved_laws,
+                    usage=None,
                 )
                 logger.success(
                     "✅ Objective-change applicable_laws preserved (regeneration skipped){}",
@@ -1866,14 +1860,12 @@ class ObjectiveChangeMixin:
             preserved_timeline = []
         self._workspace_procedural_timeline_payload[workspace_id] = preserved_timeline
         if self._socket_client:
-            await self._socket_client.emit(
-                "document_feature_response",
-                {
-                    "featureType": "procedural_timeline",
-                    "workspaceId": workspace_id,
-                    "userId": user_id,
-                    "payload": {"proceduralTimeline": preserved_timeline},
-                },
+            await self._emit_document_feature(
+                feature_type="procedural_timeline",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload={"proceduralTimeline": preserved_timeline},
+                usage=None,
             )
             logger.success(
                 "✅ Objective-change preserved procedural_timeline re-emitted{}",
@@ -2009,23 +2001,26 @@ class ObjectiveChangeMixin:
 
         logger.info("Using workspace role for background AI pipeline: {}", role)
         try:
-            strategies_result = await self._generate_strategies_from_documents(
-                workspace_id=workspace_id,
-                user_id=user_id,
-                workspace_role=role,
-                batch_result=batch_result,
-                is_update=is_update,
-            )
+            # Meter this feature in its own scope: _generate_strategies_from_documents
+            # does not self-emit (the pipeline emits below), so capture its tokens
+            # here and hand the accumulator to the emit. The accumulator object
+            # survives after the scope closes, so the emit still reads the totals.
+            with capture_usage() as _u_strategy:
+                strategies_result = await self._generate_strategies_from_documents(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=role,
+                    batch_result=batch_result,
+                    is_update=is_update,
+                )
             if strategies_result and self._socket_client:
                 logger.success("✅ Strategies generated (background), emitting...")
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "strategy_objective",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": strategies_result,
-                    },
+                await self._emit_document_feature(
+                    feature_type="strategy_objective",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=strategies_result,
+                    usage=_u_strategy,
                 )
                 self._workspace_strategy_payload[workspace_id] = strategies_result
                 chips = strategies_result.get("suggestionChips") or []
@@ -2111,6 +2106,7 @@ class ObjectiveChangeMixin:
         except RuntimeError as e:
             logger.error("Could not schedule strategy/analysis pipeline: {}", e)
 
+    @meter_usage
     async def _emit_analysis_report(
         self,
         workspace_id: str,
@@ -2190,14 +2186,12 @@ class ObjectiveChangeMixin:
         self._workspace_analysis_payload[workspace_id] = analysis_report
         self._pending_reemit_workspace_id = workspace_id
         self._pending_reemit_user_id = user_id
-        await self._socket_client.emit(
-            "document_feature_response",
-            {
-                "featureType": "analysis_report",
-                "workspaceId": workspace_id,
-                "userId": user_id,
-                "payload": analysis_report,
-            },
+        await self._emit_document_feature(
+            feature_type="analysis_report",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            payload=analysis_report,
+            usage=current_usage(),
         )
         logger.success("✅ Analysis report sent to backend{}", log_context)
         # Brief yield so the socket can flush before caller continues (reduces risk of disconnect before delivery)
@@ -2243,6 +2237,7 @@ class ObjectiveChangeMixin:
             )
         return True
 
+    @meter_usage
     async def _generate_and_emit_analysis_report_for_sync(
         self,
         workspace_id: str,
@@ -2277,14 +2272,12 @@ class ObjectiveChangeMixin:
                     log_context=" (sync)",
                 )
             if self._socket_client and analysis_report:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "analysis_report",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": analysis_report,
-                    },
+                await self._emit_document_feature(
+                    feature_type="analysis_report",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=analysis_report,
+                    usage=current_usage(),
                 )
                 self._workspace_analysis_payload[workspace_id] = analysis_report
                 logger.success("✅ Analysis report sent to backend (sync)")
@@ -2307,14 +2300,12 @@ class ObjectiveChangeMixin:
                     (workspace_role or "ADJUDICATOR").strip().upper()
                 )
                 if self._socket_client:
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "analysis_report",
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "payload": fallback,
-                        },
+                    await self._emit_document_feature(
+                        feature_type="analysis_report",
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        payload=fallback,
+                        usage=current_usage(),
                     )
                     self._workspace_analysis_payload[workspace_id] = fallback
                     logger.success(

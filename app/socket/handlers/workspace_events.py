@@ -19,6 +19,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import capture_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -166,6 +167,7 @@ class WorkspaceEventsMixin:
                 )
             doc_assess = self._workspace_document_assessments_payload.get(workspace_id)
             if doc_assess:
+                doc_assess["metadata"] = self._cumulative_usage_metadata(workspace_id)
                 await self._socket_client.emit(
                     "document_feature_response",
                     doc_assess,
@@ -177,6 +179,7 @@ class WorkspaceEventsMixin:
             # 2) Workspace metadata (if available)
             metadata = self._workspace_metadata_payload.get(workspace_id)
             if metadata:
+                metadata["metadata"] = self._cumulative_usage_metadata(workspace_id)
                 await self._socket_client.emit(
                     "document_feature_response",
                     metadata,
@@ -188,28 +191,24 @@ class WorkspaceEventsMixin:
             # 3) Strategy & objectives
             strategies_result = self._workspace_strategy_payload.get(workspace_id)
             if strategies_result:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "strategy_objective",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": strategies_result,
-                    },
+                await self._emit_document_feature(
+                    feature_type="strategy_objective",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=strategies_result,
+                    usage=None,
                 )
                 logger.success("✅ Strategy re-emitted to backend after reconnect")
                 await asyncio.sleep(0.2)
             # 4) Analysis report
             analysis_report = self._workspace_analysis_payload.get(workspace_id)
             if analysis_report:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "analysis_report",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": analysis_report,
-                    },
+                await self._emit_document_feature(
+                    feature_type="analysis_report",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=analysis_report,
+                    usage=None,
                 )
                 logger.success(
                     "✅ Analysis report re-emitted to backend after reconnect"
@@ -217,18 +216,16 @@ class WorkspaceEventsMixin:
             # 5) List of dates timeline
             list_of_dates = self._workspace_list_of_dates_payload.get(workspace_id)
             if list_of_dates is not None:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "list_of_dates",
+                await self._emit_document_feature(
+                    feature_type="list_of_dates",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload={
                         "workspaceId": workspace_id,
                         "userId": user_id,
-                        "payload": {
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "listOfDates": list_of_dates,
-                        },
+                        "listOfDates": list_of_dates,
                     },
+                    usage=None,
                 )
                 logger.success("✅ List of dates re-emitted to backend after reconnect")
                 self._log_list_of_dates_outbound(
@@ -240,14 +237,12 @@ class WorkspaceEventsMixin:
             # 6) Applicable laws
             applicable_laws = self._workspace_applicable_laws_payload.get(workspace_id)
             if applicable_laws is not None:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "applicable_laws",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": applicable_laws,
-                    },
+                await self._emit_document_feature(
+                    feature_type="applicable_laws",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=applicable_laws,
+                    usage=None,
                 )
                 logger.success(
                     "✅ Applicable laws re-emitted to backend after reconnect"
@@ -255,14 +250,12 @@ class WorkspaceEventsMixin:
             # 7) Procedural timeline (product order: timeline → parties → case laws)
             procedural_timeline = self._workspace_procedural_timeline_payload.get(workspace_id)
             if procedural_timeline is not None:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "procedural_timeline",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": {"proceduralTimeline": procedural_timeline},
-                    },
+                await self._emit_document_feature(
+                    feature_type="procedural_timeline",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload={"proceduralTimeline": procedural_timeline},
+                    usage=None,
                 )
                 logger.success(
                     "✅ Procedural timeline re-emitted to backend after reconnect"
@@ -270,14 +263,12 @@ class WorkspaceEventsMixin:
             # 8) Relevant parties
             relevant_parties = self._workspace_relevant_parties_payload.get(workspace_id)
             if relevant_parties is not None:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "relevant_parties",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": relevant_parties,
-                    },
+                await self._emit_document_feature(
+                    feature_type="relevant_parties",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=relevant_parties,
+                    usage=None,
                 )
                 logger.success(
                     "✅ Relevant parties re-emitted to backend after reconnect"
@@ -285,14 +276,12 @@ class WorkspaceEventsMixin:
             # 9) Case laws
             case_laws = self._workspace_case_laws_payload.get(workspace_id)
             if case_laws is not None:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "case_laws",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": case_laws,
-                    },
+                await self._emit_document_feature(
+                    feature_type="case_laws",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=case_laws,
+                    usage=None,
                 )
                 logger.success(
                     "✅ Case laws re-emitted to backend after reconnect"
@@ -302,14 +291,12 @@ class WorkspaceEventsMixin:
             if drafting_payload is not None:
                 # Cache holds the internal card shape; serialize to the
                 # matches/matchPercent wire contract on re-emit.
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "drafting_assistant",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": drafting_payload_to_wire(drafting_payload),
-                    },
+                await self._emit_document_feature(
+                    feature_type="drafting_assistant",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=drafting_payload_to_wire(drafting_payload),
+                    usage=None,
                 )
                 logger.success(
                     "✅ Drafting suggestions re-emitted to backend after reconnect"
@@ -614,6 +601,7 @@ class WorkspaceEventsMixin:
                             logger.info(
                                 f"📤 Emitting document_feature_response (document_assessments) with {len(document_results)} documents"
                             )
+                            document_assessment_payload["metadata"] = self._cumulative_usage_metadata(str(payload.workspaceId))
                             await self._socket_client.emit(
                                 "document_feature_response", document_assessment_payload
                             )
@@ -650,6 +638,7 @@ class WorkspaceEventsMixin:
                                         "description": meta.get("description", ""),
                                     },
                                 }
+                                workspace_metadata_payload["metadata"] = self._cumulative_usage_metadata(str(payload.workspaceId))
                                 await self._socket_client.emit(
                                     "document_feature_response",
                                     workspace_metadata_payload,
@@ -690,14 +679,12 @@ class WorkspaceEventsMixin:
                                         .strip()
                                         .upper()
                                     )
-                                    await self._socket_client.emit(
-                                        "document_feature_response",
-                                        {
-                                            "featureType": "analysis_report",
-                                            "workspaceId": str(payload.workspaceId),
-                                            "userId": str(payload.userId),
-                                            "payload": fallback,
-                                        },
+                                    await self._emit_document_feature(
+                                        feature_type="analysis_report",
+                                        workspace_id=str(payload.workspaceId),
+                                        user_id=str(payload.userId),
+                                        payload=fallback,
+                                        usage=None,
                                     )
                                     self._workspace_analysis_payload[
                                         payload.workspaceId
@@ -705,18 +692,16 @@ class WorkspaceEventsMixin:
                                     logger.info(
                                         "✅ Analysis report (fallback, 0 successful docs) sent to backend"
                                     )
-                                    await self._socket_client.emit(
-                                        "document_feature_response",
-                                        {
-                                            "featureType": "list_of_dates",
+                                    await self._emit_document_feature(
+                                        feature_type="list_of_dates",
+                                        workspace_id=str(payload.workspaceId),
+                                        user_id=str(payload.userId),
+                                        payload={
                                             "workspaceId": str(payload.workspaceId),
                                             "userId": str(payload.userId),
-                                            "payload": {
-                                                "workspaceId": str(payload.workspaceId),
-                                                "userId": str(payload.userId),
-                                                "listOfDates": [],
-                                            },
+                                            "listOfDates": [],
                                         },
+                                        usage=None,
                                     )
                                     self._workspace_list_of_dates_payload[
                                         payload.workspaceId
@@ -746,6 +731,7 @@ class WorkspaceEventsMixin:
                                 "userId": payload.userId,
                                 "error": str(doc_error),
                             }
+                            error_payload["metadata"] = self._cumulative_usage_metadata(str(payload.workspaceId))
                             await self._socket_client.emit(
                                 "document_feature_response", error_payload
                             )
@@ -762,31 +748,27 @@ class WorkspaceEventsMixin:
                         (payload.workspaceRole or "ADJUDICATOR").strip().upper()
                     )
                     fallback = self._analysis_report_fallback(workspace_role)
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "analysis_report",
-                            "workspaceId": payload.workspaceId,
-                            "userId": payload.userId,
-                            "payload": fallback,
-                        },
+                    await self._emit_document_feature(
+                        feature_type="analysis_report",
+                        workspace_id=payload.workspaceId,
+                        user_id=payload.userId,
+                        payload=fallback,
+                        usage=None,
                     )
                     self._workspace_analysis_payload[payload.workspaceId] = fallback
                     logger.info(
                         "✅ Analysis report (fallback, no docs) sent to backend"
                     )
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "list_of_dates",
+                    await self._emit_document_feature(
+                        feature_type="list_of_dates",
+                        workspace_id=payload.workspaceId,
+                        user_id=payload.userId,
+                        payload={
                             "workspaceId": payload.workspaceId,
                             "userId": payload.userId,
-                            "payload": {
-                                "workspaceId": payload.workspaceId,
-                                "userId": payload.userId,
-                                "listOfDates": [],
-                            },
+                            "listOfDates": [],
                         },
+                        usage=None,
                     )
                     self._workspace_list_of_dates_payload[payload.workspaceId] = []
                     logger.info("✅ List of dates (empty, no docs) sent to backend")
@@ -1216,15 +1198,16 @@ class WorkspaceEventsMixin:
                     # Strategy: generate or use fallback so backend always receives strategy_objective (e.g. when all docs deleted)
                     strategies_result = None
                     try:
-                        strategies_result = (
-                            await self._generate_strategies_from_documents(
-                                workspace_id=payload.workspaceId,
-                                user_id=payload.userId,
-                                workspace_role=workspace_role,
-                                batch_result=None,
-                                is_update=True,
+                        with capture_usage() as _u1:
+                            strategies_result = (
+                                await self._generate_strategies_from_documents(
+                                    workspace_id=payload.workspaceId,
+                                    user_id=payload.userId,
+                                    workspace_role=workspace_role,
+                                    batch_result=None,
+                                    is_update=True,
+                                )
                             )
-                        )
                     except Exception as strategy_err:
                         logger.warning(
                             "Strategy generation after delete failed: {}; using fallback",
@@ -1239,14 +1222,12 @@ class WorkspaceEventsMixin:
                         )
                     try:
                         if self._socket_client:
-                            await self._socket_client.emit(
-                                "document_feature_response",
-                                {
-                                    "featureType": "strategy_objective",
-                                    "workspaceId": payload.workspaceId,
-                                    "userId": payload.userId,
-                                    "payload": strategies_result,
-                                },
+                            await self._emit_document_feature(
+                                feature_type="strategy_objective",
+                                workspace_id=payload.workspaceId,
+                                user_id=payload.userId,
+                                payload=strategies_result,
+                                usage=_u1,
                             )
                             self._workspace_strategy_payload[payload.workspaceId] = (
                                 strategies_result
@@ -1262,15 +1243,16 @@ class WorkspaceEventsMixin:
                     # Analysis report: always emit valid payload (never null); use fallback when no docs or on error
                     analysis_report = None
                     try:
-                        analysis_report = (
-                            await self._generate_analysis_report_from_documents(
-                                workspace_id=payload.workspaceId,
-                                user_id=payload.userId,
-                                workspace_role=workspace_role,
-                                batch_result=None,
-                                is_update=True,
+                        with capture_usage() as _u2:
+                            analysis_report = (
+                                await self._generate_analysis_report_from_documents(
+                                    workspace_id=payload.workspaceId,
+                                    user_id=payload.userId,
+                                    workspace_role=workspace_role,
+                                    batch_result=None,
+                                    is_update=True,
+                                )
                             )
-                        )
                     except Exception as ar_err:
                         logger.warning(
                             "Analysis report after delete failed: {}; using fallback",
@@ -1305,14 +1287,12 @@ class WorkspaceEventsMixin:
                         )
                     try:
                         if self._socket_client:
-                            await self._socket_client.emit(
-                                "document_feature_response",
-                                {
-                                    "featureType": "analysis_report",
-                                    "workspaceId": payload.workspaceId,
-                                    "userId": payload.userId,
-                                    "payload": analysis_report,
-                                },
+                            await self._emit_document_feature(
+                                feature_type="analysis_report",
+                                workspace_id=payload.workspaceId,
+                                user_id=payload.userId,
+                                payload=analysis_report,
+                                usage=_u2,
                             )
                             self._workspace_analysis_payload[payload.workspaceId] = (
                                 analysis_report
@@ -1591,6 +1571,7 @@ class WorkspaceEventsMixin:
                                 },
                             }
 
+                            document_assessment_payload["metadata"] = self._cumulative_usage_metadata(str(payload.workspaceId))
                             await self._socket_client.emit(
                                 "document_feature_response", document_assessment_payload
                             )
@@ -1621,6 +1602,7 @@ class WorkspaceEventsMixin:
                                             "description": meta.get("description", ""),
                                         },
                                     }
+                                    workspace_metadata_payload["metadata"] = self._cumulative_usage_metadata(str(payload.workspaceId))
                                     await self._socket_client.emit(
                                         "document_feature_response",
                                         workspace_metadata_payload,
@@ -1668,14 +1650,12 @@ class WorkspaceEventsMixin:
                                         fallback = self._analysis_report_fallback(
                                             workspace_role
                                         )
-                                        await self._socket_client.emit(
-                                            "document_feature_response",
-                                            {
-                                                "featureType": "analysis_report",
-                                                "workspaceId": payload.workspaceId,
-                                                "userId": payload.userId,
-                                                "payload": fallback,
-                                            },
+                                        await self._emit_document_feature(
+                                            feature_type="analysis_report",
+                                            workspace_id=payload.workspaceId,
+                                            user_id=payload.userId,
+                                            payload=fallback,
+                                            usage=None,
                                         )
                                         self._workspace_analysis_payload[
                                             payload.workspaceId
@@ -1683,18 +1663,16 @@ class WorkspaceEventsMixin:
                                         logger.info(
                                             "✅ Analysis report (fallback, 0 successful sync) sent to backend"
                                         )
-                                        await self._socket_client.emit(
-                                            "document_feature_response",
-                                            {
-                                                "featureType": "list_of_dates",
+                                        await self._emit_document_feature(
+                                            feature_type="list_of_dates",
+                                            workspace_id=payload.workspaceId,
+                                            user_id=payload.userId,
+                                            payload={
                                                 "workspaceId": payload.workspaceId,
                                                 "userId": payload.userId,
-                                                "payload": {
-                                                    "workspaceId": payload.workspaceId,
-                                                    "userId": payload.userId,
-                                                    "listOfDates": [],
-                                                },
+                                                "listOfDates": [],
                                             },
+                                            usage=None,
                                         )
                                         self._workspace_list_of_dates_payload[
                                             payload.workspaceId
@@ -1725,14 +1703,12 @@ class WorkspaceEventsMixin:
                 # Re-emit strategy from cache (no regeneration); then analysis_report. Single emit block, no try/except around emits.
                 strategies_result = self._workspace_strategy_payload.get(workspace_id)
                 if strategies_result:
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "strategy_objective",
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "payload": strategies_result,
-                        },
+                    await self._emit_document_feature(
+                        feature_type="strategy_objective",
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        payload=strategies_result,
+                        usage=None,
                     )
                     logger.success(
                         "✅ Strategy & Objectives re-emitted to backend (from cache)"
@@ -1742,15 +1718,16 @@ class WorkspaceEventsMixin:
                     )  # Space out emits so backend can process each; reduces disconnect risk
                 else:
                     try:
-                        strategies_result = (
-                            await self._generate_strategies_from_documents(
-                                workspace_id=workspace_id,
-                                user_id=user_id,
-                                workspace_role=workspace_role,
-                                batch_result=None,
-                                is_update=True,
+                        with capture_usage() as _u3:
+                            strategies_result = (
+                                await self._generate_strategies_from_documents(
+                                    workspace_id=workspace_id,
+                                    user_id=user_id,
+                                    workspace_role=workspace_role,
+                                    batch_result=None,
+                                    is_update=True,
+                                )
                             )
-                        )
                     except Exception as strategy_err:
                         logger.warning(
                             "Failed to generate strategy on skip_reprocess: {}",
@@ -1758,14 +1735,12 @@ class WorkspaceEventsMixin:
                         )
                         strategies_result = None
                     if strategies_result:
-                        await self._socket_client.emit(
-                            "document_feature_response",
-                            {
-                                "featureType": "strategy_objective",
-                                "workspaceId": workspace_id,
-                                "userId": user_id,
-                                "payload": strategies_result,
-                            },
+                        await self._emit_document_feature(
+                            feature_type="strategy_objective",
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            payload=strategies_result,
+                            usage=_u3,
                         )
                         self._workspace_strategy_payload[workspace_id] = (
                             strategies_result
@@ -1776,14 +1751,12 @@ class WorkspaceEventsMixin:
 
                 analysis_report = self._workspace_analysis_payload.get(workspace_id)
                 if analysis_report:
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "analysis_report",
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "payload": analysis_report,
-                        },
+                    await self._emit_document_feature(
+                        feature_type="analysis_report",
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        payload=analysis_report,
+                        usage=None,
                     )
                     logger.success(
                         "✅ Analysis report re-emitted to backend (from cache)"
@@ -1795,18 +1768,16 @@ class WorkspaceEventsMixin:
                         workspace_id
                     )
                     if list_of_dates is not None:
-                        await self._socket_client.emit(
-                            "document_feature_response",
-                            {
-                                "featureType": "list_of_dates",
+                        await self._emit_document_feature(
+                            feature_type="list_of_dates",
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            payload={
                                 "workspaceId": workspace_id,
                                 "userId": user_id,
-                                "payload": {
-                                    "workspaceId": workspace_id,
-                                    "userId": user_id,
-                                    "listOfDates": list_of_dates,
-                                },
+                                "listOfDates": list_of_dates,
                             },
+                            usage=None,
                         )
                         logger.success(
                             "✅ List of dates re-emitted to backend (from cache)"
@@ -1815,14 +1786,12 @@ class WorkspaceEventsMixin:
                         workspace_id
                     )
                     if applicable_laws is not None:
-                        await self._socket_client.emit(
-                            "document_feature_response",
-                            {
-                                "featureType": "applicable_laws",
-                                "workspaceId": workspace_id,
-                                "userId": user_id,
-                                "payload": applicable_laws,
-                            },
+                        await self._emit_document_feature(
+                            feature_type="applicable_laws",
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            payload=applicable_laws,
+                            usage=None,
                         )
                         logger.success(
                             "✅ Applicable laws re-emitted to backend (from cache)"
@@ -1838,16 +1807,14 @@ class WorkspaceEventsMixin:
                         self._workspace_procedural_timeline_payload.get(workspace_id)
                     )
                     if procedural_timeline is not None:
-                        await self._socket_client.emit(
-                            "document_feature_response",
-                            {
-                                "featureType": "procedural_timeline",
-                                "workspaceId": workspace_id,
-                                "userId": user_id,
-                                "payload": {
-                                    "proceduralTimeline": procedural_timeline,
-                                },
+                        await self._emit_document_feature(
+                            feature_type="procedural_timeline",
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            payload={
+                                "proceduralTimeline": procedural_timeline,
                             },
+                            usage=None,
                         )
                         logger.success(
                             "✅ Procedural timeline re-emitted to backend (from cache)"
@@ -1856,28 +1823,24 @@ class WorkspaceEventsMixin:
                         workspace_id
                     )
                     if relevant_parties is not None:
-                        await self._socket_client.emit(
-                            "document_feature_response",
-                            {
-                                "featureType": "relevant_parties",
-                                "workspaceId": workspace_id,
-                                "userId": user_id,
-                                "payload": relevant_parties,
-                            },
+                        await self._emit_document_feature(
+                            feature_type="relevant_parties",
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            payload=relevant_parties,
+                            usage=None,
                         )
                         logger.success(
                             "✅ Relevant parties re-emitted to backend (from cache)"
                         )
                     case_laws = self._workspace_case_laws_payload.get(workspace_id)
                     if case_laws is not None:
-                        await self._socket_client.emit(
-                            "document_feature_response",
-                            {
-                                "featureType": "case_laws",
-                                "workspaceId": workspace_id,
-                                "userId": user_id,
-                                "payload": case_laws,
-                            },
+                        await self._emit_document_feature(
+                            feature_type="case_laws",
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            payload=case_laws,
+                            usage=None,
                         )
                         logger.success(
                             "✅ Case laws re-emitted to backend (from cache)"
@@ -1939,14 +1902,12 @@ class WorkspaceEventsMixin:
                     workspace_id
                 )
                 if cached_assessments:
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "document_assessments",
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "payload": cached_assessments,
-                        },
+                    await self._emit_document_feature(
+                        feature_type="document_assessments",
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        payload=cached_assessments,
+                        usage=None,
                     )
                     logger.success(
                         "✅ Document assessments re-emitted{} (from cache)", log_ctx
@@ -1954,14 +1915,12 @@ class WorkspaceEventsMixin:
 
                 cached_metadata = self._workspace_metadata_payload.get(workspace_id)
                 if cached_metadata:
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "workspace_metadata",
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "payload": cached_metadata,
-                        },
+                    await self._emit_document_feature(
+                        feature_type="workspace_metadata",
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        payload=cached_metadata,
+                        usage=None,
                     )
                     logger.success(
                         "✅ Workspace metadata re-emitted{} (from cache)", log_ctx
@@ -1980,13 +1939,14 @@ class WorkspaceEventsMixin:
                 # 3) Regenerate strategy_objective for the new role, emit + cache.
                 strategies_result = None
                 try:
-                    strategies_result = await self._generate_strategies_from_documents(
-                        workspace_id=workspace_id,
-                        user_id=user_id,
-                        workspace_role=workspace_role,
-                        batch_result=None,
-                        is_update=True,
-                    )
+                    with capture_usage() as _u4:
+                        strategies_result = await self._generate_strategies_from_documents(
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            workspace_role=workspace_role,
+                            batch_result=None,
+                            is_update=True,
+                        )
                 except Exception as strategy_err:
                     logger.warning(
                         "Strategy regeneration{} failed: {}", log_ctx, strategy_err
@@ -1995,14 +1955,12 @@ class WorkspaceEventsMixin:
                     strategies_result = self._strategy_objective_fallback(
                         workspace_id, user_id, workspace_role, is_update=True
                     )
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "strategy_objective",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": strategies_result,
-                    },
+                await self._emit_document_feature(
+                    feature_type="strategy_objective",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=strategies_result,
+                    usage=_u4,
                 )
                 self._workspace_strategy_payload[workspace_id] = strategies_result
                 logger.success("🎉 Strategy & Objectives regenerated{}", log_ctx)
@@ -2015,15 +1973,16 @@ class WorkspaceEventsMixin:
                 # re-emitted from cache. Mirror the deletion-path pattern instead.
                 analysis_report = None
                 try:
-                    analysis_report = (
-                        await self._generate_analysis_report_from_documents(
-                            workspace_id=workspace_id,
-                            user_id=user_id,
-                            workspace_role=workspace_role,
-                            batch_result=None,
-                            is_update=True,
+                    with capture_usage() as _u5:
+                        analysis_report = (
+                            await self._generate_analysis_report_from_documents(
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                workspace_role=workspace_role,
+                                batch_result=None,
+                                is_update=True,
+                            )
                         )
-                    )
                 except Exception as ar_err:
                     logger.warning(
                         "Analysis report regeneration{} failed: {}",
@@ -2050,14 +2009,12 @@ class WorkspaceEventsMixin:
                             log_ctx,
                             tag_err,
                         )
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "analysis_report",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": analysis_report,
-                    },
+                await self._emit_document_feature(
+                    feature_type="analysis_report",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=analysis_report,
+                    usage=_u5,
                 )
                 self._workspace_analysis_payload[workspace_id] = analysis_report
                 logger.success("✅ Analysis report regenerated{}", log_ctx)
@@ -2073,18 +2030,16 @@ class WorkspaceEventsMixin:
                     workspace_id
                 )
                 if cached_list_of_dates is not None:
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "list_of_dates",
+                    await self._emit_document_feature(
+                        feature_type="list_of_dates",
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        payload={
                             "workspaceId": workspace_id,
                             "userId": user_id,
-                            "payload": {
-                                "workspaceId": workspace_id,
-                                "userId": user_id,
-                                "listOfDates": cached_list_of_dates,
-                            },
+                            "listOfDates": cached_list_of_dates,
                         },
+                        usage=None,
                     )
                     logger.success(
                         "✅ List of dates re-emitted{} (from cache)", log_ctx
@@ -2095,16 +2050,14 @@ class WorkspaceEventsMixin:
                     self._workspace_procedural_timeline_payload.get(workspace_id)
                 )
                 if cached_procedural_timeline is not None:
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "procedural_timeline",
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "payload": {
-                                "proceduralTimeline": cached_procedural_timeline,
-                            },
+                    await self._emit_document_feature(
+                        feature_type="procedural_timeline",
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        payload={
+                            "proceduralTimeline": cached_procedural_timeline,
                         },
+                        usage=None,
                     )
                     logger.success(
                         "✅ Procedural timeline re-emitted{} (from cache)", log_ctx
@@ -2152,39 +2105,33 @@ class WorkspaceEventsMixin:
                     strategy_fallback = self._strategy_objective_fallback(
                         workspace_id, user_id, workspace_role, is_update=True
                     )
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "strategy_objective",
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "payload": strategy_fallback,
-                        },
+                    await self._emit_document_feature(
+                        feature_type="strategy_objective",
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        payload=strategy_fallback,
+                        usage=None,
                     )
                     self._workspace_strategy_payload[workspace_id] = strategy_fallback
                     analysis_fallback = self._analysis_report_fallback(workspace_role)
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "analysis_report",
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "payload": analysis_fallback,
-                        },
+                    await self._emit_document_feature(
+                        feature_type="analysis_report",
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        payload=analysis_fallback,
+                        usage=None,
                     )
                     self._workspace_analysis_payload[workspace_id] = analysis_fallback
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "list_of_dates",
+                    await self._emit_document_feature(
+                        feature_type="list_of_dates",
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        payload={
                             "workspaceId": workspace_id,
                             "userId": user_id,
-                            "payload": {
-                                "workspaceId": workspace_id,
-                                "userId": user_id,
-                                "listOfDates": [],
-                            },
+                            "listOfDates": [],
                         },
+                        usage=None,
                     )
                     self._workspace_list_of_dates_payload[workspace_id] = []
                     self._schedule_list_of_dates_and_applicable_laws(

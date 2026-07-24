@@ -16,9 +16,10 @@ concurrently never see each other's counts.
 from __future__ import annotations
 
 import contextlib
+import functools
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from typing import Any, Awaitable, Callable, Iterator, Optional
 
 from loguru import logger
 
@@ -66,6 +67,26 @@ def capture_usage() -> Iterator[UsageAccumulator]:
 def current_usage() -> Optional[UsageAccumulator]:
     """Return the accumulator for the active scope, or None if none is open."""
     return _current_usage.get()
+
+
+def meter_usage(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    """Decorate an async method so its whole body runs inside a fresh
+    :func:`capture_usage` scope.
+
+    Used on feature generate-and-emit handlers: every ``record_usage`` made while
+    the method runs is attributed to a per-call accumulator that the method's own
+    emit reads via :func:`current_usage`. The scope is NESTED — if an outer scope
+    is open (e.g. a chat turn), that outer scope is restored on return and does
+    NOT receive this feature's tokens, so each feature is billed exactly once to
+    the workspace cumulative and the chat ``ai_response`` is not double-charged.
+    """
+
+    @functools.wraps(func)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with capture_usage():
+            return await func(*args, **kwargs)
+
+    return wrapper
 
 
 def begin_usage() -> "tuple[object, UsageAccumulator]":

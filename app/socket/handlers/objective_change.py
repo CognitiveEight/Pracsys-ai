@@ -1889,33 +1889,72 @@ class ObjectiveChangeMixin:
                 parties_err,
             )
 
-        # 3d) Case laws: PRESERVE on objective change. The precedents that were
-        # uploaded/found don't change with the legal objective, so re-emit the
-        # cached payload rather than regenerating. Only regenerate on document
-        # add/delete (handled by the document-sync scheduler).
+        # 3d) Case laws: REGENERATE for the new objective so the precedents
+        # advance the new legal direction (objective_context steers both the
+        # Indian-Kanoon search query and the LLM select/rank pass;
+        # merge_with_previous=False replaces the stale set instead of unioning).
+        # Falls back to preserve-and-re-emit on failure so the panel never
+        # sticks on a loader.
+        case_done = False
         try:
-            await self._reemit_case_laws_unchanged(workspace_id, user_id)
+            await self._generate_and_emit_case_laws(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+                objective_context=new_objective_text or None,
+                merge_with_previous=False,
+            )
+            case_done = True
             logger.success(
-                "✅ Objective-change case_laws preserved (regeneration skipped){}",
+                "✅ Objective-change case_laws regenerated for new objective{}",
                 ctx,
             )
         except Exception as case_err:
             logger.warning(
-                "Objective-change case_laws preserve failed{}: {}", ctx, case_err
+                "Objective-change case_laws regeneration failed{}: {}", ctx, case_err
             )
+        if not case_done:
+            try:
+                await self._reemit_case_laws_unchanged(workspace_id, user_id)
+            except Exception as case_preserve_err:
+                logger.warning(
+                    "Objective-change case_laws preserve fallback failed{}: {}",
+                    ctx,
+                    case_preserve_err,
+                )
 
-        # 5) Drafting Assistant suggested drafts: PRESERVE on objective change.
-        # The lawyer's curated/suggested drafts and template library are unchanged
-        # by an objective shift, so re-emit the cached suggestions (clears the FE
-        # loader) instead of regenerating. Only regenerate on document add/delete.
+        # 5) Drafting Assistant suggested drafts: REGENERATE for the new
+        # objective. The generator's brief (_build_case_brief_for_drafting)
+        # reads the freshly-updated strategicObjective from the strategy cache,
+        # so a plain regeneration makes the suggested drafts objective-aware.
+        # Falls back to preserve-and-re-emit on failure so the panel loader clears.
+        draft_done = False
         try:
-            await self._reemit_drafting_unchanged(workspace_id, user_id)
+            await self._generate_and_emit_drafting_suggestions(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+            )
+            draft_done = True
+            logger.success(
+                "✅ Objective-change drafting regenerated for new objective{}",
+                ctx,
+            )
         except Exception as draft_err:
             logger.warning(
-                "Objective-change drafting preserve failed{}: {}",
+                "Objective-change drafting regeneration failed{}: {}",
                 ctx,
                 draft_err,
             )
+        if not draft_done:
+            try:
+                await self._reemit_drafting_unchanged(workspace_id, user_id)
+            except Exception as draft_preserve_err:
+                logger.warning(
+                    "Objective-change drafting preserve fallback failed{}: {}",
+                    ctx,
+                    draft_preserve_err,
+                )
 
     def _schedule_objective_change_reanalysis(
         self,

@@ -191,6 +191,9 @@ class ChatMixin:
             from app.workspace.context import context_manager
 
             fields: Dict[str, Any] = {
+                # Unique per emit so the backend WorkspaceCostService records a
+                # distinct cost entry (it keys on messageId and skips without one).
+                "messageId": uuid.uuid4().hex,
                 "inputTokens": 0,
                 "outputTokens": 0,
                 "totalTokens": 0,
@@ -244,7 +247,12 @@ class ChatMixin:
                 metadata = self._token_usage_metadata(workspace_id, usage)
             else:
                 metadata = self._cumulative_usage_metadata(workspace_id)
-            if isinstance(metadata, dict) and metadata:
+            if isinstance(metadata, dict):
+                # The backend WorkspaceCostService keys the cost record on
+                # messageId and skips the record entirely without one. A fresh
+                # (usage-based) metadata block has no messageId, so mint a unique
+                # one per emit here. aiModel mirrors the ai_response contract.
+                metadata.setdefault("messageId", uuid.uuid4().hex)
                 metadata.setdefault("aiModel", settings.gemini_model)
         except Exception as exc:
             logger.warning(

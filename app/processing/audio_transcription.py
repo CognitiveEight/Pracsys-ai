@@ -35,6 +35,7 @@ from typing import Any, Optional
 
 from loguru import logger
 
+from app.ai.usage import record_stt_seconds, record_usage
 from app.core.config import settings
 
 try:
@@ -235,6 +236,25 @@ def _coerce_valid_json_text(raw: str) -> Optional[str]:
         return None
 
 
+def _record_audio_gemini_usage(response: Any) -> None:
+    """Bill one raw-SDK audio Gemini call to the active usage scope.
+
+    The three helpers below call ``_genai.GenerativeModel(...).generate_content``
+    directly rather than going through ``GeminiClient``, so they bypass its
+    ``_record_usage`` hook and their tokens would otherwise be billed to nobody.
+    Field names and the thinking-tokens-as-output rule mirror
+    ``GeminiClient._record_usage``. Never raises.
+    """
+    try:
+        usage = getattr(response, "usage_metadata", None)
+        prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
+        output_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
+        thinking_tokens = int(getattr(usage, "thoughts_token_count", 0) or 0)
+        record_usage(prompt_tokens, output_tokens + thinking_tokens)
+    except Exception as exc:  # cost metering must never break transcription
+        logger.debug("Audio Gemini usage metering failed: {}", exc)
+
+
 def _generate_gemini_json_raw(
     prompt: str, *, max_output_tokens: int = 2048
 ) -> Optional[str]:
@@ -262,6 +282,7 @@ def _generate_gemini_json_raw(
     except Exception as e:
         logger.warning("Audio Gemini JSON call failed: {}", e)
         return None
+    _record_audio_gemini_usage(response)
     text = getattr(response, "text", "") or ""
     if not text:
         logger.warning("Audio Gemini JSON call returned empty text")
@@ -320,6 +341,7 @@ def _generate_gemini_plaintext_raw(
     except Exception as e:
         logger.warning("Audio Gemini plain-text call failed: {}", e)
         return None
+    _record_audio_gemini_usage(response)
     text = (getattr(response, "text", "") or "").strip()
     return text or None
 
@@ -340,6 +362,7 @@ def _generate_gemini_text(prompt: str, *, max_output_tokens: int = 128) -> Optio
     except Exception as e:
         logger.debug("Audio Gemini text call failed: {}", e)
         return None
+    _record_audio_gemini_usage(response)
     text = (getattr(response, "text", "") or "").strip()
     return text or None
 
@@ -1020,9 +1043,19 @@ def _recognize_with_batch_chirp3_gcs(
         )
 
         last_exc: Optional[BaseException] = None
+        # Cost basis: BatchRecognize bills the full audio duration per job, and
+        # each retry below submits a fresh billable job — so this is recorded
+        # per attempt, not once per function call. prepared_audio.path is always
+        # a normalised PCM16 WAV, so the duration read is exact.
+        billable_seconds = 0.0
+        try:
+            billable_seconds = _wav_duration_seconds(prepared_audio.path)
+        except Exception as dur_exc:  # duration is for costing only
+            logger.debug("Audio: could not read duration for cost metering: {}", dur_exc)
         for attempt in range(1, _BATCH_MAX_ATTEMPTS + 1):
             try:
                 operation = client.batch_recognize(request=request)
+                record_stt_seconds(billable_seconds)
                 batch_response = operation.result(timeout=600)
                 result = _v2_batch_response_to_transcript_result(batch_response)
                 if result.words or result.raw_transcript:
@@ -1085,6 +1118,11 @@ def _recognize_chunked_with_chirp3_v2(
             except Exception as exc:
                 logger.warning("Audio: Recognize failed for chunk {} ({}); skipping", chunk_idx, exc)
                 continue
+            # Cost: billed per chunk of submitted audio. CHUNK_OVERLAP_SECONDS is
+            # added to both ends of each chunk in _split_pcm_wav_by_silence, so the
+            # summed seconds legitimately exceed the file's wall-clock duration —
+            # that is what Google bills, not a metering bug.
+            record_stt_seconds(chunk.end_time - chunk.start_time)
             res = _v2_response_to_transcript_result(response, time_offset=chunk.start_time)
             res.words = _trim_words_to_window(
                 res.words, keep_start=chunk.keep_start, keep_end=chunk.keep_end

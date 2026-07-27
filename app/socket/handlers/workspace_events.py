@@ -498,13 +498,27 @@ class WorkspaceEventsMixin:
                         file_dict["_id"] = file.id
                     files_to_process.append(file_dict)
 
+                # Bound before the try so the error handler far below can always
+                # read it, even if the scope never opened.
+                ingest_usage = None
                 try:
-                    # Process files in batch
-                    batch_result = await document_processor.process_batch(
-                        files=files_to_process,
-                        workspace_id=payload.workspaceId,
-                        user_id=payload.userId,
-                    )
+                    # Process files in batch.
+                    #
+                    # The capture_usage scope bills the INGESTION spend, which was
+                    # previously lost entirely: the Vision OCR units for scanned
+                    # PDFs/images (1 per page), the Speech-to-Text seconds for audio
+                    # evidence, the embedding tokens for vector storage, and the
+                    # per-document summary / evidentiary-strength / classification
+                    # Gemini calls. None of that ran inside a scope before, so
+                    # record_usage was a silent no-op. Kept tight around
+                    # process_batch so the background feature tasks scheduled later
+                    # keep their own @meter_usage scopes.
+                    with capture_usage() as ingest_usage:
+                        batch_result = await document_processor.process_batch(
+                            files=files_to_process,
+                            workspace_id=payload.workspaceId,
+                            user_id=payload.userId,
+                        )
 
                     logger.success(
                         "✅ Document processing complete: {}/{} successful, avg readability: {:.2f}%",
@@ -601,7 +615,17 @@ class WorkspaceEventsMixin:
                             logger.info(
                                 f"📤 Emitting document_feature_response (document_assessments) with {len(document_results)} documents"
                             )
-                            document_assessment_payload["metadata"] = self._cumulative_usage_metadata(str(payload.workspaceId))
+                            # Bill the ingestion spend captured above (OCR units, STT
+                            # seconds, embedding + per-document Gemini tokens) to
+                            # this emit. The cached copy below keeps this fresh
+                            # metadata, but _reemit_cached_features overwrites it
+                            # with _cumulative_usage_metadata on replay, so a
+                            # reconnect never re-bills the same spend.
+                            document_assessment_payload["metadata"] = (
+                                self._ingest_usage_metadata(
+                                    str(payload.workspaceId), ingest_usage
+                                )
+                            )
                             await self._socket_client.emit(
                                 "document_feature_response", document_assessment_payload
                             )
@@ -618,12 +642,16 @@ class WorkspaceEventsMixin:
                         # 2) Workspace metadata — own try/except (same as ex_event)
                         if batch_result.get("successful", 0) > 0:
                             try:
-                                meta = (
-                                    await self._get_workspace_category_and_subcategory(
-                                        workspace_id=payload.workspaceId,
-                                        user_id=payload.userId,
+                                # Its own scope: the category/subcategory Gemini call
+                                # runs after the ingestion scope closed, so without
+                                # this its tokens are billed to nobody.
+                                with capture_usage() as meta_usage:
+                                    meta = (
+                                        await self._get_workspace_category_and_subcategory(
+                                            workspace_id=payload.workspaceId,
+                                            user_id=payload.userId,
+                                        )
                                     )
-                                )
                                 workspace_metadata_payload = {
                                     "featureType": "workspace_metadata",
                                     "workspaceId": payload.workspaceId,
@@ -638,7 +666,11 @@ class WorkspaceEventsMixin:
                                         "description": meta.get("description", ""),
                                     },
                                 }
-                                workspace_metadata_payload["metadata"] = self._cumulative_usage_metadata(str(payload.workspaceId))
+                                workspace_metadata_payload["metadata"] = (
+                                    self._ingest_usage_metadata(
+                                        str(payload.workspaceId), meta_usage
+                                    )
+                                )
                                 await self._socket_client.emit(
                                     "document_feature_response",
                                     workspace_metadata_payload,
@@ -731,7 +763,15 @@ class WorkspaceEventsMixin:
                                 "userId": payload.userId,
                                 "error": str(doc_error),
                             }
-                            error_payload["metadata"] = self._cumulative_usage_metadata(str(payload.workspaceId))
+                            # A failure part-way through ingestion still spent real
+                            # money (e.g. OCR ran on 150 pages before the error), so
+                            # report the partial spend rather than zeros.
+                            # _ingest_usage_metadata is idempotent: if the success
+                            # emit above already reported it, this degrades to the
+                            # cumulative-only block instead of double-reporting.
+                            error_payload["metadata"] = self._ingest_usage_metadata(
+                                str(payload.workspaceId), ingest_usage
+                            )
                             await self._socket_client.emit(
                                 "document_feature_response", error_payload
                             )
@@ -1080,6 +1120,24 @@ class WorkspaceEventsMixin:
                     str(payload.workspaceId),
                     str(payload.userId),
                     str(payload.workspaceRole),
+                )
+            # Hydrate BEFORE anything can upsert the context. On cold memory
+            # upsert_workspace creates a context with empty metadata and persists
+            # it immediately, overwriting the WORKSPACE_META row — which would
+            # wipe the workspace's cumulative token_usage (totalPrice back to 0
+            # after an AI-service restart). Both _resolve_workspace_role and the
+            # upsert below can trigger that, so warm memory from Qdrant first.
+            # Idempotent and a no-op when memory is already warm; the chat path
+            # does the same (see ChatMixin._on_user_message_request).
+            try:
+                await self._hydrate_workspace_caches(
+                    str(payload.workspaceId), user_id=str(payload.userId)
+                )
+            except Exception as hydrate_err:  # best-effort — never block a sync
+                logger.debug(
+                    "Workspace cache hydration before sync failed ({}): {}",
+                    str(payload.workspaceId)[:12],
+                    hydrate_err,
                 )
             # Resolve the role BEFORE upserting the context: a doc-upload sync
             # carries no workspaceRole, and upserting first on cold memory
@@ -1480,12 +1538,19 @@ class WorkspaceEventsMixin:
                     )
 
             if payload.evidenceFiles and files_to_process and not skip_reprocess:
+                # Bound before the try so the error handler below can always read
+                # it, even if the scope never opened — see on_workspace_created.
+                ingest_usage = None
                 try:
-                    batch_result = await document_processor.process_batch(
-                        files=files_to_process,
-                        workspace_id=payload.workspaceId,
-                        user_id=payload.userId,
-                    )
+                    # capture_usage bills the re-ingestion spend (OCR units, STT
+                    # seconds, embeddings, per-document Gemini calls) — see the
+                    # matching scope in on_workspace_created.
+                    with capture_usage() as ingest_usage:
+                        batch_result = await document_processor.process_batch(
+                            files=files_to_process,
+                            workspace_id=payload.workspaceId,
+                            user_id=payload.userId,
+                        )
 
                     logger.success(
                         "✅ Document sync complete: {}/{} successful",
@@ -1571,10 +1636,23 @@ class WorkspaceEventsMixin:
                                 },
                             }
 
-                            document_assessment_payload["metadata"] = self._cumulative_usage_metadata(str(payload.workspaceId))
+                            # Bill the re-ingestion spend captured above.
+                            document_assessment_payload["metadata"] = (
+                                self._ingest_usage_metadata(
+                                    str(payload.workspaceId), ingest_usage
+                                )
+                            )
                             await self._socket_client.emit(
                                 "document_feature_response", document_assessment_payload
                             )
+                            # Refresh the reconnect cache with the sync envelope —
+                            # otherwise a replay re-sends the older created-path
+                            # payload (missing the newly synced documents).
+                            # _reemit_cached_features overwrites the metadata with
+                            # _cumulative_usage_metadata, so no re-billing.
+                            self._workspace_document_assessments_payload[
+                                payload.workspaceId
+                            ] = document_assessment_payload
                             logger.success(
                                 "✅ Document assessments (sync) sent to backend"
                             )
@@ -1582,10 +1660,13 @@ class WorkspaceEventsMixin:
                             # Emit workspace_metadata on sync: do NOT send title (send empty) so backend keeps existing title unchanged
                             if batch_result.get("successful", 0) > 0:
                                 try:
-                                    meta = await self._get_workspace_category_and_subcategory(
-                                        workspace_id=payload.workspaceId,
-                                        user_id=payload.userId,
-                                    )
+                                    # Own scope — see the matching comment in
+                                    # on_workspace_created.
+                                    with capture_usage() as meta_usage:
+                                        meta = await self._get_workspace_category_and_subcategory(
+                                            workspace_id=payload.workspaceId,
+                                            user_id=payload.userId,
+                                        )
                                     workspace_metadata_payload = {
                                         "featureType": "workspace_metadata",
                                         "workspaceId": payload.workspaceId,
@@ -1602,7 +1683,11 @@ class WorkspaceEventsMixin:
                                             "description": meta.get("description", ""),
                                         },
                                     }
-                                    workspace_metadata_payload["metadata"] = self._cumulative_usage_metadata(str(payload.workspaceId))
+                                    workspace_metadata_payload["metadata"] = (
+                                        self._ingest_usage_metadata(
+                                            str(payload.workspaceId), meta_usage
+                                        )
+                                    )
                                     await self._socket_client.emit(
                                         "document_feature_response",
                                         workspace_metadata_payload,
@@ -1693,6 +1778,33 @@ class WorkspaceEventsMixin:
                             logger.error(f"Failed to emit sync results: {emit_error}")
                 except Exception as doc_error:
                     logger.error("Error syncing documents: {}", str(doc_error))
+
+                    # Report the partial re-ingestion spend, exactly as the
+                    # created path does: a crash part-way through still burned
+                    # real OCR/STT money. _ingest_usage_metadata is idempotent,
+                    # so if the success emit above already reported it this
+                    # degrades to the cumulative-only block.
+                    if self._socket_client:
+                        try:
+                            error_payload = {
+                                "featureType": "document_assessments",
+                                "workspaceId": payload.workspaceId,
+                                "userId": payload.userId,
+                                "error": str(doc_error),
+                                "metadata": self._ingest_usage_metadata(
+                                    str(payload.workspaceId), ingest_usage
+                                ),
+                            }
+                            await self._socket_client.emit(
+                                "document_feature_response", error_payload
+                            )
+                            logger.error(
+                                "❌ Document sync error sent to backend (with partial spend)"
+                            )
+                        except Exception as emit_error:
+                            logger.error(
+                                "Failed to emit sync error notification: {}", emit_error
+                            )
 
             # When we skipped re-processing (no new/changed/deleted docs), re-emit from cache only.
             # Do NOT regenerate — only when user adds/updates/deletes documents do we regenerate (paths above).

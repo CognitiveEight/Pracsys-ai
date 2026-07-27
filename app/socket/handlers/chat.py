@@ -118,16 +118,23 @@ class ChatMixin:
     def _token_usage_metadata(
         self, workspace_id: str, usage: Any
     ) -> Dict[str, Any]:
-        """Build the token/price metadata fields for one ai_response.
+        """Build the usage/price metadata fields for one ai_response.
 
-        Prices this turn's accumulated tokens with the active model's rate,
-        increments the workspace's cumulative totals (persisted to Qdrant), and
-        returns a dict merged into ``AIResponseMetadata``. Best-effort: returns
-        ``{}`` if anything fails so a pricing hiccup never blocks a response.
-        Call exactly once per emitted response (one ai_response per turn).
+        Prices this turn's accumulated tokens with the active model's rate AND the
+        paid non-LLM work it triggered (Vision OCR units, Speech-to-Text seconds,
+        Vertex AI Search queries, Google Search grounding requests, embedding
+        tokens), increments the workspace's cumulative totals (persisted to
+        Qdrant), and returns a dict merged into ``AIResponseMetadata``.
+
+        ``price`` is the FULL cost of this response — ``inputPrice + outputPrice
+        + servicePrice`` — with each component also exposed on its own field so
+        the backend can break the bill down by source.
+
+        Best-effort: returns ``{}`` if anything fails so a pricing hiccup never
+        blocks a response. Call exactly once per emitted response.
         """
         try:
-            from app.ai.pricing import price_for
+            from app.ai.pricing import price_for, service_price_for
             from app.workspace.context import context_manager
 
             input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
@@ -136,6 +143,24 @@ class ChatMixin:
             price = price_for(model, input_tokens, output_tokens)
             total_tokens = input_tokens + output_tokens
 
+            # Paid non-LLM units consumed inside the same capture scope.
+            service_units: Dict[str, Any] = {
+                "ocrUnits": int(getattr(usage, "ocr_units", 0) or 0),
+                "sttSeconds": round(float(getattr(usage, "stt_seconds", 0.0) or 0.0), 3),
+                "searchQueries": int(getattr(usage, "search_queries", 0) or 0),
+                "groundingRequests": int(
+                    getattr(usage, "grounding_requests", 0) or 0
+                ),
+                "embedTokens": int(getattr(usage, "embed_tokens", 0) or 0),
+            }
+            service = service_price_for(
+                ocr_units=service_units["ocrUnits"],
+                stt_seconds=service_units["sttSeconds"],
+                search_queries=service_units["searchQueries"],
+                grounding_requests=service_units["groundingRequests"],
+                embed_tokens=service_units["embedTokens"],
+            )
+
             fields: Dict[str, Any] = {
                 "inputTokens": input_tokens,
                 "outputTokens": output_tokens,
@@ -143,8 +168,11 @@ class ChatMixin:
                 "tokensUsed": total_tokens,
                 "inputPrice": price["inputPrice"],
                 "outputPrice": price["outputPrice"],
-                "price": price["price"],
+                # Full cost of this response: LLM tokens + paid non-LLM APIs.
+                "price": round(price["price"] + service["servicePrice"], 6),
             }
+            fields.update(service_units)
+            fields.update(service)
 
             ctx = context_manager.get_context(workspace_id)
             if ctx is not None:
@@ -154,7 +182,13 @@ class ChatMixin:
                     # totals as they already stand.
                     totals = ctx.get_metadata("token_usage") or {}
                 else:
-                    totals = ctx.add_token_usage(input_tokens, output_tokens, price)
+                    totals = ctx.add_token_usage(
+                        input_tokens,
+                        output_tokens,
+                        price,
+                        service=service,
+                        service_units=service_units,
+                    )
                     try:
                         usage.counted = True
                     except Exception:
@@ -168,6 +202,7 @@ class ChatMixin:
                         "totalPrice": totals.get("totalPrice", 0.0),
                     }
                 )
+                fields.update(self._cumulative_service_fields(totals))
             else:
                 logger.debug(
                     "No workspace context for {}; emitting per-response token "
@@ -179,8 +214,81 @@ class ChatMixin:
             logger.warning("Failed to build token usage metadata: {}", exc)
             return {}
 
+    def _ingest_usage_metadata(self, workspace_id: str, usage: Any) -> Dict[str, Any]:
+        """Usage metadata for a HAND-BUILT ``document_feature_response`` payload.
+
+        ``_emit_document_feature`` supplies ``messageId`` / ``aiModel`` around
+        ``_token_usage_metadata``; the few payloads assembled as dict literals
+        (the ingestion ``document_assessments`` emits) do not go through it, so
+        this wrapper adds the same two fields. Without ``messageId`` the backend
+        ``WorkspaceCostService`` drops the cost record entirely.
+
+        Idempotent per accumulator: once a scope's spend has been reported the
+        accumulator is flagged ``counted``, and any further call degrades to the
+        cumulative-only block. That makes this safe to call from both the success
+        emit and the ingestion error path — whichever runs first reports the real
+        (possibly partial) spend, and the other cannot double-report it.
+        """
+        if usage is None or bool(getattr(usage, "counted", False)):
+            return self._cumulative_usage_metadata(workspace_id)
+        metadata = self._token_usage_metadata(workspace_id, usage)
+        if isinstance(metadata, dict):
+            metadata.setdefault("messageId", uuid.uuid4().hex)
+            metadata.setdefault("aiModel", settings.gemini_model)
+            # Hand-built payloads bypass _emit_document_feature's check, so run it
+            # here too — same reason: an unknown key means an unrecorded cost.
+            self._warn_unknown_metadata_keys("ingestion payload", metadata)
+        return metadata
+
+    @staticmethod
+    def _warn_unknown_metadata_keys(label: str, metadata: Dict[str, Any]) -> None:
+        """Warn when a metadata block carries a key the backend contract has no field for.
+
+        ``document_feature_response`` is a hand-built dict with no pydantic model,
+        so its ``metadata`` mirrors ``AIResponseMetadata`` by convention only — a
+        typo'd key ships silently and the backend ``WorkspaceCostService`` never
+        sees that cost. ``AIResponseMetadata`` (app/socket/schemas.py) is the single
+        source of truth for the field list; nothing is dropped or renamed here, the
+        mismatch is only surfaced in the logs.
+        """
+        try:
+            from app.socket.schemas import AIResponseMetadata
+
+            known = set(AIResponseMetadata.model_fields.keys())
+            unknown = sorted(set(metadata.keys()) - known)
+            if unknown:
+                logger.warning(
+                    "Metadata for {} carries key(s) absent from AIResponseMetadata: "
+                    "{} — the backend will ignore them (typo?)",
+                    label,
+                    ", ".join(unknown),
+                )
+        except Exception as exc:  # a naming check must never block an emit
+            logger.debug("Metadata key check failed for {}: {}", label, exc)
+
+    @staticmethod
+    def _cumulative_service_fields(totals: Dict[str, Any]) -> Dict[str, Any]:
+        """Read the cumulative paid non-LLM totals out of a ``token_usage`` snapshot.
+
+        Every lookup defaults to 0 because workspaces whose ``token_usage`` was
+        cached before service costing was added rehydrate without these keys.
+        """
+        return {
+            "totalOcrUnits": totals.get("totalOcrUnits", 0),
+            "totalOcrPrice": totals.get("totalOcrPrice", 0.0),
+            "totalSttSeconds": totals.get("totalSttSeconds", 0.0),
+            "totalSttPrice": totals.get("totalSttPrice", 0.0),
+            "totalSearchQueries": totals.get("totalSearchQueries", 0),
+            "totalSearchPrice": totals.get("totalSearchPrice", 0.0),
+            "totalGroundingRequests": totals.get("totalGroundingRequests", 0),
+            "totalGroundingPrice": totals.get("totalGroundingPrice", 0.0),
+            "totalEmbedTokens": totals.get("totalEmbedTokens", 0),
+            "totalEmbedPrice": totals.get("totalEmbedPrice", 0.0),
+            "totalServicePrice": totals.get("totalServicePrice", 0.0),
+        }
+
     def _cumulative_usage_metadata(self, workspace_id: str) -> Dict[str, Any]:
-        """Usage metadata for a RE-EMIT (no new LLM call this time).
+        """Usage metadata for a RE-EMIT (no new LLM/paid API call this time).
 
         Per-response fields are zero; cumulative fields report the workspace's
         current running totals WITHOUT incrementing them (reconnect replay,
@@ -201,6 +309,18 @@ class ChatMixin:
                 "inputPrice": 0.0,
                 "outputPrice": 0.0,
                 "price": 0.0,
+                # No paid non-LLM work happened on a re-emit either.
+                "ocrUnits": 0,
+                "ocrPrice": 0.0,
+                "sttSeconds": 0.0,
+                "sttPrice": 0.0,
+                "searchQueries": 0,
+                "searchPrice": 0.0,
+                "groundingRequests": 0,
+                "groundingPrice": 0.0,
+                "embedTokens": 0,
+                "embedPrice": 0.0,
+                "servicePrice": 0.0,
             }
             ctx = context_manager.get_context(workspace_id)
             if ctx is not None:
@@ -214,6 +334,7 @@ class ChatMixin:
                         "totalPrice": totals.get("totalPrice", 0.0),
                     }
                 )
+                fields.update(self._cumulative_service_fields(totals))
             return fields
         except Exception as exc:
             logger.warning("Failed to build cumulative usage metadata: {}", exc)
@@ -239,9 +360,11 @@ class ChatMixin:
         The metadata block uses the same field names as ``AIResponseMetadata`` so
         the backend reads it identically to the chat ``ai_response`` contract.
         Best-effort throughout: a pricing hiccup never blocks the emit.
+
+        The metadata block is built BEFORE the socket-client check: building it is
+        what folds the spend into the workspace cumulative, and money already
+        burned must be billed even when there is no socket to emit on.
         """
-        if not self._socket_client:
-            return
         try:
             if usage is not None:
                 metadata = self._token_usage_metadata(workspace_id, usage)
@@ -254,6 +377,7 @@ class ChatMixin:
                 # one per emit here. aiModel mirrors the ai_response contract.
                 metadata.setdefault("messageId", uuid.uuid4().hex)
                 metadata.setdefault("aiModel", settings.gemini_model)
+                self._warn_unknown_metadata_keys(feature_type, metadata)
         except Exception as exc:
             logger.warning(
                 "Feature usage metadata build failed for {} (non-fatal): {}",
@@ -261,6 +385,14 @@ class ChatMixin:
                 exc,
             )
             metadata = {}
+        if not self._socket_client:
+            logger.info(
+                "No socket client — {} emit dropped for workspace {} (spend still "
+                "billed to the workspace cumulative)",
+                feature_type,
+                str(workspace_id)[:12],
+            )
+            return
         await self._socket_client.emit(
             "document_feature_response",
             {
@@ -2270,6 +2402,27 @@ class ChatMixin:
           generate contextual, role-based suggestion chips so they change with the chat.
         - Otherwise return a random 4 from the stored 15-16 strategy chips (role/case-related).
         Chips are sent as prompts[]; when user clicks one, that text goes into the chat as the user message.
+
+        The whole body runs inside a usage scope: the contextual-chip branch calls
+        Gemini (``_generate_contextual_suggestion_chips``), and without a scope
+        those tokens were billed to nobody. Most polls serve cached chips and spend
+        nothing, so the usage metadata is attached only when tokens were actually
+        consumed — see the emit below.
+        """
+        import random
+
+        from app.ai.usage import capture_usage
+
+        with capture_usage() as chips_usage:
+            await self._handle_probing_prompts_request(data, chips_usage)
+
+    async def _handle_probing_prompts_request(
+        self, data: Dict[str, Any], chips_usage: Any = None
+    ) -> None:
+        """Body of :meth:`on_probing_prompts_request` (see its docstring).
+
+        Split out so the usage scope can wrap the whole thing with one ``with``
+        rather than re-indenting the entire handler.
         """
         import random
 
@@ -2487,6 +2640,22 @@ class ChatMixin:
             }
             if data.get("timestamp") is not None:
                 response["timestamp"] = data.get("timestamp")
+
+            # Bill the chip-generation spend (only the contextual branch calls
+            # Gemini; a cached-chip poll consumes nothing and gets no metadata
+            # block, so the backend does not record a stream of $0 entries).
+            # Billed before the throttle check below so a throttled response
+            # still adds its real spend to the workspace cumulative.
+            chips_metadata = None
+            spent_tokens = (
+                int(getattr(chips_usage, "input_tokens", 0) or 0)
+                + int(getattr(chips_usage, "output_tokens", 0) or 0)
+            )
+            if workspace_id and spent_tokens > 0:
+                chips_metadata = self._ingest_usage_metadata(workspace_id, chips_usage)
+                if chips_metadata:
+                    response["metadata"] = chips_metadata
+
             if self._socket_client:
                 import time
 

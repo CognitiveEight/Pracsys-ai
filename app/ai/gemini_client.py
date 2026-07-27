@@ -26,7 +26,11 @@ except Exception:  # pragma: no cover - depends on installed deps
     genai_ng_types = None  # type: ignore
     _NG_SDK_AVAILABLE = False
 
-from app.ai.usage import record_usage
+from app.ai.usage import (
+    record_embed_tokens,
+    record_grounding_requests,
+    record_usage,
+)
 from app.core.config import settings
 from app.observability.trace import tracer
 
@@ -423,6 +427,10 @@ class GeminiClient:
                             )
 
                         repair_response = await asyncio.to_thread(_sync_repair)
+                        # A repair round is a full billable generation — record it
+                        # like the first pass above, or JSON-mode features
+                        # under-report every time their output needs repairing.
+                        self._record_usage(repair_response)
                         repaired_text = self._safe_extract_text(repair_response)
                         valid = self._coerce_valid_json_text(repaired_text)
                         if valid is not None:
@@ -764,6 +772,9 @@ class GeminiClient:
                 response, label=f"{self.model_name}/grounded"
             )
             self._record_usage(response)
+            # Grounding with Google Search is billed PER REQUEST on top of the
+            # tokens recorded above, so both are counted here.
+            record_grounding_requests(1)
             text = self._safe_extract_text(response) or ""
             sources = self._extract_grounding_sources(response)
             logger.info(
@@ -872,6 +883,14 @@ class GeminiClient:
                 )
 
             result = await asyncio.to_thread(_sync_embed)
+
+            # Cost: embeddings are billed per input token, but the legacy
+            # ``genai.embed_content`` result is a plain {"embedding": [...]} dict
+            # with no usage_metadata — the real count is unavailable here. Record
+            # a ~4-chars-per-token ESTIMATE so the spend is not invisible;
+            # ``embedPrice`` is therefore approximate (at $0.15/1M the absolute
+            # error is negligible next to OCR/STT).
+            record_embed_tokens(len(text or "") // 4)
 
             embedding = result["embedding"]
 

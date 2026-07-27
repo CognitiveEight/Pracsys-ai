@@ -308,6 +308,20 @@ class TemplateSyncMixin:
         except Exception as e:
             logger.error("_emit_blueprint_proposals: drafting agent unavailable: {}", e)
             return
+        # Profiling calls Gemini; user-scoped like template ingest, so priced and
+        # logged rather than billed to a workspace (see _ingest_template_items).
+        from app.ai.usage import capture_usage, log_unbilled_usage
+
+        with capture_usage() as proposal_usage:
+            try:
+                await self._emit_blueprint_proposals_inner(user_id, templates, drafting_agent)
+            finally:
+                log_unbilled_usage("blueprint proposals", proposal_usage)
+
+    async def _emit_blueprint_proposals_inner(
+        self, user_id: str, templates: List[Any], drafting_agent: Any
+    ) -> None:
+        """Body of :meth:`_emit_blueprint_proposals` (see its docstring)."""
         for tpl in templates:
             # Skip presets (no draft body) and re-uploads that already shipped an
             # approved blueprint (those are stored authoritative at ingest).
@@ -355,7 +369,25 @@ class TemplateSyncMixin:
         ``template_sync_response`` snapshot. Returns the count ingested.
         Per-item failures are isolated and non-fatal. Re-uses any existing
         cached payload so an unchanged file hash skips re-extraction.
+
+        Template ingestion is paid work (Vision OCR on scanned templates, Gemini
+        profiling), but it is user-scoped — templates belong to a library, not a
+        workspace — so a scope is opened here purely to price and log the spend
+        via ``log_unbilled_usage``. Wrapping the shared helper covers both
+        callers at once.
         """
+        from app.ai.usage import capture_usage, log_unbilled_usage
+
+        with capture_usage() as tpl_usage:
+            try:
+                return await self._ingest_template_items_inner(user_id, templates)
+            finally:
+                log_unbilled_usage("template ingest", tpl_usage)
+
+    async def _ingest_template_items_inner(
+        self, user_id: str, templates: List[Any]
+    ) -> int:
+        """Body of :meth:`_ingest_template_items` (see its docstring)."""
         try:
             from app.langgraph.drafting_agent import drafting_agent
         except Exception as e:
@@ -525,7 +557,23 @@ class TemplateSyncMixin:
 
         Re-profiles the template (forcing a fresh profile even if one exists)
         and emits a fresh ``template_blueprint_proposal`` back. Ingests the
-        template from ``fileUrl`` first when the in-memory store is cold."""
+        template from ``fileUrl`` first when the in-memory store is cold.
+
+        Wrapped in a usage scope: the cold ingest OCRs the template and the
+        proposal build calls Gemini. This event is user-scoped (no workspaceId in
+        the payload and none in the reply), so the spend cannot be added to a
+        workspace cumulative — it is priced and logged instead, which also keeps
+        the "consumed outside any capture_usage scope" alarm meaningful."""
+        from app.ai.usage import capture_usage, log_unbilled_usage
+
+        with capture_usage() as tpl_usage:
+            try:
+                await self._handle_request_blueprint_proposal(data)
+            finally:
+                log_unbilled_usage("request_blueprint_proposal", tpl_usage)
+
+    async def _handle_request_blueprint_proposal(self, data: Dict[str, Any]) -> None:
+        """Body of :meth:`on_request_blueprint_proposal` (see its docstring)."""
         payload_in = data if isinstance(data, dict) else {}
         user_id = str(payload_in.get("userId") or "").strip()
         template_id = str(payload_in.get("templateId") or "").strip()

@@ -181,6 +181,7 @@ class FileProcessor:
 
             from google.auth.api_key import Credentials as ApiKeyCredentials
 
+            from app.ai.usage import record_ocr_units
             from app.core.config import settings
 
             # Vision OCR uses API key only (no service-account credentials).
@@ -200,6 +201,12 @@ class FileProcessor:
 
             image = vision.Image(content=image_data)
             response = client.text_detection(image=image)
+            # Cost: one billable Vision unit per call — recorded here, the single
+            # Vision call site, so every OCR path (per-PDF-page loop in
+            # _extract_text_from_pdf_with_ocr, standalone images, content-sniffed
+            # images) is counted exactly once. Recorded BEFORE the error check
+            # below because a response that carries an error was still billed.
+            record_ocr_units(1)
             if response.error.message:
                 raise Exception(f"GCP Vision API error: {response.error.message}")
 

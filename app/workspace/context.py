@@ -160,25 +160,47 @@ class WorkspaceContext:
         self._persist_meta()
 
     def add_token_usage(
-        self, input_tokens: int, output_tokens: int, price: Dict[str, float]
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        price: Dict[str, float],
+        service: Optional[Dict[str, float]] = None,
+        service_units: Optional[Dict[str, float]] = None,
     ) -> Dict[str, float]:
-        """Increment the workspace's cumulative token/price totals and persist.
+        """Increment the workspace's cumulative usage/price totals and persist.
 
         Stores the running totals under ``metadata["token_usage"]`` so they ride
         the existing WORKSPACE_META Qdrant cache (see ``to_cache_dict`` /
         ``apply_cache_dict``) and survive an AI-service restart. ``price`` is the
-        per-response cost dict from ``app.ai.pricing.price_for`` (keys
+        per-response LLM cost dict from ``app.ai.pricing.price_for`` (keys
         ``inputPrice``, ``outputPrice``, ``price``).
 
-        Returns the updated cumulative snapshot:
-        ``totalInputTokens``, ``totalOutputTokens``, ``totalTokens``,
-        ``totalInputPrice``, ``totalOutputPrice``, ``totalPrice``.
+        ``service`` is the optional paid non-LLM cost dict from
+        ``app.ai.pricing.service_price_for`` (``ocrPrice``, ``sttPrice``,
+        ``searchPrice``, ``groundingPrice``, ``embedPrice``, ``servicePrice``) and
+        ``service_units`` the raw quantities behind it (``ocrUnits``,
+        ``sttSeconds``, ``searchQueries``, ``groundingRequests``, ``embedTokens``).
+        ``servicePrice`` is folded into ``totalPrice``, so ``totalPrice`` is the
+        workspace's whole bill — LLM plus OCR/STT/search/grounding/embeddings.
+
+        Returns the updated cumulative snapshot: the ``totalInputTokens`` /
+        ``totalOutputTokens`` / ``totalTokens`` / ``totalInputPrice`` /
+        ``totalOutputPrice`` / ``totalPrice`` fields plus the per-source
+        ``total*`` service fields and ``totalServicePrice``.
+
+        Note every read below uses ``.get(key, 0)``: ``apply_cache_dict``
+        rehydrates pre-existing workspaces whose cached ``token_usage`` predates
+        the service fields, so the new keys are legitimately absent there.
         """
         in_tok = max(int(input_tokens or 0), 0)
         out_tok = max(int(output_tokens or 0), 0)
         in_price = float(price.get("inputPrice", 0.0) or 0.0)
         out_price = float(price.get("outputPrice", 0.0) or 0.0)
-        total_price = float(price.get("price", in_price + out_price) or 0.0)
+        llm_price = float(price.get("price", in_price + out_price) or 0.0)
+
+        service = service or {}
+        service_units = service_units or {}
+        service_price = float(service.get("servicePrice", 0.0) or 0.0)
 
         current = self.metadata.get("token_usage") or {}
         totals = {
@@ -191,13 +213,48 @@ class WorkspaceContext:
             "totalOutputPrice": round(
                 float(current.get("totalOutputPrice", 0.0) or 0.0) + out_price, 6
             ),
+            # Whole bill: LLM tokens + paid non-LLM APIs.
             "totalPrice": round(
-                float(current.get("totalPrice", 0.0) or 0.0) + total_price, 6
+                float(current.get("totalPrice", 0.0) or 0.0)
+                + llm_price
+                + service_price,
+                6,
             ),
         }
         totals["totalTokens"] = (
             totals["totalInputTokens"] + totals["totalOutputTokens"]
         )
+
+        # Per-source paid non-LLM totals. Units are counted alongside cost so the
+        # backend can show "N pages OCR'd" next to the dollar figure.
+        for total_key, source_key, caster in (
+            ("totalOcrUnits", "ocrUnits", int),
+            ("totalSearchQueries", "searchQueries", int),
+            ("totalGroundingRequests", "groundingRequests", int),
+            ("totalEmbedTokens", "embedTokens", int),
+        ):
+            totals[total_key] = caster(current.get(total_key, 0) or 0) + caster(
+                service_units.get(source_key, 0) or 0
+            )
+        totals["totalSttSeconds"] = round(
+            float(current.get("totalSttSeconds", 0.0) or 0.0)
+            + float(service_units.get("sttSeconds", 0.0) or 0.0),
+            3,
+        )
+        for total_key, source_key in (
+            ("totalOcrPrice", "ocrPrice"),
+            ("totalSttPrice", "sttPrice"),
+            ("totalSearchPrice", "searchPrice"),
+            ("totalGroundingPrice", "groundingPrice"),
+            ("totalEmbedPrice", "embedPrice"),
+            ("totalServicePrice", "servicePrice"),
+        ):
+            totals[total_key] = round(
+                float(current.get(total_key, 0.0) or 0.0)
+                + float(service.get(source_key, 0.0) or 0.0),
+                6,
+            )
+
         # set_metadata persists the whole context (fire-and-forget to Qdrant).
         self.set_metadata("token_usage", totals)
         return totals

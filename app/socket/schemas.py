@@ -595,14 +595,48 @@ class AIResponseMetadata(BaseModel):
     totalTokens: Optional[int] = None
     inputPrice: Optional[float] = None
     outputPrice: Optional[float] = None
-    price: Optional[float] = None  # inputPrice + outputPrice for this response
+    # FULL cost of this response: inputPrice + outputPrice + servicePrice.
+    price: Optional[float] = None
+
+    # --- Per-response paid NON-LLM usage & cost (this response only) ---
+    # The pipeline spends money outside Gemini generation. Each source reports its
+    # billable quantity and its USD cost; ``servicePrice`` is their sum and is
+    # already included in ``price`` above. Rates: app/ai/pricing.py (env-overridable).
+    # Free tiers are monthly + account-wide so they are NOT modelled — these are
+    # upper bounds. ``embedTokens`` is an estimate (~4 chars/token).
+    ocrUnits: Optional[int] = None  # Vision units: 1 per image, 1 per OCR'd PDF page
+    ocrPrice: Optional[float] = None
+    sttSeconds: Optional[float] = None  # Speech-to-Text billed audio seconds
+    sttPrice: Optional[float] = None
+    searchQueries: Optional[int] = None  # Vertex AI Search queries
+    searchPrice: Optional[float] = None
+    groundingRequests: Optional[int] = None  # Google Search grounding requests
+    groundingPrice: Optional[float] = None
+    embedTokens: Optional[int] = None  # embedding input tokens (estimated)
+    embedPrice: Optional[float] = None
+    servicePrice: Optional[float] = None  # sum of the five prices above
 
     # --- Cumulative per-workspace totals (incremented on every response) ---
     totalInputTokens: Optional[int] = None
     totalOutputTokens: Optional[int] = None
     totalInputPrice: Optional[float] = None
     totalOutputPrice: Optional[float] = None
-    totalPrice: Optional[float] = None  # running total cost for the workspace
+    # Running total cost for the workspace: LLM tokens AND paid non-LLM APIs
+    # (== totalInputPrice + totalOutputPrice + totalServicePrice).
+    totalPrice: Optional[float] = None
+
+    # --- Cumulative per-workspace paid NON-LLM totals ---
+    totalOcrUnits: Optional[int] = None
+    totalOcrPrice: Optional[float] = None
+    totalSttSeconds: Optional[float] = None
+    totalSttPrice: Optional[float] = None
+    totalSearchQueries: Optional[int] = None
+    totalSearchPrice: Optional[float] = None
+    totalGroundingRequests: Optional[int] = None
+    totalGroundingPrice: Optional[float] = None
+    totalEmbedTokens: Optional[int] = None
+    totalEmbedPrice: Optional[float] = None
+    totalServicePrice: Optional[float] = None  # included in totalPrice above
 
     # Additional fields for internal use (not in backend spec)
     confidence: Optional[str] = None

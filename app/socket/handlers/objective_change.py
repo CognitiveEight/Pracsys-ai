@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import capture_usage, current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -119,6 +120,7 @@ from app.prompts.objective_change_prompts import (
     llm_merge_dated_entries_against_previous_prompt,
     llm_classify_factual_vs_procedural_prompt,
     merge_applicable_laws_with_previous_prompt,
+    llm_resolve_answered_missing_info_prompt,
 )
 
 
@@ -313,14 +315,12 @@ class ObjectiveChangeMixin:
                     workspace_id
                 ) or {"caseLaws": []}
                 try:
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "case_laws",
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "payload": fallback,
-                        },
+                    await self._emit_document_feature(
+                        feature_type="case_laws",
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        payload=fallback,
+                        usage=None,
                     )
                 except Exception as emit_err:
                     logger.warning(
@@ -723,6 +723,121 @@ class ObjectiveChangeMixin:
                 if len(fallback) >= max_keep:
                     break
             return fallback[:max_keep]
+
+    async def _llm_resolve_answered_missing_info(
+        self,
+        workspace_id: str,
+        merged_missing: List[str],
+        fresh_missing: List[str],
+        *,
+        log_context: str = "",
+    ) -> List[str]:
+        """Post-merge resolution pass: drop merged missingInfo items that are
+        now ANSWERED by the uploaded documents (the grow-only merge never
+        removes items, so an item asking for e.g. a cheque number would stay
+        forever after the user uploads the cheque).
+
+        Fail-open: any error returns the input list unchanged. Never drops
+        items the fresh regeneration still flags as missing, nor entries the
+        user added via added_missing_information.
+        """
+        items = [s for s in (merged_missing or []) if isinstance(s, str) and s.strip()]
+        if not items:
+            return merged_missing
+        try:
+            from app.ai.gemini_client import gemini_client
+            from app.vectorstore.qdrant import vector_store
+
+            # Guard 1: the fresh generation just re-verified these against ALL
+            # documents (missing-info verification step) and still flagged
+            # them — never contradict it.
+            fresh_lower = {
+                s.strip().lower() for s in (fresh_missing or []) if isinstance(s, str)
+            }
+            # Guard 2: user-added entries are only removable by the user via
+            # analysis_report_feedback.
+            user_added = self._workspace_user_added_missing_info.get(workspace_id) or []
+
+            def _protected(item: str) -> bool:
+                if item.strip().lower() in fresh_lower:
+                    return True
+                return any(
+                    self._match_rejected_value(item, ua)
+                    for ua in user_added
+                    if isinstance(ua, str) and ua.strip()
+                )
+
+            candidate_idx = {i for i, s in enumerate(items) if not _protected(s)}
+            if not candidate_idx:
+                return items
+
+            cached = self._workspace_case_entities_cache.get(workspace_id)
+            entities = cached[1] if cached and isinstance(cached[1], dict) else {}
+            entities_block = (
+                json.dumps(entities, indent=2, ensure_ascii=False)
+                if entities
+                else "(none)"
+            )
+            docs = await vector_store.get_all_documents(workspace_id=workspace_id)
+            with_content = [d for d in docs if (d.get("content") or "").strip()]
+            budget = 40000
+            per_doc = budget // max(1, len(with_content))
+            doc_parts = []
+            for i, d in enumerate(with_content, 1):
+                content = (d.get("content") or "").strip()[:per_doc]
+                doc_parts.append(
+                    f"--- Document {i} (id: {d.get('document_id') or ''}) ---\n{content}"
+                )
+            document_content = (
+                "\n\n".join(doc_parts) or "No document content available."
+            )
+
+            numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(items))
+            prompt = llm_resolve_answered_missing_info_prompt(
+                numbered_items=numbered,
+                entities_block=entities_block,
+                document_content=document_content,
+            )
+            raw = await gemini_client.generate(
+                prompt=prompt,
+                temperature=0.0,
+                max_tokens=4000,
+                response_mime_type="application/json",
+            )
+            candidate = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            parsed = json.loads(candidate) if candidate else json.loads((raw or "").strip())
+            answered = parsed.get("answered") if isinstance(parsed, dict) else None
+            if not isinstance(answered, list):
+                return items
+            drop: Set[int] = set()
+            for a in answered:
+                if not isinstance(a, dict):
+                    continue
+                try:
+                    n = int(a.get("index"))
+                except (TypeError, ValueError):
+                    continue
+                # Evidence quote is mandatory — an index without evidence is
+                # not a confirmed resolution.
+                if not str(a.get("evidence") or "").strip():
+                    continue
+                if 1 <= n <= len(items) and (n - 1) in candidate_idx:
+                    drop.add(n - 1)
+            if drop:
+                logger.info(
+                    "Analysis missingInfo resolution{}: dropping {} answered item(s): {}",
+                    log_context,
+                    len(drop),
+                    [items[i] for i in sorted(drop)],
+                )
+            return [s for i, s in enumerate(items) if i not in drop]
+        except Exception as e:
+            logger.warning(
+                "missingInfo resolution pass failed{}: {}; keeping grow-only merge result",
+                log_context,
+                e,
+            )
+            return merged_missing
 
     async def _llm_merge_strengths_against_previous(
         self,
@@ -1269,6 +1384,60 @@ class ObjectiveChangeMixin:
             law["id"] = f"law_{i+1}"
         return {"laws": merged[:max_laws]}
 
+    # Analysis-report text sections that get {id, text, isMatched} tagging, and
+    # the currentState key + rejected-memory section each maps to.
+    _ANALYSIS_TAGGED_SECTIONS = (
+        # (report_field, currentState_key, rejected_section_or_None)
+        ("missingInfo", "missingInfo", "missingInfo"),
+        ("weaknesses", "weaknesses", "riskOrWeakness"),
+        ("risks", "risks", "riskOrWeakness"),
+        ("relevantJurisdiction", "relevantJurisdiction", None),
+    )
+
+    async def _tag_analysis_report_against_current_state(
+        self,
+        workspace_id: str,
+        analysis_report: Dict[str, Any],
+        *,
+        log_context: str = "",
+    ) -> Dict[str, Any]:
+        """Tag the four analysis text sections against the frontend's
+        currentState so each item is emitted as ``{id, text, isMatched}``.
+
+        Replaces the old grow-only merge (`_merge_analysis_report_with_previous`)
+        and answered-item drop (`_llm_resolve_answered_missing_info`): the fresh
+        report is authoritative for content, and reconciliation only stamps
+        identity (matched → carry prior id; new → mint id; prev-only → dropped).
+        Rejected-item memory is still honoured. Runs on every emit (create and
+        sync); with no currentState every item is emitted new with a minted id
+        so the shape is uniform from the first emit.
+        """
+        if not isinstance(analysis_report, dict):
+            return analysis_report
+        current_state = self._workspace_current_state_payload.get(workspace_id) or {}
+        if not isinstance(current_state, dict):
+            current_state = {}
+        for report_field, cs_key, reject_section in self._ANALYSIS_TAGGED_SECTIONS:
+            fresh = _coerce_analysis_text_list(analysis_report.get(report_field))
+            # Honour rejected-item memory: never re-surface a dismissed item.
+            if reject_section:
+                fresh = [
+                    s
+                    for s in fresh
+                    if not self._is_previously_rejected_analysis_item(
+                        workspace_id=workspace_id,
+                        section=reject_section,
+                        candidate=s,
+                    )
+                ]
+            prev_items = current_state.get(cs_key) if current_state else None
+            analysis_report[report_field] = await self._reconcile_against_current_state(
+                fresh=fresh,
+                prev_items=prev_items if isinstance(prev_items, list) else None,
+                section=report_field,
+            )
+        return analysis_report
+
     async def _merge_analysis_report_with_previous(
         self,
         workspace_id: str,
@@ -1336,6 +1505,15 @@ class ObjectiveChangeMixin:
             new_missing_filtered,
             item_type="missing information items",
             max_keep=10,
+        )
+        # The merge above is grow-only; drop items now ANSWERED by the
+        # uploaded documents (must run before the score block so the score
+        # cap sees the cleaned list).
+        merged["missingInfo"] = await self._llm_resolve_answered_missing_info(
+            workspace_id,
+            merged.get("missingInfo") or [],
+            new_missing_filtered,
+            log_context=ctx,
         )
         merged["weaknesses"] = await self._llm_merge_against_previous(
             _str_list(prev_analysis.get("weaknesses")),
@@ -1533,28 +1711,44 @@ class ObjectiveChangeMixin:
         # fully objective-aligned report with a fresh score and no carryover.
         # (`_merge_analysis_report_with_previous` is unchanged and still used by
         # the document re-upload / sync paths, where incremental merge is correct.)
-        new_analysis = await self._generate_analysis_report_from_documents(
-            workspace_id=workspace_id,
-            user_id=user_id,
-            workspace_role=workspace_role,
-            batch_result=None,
-            is_update=False,
-        )
+        with capture_usage() as _u_obj_analysis:
+            new_analysis = await self._generate_analysis_report_from_documents(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+                batch_result=None,
+                is_update=False,
+            )
         if not (isinstance(new_analysis, dict) and new_analysis):
             new_analysis = self._analysis_report_fallback(
                 (workspace_role or "ADJUDICATOR").strip().upper()
             )
 
+        # Tag the objective-aligned report against the frontend's currentState
+        # so items that still textually match the previously-curated ones carry
+        # their id (isMatched=True) and genuinely new objective-driven items get
+        # a minted id (isMatched=False). This is identity-tagging only — content
+        # is fully replaced by the objective-driven regeneration above.
+        if isinstance(new_analysis, dict):
+            try:
+                new_analysis = await self._tag_analysis_report_against_current_state(
+                    workspace_id, new_analysis, log_context=ctx,
+                )
+            except Exception as tag_err:
+                logger.warning(
+                    "Objective-change analysis currentState tagging failed{}: {}; "
+                    "emitting untagged",
+                    ctx, tag_err,
+                )
+
         self._workspace_analysis_payload[workspace_id] = new_analysis
         if self._socket_client:
-            await self._socket_client.emit(
-                "document_feature_response",
-                {
-                    "featureType": "analysis_report",
-                    "workspaceId": workspace_id,
-                    "userId": user_id,
-                    "payload": new_analysis,
-                },
+            await self._emit_document_feature(
+                feature_type="analysis_report",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=new_analysis,
+                usage=_u_obj_analysis,
             )
             logger.success(
                 "✅ Objective-change analysis update emitted "
@@ -1599,18 +1793,16 @@ class ObjectiveChangeMixin:
                 preserved_dates = []
             self._workspace_list_of_dates_payload[workspace_id] = preserved_dates
             if self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "list_of_dates",
+                await self._emit_document_feature(
+                    feature_type="list_of_dates",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload={
                         "workspaceId": workspace_id,
                         "userId": user_id,
-                        "payload": {
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "listOfDates": preserved_dates,
-                        },
+                        "listOfDates": preserved_dates,
                     },
+                    usage=None,
                 )
                 logger.success(
                     "✅ Objective-change list_of_dates preserved (relevance re-eval skipped){}",
@@ -1644,14 +1836,12 @@ class ObjectiveChangeMixin:
                 preserved_laws = {}
             self._workspace_applicable_laws_payload[workspace_id] = preserved_laws
             if self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "applicable_laws",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": preserved_laws,
-                    },
+                await self._emit_document_feature(
+                    feature_type="applicable_laws",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=preserved_laws,
+                    usage=None,
                 )
                 logger.success(
                     "✅ Objective-change applicable_laws preserved (regeneration skipped){}",
@@ -1670,14 +1860,12 @@ class ObjectiveChangeMixin:
             preserved_timeline = []
         self._workspace_procedural_timeline_payload[workspace_id] = preserved_timeline
         if self._socket_client:
-            await self._socket_client.emit(
-                "document_feature_response",
-                {
-                    "featureType": "procedural_timeline",
-                    "workspaceId": workspace_id,
-                    "userId": user_id,
-                    "payload": {"proceduralTimeline": preserved_timeline},
-                },
+            await self._emit_document_feature(
+                feature_type="procedural_timeline",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload={"proceduralTimeline": preserved_timeline},
+                usage=None,
             )
             logger.success(
                 "✅ Objective-change preserved procedural_timeline re-emitted{}",
@@ -1701,33 +1889,72 @@ class ObjectiveChangeMixin:
                 parties_err,
             )
 
-        # 3d) Case laws: PRESERVE on objective change. The precedents that were
-        # uploaded/found don't change with the legal objective, so re-emit the
-        # cached payload rather than regenerating. Only regenerate on document
-        # add/delete (handled by the document-sync scheduler).
+        # 3d) Case laws: REGENERATE for the new objective so the precedents
+        # advance the new legal direction (objective_context steers both the
+        # Indian-Kanoon search query and the LLM select/rank pass;
+        # merge_with_previous=False replaces the stale set instead of unioning).
+        # Falls back to preserve-and-re-emit on failure so the panel never
+        # sticks on a loader.
+        case_done = False
         try:
-            await self._reemit_case_laws_unchanged(workspace_id, user_id)
+            await self._generate_and_emit_case_laws(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+                objective_context=new_objective_text or None,
+                merge_with_previous=False,
+            )
+            case_done = True
             logger.success(
-                "✅ Objective-change case_laws preserved (regeneration skipped){}",
+                "✅ Objective-change case_laws regenerated for new objective{}",
                 ctx,
             )
         except Exception as case_err:
             logger.warning(
-                "Objective-change case_laws preserve failed{}: {}", ctx, case_err
+                "Objective-change case_laws regeneration failed{}: {}", ctx, case_err
             )
+        if not case_done:
+            try:
+                await self._reemit_case_laws_unchanged(workspace_id, user_id)
+            except Exception as case_preserve_err:
+                logger.warning(
+                    "Objective-change case_laws preserve fallback failed{}: {}",
+                    ctx,
+                    case_preserve_err,
+                )
 
-        # 5) Drafting Assistant suggested drafts: PRESERVE on objective change.
-        # The lawyer's curated/suggested drafts and template library are unchanged
-        # by an objective shift, so re-emit the cached suggestions (clears the FE
-        # loader) instead of regenerating. Only regenerate on document add/delete.
+        # 5) Drafting Assistant suggested drafts: REGENERATE for the new
+        # objective. The generator's brief (_build_case_brief_for_drafting)
+        # reads the freshly-updated strategicObjective from the strategy cache,
+        # so a plain regeneration makes the suggested drafts objective-aware.
+        # Falls back to preserve-and-re-emit on failure so the panel loader clears.
+        draft_done = False
         try:
-            await self._reemit_drafting_unchanged(workspace_id, user_id)
+            await self._generate_and_emit_drafting_suggestions(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+            )
+            draft_done = True
+            logger.success(
+                "✅ Objective-change drafting regenerated for new objective{}",
+                ctx,
+            )
         except Exception as draft_err:
             logger.warning(
-                "Objective-change drafting preserve failed{}: {}",
+                "Objective-change drafting regeneration failed{}: {}",
                 ctx,
                 draft_err,
             )
+        if not draft_done:
+            try:
+                await self._reemit_drafting_unchanged(workspace_id, user_id)
+            except Exception as draft_preserve_err:
+                logger.warning(
+                    "Objective-change drafting preserve fallback failed{}: {}",
+                    ctx,
+                    draft_preserve_err,
+                )
 
     def _schedule_objective_change_reanalysis(
         self,
@@ -1813,23 +2040,26 @@ class ObjectiveChangeMixin:
 
         logger.info("Using workspace role for background AI pipeline: {}", role)
         try:
-            strategies_result = await self._generate_strategies_from_documents(
-                workspace_id=workspace_id,
-                user_id=user_id,
-                workspace_role=role,
-                batch_result=batch_result,
-                is_update=is_update,
-            )
+            # Meter this feature in its own scope: _generate_strategies_from_documents
+            # does not self-emit (the pipeline emits below), so capture its tokens
+            # here and hand the accumulator to the emit. The accumulator object
+            # survives after the scope closes, so the emit still reads the totals.
+            with capture_usage() as _u_strategy:
+                strategies_result = await self._generate_strategies_from_documents(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=role,
+                    batch_result=batch_result,
+                    is_update=is_update,
+                )
             if strategies_result and self._socket_client:
                 logger.success("✅ Strategies generated (background), emitting...")
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "strategy_objective",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": strategies_result,
-                    },
+                await self._emit_document_feature(
+                    feature_type="strategy_objective",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=strategies_result,
+                    usage=_u_strategy,
                 )
                 self._workspace_strategy_payload[workspace_id] = strategies_result
                 chips = strategies_result.get("suggestionChips") or []
@@ -1915,6 +2145,7 @@ class ObjectiveChangeMixin:
         except RuntimeError as e:
             logger.error("Could not schedule strategy/analysis pipeline: {}", e)
 
+    @meter_usage
     async def _emit_analysis_report(
         self,
         workspace_id: str,
@@ -1960,27 +2191,24 @@ class ObjectiveChangeMixin:
             analysis_report = self._analysis_report_fallback(
                 (workspace_role or "ADJUDICATOR").strip().upper()
             )
-        # Merge with the previously cached version when this is a regeneration
-        # (audio re-uploaded, transcript edited, sync after add/edit). Without
-        # this, the FE sees v1 from the first emit AND v2 from the second emit
-        # with overlapping items — e.g. "Name of the Petitioner's bank and
-        # specific branch" (v1) plus "Name of the Petitioner's bank" (v2).
-        # The merge unions prev + new and runs LLM semantic dedup so each
-        # emitted report is the cumulative state with no semantic duplicates,
-        # rejection memory preserved, and identity/score from prev kept.
-        if is_update and isinstance(analysis_report, dict):
+        # Tag the fresh report's text sections against the frontend's
+        # currentState so each item carries {id, text, isMatched}: items that
+        # match the previously-curated state keep their id (isMatched=True),
+        # genuinely new items get a minted id (isMatched=False), and prev-only
+        # items are dropped. Runs on every emit (create + sync) so the shape is
+        # uniform; with no currentState every item is emitted new.
+        if isinstance(analysis_report, dict):
             try:
-                analysis_report = await self._merge_analysis_report_with_previous(
-                    workspace_id=workspace_id,
-                    workspace_role=workspace_role,
-                    new_analysis=analysis_report,
+                analysis_report = await self._tag_analysis_report_against_current_state(
+                    workspace_id,
+                    analysis_report,
                     log_context=log_context or " (emit)",
                 )
-            except Exception as merge_err:
+            except Exception as tag_err:
                 logger.warning(
-                    "Analysis report merge with previous failed{}: {}; "
-                    "emitting unmerged",
-                    log_context, merge_err,
+                    "Analysis report currentState tagging failed{}: {}; "
+                    "emitting untagged",
+                    log_context, tag_err,
                 )
         # Guard: if objective-change refresh is active, skip stale background emits
         # so workspace sees only objective-aligned analysis report.
@@ -1997,14 +2225,12 @@ class ObjectiveChangeMixin:
         self._workspace_analysis_payload[workspace_id] = analysis_report
         self._pending_reemit_workspace_id = workspace_id
         self._pending_reemit_user_id = user_id
-        await self._socket_client.emit(
-            "document_feature_response",
-            {
-                "featureType": "analysis_report",
-                "workspaceId": workspace_id,
-                "userId": user_id,
-                "payload": analysis_report,
-            },
+        await self._emit_document_feature(
+            feature_type="analysis_report",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            payload=analysis_report,
+            usage=current_usage(),
         )
         logger.success("✅ Analysis report sent to backend{}", log_context)
         # Brief yield so the socket can flush before caller continues (reduces risk of disconnect before delivery)
@@ -2050,6 +2276,7 @@ class ObjectiveChangeMixin:
             )
         return True
 
+    @meter_usage
     async def _generate_and_emit_analysis_report_for_sync(
         self,
         workspace_id: str,
@@ -2074,27 +2301,22 @@ class ObjectiveChangeMixin:
                 analysis_report = self._analysis_report_fallback(
                     (workspace_role or "ADJUDICATOR").strip().upper()
                 )
-            # Merge with the previous cached version: drops items the user
-            # already saw, preserves rejection memory, keeps identity + score.
-            # Without this, a transcript-edit re-upload re-emits the prev
-            # missingInfo / weaknesses / risks alongside any new ones, doubling
-            # up the list visible in the UI.
+            # Tag the fresh report against the frontend's currentState so items
+            # carry {id, text, isMatched} (matched → prior id; new → minted id;
+            # prev-only → dropped). Rejection memory is still honoured.
             if isinstance(analysis_report, dict):
-                analysis_report = await self._merge_analysis_report_with_previous(
-                    workspace_id=workspace_id,
-                    workspace_role=workspace_role,
-                    new_analysis=analysis_report,
+                analysis_report = await self._tag_analysis_report_against_current_state(
+                    workspace_id,
+                    analysis_report,
                     log_context=" (sync)",
                 )
             if self._socket_client and analysis_report:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "analysis_report",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": analysis_report,
-                    },
+                await self._emit_document_feature(
+                    feature_type="analysis_report",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=analysis_report,
+                    usage=current_usage(),
                 )
                 self._workspace_analysis_payload[workspace_id] = analysis_report
                 logger.success("✅ Analysis report sent to backend (sync)")
@@ -2117,14 +2339,12 @@ class ObjectiveChangeMixin:
                     (workspace_role or "ADJUDICATOR").strip().upper()
                 )
                 if self._socket_client:
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "analysis_report",
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "payload": fallback,
-                        },
+                    await self._emit_document_feature(
+                        feature_type="analysis_report",
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        payload=fallback,
+                        usage=current_usage(),
                     )
                     self._workspace_analysis_payload[workspace_id] = fallback
                     logger.success(

@@ -10,6 +10,7 @@ __all__ = [
     "generate_strategies_from_documents_prompt5",
     "generate_strategies_from_documents_prompt6",
     "regenerate_strategy_objective_preserving_case_summary_prompt",
+    "reground_strategy_objective_prompt",
     "regenerate_case_summary_with_feedback_prompt",
     "regenerate_next_steps_with_feedback_prompt",
     "regenerate_strategic_objective_with_feedback_prompt",
@@ -18,7 +19,38 @@ __all__ = [
     "llm_classify_objective_change_intent_prompt",
     "llm_classify_panel_edit_intent_prompt",
     "llm_classify_panel_edit_intent_prompt2",
+    "role_to_party_resolution_block",
 ]
+
+
+def role_to_party_resolution_block(workspace_role, *, confirmed_party=None):
+    """Binds the abstract workspace role to a SPECIFIC NAMED party in the correct
+    (live / dominant) proceeding.
+
+    In consolidated, multi-proceeding records the same person can be the
+    complainant/petitioner in one matter and the respondent/appellant in another,
+    so the model must resolve WHICH named party holds the selected role in the
+    live matter before writing any advocacy — otherwise it argues for the wrong
+    side. When the user has already confirmed the role-holder, that mapping is
+    injected as an authoritative anchor that overrides the model's own inference.
+    """
+    confirmed_line = ""
+    if confirmed_party and str(confirmed_party).strip():
+        confirmed_line = (
+            f"\n- USER-CONFIRMED (AUTHORITATIVE — overrides your own inference): the "
+            f"{workspace_role} in this matter is {str(confirmed_party).strip()}. Write ALL "
+            f"advocacy for {str(confirmed_party).strip()} as the {workspace_role}; do NOT "
+            f"advocate for any opposing party."
+        )
+    return (
+f"""ROLE -> NAMED-PARTY RESOLUTION (CRITICAL — do this BEFORE writing strategicObjective / possibleNextSteps / suggestionChips):
+- Your selected role is {workspace_role}. This is an ABSTRACT posture that MUST be bound to a SPECIFIC NAMED PARTY in this matter. It is NOT a generic label and is NOT automatically the company, promoter, builder, bank, authority, or the opponent.
+- These documents may contain MULTIPLE, CONSOLIDATED proceedings (an original complaint/suit, appeals, revisions, execution). The SAME named person can be the complainant/petitioner in one proceeding and the respondent/appellant in another. Procedural roles INVERT on appeal: the party that WON below and DEFENDS the order is the RESPONDENT in the appeal, while the party that LOST and CHALLENGES it is the APPELLANT/PETITIONER. Do NOT inherit a party's role from the ORIGINAL/lower proceeding.
+- STEP 1 — Identify the DOMINANT / LIVE proceeding: the most recent, currently-pending matter (latest dated orders, still awaiting decision). That proceeding governs role assignment.
+- STEP 2 — Within that live proceeding, resolve which NAMED party occupies your role {workspace_role}: RESPONDENT / DEFENDANT = the party defending or opposing the live appeal / petition / execution; PETITIONER / APPELLANT / COMPLAINANT = the party who initiated the live challenge. For ADJUDICATOR / MEDIATOR there is NO represented party — stay neutral.
+- STEP 3 — Write the ENTIRE strategicObjective, possibleNextSteps, and suggestionChips as advocacy FOR that one named party (for ADJUDICATOR / MEDIATOR: neutral, no advocacy for anyone). Begin strategicObjective by naming that party, e.g. "The strategic objective for <Named Party>, the {workspace_role} in <live proceeding>, is ...". Never advocate for the opposing party, and never advocate for whoever merely held your role in a secondary/original proceeding.
+- AMBIGUITY: if your role could map to more than one named party and no single proceeding is clearly dominant, STATE the ambiguity explicitly in one sentence and proceed with the best-supported (live-matter) reading. Never silently advocate for the wrong side.{confirmed_line}"""
+    )
 
 
 def generate_strategies_from_documents_prompt(*, combined_document_content, workspace_role):
@@ -77,7 +109,7 @@ f"""You are a legal strategy analyst for Indian law. Analyze the following docum
     )
 
 
-def generate_strategies_from_documents_prompt2(*, SPEAKER_LABEL_GUARDRAIL, _entities_block, annexure_limit_block, combined_document_content, strategy_inventory, workspace_role, current_year, today_str):
+def generate_strategies_from_documents_prompt2(*, SPEAKER_LABEL_GUARDRAIL, _entities_block, annexure_limit_block, combined_document_content, strategy_inventory, workspace_role, current_year, today_str, confirmed_party=None):
     return (
 f"""Analyze these legal documents and provide a JSON response.
 
@@ -117,6 +149,8 @@ TRUNCATED-TEXT AND PERIPHERAL-ENTITY RULES (CRITICAL — applies to caseSummary,
 DATE INTERPRETATION (CRITICAL): Today is {today_str} (current year {current_year}). If the source states a date together with its year, use that exact year. If a date is stated WITHOUT a year (e.g. "25 May", "26 tareekh", "last month"), use the CURRENT YEAR ({current_year}); step back one year only if the current year would place the event in the future. Never default to 2024 or any other legacy year for a date whose year was not stated in the source. Statute years (e.g. "Information Technology Act, 2000", "BNS, 2023") are fixed by law and MUST NOT be changed by this rule.
 
 YOUR ROLE: {workspace_role}
+
+{role_to_party_resolution_block(workspace_role, confirmed_party=confirmed_party)}
 
 TASK:
 1. Case summary (10-20 sentences — write the FULL chronological narrative, do NOT compress ; MUST start with "This case is about..." ; MUST name every party exactly as written, include every property/land/document identifier, exact amounts in source notation, every significant date in DD/MM/YYYY, every suit/case/FIR number, and named statutes when present in the documents — never generic categories)
@@ -166,7 +200,7 @@ DUAL-LENS RULE (CIVIL LAW + CRIMINAL LAW — BOTH BRANCHES):
 - **No bracket tags in user-facing output.** Do NOT prefix or label items with "(criminal angle)", "(civil angle)", "(criminal-law angle)", "(civil-law angle)", or any similar bracketed tag. Weave both threads into natural prose / bullet text the way a lawyer would draft them in a memo.
 
 MULTIPLE MATTERS:
-If documents appear to include multiple matters, explicitly mention ambiguity and focus your output on the dominant dispute supported by strongest evidence.
+If documents appear to include multiple matters, explicitly mention ambiguity and focus your output on the dominant dispute supported by strongest evidence. When the matters are consolidated stages of ONE dispute (original complaint/suit, appeal, revision, execution), apply the ROLE -> NAMED-PARTY RESOLUTION steps above: fix the role to the named party as it stands in the DOMINANT / LIVE proceeding (remember procedural roles invert on appeal), and do NOT carry a party's role over from an earlier/lower stage.
 
 INSUFFICIENT DATA:
 If documents do not contain enough information, explicitly state the limitation in caseSummary, reportCaseSummary, and strategicObjective. Do NOT guess facts.
@@ -261,6 +295,16 @@ def generate_strategies_from_documents_prompt6(*, workspace_role):
     return (
 "- strategicObjective: 10-20 sentences. "
                                         f"Role-specific for {workspace_role}. "
+                                        "First bind the role to a SPECIFIC "
+                                        "NAMED PARTY: in consolidated records "
+                                        "the same person may be petitioner in "
+                                        "one stage and respondent/appellant in "
+                                        "another (roles invert on appeal); "
+                                        f"resolve who is the {workspace_role} "
+                                        "in the DOMINANT / LIVE proceeding and "
+                                        "advocate for THAT named party (never "
+                                        "the promoter/company/opponent by "
+                                        "default). "
                                         "Anchor on named parties from the "
                                         "EXTRACTED FACTS, exact dates in "
                                         "DD/MM/YYYY, suit/FIR numbers, exact "
@@ -276,7 +320,7 @@ def generate_strategies_from_documents_prompt6(*, workspace_role):
     )
 
 
-def regenerate_strategy_objective_preserving_case_summary_prompt(*, SPEAKER_LABEL_GUARDRAIL, case_summary, combined_document_content, current_strategy, report_case_summary, role, user_objective_instruction):
+def regenerate_strategy_objective_preserving_case_summary_prompt(*, SPEAKER_LABEL_GUARDRAIL, case_summary, combined_document_content, current_strategy, report_case_summary, role, user_objective_instruction, entities_block="{}", confirmed_party=None):
     return (
 f"""You are a legal strategy analyst for Indian law.
 
@@ -299,12 +343,17 @@ Current possible next steps (to replace):
 
 **Role**: {role}
 
+{role_to_party_resolution_block(role, confirmed_party=confirmed_party)}
+
+EXTRACTED FACTS (authoritative entities pulled from the documents — the ONLY organisations, authorities, bodies, parties, and places you may name):
+{entities_block}
+
 **Document content** (for fact consistency only; do not rewrite the case summaries):
 {combined_document_content}
 
 Return JSON ONLY with these keys:
 {{
-  "strategicObjective": "5-6 sentences, role-tailored for {role}, aligned with the user's instruction and the case facts",
+  "strategicObjective": "10-20 sentences, role-tailored for {role}, advocacy anchored to the specific named party who holds the role in the live/dominant proceeding (per ROLE -> NAMED-PARTY RESOLUTION above), aligned with the user's instruction and the case facts",
   "possibleNextSteps": ["3-5 concrete immediate actions; use Annexure N for uploads, never Document N"],
   "suggestionChips": ["15-16 short labels, 2-5 words each, actionable"]
 }}
@@ -313,9 +362,55 @@ Rules:
 - Do not restate or replace caseSummary/reportCaseSummary in the output.
 - The new strategicObjective and possibleNextSteps MUST reflect the new user instruction and MUST NOT just repeat the current objective/steps.
 - BNS/BNSS/BSA naming (not IPC/CrPC/IEA where replaced).
-- No invented facts; if the instruction conflicts with documents, note the tension in strategicObjective.
+- GROUNDING (MANDATORY): Do NOT name any organisation, authority, board, association, committee, party, or place that does not appear in EXTRACTED FACTS or the document content above. Use only the real entities from this case — never introduce a new body or location to fit the instruction.
+- FORUM/VENUE instructions: when the user's instruction only names a place, court, or body (e.g. "file in Patna", "file to ICC"), treat it STRICTLY as a forum preference. Do NOT invent local organisations, offices, tournaments, or a local "leg"/branch of an event to match that place. Keep the actual parties and bodies named in the documents (e.g. a national board or a specific state association) — do NOT rename or relocate them.
+- CONFLICT (MANDATORY): the chosen forum may be unsuitable in TWO ways — state the tension explicitly in strategicObjective, never paper over it:
+   (a) TERRITORIAL — the forum's location has no factual nexus to the documents (no party, event, cause of action, or property there). Say that territorial jurisdiction must first be established.
+   (b) AUTHORITY / SUBJECT-MATTER — the named forum has no power to grant the requested relief for this kind of matter (e.g. an international or global body, a regulator, or a wrong-tier forum that does not adjudicate this domestic dispute). Name which forum actually has jurisdiction, and describe the ONLY realistic route to the requested forum if one exists (e.g. a representation citing breach of that body's guidelines, or an internal referral) — do NOT present it as a straightforward "filing" when it is not.
+- ALIGN next steps to the realistic route implied by the CONFLICT analysis. Do NOT silently revert possibleNextSteps to the previous forum's domestic steps while claiming to pursue the new forum — every step must be consistent with what is actually possible before the chosen forum.
+- No invented facts of any kind.
 - {SPEAKER_LABEL_GUARDRAIL}
 - JSON only; complete strings and arrays."""
+    )
+
+
+def reground_strategy_objective_prompt(*, strategic_objective, possible_next_steps, ungrounded_terms, combined_document_content, user_objective_instruction, entities_block, role):
+    """One corrective pass: rewrite the objective/next-steps to remove any
+    organisation/body/place that is NOT present in the documents/entities.
+    Triggered by the deterministic ungrounded-entity backstop."""
+    return (
+f"""You are correcting a legal strategic objective that introduced entities NOT supported by the case documents.
+
+FLAGGED terms that appear NOWHERE in the documents or extracted facts (remove or replace each — they were invented):
+{json.dumps(ungrounded_terms, ensure_ascii=True)}
+
+EXTRACTED FACTS (the ONLY organisations, authorities, bodies, parties, and places you may name):
+{entities_block}
+
+Document content (ground truth):
+{combined_document_content}
+
+User's venue/strategic instruction (a filing preference — a place/court here is a VENUE only, NOT a licence to invent local entities or events):
+{user_objective_instruction.strip()}
+
+Objective to correct:
+{strategic_objective}
+
+Possible next steps to correct:
+{json.dumps(possible_next_steps, ensure_ascii=True)}
+
+RULES:
+- Rewrite so that EVERY named organisation, authority, board, association, party, and place appears in EXTRACTED FACTS or the document content. Delete or replace every flagged term.
+- Keep the user's chosen forum/venue (e.g. a High Court at a named city) — that is allowed as a venue — but do NOT invent any local body, office, tournament, or "leg" tied to it.
+- If the chosen venue has no factual nexus to the documents, state that tension plainly (e.g. jurisdiction must be established) instead of fabricating a connection.
+- Preserve the legal intent and role framing ({role}); do not weaken the objective, only de-fabricate it. Keep the advocacy anchored to the SAME named party who holds the {role} in the live/dominant proceeding (in consolidated records roles invert on appeal — do not flip sides or revert to the promoter/company/opponent).
+- BNS/BNSS/BSA naming (not IPC/CrPC/IEA).
+
+Return JSON ONLY:
+{{
+  "strategicObjective": "corrected 5-6 sentences",
+  "possibleNextSteps": ["corrected 3-5 concrete actions; Annexure N for uploads"]
+}}"""
     )
 
 
@@ -730,9 +825,13 @@ OUTPUT FORMAT (JSON ONLY):
   "analysisReport":     {{"shouldEdit": true | false, "instruction": "ONLY the per-panel edit text for the analysis report; empty when shouldEdit=false"}},
   "listOfDates":        {{"shouldEdit": true | false, "instruction": "set true ONLY for a NAME change / rename (Rule 12) so the person's name is replaced in the existing dated events; empty otherwise"}},
   "isRename":           true | false,
+  "isRoleReassignment": true | false,
+  "reassignRole":       "the litigation role named by the user in a Rule 13 reassignment — one of PETITIONER / APPELLANT / COMPLAINANT / PLAINTIFF / RESPONDENT / DEFENDANT, or CLIENT when the user says 'we represent' / 'our client' / 'my client' without a role word; empty when isRoleReassignment=false",
+  "reassignParty":      "the EXACT named party the user assigned to that role (verbatim, e.g. 'Pradeep Mehra'); empty when isRoleReassignment=false",
   "isQuestionLike":     true | false
 }}
 ("isRename" = true ONLY for a workspace-wide NAME change / rename / name-assignment per Rule 12; false for every other kind of edit.)
+("isRoleReassignment" = true ONLY for a Rule 13 advocacy-role reassignment; when true, set "isRename" false and all six panel shouldEdit false — a dedicated flow re-orients the strategy.)
 
 DECISION RULES:
 
@@ -836,6 +935,28 @@ DECISION RULES:
     For BOTH the literal-rename and the name-assignment sub-case, also set "isRename": true. For
     every other kind of edit (line/word add/update/delete, rephrase, remove a sentence), set
     "isRename": false.
+
+13) ADVOCACY-ROLE REASSIGNMENT (HIGHEST PRIORITY — OVERRIDES RULES 8, 11, AND 12):
+    When the user identifies or CORRECTS which NAMED party occupies a LITIGATION ROLE — i.e. who
+    is the petitioner / appellant / complainant / plaintiff / respondent / defendant — or states
+    WHOM THE USER REPRESENTS, this is an advocacy re-orientation, NOT a cosmetic rename. Triggers:
+      - "the respondent is Pradeep Mehra", "the petitioner is X", "X is the appellant",
+        "the complainant is X", "correct the respondent to X", "the respondent should be X, not Y"
+      - "we represent X", "our client is X", "my client is X", "we are appearing for X"
+      (Often paired with "update the workspace / everything accordingly".)
+    Set "isRoleReassignment": true, "isRename": false, and set ALL SIX panel shouldEdit=false
+    (caseSummary, reportCaseSummary, strategicObjective, possibleNextSteps, analysisReport,
+    listOfDates) — a dedicated flow re-orients the strategy; do NOT emit surgical per-panel edits.
+    Populate:
+      - "reassignRole": the role word the user used, normalised to one of
+        PETITIONER / APPELLANT / COMPLAINANT / PLAINTIFF / RESPONDENT / DEFENDANT; or CLIENT when
+        the user only says "we represent" / "our client" / "appearing for" with no role word.
+      - "reassignParty": the EXACT named party, verbatim (e.g. "Pradeep Mehra").
+    "isQuestionLike": false.
+    DISTINCTION from Rule 12: Rule 12 name-assignment gives a name to an ANONYMISED / described
+    party (gender/descriptor, e.g. "the female employee is heena") and only LABELS text. Rule 13
+    reassigns a LITIGATION ROLE to a named party and changes WHOSE SIDE the advocacy is written
+    for. When both could apply (a litigation-role word plus a name), Rule 13 wins.
 {scoped_panel_rule}
 Return JSON only — no markdown, no commentary."""
     )

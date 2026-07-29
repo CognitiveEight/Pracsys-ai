@@ -19,6 +19,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -419,6 +420,58 @@ class RelevantPartiesMixin:
             p["id"] = f"party_{i + 1}"
         return {"parties": merged}
 
+    def _tag_parties_against_current_state(
+        self, workspace_id: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Tag each emitted party as matched vs new against the frontend's
+        currentState.relevantParties. A party whose name matches a previously
+        curated party carries that party's id and ``isMatched=True``; otherwise
+        it keeps its ``party_N`` id and ``isMatched=False``.
+
+        Party names have robust canonical matching (`_party_names_match`), so
+        this is deterministic — no LLM call needed. Status groups (approved /
+        pending) are flattened; curation status is ignored.
+        """
+        if not isinstance(payload, dict):
+            return payload
+        current_state = self._workspace_current_state_payload.get(workspace_id) or {}
+        cs_parties = (
+            current_state.get("relevantParties")
+            if isinstance(current_state, dict)
+            else None
+        )
+        prev: List[Dict[str, str]] = []
+        if isinstance(cs_parties, dict):
+            for group in ("approved", "pending"):
+                for it in cs_parties.get(group) or []:
+                    if isinstance(it, dict) and it.get("id") and it.get("name"):
+                        prev.append(
+                            {
+                                "id": str(it["id"]),
+                                "key": self._party_name_key(it["name"]),
+                            }
+                        )
+        consumed: Set[str] = set()
+        for party in payload.get("parties") or []:
+            if not isinstance(party, dict):
+                continue
+            fkey = self._party_name_key(party.get("name"))
+            matched_id = None
+            for p in prev:
+                if p["id"] in consumed or not p["key"]:
+                    continue
+                if fkey and self._party_names_match(fkey, p["key"]):
+                    matched_id = p["id"]
+                    consumed.add(p["id"])
+                    break
+            if matched_id:
+                party["id"] = matched_id
+                party["isMatched"] = True
+            else:
+                party["isMatched"] = False
+        return payload
+
+    @meter_usage
     async def _generate_and_emit_relevant_parties(
         self,
         workspace_id: str,
@@ -560,6 +613,10 @@ class RelevantPartiesMixin:
         payload = self._merge_relevant_parties_provenance(
             workspace_id, carried_prev, new_parties
         )
+        # Tag each party matched vs new against the frontend's currentState
+        # (carry the FE id on match, else keep party_N). Cache the tagged
+        # payload so reconnect re-emits the same ids.
+        payload = self._tag_parties_against_current_state(workspace_id, payload)
         self._workspace_relevant_parties_payload[workspace_id] = payload
         logger.info(
             "Relevant parties: {} live doc(s), {} newly-extracted doc(s), "
@@ -571,14 +628,12 @@ class RelevantPartiesMixin:
         )
         if not self._socket_client:
             return
-        await self._socket_client.emit(
-            "document_feature_response",
-            {
-                "featureType": "relevant_parties",
-                "workspaceId": workspace_id,
-                "userId": user_id,
-                "payload": payload,
-            },
+        await self._emit_document_feature(
+            feature_type="relevant_parties",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            payload=payload,
+            usage=current_usage(),
         )
         logger.success(
             "✅ Relevant parties sent to backend ({} parties)",

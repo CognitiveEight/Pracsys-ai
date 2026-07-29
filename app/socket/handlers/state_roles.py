@@ -200,7 +200,9 @@ class StateRolesMixin:
             CacheKinds.DOCUMENT_ASSESSMENTS: self._workspace_document_assessments_payload,
             CacheKinds.STRATEGY_PAYLOAD: self._workspace_strategy_payload,
             CacheKinds.REJECTED_ANALYSIS_ITEMS: self._workspace_rejected_analysis_items,
+            CacheKinds.USER_ADDED_MISSING_INFO: self._workspace_user_added_missing_info,
             CacheKinds.DRAFTING_SUGGESTIONS: self._workspace_drafting_payload,
+            CacheKinds.CURRENT_STATE: self._workspace_current_state_payload,
         }
         for kind, target in kind_to_dict.items():
             payload = cached_kinds.get(kind)
@@ -334,26 +336,29 @@ class StateRolesMixin:
 
         Priority:
         1) Explicit role from current payload
-        2) In-memory workspace context
-        3) Persisted role cache (Qdrant-backed)
+        2) Persisted role cache (authoritative: in-memory role cache, then Qdrant)
+        3) In-memory workspace context (may be a fabricated ADJUDICATOR default)
         4) ADJUDICATOR fallback
+
+        The persisted role cache MUST win over the in-memory workspace context:
+        `upsert_workspace` and `hydrate_context_from_cache` (app/workspace/context.py)
+        default a role-less context to ADJUDICATOR, and that fabricated default
+        would otherwise shadow the user's real selection on paths that carry no
+        explicit role (e.g. a document-upload workspace_sync).
         """
         valid_roles = {"ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"}
         normalized_preferred = (preferred_role or "").strip().upper()
         if normalized_preferred in valid_roles:
+            logger.debug(
+                "Resolved workspace role {} (source=payload, workspace={})",
+                normalized_preferred,
+                str(workspace_id)[:12],
+            )
             return normalized_preferred
 
-        try:
-            from app.workspace.context import context_manager
-
-            ctx = context_manager.get_context(workspace_id)
-            if ctx and ctx.workspace_role:
-                ctx_role = (ctx.workspace_role or "").strip().upper()
-                if ctx_role in valid_roles:
-                    return ctx_role
-        except Exception:
-            pass
-
+        # (2) Authoritative persisted role cache. _restore_workspace_role checks
+        # the in-memory role-cache dicts first, then reads Qdrant only on a cold
+        # miss, so this is cheap on the warm path.
         restored_role = await self._restore_workspace_role(
             workspace_id=workspace_id,
             user_id=user_id,
@@ -371,6 +376,34 @@ class StateRolesMixin:
                 )
             except Exception:
                 pass
+            logger.debug(
+                "Resolved workspace role {} (source=restored, workspace={})",
+                restored_role,
+                str(workspace_id)[:12],
+            )
             return restored_role
 
+        # (3) Fall back to the in-memory context only when nothing is persisted.
+        try:
+            from app.workspace.context import context_manager
+
+            ctx = context_manager.get_context(workspace_id)
+            if ctx and ctx.workspace_role:
+                ctx_role = (ctx.workspace_role or "").strip().upper()
+                if ctx_role in valid_roles:
+                    logger.debug(
+                        "Resolved workspace role {} (source=context, workspace={})",
+                        ctx_role,
+                        str(workspace_id)[:12],
+                    )
+                    return ctx_role
+        except Exception:
+            pass
+
+        logger.info(
+            "Workspace role unresolved; defaulting to ADJUDICATOR (source=fallback, "
+            "workspace={}, user={})",
+            str(workspace_id)[:12],
+            str(user_id)[:12],
+        )
         return "ADJUDICATOR"

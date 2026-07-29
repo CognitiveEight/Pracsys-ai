@@ -70,6 +70,90 @@ class WorkspaceCreatedPayload(BaseModel):
         populate_by_name = True
 
 
+# ============================================================================
+# currentState — the previously-emitted, user-curated panel state the frontend
+# sends back inside workspace_sync so regeneration can tag each item as matched
+# (carried over from before) vs new. Present only on a re-run trigger
+# (upload/transcript/remove/objective change); omitted on plain rename/reset.
+# Each sub-block is omitted when that feature is empty. The ``status`` field
+# (approved/pending/rejected) is parsed but intentionally ignored — matching is
+# by text/content only.
+# ============================================================================
+
+
+class CurrentStateTextItem(BaseModel):
+    """One curated text item (missingInfo/risks/weaknesses/relevantJurisdiction)."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: str
+    text: str
+    status: Optional[str] = None  # approved | pending | rejected (ignored on match)
+
+
+class CurrentStatePartyItem(BaseModel):
+    """One curated relevant-party (matched by name)."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: str
+    name: str
+
+
+class CurrentStatePartiesGroup(BaseModel):
+    """Relevant-parties grouped by curation status; flattened on match."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    approved: List[CurrentStatePartyItem] = []
+    pending: List[CurrentStatePartyItem] = []
+
+
+class CurrentStateDateItem(BaseModel):
+    """One curated list-of-dates entry (matched by date + title)."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: str
+    date: str
+    title: str
+
+
+class CurrentStateDatesGroup(BaseModel):
+    """List-of-dates grouped by curation status; flattened on match."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    approved: List[CurrentStateDateItem] = []
+    pending: List[CurrentStateDateItem] = []
+
+
+class CurrentStateLawItem(BaseModel):
+    """One curated applicable-law (matched by act + section; no prior id)."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    act: str
+    section: Optional[str] = None
+
+
+class WorkspaceCurrentState(BaseModel):
+    """
+    Previously-emitted, user-curated panel state echoed back by the frontend.
+    Every sub-block is optional (omitted when that feature is empty).
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    missingInfo: Optional[List[CurrentStateTextItem]] = None
+    risks: Optional[List[CurrentStateTextItem]] = None
+    weaknesses: Optional[List[CurrentStateTextItem]] = None
+    relevantJurisdiction: Optional[List[CurrentStateTextItem]] = None
+    relevantParties: Optional[CurrentStatePartiesGroup] = None
+    listOfDates: Optional[CurrentStateDatesGroup] = None
+    applicableLaws: Optional[List[CurrentStateLawItem]] = None
+
+
 class WorkspaceSyncPayload(BaseModel):
     """
     Schema for workspace_sync event (Server → AI_Maverick).
@@ -78,6 +162,8 @@ class WorkspaceSyncPayload(BaseModel):
     deletedDocumentIds so AI can remove them from vector store and regenerate strategy.
     workspaceRole is sent when user changes role (e.g. Edit Workspace → Mediator).
     Optional custom instructions: structure, tone, description (same as workspace_created).
+    ``currentState`` carries the previously-emitted panel state so regeneration
+    can tag items as matched vs new (see WorkspaceCurrentState).
     """
 
     workspaceId: str
@@ -95,6 +181,9 @@ class WorkspaceSyncPayload(BaseModel):
     structure: Optional[str] = None
     tone: Optional[str] = None
     description: Optional[str] = None
+    currentState: Optional[WorkspaceCurrentState] = (
+        None  # Previously-curated panel state (present only on re-run triggers)
+    )
 
     class Config:
         populate_by_name = True
@@ -494,9 +583,60 @@ class AIResponseMetadata(BaseModel):
 
     messageId: Optional[str] = None  # Optional message identifier
     aiModel: Optional[str] = None  # AI model name (e.g., "gemini-pro")
-    tokensUsed: Optional[int] = None  # Number of tokens used
+    tokensUsed: Optional[int] = None  # Total tokens for THIS response (input+output)
     responseTime: Optional[float] = None  # Response time in milliseconds
     error: Optional[str] = None  # Error message if any
+
+    # --- Per-response token usage & cost (this response only) ---
+    # Thinking tokens are folded into outputTokens (Gemini bills them as output).
+    # Prices are USD, computed from the active model's rate (app/ai/pricing.py).
+    inputTokens: Optional[int] = None
+    outputTokens: Optional[int] = None
+    totalTokens: Optional[int] = None
+    inputPrice: Optional[float] = None
+    outputPrice: Optional[float] = None
+    # FULL cost of this response: inputPrice + outputPrice + servicePrice.
+    price: Optional[float] = None
+
+    # --- Per-response paid NON-LLM usage & cost (this response only) ---
+    # The pipeline spends money outside Gemini generation. Each source reports its
+    # billable quantity and its USD cost; ``servicePrice`` is their sum and is
+    # already included in ``price`` above. Rates: app/ai/pricing.py (env-overridable).
+    # Free tiers are monthly + account-wide so they are NOT modelled — these are
+    # upper bounds. ``embedTokens`` is an estimate (~4 chars/token).
+    ocrUnits: Optional[int] = None  # Vision units: 1 per image, 1 per OCR'd PDF page
+    ocrPrice: Optional[float] = None
+    sttSeconds: Optional[float] = None  # Speech-to-Text billed audio seconds
+    sttPrice: Optional[float] = None
+    searchQueries: Optional[int] = None  # Vertex AI Search queries
+    searchPrice: Optional[float] = None
+    groundingRequests: Optional[int] = None  # Google Search grounding requests
+    groundingPrice: Optional[float] = None
+    embedTokens: Optional[int] = None  # embedding input tokens (estimated)
+    embedPrice: Optional[float] = None
+    servicePrice: Optional[float] = None  # sum of the five prices above
+
+    # --- Cumulative per-workspace totals (incremented on every response) ---
+    totalInputTokens: Optional[int] = None
+    totalOutputTokens: Optional[int] = None
+    totalInputPrice: Optional[float] = None
+    totalOutputPrice: Optional[float] = None
+    # Running total cost for the workspace: LLM tokens AND paid non-LLM APIs
+    # (== totalInputPrice + totalOutputPrice + totalServicePrice).
+    totalPrice: Optional[float] = None
+
+    # --- Cumulative per-workspace paid NON-LLM totals ---
+    totalOcrUnits: Optional[int] = None
+    totalOcrPrice: Optional[float] = None
+    totalSttSeconds: Optional[float] = None
+    totalSttPrice: Optional[float] = None
+    totalSearchQueries: Optional[int] = None
+    totalSearchPrice: Optional[float] = None
+    totalGroundingRequests: Optional[int] = None
+    totalGroundingPrice: Optional[float] = None
+    totalEmbedTokens: Optional[int] = None
+    totalEmbedPrice: Optional[float] = None
+    totalServicePrice: Optional[float] = None  # included in totalPrice above
 
     # Additional fields for internal use (not in backend spec)
     confidence: Optional[str] = None
@@ -823,6 +963,7 @@ class RelevantPartyItem(BaseModel):
     contactNumber: str = ""  # user-supplied (panel edit); "" on auto-gen
     email: str = ""  # user-supplied (panel edit); "" on auto-gen
     officialIdUrl: str = ""  # user-supplied (panel edit); "" on auto-gen
+    isMatched: bool = False  # True when this party carried over from currentState
 
 
 class RelevantPartiesPayload(BaseModel):

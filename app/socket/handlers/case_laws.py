@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -594,6 +595,7 @@ class CaseLawsMixin:
                 c["referenceName"] = f"Full judgment ({sn})" if sn else "Full judgment"
         return {"caseLaws": merged}
 
+    @meter_usage
     async def _generate_and_emit_case_laws(
         self,
         workspace_id: str,
@@ -648,14 +650,12 @@ class CaseLawsMixin:
                 workspace_id[:12] if workspace_id else "",
                 len(search_results),
             )
-        await self._socket_client.emit(
-            "document_feature_response",
-            {
-                "featureType": "case_laws",
-                "workspaceId": workspace_id,
-                "userId": user_id,
-                "payload": payload,
-            },
+        await self._emit_document_feature(
+            feature_type="case_laws",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            payload=payload,
+            usage=current_usage(),
         )
         logger.success(
             "✅ Case laws sent to backend ({} cases)",
@@ -695,6 +695,7 @@ class CaseLawsMixin:
             request_id,
         )
 
+    @meter_usage
     async def on_case_law_document_request(self, data: Dict[str, Any]) -> None:
         """
         Server → AI: a lawyer uploaded a document (stored in GCS). Fetch it,
@@ -876,14 +877,12 @@ class CaseLawsMixin:
             )
             self._workspace_case_laws_payload[workspace_id] = merged
             if self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "case_laws",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": merged,
-                    },
+                await self._emit_document_feature(
+                    feature_type="case_laws",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=merged,
+                    usage=current_usage(),
                 )
                 logger.success(
                     "✅ case_law_document_request: appended 1 case; panel now has "

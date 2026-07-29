@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -120,16 +121,15 @@ class PanelEditsMixin:
         if not self._socket_client:
             return
         cached = self._workspace_case_laws_payload.get(workspace_id) or {"caseLaws": []}
-        await self._socket_client.emit(
-            "document_feature_response",
-            {
-                "featureType": "case_laws",
-                "workspaceId": workspace_id,
-                "userId": user_id,
-                "payload": cached,
-            },
+        await self._emit_document_feature(
+            feature_type="case_laws",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            payload=cached,
+            usage=None,
         )
 
+    @meter_usage
     async def on_add_case_law(self, data: Dict[str, Any]) -> None:
         """
         Handle add_case_law: user manually adds a precedent via the "Add Case
@@ -221,14 +221,12 @@ class PanelEditsMixin:
         )
         self._workspace_case_laws_payload[workspace_id] = merged
         if self._socket_client:
-            await self._socket_client.emit(
-                "document_feature_response",
-                {
-                    "featureType": "case_laws",
-                    "workspaceId": workspace_id,
-                    "userId": user_id,
-                    "payload": merged,
-                },
+            await self._emit_document_feature(
+                feature_type="case_laws",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=merged,
+                usage=current_usage(),
             )
             logger.success(
                 "✅ add_case_law: appended {} case(s); panel now has {} (workspace={})",
@@ -244,14 +242,12 @@ class PanelEditsMixin:
         payload = self._workspace_relevant_parties_payload.get(workspace_id) or {
             "parties": []
         }
-        await self._socket_client.emit(
-            "document_feature_response",
-            {
-                "featureType": "relevant_parties",
-                "workspaceId": workspace_id,
-                "userId": user_id,
-                "payload": payload,
-            },
+        await self._emit_document_feature(
+            feature_type="relevant_parties",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            payload=payload,
+            usage=None,
         )
 
     async def on_add_relevant_party(self, data: Dict[str, Any]) -> None:

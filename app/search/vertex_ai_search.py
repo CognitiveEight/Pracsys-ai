@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from app.ai.usage import record_search_queries
 from app.core.config import settings
 
 
@@ -71,6 +72,9 @@ async def search_indiankanoon(query: str) -> List[Dict[str, str]]:
     # store, useful on a blended store, and keeps query semantics aligned
     # with the old CSE call.
     constrained = f"site:indiankanoon.org {query}"
+    # Cost: one billable Discovery Engine query per invocation. Recorded BEFORE
+    # the call because a failed/empty search is still a billed request.
+    record_search_queries(1)
     try:
         docs = await retriever.ainvoke(constrained)
     except Exception as e:

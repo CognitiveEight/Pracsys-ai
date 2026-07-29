@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -429,7 +430,13 @@ class LawRelevanceMixin:
             "applicable_law_relevance → backend document_feature_response (preview): {}",
             doc_log[:2000] + ("..." if len(doc_log) > 2000 else ""),
         )
-        await self._socket_client.emit("document_feature_response", doc_feature_body)
+        await self._emit_document_feature(
+            feature_type="applicable_law_relevance",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            payload=payload_inner,
+            usage=current_usage(),
+        )
         await asyncio.sleep(0.1)
 
         standalone: Dict[str, Any] = {
@@ -454,6 +461,7 @@ class LawRelevanceMixin:
             law_dict.get("relevance"),
         )
 
+    @meter_usage
     async def on_applicable_law_relevance_request(self, data: Dict[str, Any]) -> None:
         """
         Server asks whether a lawyer-selected act/section is relevant to the case documents.

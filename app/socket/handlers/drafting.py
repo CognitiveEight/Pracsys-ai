@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -211,11 +212,17 @@ class DraftingMixin:
                     if strength_pts:
                         lines.append("Strengths: " + " | ".join(strength_pts))
                 if isinstance(weaknesses, list) and weaknesses:
-                    weak_pts = [str(w).strip() for w in weaknesses[:4] if w]
+                    # Items are now {id,text,isMatched} dicts (were plain
+                    # strings) — coerce to text so we never render dict reprs.
+                    weak_pts = [
+                        s for s in _coerce_analysis_text_list(weaknesses[:4]) if s
+                    ]
                     if weak_pts:
                         lines.append("Weaknesses: " + " | ".join(weak_pts))
                 if isinstance(missing, list) and missing:
-                    miss_pts = [str(m).strip() for m in missing[:4] if m]
+                    miss_pts = [
+                        s for s in _coerce_analysis_text_list(missing[:4]) if s
+                    ]
                     if miss_pts:
                         lines.append("Missing info: " + " | ".join(miss_pts))
                 if isinstance(pending, list) and pending:
@@ -272,6 +279,7 @@ class DraftingMixin:
             "list_of_dates_brief": list_of_dates_brief,
         }
 
+    @meter_usage
     async def _generate_and_emit_drafting_suggestions(
         self,
         workspace_id: str,
@@ -377,9 +385,12 @@ class DraftingMixin:
             except Exception as e:
                 logger.warning("Drafting suggestions: could not dump response body: {}", e)
 
-            await self._socket_client.emit(
-                "document_feature_response",
-                response_body,
+            await self._emit_document_feature(
+                feature_type="drafting_assistant",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=drafting_payload_to_wire(payload),
+                usage=current_usage(),
             )
             logger.success(
                 "✅ Drafting suggestions sent to backend ({} item(s))",
@@ -404,14 +415,12 @@ class DraftingMixin:
         cached = self._workspace_drafting_payload.get(workspace_id)
         if cached is None:
             return
-        await self._socket_client.emit(
-            "document_feature_response",
-            {
-                "featureType": "drafting_assistant",
-                "workspaceId": workspace_id,
-                "userId": user_id,
-                "payload": drafting_payload_to_wire(cached),
-            },
+        await self._emit_document_feature(
+            feature_type="drafting_assistant",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            payload=drafting_payload_to_wire(cached),
+            usage=None,
         )
         logger.success(
             "✅ Objective-change drafting suggestions preserved (regeneration skipped)"
@@ -476,6 +485,7 @@ class DraftingMixin:
                 )
             )
 
+    @meter_usage
     async def _refresh_drafting_matches_on_growth(
         self,
         workspace_id: str,
@@ -540,15 +550,12 @@ class DraftingMixin:
                     s.get("templateName"),
                 )
 
-            response_body = {
-                "featureType": "drafting_assistant",
-                "workspaceId": workspace_id,
-                "userId": user_id,
-                "payload": drafting_payload_to_wire(payload),
-            }
-            await self._socket_client.emit(
-                "document_feature_response",
-                response_body,
+            await self._emit_document_feature(
+                feature_type="drafting_assistant",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=drafting_payload_to_wire(payload),
+                usage=current_usage(),
             )
             logger.success(
                 "✅ Drafting panel refreshed (frozen matched cards) — "

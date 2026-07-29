@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -127,6 +128,7 @@ from app.prompts.analysis_report_prompts import (
 class AnalysisReportMixin:
     """Analysis report generation, scoring, feedback, and rejection memory."""
 
+    @meter_usage
     async def _regenerate_analysis_report_with_feedback(
         self,
         *,
@@ -163,7 +165,18 @@ class AnalysisReportMixin:
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
                 role = "ADJUDICATOR"
 
-            current_report_json = json.dumps(current_report, ensure_ascii=True)
+            # The cached report's text sections are now {id,text,isMatched}
+            # dicts. The edit prompt expects plain strings ("the other lists
+            # stay lists of strings"), so normalize a copy to strings for the
+            # prompt and the no-op comparison; the emitted result is re-tagged
+            # below so identity survives the edit.
+            current_report_norm = dict(current_report)
+            for _k in ("missingInfo", "weaknesses", "risks", "relevantJurisdiction"):
+                if _k in current_report_norm:
+                    current_report_norm[_k] = _coerce_analysis_text_list(
+                        current_report_norm.get(_k)
+                    )
+            current_report_json = json.dumps(current_report_norm, ensure_ascii=True)
 
             prompt = regenerate_analysis_report_with_feedback_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, current_report_json=current_report_json, instruction=instruction, role=role)
 
@@ -199,7 +212,7 @@ class AnalysisReportMixin:
             # emit a no-op payload.
             try:
                 if json.dumps(edited, sort_keys=True, ensure_ascii=True) == json.dumps(
-                    current_report, sort_keys=True, ensure_ascii=True
+                    current_report_norm, sort_keys=True, ensure_ascii=True
                 ):
                     logger.info(
                         "Analysis report edit produced no change — instruction={!r}",
@@ -209,17 +222,28 @@ class AnalysisReportMixin:
             except Exception:
                 pass
 
+            # Re-tag the edited report so the emitted payload keeps the
+            # {id,text,isMatched} shape: unchanged items match currentState and
+            # keep their id; text the user just edited becomes a new item.
+            try:
+                edited = await self._tag_analysis_report_against_current_state(
+                    workspace_id, edited, log_context=" (surgical edit)",
+                )
+            except Exception as tag_err:
+                logger.debug(
+                    "Surgical-edit currentState tagging failed: {}; emitting untagged",
+                    tag_err,
+                )
+
             self._workspace_analysis_payload[workspace_id] = edited
 
             if self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "analysis_report",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": edited,
-                    },
+                await self._emit_document_feature(
+                    feature_type="analysis_report",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=edited,
+                    usage=current_usage(),
                 )
                 logger.success(
                     "✅ Analysis report surgical edit emitted workspace={}",
@@ -482,7 +506,12 @@ OBJECTIVE-ALIGNMENT RULES (MANDATORY):
 - missingInfo should prioritize gaps that are critical to execute that objective.
 - pendingActions and nextSteps must be practical actions that move the matter toward that objective in priority order.
 - relevantJurisdiction must reflect objective-linked forum cues in annexures or objective text (for example, if the objective says filing in Patna, assess whether Patna forum support appears in annexure facts and list appropriate jurisdiction/forum entries).
-- Never fabricate facts to force alignment; when objective and evidence conflict, state the conflict as weakness/risk.
+- FORUM-NEXUS CONFLICT (MANDATORY): if the objective names a forum/body/location that is unsuitable in EITHER of these ways, you MUST NOT present it as supported — you MUST add (a) a top-priority `risks` item naming the problem and (b) a `missingInfo` item asking for what is needed to sustain that route:
+   (a) TERRITORIAL — the forum's location has NO factual nexus in EXTRACTED FACTS or the annexures (no party, event, cause of action, or property located there); e.g. "file in Patna" for a matter arising elsewhere. The risk names the territorial-jurisdiction / maintainability problem (Article 226(2) / Section 197 BNSS); the missingInfo asks for the specific nexus/cause-of-action link.
+   (b) AUTHORITY / SUBJECT-MATTER — the named forum has NO power to grant the requested relief for this matter type (e.g. an international or global body such as the ICC, a regulator, or a wrong-tier forum that does not adjudicate this domestic dispute). The risk states that this forum lacks jurisdiction/authority over the matter and names the forum that actually does; the missingInfo asks for the legal basis or realistic route (e.g. a guideline-breach representation / referral) to reach the requested forum.
+  You may still list the objective's forum in relevantJurisdiction, but the paired risk + missingInfo are required, and `nextSteps` must reflect the realistic route (not silently revert to the prior forum's steps).
+- NEVER invent a party, organisation, body, or place to manufacture a nexus to the objective's forum. Keep the real entities from EXTRACTED FACTS — do not rename or relocate them to match the objective.
+- Never fabricate facts to force alignment; when objective and evidence conflict, state the conflict as BOTH a `risks` item AND (where information is needed) a `missingInfo` item — not merely as a weakness.
 
 RELEVANT JURISDICTION FORMAT (STRICT):
 - Output must be COURT/FORUM-centric by location (High Court / Supreme Court / District Court / Family Court / Magistrate Court / Sessions Court / Tribunal / Commission etc.). Cover BOTH the criminal-side forum and the civil-side forum where both branches are live.
@@ -2210,14 +2239,12 @@ Rules:
                             fallback_payload["timestamp"] = (
                                 datetime.utcnow().isoformat() + "Z"
                             )
-                            await self._socket_client.emit(
-                                "document_feature_response",
-                                {
-                                    "featureType": "analysis_report",
-                                    "workspaceId": workspace_id,
-                                    "userId": user_id,
-                                    "payload": fallback_payload,
-                                },
+                            await self._emit_document_feature(
+                                feature_type="analysis_report",
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                payload=fallback_payload,
+                                usage=None,
                             )
                             logger.info(
                                 "Cached analysis report emitted after no-emit refresh (workspace={})",
@@ -2234,14 +2261,12 @@ Rules:
                         fallback_payload["timestamp"] = (
                             datetime.utcnow().isoformat() + "Z"
                         )
-                        await self._socket_client.emit(
-                            "document_feature_response",
-                            {
-                                "featureType": "analysis_report",
-                                "workspaceId": workspace_id,
-                                "userId": user_id,
-                                "payload": fallback_payload,
-                            },
+                        await self._emit_document_feature(
+                            feature_type="analysis_report",
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            payload=fallback_payload,
+                            usage=None,
                         )
                         logger.info(
                             "Cached analysis report emitted after timeout (workspace={})",
@@ -2306,14 +2331,12 @@ Rules:
                 current_strategy["timestamp"] = datetime.utcnow().isoformat()
                 self._workspace_strategy_payload[workspace_id] = current_strategy
                 applied_any = True
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "strategy_objective",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": current_strategy,
-                    },
+                await self._emit_document_feature(
+                    feature_type="strategy_objective",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=current_strategy,
+                    usage=None,
                 )
                 response_parts.append("Strategy objective text updated")
 
@@ -2429,14 +2452,12 @@ Rules:
                 current_report["timestamp"] = datetime.utcnow().isoformat() + "Z"
 
                 self._workspace_analysis_payload[workspace_id] = current_report
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "analysis_report",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": current_report,
-                    },
+                await self._emit_document_feature(
+                    feature_type="analysis_report",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=current_report,
+                    usage=None,
                 )
                 applied_any = True
                 response_parts.append(
@@ -2666,6 +2687,26 @@ Rules:
             "Score adjusted to reflect user rejection.",
         )
 
+    async def _retag_analysis_report_safe(
+        self, workspace_id: str, report: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Re-apply currentState tagging to a report whose text sections were
+        flattened to plain strings by ``_normalize_analysis_report_lists`` (e.g.
+        after a reject/add mutation), so the emitted payload keeps the
+        {id,text,isMatched} shape. Fail-open: returns the input on any error.
+        """
+        try:
+            return await self._tag_analysis_report_against_current_state(
+                workspace_id, report, log_context=" (feedback)",
+            )
+        except Exception as tag_err:
+            logger.debug(
+                "Analysis report re-tagging after feedback failed: {}; "
+                "emitting untagged",
+                tag_err,
+            )
+            return report
+
     async def on_analysis_report_feedback(self, data: Dict[str, Any]) -> None:
         """
         Handle analysis_report_feedback: user rejected an analysis item (missingInfo or riskOrWeakness).
@@ -2772,6 +2813,7 @@ Rules:
                     exc,
                 )
 
+    @meter_usage
     async def _apply_batched_feedback(
         self, workspace_id: str, events: List[Dict[str, Any]]
     ) -> None:
@@ -2887,16 +2929,15 @@ Rules:
                 workspace_id,
             )
             report["timestamp"] = datetime.utcnow().isoformat() + "Z"
+            report = await self._retag_analysis_report_safe(workspace_id, report)
             self._workspace_analysis_payload[workspace_id] = report
             if self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "analysis_report",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": report,
-                    },
+                await self._emit_document_feature(
+                    feature_type="analysis_report",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=report,
+                    usage=current_usage(),
                 )
             return
 
@@ -2982,17 +3023,16 @@ Rules:
         ).strip()
         report["timestamp"] = datetime.utcnow().isoformat() + "Z"
 
+        report = await self._retag_analysis_report_safe(workspace_id, report)
         self._workspace_analysis_payload[workspace_id] = report
 
         if self._socket_client:
-            await self._socket_client.emit(
-                "document_feature_response",
-                {
-                    "featureType": "analysis_report",
-                    "workspaceId": workspace_id,
-                    "userId": user_id,
-                    "payload": report,
-                },
+            await self._emit_document_feature(
+                feature_type="analysis_report",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=report,
+                usage=current_usage(),
             )
             logger.success(
                 "✅ analysis_report_feedback batch applied: {} rejections, score {}% → {}% (delta +{})",
@@ -3169,6 +3209,7 @@ Rules:
             )
             return (False, 0, "")
 
+    @meter_usage
     async def on_added_missing_information(self, data: Dict[str, Any]) -> None:
         """
         Handle added_missing_information: user manually supplies title+description
@@ -3260,16 +3301,15 @@ Rules:
                 workspace_id,
             )
             report["timestamp"] = datetime.utcnow().isoformat() + "Z"
+            report = await self._retag_analysis_report_safe(workspace_id, report)
             self._workspace_analysis_payload[workspace_id] = report
             if self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "analysis_report",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": report,
-                    },
+                await self._emit_document_feature(
+                    feature_type="analysis_report",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=report,
+                    usage=current_usage(),
                 )
                 logger.success(
                     "✅ added_missing_information no-op: re-emitted unchanged analysis_report (score stays at {}%)",
@@ -3306,6 +3346,12 @@ Rules:
         if not already_present and new_entry:
             current_missing = list(current_missing) + [new_entry]
             report[missing_list_key] = current_missing
+            # Remember user-added entries so the answered-by-upload resolution
+            # pass never auto-removes them (only analysis_report_feedback can).
+            bucket = list(self._workspace_user_added_missing_info.get(workspace_id) or [])
+            if new_entry not in bucket:
+                bucket.append(new_entry)
+                self._workspace_user_added_missing_info[workspace_id] = bucket[-50:]
             logger.info(
                 "added_missing_information: appended new entry to missingInfo "
                 "(workspace={}, total={})",
@@ -3351,17 +3397,16 @@ Rules:
         ).strip()
         report["timestamp"] = datetime.utcnow().isoformat() + "Z"
 
+        report = await self._retag_analysis_report_safe(workspace_id, report)
         self._workspace_analysis_payload[workspace_id] = report
 
         if self._socket_client:
-            await self._socket_client.emit(
-                "document_feature_response",
-                {
-                    "featureType": "analysis_report",
-                    "workspaceId": workspace_id,
-                    "userId": user_id,
-                    "payload": report,
-                },
+            await self._emit_document_feature(
+                feature_type="analysis_report",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=report,
+                usage=current_usage(),
             )
             logger.success(
                 "✅ added_missing_information applied: score {}% → {}% (-{}), re-emitted analysis_report",

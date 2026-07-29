@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -120,6 +121,7 @@ from app.prompts.procedural_timeline_prompts import (
 class ProceduralTimelineMixin:
     """Procedural timeline (upcoming dates) generation and feedback."""
 
+    @meter_usage
     async def _regenerate_procedural_timeline_with_feedback(
         self,
         *,
@@ -189,14 +191,12 @@ class ProceduralTimelineMixin:
             self._workspace_procedural_timeline_payload[workspace_id] = edited
 
             if emit_result and self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "procedural_timeline",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": {"proceduralTimeline": edited},
-                    },
+                await self._emit_document_feature(
+                    feature_type="procedural_timeline",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload={"proceduralTimeline": edited},
+                    usage=current_usage(),
                 )
                 logger.success(
                     "✅ Procedural timeline name edit emitted workspace={}",
@@ -270,6 +270,7 @@ class ProceduralTimelineMixin:
             logger.warning("Procedural timeline agent failed: {}", e)
             return []
 
+    @meter_usage
     async def _generate_and_emit_procedural_timeline(
         self,
         workspace_id: str,
@@ -330,14 +331,12 @@ class ProceduralTimelineMixin:
             )
             prior_fast.sort(key=lambda x: str(x.get("date") or ""))
             self._workspace_procedural_timeline_payload[workspace_id] = prior_fast
-            await self._socket_client.emit(
-                "document_feature_response",
-                {
-                    "featureType": "procedural_timeline",
-                    "workspaceId": workspace_id,
-                    "userId": user_id,
-                    "payload": {"proceduralTimeline": prior_fast},
-                },
+            await self._emit_document_feature(
+                feature_type="procedural_timeline",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload={"proceduralTimeline": prior_fast},
+                usage=current_usage(),
             )
             logger.success(
                 "✅ Procedural timeline filtered+emitted after deletion (no LLM regen): "
@@ -421,14 +420,12 @@ class ProceduralTimelineMixin:
         payload = {
             "proceduralTimeline": timeline,
         }
-        await self._socket_client.emit(
-            "document_feature_response",
-            {
-                "featureType": "procedural_timeline",
-                "workspaceId": workspace_id,
-                "userId": user_id,
-                "payload": payload,
-            },
+        await self._emit_document_feature(
+            feature_type="procedural_timeline",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            payload=payload,
+            usage=current_usage(),
         )
         logger.success(
             "✅ Procedural timeline sent to backend ({} entries)", len(timeline)

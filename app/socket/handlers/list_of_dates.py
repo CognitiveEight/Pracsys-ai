@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -102,6 +103,7 @@ from app.socket.event_utils import (
     _strip_ui_truncated_tokens,
     scrub_app_brand,
     _coerce_analysis_text_list,
+    _mint_item_id,
     _strip_strength_point_statute_boilerplate,
     _annexure_wording_for_next_steps,
     _clamp_annexure_references,
@@ -122,6 +124,7 @@ from app.prompts.list_of_dates_prompts import (
 class ListOfDatesMixin:
     """List of Dates (chronology) generation and feedback."""
 
+    @meter_usage
     async def _regenerate_list_of_dates_with_feedback(
         self,
         *,
@@ -196,18 +199,16 @@ class ListOfDatesMixin:
             self._workspace_list_of_dates_payload[workspace_id] = edited
 
             if emit_result and self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "list_of_dates",
+                await self._emit_document_feature(
+                    feature_type="list_of_dates",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload={
                         "workspaceId": workspace_id,
                         "userId": user_id,
-                        "payload": {
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "listOfDates": edited,
-                        },
+                        "listOfDates": edited,
                     },
+                    usage=current_usage(),
                 )
                 logger.success(
                     "✅ List of dates name edit emitted workspace={}",
@@ -218,6 +219,7 @@ class ListOfDatesMixin:
             logger.warning("List of dates name edit failed: {}", e)
             return False
 
+    @meter_usage
     async def _reeval_list_of_dates_relevance(
         self,
         *,
@@ -272,22 +274,36 @@ class ListOfDatesMixin:
                 )
                 return False
 
-            edited = scrub_app_brand(edited)
+            # Mode 2 keeps every entry in the same order and changes ONLY the
+            # relevance. Merge deterministically by index: keep each cached entry
+            # verbatim (preserving id / isMatched and all identity fields, which
+            # the LLM is not guaranteed to echo back) and take just the re-scored
+            # relevance from the model. This is what makes the objective change
+            # move relevance without disturbing the matched/new tagging.
+            merged: List[Dict[str, Any]] = []
+            for cur, ed in zip(current, edited):
+                if isinstance(cur, dict):
+                    item = dict(cur)
+                    new_rel = ed.get("relevance") if isinstance(ed, dict) else None
+                    if isinstance(new_rel, str) and new_rel.strip():
+                        item["relevance"] = new_rel.strip()
+                    merged.append(item)
+                elif isinstance(ed, dict):
+                    merged.append(ed)
+            edited = scrub_app_brand(merged)
             self._workspace_list_of_dates_payload[workspace_id] = edited
 
             if emit_result and self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "list_of_dates",
+                await self._emit_document_feature(
+                    feature_type="list_of_dates",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload={
                         "workspaceId": workspace_id,
                         "userId": user_id,
-                        "payload": {
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "listOfDates": edited,
-                        },
+                        "listOfDates": edited,
                     },
+                    usage=current_usage(),
                 )
                 logger.success(
                     "✅ List of dates relevance re-evaluated for new objective workspace={}",
@@ -1229,6 +1245,56 @@ class ListOfDatesMixin:
             logger.warning("List of dates generation failed: {}", e)
             return []
 
+    async def _tag_dates_against_current_state(
+        self, workspace_id: str, entries: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Attach ``id`` + ``isMatched`` to each list-of-dates entry against the
+        frontend's currentState.listOfDates. An entry matching a previously
+        curated date (by date + title) carries that date's id (isMatched=True);
+        a new entry gets a minted ``date_<hex>`` id (isMatched=False). Status
+        groups (approved / pending) are flattened; status is ignored.
+        """
+        if not isinstance(entries, list) or not entries:
+            return entries
+        current_state = self._workspace_current_state_payload.get(workspace_id) or {}
+        cs_dates = (
+            current_state.get("listOfDates")
+            if isinstance(current_state, dict)
+            else None
+        )
+        prev_pool: List[Dict[str, Any]] = []
+        if isinstance(cs_dates, dict):
+            for group in ("approved", "pending"):
+                for it in cs_dates.get(group) or []:
+                    if isinstance(it, dict) and it.get("id"):
+                        prev_pool.append(
+                            {
+                                "id": str(it["id"]),
+                                "text": f"{it.get('date') or ''} | {it.get('title') or ''}",
+                            }
+                        )
+        fresh_texts = [
+            f"{e.get('date') or ''} | {e.get('title') or ''}"
+            if isinstance(e, dict)
+            else ""
+            for e in entries
+        ]
+        matches = await self._match_items_to_previous(
+            fresh_texts, prev_pool, item_type="list of dates"
+        )
+        for i, e in enumerate(entries):
+            if not isinstance(e, dict):
+                continue
+            prev_id = matches.get(i)
+            if prev_id:
+                e["id"] = prev_id
+                e["isMatched"] = True
+            else:
+                e["id"] = _mint_item_id("date")
+                e["isMatched"] = False
+        return entries
+
+    @meter_usage
     async def _generate_and_emit_list_of_dates(
         self,
         workspace_id: str,
@@ -1299,20 +1365,21 @@ class ListOfDatesMixin:
                     str(x.get("sourceDocName") or ""),
                 )
             )
+            prior_fast = await self._tag_dates_against_current_state(
+                workspace_id, prior_fast
+            )
             self._workspace_list_of_dates_payload[workspace_id] = prior_fast
             payload_fast = {
                 "workspaceId": workspace_id,
                 "userId": user_id,
                 "listOfDates": prior_fast,
             }
-            await self._socket_client.emit(
-                "document_feature_response",
-                {
-                    "featureType": "list_of_dates",
-                    "workspaceId": workspace_id,
-                    "userId": user_id,
-                    "payload": payload_fast,
-                },
+            await self._emit_document_feature(
+                feature_type="list_of_dates",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=payload_fast,
+                usage=current_usage(),
             )
             logger.success(
                 "✅ List of dates filtered+emitted after deletion (no LLM regen): "
@@ -1418,6 +1485,7 @@ class ListOfDatesMixin:
                 str(x.get("sourceDocName") or ""),
             )
         )
+        merged = await self._tag_dates_against_current_state(workspace_id, merged)
         self._workspace_list_of_dates_payload[workspace_id] = merged
         list_of_dates = merged
         # Payload matches backend spec: workspaceId, userId at root and inside payload for storage
@@ -1426,14 +1494,12 @@ class ListOfDatesMixin:
             "userId": user_id,
             "listOfDates": list_of_dates,
         }
-        await self._socket_client.emit(
-            "document_feature_response",
-            {
-                "featureType": "list_of_dates",
-                "workspaceId": workspace_id,
-                "userId": user_id,
-                "payload": payload,
-            },
+        await self._emit_document_feature(
+            feature_type="list_of_dates",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            payload=payload,
+            usage=current_usage(),
         )
         logger.success(
             "✅ List of dates sent to backend ({} entries)", len(list_of_dates)

@@ -305,15 +305,32 @@ Refer to parties ONLY as listed above; do not invent parties or roles.
             or analysis_report.get("report_quality_score_explanation")
             or ""
         ).strip()
-        missing = (
+        # missingInfo / weaknesses / risks / relevantJurisdiction are now
+        # {id, text, isMatched} dicts (were plain strings). Coerce to display
+        # text so the context lines never render Python dict literals.
+        def _ar_text(x: Any) -> str:
+            if isinstance(x, dict):
+                for k in ("text", "point", "description", "value", "title"):
+                    v = x.get(k)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+                return ""
+            return str(x).strip() if x else ""
+
+        def _ar_text_list(items: Any) -> List[str]:
+            if not isinstance(items, list):
+                return []
+            return [t for t in (_ar_text(x) for x in items) if t]
+
+        missing = _ar_text_list(
             analysis_report.get("missingInfo")
             or analysis_report.get("missing_info")
             or []
         )
         strengths_ar = analysis_report.get("strengths") or []
-        weak_ar = analysis_report.get("weaknesses") or []
-        risks_ar = analysis_report.get("risks") or []
-        juris = (
+        weak_ar = _ar_text_list(analysis_report.get("weaknesses") or [])
+        risks_ar = _ar_text_list(analysis_report.get("risks") or [])
+        juris = _ar_text_list(
             analysis_report.get("relevantJurisdiction")
             or analysis_report.get("relevant_jurisdiction")
             or []

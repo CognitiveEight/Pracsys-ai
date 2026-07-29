@@ -8,7 +8,68 @@ __all__ = [
     "llm_merge_dated_entries_against_previous_prompt",
     "llm_classify_factual_vs_procedural_prompt",
     "merge_applicable_laws_with_previous_prompt",
+    "llm_resolve_answered_missing_info_prompt",
+    "llm_match_fresh_against_previous_prompt",
 ]
+
+
+def llm_match_fresh_against_previous_prompt(*, item_type, numbered_fresh, numbered_prev):
+    """Match freshly-regenerated items to the previously-curated items by MEANING.
+
+    Used for currentState reconciliation: a fresh item that means the same as a
+    previous item carries that previous item's identity (isMatched). This is
+    identity-matching only — it never rewrites, merges, or drops content.
+    """
+    return (
+f"""You are matching a freshly-regenerated {item_type} list to the version the user previously curated, for the SAME legal case analysis.
+
+PREVIOUS list (already curated by the user — each line is "index. [id] text"):
+{numbered_prev}
+
+FRESH list (freshly regenerated — each line is "index. text"):
+{numbered_fresh}
+
+YOUR TASK: decide which FRESH items are the SAME (by meaning) as a PREVIOUS item.
+
+RULES (apply strictly):
+1. A FRESH item MATCHES a PREVIOUS item only when they express the SAME underlying requirement / risk / fact / concern — even if worded differently or more/less specific.
+2. Each FRESH item matches AT MOST ONE previous item; each PREVIOUS item is used AT MOST ONCE. Pick the single best pairing.
+3. If a FRESH item introduces a clearly distinct object/requirement not covered by any PREVIOUS item, leave it UNMATCHED (do not force a match).
+4. Do NOT rewrite, merge, re-rank, or invent items. Only report pairings.
+
+Return ONLY this JSON, no commentary:
+{{"matches":[{{"freshIndex":1,"prevId":"<the id in brackets from PREVIOUS>"}}]}}
+Return {{"matches":[]}} if nothing matches.
+"""
+    )
+
+
+def llm_resolve_answered_missing_info_prompt(*, numbered_items, entities_block, document_content):
+    return (
+f"""You are auditing the "Missing Information" list of a legal case analysis after new documents were uploaded.
+
+MISSING INFORMATION ITEMS (currently shown to the user):
+{numbered_items}
+
+EXTRACTED FACTS (authoritative entities pulled from ALL uploaded documents):
+{entities_block}
+
+DOCUMENT CONTENT (excerpts from ALL uploaded documents):
+{document_content}
+
+YOUR TASK: identify which items are now ANSWERED by the documents.
+
+RULES (apply strictly):
+1. Mark an item as answered ONLY when a specific fact or passage above DIRECTLY supplies the exact information the item asks for.
+2. Quote that fact/passage as evidence. No evidence quote = NOT answered.
+3. Partial or inferred coverage is NOT answered. When in doubt, keep the item as missing.
+4. Do not rewrite, merge, or re-rank items. Only classify.
+
+Return ONLY this JSON, no commentary:
+{{"answered":[{{"index":1,"evidence":"exact quote from facts or documents"}}]}}
+Return {{"answered":[]}} if nothing is answered.
+"""
+    )
 
 
 def llm_semantic_keep_indexes_prompt(*, item_type, max_keep, numbered):

@@ -726,13 +726,17 @@ def _litigation_framework_role_suffix(role_upper: str) -> str:
     if role_upper == "PETITIONER":
         return (
             "LITIGATION FRAMEWORK — ROLE APPLICATION: Apply the Indian Litigation Reasoning Framework as written, "
-            "petitioner-oriented (challenge impugned action, assert rights, seek reliefs)."
+            "petitioner-oriented (challenge impugned action, assert rights, seek reliefs). "
+            "First bind PETITIONER to a specific NAMED party: in consolidated records the petitioner/appellant is the party who INITIATED the live challenge "
+            "(roles invert on appeal); do NOT carry a party's role over from an earlier/lower stage and do NOT default to any particular side."
         )
     if role_upper == "RESPONDENT":
         return (
             "LITIGATION FRAMEWORK — ROLE APPLICATION: Apply the same analytical rigour from the RESPONDENT's perspective — "
             "stress defences, jurisdictional and procedural objections, alternate readings of fact and law, and why the other side's "
-            "violations may not be made out. In Remedies, address averments and procedural shields available to the respondent rather than advancing petitioner relief."
+            "violations may not be made out. In Remedies, address averments and procedural shields available to the respondent rather than advancing petitioner relief. "
+            "First bind RESPONDENT to a specific NAMED party: in consolidated records the respondent is the party DEFENDING/OPPOSING the live appeal or petition "
+            "(roles invert on appeal — the winner below becomes the respondent above); do NOT assume the promoter, company, bank, authority, or opponent is the respondent, and do NOT carry a party's role over from an earlier/lower stage."
         )
     if role_upper == "ADJUDICATOR":
         return (
@@ -802,6 +806,13 @@ def get_structured_document_feature_system_instruction(
         f"The workspace role is already selected: {role_upper}. "
         "Never ask the user to choose a role. Never output annexure-upload gate messages, "
         "onboarding text, or conversational preambles. "
+        "ROLE -> NAMED PARTY — the selected role is an abstract posture that must be bound to a "
+        "SPECIFIC NAMED party in this matter. In consolidated / multi-stage records (original "
+        "complaint, appeal, revision, execution) the same person can be petitioner in one stage "
+        "and respondent/appellant in another — procedural roles INVERT on appeal. Resolve who holds "
+        f"the {role_upper} role in the DOMINANT / LIVE (most recent, pending) proceeding and write all "
+        "role-tailored advocacy for THAT named party; never default the role to the promoter, company, "
+        "bank, authority, or opponent, and never inherit a party's role from an earlier/lower stage. "
         "DATE INTERPRETATION — "
         f"Today's date is {today_str} (current year is {current_year}). "
         "If the source states a date together with its year, use that exact year unchanged. "

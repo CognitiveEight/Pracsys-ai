@@ -56,6 +56,23 @@ class Settings(BaseSettings):
     google_api_key: Optional[str] = None
     gemini_model: str = "gemini-2.5-flash"
 
+    # Token pricing overrides (USD per 1,000,000 tokens). When BOTH are set they
+    # take precedence over the built-in per-model table in app/ai/pricing.py, so
+    # ops can retune costs without a code change. Leave unset to price by model.
+    token_price_input_per_million: Optional[float] = None
+    token_price_output_per_million: Optional[float] = None
+
+    # Paid non-LLM API rate overrides. Each takes precedence over the matching
+    # default in app/ai/pricing.py, so an upstream price change can be corrected
+    # without a deploy. Leave unset to use the built-in defaults — and note those
+    # defaults must be verified against Google's published pricing pages (cited
+    # in pricing.py). Free tiers are not modelled; cost is an upper bound.
+    ocr_price_per_1k_units: Optional[float] = None  # Vision text_detection
+    stt_price_per_minute: Optional[float] = None  # Speech-to-Text V2 / Chirp 3
+    search_price_per_1k_queries: Optional[float] = None  # Vertex AI Search
+    grounding_price_per_1k_requests: Optional[float] = None  # Google Search grounding
+    embed_price_per_million_tokens: Optional[float] = None  # Gemini embeddings
+
     # Google Cloud Platform
     google_application_credentials: Optional[str] = None
     # Separate service-account for Speech-to-Text V2 (Chirp 3) + audio GCS bucket.

@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
@@ -121,6 +122,7 @@ from app.prompts.applicable_laws_prompts import (
 class ApplicableLawsMixin:
     """Applicable laws (acts/sections) generation and feedback."""
 
+    @meter_usage
     async def _regenerate_applicable_laws_with_feedback(
         self,
         *,
@@ -191,14 +193,12 @@ class ApplicableLawsMixin:
             self._workspace_applicable_laws_payload[workspace_id] = edited
 
             if emit_result and self._socket_client:
-                await self._socket_client.emit(
-                    "document_feature_response",
-                    {
-                        "featureType": "applicable_laws",
-                        "workspaceId": workspace_id,
-                        "userId": user_id,
-                        "payload": edited,
-                    },
+                await self._emit_document_feature(
+                    feature_type="applicable_laws",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=edited,
+                    usage=current_usage(),
                 )
                 logger.success(
                     "✅ Applicable laws name edit emitted workspace={}",
@@ -591,6 +591,34 @@ class ApplicableLawsMixin:
                 return heuristic
         return normalized
 
+    def _tag_laws_against_current_state(
+        self, workspace_id: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Tag each applicable-law with ``isMatched`` against the frontend's
+        currentState.applicableLaws (matched by act + section). currentState
+        laws have no id, so the law keeps its ``law_N`` id and only gains the
+        flag. Deterministic — no LLM call needed.
+        """
+        if not isinstance(payload, dict):
+            return payload
+        current_state = self._workspace_current_state_payload.get(workspace_id) or {}
+        cs_laws = (
+            current_state.get("applicableLaws")
+            if isinstance(current_state, dict)
+            else None
+        )
+        prev_sigs: Set[str] = set()
+        for it in cs_laws or []:
+            if isinstance(it, dict):
+                sig = self._law_signature(it)
+                if sig and sig != "|":
+                    prev_sigs.add(sig)
+        for law in payload.get("laws") or []:
+            if isinstance(law, dict):
+                law["isMatched"] = self._law_signature(law) in prev_sigs
+        return payload
+
+    @meter_usage
     async def _generate_and_emit_applicable_laws(
         self,
         workspace_id: str,
@@ -646,17 +674,19 @@ class ApplicableLawsMixin:
         else:
             # Objective change: replace stale laws with the freshly-derived set.
             payload = new_payload
+        # Tag each law matched vs new against the frontend's currentState
+        # (match by act + section). Cache the tagged payload so reconnect
+        # re-emits the same flags.
+        payload = self._tag_laws_against_current_state(workspace_id, payload)
         self._workspace_applicable_laws_payload[workspace_id] = payload
         if not self._socket_client:
             return
-        await self._socket_client.emit(
-            "document_feature_response",
-            {
-                "featureType": "applicable_laws",
-                "workspaceId": workspace_id,
-                "userId": user_id,
-                "payload": payload,
-            },
+        await self._emit_document_feature(
+            feature_type="applicable_laws",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            payload=payload,
+            usage=current_usage(),
         )
         logger.success(
             "✅ Applicable laws sent to backend ({} laws)",

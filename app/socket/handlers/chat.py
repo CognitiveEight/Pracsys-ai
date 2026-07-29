@@ -115,6 +115,295 @@ from app.socket.event_utils import (
 class ChatMixin:
     """Intelligence chat, drafting-assistant chat, probing prompts."""
 
+    def _token_usage_metadata(
+        self, workspace_id: str, usage: Any
+    ) -> Dict[str, Any]:
+        """Build the usage/price metadata fields for one ai_response.
+
+        Prices this turn's accumulated tokens with the active model's rate AND the
+        paid non-LLM work it triggered (Vision OCR units, Speech-to-Text seconds,
+        Vertex AI Search queries, Google Search grounding requests, embedding
+        tokens), increments the workspace's cumulative totals (persisted to
+        Qdrant), and returns a dict merged into ``AIResponseMetadata``.
+
+        ``price`` is the FULL cost of this response — ``inputPrice + outputPrice
+        + servicePrice`` — with each component also exposed on its own field so
+        the backend can break the bill down by source.
+
+        Best-effort: returns ``{}`` if anything fails so a pricing hiccup never
+        blocks a response. Call exactly once per emitted response.
+        """
+        try:
+            from app.ai.pricing import price_for, service_price_for
+            from app.workspace.context import context_manager
+
+            input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+            output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+            model = settings.gemini_model
+            price = price_for(model, input_tokens, output_tokens)
+            total_tokens = input_tokens + output_tokens
+
+            # Paid non-LLM units consumed inside the same capture scope.
+            service_units: Dict[str, Any] = {
+                "ocrUnits": int(getattr(usage, "ocr_units", 0) or 0),
+                "sttSeconds": round(float(getattr(usage, "stt_seconds", 0.0) or 0.0), 3),
+                "searchQueries": int(getattr(usage, "search_queries", 0) or 0),
+                "groundingRequests": int(
+                    getattr(usage, "grounding_requests", 0) or 0
+                ),
+                "embedTokens": int(getattr(usage, "embed_tokens", 0) or 0),
+            }
+            service = service_price_for(
+                ocr_units=service_units["ocrUnits"],
+                stt_seconds=service_units["sttSeconds"],
+                search_queries=service_units["searchQueries"],
+                grounding_requests=service_units["groundingRequests"],
+                embed_tokens=service_units["embedTokens"],
+            )
+
+            fields: Dict[str, Any] = {
+                "inputTokens": input_tokens,
+                "outputTokens": output_tokens,
+                "totalTokens": total_tokens,
+                "tokensUsed": total_tokens,
+                "inputPrice": price["inputPrice"],
+                "outputPrice": price["outputPrice"],
+                # Full cost of this response: LLM tokens + paid non-LLM APIs.
+                "price": round(price["price"] + service["servicePrice"], 6),
+            }
+            fields.update(service_units)
+            fields.update(service)
+
+            ctx = context_manager.get_context(workspace_id)
+            if ctx is not None:
+                already_counted = bool(getattr(usage, "counted", False))
+                if already_counted:
+                    # Second emit in the same turn — don't bill again; report the
+                    # totals as they already stand.
+                    totals = ctx.get_metadata("token_usage") or {}
+                else:
+                    totals = ctx.add_token_usage(
+                        input_tokens,
+                        output_tokens,
+                        price,
+                        service=service,
+                        service_units=service_units,
+                    )
+                    try:
+                        usage.counted = True
+                    except Exception:
+                        pass
+                fields.update(
+                    {
+                        "totalInputTokens": totals.get("totalInputTokens", 0),
+                        "totalOutputTokens": totals.get("totalOutputTokens", 0),
+                        "totalInputPrice": totals.get("totalInputPrice", 0.0),
+                        "totalOutputPrice": totals.get("totalOutputPrice", 0.0),
+                        "totalPrice": totals.get("totalPrice", 0.0),
+                    }
+                )
+                fields.update(self._cumulative_service_fields(totals))
+            else:
+                logger.debug(
+                    "No workspace context for {}; emitting per-response token "
+                    "usage without cumulative totals",
+                    workspace_id,
+                )
+            return fields
+        except Exception as exc:  # pricing must never break a response
+            logger.warning("Failed to build token usage metadata: {}", exc)
+            return {}
+
+    def _ingest_usage_metadata(self, workspace_id: str, usage: Any) -> Dict[str, Any]:
+        """Usage metadata for a HAND-BUILT ``document_feature_response`` payload.
+
+        ``_emit_document_feature`` supplies ``messageId`` / ``aiModel`` around
+        ``_token_usage_metadata``; the few payloads assembled as dict literals
+        (the ingestion ``document_assessments`` emits) do not go through it, so
+        this wrapper adds the same two fields. Without ``messageId`` the backend
+        ``WorkspaceCostService`` drops the cost record entirely.
+
+        Idempotent per accumulator: once a scope's spend has been reported the
+        accumulator is flagged ``counted``, and any further call degrades to the
+        cumulative-only block. That makes this safe to call from both the success
+        emit and the ingestion error path — whichever runs first reports the real
+        (possibly partial) spend, and the other cannot double-report it.
+        """
+        if usage is None or bool(getattr(usage, "counted", False)):
+            return self._cumulative_usage_metadata(workspace_id)
+        metadata = self._token_usage_metadata(workspace_id, usage)
+        if isinstance(metadata, dict):
+            metadata.setdefault("messageId", uuid.uuid4().hex)
+            metadata.setdefault("aiModel", settings.gemini_model)
+            # Hand-built payloads bypass _emit_document_feature's check, so run it
+            # here too — same reason: an unknown key means an unrecorded cost.
+            self._warn_unknown_metadata_keys("ingestion payload", metadata)
+        return metadata
+
+    @staticmethod
+    def _warn_unknown_metadata_keys(label: str, metadata: Dict[str, Any]) -> None:
+        """Warn when a metadata block carries a key the backend contract has no field for.
+
+        ``document_feature_response`` is a hand-built dict with no pydantic model,
+        so its ``metadata`` mirrors ``AIResponseMetadata`` by convention only — a
+        typo'd key ships silently and the backend ``WorkspaceCostService`` never
+        sees that cost. ``AIResponseMetadata`` (app/socket/schemas.py) is the single
+        source of truth for the field list; nothing is dropped or renamed here, the
+        mismatch is only surfaced in the logs.
+        """
+        try:
+            from app.socket.schemas import AIResponseMetadata
+
+            known = set(AIResponseMetadata.model_fields.keys())
+            unknown = sorted(set(metadata.keys()) - known)
+            if unknown:
+                logger.warning(
+                    "Metadata for {} carries key(s) absent from AIResponseMetadata: "
+                    "{} — the backend will ignore them (typo?)",
+                    label,
+                    ", ".join(unknown),
+                )
+        except Exception as exc:  # a naming check must never block an emit
+            logger.debug("Metadata key check failed for {}: {}", label, exc)
+
+    @staticmethod
+    def _cumulative_service_fields(totals: Dict[str, Any]) -> Dict[str, Any]:
+        """Read the cumulative paid non-LLM totals out of a ``token_usage`` snapshot.
+
+        Every lookup defaults to 0 because workspaces whose ``token_usage`` was
+        cached before service costing was added rehydrate without these keys.
+        """
+        return {
+            "totalOcrUnits": totals.get("totalOcrUnits", 0),
+            "totalOcrPrice": totals.get("totalOcrPrice", 0.0),
+            "totalSttSeconds": totals.get("totalSttSeconds", 0.0),
+            "totalSttPrice": totals.get("totalSttPrice", 0.0),
+            "totalSearchQueries": totals.get("totalSearchQueries", 0),
+            "totalSearchPrice": totals.get("totalSearchPrice", 0.0),
+            "totalGroundingRequests": totals.get("totalGroundingRequests", 0),
+            "totalGroundingPrice": totals.get("totalGroundingPrice", 0.0),
+            "totalEmbedTokens": totals.get("totalEmbedTokens", 0),
+            "totalEmbedPrice": totals.get("totalEmbedPrice", 0.0),
+            "totalServicePrice": totals.get("totalServicePrice", 0.0),
+        }
+
+    def _cumulative_usage_metadata(self, workspace_id: str) -> Dict[str, Any]:
+        """Usage metadata for a RE-EMIT (no new LLM/paid API call this time).
+
+        Per-response fields are zero; cumulative fields report the workspace's
+        current running totals WITHOUT incrementing them (reconnect replay,
+        cached/no-op re-emit). Best-effort: returns ``{}`` if anything fails so a
+        re-emit is never blocked.
+        """
+        try:
+            from app.workspace.context import context_manager
+
+            fields: Dict[str, Any] = {
+                # Unique per emit so the backend WorkspaceCostService records a
+                # distinct cost entry (it keys on messageId and skips without one).
+                "messageId": uuid.uuid4().hex,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "totalTokens": 0,
+                "tokensUsed": 0,
+                "inputPrice": 0.0,
+                "outputPrice": 0.0,
+                "price": 0.0,
+                # No paid non-LLM work happened on a re-emit either.
+                "ocrUnits": 0,
+                "ocrPrice": 0.0,
+                "sttSeconds": 0.0,
+                "sttPrice": 0.0,
+                "searchQueries": 0,
+                "searchPrice": 0.0,
+                "groundingRequests": 0,
+                "groundingPrice": 0.0,
+                "embedTokens": 0,
+                "embedPrice": 0.0,
+                "servicePrice": 0.0,
+            }
+            ctx = context_manager.get_context(workspace_id)
+            if ctx is not None:
+                totals = ctx.get_metadata("token_usage") or {}
+                fields.update(
+                    {
+                        "totalInputTokens": totals.get("totalInputTokens", 0),
+                        "totalOutputTokens": totals.get("totalOutputTokens", 0),
+                        "totalInputPrice": totals.get("totalInputPrice", 0.0),
+                        "totalOutputPrice": totals.get("totalOutputPrice", 0.0),
+                        "totalPrice": totals.get("totalPrice", 0.0),
+                    }
+                )
+                fields.update(self._cumulative_service_fields(totals))
+            return fields
+        except Exception as exc:
+            logger.warning("Failed to build cumulative usage metadata: {}", exc)
+            return {}
+
+    async def _emit_document_feature(
+        self,
+        *,
+        feature_type: str,
+        workspace_id: str,
+        user_id: str,
+        payload: Any,
+        usage: Any = None,
+    ) -> None:
+        """Emit a ``document_feature_response`` with a top-level token-usage metadata block.
+
+        ``usage`` is the ``capture_usage()`` accumulator for a FRESH generation —
+        its tokens are priced and the workspace cumulative is incremented exactly
+        once (guarded by the accumulator's ``counted`` flag). Pass ``usage=None``
+        for a re-emit (reconnect replay, cached / no-op re-emit): the block reports
+        per-response zeros plus the current cumulative, with no increment.
+
+        The metadata block uses the same field names as ``AIResponseMetadata`` so
+        the backend reads it identically to the chat ``ai_response`` contract.
+        Best-effort throughout: a pricing hiccup never blocks the emit.
+
+        The metadata block is built BEFORE the socket-client check: building it is
+        what folds the spend into the workspace cumulative, and money already
+        burned must be billed even when there is no socket to emit on.
+        """
+        try:
+            if usage is not None:
+                metadata = self._token_usage_metadata(workspace_id, usage)
+            else:
+                metadata = self._cumulative_usage_metadata(workspace_id)
+            if isinstance(metadata, dict):
+                # The backend WorkspaceCostService keys the cost record on
+                # messageId and skips the record entirely without one. A fresh
+                # (usage-based) metadata block has no messageId, so mint a unique
+                # one per emit here. aiModel mirrors the ai_response contract.
+                metadata.setdefault("messageId", uuid.uuid4().hex)
+                metadata.setdefault("aiModel", settings.gemini_model)
+                self._warn_unknown_metadata_keys(feature_type, metadata)
+        except Exception as exc:
+            logger.warning(
+                "Feature usage metadata build failed for {} (non-fatal): {}",
+                feature_type,
+                exc,
+            )
+            metadata = {}
+        if not self._socket_client:
+            logger.info(
+                "No socket client — {} emit dropped for workspace {} (spend still "
+                "billed to the workspace cumulative)",
+                feature_type,
+                str(workspace_id)[:12],
+            )
+            return
+        await self._socket_client.emit(
+            "document_feature_response",
+            {
+                "featureType": feature_type,
+                "workspaceId": workspace_id,
+                "userId": user_id,
+                "payload": payload,
+                "metadata": metadata,
+            },
+        )
+
     async def _handle_drafting_assistant_message(
         self,
         *,
@@ -261,6 +550,8 @@ class ChatMixin:
             logger.error("Socket client unavailable; cannot emit drafting ai_response")
             return
 
+        from app.ai.usage import current_usage
+
         ai_response_payload: Dict[str, Any] = {
             "chatId": chat_id,
             "workspaceId": workspace_id,
@@ -275,6 +566,9 @@ class ChatMixin:
             "metadata": {
                 "messageId": chat_id,
                 "aiModel": settings.gemini_model,
+                # Per-response token/price + incremented workspace totals for
+                # this drafting turn (scope opened in on_user_message_request).
+                **self._token_usage_metadata(workspace_id, current_usage()),
             },
         }
         if ai_response_payload["draftDocument"] is None:
@@ -387,6 +681,14 @@ class ChatMixin:
         Args:
             data: User message request payload
         """
+        # Open a per-turn token-usage capture scope. Every GeminiClient.generate*
+        # call made while this is open (agent workflow, suggestion chips, role
+        # detection, drafting agent, …) accumulates here via ContextVar, and the
+        # single ai_response emitted for this turn reads the totals. Reset in the
+        # finally so the scope never leaks into another task/turn.
+        from app.ai.usage import begin_usage, current_usage, reset_usage
+
+        usage_token, _usage_acc = begin_usage()
         try:
             # Validate and parse payload
             payload = UserMessageRequestPayload(**data)
@@ -588,6 +890,9 @@ class ChatMixin:
                                 metadata=AIResponseMetadata(
                                     messageId=chat_id,
                                     aiModel=settings.gemini_model,
+                                    **self._token_usage_metadata(
+                                        workspace_id, current_usage()
+                                    ),
                                 ),
                             )
                             payload_dict = ai_response.dict(by_alias=True)
@@ -931,6 +1236,146 @@ class ChatMixin:
                         classification = {}
 
                     if classification and not classification.get("isQuestionLike"):
+                        # ADVOCACY-ROLE REASSIGNMENT (Rule 13): the user corrected
+                        # WHICH named party holds a litigation role (e.g. "the
+                        # respondent is Pradeep Mehra" / "we represent X"). This is
+                        # NOT a cosmetic rename — the whole strategy must be
+                        # RE-ORIENTED to advocate for the correct party. Route the
+                        # objective through the full-regeneration path (which flips
+                        # advocacy) instead of the word-for-word surgical editor,
+                        # persist the mapping so later syncs keep it, and short-
+                        # circuit: the classifier already forced every panel
+                        # shouldEdit=false + isRename=false, so the surgical
+                        # dispatch below harmlessly no-ops.
+                        if (
+                            classification.get("isRoleReassignment")
+                            and (classification.get("reassignParty") or "").strip()
+                        ):
+                            _ws_role = (
+                                role_context.get("role") or "ADJUDICATOR"
+                            ).strip().upper()
+                            _reassign_role = (
+                                classification.get("reassignRole") or ""
+                            ).strip().upper()
+                            _reassign_party = (
+                                classification.get("reassignParty") or ""
+                            ).strip()
+                            # Only advocacy roles re-orient; ADJUDICATOR/MEDIATOR
+                            # are neutral and have no party to advocate for.
+                            if _ws_role in ("PETITIONER", "RESPONDENT"):
+                                _pet_side = {
+                                    "PETITIONER", "APPELLANT", "COMPLAINANT", "PLAINTIFF",
+                                }
+                                _res_side = {"RESPONDENT", "DEFENDANT"}
+                                _ws_side = (
+                                    _pet_side if _ws_role == "PETITIONER" else _res_side
+                                )
+                                # Did the user name OUR side (a confirmable party)
+                                # or the OPPOSING side?
+                                _names_our_side = (
+                                    _reassign_role in ("", "CLIENT")
+                                    or _reassign_role in _ws_side
+                                )
+                                _confirmed_party = (
+                                    _reassign_party if _names_our_side else None
+                                )
+                                if _confirmed_party:
+                                    _reorient_instr = (
+                                        f"The {_ws_role} in this matter is "
+                                        f"{_confirmed_party}. Re-orient the ENTIRE "
+                                        f"strategic objective, possible next steps and "
+                                        f"suggestion chips to advocate FOR "
+                                        f"{_confirmed_party} as the {_ws_role} in the "
+                                        f"live/dominant proceeding. Do NOT change any "
+                                        f"case facts — only change whose side the "
+                                        f"advocacy is written for."
+                                    )
+                                else:
+                                    _reorient_instr = (
+                                        f"{_reassign_party} is the "
+                                        f"{_reassign_role or 'opposing party'}. Therefore "
+                                        f"the {_ws_role} we represent is the party "
+                                        f"OPPOSING {_reassign_party}. Re-orient the "
+                                        f"ENTIRE strategic objective, possible next steps "
+                                        f"and suggestion chips to advocate FOR the "
+                                        f"{_ws_role} (the party opposing "
+                                        f"{_reassign_party}) in the live/dominant "
+                                        f"proceeding. Do NOT change any case facts."
+                                    )
+                                # Persist the confirmed role->party so later
+                                # regenerations (e.g. a document-upload sync) keep
+                                # advocating for the pinned party.
+                                if _confirmed_party:
+                                    try:
+                                        from app.workspace.context import (
+                                            context_manager as _cm,
+                                        )
+
+                                        _rctx = _cm.get_context(workspace_id)
+                                        if _rctx is not None:
+                                            _rctx.set_metadata(
+                                                "confirmed_role_party",
+                                                {
+                                                    "role": _ws_role,
+                                                    "party": _confirmed_party,
+                                                },
+                                            )
+                                            _rctx._persist_meta()
+                                    except Exception as _persist_err:
+                                        logger.warning(
+                                            "Persist confirmed role->party failed (non-fatal): {}",
+                                            _persist_err,
+                                        )
+                                _cur_strat_reassign = (
+                                    self._workspace_strategy_payload.get(workspace_id)
+                                    or cur_strat_for_edit
+                                )
+                                if isinstance(_cur_strat_reassign, dict) and (
+                                    _cur_strat_reassign.get("caseSummary") or ""
+                                ).strip():
+                                    await self._emit_workspace_refresh(
+                                        workspace_id=workspace_id,
+                                        user_id=user_id,
+                                        reason="objective_change_regeneration_started",
+                                        feature_types=[
+                                            "strategy_objective",
+                                            "analysis_report",
+                                            "list_of_dates",
+                                            "applicable_laws",
+                                            "procedural_timeline",
+                                            "drafting_assistant",
+                                        ],
+                                    )
+                                    _reassign_ok = await self._regenerate_strategy_objective_preserving_case_summary(
+                                        workspace_id=workspace_id,
+                                        user_id=user_id,
+                                        workspace_role=_ws_role,
+                                        user_objective_instruction=_reorient_instr,
+                                        current_strategy=_cur_strat_reassign,
+                                        confirmed_party=_confirmed_party,
+                                    )
+                                    if _reassign_ok:
+                                        objective_regen_ok = True
+                                        objective_ack_kind = "direct"
+                                        self._schedule_objective_change_reanalysis(
+                                            workspace_id=workspace_id,
+                                            user_id=user_id,
+                                            log_context=(
+                                                " (role reassignment re-orientation)"
+                                            ),
+                                        )
+                                        logger.success(
+                                            "✅ Role reassignment re-oriented objective: {}={} (workspace={})",
+                                            _ws_role,
+                                            _confirmed_party
+                                            or f"opposing {_reassign_party}",
+                                            workspace_id[:12] if workspace_id else "",
+                                        )
+                                    else:
+                                        logger.warning(
+                                            "Role reassignment re-orientation returned False (workspace={})",
+                                            workspace_id[:12] if workspace_id else "",
+                                        )
                         # WORKSPACE-WIDE RENAME: a name change must replace the
                         # party's name in the EXISTING content of EVERY panel
                         # (no regeneration). Don't rely on the LLM flagging each
@@ -1239,18 +1684,16 @@ class ChatMixin:
                                     )
                                     if not isinstance(_preserved_lod, list):
                                         _preserved_lod = []
-                                    await self._socket_client.emit(
-                                        "document_feature_response",
-                                        {
-                                            "featureType": "list_of_dates",
+                                    await self._emit_document_feature(
+                                        feature_type="list_of_dates",
+                                        workspace_id=workspace_id,
+                                        user_id=user_id,
+                                        payload={
                                             "workspaceId": workspace_id,
                                             "userId": user_id,
-                                            "payload": {
-                                                "workspaceId": workspace_id,
-                                                "userId": user_id,
-                                                "listOfDates": _preserved_lod,
-                                            },
+                                            "listOfDates": _preserved_lod,
                                         },
+                                        usage=None,
                                     )
                                     logger.success(
                                         "✅ Rename: preserved list_of_dates re-emitted (no-op edit) workspace={}",
@@ -1265,14 +1708,12 @@ class ChatMixin:
                                     )
                                     if not isinstance(_preserved_laws, dict):
                                         _preserved_laws = {}
-                                    await self._socket_client.emit(
-                                        "document_feature_response",
-                                        {
-                                            "featureType": "applicable_laws",
-                                            "workspaceId": workspace_id,
-                                            "userId": user_id,
-                                            "payload": _preserved_laws,
-                                        },
+                                    await self._emit_document_feature(
+                                        feature_type="applicable_laws",
+                                        workspace_id=workspace_id,
+                                        user_id=user_id,
+                                        payload=_preserved_laws,
+                                        usage=None,
                                     )
                                     logger.success(
                                         "✅ Rename: preserved applicable_laws re-emitted (no-op edit) workspace={}",
@@ -1287,16 +1728,14 @@ class ChatMixin:
                                     )
                                     if not isinstance(_preserved_timeline, list):
                                         _preserved_timeline = []
-                                    await self._socket_client.emit(
-                                        "document_feature_response",
-                                        {
-                                            "featureType": "procedural_timeline",
-                                            "workspaceId": workspace_id,
-                                            "userId": user_id,
-                                            "payload": {
-                                                "proceduralTimeline": _preserved_timeline
-                                            },
+                                    await self._emit_document_feature(
+                                        feature_type="procedural_timeline",
+                                        workspace_id=workspace_id,
+                                        user_id=user_id,
+                                        payload={
+                                            "proceduralTimeline": _preserved_timeline
                                         },
+                                        usage=None,
                                     )
                                     logger.success(
                                         "✅ Rename: preserved procedural_timeline re-emitted (no-op edit) workspace={}",
@@ -1328,14 +1767,12 @@ class ChatMixin:
                                 workspace_id
                             )
                             if isinstance(_final_strategy, dict) and _final_strategy:
-                                await self._socket_client.emit(
-                                    "document_feature_response",
-                                    {
-                                        "featureType": "strategy_objective",
-                                        "workspaceId": workspace_id,
-                                        "userId": user_id,
-                                        "payload": _final_strategy,
-                                    },
+                                await self._emit_document_feature(
+                                    feature_type="strategy_objective",
+                                    workspace_id=workspace_id,
+                                    user_id=user_id,
+                                    payload=_final_strategy,
+                                    usage=None,
                                 )
                                 logger.success(
                                     "✅ Strategy panel emitted once after edits {} (workspace={})",
@@ -1845,7 +2282,6 @@ class ChatMixin:
                 metadata=AIResponseMetadata(
                     messageId=response.message_id,
                     aiModel=settings.gemini_model,
-                    tokensUsed=response.tokens_used,
                     responseTime=processing_time,
                     confidence=(
                         response.confidence.value
@@ -1853,6 +2289,9 @@ class ChatMixin:
                         else str(response.confidence)
                     ),
                     detectedIntent=response.detected_intent,
+                    # Per-response token/price + incremented workspace totals.
+                    # tokensUsed is set here too (total tokens for this response).
+                    **self._token_usage_metadata(workspace_id, current_usage()),
                 ),
                 suggestionChips=(
                     suggestion_chips_for_payload
@@ -1930,16 +2369,18 @@ class ChatMixin:
                 user_id = data.get("userId", "unknown")
 
                 if self._socket_client and chat_id:
+                    error_meta = AIResponseMetadata(
+                        messageId=chat_id,
+                        aiModel=settings.gemini_model,
+                        error=str(e),
+                        **self._token_usage_metadata(workspace_id, current_usage()),
+                    )
                     error_response = AIResponsePayload(
                         chatId=chat_id,
                         workspaceId=workspace_id,
                         userId=user_id,
                         content=f"I apologize, but I encountered an error processing your message: {str(e)}",
-                        metadata=AIResponseMetadata(
-                            messageId=chat_id,
-                            aiModel=settings.gemini_model,
-                            error=str(e),
-                        ),
+                        metadata=error_meta,
                     )
                     await self._socket_client.emit_ai_response(
                         error_response.dict(by_alias=True)
@@ -1947,6 +2388,12 @@ class ChatMixin:
                     logger.info("Error response sent to user")
             except Exception as emit_error:
                 logger.error(f"Failed to emit error response: {emit_error}")
+        finally:
+            # Always close the per-turn usage scope opened above.
+            try:
+                reset_usage(usage_token)
+            except Exception:
+                pass
 
     async def on_probing_prompts_request(self, data: Dict[str, Any]) -> None:
         """
@@ -1955,6 +2402,27 @@ class ChatMixin:
           generate contextual, role-based suggestion chips so they change with the chat.
         - Otherwise return a random 4 from the stored 15-16 strategy chips (role/case-related).
         Chips are sent as prompts[]; when user clicks one, that text goes into the chat as the user message.
+
+        The whole body runs inside a usage scope: the contextual-chip branch calls
+        Gemini (``_generate_contextual_suggestion_chips``), and without a scope
+        those tokens were billed to nobody. Most polls serve cached chips and spend
+        nothing, so the usage metadata is attached only when tokens were actually
+        consumed — see the emit below.
+        """
+        import random
+
+        from app.ai.usage import capture_usage
+
+        with capture_usage() as chips_usage:
+            await self._handle_probing_prompts_request(data, chips_usage)
+
+    async def _handle_probing_prompts_request(
+        self, data: Dict[str, Any], chips_usage: Any = None
+    ) -> None:
+        """Body of :meth:`on_probing_prompts_request` (see its docstring).
+
+        Split out so the usage scope can wrap the whole thing with one ``with``
+        rather than re-indenting the entire handler.
         """
         import random
 
@@ -2172,6 +2640,22 @@ class ChatMixin:
             }
             if data.get("timestamp") is not None:
                 response["timestamp"] = data.get("timestamp")
+
+            # Bill the chip-generation spend (only the contextual branch calls
+            # Gemini; a cached-chip poll consumes nothing and gets no metadata
+            # block, so the backend does not record a stream of $0 entries).
+            # Billed before the throttle check below so a throttled response
+            # still adds its real spend to the workspace cumulative.
+            chips_metadata = None
+            spent_tokens = (
+                int(getattr(chips_usage, "input_tokens", 0) or 0)
+                + int(getattr(chips_usage, "output_tokens", 0) or 0)
+            )
+            if workspace_id and spent_tokens > 0:
+                chips_metadata = self._ingest_usage_metadata(workspace_id, chips_usage)
+                if chips_metadata:
+                    response["metadata"] = chips_metadata
+
             if self._socket_client:
                 import time
 

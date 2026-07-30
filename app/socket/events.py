@@ -257,6 +257,18 @@ class SocketEventHandler(
         self._workspace_deleted_parties: Dict[str, List[str]] = (
             PersistentWorkspaceDict(CacheKinds.DELETED_PARTIES)
         )
+        # Ledger of documents the user uploaded and later deleted (mirrors
+        # _workspace_deleted_parties: memory of a user removal that survives
+        # regeneration). Snapshotted from the document_assessments entry by
+        # _prune_document_assessments before that entry is dropped, so the
+        # documentType and key fields outlive the document. The analysis report
+        # reports each material entry as a missingInfo gap; an entry is removed
+        # when the same documentId is re-ingested (upload or version restore).
+        # Shape: {workspace_id: [{documentId, fileName, documentType,
+        #                         keyFields, removedAt}, ...]}
+        self._workspace_removed_documents: Dict[str, List[Dict[str, Any]]] = (
+            PersistentWorkspaceDict(CacheKinds.REMOVED_DOCUMENTS)
+        )
         # Procedural timeline payload per workspace (upcoming filing/hearing/compliance/evidence/adjournment dates)
         self._workspace_procedural_timeline_payload: Dict[
             str, List[Dict[str, Any]]
@@ -328,6 +340,13 @@ class SocketEventHandler(
         # De-dup guard for replayed workspace_sync events (e.g., reconnect replay).
         # workspace_id -> {"fingerprint": str, "ts": float}
         self._last_workspace_sync_fingerprint: Dict[str, Dict[str, Any]] = {}
+        # De-dup guard for replayed workspace_version_restore events. Kept
+        # SEPARATE from the workspace_sync guard on purpose: restoring back to a
+        # version that was live minutes ago produces a document set the sync
+        # fingerprint has already seen, and sharing the window would silently
+        # swallow the restore. Keyed on versionId instead.
+        # workspace_id -> {"fingerprint": str, "ts": float}
+        self._last_version_restore_fingerprint: Dict[str, Dict[str, Any]] = {}
         # De-dup guard for replayed workspace_transferred events (same shape).
         # workspace_id -> {"fingerprint": str, "ts": float}
         self._last_workspace_transfer_fingerprint: Dict[str, Dict[str, Any]] = {}
@@ -362,6 +381,9 @@ class SocketEventHandler(
         # Backend-specified events (AI_Maverick listens to these)
         self.register("workspace_created", self.on_workspace_created)
         self.register("workspace_sync", self.on_workspace_sync)
+        self.register(
+            "workspace_version_restore", self.on_workspace_version_restore
+        )
         # Workspace ownership moved to another lawyer — re-key owner state and
         # re-emit the features listed in reEmitFeatures (drafting_assistant).
         self.register("workspace_transferred", self.on_workspace_transferred)

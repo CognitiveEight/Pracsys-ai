@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- (Document additions here before release)
+
+### Changed
+
+- (Document changes here before release)
+
+### Fixed
+
+- (Document fixes here before release)
+
+---
+
+## [5.1.0] - 2026-07-31
+
+### Added
+
 - **Paid non-LLM API cost is now tracked and reported alongside LLM token cost** (`app/ai/usage.py`, `app/ai/pricing.py`, `app/core/config.py`, `app/processing/file_handlers.py`, `app/processing/audio_transcription.py`, `app/search/vertex_ai_search.py`, `app/ai/gemini_client.py`, `app/workspace/context.py`, `app/socket/handlers/chat.py`, `app/socket/schemas.py`). Costing was token-only, so every paid Google Cloud call the pipeline makes was billed to nobody: Vision OCR (1 unit per image **and per PDF page**), Speech-to-Text V2 / Chirp 3 (audio seconds, including retries and chunk overlap), Vertex AI Search (per query), Google Search grounding (per request), and embeddings (per input token). `UsageAccumulator` now carries `ocr_units` / `stt_seconds` / `search_queries` / `grounding_requests` / `embed_tokens` — reported via new `record_ocr_units` / `record_stt_seconds` / `record_search_queries` / `record_grounding_requests` / `record_embed_tokens` helpers, priced by the new `service_price_for()`, and accumulated per workspace by `add_token_usage`.
 
   **Socket payload change** — `AIResponseMetadata` (and therefore the `metadata` block on both `ai_response` and every `document_feature_response`) gains per-response `ocrUnits`/`ocrPrice`, `sttSeconds`/`sttPrice`, `searchQueries`/`searchPrice`, `groundingRequests`/`groundingPrice`, `embedTokens`/`embedPrice`, `servicePrice`, and the matching cumulative `total*` fields plus `totalServicePrice`. **`price` and `totalPrice` now include this service cost** — `price == inputPrice + outputPrice + servicePrice` and `totalPrice == totalInputPrice + totalOutputPrice + totalServicePrice`. Every field is optional, so consumers that ignore them are unaffected; a consumer that *recomputes* `price` from `inputPrice + outputPrice` will now understate the bill and should read `price` (or add `servicePrice`) instead.

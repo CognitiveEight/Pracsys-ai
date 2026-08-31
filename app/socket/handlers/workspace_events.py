@@ -72,7 +72,6 @@ from app.utils.exceptions import SocketEventError
 from app.workspace.custom_instructions import (build_custom_instruction_suffix,
                                                hydrate_custom_instructions_from_cache,
                                                set_custom_instructions)
-from app.workspace.manager import workspace_manager
 from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
                                        hydrate_workspace_state, persist_state,
                                        restore_state)
@@ -376,6 +375,12 @@ class WorkspaceEventsMixin:
         try:
             # Validate and parse payload
             payload = WorkspaceCreatedPayload(**data)
+
+            # A workspace showing signs of life revokes any pending compliance
+            # purge (see handlers/workspace_purge.py). Without this a case
+            # deleted then restored inside the grace window would keep its armed
+            # timer and be erased on schedule days later.
+            self.cancel_pending_purge(payload.workspaceId, trigger="workspace_created")
 
             # Store custom instructions if provided (structure, tone, description)
             custom = data.get("customInstructions") or {}
@@ -837,6 +842,12 @@ class WorkspaceEventsMixin:
 
             # Validate and parse payload
             payload = WorkspaceSyncPayload(**data)
+
+            # A workspace showing signs of life revokes any pending compliance
+            # purge (see handlers/workspace_purge.py). Without this a case
+            # deleted then restored inside the grace window would keep its armed
+            # timer and be erased on schedule days later.
+            self.cancel_pending_purge(payload.workspaceId, trigger="workspace_sync")
 
             # Cache the previously-emitted, user-curated panel state so every
             # regeneration path (upload/delete here AND the chat-triggered
@@ -2287,6 +2298,9 @@ class WorkspaceEventsMixin:
             user_id = str(payload.userId)
             version_id = str(payload.versionId)
 
+            # Live workspace: revoke any pending compliance purge.
+            self.cancel_pending_purge(workspace_id, trigger="workspace_version_restore")
+
             logger.info(
                 "⏪ Workspace version restore: {} → version {} (User: {})",
                 workspace_id,
@@ -2865,6 +2879,9 @@ class WorkspaceEventsMixin:
             )
             return
 
+        # Live workspace: revoke any pending compliance purge.
+        self.cancel_pending_purge(workspace_id, trigger="workspace_transferred")
+
         # De-dup guard for replayed transfers (e.g. reconnect replay), same
         # 180s fingerprint window as workspace_sync.
         try:
@@ -3136,16 +3153,11 @@ class WorkspaceEventsMixin:
             logger.error(f"Error processing workspace_updated: {e}")
             raise
 
-    async def on_workspace_deleted(self, data: Dict[str, Any]) -> None:
-        """Handle workspace deletion event (legacy)."""
-        try:
-            workspace_id = data.get("workspace_id") or data.get("workspaceId")
-            logger.info(f"Workspace deleted (legacy): {workspace_id}")
-
-            # Delete the workspace
-            await workspace_manager.delete_workspace(workspace_id)
-
-            audit_logger.log_event("workspace_deleted", {"workspace_id": workspace_id})
-        except Exception as e:
-            logger.error(f"Error processing workspace_deleted: {e}")
-            raise
+    # NOTE: on_workspace_deleted lives in WorkspacePurgeMixin
+    # (app/socket/handlers/workspace_purge.py). The legacy version that used to
+    # sit here deleted the workspace the instant the event arrived, which
+    # ignored the backend's grace window: a case restored on day 2 of 7 would
+    # already have lost its index. It also had no de-duplication, so the
+    # backend's deliberate re-sends each re-ran the delete. Keep this file free
+    # of a competing definition — WorkspaceEventsMixin precedes
+    # WorkspacePurgeMixin in the MRO, so one here would silently win.

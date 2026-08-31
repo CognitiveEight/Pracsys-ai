@@ -191,6 +191,47 @@ async def _preserve_token_usage(workspace_id: str, data: Any) -> Any:
     return data
 
 
+# ---------------------------------------------------------------------------
+# Purge suppression
+# ---------------------------------------------------------------------------
+# `persist_state` is fire-and-forget: the Qdrant upsert is scheduled and the
+# caller moves on. That is fine normally, but it races the compliance purge in
+# `workspace_deleted` — an upsert scheduled just before the purge can land just
+# after it, silently recreating a cache point for data we told the client was
+# erased. A deletion that half-works is worse than one that fails loudly.
+#
+# So a purged workspace is recorded here and every subsequent write for it is
+# dropped at the source. `allow_workspace_persistence` lifts the block when the
+# workspace legitimately comes back (a restore inside the grace window, or a
+# fresh workspace_sync after it) — see WorkspacePurgeMixin.
+_purge_blocked_workspaces: set = set()
+_purge_lock = threading.Lock()
+
+
+def block_workspace_persistence(workspace_id: str) -> None:
+    """Drop all future state writes for a workspace (called by the purge)."""
+    if not workspace_id:
+        return
+    with _purge_lock:
+        _purge_blocked_workspaces.add(str(workspace_id))
+
+
+def allow_workspace_persistence(workspace_id: str) -> None:
+    """Re-enable state writes for a workspace that has legitimately returned."""
+    if not workspace_id:
+        return
+    with _purge_lock:
+        _purge_blocked_workspaces.discard(str(workspace_id))
+
+
+def is_workspace_persistence_blocked(workspace_id: str) -> bool:
+    """True when a purge has disabled writes for this workspace."""
+    if not workspace_id:
+        return False
+    with _purge_lock:
+        return str(workspace_id) in _purge_blocked_workspaces
+
+
 def persist_state(
     workspace_id: str,
     kind: str,
@@ -202,6 +243,14 @@ def persist_state(
     if not workspace_id or not kind:
         return
     if data is None:
+        return
+    # Refuse to resurrect state for a purged workspace (see the note above).
+    if is_workspace_persistence_blocked(workspace_id):
+        logger.debug(
+            "Dropping state write for purged workspace (workspace={}, kind={})",
+            workspace_id,
+            kind,
+        )
         return
 
     async def _do_persist():

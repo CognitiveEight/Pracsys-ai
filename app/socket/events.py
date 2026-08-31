@@ -129,6 +129,7 @@ from app.socket.handlers import (
     TemplateSyncMixin,
     WorkspaceMetadataMixin,
     WorkspaceEventsMixin,
+    WorkspacePurgeMixin,
     ChatMixin,
     SuggestionChipsMixin,
 )
@@ -154,6 +155,7 @@ class SocketEventHandler(
     TemplateSyncMixin,
     WorkspaceMetadataMixin,
     WorkspaceEventsMixin,
+    WorkspacePurgeMixin,
     ChatMixin,
     SuggestionChipsMixin,
 ):
@@ -355,6 +357,25 @@ class SocketEventHandler(
         # During objective-change regeneration, suppress stale background analysis_report emits
         # from older pipelines so FE receives only the fresh objective-aligned report.
         self._suppress_analysis_emit_until_ts: Dict[str, float] = {}
+        # --- workspace_deleted / compliance purge (see handlers/workspace_purge.py)
+        # Deletions awaiting their purgeAfter deadline.
+        #   workspace_id -> {requestId, purgeAfter, deletedAt, userId, reason,
+        #                    armedAt, task}
+        # Held in memory only, by design: a restart loses the timer, and the
+        # backend re-sends every pending deletion on reconnect under the same
+        # requestId until purgeAfter passes, which re-arms it.
+        self._pending_purges: Dict[str, Dict[str, Any]] = {}
+        # requestId -> first-seen time. The backend's de-duplication key.
+        self._seen_purge_requests: Dict[str, float] = {}
+        # Workspaces already erased. Keeps a re-send that races the purgeAfter
+        # boundary from re-arming a purge for data that is already gone, and
+        # marks the workspace as needing a rebuild-from-scratch on the next sync.
+        #   workspace_id -> {purgedAt, requestId, userId, reason}
+        self._purged_workspaces: Dict[str, Dict[str, Any]] = {}
+        # chat_id -> workspace_id. Chat-scoped caches hold extracted document
+        # text but are keyed by chat_id alone; without this index the purge
+        # cannot reach them. Populated at the chat entry point.
+        self._chat_workspace_index: Dict[str, str] = {}
         self._register_default_handlers()
 
     def set_socket_client(self, client):

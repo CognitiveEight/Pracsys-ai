@@ -2,7 +2,7 @@
 Application configuration management.
 """
 
-from typing import Optional
+from typing import List, Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -51,6 +51,19 @@ class Settings(BaseSettings):
 
     # Signature encoding (per backend spec: urlsafe base64)
     socket_signature_encoding: str = "urlsafe"  # Options: "urlsafe" or "standard"
+
+    # Handshake signature scheme (see app/socket/auth.py).
+    #   "v1"     -> replay-resistant: HMAC over "v1:AI_Maverick:<ts>:<nonce>",
+    #               sent as x-signature / x-signature-timestamp / x-signature-nonce.
+    #   "legacy" -> pre-migration constant signature. Replayable forever; only for
+    #               rollback while the backend's AI_SIGNATURE_ALLOW_LEGACY window is open.
+    socket_auth_scheme: str = "v1"
+
+    # Engine.IO transports for the handshake, comma-separated (e.g. "websocket" or
+    # "polling,websocket"). Empty/unset keeps the python-socketio default
+    # (polling first, then upgrade). Pin to "websocket" if the backend verifies the
+    # nonce on the upgrade request as well as the initial handshake.
+    socket_transports: Optional[str] = None
 
     # API Keys - Google Services
     google_api_key: Optional[str] = None
@@ -150,6 +163,19 @@ class Settings(BaseSettings):
     def is_production(self) -> bool:
         """Check if running in production mode."""
         return self.app_env == "production"
+
+    @property
+    def socket_transports_list(self) -> Optional[List[str]]:
+        """
+        Parsed SOCKET_TRANSPORTS, or None to keep the python-socketio default.
+
+        Returns:
+            Ordered transport names (e.g. ``["websocket"]``), or None when unset.
+        """
+        if not self.socket_transports:
+            return None
+        transports = [t.strip() for t in self.socket_transports.split(",") if t.strip()]
+        return transports or None
 
     @property
     def redis_url(self) -> str:

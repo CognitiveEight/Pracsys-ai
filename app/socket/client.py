@@ -7,10 +7,7 @@ sensible pingInterval so the connection is not closed while the AI service is ge
 """
 
 import asyncio
-import base64
-import hashlib
 import json
-import hmac
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -20,6 +17,17 @@ from loguru import logger
 
 from app import __version__ as app_version
 from app.core.config import settings
+from app.socket.auth import (
+    CLIENT_ID,
+    HEADER_CLIENT_TYPE,
+    HEADER_NONCE,
+    HEADER_SIGNATURE,
+    HEADER_TIMESTAMP,
+    SCHEME_V1,
+    SocketAuthError,
+    build_auth_headers,
+    redact_auth_headers,
+)
 from app.socket.backend_events import AI_HEARTBEAT_PING, AI_HEARTBEAT_PONG
 from app.socket.events import event_handler
 from app.utils.exceptions import SocketConnectionError
@@ -42,67 +50,158 @@ class SocketClient:
         self._reconnect_task: Optional[asyncio.Task] = None
         # Used to coordinate short waits during transient disconnects.
         self._connected_event: asyncio.Event = asyncio.Event()
-
-    def _generate_signature(self) -> Optional[str]:
-        """
-        Generate HMAC-SHA256 signature for authentication.
-
-        Per backend specification:
-        - Signature = HMAC_SHA256(SOCKET_SECRET_KEY, ai_chat_user)
-        - Encoded as Base64 URL-safe
-
-        Returns:
-            Base64-encoded signature or None if credentials not configured
-        """
-        if not settings.socket_secret_key:
-            logger.warning(
-                "Socket signature authentication not configured (SOCKET_SECRET_KEY missing)"
-            )
-            return None
-
-        try:
-            # Get payload from configuration
-            payload = settings.socket_ai_payload
-
-            if not payload:
-                logger.error("SOCKET_AI_PAYLOAD not configured in .env file")
-                return None
-
-            # Generate HMAC-SHA256 signature using SOCKET_SECRET_KEY + payload
-            # HMAC requires: key, message, digestmod
-            signature = hmac.new(
-                settings.socket_secret_key.encode("utf-8"),  # key
-                payload.encode("utf-8"),  # message
-                hashlib.sha256,  # digestmod
-            ).digest()
-
-            # Encode signature in Base64 URL-safe (per backend spec)
-            signature_b64 = base64.urlsafe_b64encode(signature).decode("utf-8")
-            logger.debug("Generated socket signature for AI_Maverick client")
-            logger.debug(f"Payload: {payload}")
-            logger.debug(f"Signature: {signature_b64}")
-
-            return signature_b64
-        except Exception as e:
-            logger.error("Failed to generate signature: {}", str(e))
-            return None
+        # Handshake bookkeeping. Every connection attempt (including python-socketio's
+        # automatic reconnects) signs a fresh nonce, so this records which one is in
+        # flight: it is what turns an opaque "connection refused" into a diagnosable
+        # event, and what proves at runtime which scheme the backend actually accepted.
+        self._handshake_attempts: int = 0
+        self._last_handshake: Optional[Dict[str, Any]] = None
 
     def _get_custom_headers(self) -> Dict[str, str]:
         """
-        Get custom headers for socket connection including authentication.
+        Build a FRESH set of handshake headers for one connection attempt.
+
+        This is handed to python-socketio as a callable rather than a dict:
+        the library re-resolves callable headers on every connect *and* on every
+        automatic reconnect, which is exactly what the v1 scheme requires --
+        the nonce is single-use and the timestamp expires after 300s, so reusing
+        one set of headers makes the first connection succeed and every
+        reconnect fail with ``replayed_nonce``.
+
+        Never raises: it runs inside python-socketio's reconnect loop, which
+        only catches ConnectionError/ValueError, so an exception here would kill
+        the reconnect task. A misconfiguration degrades to the unsigned
+        ``x-client-type`` header, the backend refuses the handshake, and the
+        normal reconnect backoff applies. Startup validation in
+        ``app/core/lifecycle.py`` catches the missing secret far earlier.
 
         Returns:
-            Dictionary of custom headers
+            Handshake headers, lowercase-keyed.
         """
-        headers = {"x-client-type": "AI_Maverick"}
+        self._handshake_attempts += 1
+        attempt = self._handshake_attempts
+        scheme = (settings.socket_auth_scheme or "").strip().lower()
 
-        # Add signature if configured
-        signature = self._generate_signature()
-        if signature:
-            headers["x-signature"] = signature
-            logger.debug("Added authentication signature to headers")
+        try:
+            headers = build_auth_headers(
+                settings.socket_secret_key,
+                scheme=settings.socket_auth_scheme,
+                legacy_payload=settings.socket_ai_payload,
+            )
+        except SocketAuthError as e:
+            self._last_handshake = {
+                "attempt": attempt,
+                "scheme": scheme,
+                "signed": False,
+                "error": str(e),
+                "builtAt": _utc_iso_ms_z(),
+            }
+            logger.error(
+                "🔐 Handshake #{} NOT signed ({}); connecting unsigned - the backend "
+                "will refuse this with missing_header",
+                attempt,
+                str(e),
+            )
+            return {HEADER_CLIENT_TYPE: CLIENT_ID}
 
+        signature = headers.get(HEADER_SIGNATURE, "")
+        self._last_handshake = {
+            "attempt": attempt,
+            "scheme": scheme,
+            "signed": True,
+            "timestamp": headers.get(HEADER_TIMESTAMP),
+            "nonce": headers.get(HEADER_NONCE),
+            "signatureLength": len(signature),
+            "builtAt": _utc_iso_ms_z(),
+        }
+
+        # Timestamp and nonce are logged deliberately: neither is a credential, and
+        # they are exactly what the backend asks for when diagnosing a refused
+        # handshake. The signature and the secret are never logged - only the
+        # signature's length, which is the one thing that catches a padding or
+        # encoding mistake (v1 must always be 43 unpadded base64url characters).
+        if scheme == SCHEME_V1:
+            logger.info(
+                "🔐 Handshake #{} signed | scheme={} ts={} nonce={} sigLen={}",
+                attempt,
+                scheme,
+                headers.get(HEADER_TIMESTAMP),
+                headers.get(HEADER_NONCE),
+                len(signature),
+            )
+            if len(signature) != 43 or "=" in signature:
+                logger.error(
+                    "Signature is {} chars (padded={}) but v1 requires 43 unpadded "
+                    "base64url characters - the backend will reject this as "
+                    "bad_signature",
+                    len(signature),
+                    "=" in signature,
+                )
+        else:
+            logger.warning(
+                "🔐 Handshake #{} signed with the LEGACY constant signature "
+                "(replayable; accepted only while the backend's "
+                "AI_SIGNATURE_ALLOW_LEGACY window is open)",
+                attempt,
+            )
+
+        logger.debug("Handshake headers: {}", redact_auth_headers(headers))
         return headers
+
+    def _handshake_summary(self) -> Dict[str, Any]:
+        """
+        Return the last handshake's non-secret details for logging.
+
+        Empty until the first connection attempt has built its headers.
+        """
+        return dict(self._last_handshake or {})
+
+    def _log_handshake_refusal(self, reason: Any) -> None:
+        """
+        Log everything needed to diagnose a refused handshake without the
+        backend's logs, and everything the backend asks for when we raise an
+        issue with them -- except the signature and the secret, which must
+        never be logged.
+
+        Called from both ``connect_error`` and the failure path of
+        :meth:`connect`: the backend disconnects on a bad handshake without a
+        descriptive body, and depending on the transport the rejection can
+        surface as a namespace error or simply as a connect timeout, so neither
+        call site alone is guaranteed to fire.
+
+        Args:
+            reason: Whatever the transport reported (may be None).
+        """
+        hs = self._handshake_summary()
+        if not hs:
+            logger.error(
+                "🔒 Handshake REFUSED before any headers were built | reason={}",
+                reason,
+            )
+            return
+
+        logger.error(
+            "🔒 Handshake #{} REFUSED | scheme={} ts={} nonce={} sigLen={} "
+            "builtAt={} reason={}",
+            hs.get("attempt"),
+            hs.get("scheme"),
+            hs.get("timestamp"),
+            hs.get("nonce"),
+            hs.get("signatureLength"),
+            hs.get("builtAt"),
+            reason,
+        )
+        logger.error(
+            "Signed string was 'v1:AI_Maverick:<ts>:<nonce>'. Ask the backend for "
+            "the refusal code. EVERY attempt refused => clock drift >300s (check "
+            "NTP; local UTC now is {}, sent ts was {}) or a SOCKET_SECRET_KEY "
+            "mismatch. Only RECONNECTS refused => the nonce was reused instead of "
+            "re-signed. Refused on the legacy scheme => the backend's "
+            "AI_SIGNATURE_ALLOW_LEGACY window is closed. Report the values above "
+            "- never the signature or the secret.",
+            _utc_iso_ms_z(),
+            hs.get("timestamp"),
+        )
 
     async def connect(self) -> None:
         """
@@ -137,32 +236,32 @@ class SocketClient:
             # Register event handlers
             self._register_handlers()
 
-            # Get custom headers with authentication
-            custom_headers = self._get_custom_headers()
-
             # Connect to server
             logger.info("Connecting to socket server: {}", settings.socket_url)
             logger.info("Socket path: {}", settings.socket_path)
             logger.info("Namespace: {}", settings.socket_namespace)
-            logger.info(
-                "Custom headers: {}",
-                {
-                    k: "***" if k == "x-signature" else v
-                    for k, v in custom_headers.items()
-                },
-            )
+            logger.info("Auth scheme: {}", settings.socket_auth_scheme)
 
-            if custom_headers.get("x-signature"):
-                logger.success("✅ Authentication signature generated successfully")
-            else:
-                logger.warning(
-                    "⚠️ No authentication signature (SECRET_KEY or PAYLOAD_JSON not configured)"
+            transports = settings.socket_transports_list
+            if transports:
+                logger.info("Engine.IO transports: {}", transports)
+
+            if not settings.socket_secret_key:
+                logger.error(
+                    "⚠️ SOCKET_SECRET_KEY is not configured - the backend will refuse "
+                    "the handshake"
                 )
 
+            # NOTE: the builder is passed as a CALLABLE, not as a pre-built dict.
+            # python-socketio resolves callable headers on every connect attempt,
+            # including its automatic reconnects, so each attempt gets a fresh
+            # nonce and timestamp. Passing a dict here would make the first
+            # connection succeed and every reconnect fail with replayed_nonce.
             await self.sio.connect(
                 settings.socket_url,
                 socketio_path=settings.socket_path,
-                headers=custom_headers,
+                headers=self._get_custom_headers,
+                transports=transports,
                 namespaces=[settings.socket_namespace],
                 wait=True,
                 wait_timeout=60,
@@ -180,9 +279,17 @@ class SocketClient:
 
         except Exception as e:
             logger.error("Failed to connect to socket server: {}", str(e))
+            # A refused handshake can surface here as a namespace failure or as a
+            # plain wait_timeout, with nothing in the error naming the cause.
+            self._log_handshake_refusal(str(e))
             raise SocketConnectionError(
                 "Failed to connect to socket server",
-                details={"error": str(e), "url": settings.socket_url},
+                details={
+                    "error": str(e),
+                    "url": settings.socket_url,
+                    "authScheme": settings.socket_auth_scheme,
+                    "handshake": self._handshake_summary(),
+                },
             )
 
     async def disconnect(self) -> None:
@@ -368,11 +475,32 @@ class SocketClient:
             """Handle connection event."""
             logger.info("Socket.IO connected")
             logger.success("🟢 Connection established with server as AI_Maverick")
+
+            # Which handshake was accepted. During the migration this is the line
+            # that proves the service is genuinely on v1 and not silently riding
+            # the backend's AI_SIGNATURE_ALLOW_LEGACY window (rollout step 7).
+            hs = self._handshake_summary()
+            if hs.get("scheme") == SCHEME_V1:
+                logger.success(
+                    "🔓 Handshake #{} ACCEPTED on scheme {} | ts={} nonce={}",
+                    hs.get("attempt"),
+                    hs.get("scheme"),
+                    hs.get("timestamp"),
+                    hs.get("nonce"),
+                )
+            elif hs:
+                logger.warning(
+                    "🔓 Handshake #{} accepted on the LEGACY scheme - the backend "
+                    "still has AI_SIGNATURE_ALLOW_LEGACY open. Move to "
+                    "SOCKET_AUTH_SCHEME=v1 before that window closes.",
+                    hs.get("attempt"),
+                )
             logger.info("📡 Listening for events:")
             logger.info("   - workspace_created")
             logger.info("   - workspace_sync")
             logger.info("   - workspace_version_restore")
             logger.info("   - workspace_transferred")
+            logger.info("   - workspace_deleted")
             logger.info("   - user_message_request")
             logger.info("   - probing_prompts_request")
             logger.info("   - analysis_report_feedback")
@@ -416,16 +544,29 @@ class SocketClient:
                     logger.warning("Server disconnected (check auth)")
             else:
                 logger.warning("🔴 Connection lost (no reason provided)")
-            logger.info("Reconnecting automatically (delay from config)...")
+            logger.info(
+                "Reconnecting automatically (delay from config); the next attempt "
+                "re-signs with a fresh timestamp and nonce"
+            )
             await event_handler.handle("disconnect", {"reason": reason})
 
         @self.sio.event
         async def connect_error(data):
-            """Handle connection error."""
+            """
+            Handle connection error.
+
+            The backend disconnects on a failed handshake without a descriptive
+            body, so the hints below mirror the failure table in
+            docs/AI_SERVICE_AUTH_MIGRATION.md section 8. Ask the backend team
+            for the refusal code in their logs; when reporting, include the UTC
+            time, the x-signature-timestamp and x-signature-nonce sent (both are
+            logged at DEBUG) - never the signature or the secret.
+            """
             logger.error("Socket.IO connection error: {}", data)
             logger.error(
                 "❌ Connection failed - check authentication and server status"
             )
+            self._log_handshake_refusal(data)
             await event_handler.handle("error", data)
 
         @self.sio.event
@@ -450,8 +591,26 @@ class SocketClient:
             Handle 'connected' event from server.
             Confirms successful connection with userId and clientType.
             """
-            logger.success("✅ Server confirmed connection")
-            logger.info(f"Connection data: {data}")
+            payload = data if isinstance(data, dict) else {}
+            hs = self._handshake_summary()
+            logger.success(
+                "✅ Server confirmed connection | clientType={} userId={} scheme={} "
+                "handshake=#{}",
+                payload.get("clientType"),
+                payload.get("userId"),
+                hs.get("scheme"),
+                hs.get("attempt"),
+            )
+            if payload.get("message"):
+                logger.info("Server message: {}", payload.get("message"))
+            if payload.get("clientType") and payload.get("clientType") != CLIENT_ID:
+                logger.error(
+                    "Backend identified this client as {} - expected {}. Check the "
+                    "x-client-type header.",
+                    payload.get("clientType"),
+                    CLIENT_ID,
+                )
+            logger.debug("Connection data: {}", data)
             await event_handler.handle("connected", data)
 
         @self.sio.event
@@ -767,8 +926,26 @@ class SocketClient:
 
         @self.sio.event
         async def workspace_deleted(data):
-            """Handle workspace deleted event (legacy)."""
-            logger.debug("Received legacy workspace_deleted event")
+            """
+            Handle workspace_deleted event (Server → AI_Maverick).
+
+            The backend's erasure cascade does not reach this service, so this
+            event is the instruction to erase the AI-held copy of the case. It
+            is logged at INFO rather than DEBUG: a compliance deletion should
+            leave a trace at the default log level.
+
+            Re-sends carrying the same requestId are EXPECTED — the backend
+            emit is fire-and-forget, so it re-sends every pending deletion on
+            reconnect until purgeAfter passes. The handler dedupes.
+            """
+            logger.info("🗑️ Received workspace_deleted event")
+            try:
+                logger.info(
+                    "📥 workspace_deleted payload: {}",
+                    json.dumps(data, default=str) if data else "null",
+                )
+            except Exception:
+                logger.info("📥 workspace_deleted payload (repr): {}", repr(data))
             await event_handler.handle("workspace_deleted", data)
 
         @self.sio.on("*")

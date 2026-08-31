@@ -229,6 +229,46 @@ class TransferredUserInfo(BaseModel):
         populate_by_name = True
 
 
+class WorkspaceDeletedPayload(BaseModel):
+    """
+    Schema for workspace_deleted event (Server → AI_Maverick).
+
+    The backend's erasure cascade does not reach this service: when a lawyer
+    deletes a case, the backend drops its own records and files, but the copy
+    embedded in our vector store is outside that cascade and used to survive
+    indefinitely. This event is the instruction to erase it, so that "your case
+    is deleted" is true of the AI's copy too.
+
+    Three properties of this event drive the handler:
+
+    - ``purgeAfter`` is ABSOLUTE and authoritative. Delete at or after that
+      instant; never recompute it from ``purgeAfterDays`` (which is
+      informational) or from a local clock offset. A timestamp rather than a
+      duration means there is nothing to configure here and no clock-skew
+      argument between the two services.
+    - DUPLICATES ARE EXPECTED. The backend emit is fire-and-forget, so an event
+      sent while this service is mid-deploy evaporates with no error. The
+      backend therefore persists every pending deletion and re-sends it on each
+      reconnect, with the SAME ``requestId``, until ``purgeAfter`` passes. The
+      handler dedupes on ``requestId`` and is idempotent per workspace.
+    - The deletion is REVOCABLE until it runs. A restore inside the grace
+      window arrives as ordinary workspace traffic (created / sync / restore /
+      transfer), which cancels the pending purge — without that, a workspace
+      restored on day 2 would be silently erased on day 7.
+    """
+
+    workspaceId: str  # 24-hex MongoDB ObjectId; the only key needed to purge
+    userId: str  # Case OWNER, always — never whoever pressed delete
+    deletedAt: str  # ISO 8601 UTC
+    purgeAfter: str  # ISO 8601 UTC — absolute; delete at or after this instant
+    purgeAfterDays: Optional[int] = None  # Informational; purgeAfter wins
+    reason: Optional[str] = None  # "user_deleted" | "admin_deleted"
+    requestId: Optional[str] = None  # wd_<first8-of-workspaceId>_<epoch_ms>
+    event: Optional[str] = None  # Always "workspace_deleted"
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
 class WorkspaceTransferredPayload(BaseModel):
     """
     Schema for workspace_transferred event (Server → AI_Maverick).

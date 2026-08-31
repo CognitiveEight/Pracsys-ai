@@ -712,6 +712,12 @@ class ChatMixin:
             user_id = payload.userId or "unknown"
             chat_id = payload.chatId or f"chat_{datetime.utcnow().timestamp()}"
 
+            # Chat-scoped caches below (attachment text, last assistant reply)
+            # are keyed by chat_id alone. Record the owning workspace so a
+            # workspace_deleted purge can reach them — chat attachments hold
+            # extracted document content.
+            self.note_chat_workspace(chat_id, workspace_id)
+
             # Repopulate in-memory caches from Qdrant when the AI service was
             # restarted between the original workspace_sync and this message.
             # No-op if the cache is already warm or workspace_id is missing.

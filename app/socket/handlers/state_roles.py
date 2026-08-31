@@ -194,6 +194,7 @@ class StateRolesMixin:
             CacheKinds.CASE_LAWS: self._workspace_case_laws_payload,
             CacheKinds.RELEVANT_PARTIES: self._workspace_relevant_parties_payload,
             CacheKinds.DELETED_PARTIES: self._workspace_deleted_parties,
+            CacheKinds.REMOVED_DOCUMENTS: self._workspace_removed_documents,
             CacheKinds.PROCEDURAL_TIMELINE: self._workspace_procedural_timeline_payload,
             CacheKinds.LIST_OF_DATES: self._workspace_list_of_dates_payload,
             CacheKinds.WORKSPACE_METADATA_PAYLOAD: self._workspace_metadata_payload,

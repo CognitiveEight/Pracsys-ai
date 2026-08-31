@@ -46,6 +46,15 @@ class CacheKinds:
     # Per-workspace memory of parties the user has deleted, so a later
     # regeneration does not silently re-add them (mirrors REJECTED_ANALYSIS_ITEMS).
     DELETED_PARTIES = "deleted_parties"
+    # Per-workspace ledger of documents the user uploaded and later deleted,
+    # snapshotted from the document_assessments entry before it is pruned
+    # (documentType + key fields survive the document itself). Read by the
+    # analysis report so a withdrawn document is reported as a gap in
+    # missingInfo instead of silently vanishing. Entries are dropped when the
+    # same documentId is re-ingested, which is what makes a version restore
+    # self-healing. Shape:
+    #   [{"documentId","fileName","documentType","keyFields","removedAt"}, ...]
+    REMOVED_DOCUMENTS = "removed_documents"
     PROCEDURAL_TIMELINE = "procedural_timeline"
     CUSTOM_INSTRUCTIONS = "custom_instructions"
     LIST_OF_DATES = "list_of_dates"
@@ -79,6 +88,7 @@ WORKSPACE_HYDRATION_KINDS = (
     CacheKinds.CASE_LAWS,
     CacheKinds.RELEVANT_PARTIES,
     CacheKinds.DELETED_PARTIES,
+    CacheKinds.REMOVED_DOCUMENTS,
     CacheKinds.PROCEDURAL_TIMELINE,
     CacheKinds.CUSTOM_INSTRUCTIONS,
     CacheKinds.LIST_OF_DATES,

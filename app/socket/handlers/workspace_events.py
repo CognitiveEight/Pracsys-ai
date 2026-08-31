@@ -66,6 +66,7 @@ from app.socket.schemas import (
     WorkspaceCreatedPayload,
     WorkspaceSyncPayload,
     WorkspaceTransferredPayload,
+    WorkspaceVersionRestorePayload,
 )
 from app.utils.exceptions import SocketEventError
 from app.workspace.custom_instructions import (build_custom_instruction_suffix,
@@ -531,87 +532,20 @@ class WorkspaceEventsMixin:
                     if self._socket_client:
                         # 1) Document assessments — own try/except
                         try:
-                            document_results = []
-                            for result in batch_result.get("results", []):
-                                doc_result = {
-                                    "documentId": result.get("document_id"),
-                                    "filename": result.get("filename"),
-                                    "success": result.get("success", False),
-                                    "readabilityScore": result.get(
-                                        "readability_score", 0
-                                    ),
-                                    "readabilityRating": result.get(
-                                        "readability_rating", "Unknown"
-                                    ),
-                                    "readable": result.get("readable", False),
-                                    "extractedTextLength": result.get(
-                                        "extracted_text_length", 0
-                                    ),
-                                    "storedInVectorDb": result.get(
-                                        "stored_in_vector_db", False
-                                    ),
-                                    "summary": result.get("summary", ""),
-                                    "evidentiaryStrength": result.get(
-                                        "evidentiary_strength", "N/A"
-                                    ),
-                                    # Document classification + structured fields.
-                                    # documentType: snake_case enum (e.g. aadhaar_card,
-                                    # bank_statement, fir, court_order, other).
-                                    # extractedFields: masked / safe values for display.
-                                    # sensitiveFields: full raw IDs for sealed encrypted
-                                    # storage on the backend — must NOT be displayed.
-                                    "documentType": result.get(
-                                        "document_type", "other"
-                                    ),
-                                    "extractedFields": result.get(
-                                        "extracted_fields", {}
-                                    ),
-                                    "sensitiveFields": result.get(
-                                        "sensitive_fields", {}
-                                    ),
-                                }
-                                # Audio: attach transcript + transcriptStatus.
-                                # When transcription has not produced text yet ("pending")
-                                # or has errored ("failed"), emit a minimal entry to match
-                                # the backend contract (no quality / summary fields).
-                                if result.get("is_audio"):
-                                    status = result.get("transcript_status", "failed")
-                                    transcript_text = result.get("transcript", "") or ""
-                                    if status == "ready" and transcript_text:
-                                        doc_result["transcript"] = transcript_text
-                                        doc_result["transcriptStatus"] = "ready"
-                                    else:
-                                        # Drop quality/summary fields for not-ready audio
-                                        doc_result = {
-                                            "documentId": result.get("document_id"),
-                                            "fileName": result.get("filename"),
-                                            "transcriptStatus": status if status in ("pending", "failed") else "failed",
-                                        }
-                                if not result.get("success") and "transcriptStatus" not in doc_result:
-                                    doc_result["error"] = result.get(
-                                        "error", "Unknown error"
-                                    )
-                                document_results.append(doc_result)
-                            document_assessment_payload = {
-                                "featureType": "document_assessments",
-                                "workspaceId": payload.workspaceId,
-                                "userId": payload.userId,
-                                "payload": {
-                                    "documentAssessments": document_results,
-                                    "summary": {
-                                        "totalFiles": batch_result.get(
-                                            "total_files", 0
-                                        ),
-                                        "successfulFiles": batch_result.get(
-                                            "successful", 0
-                                        ),
-                                        "failedFiles": batch_result.get("failed", 0),
-                                        "averageReadabilityScore": batch_result.get(
-                                            "average_readability_score", 0
-                                        ),
-                                    },
-                                },
-                            }
+                            # Shared builder — see
+                            # DocumentsMixin._build_document_assessment_envelope
+                            # for the per-entry contract (audio collapse,
+                            # sensitiveFields handling).
+                            document_assessment_payload = (
+                                self._build_document_assessment_envelope(
+                                    payload.workspaceId,
+                                    payload.userId,
+                                    batch_result,
+                                )
+                            )
+                            document_results = document_assessment_payload["payload"][
+                                "documentAssessments"
+                            ]
                             logger.info(
                                 f"📤 Emitting document_feature_response (document_assessments) with {len(document_results)} documents"
                             )
@@ -630,9 +564,29 @@ class WorkspaceEventsMixin:
                                 "document_feature_response", document_assessment_payload
                             )
                             # Cache for reliable re-emit after reconnect when socket drops mid-workspace_created
+                            # Replace (not merge) here: workspace_created defines
+                            # the full initial document set, so an earlier cache
+                            # for this workspace id is stale by definition.
                             self._workspace_document_assessments_payload[
                                 payload.workspaceId
                             ] = document_assessment_payload
+                            # Invariant: nothing currently in evidence may sit in
+                            # the removed-evidence ledger.
+                            try:
+                                self._forget_removed_documents(
+                                    payload.workspaceId,
+                                    [
+                                        r.get("document_id")
+                                        for r in batch_result.get("results", [])
+                                        if r.get("document_id") and r.get("success")
+                                    ],
+                                )
+                            except Exception as ledger_err:
+                                logger.warning(
+                                    "Removed-document ledger cleanup after initial "
+                                    "ingestion failed: {}",
+                                    ledger_err,
+                                )
                             logger.success(
                                 "✅ Document assessments sent (or cached for re-emit) to backend"
                             )
@@ -1232,6 +1186,28 @@ class WorkspaceEventsMixin:
                     logger.error("Vector store delete failed: {}", str(del_err))
                     logger.exception(del_err)
                 if delete_ok:
+                    # Prune the assessments cache BEFORE any regeneration below:
+                    # _build_document_inventory feeds that cache into every
+                    # feature prompt as "GROUND TRUTH for which documents are
+                    # present", so leaving the deleted document there makes the
+                    # agent assert it is still in evidence and suppresses it
+                    # from missingInfo. Snapshot the pruned entries into the
+                    # removed-evidence ledger first — after the prune this is
+                    # the only record the document ever existed.
+                    try:
+                        removed_entries = self._prune_document_assessments(
+                            payload.workspaceId, deleted_ids
+                        )
+                        self._record_removed_documents(
+                            payload.workspaceId, removed_entries
+                        )
+                    except Exception as prune_err:
+                        logger.warning(
+                            "Assessment prune / removed-document ledger update "
+                            "after delete failed: {}",
+                            prune_err,
+                        )
+
                     # Resolve role once; list_of_dates + applicable_laws must run after delete even if strategy emit fails.
                     workspace_role = resolved_workspace_role
 
@@ -1561,81 +1537,15 @@ class WorkspaceEventsMixin:
                     # Send processing results back to backend
                     if self._socket_client:
                         try:
-                            # Prepare document results (with summary and evidentiary strength)
-                            document_results = []
-                            for result in batch_result.get("results", []):
-                                doc_result = {
-                                    "documentId": result.get("document_id"),
-                                    "filename": result.get("filename"),
-                                    "success": result.get("success", False),
-                                    "readabilityScore": result.get(
-                                        "readability_score", 0
-                                    ),
-                                    "readabilityRating": result.get(
-                                        "readability_rating", "Unknown"
-                                    ),
-                                    "readable": result.get("readable", False),
-                                    "extractedTextLength": result.get(
-                                        "extracted_text_length", 0
-                                    ),
-                                    "storedInVectorDb": result.get(
-                                        "stored_in_vector_db", False
-                                    ),
-                                    "summary": result.get("summary", ""),
-                                    "evidentiaryStrength": result.get(
-                                        "evidentiary_strength", "N/A"
-                                    ),
-                                    "documentType": result.get(
-                                        "document_type", "other"
-                                    ),
-                                    "extractedFields": result.get(
-                                        "extracted_fields", {}
-                                    ),
-                                    "sensitiveFields": result.get(
-                                        "sensitive_fields", {}
-                                    ),
-                                }
-                                # Audio: attach transcript + transcriptStatus.
-                                if result.get("is_audio"):
-                                    status = result.get("transcript_status", "failed")
-                                    transcript_text = result.get("transcript", "") or ""
-                                    if status == "ready" and transcript_text:
-                                        doc_result["transcript"] = transcript_text
-                                        doc_result["transcriptStatus"] = "ready"
-                                    else:
-                                        doc_result = {
-                                            "documentId": result.get("document_id"),
-                                            "fileName": result.get("filename"),
-                                            "transcriptStatus": status if status in ("pending", "failed") else "failed",
-                                        }
-                                if not result.get("success") and "transcriptStatus" not in doc_result:
-                                    doc_result["error"] = result.get(
-                                        "error", "Unknown error"
-                                    )
-                                document_results.append(doc_result)
-
-                            # Emit document_feature_response for document assessments (per backend spec)
-                            document_assessment_payload = {
-                                "featureType": "document_assessments",
-                                "workspaceId": payload.workspaceId,
-                                "userId": payload.userId,
-                                "payload": {
-                                    "documentAssessments": document_results,
-                                    "summary": {
-                                        "totalFiles": batch_result.get(
-                                            "total_files", 0
-                                        ),
-                                        "successfulFiles": batch_result.get(
-                                            "successful", 0
-                                        ),
-                                        "failedFiles": batch_result.get("failed", 0),
-                                        "averageReadabilityScore": batch_result.get(
-                                            "average_readability_score", 0
-                                        ),
-                                    },
-                                },
-                            }
-
+                            # Shared builder — see
+                            # DocumentsMixin._build_document_assessment_envelope.
+                            document_assessment_payload = (
+                                self._build_document_assessment_envelope(
+                                    payload.workspaceId,
+                                    payload.userId,
+                                    batch_result,
+                                )
+                            )
                             # Bill the re-ingestion spend captured above.
                             document_assessment_payload["metadata"] = (
                                 self._ingest_usage_metadata(
@@ -1650,9 +1560,38 @@ class WorkspaceEventsMixin:
                             # payload (missing the newly synced documents).
                             # _reemit_cached_features overwrites the metadata with
                             # _cumulative_usage_metadata, so no re-billing.
+                            #
+                            # MERGE, don't replace: this envelope only describes
+                            # the files processed in this sync, so assigning it
+                            # verbatim shrank the cache to the new-file count and
+                            # made _build_document_inventory / _get_annexure_count
+                            # forget every earlier upload (which then got flagged
+                            # as missingInfo). The emit above is unchanged; only
+                            # the cached copy carries the full manifest.
                             self._workspace_document_assessments_payload[
                                 payload.workspaceId
-                            ] = document_assessment_payload
+                            ] = self._merge_document_assessments(
+                                payload.workspaceId, document_assessment_payload
+                            )
+                            # A re-ingested document is back in evidence, so it
+                            # must stop being reported as a removed-evidence gap.
+                            # This is what makes a version restore delivered as an
+                            # ordinary workspace_sync self-healing.
+                            try:
+                                self._forget_removed_documents(
+                                    payload.workspaceId,
+                                    [
+                                        r.get("document_id")
+                                        for r in batch_result.get("results", [])
+                                        if r.get("document_id") and r.get("success")
+                                    ],
+                                )
+                            except Exception as ledger_err:
+                                logger.warning(
+                                    "Removed-document ledger cleanup after sync "
+                                    "ingestion failed: {}",
+                                    ledger_err,
+                                )
                             logger.success(
                                 "✅ Document assessments (sync) sent to backend"
                             )
@@ -2211,6 +2150,39 @@ class WorkspaceEventsMixin:
                                 "Could not clear vector store for empty evidence list: {}",
                                 clear_err,
                             )
+                        # Every document is gone: prune the whole assessments
+                        # cache (otherwise the inventory keeps asserting them as
+                        # present) and record them all in the removed-evidence
+                        # ledger so a later re-upload or restore reconciles.
+                        try:
+                            cached_assessments = (
+                                self._workspace_document_assessments_payload.get(
+                                    workspace_id
+                                )
+                                or {}
+                            )
+                            all_ids = [
+                                a.get("documentId")
+                                for a in (
+                                    (cached_assessments.get("payload") or {}).get(
+                                        "documentAssessments"
+                                    )
+                                    or []
+                                )
+                                if isinstance(a, dict) and a.get("documentId")
+                            ]
+                            self._record_removed_documents(
+                                workspace_id,
+                                self._prune_document_assessments(
+                                    workspace_id, all_ids
+                                ),
+                            )
+                        except Exception as prune_err:
+                            logger.warning(
+                                "Assessment prune / removed-document ledger update "
+                                "for empty evidence list failed: {}",
+                                prune_err,
+                            )
                     workspace_role = (
                         resolved_workspace_role
                     )
@@ -2280,6 +2252,584 @@ class WorkspaceEventsMixin:
 
         except Exception as e:
             logger.error("Error processing workspace_sync event: {}", str(e))
+            logger.exception(e)
+            raise
+
+    async def on_workspace_version_restore(self, data: Dict[str, Any]) -> None:
+        """
+        Handle workspace_version_restore event (Server → AI_Maverick).
+
+        The user rolled the workspace back to an earlier document version. This
+        is deliberately a separate handler rather than another branch in
+        ``on_workspace_sync``: that function's ``if/elif`` chain computes
+        ``skip_reprocess`` only when nothing was deleted, so a restore inserted
+        there would be swallowed whenever the restored files happened to already
+        be indexed.
+
+        Reconciles to the target state rather than trusting the delta:
+        ``evidenceFiles`` is authoritative, and the live vector store is the
+        source of truth for what is currently indexed, so
+        ``deletedDocumentIds`` / ``restoredDocumentIds`` only have to be
+        approximately right.
+
+        Flow:
+        1. Idempotency guard keyed on ``versionId`` (separate window from sync)
+        2. Hydrate caches, resolve role, upsert context
+        3. Diff live vector store against the target document set
+        4. Delete what should not be there → prune assessments → ledger
+        5. Ingest what is missing (metered) → merge assessments → clear ledger
+        6. Regenerate the full feature suite
+        7. Log audit event
+        """
+        try:
+            payload = WorkspaceVersionRestorePayload(**data)
+            workspace_id = str(payload.workspaceId)
+            user_id = str(payload.userId)
+            version_id = str(payload.versionId)
+
+            logger.info(
+                "⏪ Workspace version restore: {} → version {} (User: {})",
+                workspace_id,
+                version_id,
+                user_id,
+            )
+
+            # Cache the frontend's curated panel state so the regenerations
+            # below can tag items matched vs new (same rule as sync: only
+            # overwrite when present, never clobber with an omitted field).
+            if payload.currentState is not None:
+                try:
+                    self._workspace_current_state_payload[workspace_id] = (
+                        payload.currentState.model_dump()
+                    )
+                except Exception as cs_err:
+                    logger.debug("Failed to cache currentState on restore: {}", cs_err)
+
+            # -----------------------------------------------------------------
+            # Idempotency guard. Deliberately keyed on versionId and stored in
+            # its own dict: restoring back to a version that was live minutes
+            # ago yields a document set the workspace_sync fingerprint has
+            # already seen, so sharing that window would silently drop the
+            # restore. Only a genuine replay of the SAME restore is skipped.
+            # -----------------------------------------------------------------
+            try:
+                import json
+
+                fp_obj = {
+                    "workspaceId": workspace_id,
+                    "versionId": version_id,
+                    "updatedAt": str(payload.updatedAt or ""),
+                    "deletedDocumentIds": sorted(
+                        str(x) for x in (payload.deletedDocumentIds or [])
+                    ),
+                    "restoredDocumentIds": sorted(
+                        str(x) for x in (payload.restoredDocumentIds or [])
+                    ),
+                }
+                fingerprint = json.dumps(fp_obj, sort_keys=True, default=str)
+                now_ts = time.time()
+                last = self._last_version_restore_fingerprint.get(workspace_id)
+                if (
+                    last
+                    and last.get("fingerprint") == fingerprint
+                    and (now_ts - float(last.get("ts") or 0.0)) < 180.0
+                ):
+                    logger.info(
+                        "Skipping duplicate/replayed workspace_version_restore for "
+                        "workspace {} (version {} fingerprint matched within 180s)",
+                        workspace_id,
+                        version_id,
+                    )
+                    return
+                self._last_version_restore_fingerprint[workspace_id] = {
+                    "fingerprint": fingerprint,
+                    "ts": now_ts,
+                }
+            except Exception as fp_err:
+                logger.debug(
+                    "version_restore idempotency guard skipped due to fingerprint "
+                    "error: {}",
+                    fp_err,
+                )
+
+            # Custom instructions (same optional nested shape as sync).
+            custom = (data or {}).get("customInstructions") or {}
+            structure = getattr(payload, "structure", None) or custom.get("structure")
+            tone = getattr(payload, "tone", None) or custom.get("tone")
+            description = getattr(payload, "description", None) or custom.get(
+                "description"
+            )
+            if structure is not None or tone is not None or description is not None:
+                set_custom_instructions(
+                    workspace_id,
+                    structure=structure,
+                    tone=tone,
+                    description=description,
+                )
+
+            # Hydrate BEFORE any upsert so a cold context cannot wipe the
+            # persisted cumulative token_usage — see the same ordering in
+            # on_workspace_sync.
+            try:
+                await self._hydrate_workspace_caches(workspace_id, user_id=user_id)
+            except Exception as hydrate_err:
+                logger.debug(
+                    "Workspace cache hydration before version restore failed "
+                    "({}): {}",
+                    workspace_id[:12],
+                    hydrate_err,
+                )
+
+            if payload.workspaceRole:
+                await self._remember_workspace_role(
+                    workspace_id, user_id, str(payload.workspaceRole)
+                )
+            workspace_role = await self._resolve_workspace_role(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                preferred_role=payload.workspaceRole,
+            )
+            logger.info(
+                "Resolved workspace role for version restore: {}", workspace_role
+            )
+
+            from datetime import datetime as dt
+
+            from app.workspace.context import context_manager
+
+            updated_at = None
+            try:
+                if payload.updatedAt:
+                    updated_at = dt.fromisoformat(
+                        payload.updatedAt.replace("Z", "+00:00")
+                    )
+            except Exception:
+                updated_at = dt.utcnow()
+
+            # Target set = the non-deleted evidenceFiles at the restored version.
+            target_files = [
+                f
+                for f in (payload.evidenceFiles or [])
+                if not (
+                    getattr(f, "isDeleted", False) or getattr(f, "is_deleted", False)
+                )
+            ]
+            context_manager.upsert_workspace(
+                workspace_id,
+                user_id,
+                title=payload.title,
+                status=payload.status,
+                workspace_role=payload.workspaceRole or workspace_role,
+                evidence_files=target_files,
+                updated_at=updated_at,
+            )
+
+            # -----------------------------------------------------------------
+            # Reconcile: diff the live vector store against the target set.
+            # -----------------------------------------------------------------
+            from app.vectorstore.qdrant import vector_store
+
+            live_ids: Set[str] = set()
+            try:
+                live_docs = await vector_store.get_all_documents(
+                    workspace_id=workspace_id
+                )
+                live_ids = {
+                    str(d.get("document_id")).strip()
+                    for d in (live_docs or [])
+                    if d.get("document_id")
+                }
+            except Exception as live_err:
+                logger.error(
+                    "Could not read live documents for version restore; aborting "
+                    "to avoid destructive guesswork: {}",
+                    live_err,
+                )
+                raise
+
+            files_by_id: Dict[str, Any] = {}
+            missing_id_count = 0
+            for f in target_files:
+                fid = getattr(f, "id", None) or getattr(f, "_id", None)
+                fid = str(fid).strip() if fid else ""
+                if not fid:
+                    # process_batch indexes file_info["_id"] unconditionally, so
+                    # an id-less file would raise inside the metered scope.
+                    missing_id_count += 1
+                    continue
+                files_by_id[fid] = f
+            if missing_id_count:
+                logger.warning(
+                    "version restore: skipped {} evidence file(s) with no _id "
+                    "(cannot be reconciled or ingested)",
+                    missing_id_count,
+                )
+
+            target_ids = set(files_by_id.keys())
+            to_delete = sorted(live_ids - target_ids)
+            to_ingest = sorted(target_ids - live_ids)
+            logger.info(
+                "⏪ Restore reconciliation for workspace {}: live={}, target={}, "
+                "to_delete={}, to_ingest={}",
+                workspace_id[:12],
+                len(live_ids),
+                len(target_ids),
+                to_delete,
+                to_ingest,
+            )
+            if payload.deletedDocumentIds or payload.restoredDocumentIds:
+                logger.debug(
+                    "Backend delta said deleted={}, restored={} (advisory; "
+                    "reconciliation above is authoritative)",
+                    list(payload.deletedDocumentIds or []),
+                    list(payload.restoredDocumentIds or []),
+                )
+
+            # Light up every panel's loader before the heavy work starts.
+            # document_assessments is included ONLY when something is actually
+            # being re-ingested — it is the one panel this handler may not emit,
+            # and an unmatched loader would spin forever.
+            refresh_features = (["document_assessments"] if to_ingest else []) + [
+                "strategy_objective",
+                "analysis_report",
+                "list_of_dates",
+                "applicable_laws",
+                "procedural_timeline",
+                "relevant_parties",
+                "case_laws",
+                "drafting_assistant",
+            ]
+            await self._emit_workspace_refresh(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                reason="ai_update_started",
+                feature_types=refresh_features,
+            )
+
+            # ----------------------------- delete -----------------------------
+            if to_delete:
+                try:
+                    await vector_store.delete_documents(
+                        workspace_id=workspace_id, document_ids=to_delete
+                    )
+                    logger.info(
+                        "🗑️ Restore removed {} document(s) from the vector store: {}",
+                        len(to_delete),
+                        to_delete,
+                    )
+                except Exception as del_err:
+                    logger.error(
+                        "Vector store delete during version restore failed; "
+                        "aborting so panels are not regenerated against a "
+                        "half-reconciled document set: {}",
+                        del_err,
+                    )
+                    raise
+                # Prune the inventory before any prompt is built, and snapshot
+                # into the removed-evidence ledger so these show up as
+                # missingInfo gaps (see _prune_document_assessments).
+                try:
+                    self._record_removed_documents(
+                        workspace_id,
+                        self._prune_document_assessments(workspace_id, to_delete),
+                    )
+                except Exception as prune_err:
+                    logger.warning(
+                        "Assessment prune / removed-document ledger update during "
+                        "version restore failed: {}",
+                        prune_err,
+                    )
+
+            # ----------------------------- ingest -----------------------------
+            batch_result: Optional[Dict[str, Any]] = None
+            if to_ingest:
+                files_to_process = []
+                for fid in to_ingest:
+                    f = files_by_id[fid]
+                    files_to_process.append(
+                        {
+                            "url": f.url,
+                            "filename": f.filename,
+                            "originalName": f.originalName,
+                            "storeFileName": f.storeFileName,
+                            "extension": f.extension,
+                            "fileHash": f.fileHash,
+                            "path": f.path,
+                            "uploadedAt": f.uploadedAt,
+                            "_id": fid,
+                        }
+                    )
+                ingest_usage = None
+                try:
+                    # Own capture_usage scope: without one, the OCR units / STT
+                    # seconds / embedding + Gemini tokens this re-ingestion
+                    # spends are billed to nobody (record_* is a no-op with no
+                    # open scope).
+                    with capture_usage() as ingest_usage:
+                        batch_result = await document_processor.process_batch(
+                            files=files_to_process,
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                        )
+                    logger.success(
+                        "✅ Restore re-ingestion complete: {}/{} successful",
+                        batch_result.get("successful", 0),
+                        batch_result.get("total_files", 0),
+                    )
+                except Exception as ingest_err:
+                    logger.error(
+                        "Restore re-ingestion failed: {}; continuing with the "
+                        "documents that are present",
+                        ingest_err,
+                    )
+                    logger.exception(ingest_err)
+                    batch_result = None
+
+                if not batch_result and self._socket_client:
+                    # The refresh above lit the document_assessments loader on
+                    # the promise of an emit that is not coming. Re-emit the
+                    # cached envelope so the panel settles instead of spinning.
+                    try:
+                        cached_assess = (
+                            self._workspace_document_assessments_payload.get(
+                                workspace_id
+                            )
+                        )
+                        if isinstance(cached_assess, dict):
+                            cached_assess["metadata"] = self._cumulative_usage_metadata(
+                                workspace_id
+                            )
+                            await self._socket_client.emit(
+                                "document_feature_response", cached_assess
+                            )
+                            logger.info(
+                                "Re-emitted cached document_assessments to clear the "
+                                "loader after failed restore re-ingestion"
+                            )
+                    except Exception as reemit_err:
+                        logger.warning(
+                            "Could not re-emit cached document_assessments after "
+                            "failed restore re-ingestion: {}",
+                            reemit_err,
+                        )
+
+                if batch_result and self._socket_client:
+                    try:
+                        document_assessment_payload = (
+                            self._build_document_assessment_envelope(
+                                workspace_id, user_id, batch_result
+                            )
+                        )
+                        document_assessment_payload["metadata"] = (
+                            self._ingest_usage_metadata(workspace_id, ingest_usage)
+                        )
+                        await self._socket_client.emit(
+                            "document_feature_response", document_assessment_payload
+                        )
+                        # Merge (not replace): this envelope covers only the
+                        # restored files, and the cache must stay a manifest of
+                        # every live document.
+                        self._workspace_document_assessments_payload[workspace_id] = (
+                            self._merge_document_assessments(
+                                workspace_id, document_assessment_payload
+                            )
+                        )
+                        # Back in evidence → no longer a removed-evidence gap.
+                        self._forget_removed_documents(
+                            workspace_id,
+                            [
+                                r.get("document_id")
+                                for r in batch_result.get("results", [])
+                                if r.get("document_id") and r.get("success")
+                            ],
+                        )
+                        logger.success(
+                            "✅ Document assessments (version restore) sent to backend"
+                        )
+                    except Exception as assess_err:
+                        logger.error(
+                            "Failed to emit document_assessments on restore: {}",
+                            assess_err,
+                        )
+
+                    # workspace_metadata: send an empty title with
+                    # updateTitle=False so the backend keeps the title the user
+                    # already has — a restore must not rename the workspace.
+                    # Same key contract as the sync path.
+                    if batch_result.get("successful", 0) > 0:
+                        try:
+                            # Own scope: this category/subcategory Gemini call
+                            # runs after the ingestion scope closed.
+                            with capture_usage() as meta_usage:
+                                meta = (
+                                    await self._get_workspace_category_and_subcategory(
+                                        workspace_id=workspace_id,
+                                        user_id=user_id,
+                                    )
+                                )
+                            workspace_metadata_payload = {
+                                "featureType": "workspace_metadata",
+                                "workspaceId": workspace_id,
+                                "userId": user_id,
+                                "payload": {
+                                    "workspaceTitle": "",
+                                    "updateTitle": False,
+                                    "caseCategory": meta.get("caseCategory", "General"),
+                                    "subcategories": meta.get("subcategories", []),
+                                    "description": meta.get("description", ""),
+                                },
+                            }
+                            workspace_metadata_payload["metadata"] = (
+                                self._ingest_usage_metadata(workspace_id, meta_usage)
+                            )
+                            await self._socket_client.emit(
+                                "document_feature_response",
+                                workspace_metadata_payload,
+                            )
+                            self._workspace_metadata_payload[workspace_id] = (
+                                workspace_metadata_payload
+                            )
+                            logger.success(
+                                "✅ Workspace metadata (version restore) sent: "
+                                "title=unchanged, category={}",
+                                meta.get("caseCategory"),
+                            )
+                        except Exception as meta_err:
+                            logger.warning(
+                                "workspace_metadata emit on restore failed: {}",
+                                meta_err,
+                            )
+
+            # ------------------------- regenerate all -------------------------
+            # Full suite on every restore. Strategy + analysis run inline (so a
+            # failure here still leaves a valid payload via the fallbacks), then
+            # the scheduled tail covers list_of_dates → applicable_laws →
+            # procedural_timeline → relevant_parties → case_laws → drafting.
+            # Bound before the try so the emit below can always read them, even
+            # if a scope never opened — same convention as on_workspace_created.
+            _u_strategy = None
+            _u_analysis = None
+            strategies_result = None
+            try:
+                with capture_usage() as _u_strategy:
+                    strategies_result = await self._generate_strategies_from_documents(
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        workspace_role=workspace_role,
+                        batch_result=batch_result,
+                        is_update=True,
+                    )
+            except Exception as strategy_err:
+                logger.warning(
+                    "Strategy generation after version restore failed: {}; using "
+                    "fallback",
+                    strategy_err,
+                )
+            if not strategies_result:
+                strategies_result = self._strategy_objective_fallback(
+                    workspace_id, user_id, workspace_role, is_update=True
+                )
+            try:
+                if self._socket_client:
+                    await self._emit_document_feature(
+                        feature_type="strategy_objective",
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        payload=strategies_result,
+                        usage=_u_strategy,
+                    )
+                    self._workspace_strategy_payload[workspace_id] = strategies_result
+                    logger.success("🎉 Strategy & Objectives sent after version restore")
+            except Exception as strat_emit_err:
+                logger.warning(
+                    "Strategy emit after version restore failed: {}", strat_emit_err
+                )
+
+            analysis_report = None
+            try:
+                with capture_usage() as _u_analysis:
+                    analysis_report = (
+                        await self._generate_analysis_report_from_documents(
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            workspace_role=workspace_role,
+                            batch_result=batch_result,
+                            is_update=True,
+                        )
+                    )
+            except Exception as ar_err:
+                logger.warning(
+                    "Analysis report after version restore failed: {}; using fallback",
+                    ar_err,
+                )
+            if not analysis_report or not isinstance(analysis_report, dict):
+                analysis_report = self._analysis_report_fallback(
+                    (workspace_role or "ADJUDICATOR").strip().upper()
+                )
+            # Replace, don't merge: the restored document set is authoritative,
+            # so items tied to a document that is no longer here must drop.
+            try:
+                analysis_report = await self._tag_analysis_report_against_current_state(
+                    workspace_id, analysis_report, log_context=" (version restore)"
+                )
+            except Exception as tag_err:
+                logger.warning(
+                    "Analysis report currentState tagging after version restore "
+                    "failed: {}; emitting untagged",
+                    tag_err,
+                )
+            try:
+                if self._socket_client:
+                    await self._emit_document_feature(
+                        feature_type="analysis_report",
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        payload=analysis_report,
+                        usage=_u_analysis,
+                    )
+                    self._workspace_analysis_payload[workspace_id] = analysis_report
+                    logger.success("✅ Analysis report sent after version restore")
+            except Exception as ar_emit_err:
+                logger.warning(
+                    "Analysis report emit after version restore failed: {}",
+                    ar_emit_err,
+                )
+
+            # Passing BOTH batch_result and deleted_doc_ids is deliberate:
+            # deleted_doc_ids drives replace-not-merge for the web-search-derived
+            # panels (applicable_laws / case_laws, which have no per-document
+            # provenance) and the deterministic sourceDocId prune for the dated
+            # panels, while a non-None batch_result keeps list_of_dates and
+            # procedural_timeline OFF their pure-deletion fast path so restored
+            # documents actually get re-read by the LLM.
+            self._schedule_list_of_dates_and_applicable_laws(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+                batch_result=batch_result,
+                log_context=" (after version restore)",
+                deleted_doc_ids=to_delete or None,
+            )
+
+            audit_logger.log_event(
+                "workspace_version_restore_ai",
+                {
+                    "workspace_id": workspace_id,
+                    "user_id": user_id,
+                    "version_id": version_id,
+                    "target_files_count": len(target_ids),
+                    "deleted_count": len(to_delete),
+                    "ingested_count": len(to_ingest),
+                },
+            )
+            logger.success(
+                "✅ Workspace version restore completed: {} (version {})",
+                workspace_id,
+                version_id,
+            )
+
+        except Exception as e:
+            logger.error("Error processing workspace_version_restore event: {}", str(e))
             logger.exception(e)
             raise
 

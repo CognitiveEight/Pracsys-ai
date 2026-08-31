@@ -359,6 +359,7 @@ class SocketClient:
         Per backend specification, AI service listens for:
         - workspace_created: New workspace created
         - workspace_sync: Workspace updated
+        - workspace_version_restore: Workspace restored to an earlier document version
         - user_message_request: User sent chat message
         """
 
@@ -370,6 +371,7 @@ class SocketClient:
             logger.info("📡 Listening for events:")
             logger.info("   - workspace_created")
             logger.info("   - workspace_sync")
+            logger.info("   - workspace_version_restore")
             logger.info("   - workspace_transferred")
             logger.info("   - user_message_request")
             logger.info("   - probing_prompts_request")
@@ -480,6 +482,29 @@ class SocketClient:
             except Exception:
                 logger.info("📥 workspace_sync RAW payload (repr): {}", repr(data))
             await event_handler.handle("workspace_sync", data)
+
+        @self.sio.event
+        async def workspace_version_restore(data):
+            """
+            Handle workspace_version_restore event (Server → AI_Maverick).
+            User restored the workspace to an earlier document version:
+            evidenceFiles carries the FULL surviving set at that version, so the
+            AI reconciles the vector store to it and regenerates every panel.
+            """
+            logger.info("⏪ Received workspace_version_restore event")
+            try:
+                import json
+
+                raw = json.dumps(data, default=str) if data is not None else "null"
+                logger.info(
+                    "📥 workspace_version_restore RAW payload: {}",
+                    raw[:2000] + ("..." if len(raw) > 2000 else ""),
+                )
+            except Exception:
+                logger.info(
+                    "📥 workspace_version_restore RAW payload (repr): {}", repr(data)
+                )
+            await event_handler.handle("workspace_version_restore", data)
 
         @self.sio.event
         async def workspace_transferred(data):

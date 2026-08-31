@@ -189,6 +189,35 @@ class WorkspaceSyncPayload(BaseModel):
         populate_by_name = True
 
 
+class WorkspaceVersionRestorePayload(WorkspaceSyncPayload):
+    """
+    Schema for workspace_version_restore event (Server → AI_Maverick).
+    Emitted when the user restores the workspace to an earlier document version.
+
+    Deliberately extends WorkspaceSyncPayload so both sides reuse the same
+    evidence-file serialisation. Two additions:
+
+    - ``versionId`` — the version being restored TO. Required: it keys this
+      handler's own idempotency guard, which is separate from the
+      workspace_sync fingerprint window because restoring back to a version
+      seen minutes ago is a legitimate user action, not a replay.
+    - ``restoredDocumentIds`` — documents coming back into evidence (a subset of
+      ``evidenceFiles``). Advisory only.
+
+    ``evidenceFiles`` is AUTHORITATIVE: it must carry the FULL surviving
+    document set at the restored version. ``deletedDocumentIds`` and
+    ``restoredDocumentIds`` are cross-checks — the handler diffs
+    ``evidenceFiles`` against the live vector store and reconciles to that, so a
+    partially-correct payload still converges on the right state.
+    """
+
+    versionId: str  # Version being restored to
+    restoredDocumentIds: List[str] = []  # Documents returning to evidence (advisory)
+
+    class Config:
+        populate_by_name = True
+
+
 class TransferredUserInfo(BaseModel):
     """New owner details embedded in workspace_transferred."""
 

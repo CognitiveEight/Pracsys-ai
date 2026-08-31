@@ -403,6 +403,19 @@ class AnalysisReportMixin:
 
             document_inventory = self._build_document_inventory(workspace_id)
 
+            # Documents the user uploaded and later deleted. Injected before
+            # STEP 2 so it outranks the DOCUMENT-TYPE COVERAGE TABLE and the
+            # STRICT EXCLUSIONS that follow — both of those suppress gaps for
+            # documents that are present, and must not hide a document the user
+            # withdrew. Empty string when nothing has been removed.
+            removed_evidence_block = self._build_removed_documents_block(workspace_id)
+            if removed_evidence_block:
+                removed_evidence_block = (
+                    "--------------------------------------------------\n"
+                    + removed_evidence_block
+                    + "\n"
+                )
+
             # Tell the model exactly how many annexures exist so it cannot
             # invent "Annexure 2", "Annexure 3", ... when only one upload
             # is present. The post-processing clamp in
@@ -605,6 +618,7 @@ Carefully read the documents and identify key facts such as:
 
 Only treat something as "present" if it is explicitly stated in the documents.
 
+{removed_evidence_block}
 --------------------------------------------------
 STEP 2 — MISSING INFORMATION VERIFICATION
 --------------------------------------------------
@@ -612,7 +626,7 @@ STEP 2 — MISSING INFORMATION VERIFICATION
 Before listing an item in missingInfo, verify ALL THREE conditions:
 
 1. The information is NOT present anywhere in the documents.
-2. The information is NOT covered by any documentType listed in DOCUMENT INVENTORY (e.g. if inventory shows aadhaar_card, do NOT add "Aadhaar / identity proof missing"; if inventory shows bank_statement, do NOT add "bank statement / account proof missing"; if inventory shows pan_card, do NOT add "PAN / tax identity missing").
+2. The information is NOT covered by any documentType listed in DOCUMENT INVENTORY (e.g. if inventory shows aadhaar_card, do NOT add "Aadhaar / identity proof missing"; if inventory shows bank_statement, do NOT add "bank statement / account proof missing"; if inventory shows pan_card, do NOT add "PAN / tax identity missing") — UNLESS that documentType appears in REMOVED EVIDENCE above, in which case it is NOT present and MUST be flagged.
 3. The information is CRITICAL to prove the case or defend the case.
 
 If ANY condition fails, DO NOT include it.
@@ -638,7 +652,7 @@ DOCUMENT-TYPE COVERAGE TABLE (use to map inventory entries to common missingInfo
 - death_certificate → death proof
 
 STRICT EXCLUSIONS:
-Do NOT list these as missing if they appear anywhere in the documents:
+Do NOT list these as missing if they appear anywhere in the documents. This list does NOT apply to any documentType listed in REMOVED EVIDENCE above — a document the user withdrew MUST be flagged as missing even if it appears below:
 
 - serial number
 - model number
@@ -796,6 +810,7 @@ ENTITY-GROUNDING RULE (CRITICAL):
                 entities_block_ar=_entities_block_ar,
                 annexure_limit_block=annexure_limit_block,
                 current_year_ar=current_year_ar,
+                removed_evidence_block=removed_evidence_block,
             )
 
             custom_suffix = build_custom_instruction_suffix(workspace_id)
@@ -1514,6 +1529,14 @@ Rules:
             # emit. Downstream merge and feedback paths re-apply the clamp
             # via _normalize_analysis_report_lists, so this is defence in
             # depth.
+            # Guarantee a missingInfo gap for every document the user deleted.
+            # The REMOVED-EVIDENCE prompt rules ask for this, but the DOCUMENT-TYPE
+            # COVERAGE TABLE / STRICT EXCLUSIONS pull the other way, so a
+            # deterministic append is the actual guarantee. Runs before the
+            # normalizer so the appended text is scrubbed and clamped like the
+            # rest, and inside the generator so every caller (sync delete, sync
+            # upload, objective change, version restore) gets it.
+            self._apply_removed_evidence_missing_info(workspace_id, payload)
             self._normalize_analysis_report_lists(payload, max_annexure=num_docs)
             return payload
 

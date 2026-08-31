@@ -1417,6 +1417,24 @@ class ObjectiveChangeMixin:
         current_state = self._workspace_current_state_payload.get(workspace_id) or {}
         if not isinstance(current_state, dict):
             current_state = {}
+        # Gaps created by a document the user deleted are exempt from
+        # rejected-item memory. A user often dismisses a missingInfo item
+        # *because* a document answered it; once that document is withdrawn the
+        # gap is real again, and the permanent suppression below would hide it
+        # forever. Derived from the same ledger as the deterministic append in
+        # _apply_removed_evidence_missing_info, so the texts match exactly.
+        try:
+            removed_evidence_texts = {
+                item["text"]
+                for item in self._removed_evidence_missing_info_items(workspace_id)
+            }
+        except Exception as ledger_err:
+            logger.debug(
+                "Removed-evidence exemption unavailable (workspace={}): {}",
+                workspace_id,
+                ledger_err,
+            )
+            removed_evidence_texts = set()
         for report_field, cs_key, reject_section in self._ANALYSIS_TAGGED_SECTIONS:
             fresh = _coerce_analysis_text_list(analysis_report.get(report_field))
             # Honour rejected-item memory: never re-surface a dismissed item.
@@ -1424,7 +1442,8 @@ class ObjectiveChangeMixin:
                 fresh = [
                     s
                     for s in fresh
-                    if not self._is_previously_rejected_analysis_item(
+                    if s in removed_evidence_texts
+                    or not self._is_previously_rejected_analysis_item(
                         workspace_id=workspace_id,
                         section=reject_section,
                         candidate=s,

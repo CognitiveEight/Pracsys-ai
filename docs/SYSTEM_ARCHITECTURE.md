@@ -58,6 +58,7 @@ The AI service is driven by **Socket.IO** events from the backend. Main events:
 |-----------------------------|------------|---------|
 | `workspace_created`         | Backend → AI | New workspace: init role, process evidence files, generate the full feature suite |
 | `workspace_sync`            | Backend → AI | Workspace updated: re-run doc processing / regeneration when docs change |
+| `workspace_version_restore` | Backend → AI | Workspace rolled back to an earlier document version: reconcile the vector store to that version and regenerate every panel |
 | `user_message_request`      | Backend → AI | User chat message: build context, run Intelligence Chat Agent (or the Drafting Assistant when `chat_type="DRAFTING_ASSISTANT"`), return reply |
 | `template_sync`             | Backend → AI | Lawyer's template library changed (uploaded / renamed / deleted) |
 | `add_case_law`              | Backend → AI | Add a precedent by citation / URL / pasted text ("Add Case Law" button) |
@@ -66,6 +67,32 @@ The AI service is driven by **Socket.IO** events from the backend. Main events:
 | `probing_prompts_request`   | Backend → AI | Suggestion chips for strategy or chat |
 | `analysis_report_feedback`  | Backend → AI | User feedback on report; recalc and re-emit analysis |
 | `applicable_law_relevance_request` | Backend → AI | Re-assess one law's relevance to the matter |
+
+### `workspace_version_restore` payload contract
+
+```jsonc
+{
+  "workspaceId": "…", "userId": "…",
+  "versionId": "…",              // required — the version being restored TO
+  "evidenceFiles": [ /* EvidenceFilePayload */ ],  // AUTHORITATIVE: the FULL surviving set at that version
+  "deletedDocumentIds": ["…"],   // advisory cross-check
+  "restoredDocumentIds": ["…"],  // advisory cross-check
+  "updatedAt": "2026-07-30T…",   // required ISO
+  "workspaceRole": "…", "title": "…", "status": "…",
+  "currentState": { /* WorkspaceCurrentState */ },
+  "structure": "…", "tone": "…", "description": "…"
+}
+```
+
+`evidenceFiles` is the contract that matters: the handler diffs it against the
+live Qdrant document set and reconciles to it, so `deletedDocumentIds` /
+`restoredDocumentIds` only need to be approximately right (a stale document the
+backend forgot to list is still removed). Documents removed by a restore are
+snapshotted into the removed-evidence ledger (`CacheKinds.REMOVED_DOCUMENTS`)
+and reported as `analysis_report.missingInfo` gaps; re-ingesting the same
+`documentId` clears the ledger entry. Idempotency is keyed on `versionId` in its
+own 180 s window — restoring back to a recently-live version must not be
+mistaken for a `workspace_sync` replay.
 
 **Outbound (AI → Backend):**
 

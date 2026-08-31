@@ -1,3 +1,129 @@
+# Release v5.1.0 - 2026-07-31
+
+This release (`v5.1.0`) completes the workspace bill and repairs the document manifest. Paid non-LLM Google Cloud work — Vision OCR, Speech-to-Text, Vertex AI Search, Google Search grounding and embeddings — is now metered and priced alongside LLM tokens, and the cached document inventory that every feature prompt treats as ground truth is now kept accurate in both directions: deleted evidence is reported as a gap instead of vanishing, and previously-uploaded documents are no longer flagged as missing after an incremental upload. One new inbound event, `workspace_version_restore`, is added for workspace version rollback. **One semantically breaking change for consumers:** `metadata.price` / `totalPrice` now include paid service cost, not just token cost. It also carries the workspace-ownership handover event, curated-panel-state reconciliation, a role-resolution correction that affects every downstream panel, and a batch of ingestion and drafting fixes.
+
+## Highlights
+
+- **The bill is now the whole bill.** Every paid Google Cloud call the pipeline makes was previously billed to nobody. `metadata` on every emit now carries per-response and cumulative `ocrUnits`/`ocrPrice`, `sttSeconds`/`sttPrice`, `searchQueries`/`searchPrice`, `groundingRequests`/`groundingPrice`, `embedTokens`/`embedPrice` and their sum `servicePrice` — with `price == inputPrice + outputPrice + servicePrice`.
+- **Deleted documents are reported as missing information.** Deleting a matter's invoice used to make it disappear from the intelligence entirely; it now surfaces as a gap and stops being cited as evidence, guaranteed by a deterministic append rather than by prompt compliance alone.
+- **A live manifest bug is fixed.** Incremental uploads were overwriting the cached document manifest with only the newly-processed files, so after a second upload the AI forgot the earlier documents and began flagging *already-uploaded* evidence as missing. Every workspace with more than one upload should see missing-information quality visibly improve.
+- **New inbound event `workspace_version_restore`** reconciles a restored workspace against reality — diffing the live vector-store document set against `evidenceFiles` — instead of trusting the backend's delta, so a restore is neither silently skipped nor re-billed.
+- **A workspace's cumulative bill survives a service restart** instead of restarting from zero on the first `workspace_sync` after a cold start.
+- **New inbound event `workspace_transferred`** — when a matter changes owner, per-workspace owner state is re-keyed and the Drafting Assistant is rebuilt against the new lawyer's template library, without reprocessing a single document.
+- **Curated panel state is no longer churned.** `workspace_sync` now accepts the previously-emitted, user-curated panel state as `currentState`, so regeneration tags each item as carried-over vs new instead of re-presenting work the lawyer had already reviewed.
+- **A role-resolution bug that silently mis-framed whole workspaces is fixed.** A document-upload sync carries no `workspaceRole`, and a cold-memory context fabricated an ADJUDICATOR default that shadowed the user's real selection — so panels could be generated from the wrong perspective.
+- **Answered missing-information items now resolve on upload.** Uploading a document that answers a gap clears it, instead of leaving it standing.
+- **Panels arrive in product order and the event loop no longer stalls** during OCR-heavy ingestion.
+
+## Features Delivered
+
+- Paid-service metering and pricing (`app/ai/usage.py`, `app/ai/pricing.py`): `UsageAccumulator` carries `ocr_units` / `stt_seconds` / `search_queries` / `grounding_requests` / `embed_tokens`, reported by matching `record_*` helpers at the single lowest paid call site and priced by the new `service_price_for()`. Rates are verified against Google's July 2026 published pricing and each is environment-overridable; the Google Search grounding default is model-aware ($35/1k grounded prompts on Gemini 2.5, $14/1k on Gemini 3).
+- Removed-evidence ledger (`CacheKinds.REMOVED_DOCUMENTS`): each pruned `document_assessments` entry is snapshotted before it is dropped, feeding both a REMOVED EVIDENCE block in the analysis-report prompt and `_apply_removed_evidence_missing_info`, which deterministically appends one `missingInfo` entry per removed document type the agent did not raise itself and re-clamps `caseResolutionScore` to 95. Re-ingesting the same `documentId` clears the ledger entry, so restores are self-healing.
+- `workspace_version_restore` handler (`WorkspaceVersionRestorePayload`, required `versionId` + advisory `restoredDocumentIds`): a separate handler rather than a branch of `on_workspace_sync`, whose `skip_reprocess` path would have swallowed the restore. It deletes, prunes, re-ingests under its own usage scope and regenerates the full feature suite, with idempotency keyed on `versionId` in its own 180 s window.
+- `workspace_transferred` handler (`WorkspaceTransferredPayload` / `TransferredUserInfo`): `workspaceId`, `previousUserId`, `newUserId`, optional `newUser`, `reEmitFeatures` and an informational `evidenceFiles`. Ownership moves without reprocessing — the handler re-keys context, role caches, drafting provenance and every cached wrapper embedding `userId`, then regenerates and re-emits only the features named in `reEmitFeatures` (currently `drafting_assistant`, force-synced against the new owner's templates first).
+- `currentState` on the workspace-sync payload (`WorkspaceCurrentState` plus `CurrentStateTextItem` / `CurrentStatePartyItem` / `CurrentStateDateItem` / `CurrentStateLawItem` groups): the frontend returns the curated panel state on a re-run trigger (upload / transcript / remove / objective change, omitted on plain rename or reset) and regeneration reconciles against it, tagging carried-over items `isMatched`. Matching is by text/content only — the `status` field (approved/pending/rejected) is parsed and deliberately ignored.
+- Objective-aware Case Laws and Drafting: an objective change now propagates into both panels instead of leaving them derived from the previous objective.
+
+## Quality and Stability Improvements
+
+- `document_assessments` envelope construction is now one shared helper (`_build_document_assessment_envelope`) across the created / sync / restore paths, replacing three byte-identical copies of the same 60-line transformation.
+- Token spend recorded with no usage scope open is no longer silently dropped — it warns once per kind, matching the paid-service recorders, and the three handlers that tripped it (`probing_prompts_request`, template ingestion, blueprint proposals) are instrumented.
+- `document_feature_response` emits now warn when a hand-built `metadata` key has no counterpart field in `AIResponseMetadata`, so a typo'd key can no longer ship silently and go unrecorded by the backend cost service.
+- Blocking OCR text extraction is offloaded to a worker thread (`asyncio.to_thread`), so a scan-heavy upload no longer stalls the event loop and starves chat and heartbeats.
+- The per-workspace feature pipeline is serialized behind a lock, so panels emit in product order rather than in whichever order their background tasks happened to finish; cached-feature re-emission (`_reemit_cached_features`) runs under the same lock.
+- PDF ingestion strips publisher boilerplate from legal-database exports (SCC Online TruePrint, Manupatra, Indian Kanoon), which previously dominated the extracted text — image-only judgments were skipping OCR and being rejected as “repetitive headers”.
+
+## Bug Fixes
+
+- The document inventory no longer lies about which documents are present: `_prune_document_assessments` runs on delete before any regeneration builds a prompt, and `_merge_document_assessments` keys by `documentId` on upload so the cache stays a full manifest. Reconnect replay now re-sends the complete set.
+- Document-ingestion spend is no longer lost — `process_batch` runs inside a usage scope on both `workspace_created` and `workspace_sync`, so per-document summary, evidentiary-strength and classification calls plus all ingestion OCR, transcription and embedding spend are billed.
+- A workspace's cumulative `token_usage` is hydrated before anything can upsert it, and a payload with no `token_usage` can no longer clobber a stored one.
+- JSON-repair retries are billed: up to two extra `generate_content` calls per malformed JSON generation were previously recorded nowhere.
+- Partial spend is reported when a document *sync* fails mid-ingestion, matching the existing `workspace_created` behaviour.
+- A feature's spend is billed even when the socket is down — the metadata block is built (and the cumulative incremented) before the emit is skipped.
+- Audio re-diarization Gemini tokens are counted; the three raw-SDK helpers bypassed the metering hook.
+- Workspace role resolution now treats the persisted role cache as authoritative over the in-memory context, and the role is resolved *before* the context is upserted — a role-less sync can no longer fabricate an ADJUDICATOR default that shadows the user's real selection. Related role→party advocacy resolution fixes land with it.
+- Missing-information items answered by a newly uploaded document are resolved instead of persisting.
+- Drafted documents keep continuous paragraph numbering across sections.
+- The workspace no longer fails to refresh on document upload.
+
+## Compatibility Notes
+
+- **Semantically breaking for cost consumers:** `price` and `totalPrice` now include `servicePrice`. Read `price` directly; any consumer recomputing it from `inputPrice + outputPrice` will understate the bill. All new fields are optional and additive.
+- **Behavioural, not breaking:** the reconnect replay of `document_assessments` now carries the full manifest rather than the last batch — consumers must **upsert by `documentId`**, not replace their list.
+- `analysis_report.missingInfo` keeps its shape (`[{id, text, isMatched}]`) but will contain more entries; `caseResolutionScore` caps at 95 while any gap exists.
+- `probing_prompts_response` gains the standard `metadata` block, but only when chips were actually generated.
+- `workspace_version_restore` is inert until the backend emits it, so the AI service can be deployed first and rolled back safely. The backend contract for it is specified in `docs/BACKEND_VERSION_RESTORE_SPEC.md`, which must be sent to the backend team directly: the repository ignores `*.md` apart from `README.md`, `SYSTEM_ARCHITECTURE.md`, `RELEASE.md` and `CHANGELOG.md`, so that spec is not present in a clone.
+- No new **required** environment variables, no new dependencies, and no Qdrant, Docker or schema migration. Five optional pricing overrides exist (`OCR_PRICE_PER_1K_UNITS`, `STT_PRICE_PER_MINUTE`, `SEARCH_PRICE_PER_1K_QUERIES`, `GROUNDING_PRICE_PER_1K_REQUESTS`, `EMBED_PRICE_PER_MILLION_TOKENS`); all have sane defaults.
+- Free tiers and volume discounts are not modelled, so reported cost is an upper bound on the true invoice.
+- **New inbound event `workspace_transferred`.** Inert until the backend emits it, so it does not gate this deployment. `reEmitFeatures` currently expects `drafting_assistant`.
+- **New optional inbound field `currentState`** on the workspace-sync payload. Omitting it preserves the previous behaviour (everything regenerates untagged); sending it is what enables carried-over vs new tagging, so the frontend must return the curated panel state to get the benefit.
+- Panels now emit in a fixed product order rather than completion order; a consumer that assumed arrival order was arbitrary is unaffected, one that raced on it will now see deterministic ordering.
+
+---
+
+# Release v5.0.1 - 2026-07-09
+
+This release (`v5.0.1`) is a single user-visible fix to the chat acknowledgement for surgical panel edits. It is backward compatible with `v5.0.0` — no socket event or payload-shape changes.
+
+## Highlights
+
+- **Panel edits from chat now reply with a real confirmation.** When a lawyer's message is routed to the free-form panel-edit path (e.g. *"remove 1. … from possible next steps"*), the acknowledgement was a bare `"Updated: possible next steps."`, which read as the AI not responding.
+
+## Bug Fixes
+
+- The pre-dispatcher records each applied per-panel edit instruction, and a new helper `_build_panel_edit_ack` composes a 2–4 sentence plain-text confirmation stating **what** changed and the resulting panel state (how many next steps remain and which is now first; renames confirm the replacement across affected panels). On any generation failure it falls back to a templated acknowledgement — never worse than before.
+
+## Compatibility Notes
+
+- Drop-in replacement for `v5.0.0`. The `ai_response` shape, the surgical-edit routing, the skip of the full chat graph, and the no-cascade rule for panel edits are all unchanged.
+
+---
+
+# Release v5.0.0 - 2026-07-07
+
+This release (`v5.0.0`) adds two new intelligence panels — **Case Laws** and **Relevant Parties** — plus manual case-law upload, multi-draft template matching in the Drafting Assistant, and a large no-behaviour-change decomposition of the socket layer. **Major version bump: several socket payload contracts changed shape** (party role vocabulary and field names, drafting-suggestion match fields, case-law item ids) — the backend and frontend must be released in step.
+
+## Highlights
+
+- **Case Laws panel** — relevant prior judgments, each with a real, clickable source URL, a proper Indian headnote (issues, material facts, ratio, holding, relief) and a High/Medium/Low relevance badge. Selection is strict source-verified: the model ranks and summarizes only retrieved judgments and may not invent citations.
+- **Relevant Parties panel** — the people and organisations actually party to the matter, each with a normalized role badge and a one-line description, with per-document provenance so a deletion purges exactly that document's parties.
+- **Manual case-law upload** — a lawyer uploads a judgment file; the AI classifies whether it really is a case law, extracts it into the panel, and rejects anything else with a reason naming what the document actually is.
+- **Every matching library draft is now offered, each with its own % match score**, instead of the AI silently binding a suggestion to one "winner" template.
+- **`app/socket/events.py` (20,987 lines) decomposed into 21 per-feature mixins** and all 51 inline prompts centralised into `app/prompts/`, both verified byte-identical — no behaviour change.
+
+## Features Delivered
+
+- `document_feature_response` with `featureType:"case_laws"`: `payload.caseLaws[]` (capped at 8, stable `caselaw_N` ids) carrying citation, court, bench, date, binding strength/stars, legal issues, material facts, ratio, holding, relief, the case-vs-matter comparison fields, and `referenceUrl`/`referenceName` for the source judgment. Sources are aggregated across Indian Kanoon, Vertex AI Search and Gemini `google_search` grounding; a two-pass pipeline selects and compares, then fetches the real judgment text and extracts the judgment-intrinsic fields strictly from it. `legalStatus` defaults to "Not independently verified".
+- `document_feature_response` with `featureType:"relevant_parties"`: `payload.parties[]` (capped at 30) of `{ id, name, role, details, contactNumber, email, officialIdUrl }`, with new inbound CRUD events `add_relevant_party` / `edit_relevant_party` / `delete_relevant_party`. Contact fields are PII and are always emitted empty on auto-generation — they are only ever populated from user input.
+- New inbound events `add_case_law` (resolve and verify a citation, URL or text) and `case_law_document_request` → `case_law_document_response` (manual judgment upload, always terminal so the frontend never waits forever).
+- New chat scopes `chat_type:"CASE_LAWS"` and `chat_type:"RELEVANT_PARTIES"`, each injecting only its cached panel into the chat context.
+- `DraftingSuggestionItem` gains `matches[]` of `{ templateId, templateName, category, matchPercent }`, sorted by score; the minimum-match-score gate is removed so weak fits are shown with an honest score instead of being hidden.
+- New `gemini_client.generate_grounded()` returning text plus `google_search` grounding sources, with grounding redirect URLs resolved to their real destinations.
+
+## Quality and Stability Improvements
+
+- Objective / case-perspective change now **preserves** the document-derived panels (Relevant Parties, Case Laws, Upcoming Dates, Drafting suggestions) and regenerates only what the legal objective actually affects.
+- Document deletion **replaces** the derived panels (analysis report, case laws, applicable laws) instead of union-merging them, so they reflect the reduced document set; uploads keep the accumulate behaviour.
+- A case-law quality gate drops cards that would render half-empty or off-topic, and the Indian Kanoon scraper parses real judgment rows and retries with a trimmed query when a long query returns nothing.
+- Socket-layer decomposition verified by AST method-body equality (218/218 nodes identical) and a runtime diff (222 methods, 21 handler keys, same singleton); prompt extraction verified 51/51 byte-identical including interpolated expressions. See `docs/SOCKET_EVENTS_ARCHITECTURE.md`.
+
+## Bug Fixes
+
+- Dateless source dates ("25 May", "26 tareekh") now resolve to the current year across every panel, via an explicit date-interpretation directive plus a deterministic backstop that rewrites ungrounded years in free text. Statute years, currency amounts, bare years and any year present in the source are never touched.
+- List of Dates / Applicable Laws / Upcoming Dates loaders no longer stick after a chat panel edit that had nothing to change — a terminal-emit guard re-emits the cached payload.
+- Surgical chat edits now handle TERM / DATE / YEAR corrections, not just names, including the ISO `date` field of dated entries.
+- Duplicate Relevant Parties after a re-extraction are absorbed by canonical party identity plus a guarded fuzzy match; user-deleted parties are re-checked through the same logic so they stay deleted.
+
+## Compatibility Notes
+
+- **Breaking.** Relevant-party roles are Title-Case `Petitioner | Respondent | Witness | Victim | Accused | Other` (previously an UPPERCASE nine-role enum); the one-line text moved from `description` to `details`; `rawDesignation` / `sourceDoc` were dropped; PII contact fields were added. Legacy-cached entries are coerced to the new shape on merge.
+- **Breaking.** The drafting-suggestion top-level `templateId` / `templateName` / `matchMode` / `matchScore` / `matchReason` fields are replaced at the emit boundary by `matches[]`.
+- Backend and frontend must be released in step with this version.
+- Public Python surface is unchanged despite the decomposition: `event_handler` remains the only symbol other modules import from `app/socket/events.py`.
+
+---
+
 # Release v4.2.0 - 2026-06-29
 
 This release (`v4.2.0`) hardens the **Drafting Assistant** end-to-end so that AI suggested drafts and template-backed drafts are reliable, faithful to the lawyer's templates, and free of extraction noise. It is backward compatible with `v4.1.0` — no socket event or payload-shape changes.

@@ -227,6 +227,28 @@ def main() -> int:
             f"{name} prompt keeps the statute rule for court filings",
             "For COURT FILINGS, include the enabling statute" in prompt,
         )
+        check(
+            f"{name} prompt requires a purpose-bearing title",
+            "says what the draft DOES" in prompt,
+        )
+
+    print("\n9. Suggestion panel remedy balance")
+    check(
+        "panel must span remedy tracks",
+        "REMEDY COVERAGE" in suggestions,
+    )
+    check(
+        "criminal-track drafts are capped unless the matter is criminal",
+        "at MOST 2 of the panel unless the matter" in suggestions,
+    )
+    check(
+        "applicable laws are framed as a lens, not a checklist",
+        "NOT a checklist of drafts to" in suggestions,
+    )
+    check(
+        "a Section 63 BSA certificate is capped at one",
+        "at most ONE" in suggestions,
+    )
 
     print()
     if FAILURES:

@@ -666,7 +666,9 @@ def build_suggested_drafts_prompt(
 CASE SUMMARY:
 {case_summary or "(no summary available — derive from analysis report below)"}
 
-APPLICABLE LAWS (already identified for this case):
+APPLICABLE LAWS (research lens for this case — NOT a checklist of drafts to
+propose. Do not emit one draft per statute listed here; the remedies the
+client actually needs decide the panel):
 {applicable_laws_brief or "(none yet)"}
 
 STRATEGY / OBJECTIVE:
@@ -685,7 +687,13 @@ TASK:
 Propose 4 to 6 drafts that this {role_upper} should be preparing right now,
 given the case posture above. For each, return:
 
-  - title:        a formal one-line name for the draft.
+  - title:        a formal one-line name that says what the draft DOES. A
+                  statute/section may QUALIFY the purpose but must never
+                  replace it — "Application under Section 175(3) BNSS for a
+                  Direction to the Police to Register an FIR" is right;
+                  "Application under Section 175(3) of the Bharatiya Nagarik
+                  Suraksha Sanhita, 2023" is a defect (the reader cannot tell
+                  what it asks for).
                   For COURT FILINGS, include the enabling statute and
                   section, e.g. "Application under Section 12 of the
                   Protection of Women from Domestic Violence Act, 2005".
@@ -705,6 +713,30 @@ given the case posture above. For each, return:
                   deadlines, and how directly the draft advances the case.
   - description:  ONE short sentence (<= 160 characters) saying what the
                   draft is for in this specific case.
+
+REMEDY COVERAGE — the panel must reflect the remedies THIS client actually
+needs, across every track the record supports, not one track repeated:
+  (a) pre-litigation correspondence — legal notice, demand notice, reply
+      notice, cease-and-desist, takedown / preservation demand to an
+      intermediary or platform, employer or counterparty letter;
+  (b) civil and commercial relief — suit for recovery of money, damages,
+      permanent or mandatory injunction, specific performance, summary suit
+      under Order XXXVII CPC, invocation of arbitration;
+  (c) regulatory, platform and administrative — grievance officer under the
+      IT Rules, sectoral regulator (RBI / TRAI / SEBI / IRDAI), consumer
+      forum, RTI, representation to an authority;
+  (d) criminal track — FIR complaint, an application to the Magistrate, or
+      any BNS / BNSS-driven filing — ONLY where the record genuinely makes
+      out a cognizable offence, and at MOST 2 of the panel unless the matter
+      is purely criminal (an arrest, a registered FIR, a pending
+      prosecution). Never fill the panel with procedural applications under
+      the criminal codes when the client's real need is recovery, an
+      injunction, or a takedown;
+  (e) evidentiary / procedural support (e.g. a Section 63 BSA certificate for
+      electronic records) — at most ONE, and only when a filing it supports
+      is itself being proposed.
+A commercial or civil matter with a criminal overlay is led by its civil and
+correspondence remedies; the criminal drafts support them, not the reverse.
 
 CONSTRAINTS:
   - No IPC, no CrPC, no Indian Evidence Act references. Use BNS / BNSS /
@@ -799,8 +831,10 @@ case?), not by whether the original parties/facts match.
 
 Return a single JSON object:
   - applicable:   true | false.
-  - title:        if applicable, a formal one-line name framed to THIS
-                  case. Empty string if not applicable.
+  - title:        if applicable, a formal one-line name framed to THIS case
+                  that says what the draft DOES — a statute/section may
+                  QUALIFY the purpose but must never replace it. Empty
+                  string if not applicable.
                   For COURT FILINGS, include the enabling statute and
                   section, e.g. "Application under Section 12 of the
                   Protection of Women from Domestic Violence Act, 2005".

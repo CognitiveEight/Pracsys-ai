@@ -17,6 +17,7 @@ model does not invent IPC sections.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 
@@ -314,7 +315,7 @@ CASE-SPECIFIC DRAFTING
 
 Always tailor the draft according to:
 - Nature of dispute,
-- Applicable statute,
+- The governing instrument (contract / policy / statute, as the document's class requires),
 - Court jurisdiction,
 - Procedural stage,
 - Relief sought,
@@ -336,6 +337,9 @@ For civil matters:
 For corporate/legal notices:
 - Use precise and assertive legal communication style.
 - Maintain professional advocate correspondence tone.
+- Ground the notice in the governing instrument and the documentary record;
+  cite statutes only when load-bearing (see the LOAD-BEARING STATUTE TEST in
+  the document-type registry).
 
 ========================
 LEGAL ACCURACY RULES
@@ -416,17 +420,36 @@ that do not naturally have a court heading.**
 - Signature: defendant THROUGH advocate + `VERIFICATION`.
 
 ──────────────────────────────────────────────────────────────────
-5. LEGAL NOTICE / DEMAND NOTICE (advocate's letter, NOT a court filing)
+5. LEGAL NOTICE / DEMAND NOTICE / CEASE-AND-DESIST / STATUTORY
+   NOTICE (Section 138 NI Act, Section 21 A&C Act, Section 80 CPC) /
+   EMPLOYER-HR LETTER — advocate's letter, NOT a court filing
 ──────────────────────────────────────────────────────────────────
 - Opening: advocate's **letterhead** (firm name + chamber address +
   contact). Date. Reference number / "WITHOUT PREJUDICE".
 - Addressee: `TO,` block — recipient's name and full address.
-- Subject line: `SUBJECT: LEGAL NOTICE FOR <relief sought>`.
-- Body: `Dear Sir / Madam,` → narrative paragraphs setting out
-  client instructions, facts, and the cause of action → cite
-  applicable provisions (BNS / BNSS / BSA / IT Act).
-- Closing: **DEMAND clause + DEADLINE** (e.g. "comply within 15
-  days"), followed by consequences of non-compliance.
+- Subject line: `SUBJECT: LEGAL NOTICE FOR <relief sought>` — in
+  capitals, naming the amount / relief and the consequence.
+- Body: `Dear Sir / Madam,` → "Under instructions from and on behalf
+  of our client <CLIENT> ..." → NUMBERED paragraphs setting out the
+  facts in date order (how the relationship arose, what was agreed,
+  what the addressee did, the prior correspondence and any admission)
+  → the governing instrument's clauses QUOTED VERBATIM with their
+  clause numbers → why that conduct breaches those clauses.
+- The notice is argued from the CONTRACT and the RECORD, not from a
+  list of sections. Name an Act / section ONLY where the statute is
+  itself a fact or an operative duty on this record — the sections of
+  an FIR actually registered, a regulator's direction actually
+  breached, or a notice the statute itself prescribes (Section 138 NI
+  Act, Section 21 Arbitration and Conciliation Act, Section 80 CPC).
+  A notice citing NO statute at all is correct and normal. Never
+  enumerate "applicable provisions", and never cite BNSS / CrPC in a
+  civil or commercial notice.
+- Closing: **ITEMISED DEMAND list** (a., b., c. ...) with the exact
+  figure for each head (principal, contractual interest and its rate,
+  taxes, legal costs), a **DEADLINE** stated both as a period from
+  receipt and as an absolute date ("within 15 days of receipt, and in
+  any event no later than <DD Month YYYY>"), the consequences of
+  non-compliance, and an express **reservation of rights**.
 - Signature: advocate's signature block (name, enrolment number,
   chamber address). Optionally `CC: client`.
 - **FORBIDDEN in a Legal Notice**: court heading, party array,
@@ -439,13 +462,44 @@ that do not naturally have a court heading.**
 - Opening: advocate's letterhead + date + reference to the incoming
   notice (date, sender's advocate).
 - Addressee: `TO,` — sender's advocate.
-- Body: `Dear Sir / Madam,` → introduction of client → numbered
-  point-by-point rebuttal keyed to the paragraphs of the incoming
-  notice.
+- Body: `Dear Sir / Madam,` → introduction of client → a general
+  denial ("save and except what is expressly admitted herein, each
+  allegation is denied") → numbered point-by-point rebuttal keyed to
+  the paragraphs of the incoming notice, answered from the governing
+  instrument's clauses (quoted verbatim) and the documentary record,
+  not from statutory sections → where the client has issued its own
+  earlier notices, record that they remain in full force and are
+  neither superseded nor withdrawn.
+- Where settlement is open, a WITHOUT PREJUDICE paragraph proposing
+  specific dates, and a document-retention / preservation notice.
 - Closing: denial of the demand, reservation of legal remedies.
 - Signature: advocate's signature block.
-- **FORBIDDEN**: court heading, `PRAYER`, `VERIFICATION` — same
-  rules as a Legal Notice.
+- **FORBIDDEN**: court heading, `PRAYER`, `VERIFICATION`, and any
+  statute list that fails the LOAD-BEARING STATUTE TEST — same rules
+  as a Legal Notice.
+
+──────────────────────────────────────────────────────────────────
+LOAD-BEARING STATUTE TEST (applies to items 5 and 6 above, and to
+every advocate's letter generally)
+──────────────────────────────────────────────────────────────────
+In pre-litigation correspondence, cite a statute ONLY when the letter
+cannot function without it:
+  (a) the sections of an FIR / complaint ACTUALLY registered — stated
+      as a fact of the record, with the FIR number and date, not as
+      your own characterisation of the conduct;
+  (b) a regulator's binding direction or licence condition ACTUALLY
+      breached (RBI / TRAI / SEBI and the like), where that breach is
+      itself the grievance;
+  (c) the provision that MAKES this a statutory notice — Section 138
+      r/w Section 142 NI Act, Section 21 Arbitration and Conciliation
+      Act, Section 80 CPC;
+  (d) a mandatory statutory notice PERIOD relied on for the deadline.
+Everything else is omitted. Do NOT characterise the noticee's conduct
+by section numbers, and never open a "Legal Grounds" / "Statutory
+Provisions" / "Applicable Law" paragraph in a letter. State the breach
+against the quoted clause or the duty actually owed. An uncertain
+citation in correspondence is DELETED, not replaced with a
+placeholder.
 
 ──────────────────────────────────────────────────────────────────
 7. FIR COMPLAINT / POLICE COMPLAINT
@@ -562,7 +616,9 @@ For all events on or after 1 July 2024 (the date the new Indian criminal code ca
 
 You may reference the old Acts only when the cause of action predates 1 July 2024 and the older Act remains the operative statute for that event, or when the lawyer explicitly instructs you to cite the older provision. In every other situation, use BNS / BNSS / BSA.
 
-Never fabricate a section number when you are not sure of the BNS/BNSS/BSA equivalent — leave a clearly marked placeholder (e.g. "[applicable BNS section]") and surface a follow-up question instead."""
+Never fabricate a section number when you are not sure of the BNS/BNSS/BSA equivalent — leave a clearly marked placeholder (e.g. "[applicable BNS section]") and surface a follow-up question instead.
+
+That placeholder rule is a COURT-FILING rule. In pre-litigation correspondence (legal notice, reply notice, demand notice, cease-and-desist, arbitration notice, employer letter), never emit a statute placeholder — omit the citation and rewrite the sentence without it. An omitted citation is correct there; a bracketed one is a defect."""
 
 
 # ---------------------------------------------------------------------------
@@ -629,9 +685,22 @@ TASK:
 Propose 4 to 6 drafts that this {role_upper} should be preparing right now,
 given the case posture above. For each, return:
 
-  - title:        formal one-line name including the statute and section,
-                  e.g. "Application under Section 12 of the Protection of
-                  Women from Domestic Violence Act, 2005".
+  - title:        a formal one-line name for the draft.
+                  For COURT FILINGS, include the enabling statute and
+                  section, e.g. "Application under Section 12 of the
+                  Protection of Women from Domestic Violence Act, 2005".
+                  For PRE-LITIGATION CORRESPONDENCE (legal notice, reply
+                  notice, demand notice, cease-and-desist, arbitration
+                  notice, employer letter), title it by DOCUMENT TYPE +
+                  SUBJECT MATTER and attach NO statute or section unless
+                  the statute is what makes the notice mandatory (e.g.
+                  "Legal Notice under Section 138 of the Negotiable
+                  Instruments Act, 1881", "Notice Invoking Arbitration
+                  under Section 21 of the Arbitration and Conciliation
+                  Act, 1996"). Otherwise use the plain form: "Legal
+                  Notice for Breach of the Service Agreement dated
+                  12.03.2024 and Recovery of Outstanding Dues", "Reply
+                  Notice to the Legal Notice dated 04.02.2026".
   - relevance:    "High" | "Medium" | "Low" — based on urgency, statutory
                   deadlines, and how directly the draft advances the case.
   - description:  ONE short sentence (<= 160 characters) saying what the
@@ -646,8 +715,8 @@ CONSTRAINTS:
     in list-of-dates) or that close an explicit gap in the analysis report.
   - If a template in the LAWYER'S TEMPLATE LIBRARY fits a draft this case
     genuinely needs right now, prefer proposing that draft and title it by
-    its document type (e.g. "Legal Notice under Section 35 of the Consumer
-    Protection Act, 2019"). But do NOT propose a draft solely because a
+    its document type (e.g. "Legal Notice for Deficiency in Service and
+    Refund of the Amounts Paid"). But do NOT propose a draft solely because a
     template exists — case appropriateness and posture still decide. Never
     copy the template's original party names, dates, or facts into the
     suggestion; use only this case's facts.
@@ -730,10 +799,23 @@ case?), not by whether the original parties/facts match.
 
 Return a single JSON object:
   - applicable:   true | false.
-  - title:        if applicable, a formal one-line name including the statute
-                  and section where known, framed to THIS case (e.g. "Legal
-                  Notice under Section 35 of the Consumer Protection Act,
-                  2019"). Empty string if not applicable.
+  - title:        if applicable, a formal one-line name framed to THIS
+                  case. Empty string if not applicable.
+                  For COURT FILINGS, include the enabling statute and
+                  section, e.g. "Application under Section 12 of the
+                  Protection of Women from Domestic Violence Act, 2005".
+                  For PRE-LITIGATION CORRESPONDENCE (legal notice, reply
+                  notice, demand notice, cease-and-desist, arbitration
+                  notice, employer letter), title it by DOCUMENT TYPE +
+                  SUBJECT MATTER and attach NO statute or section unless
+                  the statute is what makes the notice mandatory (e.g.
+                  "Legal Notice under Section 138 of the Negotiable
+                  Instruments Act, 1881", "Notice Invoking Arbitration
+                  under Section 21 of the Arbitration and Conciliation
+                  Act, 1996"). Otherwise use the plain form: "Legal
+                  Notice for Breach of the Service Agreement dated
+                  12.03.2024 and Recovery of Outstanding Dues", "Reply
+                  Notice to the Legal Notice dated 04.02.2026".
   - relevance:    "High" | "Medium" | "Low" — based on urgency and how
                   directly this draft advances the case.
   - description:  ONE short sentence (<= 160 characters) saying what the draft
@@ -1275,13 +1357,20 @@ DRAFT_RENDER_INSTRUCTION = (
     + "    and antecedents; a matrimonial petition narrates the marriage and "
     + "    the instances pleaded; an affidavit narrates the deponent's "
     + "    averments; a plaint narrates the cause of action.\n"
-    + "  • Articulating the LEGAL characterisation and reasoning — name the "
-    + "    cause(s) of action / legal grounds that fit THIS document type and "
-    + "    matter under the applicable statutes, and explain WHY these facts "
-    + "    satisfy them (e.g. deficiency in service / sale of defective goods "
-    + "    for a consumer notice; the grounds for bail and parity for a bail "
-    + "    application; the statutory grounds pleaded in a petition). Use "
-    + "    BNS / BNSS / BSA / IT Act — never IPC / CrPC / Evidence Act.\n"
+    + "  • Articulating the LEGAL characterisation and reasoning — how you "
+    + "    do this depends on the DOCUMENT CLASS. For a COURT FILING, name "
+    + "    the cause(s) of action / legal grounds under the applicable "
+    + "    statutes and the provision the relief is sought under, and explain "
+    + "    WHY these facts satisfy them (the grounds for bail and parity for "
+    + "    a bail application; the statutory grounds pleaded in a petition). "
+    + "    For PRE-LITIGATION CORRESPONDENCE (legal notice, reply notice, "
+    + "    demand notice), characterise the breach against the CONTRACTUAL "
+    + "    OBLIGATION or duty breached — quote the clause and show why the "
+    + "    facts establish the breach — and cite a statute ONLY where one is "
+    + "    genuinely operative on this record (see CORRESPONDENCE DISCIPLINE "
+    + "    in the task prompt); a notice needs no statutory citation to be "
+    + "    complete. Where a statute IS cited, use BNS / BNSS / BSA / IT Act "
+    + "    — never IPC / CrPC / Evidence Act.\n"
     + "  • Developing the IMPACT / relief basis concretely — the harm or "
     + "    prejudice the matter actually involves (financial loss, physical "
     + "    or reputational harm, mental / emotional distress, prejudice to "
@@ -1591,10 +1680,21 @@ _DOC_TYPE_KEYWORDS: list = [
         ["bail application", "regular bail", "bail under"]),
     ("Reply Notice",
         ["reply notice", "reply to notice", "reply to legal notice",
-         "reply to demand notice"]),
+         "reply to demand notice", "notice reply"]),
+    ("Section 138 Notice",
+        ["section 138", "sec 138", "cheque bounce notice",
+         "dishonour of cheque notice", "dishonoured cheque notice"]),
+    ("Arbitration Notice",
+        ["arbitration notice", "notice invoking arbitration",
+         "invoking arbitration", "notice of arbitration"]),
+    ("Cease and Desist Notice",
+        ["cease and desist", "cease-and-desist"]),
+    ("Employment Notice",
+        ["show cause notice", "termination letter", "notice period recovery",
+         "resignation recovery", "full and final settlement letter"]),
     ("Legal Notice",
         ["legal notice", "demand notice", "lawyer notice",
-         "advocate notice"]),
+         "advocate notice", "recovery notice"]),
     ("FIR Complaint",
         ["fir complaint", "police complaint", "complaint to police",
          "complaint to sho", "complaint to station house officer",
@@ -1641,10 +1741,112 @@ def _infer_document_type_label(draft_title: Optional[str]) -> str:
     return "OTHER"
 
 
+# Document CLASS — coarser than the type label and used to decide how much
+# statutory citation a draft should carry. Pre-litigation correspondence is
+# argued from the contract and the record (a real advocate's notice quotes
+# clause 6.1, not a BNSS section); court filings must still name the provision
+# the relief is sought under, so they keep the existing statutory framing.
+DOC_CLASS_CORRESPONDENCE = "correspondence"
+DOC_CLASS_FILING = "filing"
+DOC_CLASS_UNKNOWN = "unknown"
+
+# Labels from BOTH vocabularies: `_DOC_TYPE_KEYWORDS` (title inference, used in
+# blank mode) and TEMPLATE_DOCUMENT_TYPE_LABELS (the template classifier).
+_CORRESPONDENCE_DOC_TYPES: frozenset = frozenset(
+    {
+        "legal notice",
+        "reply notice",
+        "demand notice",
+        "section 138 notice",
+        "arbitration notice",
+        "cease and desist notice",
+        "employment notice",
+        "representation",
+    }
+)
+
+_FILING_DOC_TYPES: frozenset = frozenset(
+    {
+        "anticipatory bail application",
+        "bail application",
+        "written statement",
+        "civil plaint",
+        "plaint",
+        "petition",
+        "writ petition",
+        "divorce petition",
+        "appeal",
+        "revision petition",
+        "rejoinder",
+        "synopsis",
+        "consumer complaint",
+        "cheque bounce complaint",
+        "criminal complaint",
+        "police complaint",
+        "fir",
+        "fir complaint",
+        "maintenance application",
+        "domestic violence application",
+        "custody application",
+        "injunction application",
+        "stay application",
+        "miscellaneous application",
+        "bnss section application",
+        "cctv preservation application",
+        "memo of parties",
+    }
+)
+
+
+_FILING_TITLE_WORD_RE = re.compile(
+    r"\b(?:petition|plaint|complaint|appeal|revision|application|suit|bail|"
+    r"writ|affidavit|vakalatnama|written\s+statement|rejoinder|counter)\b",
+    re.IGNORECASE,
+)
+
+
+def infer_document_class(
+    draft_title: Optional[str],
+    template_document_type: Optional[str] = None,
+) -> str:
+    """Classify a draft as pre-litigation correspondence or a court filing.
+
+    Both signals are considered: the template's own classified `document_type`
+    (an LLM classification of the actual document) and the deterministic
+    inference from the draft title. A court-filing signal from EITHER source
+    wins, because the filing class keeps today's statute-citing behaviour and
+    is therefore the safe answer. Returns DOC_CLASS_UNKNOWN when neither source
+    resolves, in which case callers must leave behaviour unchanged.
+    """
+    labels = {
+        (candidate or "").strip().lower()
+        for candidate in (
+            template_document_type,
+            _infer_document_type_label(draft_title),
+        )
+    }
+    labels.discard("")
+    labels.discard("other")
+    # Fail safe toward the filing class: it keeps today's statute-citing
+    # behaviour, so a misfire never degrades a petition. Correspondence only
+    # wins when NEITHER signal looks like a court filing.
+    if labels & _FILING_DOC_TYPES:
+        return DOC_CLASS_FILING
+    if labels & _CORRESPONDENCE_DOC_TYPES:
+        return DOC_CLASS_CORRESPONDENCE
+    # Neither vocabulary matched. Sniff the raw title for court-filing words so
+    # a type the label tables do not carry (e.g. "Writ Petition against the
+    # impugned order") still lands on the safe side rather than UNKNOWN.
+    if _FILING_TITLE_WORD_RE.search(draft_title or ""):
+        return DOC_CLASS_FILING
+    return DOC_CLASS_UNKNOWN
+
+
 def _build_style_block(
     draft_depth: Optional[str],
     structure_style: Optional[str],
     guardrail_level: Optional[str],
+    document_class: str = DOC_CLASS_UNKNOWN,
 ) -> str:
     """Render the lawyer-approved depth / structure / guardrail controls as an
     authoritative instruction block for the draft renderer. Returns '' when no
@@ -1708,11 +1910,29 @@ def _build_style_block(
     if guardrails:
         low = guardrails.lower()
         if "comprehensive" in low or "strict" in low or "high" in low:
-            lines.append(
-                "LEGAL GUARDRAILS = COMPREHENSIVE: apply full legal-soundness "
-                "review — verify every statute/section citation, flag risks, and "
-                "ensure each contention is legally supported."
-            )
+            if document_class == DOC_CLASS_CORRESPONDENCE:
+                # "Legally supported" in a notice means supported by the
+                # instrument and the record. The generic wording below reads as
+                # "attach a section to each contention", which is exactly the
+                # statute-stacking this class must avoid.
+                lines.append(
+                    "LEGAL GUARDRAILS = COMPREHENSIVE: apply full soundness "
+                    "review — verify every date, figure, clause number and "
+                    "quoted clause text against the record, ensure each "
+                    "demand is supported by the instrument or the documented "
+                    "conduct relied on, and confirm the deadline is correctly "
+                    "computed. 'Legally supported' here means SUPPORTED BY "
+                    "THE INSTRUMENT AND THE RECORD, not accompanied by a "
+                    "statutory citation — do NOT add section references to "
+                    "satisfy this guardrail. Any citation that survives must "
+                    "be load-bearing, and must be verified."
+                )
+            else:
+                lines.append(
+                    "LEGAL GUARDRAILS = COMPREHENSIVE: apply full legal-soundness "
+                    "review — verify every statute/section citation, flag risks, and "
+                    "ensure each contention is legally supported."
+                )
         elif "standard" in low or "moderate" in low or "basic" in low or "light" in low:
             lines.append(
                 "LEGAL GUARDRAILS = STANDARD: apply the core soundness checks; "
@@ -1747,6 +1967,7 @@ def build_draft_render_prompt(
     draft_depth: Optional[str] = None,
     structure_style: Optional[str] = None,
     guardrail_level: Optional[str] = None,
+    template_document_type: Optional[str] = None,
 ) -> str:
     """Build the user prompt for final draft rendering.
 
@@ -1755,8 +1976,13 @@ def build_draft_render_prompt(
     `draft_depth` / `structure_style` / `guardrail_level` come from the
     lawyer-approved template blueprint (see TemplateBlueprint). They are
     no-ops when absent (older templates / blank drafts).
+
+    `template_document_type` is the template's classified document type; with
+    the draft title it decides the document CLASS (see `infer_document_class`),
+    which gates the correspondence citation discipline below.
     """
     role_upper = (role or "ADJUDICATOR").strip().upper()
+    document_class = infer_document_class(draft_title, template_document_type)
 
     # Template tone WINS over the default Indian-advocate register (decision:
     # reused drafts should read like the lawyer's original document). Filing
@@ -1776,7 +2002,9 @@ def build_draft_render_prompt(
 
     # Lawyer-approved drafting controls (depth / structure / guardrails). These
     # are AUTHORITATIVE preferences from the template blueprint. Absent → no-op.
-    style_block = _build_style_block(draft_depth, structure_style, guardrail_level)
+    style_block = _build_style_block(
+        draft_depth, structure_style, guardrail_level, document_class
+    )
 
     template_block = ""
     if template_text:
@@ -1967,6 +2195,77 @@ genuinely missing.
             "original numbers.\n"
         )
 
+    # Pre-litigation correspondence (legal notice / reply / demand / statutory
+    # notice) argues from the contract and the record, not from a list of
+    # sections. This block governs WHAT IS WRITTEN INSIDE the document's
+    # sections only — it never changes a template's skeleton, so it is safe in
+    # template mode as well as blank mode.
+    correspondence_block = ""
+    if document_class == DOC_CLASS_CORRESPONDENCE:
+        correspondence_block = (
+            "CORRESPONDENCE DISCIPLINE (this document is pre-litigation "
+            "correspondence, NOT a court filing) — this governs the CONTENT "
+            "written inside the document's sections. It NEVER overrides a "
+            "template's skeleton: add no section, heading, or block the "
+            "template does not already have.\n"
+            "  • AUTHORITY ORDER — argue from, in this order: (1) the "
+            "governing instrument (agreement / term sheet / appointment "
+            "letter / purchase order) — quote the CLAUSE NUMBER and its text "
+            "VERBATIM in quotation marks, the way a real advocate's notice "
+            "does; (2) the documentary record — exact dates, amounts, "
+            "invoice / reference numbers, prior correspondence, and the "
+            "addressee's own admissions; (3) the conduct complained of and "
+            "why it breaches that obligation; (4) the demand. DEPTH COMES "
+            "FROM FACTS, QUOTED CLAUSES, CHRONOLOGY AND QUANTIFICATION — "
+            "never from listing statutes.\n"
+            "  • STATUTES ONLY WHEN LOAD-BEARING — name an Act or section "
+            "ONLY where the statute is itself a fact or an operative duty on "
+            "THIS record: the sections of an FIR / complaint actually "
+            "registered; a regulator's binding direction actually breached "
+            "(an RBI / TRAI / SEBI direction or circular); a notice the "
+            "statute itself prescribes (Section 138 NI Act, Section 21 "
+            "Arbitration and Conciliation Act, Section 80 CPC) where the "
+            "statute is the vehicle for the notice; or a provision the "
+            "lawyer supplied in GATHERED FACTS or the instructions. "
+            "Otherwise cite nothing.\n"
+            "  • NEVER — an 'applicable provisions' / 'legal grounds' "
+            "enumeration; a section attached to each contention; criminal-"
+            "procedure sections (BNSS / CrPC) in a civil or commercial "
+            "notice; a statutory-grounds paragraph the template does not "
+            "already contain. A notice with NO statutory citation is a "
+            "correct and normal notice.\n"
+            "  • ALWAYS KEEP — an itemised demand list (a., b., c. …) with "
+            "the exact figure for each head, reconciled to ONE figure per "
+            "head; a compliance deadline stated BOTH as a period from "
+            "receipt and as an absolute date; the consequences of non-"
+            "compliance; and an express reservation of rights and remedies.\n"
+            "  • LENGTH — the DEPTH mandate's length floor is satisfied here "
+            "by FACTUAL and CONTRACTUAL development: more dated particulars, "
+            "more quoted clause text, more itemised heads. Padding the letter "
+            "with statutory discussion does NOT satisfy it and is a defect.\n"
+        )
+        if template_text:
+            correspondence_block += (
+                "TEMPLATE MODE + CORRESPONDENCE — read the above as a CONTENT "
+                "rule, never a STRUCTURE rule. The template's structure "
+                "remains an absolute contract:\n"
+                "  • Do NOT add, remove, rename or reorder any section of the "
+                "template on account of this discipline. If the template HAS "
+                "a statutory-grounds paragraph, that paragraph STAYS and you "
+                "fill it — the lawyer put it there deliberately; modernise "
+                "its citations token-for-token and ground it in this "
+                "matter's facts.\n"
+                "  • What the discipline forbids is INFLATION: do NOT "
+                "introduce statutory grounds, section lists, 'applicable "
+                "law' recitals or offence characterisations into a section "
+                "that does not already contain them, and do NOT expand a "
+                "factual or demand paragraph into a discussion of legal "
+                "provisions. If the template's body is a factual narrative "
+                "followed by a demand, the output is a factual narrative "
+                "followed by a demand — longer and more particular, with no "
+                "new legal-grounds matter.\n"
+            )
+
     # In revision mode, gathered_facts may be stale (revisions never update
     # gathered_facts, so a prior "Advocate: X → Y" instruction isn't reflected
     # there). Label the block so the LLM knows the previous draft wins.
@@ -1980,6 +2279,18 @@ genuinely missing.
         "NEVER use them to override a concrete value already present in the draft]"
         if mode == "revision"
         else "GATHERED FACTS FROM LAWYER (JSON)"
+    )
+
+    class_constraint = (
+        "  - CORRESPONDENCE: authority comes from the instrument's clauses and "
+        "the documentary record, not from statutory sections. Cite a statute "
+        "ONLY when it is load-bearing on this record; otherwise omit it "
+        "entirely rather than leaving a bracketed placeholder.\n"
+        "  - CORRESPONDENCE: the demand must be ITEMISED with the exact figure "
+        "for each head and a stated total, and must carry BOTH a period from "
+        "receipt AND the resulting absolute date.\n"
+        if document_class == DOC_CLASS_CORRESPONDENCE
+        else ""
     )
 
     revision_constraint = (
@@ -2009,14 +2320,14 @@ CASE FACTS / EVIDENCE BRIEF:
 {gathered_facts_json or "{{}}"}
 
 DRAFT TITLE: {draft_title}
-{tone_block}{style_block}{doc_type_block}
+{tone_block}{style_block}{doc_type_block}{correspondence_block}
 {template_block}{instructions_block}{revision_block}{template_example_block}
 
 TASK:
 Produce the complete draft as a single Markdown document.
 
 CONSTRAINTS:
-{revision_constraint}  - Indian legal register, passive voice, third person.
+{class_constraint}{revision_constraint}  - Indian legal register, passive voice, third person.
   - No IPC / CrPC / Indian Evidence Act — use BNS / BNSS / BSA instead.
   - No invented citations, statute sections, court names, or monetary figures.
   - Where a slot value is missing, leave it as <placeholder> with a clear

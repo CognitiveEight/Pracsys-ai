@@ -70,6 +70,17 @@ class CacheKinds:
     # added_missing_information, so the answered-by-upload resolution pass
     # never auto-removes them (only analysis_report_feedback can).
     USER_ADDED_MISSING_INFO = "user_added_missing_info"
+    # Per-workspace ledger of FACTS the lawyer corrected in chat ("the disputed
+    # amount is 6 lakh USD, not 16 lakh"). Mirrors REMOVED_DOCUMENTS: a user
+    # decision that must survive regeneration. Without it, the next document
+    # upload regenerates every panel from the documents — which still state the
+    # old value — and silently reverts the correction. Read by every generator
+    # prompt (as an AUTHORITATIVE USER CORRECTIONS block) and enforced
+    # deterministically by _apply_fact_corrections_to_payload. One entry per
+    # corrected slot; a later correction of the same slot supersedes it. Shape:
+    #   [{"id","slot","description","was","now","superseded",
+    #     "assertedAt","source"}, ...]
+    USER_ASSERTED_FACTS = "user_asserted_facts"
     # Drafting Assistant — proactive suggested drafts panel (one entry per
     # workspace, regenerated on workspace_created / workspace_sync, re-emitted
     # on reconnect like analysis_report).
@@ -97,6 +108,7 @@ WORKSPACE_HYDRATION_KINDS = (
     CacheKinds.STRATEGY_PAYLOAD,
     CacheKinds.REJECTED_ANALYSIS_ITEMS,
     CacheKinds.USER_ADDED_MISSING_INFO,
+    CacheKinds.USER_ASSERTED_FACTS,
     CacheKinds.DRAFTING_SUGGESTIONS,
     CacheKinds.CURRENT_STATE,
 )

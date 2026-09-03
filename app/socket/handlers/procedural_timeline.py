@@ -130,6 +130,7 @@ class ProceduralTimelineMixin:
         workspace_role: str,
         user_feedback: str,
         emit_result: bool = True,
+        outcome: Optional[Dict[str, str]] = None,
     ) -> bool:
         """
         Apply a surgical find-and-replace / correction to the EXISTING Procedural
@@ -157,6 +158,9 @@ class ProceduralTimelineMixin:
             current_json = json.dumps(current, ensure_ascii=True)
             prompt = regenerate_procedural_timeline_with_feedback_prompt(current_json=current_json, instruction=instruction)
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 prompt = prompt.rstrip() + "\n\n" + custom_suffix
@@ -186,6 +190,12 @@ class ProceduralTimelineMixin:
             if json.dumps(edited, sort_keys=True, ensure_ascii=True) == json.dumps(
                 current, sort_keys=True, ensure_ascii=True
             ):
+                logger.info(
+                    "Procedural timeline edit produced no change — instruction={!r}",
+                    (user_feedback or "")[:160],
+                )
+                if outcome is not None:
+                    outcome["status"] = "unchanged"
                 return False  # nothing changed
 
             self._workspace_procedural_timeline_payload[workspace_id] = edited
@@ -202,6 +212,8 @@ class ProceduralTimelineMixin:
                     "✅ Procedural timeline name edit emitted workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
+            if outcome is not None:
+                outcome["status"] = "applied"
             return True
         except Exception as e:
             logger.warning("Procedural timeline name edit failed: {}", e)

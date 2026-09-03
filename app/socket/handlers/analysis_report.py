@@ -137,6 +137,7 @@ class AnalysisReportMixin:
         workspace_role: str,
         user_feedback: str,
         current_report: Dict[str, Any],
+        outcome: Optional[Dict[str, str]] = None,
     ) -> bool:
         """
         Apply a free-form user edit instruction (rename, rephrase, add / change /
@@ -180,6 +181,9 @@ class AnalysisReportMixin:
 
             prompt = regenerate_analysis_report_with_feedback_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, current_report_json=current_report_json, instruction=instruction, role=role)
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 prompt = prompt.rstrip() + "\n\n" + custom_suffix
@@ -200,6 +204,18 @@ class AnalysisReportMixin:
             if not isinstance(edited, dict):
                 return False
 
+            # Merge-back: keys the model omitted must survive. The editor
+            # caches the model's output wholesale, and
+            # _normalize_analysis_report_lists preserves keys it FINDS but does
+            # not restore keys that are absent — so a model that returned only
+            # the sections it changed used to silently blank nextSteps,
+            # pendingActions and caseResolutionScore. Layering the edit over a
+            # copy of the current report makes unmentioned keys survive by
+            # construction rather than by prompt compliance.
+            _merged_edit = dict(current_report_norm)
+            _merged_edit.update(edited)
+            edited = _merged_edit
+
             edited = self._normalize_analysis_report_lists(
                 edited, max_annexure=self._get_annexure_count(workspace_id)
             )
@@ -210,14 +226,28 @@ class AnalysisReportMixin:
             # was not present), nothing actually changed — return False so the
             # caller does NOT report "analysis report" as Updated and does not
             # emit a no-op payload.
+            # Compare against a baseline put through the SAME normalisation, or
+            # the guard reports "changed" purely because normalisation clamped an
+            # annexure reference that was already in the cache.
+            try:
+                _baseline = self._normalize_analysis_report_lists(
+                    json.loads(json.dumps(current_report_norm, ensure_ascii=True)),
+                    max_annexure=self._get_annexure_count(workspace_id),
+                )
+                if not isinstance(_baseline, dict):
+                    _baseline = current_report_norm
+            except Exception:
+                _baseline = current_report_norm
             try:
                 if json.dumps(edited, sort_keys=True, ensure_ascii=True) == json.dumps(
-                    current_report_norm, sort_keys=True, ensure_ascii=True
+                    _baseline, sort_keys=True, ensure_ascii=True
                 ):
                     logger.info(
                         "Analysis report edit produced no change — instruction={!r}",
                         instruction[:160],
                     )
+                    if outcome is not None:
+                        outcome["status"] = "unchanged"
                     return False
             except Exception:
                 pass
@@ -249,6 +279,8 @@ class AnalysisReportMixin:
                     "✅ Analysis report surgical edit emitted workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
+            if outcome is not None:
+                outcome["status"] = "applied"
             return True
         except Exception as e:
             logger.warning("Analysis report surgical edit failed: {}", e)
@@ -813,6 +845,9 @@ ENTITY-GROUNDING RULE (CRITICAL):
                 removed_evidence_block=removed_evidence_block,
             )
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            analysis_prompt = self._with_user_facts(workspace_id, analysis_prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 analysis_prompt = analysis_prompt.rstrip() + "\n\n" + custom_suffix
@@ -2515,6 +2550,7 @@ Rules:
         section: str,
         rejected_value: str,
         report: Dict[str, Any],
+        workspace_id: str = "",
     ) -> Tuple[bool, int, str]:
         """
         Ask AI to (a) decide if the user's rejection is VALID — i.e. the rejected
@@ -2547,16 +2583,35 @@ Rules:
             remaining_weak = len(report.get("weaknesses") or [])
             remaining_risks = len(report.get("risks") or [])
 
+            # The case description lives in the STRATEGY payload, not in the
+            # analysis report: _generate_analysis_report_from_documents never
+            # writes caseSummary / reportCaseSummary / strategicObjective, so
+            # reading them off `report` always yielded "" and the prompt below
+            # rendered the literal "(not available)" — i.e. this scoring call
+            # judged relevance with no case description at all. Fall back to
+            # `report` so a caller that does pass an enriched dict still works.
+            _strategy_src = (
+                self._workspace_strategy_payload.get(workspace_id) or {}
+                if workspace_id
+                else {}
+            )
+            if not isinstance(_strategy_src, dict):
+                _strategy_src = {}
             case_summary = (
-                report.get("caseSummary") or report.get("case_summary") or ""
+                _strategy_src.get("caseSummary")
+                or report.get("caseSummary")
+                or report.get("case_summary")
+                or ""
             ).strip()
             report_summary = (
-                report.get("reportCaseSummary")
+                _strategy_src.get("reportCaseSummary")
+                or report.get("reportCaseSummary")
                 or report.get("report_case_summary")
                 or ""
             ).strip()
             strategic_objective = (
-                report.get("strategicObjective")
+                _strategy_src.get("strategicObjective")
+                or report.get("strategicObjective")
                 or report.get("strategic_objective")
                 or ""
             ).strip()
@@ -2971,6 +3026,7 @@ Rules:
                 section=ev["section"],
                 rejected_value=ev["rejected_value"],
                 report=report,
+                workspace_id=workspace_id,
             )
             for ev in removed_events
         ]
@@ -3075,6 +3131,7 @@ Rules:
         title: str,
         description: str,
         report: Dict[str, Any],
+        workspace_id: str = "",
     ) -> Tuple[bool, int, str]:
         """
         Ask AI to (a) decide if user-supplied title+description is RELATED to the case
@@ -3094,16 +3151,35 @@ Rules:
                 )
                 return (False, 0, "")
 
+            # The case description lives in the STRATEGY payload, not in the
+            # analysis report: _generate_analysis_report_from_documents never
+            # writes caseSummary / reportCaseSummary / strategicObjective, so
+            # reading them off `report` always yielded "" and the prompt below
+            # rendered the literal "(not available)" — i.e. this scoring call
+            # judged relevance with no case description at all. Fall back to
+            # `report` so a caller that does pass an enriched dict still works.
+            _strategy_src = (
+                self._workspace_strategy_payload.get(workspace_id) or {}
+                if workspace_id
+                else {}
+            )
+            if not isinstance(_strategy_src, dict):
+                _strategy_src = {}
             case_summary = (
-                report.get("caseSummary") or report.get("case_summary") or ""
+                _strategy_src.get("caseSummary")
+                or report.get("caseSummary")
+                or report.get("case_summary")
+                or ""
             ).strip()
             report_summary = (
-                report.get("reportCaseSummary")
+                _strategy_src.get("reportCaseSummary")
+                or report.get("reportCaseSummary")
                 or report.get("report_case_summary")
                 or ""
             ).strip()
             strategic_objective = (
-                report.get("strategicObjective")
+                _strategy_src.get("strategicObjective")
+                or report.get("strategicObjective")
                 or report.get("strategic_objective")
                 or ""
             ).strip()
@@ -3310,6 +3386,7 @@ Rules:
                 title=title,
                 description=description,
                 report=report,
+                workspace_id=workspace_id,
             )
         )
 

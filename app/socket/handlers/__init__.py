@@ -15,6 +15,7 @@ from app.socket.handlers.drafting import DraftingMixin
 from app.socket.handlers.objective_change import ObjectiveChangeMixin
 from app.socket.handlers.law_relevance import LawRelevanceMixin
 from app.socket.handlers.panel_edits import PanelEditsMixin
+from app.socket.handlers.user_facts import UserFactsMixin
 from app.socket.handlers.docx_export import DocxExportMixin
 from app.socket.handlers.template_sync import TemplateSyncMixin
 from app.socket.handlers.workspace_metadata import WorkspaceMetadataMixin
@@ -38,6 +39,7 @@ __all__ = [
     "ObjectiveChangeMixin",
     "LawRelevanceMixin",
     "PanelEditsMixin",
+    "UserFactsMixin",
     "DocxExportMixin",
     "TemplateSyncMixin",
     "WorkspaceMetadataMixin",

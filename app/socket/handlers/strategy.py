@@ -136,6 +136,20 @@ from app.prompts.strategy_prompts import (
 )
 
 
+def _noop_key(value: Any) -> Any:
+    """Normalise a panel field for the surgical-edit no-op comparison.
+
+    Collapses whitespace so a model that returns the same prose with different
+    wrapping or a trailing newline still counts as "unchanged". Lists are
+    normalised element-wise so ``possibleNextSteps`` compares by content.
+    """
+    if isinstance(value, str):
+        return re.sub(r"\s+", " ", value).strip()
+    if isinstance(value, list):
+        return [_noop_key(v) for v in value]
+    return value
+
+
 class StrategyMixin:
     """Strategy & objective generation, edits, and intent classification."""
 
@@ -361,6 +375,9 @@ class StrategyMixin:
                 )
                 structured_prompt = generate_strategies_from_documents_prompt2(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, _entities_block=_entities_block, annexure_limit_block=annexure_limit_block, combined_document_content=combined_document_content, strategy_inventory=strategy_inventory, workspace_role=workspace_role, current_year=current_year, today_str=today_str, confirmed_party=_confirmed_party)
                 custom_suffix = build_custom_instruction_suffix(workspace_id)
+                structured_prompt = self._with_user_facts(
+                    workspace_id, structured_prompt
+                )
                 if custom_suffix:
                     structured_prompt = (
                         structured_prompt.rstrip() + "\n\n" + custom_suffix
@@ -1378,6 +1395,9 @@ class StrategyMixin:
 
             prompt = regenerate_strategy_objective_preserving_case_summary_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, case_summary=case_summary, combined_document_content=combined_document_content, current_strategy=current_strategy, report_case_summary=report_case_summary, role=role, user_objective_instruction=user_objective_instruction, entities_block=entities_block, confirmed_party=confirmed_party)
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 prompt = prompt.rstrip() + "\n\n" + custom_suffix
@@ -1571,6 +1591,7 @@ class StrategyMixin:
         user_feedback: str,
         current_strategy: Dict[str, Any],
         emit_result: bool = True,
+        outcome: Optional[Dict[str, str]] = None,
     ) -> bool:
         """
         Regenerate caseSummary + reportCaseSummary applying the user's edit
@@ -1640,6 +1661,9 @@ class StrategyMixin:
 
             prompt = regenerate_case_summary_with_feedback_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, combined_document_content=combined_document_content, current_case_summary=current_case_summary, current_report_case_summary=current_report_case_summary, current_strategy=current_strategy, role=role, user_feedback=user_feedback)
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 prompt = prompt.rstrip() + "\n\n" + custom_suffix
@@ -1690,6 +1714,28 @@ class StrategyMixin:
             merged["timestamp"] = datetime.utcnow().isoformat()
 
             merged = scrub_app_brand(merged)
+
+            # No-op guard (mirrors _regenerate_analysis_report_with_feedback):
+            # the model can return the case summary verbatim when the text the
+            # user named is not present. Without this the editor returned True,
+            # the caller listed "case summary" as updated, and the chat ack
+            # claimed a change that never happened. Compare the EDITED FIELDS
+            # only — `merged` always carries a fresh timestamp. The two summaries
+            # are compared independently because the fallback above mirrors
+            # caseSummary into reportCaseSummary when the model omits it.
+            if _noop_key(merged.get("caseSummary")) == _noop_key(
+                current_strategy.get("caseSummary")
+            ) and _noop_key(merged.get("reportCaseSummary")) == _noop_key(
+                current_strategy.get("reportCaseSummary")
+            ):
+                logger.info(
+                    "Case summary edit produced no change — instruction={!r}",
+                    (user_feedback or "")[:160],
+                )
+                if outcome is not None:
+                    outcome["status"] = "unchanged"
+                return False
+
             self._workspace_strategy_payload[workspace_id] = merged
 
             if emit_result and self._socket_client:
@@ -1704,6 +1750,8 @@ class StrategyMixin:
                     "✅ Case summary regen emitted (other fields preserved) workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
+            if outcome is not None:
+                outcome["status"] = "applied"
             return True
         except Exception as e:
             logger.warning("Case summary regen failed: {}", e)
@@ -1719,6 +1767,7 @@ class StrategyMixin:
         user_feedback: str,
         current_strategy: Dict[str, Any],
         emit_result: bool = True,
+        outcome: Optional[Dict[str, str]] = None,
     ) -> bool:
         """
         Regenerate possibleNextSteps + suggestionChips applying the user's edit
@@ -1742,6 +1791,9 @@ class StrategyMixin:
 
             prompt = regenerate_next_steps_with_feedback_prompt(current_case_summary=current_case_summary, current_strategic_objective=current_strategic_objective, current_strategy=current_strategy, role=role, user_feedback=user_feedback)
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 prompt = prompt.rstrip() + "\n\n" + custom_suffix
@@ -1817,6 +1869,22 @@ class StrategyMixin:
             merged["timestamp"] = datetime.utcnow().isoformat()
 
             merged = scrub_app_brand(merged)
+
+            # No-op guard. Compare possibleNextSteps ONLY: suggestionChips are
+            # regenerated at temperature 0.25 and then padded from
+            # _fallback_chips_for_role above, so they differ on essentially every
+            # call and would defeat a whole-payload comparison.
+            if _noop_key(merged.get("possibleNextSteps")) == _noop_key(
+                current_strategy.get("possibleNextSteps") or []
+            ):
+                logger.info(
+                    "Possible next steps edit produced no change — instruction={!r}",
+                    (user_feedback or "")[:160],
+                )
+                if outcome is not None:
+                    outcome["status"] = "unchanged"
+                return False
+
             self._workspace_strategy_payload[workspace_id] = merged
             self._workspace_suggestion_chips[workspace_id] = list(suggestion_chips)
             self._last_workspace_id_with_chips = workspace_id
@@ -1833,6 +1901,8 @@ class StrategyMixin:
                     "✅ Possible next steps regen emitted (other fields preserved) workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
+            if outcome is not None:
+                outcome["status"] = "applied"
             return True
         except Exception as e:
             logger.warning("Possible next steps regen failed: {}", e)
@@ -1848,6 +1918,7 @@ class StrategyMixin:
         user_feedback: str,
         current_strategy: Dict[str, Any],
         emit_result: bool = True,
+        outcome: Optional[Dict[str, str]] = None,
     ) -> bool:
         """
         Regenerate strategicObjective applying the user's surgical edit
@@ -1879,6 +1950,9 @@ class StrategyMixin:
 
             prompt = regenerate_strategic_objective_with_feedback_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, current_case_summary=current_case_summary, current_strategic_objective=current_strategic_objective, current_strategy=current_strategy, role=role, user_feedback=user_feedback)
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 prompt = prompt.rstrip() + "\n\n" + custom_suffix
@@ -1924,6 +1998,22 @@ class StrategyMixin:
             merged["timestamp"] = datetime.utcnow().isoformat()
 
             merged = scrub_app_brand(merged)
+
+            # No-op guard: a surgical instruction whose target text is absent
+            # from the objective makes the model echo it back verbatim. Returning
+            # True there is what let the chat ack report "I've updated the
+            # strategic objective" while the panel still showed the old figure.
+            if _noop_key(merged.get("strategicObjective")) == _noop_key(
+                current_strategy.get("strategicObjective")
+            ):
+                logger.info(
+                    "Strategic objective edit produced no change — instruction={!r}",
+                    (user_feedback or "")[:160],
+                )
+                if outcome is not None:
+                    outcome["status"] = "unchanged"
+                return False
+
             self._workspace_strategy_payload[workspace_id] = merged
 
             if emit_result and self._socket_client:
@@ -1938,6 +2028,8 @@ class StrategyMixin:
                     "✅ Strategic objective surgical edit emitted (other fields preserved) workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
+            if outcome is not None:
+                outcome["status"] = "applied"
             return True
         except Exception as e:
             logger.warning("Strategic objective surgical edit failed: {}", e)
@@ -2311,6 +2403,8 @@ class StrategyMixin:
             "isRoleReassignment": False,
             "reassignRole": "",
             "reassignParty": "",
+            "isFactCorrection": False,
+            "factCorrections": [],
             "isQuestionLike": False,
         }
         msg = (user_message or "").strip()
@@ -2362,6 +2456,29 @@ class StrategyMixin:
             if not isinstance(data, dict):
                 return empty
 
+            def _fact_corrections(raw: Any) -> List[Dict[str, str]]:
+                """Validate factCorrections: `now` and `description` are required
+                (`was` may be absent — the user need not quote the wrong value).
+                Malformed entries are dropped rather than guessed at."""
+                if not isinstance(raw, list):
+                    return []
+                out: List[Dict[str, str]] = []
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    now_v = str(item.get("now") or "").strip()
+                    desc = str(item.get("description") or "").strip()
+                    if not now_v or not desc:
+                        continue
+                    out.append({
+                        "was": str(item.get("was") or "").strip(),
+                        "now": now_v,
+                        "description": desc,
+                    })
+                    if len(out) >= 5:
+                        break
+                return out
+
             def _slot(key: str) -> Dict[str, Any]:
                 val = data.get(key)
                 if not isinstance(val, dict):
@@ -2389,13 +2506,25 @@ class StrategyMixin:
                 "isRoleReassignment": bool(data.get("isRoleReassignment") is True),
                 "reassignRole": str(data.get("reassignRole") or "").strip().upper(),
                 "reassignParty": str(data.get("reassignParty") or "").strip(),
+                "isFactCorrection": bool(data.get("isFactCorrection") is True),
+                "factCorrections": _fact_corrections(data.get("factCorrections")),
                 "isQuestionLike": bool(data.get("isQuestionLike") is True),
             }
+            # A flag with nothing usable behind it is a partial classification —
+            # same defensive shape as the isRoleReassignment/reassignParty pair.
+            if not result["factCorrections"]:
+                result["isFactCorrection"] = False
             # A role reassignment re-orients advocacy via a dedicated flow — it is
             # never a cosmetic rename and never a surgical per-panel edit. Enforce
             # that here so a stray classifier flag can't double-dispatch.
             if result["isRoleReassignment"] and result["reassignParty"]:
                 result["isRename"] = False
+                # A role reassignment re-orients WHOSE SIDE the strategy argues
+                # for. "The respondent is Pradeep Mehra, not Rakesh" is also
+                # literally a value correction, so the flags can collide — the
+                # advocacy flip must win.
+                result["isFactCorrection"] = False
+                result["factCorrections"] = []
                 for k in (
                     "caseSummary",
                     "reportCaseSummary",
@@ -2414,6 +2543,8 @@ class StrategyMixin:
             # trust the question signal and drop the edit flags — safer
             # default for "explain X" / "what about X" style messages.
             if result["isQuestionLike"]:
+                result["isFactCorrection"] = False
+                result["factCorrections"] = []
                 for k in (
                     "caseSummary",
                     "reportCaseSummary",
@@ -2424,12 +2555,14 @@ class StrategyMixin:
                 ):
                     result[k] = {"shouldEdit": False, "instruction": ""}
             logger.info(
-                "Panel-edit classifier: msg_len={} isQuestion={} isRoleReassignment={} reassign={}:{} caseSummary={} reportCaseSummary={} strategicObjective={} possibleNextSteps={} analysisReport={} listOfDates={}",
+                "Panel-edit classifier: msg_len={} isQuestion={} isRoleReassignment={} reassign={}:{} isFactCorrection={} facts={} caseSummary={} reportCaseSummary={} strategicObjective={} possibleNextSteps={} analysisReport={} listOfDates={}",
                 len(msg),
                 result["isQuestionLike"],
                 result["isRoleReassignment"],
                 result["reassignRole"] or "-",
                 result["reassignParty"] or "-",
+                result["isFactCorrection"],
+                len(result["factCorrections"]),
                 "yes" if result["caseSummary"]["shouldEdit"] else "no",
                 "yes" if result["reportCaseSummary"]["shouldEdit"] else "no",
                 "yes" if result["strategicObjective"]["shouldEdit"] else "no",
@@ -2450,9 +2583,17 @@ class StrategyMixin:
         panels: List[str],
         instructions: Dict[str, str],
         is_rename: bool = False,
+        unchanged: Optional[List[str]] = None,
+        failed: Optional[List[str]] = None,
     ) -> str:
         """
         Compose the chat confirmation after surgical panel edits were applied.
+
+        ``panels`` are the panels that ACTUALLY changed; ``unchanged`` were
+        attempted but did not contain the text the user named; ``failed`` were
+        attempted and errored. Keeping the three apart is the point: the ack was
+        previously built from the classifier's *instructions* alone, so it
+        confidently reported panels that were never touched.
 
         Returns a short natural-language message describing what changed (and,
         for possible-next-steps edits, the resulting list state), or "" so the
@@ -2466,7 +2607,7 @@ class StrategyMixin:
                 for panel in panels
             ]
             edits = [(p, i) for p, i in edits if i]
-            if not edits:
+            if not edits and not (unchanged or failed):
                 return ""
 
             updated_next_steps: List[str] = []
@@ -2482,6 +2623,8 @@ class StrategyMixin:
                 edits=edits,
                 updated_next_steps=updated_next_steps,
                 is_rename=is_rename,
+                unchanged=list(unchanged or []),
+                failed=list(failed or []),
             )
             raw = await gemini_client.generate(
                 prompt=prompt,

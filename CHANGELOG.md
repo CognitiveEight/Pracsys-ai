@@ -9,15 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- (Document additions here before release)
+- **User-asserted fact ledger.** A fact the lawyer corrects in chat ("the disputed
+  amount is 6 lakh USD, not 16 lakh") is now pinned per workspace
+  (`CacheKinds.USER_ASSERTED_FACTS`, `app/socket/handlers/user_facts.py`). Every
+  generator prompt carries it as an AUTHORITATIVE USER CORRECTIONS block, and a
+  deterministic pass at the `document_feature_response` chokepoint enforces it on
+  the way out — so a later `workspace_sync` regenerating from documents that still
+  state the old value can no longer revert the correction. Corrections to the same
+  fact supersede rather than accumulate. Mirrors the existing `REMOVED_DOCUMENTS`
+  contract (prompt block + deterministic pass + ledger).
+- **Fact corrections fan out across every panel**, behind
+  `ENABLE_FACT_CORRECTION_FANOUT` (default `false`). New classifier signal
+  `isFactCorrection` / `factCorrections` (Rule 14). Text panels are edited by the
+  existing surgical editors; `list_of_dates`, `applicable_laws` and
+  `procedural_timeline` are corrected by a Python substitution restricted to an
+  allowlist of text fields — never an ISO `date`, never a verbatim
+  `evidenceSnippet`.
+- `verify_fact_corrections.py` — offline verification of the chat-edit path
+  (no API key, backend or Qdrant required).
 
 ### Changed
 
-- (Document changes here before release)
+- **Socket payload behaviour**: a chat panel edit now emits a
+  `document_feature_response` for every panel whose loader it lit, including a
+  preserved re-emit when a panel did not change. Previously only the rename path
+  did this, and only for three panels.
+- The chat confirmation after a panel edit now names which panels changed, which
+  did not contain the targeted content, and which failed — instead of asserting
+  blanket success.
 
 ### Fixed
 
-- (Document fixes here before release)
+- **A chat edit no longer reports success when nothing changed.** The three
+  strategy editors (`strategicObjective`, `caseSummary` + `reportCaseSummary`,
+  `possibleNextSteps`) returned `True` whenever Gemini returned any non-empty
+  text, including byte-identical output, so the reply claimed panels it never
+  touched. They now detect a no-op, as the other four editors already did.
+- **Stuck panel loaders.** Any editor returning `False` left its spinner lit
+  forever; the terminal-emit guard now covers every panel on every edit path.
+- **Applicable-laws edits could silently drop rows and lost `isMatched`.** The
+  editor now merges the model's `description` by index onto the cached row and
+  re-checks the count after normalisation, rejecting the edit on shrinkage. This
+  also revives the no-op guard, which could never fire because normalisation
+  stripped `isMatched` from the comparison.
+- **Surgical analysis-report edits could blank `nextSteps` / `pendingActions` /
+  `caseResolutionScore`** when the model returned only the sections it changed.
+  The edit is now layered over the current report so unmentioned keys survive.
+- **Both analysis-report scoring calls ran with no case description.**
+  `_compute_rejection_score_delta` and `_compute_added_missing_info_score_delta`
+  read `caseSummary` / `reportCaseSummary` / `strategicObjective` off the analysis
+  report, which never contains them, so the prompts rendered "(not available)".
+  They now read the strategy payload, where those fields actually live. **Expect
+  `caseResolutionScore` values to move on `analysis_report_feedback` and
+  `added_missing_information` events.**
+- **The panel-edit precheck matched verbs as substrings** — "edit" inside
+  "credited", "add" inside "address" — sending ordinary questions to the LLM
+  classifier. Now word-boundary matched, with a new contrastive-correction branch
+  so a value correction with no edit verb ("the amount is 6 lakh, not 16 lakh")
+  reaches the classifier at all.
+- `_schedule_objective_change_reanalysis` now takes the per-workspace pipeline
+  lock, as the other schedulers do; its full analysis-report regeneration could
+  previously interleave with a document-upload pipeline. The strategy cache is
+  also re-read after the classifier call, so a sync completing during that
+  round-trip is no longer silently discarded.
 
 ---
 

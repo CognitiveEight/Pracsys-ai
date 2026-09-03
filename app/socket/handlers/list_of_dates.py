@@ -133,6 +133,7 @@ class ListOfDatesMixin:
         workspace_role: str,
         user_feedback: str,
         emit_result: bool = True,
+        outcome: Optional[Dict[str, str]] = None,
     ) -> bool:
         """
         Apply a surgical find-and-replace / correction to the EXISTING List of
@@ -163,6 +164,9 @@ class ListOfDatesMixin:
             current_json = json.dumps(current, ensure_ascii=True)
             prompt = regenerate_list_of_dates_with_feedback_prompt(current_json=current_json, instruction=instruction)
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 prompt = prompt.rstrip() + "\n\n" + custom_suffix
@@ -194,6 +198,12 @@ class ListOfDatesMixin:
             if json.dumps(edited, sort_keys=True, ensure_ascii=True) == json.dumps(
                 current, sort_keys=True, ensure_ascii=True
             ):
+                logger.info(
+                    "List of dates edit produced no change — instruction={!r}",
+                    (user_feedback or "")[:160],
+                )
+                if outcome is not None:
+                    outcome["status"] = "unchanged"
                 return False  # nothing changed
 
             self._workspace_list_of_dates_payload[workspace_id] = edited
@@ -214,6 +224,8 @@ class ListOfDatesMixin:
                     "✅ List of dates name edit emitted workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
+            if outcome is not None:
+                outcome["status"] = "applied"
             return True
         except Exception as e:
             logger.warning("List of dates name edit failed: {}", e)
@@ -252,6 +264,9 @@ class ListOfDatesMixin:
 
             current_json = json.dumps(current, ensure_ascii=True)
             prompt = reeval_list_of_dates_relevance_prompt(current_json=current_json, obj=obj)
+            # Authoritative user corrections lead the prompt so they outrank
+            # the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
 
             raw = await gemini_client.generate(
                 prompt=prompt,
@@ -397,6 +412,9 @@ class ListOfDatesMixin:
             current_year = today_str[:4]
             list_of_dates_inventory = self._build_document_inventory(workspace_id)
             prompt = generate_list_of_dates_from_documents_prompt(combined=combined, current_year=current_year, list_of_dates_inventory=list_of_dates_inventory, next_week_str=next_week_str, today_str=today_str, tomorrow_str=tomorrow_str)
+            # Authoritative user corrections lead the prompt so they outrank
+            # the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
             # Keep deterministic JSON extraction for timeline completeness.
             raw = await gemini_client.generate(
                 prompt=prompt,

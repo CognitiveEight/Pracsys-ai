@@ -804,12 +804,13 @@ def llm_classify_panel_edit_intent_prompt(*, msg, scoped_panel_rule):
     return (
 f"""You are a STRICT intent classifier for a legal-strategy workspace chat.
 
-The user is viewing a workspace with FIVE editable panels:
+The user is viewing a workspace with SIX editable panels:
 - CASE SUMMARY (caseSummary): a 10-20 sentence factual narrative of the case.
 - REPORT CASE SUMMARY (reportCaseSummary): the same facts rewritten as a neutral, expanded narrative for formal reports.
 - STRATEGIC OBJECTIVE (strategicObjective): the role-tailored strategic plan, 10-20 sentences.
 - POSSIBLE NEXT STEPS (possibleNextSteps): 3-5 immediate actionable bullets.
 - ANALYSIS REPORT (analysisReport): the case analysis — strengths, weaknesses, risks, missing information, and score explanations.
+- LIST OF DATES (listOfDates): the dated chronology of case events. Editable ONLY via Rule 12 (rename) or Rule 14 (fact correction) — never by a general line edit.
 
 Your job: decide whether the user is DIRECTLY asking to edit one or more of these panels, and split the user's instruction into per-panel chunks.
 
@@ -825,6 +826,10 @@ OUTPUT FORMAT (JSON ONLY):
   "analysisReport":     {{"shouldEdit": true | false, "instruction": "ONLY the per-panel edit text for the analysis report; empty when shouldEdit=false"}},
   "listOfDates":        {{"shouldEdit": true | false, "instruction": "set true ONLY for a NAME change / rename (Rule 12) so the person's name is replaced in the existing dated events; empty otherwise"}},
   "isRename":           true | false,
+  "isFactCorrection":   true | false,
+  "factCorrections":    [{{"was": "the incorrect value as it currently appears, verbatim; empty string if the user did not state it",
+                          "now": "the corrected value, verbatim as the user gave it",
+                          "description": "what this value IS, in the user's own words (e.g. 'the disputed amount', 'the date of the FIR', 'the number of defendants')"}}],
   "isRoleReassignment": true | false,
   "reassignRole":       "the litigation role named by the user in a Rule 13 reassignment — one of PETITIONER / APPELLANT / COMPLAINANT / PLAINTIFF / RESPONDENT / DEFENDANT, or CLIENT when the user says 'we represent' / 'our client' / 'my client' without a role word; empty when isRoleReassignment=false",
   "reassignParty":      "the EXACT named party the user assigned to that role (verbatim, e.g. 'Pradeep Mehra'); empty when isRoleReassignment=false",
@@ -832,10 +837,11 @@ OUTPUT FORMAT (JSON ONLY):
 }}
 ("isRename" = true ONLY for a workspace-wide NAME change / rename / name-assignment per Rule 12; false for every other kind of edit.)
 ("isRoleReassignment" = true ONLY for a Rule 13 advocacy-role reassignment; when true, set "isRename" false and all six panel shouldEdit false — a dedicated flow re-orients the strategy.)
+("isFactCorrection" = true ONLY for a Rule 14 correction of a factual VALUE where the user SUPPLIES the corrected value; false otherwise. "factCorrections" MUST be non-empty whenever it is true.)
 
 DECISION RULES:
 
-1) QUESTIONS / EXPLANATIONS / GREETINGS → all four shouldEdit = false, isQuestionLike = true.
+1) QUESTIONS / EXPLANATIONS / GREETINGS → ALL SIX shouldEdit = false, isQuestionLike = true.
    Examples: "what laws apply?", "explain the case summary", "hi", "can you describe this?",
    "is X applicable?", "tell me about ...".
 
@@ -897,7 +903,7 @@ DECISION RULES:
 
 7) `instruction` MUST be non-empty whenever shouldEdit=true. If you cannot extract a clean per-panel instruction with the targeted text, set shouldEdit=false for that panel instead of guessing.
 
-8) AMBIGUITY: if the user says "remove this" / "the response" / "that paragraph" without naming a panel, set ALL four shouldEdit=false. The chat agent will ask for clarification.
+8) AMBIGUITY: if the user says "remove this" / "the response" / "that paragraph" without naming a panel, set ALL SIX shouldEdit=false. The chat agent will ask for clarification.
 
 9) NEVER trigger an edit when the message is a question, even if a panel name appears.
    "Explain the objective" → strategicObjective.shouldEdit = false, isQuestionLike = true.
@@ -957,6 +963,54 @@ DECISION RULES:
     party (gender/descriptor, e.g. "the female employee is heena") and only LABELS text. Rule 13
     reassigns a LITIGATION ROLE to a named party and changes WHOSE SIDE the advocacy is written
     for. When both could apply (a litigation-role word plus a name), Rule 13 wins.
+
+14) FACTUAL CORRECTION OF A VALUE (OVERRIDES RULES 4, 8, 11 AND 12 — BUT NOT RULE 13):
+    When the user CORRECTS a factual VALUE about the case AND SUPPLIES THE CORRECTED VALUE —
+    a monetary amount, a date, a quantity, a count, a case / FIR / section number, a place, a
+    duration — this is a FACT CORRECTION. The value can appear in ANY panel, so it is never
+    scoped to one panel, EVEN IF the user names a single panel or names none at all.
+    An imperative edit verb is NOT required.
+    Triggers:
+      - "the disputed amount is 6 lakh USD, not 16 lakh"
+      - "it's showing 16 lakh, it should be 6 lakh"
+      - "the FIR was filed on 12/03/2024, not 12/03/2023"
+      - "there are three defendants, not two"
+      - "update the entire intelligence panel — the disputed amount is 6 lakh USD"
+    Set "isFactCorrection": true and populate "factCorrections" with ONE ENTRY PER CORRECTED
+    VALUE. Set shouldEdit=true for ALL SIX panels — caseSummary, reportCaseSummary,
+    strategicObjective, possibleNextSteps, analysisReport AND listOfDates — and give EACH the
+    SAME instruction, in this form:
+      The <description> is <now>, NOT <was>. Correct this value wherever it appears in this
+      panel, including any figure written in words, in a different currency or numeric
+      notation, and any calculation that depends on it. Preserve every other word exactly;
+      change nothing else. If this panel does not mention the value at all, return it
+      UNCHANGED, byte for byte.
+    (Substitute the actual description / now / was. Preserve the user's exact spelling and units.)
+    Set "isRename": false and "isQuestionLike": false.
+
+    THE CORRECTED VALUE IS MANDATORY. If the user only says a value is WRONG without saying
+    what it SHOULD be, this is NOT a fact correction — it is Rule 10 fact discussion. Set
+    "isFactCorrection": false and all six shouldEdit=false. We never guess a replacement value.
+    Worked contrasts:
+      - "the amount in the invoice is not correct"          -> isFactCorrection=FALSE (no corrected value; Rule 10)
+      - "I think the pending amount looks too high"          -> isFactCorrection=FALSE (opinion, no value)
+      - "is the disputed amount 16 lakh or 6 lakh?"          -> isFactCorrection=FALSE (question; isQuestionLike=true)
+      - "the disputed amount is 6 lakh USD, not 16 lakh"     -> isFactCorrection=TRUE
+      - "the hearing is on 22.09.2026, not 02.09.2026"       -> isFactCorrection=TRUE
+
+    PRECEDENCE:
+    - Rule 13 WINS over Rule 14. "The respondent is Pradeep Mehra, not Rakesh" changes WHOSE
+      SIDE the advocacy is written for, which is a re-orientation, not a value substitution.
+    - Rule 14 WINS over Rule 12. A rename swaps a LABEL and the meaning is unchanged; a fact
+      correction changes a VALUE, and the reasoning that depends on it must follow. If the
+      user corrects a NAME and nothing else, prefer Rule 12. If the user corrects an amount,
+      date, count or other value, prefer Rule 14 — even when a name is also mentioned.
+    - Rule 4 WINS over Rule 14 when the user changes the strategic DIRECTION or GOAL — what
+      the case is trying to ACHIEVE ("objective is to focus on quashing the FIR"). Rule 14
+      WINS when the user states what is TRUE about the case. The test: is the user telling you
+      what is TRUE, or what they want to ACHIEVE?
+    - Rule 14 WINS over Rules 8 and 11: a fact correction is never ambiguous for lack of a
+      panel name, and is never scoped to the default panel.
 {scoped_panel_rule}
 Return JSON only — no markdown, no commentary."""
     )
@@ -979,7 +1033,9 @@ def llm_classify_panel_edit_intent_prompt2(*, _PANEL_LABELS, default_panel):
     )
 
 
-def panel_edit_ack_prompt(*, user_message, edits, updated_next_steps, is_rename):
+def panel_edit_ack_prompt(
+    *, user_message, edits, updated_next_steps, is_rename, unchanged=None, failed=None
+):
     """Confirmation message after a surgical panel edit was applied.
 
     edits: list of (panel_human_name, instruction) pairs that actually applied.
@@ -1002,6 +1058,27 @@ def panel_edit_ack_prompt(*, user_message, edits, updated_next_steps, is_rename)
         if is_rename
         else ""
     )
+    # Panels that were checked but genuinely did not contain the text the user
+    # named. This is a normal outcome for a workspace-wide edit, NOT a failure —
+    # say so plainly rather than silently implying they were updated.
+    unchanged_block = ""
+    if unchanged:
+        unchanged_block = (
+            "\nPANELS CHECKED THAT DID NOT CONTAIN THE TARGETED CONTENT (left as-is):\n"
+            + "\n".join(f"- {p}" for p in unchanged)
+            + "\nMention these in ONE short clause, phrased as information — e.g. "
+            '"no other panel referenced that figure" — NOT as a failure and NOT as '
+            "an apology.\n"
+        )
+    # Panels whose edit genuinely errored. The lawyer must know these are stale.
+    failed_block = ""
+    if failed:
+        failed_block = (
+            "\nPANELS THAT COULD NOT BE UPDATED (an error occurred):\n"
+            + "\n".join(f"- {p}" for p in failed)
+            + "\nState plainly that these were NOT updated and invite the lawyer to "
+            "retry. Do not speculate about why.\n"
+        )
     return (
 f"""You are the assistant in a legal-strategy workspace chat. The user asked for an edit, and it has ALREADY been applied to the panels — the updated panels are already visible to the user. Write the short chat confirmation.
 
@@ -1010,8 +1087,9 @@ USER'S EDIT REQUEST:
 
 EDITS THAT WERE APPLIED (panel: instruction):
 {edits_block}
-{next_steps_block}{rename_block}
+{next_steps_block}{rename_block}{unchanged_block}{failed_block}
 WRITE THE CONFIRMATION MESSAGE. RULES:
+- NEVER claim a panel was updated unless it appears under "EDITS THAT WERE APPLIED" above. Panels listed as not containing the content, or as not updated, MUST NOT be described as changed. This is the single most important rule.
 - Plain text only: no JSON, no markdown headings, no bullet lists.
 - 2 to 4 sentences.
 - State concretely WHAT was changed, briefly quoting or paraphrasing the removed/changed/added content (a short fragment is enough — never reproduce a whole panel).

@@ -112,6 +112,39 @@ from app.socket.event_utils import (
 )
 
 
+# Edit verbs recognised by the cheap panel-edit precheck in
+# ``on_user_message_request``. Matched on WORD BOUNDARIES: a bare substring test
+# fires on ordinary prose ("edit" inside "credited", "add" inside "address",
+# "name" inside "filename", "fix" inside "prefix"), which sent innocent questions
+# to the LLM classifier and occasionally produced a spurious panel edit.
+_PANEL_EDIT_VERB_RE = re.compile(
+    r"\b(?:remove|delete|drop|change|replace|edit|modify|rewrite|rephrase"
+    r"|add|append|insert|expand|shorten|fix|correct|update)\b",
+    re.IGNORECASE,
+)
+
+# A CONTRASTIVE CORRECTION: the user names a wrong value and supplies the right
+# one ("the disputed amount is 6 lakh USD, not 16 lakh", "it's showing 16 lakh,
+# should be 6"). Such a message often contains NO edit verb at all, so the verb
+# gate above never sees it and the correction silently did nothing.
+#
+# This is deliberately a shape, not a noun list. Adding generic nouns ("amount",
+# "figure", "panel", "everything") to _panel_words was measured to take the
+# classifier hit-rate from ~7% to ~27% of messages, almost all of them ordinary
+# questions — an LLM call and ~$0.003 per turn for nothing. Requiring a
+# contrast cue WITHIN ~40 chars of a number/date/section token is far more
+# specific and costs nothing.
+_CORRECTION_SHAPE_RE = re.compile(
+    r"\b(?:not|instead\s+of|rather\s+than|should\s+be|it'?s\s+showing"
+    r"|is\s+showing|showing|actually|in\s+fact)\b[^.?!]{0,40}?"
+    r"(?:\d[\d,]*(?:\.\d+)?\s*"
+    r"(?:lakhs?|lacs?|crores?|cr|k|mn|%|rs\.?|inr|usd)?"
+    r"|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"
+    r"|\bsections?\s*\d+)",
+    re.IGNORECASE,
+)
+
+
 class ChatMixin:
     """Intelligence chat, drafting-assistant chat, probing prompts."""
 
@@ -365,6 +398,25 @@ class ChatMixin:
         what folds the spend into the workspace cumulative, and money already
         burned must be billed even when there is no socket to emit on.
         """
+        # Deterministic enforcement of the lawyer's fact corrections, at the one
+        # chokepoint every panel emit passes through. The AUTHORITATIVE USER
+        # CORRECTIONS prompt block is a soft nudge across nine generators; this
+        # is what makes "the old figure can never come back" true regardless of
+        # whether a given model call complied. Mutates the cached payload in
+        # place on purpose, so the cache converges too. Only allowlisted text
+        # fields are touched — never an ISO `date`, never a verbatim
+        # `evidenceSnippet`. Mirrors _apply_removed_evidence_missing_info.
+        try:
+            self._apply_fact_corrections_to_payload(
+                workspace_id, payload, label=feature_type
+            )
+        except Exception as fact_err:
+            logger.warning(
+                "Fact-correction pass failed for {} (non-fatal): {}",
+                feature_type,
+                fact_err,
+            )
+
         try:
             if usage is not None:
                 metadata = self._token_usage_metadata(workspace_id, usage)
@@ -1148,9 +1200,31 @@ class ChatMixin:
             objective_regen_ok = False
             objective_ack_kind: Optional[str] = None
             implicit_objective_shift_text: Optional[str] = None
-            # Defined here so the ack-builder below can read it even if the
-            # try-block raises before the pre-dispatcher initialises it.
+            # Defined here so the ack-builder below can read them even if the
+            # try-block raises before the pre-dispatcher initialises them.
             panel_edit_applied: List[str] = []
+            panel_edit_unchanged: List[str] = []
+            panel_edit_failed: List[str] = []
+            panel_edit_instructions: Dict[str, str] = {}
+            panel_edit_is_rename = False
+            # Hoisted deliberately. `_rename_instr` used to be assigned only
+            # inside `if _is_rename:`, and its consumer downstream was safe only
+            # because `and` short-circuits. Widening that guard to cover fact
+            # corrections would evaluate an unbound local, raising inside the
+            # outer try — which is swallowed as a warning AFTER the editors have
+            # already mutated the cache but BEFORE the coalesced emit, leaving a
+            # changed-but-never-emitted panel and a spinner lit forever.
+            classification: Dict[str, Any] = {}
+            _rename_instr = ""
+            _fact_instr = ""
+            _fact_corrections: List[Dict[str, str]] = []
+            # Every featureType whose FE loader gets lit. Hoisted for the same
+            # reason as the instructions above: the terminal-emit guard reads it
+            # and must never see an unbound local.
+            _refresh_features: List[str] = []
+            _is_rename = False
+            _is_fact_correction = False
+            _is_workspace_wide = False
             try:
                 combined_text_for_updates = payload.content or ""
                 # Include attachment text if present (so updates can be pasted into a file)
@@ -1173,17 +1247,21 @@ class ChatMixin:
                 # message; only when the message contains at least one edit verb
                 # AND one panel-name token do we ask the classifier.
                 # -------------------------------------------------------------
-                panel_edit_applied: List[str] = []
+                panel_edit_applied = []
                 # Per-panel edit instructions that actually applied — feeds the
                 # confirmation message so the chat reply can say WHAT changed
                 # instead of a bare "Updated: <panel>." one-liner.
-                panel_edit_instructions: Dict[str, str] = {}
+                panel_edit_instructions = {}
+                # Panels we attempted but whose content did not actually change
+                # (the corrected value simply was not in that panel) vs panels
+                # whose editor errored. Kept apart so the chat ack can say
+                # "no other panel referenced that figure" instead of either
+                # claiming a change or reporting a failure.
+                panel_edit_unchanged = []
+                panel_edit_failed = []
                 panel_edit_is_rename = False
-                _edit_verbs = (
-                    "remove", "delete", "drop", "change", "replace", "edit",
-                    "modify", "rewrite", "rephrase", "add", "append", "insert",
-                    "expand", "shorten", "fix", "correct", "update",
-                )
+                # Verb list lives at module scope as ``_PANEL_EDIT_VERB_RE`` so it
+                # is compiled once and matched on word boundaries.
                 _panel_words = (
                     "case summary", "report summary", "objective", "strategy",
                     "next step", "action item", " step", " steps", "summary",
@@ -1197,9 +1275,20 @@ class ChatMixin:
                     "name", "spelling", "rename", "everywhere", "workspace",
                 )
                 _um_lower = um_early.lower()
-                _maybe_edit = (
+                # Second branch: a contrastive fact correction, which frequently
+                # carries no edit verb. Guarded by the existing (free)
+                # informational-query check and a minimum length so a bare
+                # "not 6" cannot open the gate.
+                _looks_like_correction = (
                     bool(um_early)
-                    and any(v in _um_lower for v in _edit_verbs)
+                    and len(um_early.strip()) >= 12
+                    and bool(_CORRECTION_SHAPE_RE.search(um_early))
+                    and not self._is_pure_informational_query(um_early)
+                )
+                _maybe_edit = _looks_like_correction or (
+                    bool(um_early)
+                    # Word-boundary match: "credited" must not count as "edit".
+                    and bool(_PANEL_EDIT_VERB_RE.search(um_early))
                     and (
                         any(w in _um_lower for w in _panel_words)
                         # When the chat is explicitly scoped to the Strategy &
@@ -1234,6 +1323,24 @@ class ChatMixin:
                             "Panel-edit classification failed (non-fatal): {}", cls_err
                         )
                         classification = {}
+
+                    # Re-read the strategy cache AFTER the classifier call. The
+                    # snapshot above was taken before a ~2-3s Gemini round-trip;
+                    # a document upload completing in that window writes a new
+                    # strategy payload, and every editor below merges onto the
+                    # snapshot it was handed — so the sync's work would be
+                    # silently discarded. Cheap, and closes most of the race.
+                    _fresh_strat = self._workspace_strategy_payload.get(workspace_id)
+                    if isinstance(_fresh_strat, dict) and (
+                        _fresh_strat.get("caseSummary") or ""
+                    ).strip():
+                        if _fresh_strat is not cur_strat_for_edit:
+                            logger.debug(
+                                "Strategy cache changed during classification; "
+                                "editing the fresh payload (workspace={})",
+                                workspace_id[:12] if workspace_id else "",
+                            )
+                        cur_strat_for_edit = _fresh_strat
 
                     if classification and not classification.get("isQuestionLike"):
                         # ADVOCACY-ROLE REASSIGNMENT (Rule 13): the user corrected
@@ -1383,6 +1490,76 @@ class ChatMixin:
                         # them so coverage is exhaustive and deterministic.
                         _is_rename = bool(classification.get("isRename"))
                         panel_edit_is_rename = _is_rename
+                        # A FACT CORRECTION fans out the same way a rename does —
+                        # the corrected value can sit in any panel — but its
+                        # instruction is synthesised deterministically below
+                        # rather than taken from a per-panel classifier slot, so
+                        # every panel receives byte-identical text.
+                        _fact_corrections = [
+                            c for c in (classification.get("factCorrections") or [])
+                            if isinstance(c, dict) and c.get("now") and c.get("description")
+                        ]
+                        _is_fact_correction = bool(
+                            getattr(settings, "enable_fact_correction_fanout", False)
+                            and classification.get("isFactCorrection")
+                            and _fact_corrections
+                        )
+                        _is_workspace_wide = _is_rename or _is_fact_correction
+                        if _is_fact_correction:
+                            _fact_instr = "; ".join(
+                                f"The {c['description']} is {c['now']}"
+                                + (f", NOT {c['was']}" if c.get("was") else "")
+                                for c in _fact_corrections
+                            ) + (
+                                ". Correct this value wherever it appears in this "
+                                "panel, including any figure written in words, in a "
+                                "different currency or numeric notation, and any "
+                                "calculation that depends on it. Preserve every other "
+                                "word exactly; change nothing else. If this panel does "
+                                "not mention the value at all, return it UNCHANGED, "
+                                "byte for byte."
+                            )
+                            # Pin the correction BEFORE any editor runs, so it
+                            # survives even if every one of them fails — and so
+                            # the next document-driven regeneration cannot revert
+                            # it. This is the half of the fix that makes the
+                            # correction durable rather than cosmetic.
+                            for _c in _fact_corrections:
+                                try:
+                                    self.add_user_asserted_fact(
+                                        workspace_id,
+                                        was=_c.get("was") or "",
+                                        now=_c["now"],
+                                        description=_c["description"],
+                                    )
+                                except Exception as _pin_err:
+                                    logger.warning(
+                                        "Pinning user-asserted fact failed (non-fatal): {}",
+                                        _pin_err,
+                                    )
+                            for k in (
+                                "caseSummary",
+                                "reportCaseSummary",
+                                "strategicObjective",
+                                "possibleNextSteps",
+                                "analysisReport",
+                            ):
+                                classification[k] = {
+                                    "shouldEdit": True,
+                                    "instruction": _fact_instr,
+                                }
+                            # listOfDates / applicable_laws / procedural_timeline
+                            # are NOT sent to an LLM editor for a fact
+                            # correction: their edit prompts only understand
+                            # NAME / TERM / DATE / YEAR, and pushing an amount
+                            # correction through them risks rewriting an ISO
+                            # `date` or an `evidenceSnippet` — a verbatim quote
+                            # from the evidence. They are corrected
+                            # deterministically by
+                            # _apply_fact_corrections_to_payload instead.
+                            classification["listOfDates"] = {
+                                "shouldEdit": False, "instruction": "",
+                            }
                         if _is_rename:
                             _rename_instr = next(
                                 (
@@ -1439,18 +1616,26 @@ class ChatMixin:
                         _any_should_edit = (
                             _strategy_should_edit or _analysis_should_edit
                         )
+                        # The terminal-emit guard after the editors re-emits the
+                        # preserved payload for each lit feature that did not
+                        # produce a completion emit, so a spinner is never left on.
                         if _any_should_edit:
                             # Loader for the panels we actually re-emit. A normal
                             # surgical edit touches only strategy_objective and/or
                             # analysis_report. A RENAME touches every panel (name
                             # replaced in existing content), so the loader covers
                             # them all.
-                            _refresh_features: List[str] = []
                             if _strategy_should_edit:
                                 _refresh_features.append("strategy_objective")
                             if _analysis_should_edit:
                                 _refresh_features.append("analysis_report")
-                            if _is_rename:
+                            # A workspace-wide edit (rename or fact correction)
+                            # can touch the doc-derived panels too. Lighting
+                            # their loaders here is also what makes a fact
+                            # correction reach them: the terminal-emit guard
+                            # re-emits each preserved payload, and every emit
+                            # passes through _apply_fact_corrections_to_payload.
+                            if _is_workspace_wide:
                                 for _ft in (
                                     "list_of_dates",
                                     "applicable_laws",
@@ -1481,6 +1666,7 @@ class ChatMixin:
                             # objective "to replace", caps output at 5-6
                             # sentences, forbids repetition) which causes
                             # surgical removes to collapse unrelated content.
+                            _o = {"status": "failed"}
                             ok = await self._regenerate_strategic_objective_with_feedback(
                                 workspace_id=workspace_id,
                                 user_id=user_id,
@@ -1494,7 +1680,13 @@ class ChatMixin:
                                 # (a rename touches 3 fields → one emit, not three
                                 # partial "Previous version" snapshots in the UI).
                                 emit_result=False,
+                                outcome=_o,
                             )
+                            if not ok:
+                                if _o.get("status") == "unchanged":
+                                    panel_edit_unchanged.append("strategic objective")
+                                else:
+                                    panel_edit_failed.append("strategic objective")
                             if ok:
                                 panel_edit_applied.append("strategic objective")
                                 panel_edit_instructions["strategic objective"] = (
@@ -1528,6 +1720,7 @@ class ChatMixin:
                             # we never pass the full multi-panel user message
                             # to the case-summary regen by accident.
                             if _combined_instr:
+                                _o = {"status": "failed"}
                                 ok = await self._regenerate_case_summary_with_feedback(
                                     workspace_id=workspace_id,
                                     user_id=user_id,
@@ -1537,7 +1730,13 @@ class ChatMixin:
                                     user_feedback=_combined_instr,
                                     current_strategy=cur_strat_for_edit,
                                     emit_result=False,
+                                    outcome=_o,
                                 )
+                                if not ok:
+                                    if _o.get("status") == "unchanged":
+                                        panel_edit_unchanged.append("case summary")
+                                    else:
+                                        panel_edit_failed.append("case summary")
                                 if ok:
                                     panel_edit_applied.append("case summary")
                                     panel_edit_instructions["case summary"] = (
@@ -1555,6 +1754,7 @@ class ChatMixin:
 
                         ns_slot = classification.get("possibleNextSteps") or {}
                         if ns_slot.get("shouldEdit") and ns_slot.get("instruction"):
+                            _o = {"status": "failed"}
                             ok = await self._regenerate_next_steps_with_feedback(
                                 workspace_id=workspace_id,
                                 user_id=user_id,
@@ -1564,7 +1764,13 @@ class ChatMixin:
                                 user_feedback=ns_slot["instruction"],
                                 current_strategy=cur_strat_for_edit,
                                 emit_result=False,
+                                outcome=_o,
                             )
+                            if not ok:
+                                if _o.get("status") == "unchanged":
+                                    panel_edit_unchanged.append("possible next steps")
+                                else:
+                                    panel_edit_failed.append("possible next steps")
                             if ok:
                                 panel_edit_applied.append("possible next steps")
                                 panel_edit_instructions["possible next steps"] = (
@@ -1586,6 +1792,7 @@ class ChatMixin:
                                 isinstance(cur_report_for_edit, dict)
                                 and cur_report_for_edit
                             ):
+                                _o = {"status": "failed"}
                                 ok = await self._regenerate_analysis_report_with_feedback(
                                     workspace_id=workspace_id,
                                     user_id=user_id,
@@ -1594,7 +1801,13 @@ class ChatMixin:
                                     ),
                                     user_feedback=ar_slot["instruction"],
                                     current_report=cur_report_for_edit,
+                                    outcome=_o,
                                 )
+                                if not ok:
+                                    if _o.get("status") == "unchanged":
+                                        panel_edit_unchanged.append("analysis report")
+                                    else:
+                                        panel_edit_failed.append("analysis report")
                                 if ok:
                                     panel_edit_applied.append("analysis report")
                                     panel_edit_instructions["analysis report"] = (
@@ -1613,6 +1826,7 @@ class ChatMixin:
                         # rule (Rule 12), never by a general line edit.
                         lod_slot = classification.get("listOfDates") or {}
                         if lod_slot.get("shouldEdit") and lod_slot.get("instruction"):
+                            _o = {"status": "failed"}
                             ok = await self._regenerate_list_of_dates_with_feedback(
                                 workspace_id=workspace_id,
                                 user_id=user_id,
@@ -1620,7 +1834,13 @@ class ChatMixin:
                                     role_context.get("role") or "ADJUDICATOR"
                                 ),
                                 user_feedback=lod_slot["instruction"],
+                                outcome=_o,
                             )
+                            if not ok:
+                                if _o.get("status") == "unchanged":
+                                    panel_edit_unchanged.append("list of dates")
+                                else:
+                                    panel_edit_failed.append("list of dates")
                             if ok:
                                 panel_edit_applied.append("list of dates")
                                 panel_edit_instructions["list of dates"] = (
@@ -1638,6 +1858,7 @@ class ChatMixin:
                         # no regeneration, no new/removed laws or milestones. Gated
                         # on isRename so a normal line edit never touches them.
                         if _is_rename and _rename_instr:
+                            _o = {"status": "failed"}
                             ok = await self._regenerate_applicable_laws_with_feedback(
                                 workspace_id=workspace_id,
                                 user_id=user_id,
@@ -1645,10 +1866,17 @@ class ChatMixin:
                                     role_context.get("role") or "ADJUDICATOR"
                                 ),
                                 user_feedback=_rename_instr,
+                                outcome=_o,
                             )
+                            if not ok:
+                                if _o.get("status") == "unchanged":
+                                    panel_edit_unchanged.append("applicable laws")
+                                else:
+                                    panel_edit_failed.append("applicable laws")
                             if ok:
                                 panel_edit_applied.append("applicable laws")
                                 panel_edit_instructions["applicable laws"] = _rename_instr
+                            _o = {"status": "failed"}
                             ok = await self._regenerate_procedural_timeline_with_feedback(
                                 workspace_id=workspace_id,
                                 user_id=user_id,
@@ -1656,96 +1884,16 @@ class ChatMixin:
                                     role_context.get("role") or "ADJUDICATOR"
                                 ),
                                 user_feedback=_rename_instr,
+                                outcome=_o,
                             )
+                            if not ok:
+                                if _o.get("status") == "unchanged":
+                                    panel_edit_unchanged.append("upcoming dates")
+                                else:
+                                    panel_edit_failed.append("upcoming dates")
                             if ok:
                                 panel_edit_applied.append("upcoming dates")
                                 panel_edit_instructions["upcoming dates"] = _rename_instr
-
-                        # Terminal-emit guard (rename path). The workspace:refresh
-                        # above turned the FE spinner ON for list_of_dates,
-                        # applicable_laws and procedural_timeline. Each
-                        # _regenerate_*_with_feedback helper emits ONLY when it
-                        # actually changed the payload and returns False WITHOUT
-                        # emitting on a no-op (the renamed token — e.g. a year like
-                        # "2024" — is usually absent from laws/timeline). Without a
-                        # completion emit the spinner never clears. So for every
-                        # doc-derived panel whose spinner we lit but which did NOT
-                        # emit, re-emit the preserved cached payload — the same
-                        # preserve-and-re-emit contract as
-                        # _run_objective_change_incremental_refresh.
-                        if _is_rename and _any_should_edit and self._socket_client:
-                            try:
-                                if "list of dates" not in panel_edit_applied:
-                                    _preserved_lod = (
-                                        self._workspace_list_of_dates_payload.get(
-                                            workspace_id
-                                        )
-                                        or []
-                                    )
-                                    if not isinstance(_preserved_lod, list):
-                                        _preserved_lod = []
-                                    await self._emit_document_feature(
-                                        feature_type="list_of_dates",
-                                        workspace_id=workspace_id,
-                                        user_id=user_id,
-                                        payload={
-                                            "workspaceId": workspace_id,
-                                            "userId": user_id,
-                                            "listOfDates": _preserved_lod,
-                                        },
-                                        usage=None,
-                                    )
-                                    logger.success(
-                                        "✅ Rename: preserved list_of_dates re-emitted (no-op edit) workspace={}",
-                                        workspace_id[:12] if workspace_id else "",
-                                    )
-                                if "applicable laws" not in panel_edit_applied:
-                                    _preserved_laws = (
-                                        self._workspace_applicable_laws_payload.get(
-                                            workspace_id
-                                        )
-                                        or {}
-                                    )
-                                    if not isinstance(_preserved_laws, dict):
-                                        _preserved_laws = {}
-                                    await self._emit_document_feature(
-                                        feature_type="applicable_laws",
-                                        workspace_id=workspace_id,
-                                        user_id=user_id,
-                                        payload=_preserved_laws,
-                                        usage=None,
-                                    )
-                                    logger.success(
-                                        "✅ Rename: preserved applicable_laws re-emitted (no-op edit) workspace={}",
-                                        workspace_id[:12] if workspace_id else "",
-                                    )
-                                if "upcoming dates" not in panel_edit_applied:
-                                    _preserved_timeline = (
-                                        self._workspace_procedural_timeline_payload.get(
-                                            workspace_id
-                                        )
-                                        or []
-                                    )
-                                    if not isinstance(_preserved_timeline, list):
-                                        _preserved_timeline = []
-                                    await self._emit_document_feature(
-                                        feature_type="procedural_timeline",
-                                        workspace_id=workspace_id,
-                                        user_id=user_id,
-                                        payload={
-                                            "proceduralTimeline": _preserved_timeline
-                                        },
-                                        usage=None,
-                                    )
-                                    logger.success(
-                                        "✅ Rename: preserved procedural_timeline re-emitted (no-op edit) workspace={}",
-                                        workspace_id[:12] if workspace_id else "",
-                                    )
-                            except Exception as _preserve_err:
-                                logger.warning(
-                                    "Rename preserve-and-re-emit fallback failed (non-fatal): {}",
-                                    _preserve_err,
-                                )
 
                         # Coalesced strategy emit: the three strategy editors above
                         # suppressed their own emits (emit_result=False), so the FE
@@ -1780,15 +1928,131 @@ class ChatMixin:
                                     workspace_id[:12] if workspace_id else "",
                                 )
 
-                        if panel_edit_applied:
+                        # Terminal-emit guard. The workspace:refresh above turned
+                        # the FE spinner ON for every featureType in
+                        # _refresh_features. Each _regenerate_*_with_feedback helper
+                        # emits ONLY when it actually changed the payload and returns
+                        # False WITHOUT emitting on a no-op (the corrected token is
+                        # often absent from a given panel). Without a completion emit
+                        # the spinner never clears. So for EVERY panel whose spinner
+                        # we lit but which did not emit, re-emit the preserved cached
+                        # payload — the same preserve-and-re-emit contract as
+                        # _run_objective_change_incremental_refresh. This runs for
+                        # every edit, not just renames: a plain surgical edit whose
+                        # editor returns False used to hang its loader forever.
+                        if _refresh_features and self._socket_client:
+                            _panel_to_feature = {
+                                "strategic objective": "strategy_objective",
+                                "case summary": "strategy_objective",
+                                "possible next steps": "strategy_objective",
+                                "analysis report": "analysis_report",
+                                "list of dates": "list_of_dates",
+                                "applicable laws": "applicable_laws",
+                                "upcoming dates": "procedural_timeline",
+                            }
+                            _emitted_features = {
+                                _panel_to_feature[p]
+                                for p in panel_edit_applied
+                                if p in _panel_to_feature
+                            }
+                            for _ft in _refresh_features:
+                                if _ft in _emitted_features:
+                                    continue
+                                try:
+                                    if _ft == "strategy_objective":
+                                        _pres = (
+                                            self._workspace_strategy_payload.get(
+                                                workspace_id
+                                            )
+                                        )
+                                        if not isinstance(_pres, dict) or not _pres:
+                                            continue
+                                        _payload = _pres
+                                    elif _ft == "analysis_report":
+                                        _pres = (
+                                            self._workspace_analysis_payload.get(
+                                                workspace_id
+                                            )
+                                        )
+                                        if not isinstance(_pres, dict) or not _pres:
+                                            continue
+                                        _payload = _pres
+                                    elif _ft == "list_of_dates":
+                                        _pres = (
+                                            self._workspace_list_of_dates_payload.get(
+                                                workspace_id
+                                            )
+                                            or []
+                                        )
+                                        _payload = {
+                                            "workspaceId": workspace_id,
+                                            "userId": user_id,
+                                            "listOfDates": (
+                                                _pres if isinstance(_pres, list) else []
+                                            ),
+                                        }
+                                    elif _ft == "applicable_laws":
+                                        _pres = (
+                                            self._workspace_applicable_laws_payload.get(
+                                                workspace_id
+                                            )
+                                            or {}
+                                        )
+                                        _payload = (
+                                            _pres if isinstance(_pres, dict) else {}
+                                        )
+                                    elif _ft == "procedural_timeline":
+                                        _pres = (
+                                            self._workspace_procedural_timeline_payload.get(
+                                                workspace_id
+                                            )
+                                            or []
+                                        )
+                                        _payload = {
+                                            "proceduralTimeline": (
+                                                _pres if isinstance(_pres, list) else []
+                                            )
+                                        }
+                                    else:
+                                        continue
+                                    await self._emit_document_feature(
+                                        feature_type=_ft,
+                                        workspace_id=workspace_id,
+                                        user_id=user_id,
+                                        payload=_payload,
+                                        usage=None,
+                                    )
+                                    logger.success(
+                                        "✅ Preserved {} re-emitted (no-op edit) workspace={}",
+                                        _ft,
+                                        workspace_id[:12] if workspace_id else "",
+                                    )
+                                except Exception as _preserve_err:
+                                    logger.warning(
+                                        "Preserve-and-re-emit fallback failed for {} (non-fatal): {}",
+                                        _ft,
+                                        _preserve_err,
+                                    )
+
+                        if panel_edit_applied or panel_edit_unchanged or panel_edit_failed:
                             # Reuse the existing skip-chat-agent gate. The ack
                             # block below has a dedicated branch for
                             # objective_ack_kind == "panel_edit_direct".
+                            #
+                            # Note this fires even when NOTHING applied. The user
+                            # asked for an edit; if every panel came back
+                            # unchanged or errored they need to be told that, and
+                            # falling through to the general chat agent (which
+                            # knows nothing about the attempt) produced a
+                            # conversational reply that quietly ignored the
+                            # request.
                             objective_regen_ok = True
                             objective_ack_kind = "panel_edit_direct"
                             logger.success(
-                                "✅ Panel edits applied from free-form chat: {} (workspace={})",
+                                "✅ Panel edits from free-form chat — applied={} unchanged={} failed={} (workspace={})",
                                 panel_edit_applied,
+                                panel_edit_unchanged,
+                                panel_edit_failed,
                                 workspace_id[:12] if workspace_id else "",
                             )
                             # NOTE: intentionally NO _schedule_objective_change_reanalysis
@@ -2026,7 +2290,9 @@ class ChatMixin:
                     "Skipping intelligence chat LLM (strategy objective regen emitted)"
                 )
                 ack_parts: List[str] = []
-                if objective_ack_kind == "panel_edit_direct" and panel_edit_applied:
+                if objective_ack_kind == "panel_edit_direct" and (
+                    panel_edit_applied or panel_edit_unchanged or panel_edit_failed
+                ):
                     # Free-form panel edit. The panel itself was already emitted
                     # via document_feature_response; the chat reply must still
                     # tell the lawyer WHAT changed, not just name the panel.
@@ -2036,14 +2302,40 @@ class ChatMixin:
                         panels=panel_edit_applied,
                         instructions=panel_edit_instructions,
                         is_rename=panel_edit_is_rename,
+                        unchanged=panel_edit_unchanged,
+                        failed=panel_edit_failed,
                     )
                     if not ack_text:
-                        _fields_human = ", ".join(panel_edit_applied)
-                        ack_text = (
-                            f"I've updated the {_fields_human} as you asked. "
-                            "The refreshed panel is now available — let me know "
-                            "if you'd like any further adjustments."
-                        )
+                        # Templated fallback, used whenever the ack LLM call
+                        # fails. It must obey the same rule as the prompt: never
+                        # claim a panel that did not actually change.
+                        _parts: List[str] = []
+                        if panel_edit_applied:
+                            _parts.append(
+                                "I've updated the "
+                                + ", ".join(panel_edit_applied)
+                                + " as you asked."
+                            )
+                        if panel_edit_unchanged:
+                            _parts.append(
+                                "The "
+                                + ", ".join(panel_edit_unchanged)
+                                + " did not contain the content you named, so "
+                                "nothing there changed."
+                            )
+                        if panel_edit_failed:
+                            _parts.append(
+                                "I could not update the "
+                                + ", ".join(panel_edit_failed)
+                                + " — please try again."
+                            )
+                        if not _parts:
+                            _parts.append(
+                                "I could not find the content you named in any panel, "
+                                "so nothing was changed."
+                            )
+                        _parts.append("Let me know if you'd like any further adjustments.")
+                        ack_text = " ".join(_parts)
                     ack_parts.append(ack_text)
                 elif objective_ack_kind == "followup_clarify":
                     ack_parts.append(

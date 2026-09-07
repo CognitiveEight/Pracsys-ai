@@ -125,6 +125,7 @@ from app.socket.handlers import (
     ObjectiveChangeMixin,
     LawRelevanceMixin,
     PanelEditsMixin,
+    UserFactsMixin,
     DocxExportMixin,
     TemplateSyncMixin,
     WorkspaceMetadataMixin,
@@ -150,6 +151,7 @@ class SocketEventHandler(
     ObjectiveChangeMixin,
     LawRelevanceMixin,
     PanelEditsMixin,
+    UserFactsMixin,
     DocxExportMixin,
     TemplateSyncMixin,
     WorkspaceMetadataMixin,
@@ -233,6 +235,21 @@ class SocketEventHandler(
         # resolution pass (only analysis_report_feedback removes them).
         self._workspace_user_added_missing_info: Dict[str, List[str]] = (
             PersistentWorkspaceDict(CacheKinds.USER_ADDED_MISSING_INFO)
+        )
+        # Facts the lawyer corrected in chat ("the disputed amount is 6 lakh USD,
+        # not 16 lakh"). Mirrors _workspace_removed_documents: a user decision
+        # that outlives the panel it was made on. Every generator prompt carries
+        # it as an AUTHORITATIVE USER CORRECTIONS block, and
+        # _apply_fact_corrections_to_payload enforces it deterministically on the
+        # way out — without both, the next document upload regenerates from
+        # documents that still say 16 lakh and reverts the correction.
+        # Deliberately an instance attribute (not a module-level dict like
+        # app/workspace/custom_instructions.py) so the workspace-purge sweep over
+        # self.__dict__ erases it: these entries hold verbatim case facts.
+        # Shape: {workspace_id: [{id, slot, description, was, now, superseded,
+        #                         assertedAt, source}, ...]}
+        self._workspace_user_facts: Dict[str, List[Dict[str, Any]]] = (
+            PersistentWorkspaceDict(CacheKinds.USER_ASSERTED_FACTS)
         )
         # List of Dates timeline per workspace (chronological events from case documents)
         self._workspace_list_of_dates_payload: Dict[str, List[Dict[str, Any]]] = (

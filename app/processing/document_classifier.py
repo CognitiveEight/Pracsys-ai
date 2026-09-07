@@ -50,8 +50,80 @@ SUPPORTED_DOCUMENT_TYPES = (
     "contract", "agreement", "power_of_attorney", "will", "summons",
     # Communication / other
     "email", "letter", "photograph", "screenshot",
+    # Standard-form instruments uploaded for reference: terms of service,
+    # terms & conditions, privacy statements, acceptable-use policies, EULAs,
+    # codes of conduct. These are CITED INSTRUMENTS, not sources of case fact:
+    # the people and companies named in them are the document's own publisher,
+    # its version-control signatories and its third-party vendors, none of whom
+    # are parties to the dispute unless the case facts say so independently.
+    # Treating them as evidence made a boilerplate template's "Service Provider"
+    # outrank the actual client, and put a policy's approval table into the case
+    # summary as "key individuals involved".
+    "policy_boilerplate",
     "other",
 )
+
+# Title/heading cues for a standard-form instrument. Matched against the
+# filename and the opening of the body.
+_BOILERPLATE_TITLE_RE = re.compile(
+    r"\b(?:terms\s+(?:of\s+(?:service|use|business)|and\s+conditions)"
+    r"|terms\s*&\s*conditions|t\s*&\s*c"
+    r"|privacy\s+(?:policy|statement|notice)"
+    r"|acceptable[\s-]*use\s+policy|\baup\b"
+    r"|cookie\s+(?:policy|notice)"
+    r"|code\s+of\s+conduct"
+    r"|end[\s-]user\s+licen[cs]e|eula"
+    r"|data\s+protection\s+(?:policy|notice))\b",
+    re.IGNORECASE,
+)
+
+# What actually distinguishes a standard-form instrument is its ADDRESSEE: it is
+# written to the world at large, not to a named counterparty. So the cues are
+# second-person address and role placeholders ("the Client", "any business or
+# agent", "we/our/us"), plus the version-control furniture such documents carry.
+# A dispute-specific deed or FIR names real people instead.
+_BOILERPLATE_BODY_CUES = (
+    # second-person address to an unnamed reader
+    "you agree", "your use", "your continued", "your privacy",
+    "your personal", "if you do not agree", "by using", "you may",
+    "we may", "we will", "we collect", "we reserve the right",
+    "our services", "our site", "our website",
+    # role placeholders instead of named parties
+    "referred to as", "shall mean", "means any", "any business",
+    "any person", "any user", "all users", "the client", "the buyer",
+    "the service provider",
+    # instrument furniture
+    "these terms", "this policy", "this agreement is made",
+    "governed by the laws of", "document control", "summary of changes",
+    "version number", "revised effective", "last updated", "effective date",
+    "acceptable use", "personal information", "subsidiary companies",
+)
+
+
+def is_policy_boilerplate(
+    filename: str = "",
+    text: str = "",
+    document_type: str = "",
+) -> bool:
+    """True when a document is a standard-form instrument, not case evidence.
+
+    Deliberately independent of the LLM classifier so a misclassification
+    ('contract' / 'agreement' / 'other') cannot let boilerplate be treated as
+    evidence. Requires a title cue AND corroborating body phrasing, so a
+    dispute-specific contract that merely quotes a governing-law clause is not
+    swept up.
+    """
+    if (document_type or "").strip().lower() == "policy_boilerplate":
+        return True
+    head = (text or "")[:4000]
+    title_hit = bool(
+        _BOILERPLATE_TITLE_RE.search(filename or "")
+        or _BOILERPLATE_TITLE_RE.search(head)
+    )
+    if not title_hit:
+        return False
+    low = head.lower()
+    return sum(1 for cue in _BOILERPLATE_BODY_CUES if cue in low) >= 2
 
 
 _CLASSIFIER_PROMPT_HEADER = """You are an Indian-law document analyst. Read the redacted document excerpt and return a single JSON object describing it.

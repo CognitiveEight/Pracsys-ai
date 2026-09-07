@@ -8,7 +8,14 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from app.vectorstore.memory import memory_manager
+# NOTE: ``memory_manager`` is imported lazily inside the two methods that
+# use it, not at module scope. Importing it here closed an import cycle:
+#   app.vectorstore.memory -> app.workspace.context -> app.socket.schemas
+#   -> app.socket.client -> app.socket.events -> app.agents.role_models
+#   -> app.agents.base -> app.vectorstore.memory (still initialising)
+# which made `python -m app.main` fail with
+# "cannot import name 'memory_manager' from partially initialized module".
+# The lazy import is the same idiom used throughout the handlers.
 from app.workspace.context import WorkspaceContext
 
 
@@ -81,6 +88,8 @@ class BaseAgent(ABC):
         Returns:
             List of relevant context items
         """
+        from app.vectorstore.memory import memory_manager
+
         memory = memory_manager.get_memory(workspace_id)
         return await memory.search_relevant_context(query, limit)
 
@@ -100,6 +109,8 @@ class BaseAgent(ABC):
             content: Message content
             metadata: Optional metadata
         """
+        from app.vectorstore.memory import memory_manager
+
         memory = memory_manager.get_memory(workspace_id)
         await memory.add_message(role, content, metadata)
 

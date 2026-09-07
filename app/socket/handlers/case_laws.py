@@ -457,6 +457,9 @@ class CaseLawsMixin:
         )
 
         prompt = select_case_laws_prompt(objective_block=objective_block, research_block=research_block, self=self, signals=signals, source_blob=source_blob, workspace_id=workspace_id, workspace_role=workspace_role)
+        # Authoritative user corrections lead the prompt so they outrank
+        # the document content they contradict.
+        prompt = self._with_user_facts(workspace_id, prompt)
         raw = await gemini_client.generate(
             prompt=prompt,
             system_instruction=get_structured_document_feature_system_instruction(

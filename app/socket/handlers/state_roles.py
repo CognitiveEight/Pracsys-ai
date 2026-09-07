@@ -202,6 +202,7 @@ class StateRolesMixin:
             CacheKinds.STRATEGY_PAYLOAD: self._workspace_strategy_payload,
             CacheKinds.REJECTED_ANALYSIS_ITEMS: self._workspace_rejected_analysis_items,
             CacheKinds.USER_ADDED_MISSING_INFO: self._workspace_user_added_missing_info,
+            CacheKinds.USER_ASSERTED_FACTS: self._workspace_user_facts,
             CacheKinds.DRAFTING_SUGGESTIONS: self._workspace_drafting_payload,
             CacheKinds.CURRENT_STATE: self._workspace_current_state_payload,
         }

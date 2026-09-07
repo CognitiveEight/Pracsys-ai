@@ -9,15 +9,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- (Document additions here before release)
+- **User-asserted fact ledger.** A fact the lawyer corrects in chat ("the disputed
+  amount is 6 lakh USD, not 16 lakh") is now pinned per workspace
+  (`CacheKinds.USER_ASSERTED_FACTS`, `app/socket/handlers/user_facts.py`). Every
+  generator prompt carries it as an AUTHORITATIVE USER CORRECTIONS block, and a
+  deterministic pass at the `document_feature_response` chokepoint enforces it on
+  the way out — so a later `workspace_sync` regenerating from documents that still
+  state the old value can no longer revert the correction. Corrections to the same
+  fact supersede rather than accumulate. Mirrors the existing `REMOVED_DOCUMENTS`
+  contract (prompt block + deterministic pass + ledger).
+- **Fact corrections fan out across every panel**, behind
+  `ENABLE_FACT_CORRECTION_FANOUT` (default `true`). New classifier signal
+  `isFactCorrection` / `factCorrections` (Rule 14). Text panels are edited by the
+  existing surgical editors; `list_of_dates`, `applicable_laws` and
+  `procedural_timeline` are corrected by a Python substitution restricted to an
+  allowlist of text fields — never an ISO `date`, never a verbatim
+  `evidenceSnippet`.
+- `verify_fact_corrections.py` and `verify_ingestion.py` — offline verification
+  of the chat-edit path and the ingestion pipeline (no API key, backend or
+  Qdrant required).
 
 ### Changed
 
-- (Document changes here before release)
+- **Socket payload behaviour**: a chat panel edit now emits a
+  `document_feature_response` for every panel whose loader it lit, including a
+  preserved re-emit when a panel did not change. Previously only the rename path
+  did this, and only for three panels.
+- The chat confirmation after a panel edit now names which panels changed, which
+  did not contain the targeted content, and which failed — instead of asserting
+  blanket success.
 
 ### Fixed
 
-- (Document fixes here before release)
+- **`python -m app.socket.ai_service` started a half-booted service.** That entry
+  point opened the socket and nothing else — the vector store, document
+  processor and Gemini client were never initialised, and `stop()` disconnected
+  without cleaning either of them up. It reported a healthy connection and then
+  failed on the first document, which reads like an ingestion bug rather than a
+  service that was never booted. `AISocketService.start()`/`stop()` now delegate
+  to `app.core.lifecycle`, and the CLI entry runs the same `Application` as
+  `python -m app.main` (full startup, SIGTERM/SIGINT handling, logging setup,
+  graceful shutdown), so the two commands are equivalent and cannot drift.
+- **`python -m app.main` did not start.** Two import cycles, closed at
+  `app/agents/base.py` and `app/socket/__init__.py`. Importing any module under
+  `app.socket` — even pure-pydantic `app.socket.schemas` — executed the package
+  `__init__`, which eagerly pulled in the whole handler stack and cycled back
+  through `app.workspace.context`. `SocketClient` / `event_handler` now resolve
+  lazily (PEP 562, public API unchanged) and `memory_manager` is imported inside
+  the two methods that use it. The service boots and connects again.
+- **Policy boilerplate was read as case evidence.** A standard-form terms of
+  service, privacy statement or acceptable-use policy names its own publisher,
+  its version-control signatories and its third-party vendors — none of them
+  parties to the dispute. With no way to tell such a document from a
+  case-specific contract, a boilerplate template's "Service Provider" was
+  selected as the client over the individual actually named in the evidence. New
+  `policy_boilerplate` document type plus a classifier-independent
+  `is_policy_boilerplate()` detector; such annexures are rendered with a
+  `[CITED INSTRUMENT]` banner, and both the entity extractor and the role→party
+  resolution are told not to take parties or the client from them.
+- **A lawyer's own drafted objective was paraphrased.** Pasting finished
+  drafting into the Strategy chat returned a reworded version. The regeneration
+  prompt now reproduces a drafted objective verbatim and derives only the next
+  steps and chips from it.
+- **A new objective declared outside the Strategy & Objective chat did nothing.**
+  Classifier Rule 4 declined it as a surgical edit and the objective-change flow
+  was gated on `chat_type`, so it was silently dropped. Rule 4 now emits
+  `isObjectiveDeclaration` + `objectiveDeclarationText`, which carries the
+  declaration across that gate with no extra model call; the looser promotion
+  heuristic in `_llm_classify_objective_change_intent` stays Strategy-only.
+- **Custom instructions survived a workspace deletion.** `_custom_instructions`
+  is a module-level dict and so outside the handler's `__dict__` purge sweep;
+  `clear_custom_instructions()` is now called on `workspace_deleted`.
+- **PDF extraction silently deleted body text.** `_strip_repeated_pdf_boilerplate`
+  drops lines that recur across pages as running headers. PyPDF2 emits many PDFs
+  one word per line, so ordinary function words recurred on every page and were
+  deleted — *"our mission is to improve the effectiveness and sophistication of
+  partnership"* reached the model as *"our mission improve effectiveness
+  sophistication partnership"*, leaving it to reconstruct the missing connective
+  tissue. A repeated line must now carry header substance (>= 12 chars or >= 3
+  words) before the repetition signal fires; known watermark patterns are
+  unaffected. An implausible strip ratio now logs a warning instead of passing
+  silently.
+- **Non-parties were extracted as case participants.** The three entity
+  sub-extractors ran without `SPEAKER_LABEL_GUARDRAIL` (imported but never
+  used), so audio diarization placeholders — "Caller", "Receiver", "Speaker A" —
+  were returned as parties. The parties prompt also asked for "official
+  signatories", which pulled the Author / Reviewer / "Approved By" rows out of an
+  uploaded policy's Document Control table. Because these entities become the
+  EXTRACTED FACTS block that downstream prompts treat as *"the ONLY
+  organisations, authorities, bodies, parties and places you may name"*, the
+  leakage was not merely tolerated — it was authorised and propagated into the
+  case summary, the strategic objective and the analysis report. The guardrail is
+  now injected into all three extractors, the prompt excludes document-control
+  metadata and policy boilerplate entities, and `_drop_non_party_entities`
+  enforces both deterministically.
+- **A chat edit no longer reports success when nothing changed.** The three
+  strategy editors (`strategicObjective`, `caseSummary` + `reportCaseSummary`,
+  `possibleNextSteps`) returned `True` whenever Gemini returned any non-empty
+  text, including byte-identical output, so the reply claimed panels it never
+  touched. They now detect a no-op, as the other four editors already did.
+- **Stuck panel loaders.** Any editor returning `False` left its spinner lit
+  forever; the terminal-emit guard now covers every panel on every edit path.
+- **Applicable-laws edits could silently drop rows and lost `isMatched`.** The
+  editor now merges the model's `description` by index onto the cached row and
+  re-checks the count after normalisation, rejecting the edit on shrinkage. This
+  also revives the no-op guard, which could never fire because normalisation
+  stripped `isMatched` from the comparison.
+- **Surgical analysis-report edits could blank `nextSteps` / `pendingActions` /
+  `caseResolutionScore`** when the model returned only the sections it changed.
+  The edit is now layered over the current report so unmentioned keys survive.
+- **Both analysis-report scoring calls ran with no case description.**
+  `_compute_rejection_score_delta` and `_compute_added_missing_info_score_delta`
+  read `caseSummary` / `reportCaseSummary` / `strategicObjective` off the analysis
+  report, which never contains them, so the prompts rendered "(not available)".
+  They now read the strategy payload, where those fields actually live. **Expect
+  `caseResolutionScore` values to move on `analysis_report_feedback` and
+  `added_missing_information` events.**
+- **The panel-edit precheck matched verbs as substrings** — "edit" inside
+  "credited", "add" inside "address" — sending ordinary questions to the LLM
+  classifier. Now word-boundary matched, with a new contrastive-correction branch
+  so a value correction with no edit verb ("the amount is 6 lakh, not 16 lakh")
+  reaches the classifier at all.
+- `_schedule_objective_change_reanalysis` now takes the per-workspace pipeline
+  lock, as the other schedulers do; its full analysis-report regeneration could
+  previously interleave with a document-upload pipeline. The strategy cache is
+  also re-read after the classifier call, so a sync completing during that
+  round-trip is no longer silently discarded.
 
 ---
 

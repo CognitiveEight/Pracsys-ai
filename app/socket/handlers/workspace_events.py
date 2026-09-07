@@ -3142,6 +3142,28 @@ class WorkspaceEventsMixin:
             workspace_id = data.get("workspace_id") or data.get("workspaceId")
             logger.info(f"Workspace deleted (legacy): {workspace_id}")
 
+            # Drop the user-asserted fact ledger explicitly. It holds verbatim
+            # case facts (amounts, dates, party names) that a deletion must
+            # erase. This branch has no __dict__ sweep, so nothing else would
+            # clear the in-memory copy for the life of the process.
+            # TODO: redundant once the workspace_purge sweep (on `development`)
+            # merges here — _clear_workspace_memory covers instance caches.
+            self.clear_user_asserted_facts(workspace_id)
+            # Same reasoning: a module-level dict is outside the handler's
+            # __dict__ purge sweep, so it must be cleared explicitly.
+            try:
+                from app.workspace.custom_instructions import (
+                    clear_custom_instructions,
+                )
+
+                clear_custom_instructions(workspace_id)
+            except Exception as ci_err:  # pragma: no cover - best effort
+                logger.debug(
+                    "Clearing custom instructions failed (workspace={}): {}",
+                    workspace_id,
+                    ci_err,
+                )
+
             # Delete the workspace
             await workspace_manager.delete_workspace(workspace_id)
 

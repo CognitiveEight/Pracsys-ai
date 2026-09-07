@@ -136,6 +136,15 @@ class Settings(BaseSettings):
     workspace_data_dir: str = "./data/workspaces"
     max_file_size_mb: int = 100
 
+    # Feature flags
+    # Fan a chat fact correction ("the disputed amount is 6 lakh, not 16 lakh")
+    # out across every panel that can hold the value, and pin it so a later
+    # document-driven regeneration cannot revert it. Set
+    # ENABLE_FACT_CORRECTION_FANOUT=false to disable if the classifier's
+    # isFactCorrection precision proves too low on real traffic — grep
+    # "Panel-edit classifier:" for isFactCorrection=True to measure it.
+    enable_fact_correction_fanout: bool = True
+
     # Observability
     enable_audit_log: bool = True
     enable_trace: bool = True

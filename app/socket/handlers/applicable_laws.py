@@ -131,6 +131,7 @@ class ApplicableLawsMixin:
         workspace_role: str,
         user_feedback: str,
         emit_result: bool = True,
+        outcome: Optional[Dict[str, str]] = None,
     ) -> bool:
         """
         Apply a surgical find-and-replace / correction to the EXISTING Applicable
@@ -160,6 +161,9 @@ class ApplicableLawsMixin:
             current_json = json.dumps(current, ensure_ascii=True)
             prompt = regenerate_applicable_laws_with_feedback_prompt(current_json=current_json, instruction=instruction)
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 prompt = prompt.rstrip() + "\n\n" + custom_suffix
@@ -180,14 +184,74 @@ class ApplicableLawsMixin:
             edited_laws = edited.get("laws") if isinstance(edited, dict) else None
             if not isinstance(edited_laws, list) or len(edited_laws) != len(laws):
                 logger.warning(
-                    "Applicable laws name edit rejected (count mismatch); keeping cache"
+                    "Applicable laws edit rejected (count mismatch); keeping cache"
                 )
                 return False
 
-            edited = self._normalize_applicable_laws_payload(edited)
+            # Index-merge, the same contract as _reeval_list_of_dates_relevance:
+            # take ONLY `description` from the model and reproduce every other
+            # field from the cached row. Rebuilding from the model's output ran
+            # it through _normalize_applicable_laws_payload, which reconstructs
+            # each row as exactly {id, act, section, description, relevance} and
+            # therefore DROPPED the `isMatched` flag written by
+            # _tag_laws_against_current_state — which both lost the frontend's
+            # matched/new tagging and made the no-op comparison below unequal,
+            # so the guard never fired and every edit emitted.
+            merged_laws: List[Dict[str, Any]] = []
+            for idx, cached_law in enumerate(laws):
+                if not isinstance(cached_law, dict):
+                    return False
+                row = dict(cached_law)
+                candidate = edited_laws[idx]
+                if isinstance(candidate, dict):
+                    new_desc = str(candidate.get("description") or "").strip()
+                    if new_desc:
+                        row["description"] = new_desc
+                merged_laws.append(row)
+
+            # Run the normaliser purely as a validity check (it drops rows with a
+            # blank description or an IPC / CrPC / IEA-1872 leak). It used to run
+            # AFTER the count guard, so a row the model blanked or contaminated
+            # vanished silently with the guard already satisfied. Reject the whole
+            # edit on shrinkage instead of shipping a shorter panel.
+            _validated = self._normalize_applicable_laws_payload(
+                {"laws": [dict(r) for r in merged_laws]}
+            )
+            _validated_laws = (
+                _validated.get("laws") if isinstance(_validated, dict) else None
+            )
+            if (
+                not isinstance(_validated_laws, list)
+                or len(_validated_laws) != len(merged_laws)
+            ):
+                logger.warning(
+                    "Applicable laws edit rejected (normalisation dropped {} of {} "
+                    "rows — blank description or IPC/CrPC leak); keeping cache",
+                    len(merged_laws) - len(_validated_laws or []),
+                    len(merged_laws),
+                )
+                return False
+
+            # Overlay the normalised description/section/relevance back onto the
+            # merged rows so cleanup applies without losing `isMatched` or any
+            # other field the cached row carried.
+            for row, clean in zip(merged_laws, _validated_laws):
+                if isinstance(clean, dict):
+                    row["description"] = clean.get("description", row.get("description"))
+                    row["section"] = clean.get("section", row.get("section"))
+                    row["relevance"] = clean.get("relevance", row.get("relevance"))
+
+            edited = dict(current)
+            edited["laws"] = merged_laws
             if json.dumps(edited, sort_keys=True, ensure_ascii=True) == json.dumps(
                 current, sort_keys=True, ensure_ascii=True
             ):
+                logger.info(
+                    "Applicable laws edit produced no change — instruction={!r}",
+                    instruction[:160],
+                )
+                if outcome is not None:
+                    outcome["status"] = "unchanged"
                 return False  # nothing changed
 
             self._workspace_applicable_laws_payload[workspace_id] = edited
@@ -204,6 +268,8 @@ class ApplicableLawsMixin:
                     "✅ Applicable laws name edit emitted workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
+            if outcome is not None:
+                outcome["status"] = "applied"
             return True
         except Exception as e:
             logger.warning("Applicable laws name edit failed: {}", e)
@@ -543,6 +609,9 @@ class ApplicableLawsMixin:
             else ""
         )
         prompt = generate_applicable_laws_from_sources_prompt(objective_block=objective_block, self=self, signals=signals, source_blob=source_blob, targeted_acts_block=targeted_acts_block, targeted_acts_count=targeted_acts_count, workspace_id=workspace_id, workspace_role=workspace_role)
+        # Authoritative user corrections lead the prompt so they outrank
+        # the document content they contradict.
+        prompt = self._with_user_facts(workspace_id, prompt)
         raw = await gemini_client.generate(
             prompt=prompt,
             system_instruction=get_structured_document_feature_system_instruction(

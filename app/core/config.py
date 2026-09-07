@@ -139,11 +139,11 @@ class Settings(BaseSettings):
     # Feature flags
     # Fan a chat fact correction ("the disputed amount is 6 lakh, not 16 lakh")
     # out across every panel that can hold the value, and pin it so a later
-    # document-driven regeneration cannot revert it. Off by default so the
-    # classifier's isFactCorrection precision can be measured on real traffic
-    # (grep "Panel-edit classifier:" for isFactCorrection=True) before the
-    # fan-out is enabled. Override with ENABLE_FACT_CORRECTION_FANOUT=true.
-    enable_fact_correction_fanout: bool = False
+    # document-driven regeneration cannot revert it. Set
+    # ENABLE_FACT_CORRECTION_FANOUT=false to disable if the classifier's
+    # isFactCorrection precision proves too low on real traffic — grep
+    # "Panel-edit classifier:" for isFactCorrection=True to measure it.
+    enable_fact_correction_fanout: bool = True
 
     # Observability
     enable_audit_log: bool = True

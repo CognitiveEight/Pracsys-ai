@@ -1225,6 +1225,16 @@ class ChatMixin:
             _is_rename = False
             _is_fact_correction = False
             _is_workspace_wide = False
+            # Set from the panel-edit classifier's Rule 4 signal. A lawyer who
+            # DECLARES a new objective outside the Strategy & Objective chat
+            # used to be dropped entirely: Rule 4 tells the classifier not to
+            # treat it as a surgical edit, and the objective-change flow was
+            # gated on chat_type — so nothing ran and the chat agent answered as
+            # though it had. This carries the declaration across that gate
+            # without widening the loose promotion heuristic in
+            # _llm_classify_objective_change_intent, which stays Strategy-only.
+            _objective_declared = False
+            _objective_declaration_text = ""
             try:
                 combined_text_for_updates = payload.content or ""
                 # Include attachment text if present (so updates can be pasted into a file)
@@ -1341,6 +1351,14 @@ class ChatMixin:
                                 workspace_id[:12] if workspace_id else "",
                             )
                         cur_strat_for_edit = _fresh_strat
+
+                    _objective_declaration_text = str(
+                        classification.get("objectiveDeclarationText") or ""
+                    ).strip()
+                    _objective_declared = bool(
+                        classification.get("isObjectiveDeclaration")
+                        and _objective_declaration_text
+                    )
 
                     if classification and not classification.get("isQuestionLike"):
                         # ADVOCACY-ROLE REASSIGNMENT (Rule 13): the user corrected
@@ -2135,7 +2153,16 @@ class ChatMixin:
                             objective_ack_kind = "followup_clarify"
 
                 objective_instruction: Optional[str] = None
-                if not objective_regen_ok and chat_type_upper == "STRATEGY_OBJECTIVE":
+                if not objective_regen_ok and _objective_declared:
+                    # Rule 4 already extracted the new direction, so no second
+                    # classifier call is needed for the un-gated case.
+                    objective_instruction = _objective_declaration_text
+                    logger.info(
+                        "Objective declaration detected in a {} chat — routing to "
+                        "the objective-change flow",
+                        chat_type_upper or "general",
+                    )
+                elif not objective_regen_ok and chat_type_upper == "STRATEGY_OBJECTIVE":
                     prep = self._extract_intelligence_chat_panel_updates(
                         combined_text_for_updates
                     )
@@ -2176,7 +2203,7 @@ class ChatMixin:
                 if (
                     not objective_regen_ok
                     and objective_instruction
-                    and chat_type_upper == "STRATEGY_OBJECTIVE"
+                    and (chat_type_upper == "STRATEGY_OBJECTIVE" or _objective_declared)
                     and not self._is_pure_informational_query(um_early)
                 ):
                     cur_strat = self._workspace_strategy_payload.get(workspace_id)

@@ -45,6 +45,8 @@ def role_to_party_resolution_block(workspace_role, *, confirmed_party=None):
     return (
 f"""ROLE -> NAMED-PARTY RESOLUTION (CRITICAL — do this BEFORE writing strategicObjective / possibleNextSteps / suggestionChips):
 - Your selected role is {workspace_role}. This is an ABSTRACT posture that MUST be bound to a SPECIFIC NAMED PARTY in this matter. It is NOT a generic label and is NOT automatically the company, promoter, builder, bank, authority, or the opponent.
+- Annexures marked [CITED INSTRUMENT] are standard-form policies and terms. Identify the role-holder from the documents that describe THIS dispute — correspondence, transcripts, pleadings, orders — and only then reconcile with the instruments. A cited instrument that a party uploaded as ITS OWN standard agreement does identify that party (e.g. a Terms of Service naming "The Service Provider — <Company>" uploaded by the claimant identifies the claimant's company); a cited instrument belonging to the COUNTERPARTY or the platform does NOT — its publisher, its "Client"/"Buyer" role placeholders and its document-control signatories are not the role-holder. When the evidence names a real actor in the dispute and an instrument names a company, prefer the entity the EVIDENCE supports; if they are the same commercial side, name the company.
+- ADVISERS ARE NOT PARTIES. A consultation transcript has at least two sides: the client describing the problem, and the lawyer/consultant assessing it. Whoever offers to send a team member, collect documents, produce a consultation report, opine on "the merit" or "the strength" of the case, or quote a fee IS THE LAWYER — never the client, never the {workspace_role}. Do not make the advising side the role-holder. If the client is a company represented in the conversation by an individual, name the COMPANY as the role-holder.
 - These documents may contain MULTIPLE, CONSOLIDATED proceedings (an original complaint/suit, appeals, revisions, execution). The SAME named person can be the complainant/petitioner in one proceeding and the respondent/appellant in another. Procedural roles INVERT on appeal: the party that WON below and DEFENDS the order is the RESPONDENT in the appeal, while the party that LOST and CHALLENGES it is the APPELLANT/PETITIONER. Do NOT inherit a party's role from the ORIGINAL/lower proceeding.
 - STEP 1 — Identify the DOMINANT / LIVE proceeding: the most recent, currently-pending matter (latest dated orders, still awaiting decision). That proceeding governs role assignment.
 - STEP 2 — Within that live proceeding, resolve which NAMED party occupies your role {workspace_role}: RESPONDENT / DEFENDANT = the party defending or opposing the live appeal / petition / execution; PETITIONER / APPELLANT / COMPLAINANT = the party who initiated the live challenge. For ADJUDICATOR / MEDIATOR there is NO represented party — stay neutral.
@@ -335,6 +337,14 @@ LOCKED reportCaseSummary (verbatim context):
 **User's new strategic priority / instruction** (follow this as the primary constraint):
 {user_objective_instruction.strip()}
 
+VERBATIM RULE (CRITICAL): if the instruction above is ALREADY A DRAFTED STRATEGIC OBJECTIVE — i.e. it is
+several sentences of finished prose stating what the party seeks and how, rather than a short
+direction like "focus on quashing the FIR" — then the lawyer has written the objective themselves.
+REPRODUCE IT VERBATIM as "strategicObjective": same sentences, same order, same wording, same
+figures, same names. Do NOT paraphrase, summarise, re-order, shorten, expand, or "improve" it, and
+do NOT apply the length target below to it. Only then derive possibleNextSteps and suggestionChips
+from it. A lawyer who hands you finished drafting expects that drafting back, not a rewrite of it.
+
 Current strategic objective (to replace):
 {(current_strategy.get("strategicObjective") or "").strip()}
 
@@ -360,7 +370,7 @@ Return JSON ONLY with these keys:
 
 Rules:
 - Do not restate or replace caseSummary/reportCaseSummary in the output.
-- The new strategicObjective and possibleNextSteps MUST reflect the new user instruction and MUST NOT just repeat the current objective/steps.
+- The new strategicObjective and possibleNextSteps MUST reflect the new user instruction and MUST NOT just repeat the CURRENT objective/steps shown above. (This does not conflict with the VERBATIM RULE: reproducing the user's OWN drafted objective is required; repeating the previous objective is not.)
 - BNS/BNSS/BSA naming (not IPC/CrPC/IEA where replaced).
 - GROUNDING (MANDATORY): Do NOT name any organisation, authority, board, association, committee, party, or place that does not appear in EXTRACTED FACTS or the document content above. Use only the real entities from this case — never introduce a new body or location to fit the instruction.
 - FORUM/VENUE instructions: when the user's instruction only names a place, court, or body (e.g. "file in Patna", "file to ICC"), treat it STRICTLY as a forum preference. Do NOT invent local organisations, offices, tournaments, or a local "leg"/branch of an event to match that place. Keep the actual parties and bodies named in the documents (e.g. a national board or a specific state association) — do NOT rename or relocate them.
@@ -369,6 +379,7 @@ Rules:
    (b) AUTHORITY / SUBJECT-MATTER — the named forum has no power to grant the requested relief for this kind of matter (e.g. an international or global body, a regulator, or a wrong-tier forum that does not adjudicate this domestic dispute). Name which forum actually has jurisdiction, and describe the ONLY realistic route to the requested forum if one exists (e.g. a representation citing breach of that body's guidelines, or an internal referral) — do NOT present it as a straightforward "filing" when it is not.
 - ALIGN next steps to the realistic route implied by the CONFLICT analysis. Do NOT silently revert possibleNextSteps to the previous forum's domestic steps while claiming to pursue the new forum — every step must be consistent with what is actually possible before the chosen forum.
 - No invented facts of any kind.
+- AMBIGUOUS FIGURES: when EXTRACTED FACTS marks an amount "ambiguous": true, the source states it unclearly (typically a speech-to-text disfluency). State it as the source does and name both readings once — e.g. "a pending amount stated in the recording as either 6 lakh or 16 lakh USD (to be confirmed)". Do NOT pick one silently, do NOT average them, and do NOT present them as a range the source never gave. Carry the same wording into possibleNextSteps so confirming the figure appears as an action.
 - {SPEAKER_LABEL_GUARDRAIL}
 - JSON only; complete strings and arrays."""
     )
@@ -826,6 +837,8 @@ OUTPUT FORMAT (JSON ONLY):
   "analysisReport":     {{"shouldEdit": true | false, "instruction": "ONLY the per-panel edit text for the analysis report; empty when shouldEdit=false"}},
   "listOfDates":        {{"shouldEdit": true | false, "instruction": "set true ONLY for a NAME change / rename (Rule 12) so the person's name is replaced in the existing dated events; empty otherwise"}},
   "isRename":           true | false,
+  "isObjectiveDeclaration": true | false,
+  "objectiveDeclarationText": "the NEW strategic direction the user declared (Rule 4); empty otherwise",
   "isFactCorrection":   true | false,
   "factCorrections":    [{{"was": "the incorrect value as it currently appears, verbatim; empty string if the user did not state it",
                           "now": "the corrected value, verbatim as the user gave it",
@@ -872,9 +885,12 @@ DECISION RULES:
    "the objective should be <direction>", "change/set/update the objective to <new direction>",
    "we want to pursue <direction>" (e.g. "objective is to focus on recovering ₹12,000 first",
    "change the objective to quashing the false FIR") — this is NOT a surgical panel edit.
-   Set strategicObjective.shouldEdit=FALSE and isQuestionLike=false. A separate objective-change
-   flow regenerates the whole strategy + analysis from the new objective; this classifier must
-   NOT claim it.
+   Set strategicObjective.shouldEdit=FALSE and isQuestionLike=false, AND set
+   "isObjectiveDeclaration": true with "objectiveDeclarationText" = the new direction the user
+   stated (their words, verbatim where possible). A separate objective-change flow regenerates
+   the whole strategy + analysis from it; this classifier must NOT claim it as a surgical edit,
+   but it MUST flag it — without the flag the declaration is silently dropped in any chat that
+   is not the Strategy & Objective panel.
    Set strategicObjective.shouldEdit=TRUE ONLY for a SURGICAL edit to the EXISTING objective TEXT —
    remove / delete / drop / rephrase / replace a specific sentence, phrase, or quoted text in the
    objective — or for a workspace-wide rename (see Rule 12).

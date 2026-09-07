@@ -624,6 +624,41 @@ def _format_document_for_prompt(
     if document_type and document_type.lower() != "other":
         header_lines.append(f"[DOCUMENT TYPE: {document_type}]")
 
+    # Standard-form instruments (terms of service, privacy statements,
+    # acceptable-use policies) are uploaded for reference, but every person and
+    # company they name belongs to the DOCUMENT, not the dispute: its publisher,
+    # its version-control signatories, its third-party vendors, and role
+    # placeholders like "the Client" / "the Service Provider". Read as evidence,
+    # a boilerplate template's own Service Provider outranked the actual client
+    # in party selection, and a policy's approval table was reported as "key
+    # individuals involved in the communications". Label them so every prompt
+    # treats them as cited instruments instead.
+    try:
+        from app.processing.document_classifier import is_policy_boilerplate
+
+        _file_name = str(
+            metadata.get("file_name")
+            or metadata.get("filename")
+            or doc.get("file_name")
+            or ""
+        )
+        if is_policy_boilerplate(_file_name, body, document_type):
+            header_lines.append(
+                "[CITED INSTRUMENT — standard-form policy/terms uploaded for "
+                "reference. Its clauses MAY be cited and the CONTRACTING ENTITY "
+                "it is made by or for may well be a party to this matter (a "
+                "party often uploads its own standard agreement). But the "
+                "INDIVIDUALS it names — document-control authors, owners, "
+                "reviewers, 'Approved By' signatories — and the third-party "
+                "vendors, analytics providers and regulators it mentions are "
+                "part of the DOCUMENT, not the dispute: never describe them as "
+                "case participants. Take the FACTS of the dispute (what "
+                "happened, when, how much, who did what) from the other "
+                "annexures, not from this one.]"
+            )
+    except Exception:  # pragma: no cover - labelling must never block a prompt
+        pass
+
     def _coerce_str_list(val: Any) -> List[str]:
         if val is None:
             return []

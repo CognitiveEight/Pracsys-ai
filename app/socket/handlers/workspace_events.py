@@ -3149,6 +3149,20 @@ class WorkspaceEventsMixin:
             # TODO: redundant once the workspace_purge sweep (on `development`)
             # merges here — _clear_workspace_memory covers instance caches.
             self.clear_user_asserted_facts(workspace_id)
+            # Same reasoning: a module-level dict is outside the handler's
+            # __dict__ purge sweep, so it must be cleared explicitly.
+            try:
+                from app.workspace.custom_instructions import (
+                    clear_custom_instructions,
+                )
+
+                clear_custom_instructions(workspace_id)
+            except Exception as ci_err:  # pragma: no cover - best effort
+                logger.debug(
+                    "Clearing custom instructions failed (workspace={}): {}",
+                    workspace_id,
+                    ci_err,
+                )
 
             # Delete the workspace
             await workspace_manager.delete_workspace(workspace_id)

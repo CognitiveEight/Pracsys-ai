@@ -422,6 +422,59 @@ async def check_rename_regression():
     check("no fact pinned for a rename", H.get_user_asserted_facts(ws) == [])
 
 
+async def check_objective_declaration():
+    print("\n[7] A drafted objective works in ANY chat, and is used verbatim")
+    ws = "verify_declaration"
+    _seed(ws)
+    drafted = (
+        "The strategic objective of S. E. Investments Ltd., the Petitioner in the "
+        "ongoing enforcement proceedings, is to secure full recovery of the "
+        "principal debt of Rs. 4,02,13,129/- with interest at 18% through "
+        "enforcement of the arbitral award. The Petitioner should move for "
+        "appointment of a Court Commissioner for B-214, Chittaranjan Park."
+    )
+    before = dict(H._workspace_strategy_payload[ws])
+    cls = {k: {"shouldEdit": False, "instruction": ""} for k in (
+        "caseSummary", "reportCaseSummary", "strategicObjective",
+        "possibleNextSteps", "analysisReport", "listOfDates")}
+    cls.update({"isRename": False, "isRoleReassignment": False, "reassignRole": "",
+                "reassignParty": "", "isFactCorrection": False, "factCorrections": [],
+                "isObjectiveDeclaration": True, "objectiveDeclarationText": drafted,
+                "isQuestionLike": False})
+    seen = {"verbatim_rule": False}
+
+    async def _gen(*a, prompt="", **k):
+        p = prompt or (a[0] if a else "")
+        if "legal-strategy workspace chat" in p:
+            return json.dumps(cls)
+        if "legal strategy analyst" in p.lower() and '"suggestionChips"' in p:
+            seen["verbatim_rule"] = "VERBATIM RULE" in p
+            return json.dumps({
+                "strategicObjective": drafted,
+                "possibleNextSteps": ["File the original award before the Joint Registrar.",
+                                      "Move for sale of the attached property."],
+                "suggestionChips": ["chip"] * 16})
+        return "{}"
+    _gc.gemini_client.generate = _gen
+
+    # chat_type is ANALYSIS_REPORT — previously a dead end for a declaration.
+    await _send(ws, "change the strategic objective to this - " + drafted,
+                chat_type="ANALYSIS_REPORT")
+    for _ in range(40):
+        await asyncio.sleep(0.05)
+        if "strategy_objective" in _features():
+            break
+    strat = H._workspace_strategy_payload[ws]
+    check("declaration handled outside the Strategy & Objective chat",
+          strat["strategicObjective"] != before["strategicObjective"],
+          strat["strategicObjective"][:80])
+    check("the lawyer's own drafting is reproduced verbatim",
+          strat["strategicObjective"] == drafted, strat["strategicObjective"][:120])
+    check("VERBATIM RULE reached the prompt", seen["verbatim_rule"])
+    check("case summary still locked", strat["caseSummary"] == before["caseSummary"])
+    check("next steps refreshed", strat["possibleNextSteps"] != before["possibleNextSteps"])
+
+
 CHECKS = [
     ("editors", check_editors),
     ("ledger", check_ledger),
@@ -429,6 +482,7 @@ CHECKS = [
     ("end-to-end", check_end_to_end),
     ("honest-ack", check_honest_ack),
     ("rename", check_rename_regression),
+    ("objective-declaration", check_objective_declaration),
 ]
 
 

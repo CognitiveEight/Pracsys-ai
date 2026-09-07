@@ -2405,6 +2405,8 @@ class StrategyMixin:
             "reassignParty": "",
             "isFactCorrection": False,
             "factCorrections": [],
+            "isObjectiveDeclaration": False,
+            "objectiveDeclarationText": "",
             "isQuestionLike": False,
         }
         msg = (user_message or "").strip()
@@ -2508,12 +2510,21 @@ class StrategyMixin:
                 "reassignParty": str(data.get("reassignParty") or "").strip(),
                 "isFactCorrection": bool(data.get("isFactCorrection") is True),
                 "factCorrections": _fact_corrections(data.get("factCorrections")),
+                "isObjectiveDeclaration": bool(
+                    data.get("isObjectiveDeclaration") is True
+                ),
+                "objectiveDeclarationText": str(
+                    data.get("objectiveDeclarationText") or ""
+                ).strip(),
                 "isQuestionLike": bool(data.get("isQuestionLike") is True),
             }
             # A flag with nothing usable behind it is a partial classification —
             # same defensive shape as the isRoleReassignment/reassignParty pair.
             if not result["factCorrections"]:
                 result["isFactCorrection"] = False
+            # A declaration with no text behind it is a partial classification.
+            if not result["objectiveDeclarationText"]:
+                result["isObjectiveDeclaration"] = False
             # A role reassignment re-orients advocacy via a dedicated flow — it is
             # never a cosmetic rename and never a surgical per-panel edit. Enforce
             # that here so a stray classifier flag can't double-dispatch.
@@ -2545,6 +2556,8 @@ class StrategyMixin:
             if result["isQuestionLike"]:
                 result["isFactCorrection"] = False
                 result["factCorrections"] = []
+                result["isObjectiveDeclaration"] = False
+                result["objectiveDeclarationText"] = ""
                 for k in (
                     "caseSummary",
                     "reportCaseSummary",

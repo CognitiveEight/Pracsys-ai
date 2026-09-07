@@ -19,14 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fact supersede rather than accumulate. Mirrors the existing `REMOVED_DOCUMENTS`
   contract (prompt block + deterministic pass + ledger).
 - **Fact corrections fan out across every panel**, behind
-  `ENABLE_FACT_CORRECTION_FANOUT` (default `false`). New classifier signal
+  `ENABLE_FACT_CORRECTION_FANOUT` (default `true`). New classifier signal
   `isFactCorrection` / `factCorrections` (Rule 14). Text panels are edited by the
   existing surgical editors; `list_of_dates`, `applicable_laws` and
   `procedural_timeline` are corrected by a Python substitution restricted to an
   allowlist of text fields — never an ISO `date`, never a verbatim
   `evidenceSnippet`.
-- `verify_fact_corrections.py` — offline verification of the chat-edit path
-  (no API key, backend or Qdrant required).
+- `verify_fact_corrections.py` and `verify_ingestion.py` — offline verification
+  of the chat-edit path and the ingestion pipeline (no API key, backend or
+  Qdrant required).
 
 ### Changed
 
@@ -40,6 +41,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`python -m app.socket.ai_service` started a half-booted service.** That entry
+  point opened the socket and nothing else — the vector store, document
+  processor and Gemini client were never initialised, and `stop()` disconnected
+  without cleaning either of them up. It reported a healthy connection and then
+  failed on the first document, which reads like an ingestion bug rather than a
+  service that was never booted. `AISocketService.start()`/`stop()` now delegate
+  to `app.core.lifecycle`, and the CLI entry runs the same `Application` as
+  `python -m app.main` (full startup, SIGTERM/SIGINT handling, logging setup,
+  graceful shutdown), so the two commands are equivalent and cannot drift.
+- **`python -m app.main` did not start.** Two import cycles, closed at
+  `app/agents/base.py` and `app/socket/__init__.py`. Importing any module under
+  `app.socket` — even pure-pydantic `app.socket.schemas` — executed the package
+  `__init__`, which eagerly pulled in the whole handler stack and cycled back
+  through `app.workspace.context`. `SocketClient` / `event_handler` now resolve
+  lazily (PEP 562, public API unchanged) and `memory_manager` is imported inside
+  the two methods that use it. The service boots and connects again.
+- **Policy boilerplate was read as case evidence.** A standard-form terms of
+  service, privacy statement or acceptable-use policy names its own publisher,
+  its version-control signatories and its third-party vendors — none of them
+  parties to the dispute. With no way to tell such a document from a
+  case-specific contract, a boilerplate template's "Service Provider" was
+  selected as the client over the individual actually named in the evidence. New
+  `policy_boilerplate` document type plus a classifier-independent
+  `is_policy_boilerplate()` detector; such annexures are rendered with a
+  `[CITED INSTRUMENT]` banner, and both the entity extractor and the role→party
+  resolution are told not to take parties or the client from them.
+- **A lawyer's own drafted objective was paraphrased.** Pasting finished
+  drafting into the Strategy chat returned a reworded version. The regeneration
+  prompt now reproduces a drafted objective verbatim and derives only the next
+  steps and chips from it.
+- **A new objective declared outside the Strategy & Objective chat did nothing.**
+  Classifier Rule 4 declined it as a surgical edit and the objective-change flow
+  was gated on `chat_type`, so it was silently dropped. Rule 4 now emits
+  `isObjectiveDeclaration` + `objectiveDeclarationText`, which carries the
+  declaration across that gate with no extra model call; the looser promotion
+  heuristic in `_llm_classify_objective_change_intent` stays Strategy-only.
+- **Custom instructions survived a workspace deletion.** `_custom_instructions`
+  is a module-level dict and so outside the handler's `__dict__` purge sweep;
+  `clear_custom_instructions()` is now called on `workspace_deleted`.
+- **PDF extraction silently deleted body text.** `_strip_repeated_pdf_boilerplate`
+  drops lines that recur across pages as running headers. PyPDF2 emits many PDFs
+  one word per line, so ordinary function words recurred on every page and were
+  deleted — *"our mission is to improve the effectiveness and sophistication of
+  partnership"* reached the model as *"our mission improve effectiveness
+  sophistication partnership"*, leaving it to reconstruct the missing connective
+  tissue. A repeated line must now carry header substance (>= 12 chars or >= 3
+  words) before the repetition signal fires; known watermark patterns are
+  unaffected. An implausible strip ratio now logs a warning instead of passing
+  silently.
+- **Non-parties were extracted as case participants.** The three entity
+  sub-extractors ran without `SPEAKER_LABEL_GUARDRAIL` (imported but never
+  used), so audio diarization placeholders — "Caller", "Receiver", "Speaker A" —
+  were returned as parties. The parties prompt also asked for "official
+  signatories", which pulled the Author / Reviewer / "Approved By" rows out of an
+  uploaded policy's Document Control table. Because these entities become the
+  EXTRACTED FACTS block that downstream prompts treat as *"the ONLY
+  organisations, authorities, bodies, parties and places you may name"*, the
+  leakage was not merely tolerated — it was authorised and propagated into the
+  case summary, the strategic objective and the analysis report. The guardrail is
+  now injected into all three extractors, the prompt excludes document-control
+  metadata and policy boilerplate entities, and `_drop_non_party_entities`
+  enforces both deterministically.
 - **A chat edit no longer reports success when nothing changed.** The three
   strategy editors (`strategicObjective`, `caseSummary` + `reportCaseSummary`,
   `possibleNextSteps`) returned `True` whenever Gemini returned any non-empty

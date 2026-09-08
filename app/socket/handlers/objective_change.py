@@ -2010,12 +2010,27 @@ class ObjectiveChangeMixin:
 
         async def _runner() -> None:
             try:
-                await self._run_objective_change_incremental_refresh(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    workspace_role=role,
-                    log_context=ctx,
-                )
+                # Take the per-workspace pipeline lock, as
+                # _schedule_strategy_analysis_pipeline already does. This
+                # scheduler was the only one that did not, and it performs a
+                # full analysis-report REGEN-and-replace — so interleaving it
+                # with a document-upload pipeline let one clobber the other's
+                # emit for the same feature.
+                lock = self._workspace_pipeline_lock(workspace_id)
+                if lock.locked():
+                    logger.debug(
+                        "pipeline lock: objective-change reanalysis{} waiting for "
+                        "the in-flight pipeline (workspace={})",
+                        ctx,
+                        workspace_id[:12] if workspace_id else "",
+                    )
+                async with lock:
+                    await self._run_objective_change_incremental_refresh(
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        workspace_role=role,
+                        log_context=ctx,
+                    )
             except Exception as rean_err:
                 logger.warning(
                     "Objective-change incremental refresh{} failed: {}",

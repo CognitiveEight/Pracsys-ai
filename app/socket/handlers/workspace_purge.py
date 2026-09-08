@@ -468,6 +468,10 @@ class WorkspacePurgeMixin:
         Chat-keyed caches hold extracted document text but are keyed by bare
         chat_id, so they are resolved through ``_chat_workspace_index``.
 
+        Per-workspace state held in a *module-level* global is outside
+        ``self.__dict__`` and therefore outside the sweep — those must be
+        cleared by name (see the custom-instructions block below).
+
         Args:
             workspace_id: Workspace being erased.
 
@@ -516,6 +520,22 @@ class WorkspacePurgeMixin:
 
         for chat_id in chat_ids:
             self._chat_workspace_index.pop(chat_id, None)
+
+        # Module-level per-workspace state. The sweep above only reaches
+        # ``self.__dict__``, so anything held in a module global has to be
+        # named here explicitly or it survives an erasure request for the life
+        # of the process. Custom instructions hold a user-authored description.
+        try:
+            from app.workspace.custom_instructions import clear_custom_instructions
+
+            clear_custom_instructions(workspace_id)
+            removed += 1
+        except Exception as ci_error:  # pragma: no cover - best effort
+            logger.debug(
+                "Clearing custom instructions failed (workspace={}): {}",
+                workspace_id,
+                ci_error,
+            )
 
         # Scalars pointing at this workspace: leaving them set would make the
         # reconnect re-emit path try to republish a purged workspace's panels.

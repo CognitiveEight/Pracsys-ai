@@ -71,6 +71,17 @@ def hydrate_custom_instructions_from_cache(
         _custom_instructions[workspace_id] = cleaned
 
 
+def clear_custom_instructions(workspace_id: str) -> None:
+    """Forget a workspace's custom instructions.
+
+    Called on workspace deletion. ``_custom_instructions`` is a module-level
+    dict, so it is NOT reached by the event handler's ``self.__dict__`` purge
+    sweep — without this it survived an erasure request for the life of the
+    process.
+    """
+    _custom_instructions.pop(workspace_id, None)
+
+
 def build_custom_instruction_suffix(workspace_id: str) -> str:
     """
     Build the text to append to prompts when custom instructions are set.

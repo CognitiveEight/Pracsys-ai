@@ -18,6 +18,11 @@ from loguru import logger
 # ``_strip_repeated_pdf_boilerplate`` so the publisher header/footer never
 # dominates extracted content (which previously caused image-only judgments to
 # skip OCR and be rejected as "repetitive headers").
+# Minimum length for a repeated line to be treated as a running header/footer.
+# Below this, a recurring line is far more likely to be a body word emitted on
+# its own line by the PDF text layer than a header. See _has_header_substance.
+_MIN_BOILERPLATE_LINE_CHARS = 12
+
 _PDF_BOILERPLATE_PATTERNS = [
     re.compile(r"scc\s*online", re.I),
     re.compile(r"trueprint", re.I),
@@ -72,11 +77,34 @@ def _strip_repeated_pdf_boilerplate(page_texts: List[str]) -> str:
 
     repeat_threshold = max(3, int(0.4 * num_pages))
 
+    def _has_header_substance(norm: str) -> bool:
+        """Could this line plausibly BE a running header/footer?
+
+        The cross-page-repetition signal assumes a line is a whole header or
+        footer. That assumption collapses when the PDF's text layer comes out
+        one word per line — which PyPDF2 does for many documents. Ordinary
+        function words ("the", "and", "of", "to", "is") then recur on every
+        page and get deleted as boilerplate, silently gutting the body text:
+        "our mission is to improve the effectiveness and sophistication of
+        partnership" became "our mission improve effectiveness sophistication
+        partnership". The model is then left to reconstruct the missing
+        connective tissue, which is where invented facts come from.
+
+        A genuine running header carries substance — a publisher name, a case
+        citation, a page marker. Require that before the repetition signal may
+        fire. Known watermark patterns are matched separately and are not
+        subject to this guard.
+        """
+        return len(norm) >= _MIN_BOILERPLATE_LINE_CHARS or len(norm.split()) >= 3
+
     def _is_boilerplate(raw_line: str) -> bool:
         norm = _norm(raw_line)
         if not norm:
             return False
-        if line_page_count.get(norm, 0) >= repeat_threshold:
+        if (
+            line_page_count.get(norm, 0) >= repeat_threshold
+            and _has_header_substance(norm)
+        ):
             return True
         return any(pat.search(raw_line) for pat in _PDF_BOILERPLATE_PATTERNS)
 
@@ -86,7 +114,23 @@ def _strip_repeated_pdf_boilerplate(page_texts: List[str]) -> str:
         page_body = "\n".join(kept).strip()
         if page_body:
             cleaned_pages.append(page_body)
-    return "\n".join(cleaned_pages).strip()
+    cleaned = "\n".join(cleaned_pages).strip()
+
+    # A header/footer strip should shave a few percent. Much more than that
+    # means the repetition heuristic is eating body text, which corrupts every
+    # downstream prompt — surface it instead of failing silently.
+    original_len = sum(len(p) for p in pages)
+    if original_len and (original_len - len(cleaned)) / original_len > 0.25:
+        logger.warning(
+            "PDF boilerplate strip removed {:.0f}% of the text layer ({} -> {} "
+            "chars over {} pages) — the repetition heuristic may be eating body "
+            "text; check the PDF's text layer",
+            100 * (original_len - len(cleaned)) / original_len,
+            original_len,
+            len(cleaned),
+            num_pages,
+        )
+    return cleaned
 
 try:
     from google.auth.exceptions import DefaultCredentialsError

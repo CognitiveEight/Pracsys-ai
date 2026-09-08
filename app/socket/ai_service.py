@@ -65,15 +65,22 @@ class AISocketService:
         try:
             logger.info("🚀 Starting AI Socket Service...")
 
-            # Create socket client
-            self.client = SocketClient()
+            # Delegate to the shared application lifecycle rather than only
+            # opening the socket. This method used to create a SocketClient and
+            # connect, and nothing else — so the vector store, the document
+            # processor and the Gemini client were never initialised. The
+            # service came up green and then failed on the first document,
+            # which reads like an ingestion bug rather than a service that was
+            # never booted. Delegating also keeps this entry point and
+            # ``python -m app.main`` on one code path, so they cannot drift.
+            from app.core.lifecycle import lifecycle
 
-            # Register socket client with event handler
-            event_handler.set_socket_client(self.client)
+            await lifecycle.startup()
 
-            # Connect to server
-            await self.client.connect()
-
+            # Reuse the lifecycle's client; creating a second one here would
+            # open a second connection to the same ai_service room and every
+            # event would be handled twice.
+            self.client = lifecycle.socket_client
             self._running = True
 
             logger.success("✅ AI Socket Service started successfully")
@@ -106,9 +113,13 @@ class AISocketService:
         try:
             logger.info("🛑 Stopping AI Socket Service...")
 
-            if self.client:
-                await self.client.disconnect()
+            # Mirror start(): tear the whole stack down, not just the socket.
+            # Disconnecting alone left the document processor's temp files and
+            # the Qdrant connection open.
+            from app.core.lifecycle import lifecycle
 
+            await lifecycle.shutdown()
+            self.client = None
             self._running = False
 
             logger.success("✅ AI Socket Service stopped")
@@ -202,18 +213,43 @@ async def run_ai_service_forever() -> None:
 
 # CLI entry point
 async def main():
-    """Main entry point for running AI Socket Service standalone."""
+    """Run the AI service standalone.
+
+    Delegates to the same ``Application`` that ``python -m app.main`` runs, so
+    the two commands are equivalent and cannot drift. That matters: this entry
+    point previously only opened the socket, leaving the vector store, document
+    processor and Gemini client uninitialised — the service reported a healthy
+    connection and then failed on the first document.
+
+    ``Application.run()`` performs the full startup, installs SIGTERM/SIGINT
+    handlers, blocks until a shutdown signal, and tears the stack down.
+    """
+    from app.main import Application
+
     logger.info("=" * 80)
     logger.info("AI SOCKET.IO SERVICE")
     logger.info("=" * 80)
-    logger.info(f"Socket URL: {settings.socket_url}")
-    logger.info(f"Client Type: AI_Maverick")
-    logger.info(f"Authentication: HMAC-SHA256 signature")
+    logger.info("Client Type: AI_Maverick")
+    logger.info("Authentication: HMAC-SHA256 signature")
     logger.info("=" * 80)
 
-    await run_ai_service_forever()
+    await Application().run()
 
 
 if __name__ == "__main__":
-    """Run the AI Socket Service standalone."""
-    asyncio.run(main())
+    """Run the AI Socket Service standalone.
+
+    Equivalent to ``python -m app.main``.
+    """
+    from app.observability.logger import setup_logging
+
+    # Configure logging BEFORE anything else, exactly as app.main does —
+    # without this the service ran on Loguru's defaults and the file sinks,
+    # rotation and audit log were never set up.
+    setup_logging()
+
+    try:
+        asyncio.run(main())
+    except Exception as exc:  # pragma: no cover - top-level crash reporting
+        logger.critical("Fatal error: {}", str(exc))
+        raise

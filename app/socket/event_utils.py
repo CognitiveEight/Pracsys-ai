@@ -46,6 +46,7 @@ __all__ = [
     '_mint_item_id',
     '_normalize_match_text',
     'find_ungrounded_proper_nouns',
+    'find_dropped_case_figures',
     '_strip_strength_point_statute_boilerplate',
     '_annexure_wording_for_next_steps',
     '_clamp_annexure_references',
@@ -463,6 +464,100 @@ def find_ungrounded_proper_nouns(
         if len(flagged) >= max_results:
             break
     return flagged
+
+
+#: Magnitude words that make even a one- or two-digit number a case fact
+#: ("6 lakh", "18%"). Without these the significance filter below would let
+#: "6 lakh" vs "16 lakh" — the exact confusion the user-fact ledger exists to
+#: pin — slip through unnoticed.
+_FIGURE_MAGNITUDE_WORDS = (
+    "lakh", "lakhs", "crore", "crores", "thousand", "million", "billion",
+    "percent", "per cent", "%", "hectare", "hectares", "acre", "acres",
+)
+
+#: A number as legal documents write it: digit groups with comma separators
+#: (Indian or Western) and an optional decimal tail — 11,64,000 / 1,000.50 /
+#: 0.263 / 2019.
+_FIGURE_TOKEN_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def _normalize_figure(raw: str) -> str:
+    """Comparable form of a written figure: separators dropped, trailing
+    zero-decimals dropped, leading zeros dropped. ``Rs. 11,64,000`` and
+    ``1164000`` compare equal; ``0.263`` keeps its decimal."""
+    cleaned = (raw or "").replace(",", "").strip(" .")
+    if not cleaned:
+        return ""
+    if "." in cleaned:
+        cleaned = cleaned.rstrip("0").rstrip(".")
+    if not cleaned:
+        return "0"
+    intpart, _, frac = cleaned.partition(".")
+    intpart = intpart.lstrip("0") or "0"
+    return f"{intpart}.{frac}" if frac else intpart
+
+
+def _significant_figures(text: str) -> Dict[str, str]:
+    """Map normalized figure -> as-written form, for the figures in ``text``
+    that carry case meaning.
+
+    Significant means: at least three digits (amounts, years, suit numbers,
+    identifiers like Arazi No. 262) OR immediately followed by a magnitude
+    word. One- and two-digit numbers are otherwise skipped — "3 defendants"
+    or a day-of-month re-worded from ``03/04/2019`` to ``3 April 2019`` are
+    re-wordings, not dropped facts, and flagging them would veto every
+    legitimate re-frame.
+    """
+    found: Dict[str, str] = {}
+    if not text:
+        return found
+    lowered = text.lower()
+    for m in _FIGURE_TOKEN_RE.finditer(text):
+        raw = m.group(0).strip(" .,")
+        digits = raw.replace(",", "").replace(".", "")
+        if not digits:
+            continue
+        tail = lowered[m.end():m.end() + 12].lstrip(" \t")
+        significant = len(digits) >= 3 or any(
+            tail.startswith(w) for w in _FIGURE_MAGNITUDE_WORDS
+        )
+        if not significant:
+            continue
+        key = _normalize_figure(raw)
+        if key:
+            found.setdefault(key, raw)
+    return found
+
+
+def find_dropped_case_figures(
+    previous: str,
+    candidate: str,
+    *,
+    max_results: int = 12,
+) -> List[str]:
+    """Return the significant figures present in ``previous`` but missing from
+    ``candidate``.
+
+    The counterpart to :func:`find_ungrounded_proper_nouns`: that one catches
+    facts the model INVENTED, this one catches facts it DROPPED. Used when a
+    panel is re-framed rather than regenerated — a re-frame may re-order and
+    re-emphasise, but every amount, year, suit number and identifier the
+    previous text asserted must still be there. Comparison is on the
+    normalized form, so re-notation (``Rs. 11,64,000`` → ``1164000``) does not
+    count as a loss.
+    """
+    if not previous or not isinstance(previous, str):
+        return []
+    if not isinstance(candidate, str):
+        candidate = ""
+    kept = set(_significant_figures(candidate))
+    dropped: List[str] = []
+    for key, as_written in _significant_figures(previous).items():
+        if key not in kept:
+            dropped.append(as_written)
+        if len(dropped) >= max_results:
+            break
+    return dropped
 
 
 def _strip_strength_point_statute_boilerplate(text: str) -> str:

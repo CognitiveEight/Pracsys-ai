@@ -57,6 +57,11 @@ class CacheKinds:
     REMOVED_DOCUMENTS = "removed_documents"
     PROCEDURAL_TIMELINE = "procedural_timeline"
     CUSTOM_INSTRUCTIONS = "custom_instructions"
+    # Collaborator roster for a shared workspace, from workspace_sync's
+    # `participants`. Read on a cold workspace so an `askedBy` chat message
+    # arriving after a restart can still be resolved to a permission.
+    # Shape: [{"userId","name","permission"}, ...]
+    PARTICIPANTS = "participants"
     LIST_OF_DATES = "list_of_dates"
     WORKSPACE_METADATA_PAYLOAD = "workspace_metadata_payload"
     DOCUMENT_ASSESSMENTS = "document_assessments"
@@ -102,6 +107,7 @@ WORKSPACE_HYDRATION_KINDS = (
     CacheKinds.REMOVED_DOCUMENTS,
     CacheKinds.PROCEDURAL_TIMELINE,
     CacheKinds.CUSTOM_INSTRUCTIONS,
+    CacheKinds.PARTICIPANTS,
     CacheKinds.LIST_OF_DATES,
     CacheKinds.WORKSPACE_METADATA_PAYLOAD,
     CacheKinds.DOCUMENT_ASSESSMENTS,

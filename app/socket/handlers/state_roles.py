@@ -69,6 +69,7 @@ from app.workspace.custom_instructions import (build_custom_instruction_suffix,
                                                hydrate_custom_instructions_from_cache,
                                                set_custom_instructions)
 from app.workspace.manager import workspace_manager
+from app.workspace.participants import hydrate_participants_from_cache
 from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
                                        hydrate_workspace_state, persist_state,
                                        restore_state)
@@ -247,6 +248,17 @@ class StateRolesMixin:
         if isinstance(ci_payload, dict):
             try:
                 hydrate_custom_instructions_from_cache(workspace_id, ci_payload)
+            except Exception:
+                pass
+
+        # Collaborator roster (workspace sharing). Hydrated like custom
+        # instructions because it lives in a module-level dict, not in one of
+        # the handler's per-workspace caches above. Without it, a chat carrying
+        # askedBy after a restart would resolve against an empty roster.
+        participants_payload = cached_kinds.get(CacheKinds.PARTICIPANTS)
+        if participants_payload:
+            try:
+                hydrate_participants_from_cache(workspace_id, participants_payload)
             except Exception:
                 pass
 

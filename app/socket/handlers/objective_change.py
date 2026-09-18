@@ -1671,6 +1671,7 @@ class ObjectiveChangeMixin:
                 risks=merged.get("risks") or [],
                 strengths=merged.get("strengths") or [],
                 existing="",
+                strategic_objective=self._current_strategic_objective(workspace_id),
             )
         except Exception as expl_err:
             logger.warning(
@@ -1742,6 +1743,67 @@ class ObjectiveChangeMixin:
             new_analysis = self._analysis_report_fallback(
                 (workspace_role or "ADJUDICATOR").strip().upper()
             )
+
+        # The quality score measures readiness FOR AN OBJECTIVE, so when the
+        # objective changes the explanation of that score has to change with
+        # it — a lawyer who has just re-pointed the case and sees the same
+        # sentences reasonably concludes nothing happened.
+        #
+        # The regeneration above usually supplies a fresh one, but not always:
+        # the report JSON is long and `qualityScoreExplanation` is one of the
+        # first fields to be lost to truncation, in which case
+        # `_ensure_quality_score_explanation` had already filled it from an
+        # objective-blind pass over the gap lists — which can land on text
+        # identical to the previous objective's. So force the issue here:
+        # missing, or unchanged from the report we are replacing, means
+        # regenerate it WITH the new objective in hand.
+        if isinstance(new_analysis, dict):
+            try:
+                _prev_report = self._workspace_analysis_payload.get(workspace_id) or {}
+                _prev_expl = str(
+                    (_prev_report or {}).get("qualityScoreExplanation") or ""
+                ).strip()
+                _new_expl = str(
+                    new_analysis.get("qualityScoreExplanation") or ""
+                ).strip()
+                if not _new_expl or _new_expl == _prev_expl:
+                    try:
+                        _score = int(new_analysis.get("caseResolutionScore") or 0)
+                    except (TypeError, ValueError):
+                        _score = 0
+                    _objective_expl = await self._ensure_quality_score_explanation(
+                        workspace_role=workspace_role,
+                        case_resolution_score=_score,
+                        missing_info=new_analysis.get("missingInfo") or [],
+                        weaknesses=new_analysis.get("weaknesses") or [],
+                        risks=new_analysis.get("risks") or [],
+                        strengths=new_analysis.get("strengths") or [],
+                        existing="",
+                        strategic_objective=self._current_strategic_objective(
+                            workspace_id
+                        ),
+                    )
+                    if _objective_expl:
+                        new_analysis["qualityScoreExplanation"] = _objective_expl
+                        new_analysis["reportQualityScoreExplanation"] = (
+                            self._sanitize_report_quality_score_explanation(
+                                _objective_expl
+                            )
+                        ).strip()
+                        logger.info(
+                            "Objective-change analysis{}: quality score "
+                            "explanation regenerated for the new objective "
+                            "(was {})",
+                            ctx,
+                            "empty" if not _new_expl else "unchanged",
+                        )
+            except Exception as expl_err:
+                logger.warning(
+                    "Objective-change quality score explanation refresh "
+                    "failed{}: {}; keeping the regenerated report's own text",
+                    ctx,
+                    expl_err,
+                )
 
         # Tag the objective-aligned report against the frontend's currentState
         # so items that still textually match the previously-curated ones carry

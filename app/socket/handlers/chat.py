@@ -69,6 +69,7 @@ from app.workspace.custom_instructions import (build_custom_instruction_suffix,
                                                hydrate_custom_instructions_from_cache,
                                                set_custom_instructions)
 from app.workspace.manager import workspace_manager
+from app.workspace.participants import resolve_asker
 from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
                                        hydrate_workspace_state, persist_state,
                                        restore_state)
@@ -776,6 +777,27 @@ class ChatMixin:
             if workspace_id and workspace_id != "unknown":
                 await self._hydrate_workspace_caches(workspace_id, user_id=user_id)
 
+            # Workspace sharing: work out WHO typed this message. `userId`
+            # above is always the case OWNER — every owner-scoped cache (role,
+            # token usage, panels) stays keyed by it. `askedBy` is present only
+            # when a collaborator asked, and the roster cached from
+            # workspace_sync says whether that collaborator may change the case
+            # or only read it. Resolved after hydration so a cold process still
+            # sees the roster. See app/workspace/participants.py.
+            asker = resolve_asker(workspace_id, user_id, payload.askedBy)
+            if not asker.is_owner:
+                logger.info(
+                    "💬 Chat asked by a {} on shared workspace {} (owner remains {})",
+                    asker.log_label(),
+                    workspace_id,
+                    user_id,
+                )
+            # Read-only collaborators may ask anything, but must not mutate the
+            # case: panel edits, objective changes and role selection are all
+            # skipped for them and the reply says so.
+            mutations_allowed = asker.can_edit
+            read_only_notice: Optional[str] = None
+
             # Drafting Assistant short-circuit: when chat_type is
             # DRAFTING_ASSISTANT we hand the turn to the drafting agent
             # instead of running it through the general intelligence chat.
@@ -899,6 +921,25 @@ class ChatMixin:
                     workspace_id[:12] if workspace_id else "",
                     role_context["role"],
                 )
+
+            # A view-only collaborator must not be able to flip the workspace
+            # role: the role gate is the root of every derived panel
+            # (app/langgraph/role_agent.py), so this is the single most
+            # damaging write a shared-case reader could make. Drop the
+            # selection and let the turn continue as an ordinary question,
+            # with a notice appended to the reply.
+            if explicit_role_selection and not mutations_allowed:
+                logger.info(
+                    "Ignoring role selection '{}' from a read-only collaborator "
+                    "on workspace {}",
+                    explicit_role_selection,
+                    workspace_id,
+                )
+                read_only_notice = (
+                    "You have view-only access to this case, so I have not "
+                    "changed its role. Ask the case owner to change it."
+                )
+                explicit_role_selection = None
 
             # If the user explicitly sends a role name in chat, persist it on workspace context.
             if explicit_role_selection:
@@ -1205,6 +1246,17 @@ class ChatMixin:
             update_result = {"applied": False}
             objective_regen_ok = False
             objective_ack_kind: Optional[str] = None
+            # An objective change now RE-FRAMES the case summary as well (see
+            # _regenerate_strategy_for_new_objective), but the re-frame is
+            # discarded when it fails its fact checks. Snapshot the text here
+            # so the acknowledgement can name the case summary only when it
+            # actually moved — the same honesty rule the panel-edit ack follows.
+            _case_summary_at_turn_start = (
+                (self._workspace_strategy_payload.get(workspace_id) or {}).get(
+                    "caseSummary"
+                )
+                or ""
+            ).strip()
             implicit_objective_shift_text: Optional[str] = None
             # Defined here so the ack-builder below can read them even if the
             # try-block raises before the pre-dispatcher initialises them.
@@ -1321,6 +1373,27 @@ class ChatMixin:
                 )
                 if (
                     _maybe_edit
+                    and not mutations_allowed
+                    and not self._is_pure_informational_query(um_early)
+                ):
+                    # A read-only collaborator asked for an edit. Say so rather
+                    # than answering as though the panel had changed. The
+                    # informational-query guard matters more here than on the
+                    # owner path: there a loose `_maybe_edit` just wakes the
+                    # classifier and stays silent, whereas here it would put a
+                    # spurious refusal in front of an ordinary answer.
+                    logger.info(
+                        "Panel-edit intent from a read-only collaborator on "
+                        "workspace {} — not applied",
+                        workspace_id,
+                    )
+                    read_only_notice = (
+                        "You have view-only access to this case, so I have not "
+                        "changed any panel. Ask the case owner to make this edit."
+                    )
+                if (
+                    _maybe_edit
+                    and mutations_allowed
                     and isinstance(cur_strat_for_edit, dict)
                     and (cur_strat_for_edit.get("caseSummary") or "").strip()
                 ):
@@ -1477,13 +1550,18 @@ class ChatMixin:
                                             "drafting_assistant",
                                         ],
                                     )
-                                    _reassign_ok = await self._regenerate_strategy_objective_preserving_case_summary(
+                                    _reassign_ok = await self._regenerate_strategy_for_new_objective(
                                         workspace_id=workspace_id,
                                         user_id=user_id,
                                         workspace_role=_ws_role,
                                         user_objective_instruction=_reorient_instr,
                                         current_strategy=_cur_strat_reassign,
                                         confirmed_party=_confirmed_party,
+                                        # A role reassignment changes WHO is
+                                        # advocated for, not what the case is
+                                        # about — the summary's facts and its
+                                        # framing are both already right.
+                                        refresh_case_summary=False,
                                     )
                                     if _reassign_ok:
                                         objective_regen_ok = True
@@ -1684,7 +1762,7 @@ class ChatMixin:
                         if so_slot.get("shouldEdit") and so_slot.get("instruction"):
                             # Surgical edit: preserve everything except what
                             # the user named. The legacy
-                            # _regenerate_strategy_objective_preserving_case_summary
+                            # _regenerate_strategy_for_new_objective
                             # is intentionally NOT used here — its prompt is
                             # biased toward a full rewrite (labels current
                             # objective "to replace", caps output at 5-6
@@ -2092,6 +2170,7 @@ class ChatMixin:
                 # User said yes after we asked whether to update the objective (informal discussion flow)
                 if (
                     chat_type_upper == "STRATEGY_OBJECTIVE"
+                    and mutations_allowed
                     and is_user_affirmation_to_continue(um_early)
                     and not panel_edit_applied
                 ):
@@ -2131,7 +2210,7 @@ class ChatMixin:
                                 ],
                             )
                             regen_ok = (
-                                await self._regenerate_strategy_objective_preserving_case_summary(
+                                await self._regenerate_strategy_for_new_objective(
                                     workspace_id=workspace_id,
                                     user_id=user_id,
                                     workspace_role=(
@@ -2207,7 +2286,23 @@ class ChatMixin:
                             )
                             implicit_objective_shift_text = objective_instruction
                 if (
+                    objective_instruction
+                    and not mutations_allowed
+                    and not self._is_pure_informational_query(um_early)
+                ):
+                    logger.info(
+                        "Objective change from a read-only collaborator on "
+                        "workspace {} — not applied",
+                        workspace_id,
+                    )
+                    read_only_notice = (
+                        "You have view-only access to this case, so I have not "
+                        "changed the strategic objective. Ask the case owner to "
+                        "update it."
+                    )
+                if (
                     not objective_regen_ok
+                    and mutations_allowed
                     and objective_instruction
                     and (chat_type_upper == "STRATEGY_OBJECTIVE" or _objective_declared)
                     and not self._is_pure_informational_query(um_early)
@@ -2230,7 +2325,7 @@ class ChatMixin:
                             ],
                         )
                         objective_regen_ok = (
-                            await self._regenerate_strategy_objective_preserving_case_summary(
+                            await self._regenerate_strategy_for_new_objective(
                                 workspace_id=workspace_id,
                                 user_id=user_id,
                                 workspace_role=(
@@ -2248,14 +2343,17 @@ class ChatMixin:
                                 log_context=" (from direct objective instruction)",
                             )
 
-                update_result = await self._try_apply_intelligence_chat_panel_updates(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    combined_text=combined_text_for_updates,
-                    ignore_strategic_objective=bool(objective_regen_ok),
-                )
-                if update_result.get("applied"):
-                    logger.success("✅ Panel updates applied from chat message")
+                if mutations_allowed:
+                    update_result = (
+                        await self._try_apply_intelligence_chat_panel_updates(
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            combined_text=combined_text_for_updates,
+                            ignore_strategic_objective=bool(objective_regen_ok),
+                        )
+                    )
+                    if update_result.get("applied"):
+                        logger.success("✅ Panel updates applied from chat message")
             except Exception as upd_err:
                 logger.warning(
                     "Panel update attempt failed; continuing with generic chat. err={}",
@@ -2310,6 +2408,10 @@ class ChatMixin:
                 relevant_parties=parties_for_chat,
                 custom_instruction_suffix=custom_chat_suffix,
                 chat_history=chat_history_resolved,
+                # Attribution only when a collaborator (not the owner) asked.
+                # Never set for the owner, so the prompt is unchanged for the
+                # overwhelmingly common unshared case.
+                asked_by=None if asker.is_owner else asker.to_dict(),
             )
 
             # STEP 4: Process with Intelligence Chat Agent (skip when objective-only regen ran)
@@ -2323,6 +2425,27 @@ class ChatMixin:
                     "Skipping intelligence chat LLM (strategy objective regen emitted)"
                 )
                 ack_parts: List[str] = []
+                _case_summary_now = (
+                    (self._workspace_strategy_payload.get(workspace_id) or {}).get(
+                        "caseSummary"
+                    )
+                    or ""
+                ).strip()
+                _objective_ack = (
+                    (
+                        "I have updated the case summary, the strategic objective "
+                        "and possible next steps. "
+                        if (
+                            _case_summary_at_turn_start
+                            and _case_summary_now != _case_summary_at_turn_start
+                        )
+                        else "I have updated the strategic objective and possible "
+                        "next steps. "
+                    )
+                    + "I am refreshing the analysis report, list of dates, and "
+                    "applicable laws to align with this objective based on our "
+                    "discussion."
+                )
                 if objective_ack_kind == "panel_edit_direct" and (
                     panel_edit_applied or panel_edit_unchanged or panel_edit_failed
                 ):
@@ -2377,19 +2500,11 @@ class ChatMixin:
                         "and I will update the strategy and analysis panels."
                     )
                 elif objective_ack_kind == "followup_ok":
-                    ack_parts.append(
-                        "I have updated the strategic objective and possible next steps. "
-                        "I am refreshing the analysis report, list of dates, and applicable laws "
-                        "to align with this objective based on our discussion."
-                    )
+                    ack_parts.append(_objective_ack)
                 elif objective_ack_kind == "direct" or objective_regen_ok:
                     # Keep chat response short to avoid duplicating strategy panel payload
                     # that is already emitted via document_feature_response.
-                    ack_parts.append(
-                        "I have updated the strategic objective and possible next steps. "
-                        "I am refreshing the analysis report, list of dates, and applicable laws "
-                        "to align with this objective based on our discussion."
-                    )
+                    ack_parts.append(_objective_ack)
                 if isinstance(update_result, dict) and update_result.get("applied"):
                     extra = (update_result.get("response_text") or "").strip()
                     if extra:
@@ -2430,6 +2545,7 @@ class ChatMixin:
                 ).upper()
                 if (
                     chat_type_upper == "STRATEGY_OBJECTIVE"
+                    and mutations_allowed
                     and detected_intent_upper == "STRATEGY_CHANGE"
                     and not self._is_pure_informational_query(payload.content or "")
                 ):
@@ -2451,7 +2567,7 @@ class ChatMixin:
                             ],
                         )
                         regen_ok = (
-                            await self._regenerate_strategy_objective_preserving_case_summary(
+                            await self._regenerate_strategy_for_new_objective(
                                 workspace_id=workspace_id,
                                 user_id=user_id,
                                 workspace_role=(
@@ -2469,10 +2585,27 @@ class ChatMixin:
                             )
                             objective_regen_ok = True
                             objective_ack_kind = "direct"
+                            _cs_after = (
+                                (
+                                    self._workspace_strategy_payload.get(workspace_id)
+                                    or {}
+                                ).get("caseSummary")
+                                or ""
+                            ).strip()
                             response_text_to_emit = (
-                                "I have updated the strategic objective and possible next steps. "
-                                "I am refreshing the analysis report, list of dates, and applicable laws "
-                                "to align with this objective based on our discussion."
+                                (
+                                    "I have updated the case summary, the strategic "
+                                    "objective and possible next steps. "
+                                    if (
+                                        _case_summary_at_turn_start
+                                        and _cs_after != _case_summary_at_turn_start
+                                    )
+                                    else "I have updated the strategic objective and "
+                                    "possible next steps. "
+                                )
+                                + "I am refreshing the analysis report, list of dates, "
+                                "and applicable laws to align with this objective "
+                                "based on our discussion."
                             )
                             from types import SimpleNamespace
 
@@ -2499,7 +2632,7 @@ class ChatMixin:
                             except Exception:
                                 pass
                 # If assistant produced panel-update markers, apply them as well.
-                if objective_regen_ok:
+                if objective_regen_ok or not mutations_allowed:
                     ai_update_result = {"applied": False}
                 elif chat_type_upper != "STRATEGY_OBJECTIVE":
                     try:
@@ -2598,6 +2731,14 @@ class ChatMixin:
                             "Suggestion chips generation failed: {}", str(chip_err)
                         )
 
+            # A read-only collaborator asked for something we deliberately did
+            # not do. Lead with that, so the answer below is not mistaken for
+            # confirmation that the case changed.
+            if read_only_notice:
+                response_text_to_emit = (
+                    read_only_notice + "\n\n" + (response_text_to_emit or "").lstrip()
+                ).rstrip()
+
             # STEP 5: Build AI response payload (suggestionChips = random 4 from 10-12; click sends chip as next message)
             ai_response = AIResponsePayload(
                 chatId=chat_id,
@@ -2679,6 +2820,11 @@ class ChatMixin:
                     "response_length": len(response_text_to_emit),
                     "processing_time_ms": processing_time,
                     "intent": response.detected_intent,
+                    # Workspace sharing: who actually asked, and whether their
+                    # permission let this turn change the case.
+                    "asked_by_user_id": None if asker.is_owner else asker.user_id,
+                    "asker_permission": asker.permission,
+                    "mutations_allowed": mutations_allowed,
                 },
             )
 

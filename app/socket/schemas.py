@@ -154,6 +154,24 @@ class WorkspaceCurrentState(BaseModel):
     applicableLaws: Optional[List[CurrentStateLawItem]] = None
 
 
+class WorkspaceParticipant(BaseModel):
+    """
+    One collaborator on a SHARED workspace (workspace sharing).
+
+    Arrives inside ``workspace_sync.participants``. ``userId`` identifies the
+    collaborator; the workspace's own ``userId`` stays the case OWNER.
+    ``permission`` is ``edit`` or ``view`` — it is kept as a free string rather
+    than a Literal so an unrecognised value degrades to read-only (see
+    ``app/workspace/participants.py``) instead of rejecting the whole sync.
+    """
+
+    userId: str
+    name: Optional[str] = None
+    permission: Optional[str] = None  # "edit" | "view"
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
 class WorkspaceSyncPayload(BaseModel):
     """
     Schema for workspace_sync event (Server → AI_Maverick).
@@ -184,6 +202,10 @@ class WorkspaceSyncPayload(BaseModel):
     currentState: Optional[WorkspaceCurrentState] = (
         None  # Previously-curated panel state (present only on re-run triggers)
     )
+    # Collaborator roster. ABSENT ENTIRELY (not an empty array) when the case
+    # is not shared, which is how an un-share reaches this service — see
+    # `set_participants(..., authoritative=True)` in app/workspace/participants.py.
+    participants: Optional[List[WorkspaceParticipant]] = None
 
     class Config:
         populate_by_name = True
@@ -406,6 +428,22 @@ class ChatAttachmentPayload(BaseModel):
         extra = "ignore"
 
 
+class ChatAskedBy(BaseModel):
+    """
+    Who typed a chat message, when that is not the case owner.
+
+    Present on ``user_message_request`` ONLY for a shared workspace where a
+    collaborator asked the question. The payload's ``userId`` is unchanged (it
+    remains the OWNER), so this is purely additive: it drives attribution in
+    the reply and the read-only gate for ``view`` collaborators.
+    """
+
+    userId: str
+    name: Optional[str] = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
 class UserMessageRequestPayload(BaseModel):
     """
     Schema for user_message_request event (Server → AI_Maverick).
@@ -430,6 +468,10 @@ class UserMessageRequestPayload(BaseModel):
     attachment: Optional[ChatAttachmentPayload] = (
         None  # Document uploaded with this message (e.g. ANALYSIS_REPORT chat)
     )
+    askedBy: Optional[ChatAskedBy] = Field(
+        default=None,
+        validation_alias=AliasChoices("askedBy", "asked_by"),
+    )  # Set only when a shared-workspace collaborator (not the owner) asked.
 
     # Drafting Assistant fields. Optional; present on the kick-off turn when
     # the lawyer starts a draft from a template / suggestion / blank.

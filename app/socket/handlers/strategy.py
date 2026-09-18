@@ -104,6 +104,7 @@ from app.socket.event_utils import (
     _strip_ui_truncated_tokens,
     scrub_app_brand,
     _coerce_analysis_text_list,
+    find_dropped_case_figures,
     find_ungrounded_proper_nouns,
     _strip_strength_point_statute_boilerplate,
     _annexure_wording_for_next_steps,
@@ -122,7 +123,7 @@ from app.prompts.strategy_prompts import (
     generate_strategies_from_documents_prompt4,
     generate_strategies_from_documents_prompt5,
     generate_strategies_from_documents_prompt6,
-    regenerate_strategy_objective_preserving_case_summary_prompt,
+    regenerate_strategy_for_new_objective_prompt,
     reground_strategy_objective_prompt,
     regenerate_case_summary_with_feedback_prompt,
     regenerate_next_steps_with_feedback_prompt,
@@ -1288,7 +1289,7 @@ class StrategyMixin:
         return None
 
     @meter_usage
-    async def _regenerate_strategy_objective_preserving_case_summary(
+    async def _regenerate_strategy_for_new_objective(
         self,
         workspace_id: str,
         user_id: str,
@@ -1296,10 +1297,26 @@ class StrategyMixin:
         user_objective_instruction: str,
         current_strategy: Dict[str, Any],
         confirmed_party: Optional[str] = None,
+        refresh_case_summary: bool = True,
     ) -> bool:
         """
-        Regenerate strategicObjective, possibleNextSteps, and suggestionChips from the user's new
-        objective instruction. Keeps caseSummary and reportCaseSummary unchanged; emits strategy_objective.
+        Regenerate strategicObjective, possibleNextSteps and suggestionChips from the user's new
+        objective instruction, and (by default) RE-FRAME caseSummary + reportCaseSummary to match.
+        Emits strategy_objective.
+
+        ``refresh_case_summary`` — when True (an objective change), the two case summaries are
+        re-framed so they lead with the facts the new objective makes decisive. **Re-framing is
+        emphasis and ordering, never facts**: the case summary is defined as a fact-rich narrative
+        (named parties, exact amounts, dates, suit numbers, identifiers), and those facts belong to
+        the documents, not to the objective. Three things enforce that, because a prompt alone
+        would not: every figure in the previous summary must survive
+        (:func:`find_dropped_case_figures`), no new organisation/party/place may appear
+        (:func:`find_ungrounded_proper_nouns`), and either summary failing its check falls back to
+        the previous text while the new objective still lands. A model that returns no summary at
+        all is treated the same way — the existing text is kept.
+
+        Pass False where the trigger changes who is advocated for rather than what is being argued
+        (role reassignment): there the summary's facts and framing are both already correct.
 
         ``confirmed_party`` is the user-confirmed named party who holds the workspace role
         (from a role-reassignment). When set, it is injected as an authoritative anchor so the
@@ -1393,7 +1410,7 @@ class StrategyMixin:
             except Exception:
                 entities_block = "{}"
 
-            prompt = regenerate_strategy_objective_preserving_case_summary_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, case_summary=case_summary, combined_document_content=combined_document_content, current_strategy=current_strategy, report_case_summary=report_case_summary, role=role, user_objective_instruction=user_objective_instruction, entities_block=entities_block, confirmed_party=confirmed_party)
+            prompt = regenerate_strategy_for_new_objective_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, case_summary=case_summary, combined_document_content=combined_document_content, current_strategy=current_strategy, report_case_summary=report_case_summary, role=role, user_objective_instruction=user_objective_instruction, entities_block=entities_block, confirmed_party=confirmed_party, refresh_case_summary=refresh_case_summary)
 
             # Authoritative user corrections lead the prompt so they
             # outrank the document content they contradict.
@@ -1429,6 +1446,106 @@ class StrategyMixin:
                 for s in possible_next_steps
                 if s
             ][:5]
+
+            # ---------------------------------------------------------------
+            # Re-framed case summaries (objective change only).
+            #
+            # A new objective changes which facts matter, so the summary that
+            # leads every downstream prompt should lead with those facts. It
+            # does NOT change what the facts ARE — the summary is the
+            # fact-of-record narrative and the analysis report, list of dates
+            # and applicable laws are all derived from it. So each candidate
+            # has to earn its way in: keep every figure the previous text
+            # asserted, introduce no organisation/party/place the case does not
+            # have, and keep the mandated opening. A candidate that fails any
+            # of those is discarded and the previous summary stands — the
+            # objective still updates either way, which is the part the lawyer
+            # actually asked for.
+            # ---------------------------------------------------------------
+            new_case_summary = ""
+            new_report_case_summary = ""
+            if refresh_case_summary:
+                summary_allowed_texts = [
+                    combined_document_content,
+                    user_objective_instruction,
+                    entities_block,
+                    case_summary,
+                    report_case_summary,
+                ]
+
+                def _accept_summary(
+                    candidate: Any,
+                    previous: str,
+                    *,
+                    label: str,
+                    required_opening: str,
+                ) -> str:
+                    """Return the candidate if it is a safe re-frame of
+                    ``previous``, else "" (caller keeps ``previous``)."""
+                    text = (candidate or "").strip() if isinstance(candidate, str) else ""
+                    if not text or not previous:
+                        return ""
+                    if text == previous:
+                        return ""  # unchanged: nothing to emit, not a failure
+                    if not text.lower().startswith(required_opening.lower()):
+                        logger.warning(
+                            "Objective regen: re-framed {} dropped its required "
+                            "opening — keeping the previous text (workspace {})",
+                            label,
+                            workspace_id[:12] if workspace_id else "",
+                        )
+                        return ""
+                    dropped = find_dropped_case_figures(previous, text)
+                    if dropped:
+                        logger.warning(
+                            "Objective regen: re-framed {} dropped figure(s) {} — "
+                            "keeping the previous text (workspace {})",
+                            label,
+                            dropped,
+                            workspace_id[:12] if workspace_id else "",
+                        )
+                        return ""
+                    invented = find_ungrounded_proper_nouns(
+                        text, summary_allowed_texts
+                    )
+                    if invented:
+                        logger.warning(
+                            "Objective regen: re-framed {} introduced ungrounded "
+                            "entities {} — keeping the previous text (workspace {})",
+                            label,
+                            invented,
+                            workspace_id[:12] if workspace_id else "",
+                        )
+                        return ""
+                    return text
+
+                new_case_summary = _accept_summary(
+                    data.get("caseSummary"),
+                    case_summary,
+                    label="caseSummary",
+                    required_opening="This case is about",
+                )
+                new_report_case_summary = _accept_summary(
+                    data.get("reportCaseSummary"),
+                    report_case_summary,
+                    label="reportCaseSummary",
+                    required_opening="This matter is about",
+                )
+                # The two summaries must state the same facts. If only one
+                # survived its checks, re-framing one and not the other would
+                # leave them inconsistent, so neither is taken.
+                if bool(new_case_summary) != bool(new_report_case_summary):
+                    # Unless the workspace never had a reportCaseSummary to
+                    # begin with — then caseSummary alone is the whole record.
+                    if report_case_summary:
+                        logger.warning(
+                            "Objective regen: only one of the two case summaries "
+                            "re-framed cleanly — keeping both previous texts "
+                            "(workspace {})",
+                            workspace_id[:12] if workspace_id else "",
+                        )
+                        new_case_summary = ""
+                        new_report_case_summary = ""
 
             # Deterministic anti-fabrication backstop: the objective must not
             # name any organisation/body/place absent from the documents,
@@ -1546,9 +1663,11 @@ class StrategyMixin:
                 )[:5]
 
             merged = dict(current_strategy)
-            merged["caseSummary"] = current_strategy.get("caseSummary", case_summary)
-            merged["reportCaseSummary"] = current_strategy.get(
-                "reportCaseSummary", report_case_summary
+            merged["caseSummary"] = new_case_summary or current_strategy.get(
+                "caseSummary", case_summary
+            )
+            merged["reportCaseSummary"] = new_report_case_summary or (
+                current_strategy.get("reportCaseSummary", report_case_summary)
             )
             merged["strategicObjective"] = strategic_objective
             merged["possibleNextSteps"] = possible_next_steps
@@ -1573,7 +1692,8 @@ class StrategyMixin:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ Strategy objective regen emitted (case summary preserved) workspace={}",
+                    "✅ Strategy objective regen emitted (case summary {}) workspace={}",
+                    "re-framed" if new_case_summary else "preserved",
                     workspace_id[:12] if workspace_id else "",
                 )
             return True
@@ -1927,12 +2047,13 @@ class StrategyMixin:
         suggestionChips byte-for-byte. Updates cache and emits
         document_feature_response with featureType=strategy_objective.
 
-        Distinct from _regenerate_strategy_objective_preserving_case_summary,
-        which is used by the legacy STRATEGY_OBJECTIVE chat_type flow when
-        the user DECLARES a brand-new objective (and therefore needs the
-        next steps + chips to refresh). This surgical variant assumes the
-        user wants the existing content reproduced verbatim except for the
-        specific change they named.
+        Distinct from _regenerate_strategy_for_new_objective, which is used
+        when the user DECLARES a brand-new objective (and therefore needs the
+        next steps + chips to refresh, and the case summaries re-framed).
+        This surgical variant assumes the user wants the existing content
+        reproduced verbatim except for the specific change they named — a
+        request to reword one line of the objective is not a new objective,
+        so the case summary must not move.
         """
         try:
             from app.ai.gemini_client import gemini_client

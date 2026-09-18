@@ -212,6 +212,24 @@ WORKSPACE CONTEXT (intelligence chat = impartial analyst):
 """
     context_sections.append(role_section)
 
+    # 1b. Who is asking (shared workspaces only). Present only when a
+    # collaborator, not the case owner, typed the message; absent for every
+    # unshared case, so the prompt is unchanged on the common path. Attribution
+    # and read/write status only — it must not change the legal analysis, and a
+    # collaborator is NOT a party to the dispute.
+    asked_by = chat_context.get("asked_by")
+    if isinstance(asked_by, dict) and asked_by.get("userId"):
+        asker_name = (asked_by.get("name") or "").strip() or "a collaborator"
+        access = "edit" if asked_by.get("canEdit") else "view-only"
+        context_sections.append(
+            f"""
+WHO IS ASKING:
+- This question was asked by {asker_name}, a collaborator on this shared case ({access} access), not the case owner.
+- You may address them by name. Their access level changes NOTHING about the legal analysis — answer exactly as you would for the owner.
+- Do not treat them as a party to the dispute; they are not evidence.
+"""
+        )
+
     # 2. Active Strategy
     active_strategy = chat_context.get("active_strategy")
     if active_strategy:

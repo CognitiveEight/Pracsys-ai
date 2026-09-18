@@ -7,8 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The quality score explanation is now objective-relative and always
+  refreshed by an objective change.** `_ensure_quality_score_explanation` takes
+  the current strategic objective and passes it to all three producers (the LLM
+  pass, the deterministic fallback, and the main analysis-report prompt), each of
+  which must state how the objective bears on the score. The objective-change
+  cascade forces the refresh when the regenerated report's explanation comes back
+  empty or unchanged — the case that used to leave stale text on screen, since
+  `qualityScoreExplanation` is among the first fields lost to JSON truncation and
+  the generic refill is objective-blind. `reportQualityScoreExplanation` is
+  re-derived alongside it. The objective is also threaded through the
+  `analysis_report_feedback`, `added_missing_information` and `workspace_sync`
+  merge regenerations.
+- **An objective change now updates the Case Summary as well.** Declaring a new
+  strategic objective re-frames `caseSummary` and `reportCaseSummary` alongside
+  the objective, next steps and chips, in one call and one coalesced
+  `strategy_objective` emit (`_regenerate_strategy_for_new_objective`, renamed
+  from `_regenerate_strategy_objective_preserving_case_summary`).
+
+  Re-framing is emphasis and ordering, **never facts** — the summary is the
+  fact-of-record narrative every other panel's prompt is built on. Three
+  deterministic checks enforce it: every figure in the previous summary must
+  survive (new `find_dropped_case_figures`), no new organisation/party/place may
+  appear (`find_ungrounded_proper_nouns`), and the mandated opening must be
+  intact. A candidate failing any check is discarded and the previous text
+  stands; the new objective lands either way, and the chat acknowledgement names
+  the case summary only when it actually moved.
+
+  Unchanged: **role reassignment** still locks both summaries
+  (`refresh_case_summary=False`), and a **surgical** objective edit
+  (`_regenerate_strategic_objective_with_feedback`) still preserves them
+  byte-for-byte.
+
 ### Added
 
+- `verify_objective_change.py` — offline verification of the re-frame and
+  of every case in which it must be refused.
+
+- **Workspace sharing.** Two new optional inbound fields, neither of which
+  changes `userId` (it stays the case OWNER on both, so owner-scoped caches keep
+  their key):
+  - `workspace_sync.participants` — `[{userId, name, permission}]`, permission
+    `edit` or `view`. Absent entirely (not `[]`) when the case is not shared, so
+    an absent field on `workspace_sync` is read as *un-shared* and drops the
+    roster. `workspace_version_restore` inherits the field but is not
+    authoritative over it.
+  - `user_message_request.askedBy` — `{userId, name}`, present only when someone
+    other than the owner typed the message.
+
+  The roster lives in `app/workspace/participants.py` (`CacheKinds.PARTICIPANTS`,
+  hydrated on a cold workspace, cleared by the `workspace_deleted` purge).
+  `resolve_asker(...)` turns the pair into a permission: a `view` collaborator
+  gets the same analysis for any question, but chat-driven **writes** are
+  skipped — panel edits, fact corrections, the objective-change cascade,
+  AI-marker panel updates and role selection — and the reply says so instead of
+  implying the change landed. The asker also reaches the chat prompt as a short
+  attribution block; participants are app users, not parties to the dispute, so
+  they are kept out of every other prompt.
+- `verify_workspace_share.py` — offline verification of the sharing path
+  (schemas, roster lifecycle, permission resolution, and end-to-end viewer /
+  editor / owner chat behaviour).
 - **User-asserted fact ledger.** A fact the lawyer corrects in chat ("the disputed
   amount is 6 lakh USD, not 16 lakh") is now pinned per workspace
   (`CacheKinds.USER_ASSERTED_FACTS`, `app/socket/handlers/user_facts.py`). Every

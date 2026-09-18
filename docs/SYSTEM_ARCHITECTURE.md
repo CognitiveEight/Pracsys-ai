@@ -57,9 +57,9 @@ The AI service is driven by **Socket.IO** events from the backend. Main events:
 | Event                        | Direction   | Purpose |
 |-----------------------------|------------|---------|
 | `workspace_created`         | Backend → AI | New workspace: init role, process evidence files, generate the full feature suite |
-| `workspace_sync`            | Backend → AI | Workspace updated: re-run doc processing / regeneration when docs change |
+| `workspace_sync`            | Backend → AI | Workspace updated: re-run doc processing / regeneration when docs change. Also carries `participants` — the sharing roster (§4.2b) |
 | `workspace_version_restore` | Backend → AI | Workspace rolled back to an earlier document version: reconcile the vector store to that version and regenerate every panel |
-| `user_message_request`      | Backend → AI | User chat message: build context, run Intelligence Chat Agent (or the Drafting Assistant when `chat_type="DRAFTING_ASSISTANT"`), return reply |
+| `user_message_request`      | Backend → AI | User chat message: build context, run Intelligence Chat Agent (or the Drafting Assistant when `chat_type="DRAFTING_ASSISTANT"`), return reply. `askedBy` names a non-owner asker on a shared case (§4.2b) |
 | `template_sync`             | Backend → AI | Lawyer's template library changed (uploaded / renamed / deleted) |
 | `add_case_law`              | Backend → AI | Add a precedent by citation / URL / pasted text ("Add Case Law" button) |
 | `case_law_document_request` | Backend → AI | Lawyer uploaded a judgment file (GCS); classify + extract it, reply with `case_law_document_response` |
@@ -271,14 +271,18 @@ A chat message in the Strategy & Objective panel is routed into one of three int
 
 1. **Informational question** → answered normally; no panel changes.
 2. **Mode 1 — surgical name / term / date / year edit** (`isRename` or a per-panel edit slot). The correction is applied as an exhaustive, workspace-wide **find-and-replace over EXISTING content** across all panels — Case Summary, Report Summary, Strategic Objective, Possible Next Steps, Analysis Report, List of Dates, Applicable Laws, Upcoming Dates — with **no regeneration** (no new/removed dates, laws, or items). A NAME is applied **semantically** (a party referenced by role/description is named correctly even where it appears as "the Petitioner"); a DATE/YEAR correction also rewrites the ISO `date` field of List-of-Dates / Upcoming-Dates entries, while statute names and section numbers stay verbatim. The dispatch fans one instruction to every panel editor deterministically. The strategy fields emit a single coalesced `strategy_objective` payload; other panels emit their own `document_feature_response`. A **terminal-emit guard** re-emits the preserved cached payload for any doc-derived panel whose edit was a no-op (the token didn't appear there), so the loaders lit by `workspace:refresh` always clear.
-3. **Mode 2 — objective / case-perspective change** (`direct_update`). Declaring a new objective runs `_regenerate_strategy_objective_preserving_case_summary` then the cascade, which:
-   - **regenerates + REPLACES the Analysis Report** for the new objective (it does NOT merge with the prior report — a perspective change must drop the old framing and old quality score; `_merge_analysis_report_with_previous` is reserved for the document re-upload / `workspace_sync` paths);
+3. **Mode 2 — objective / case-perspective change** (`direct_update`). Declaring a new objective runs `_regenerate_strategy_for_new_objective` — which regenerates the objective, next steps and chips **and re-frames the Case Summary + Report Summary** (see below) — then the cascade, which:
+   - **regenerates + REPLACES the Analysis Report** for the new objective (it does NOT merge with the prior report — a perspective change must drop the old framing and old quality score; `_merge_analysis_report_with_previous` is reserved for the document re-upload / `workspace_sync` paths), and **guarantees a refreshed quality score explanation** (see below);
    - **re-scores List of Dates relevance** only (`_reeval_list_of_dates_relevance` — same entries, no new/removed dates);
    - **regenerates Applicable Laws** with the objective as the primary law-selection lens (`_generate_and_emit_applicable_laws(objective_context=…, merge_with_previous=False)`);
-   - **preserves and re-emits from cache** the Case Summary, Upcoming Dates (procedural timeline), **Relevant Parties**, **Case Laws**, and **Drafting suggestions** — who the parties are, which precedents were found/uploaded, the court dates, and the template library don't change with the legal objective; those panels regenerate only on document add/delete.
+   - **preserves and re-emits from cache** Upcoming Dates (procedural timeline), **Relevant Parties**, **Case Laws**, and **Drafting suggestions** — who the parties are, which precedents were found/uploaded, the court dates, and the template library don't change with the legal objective; those panels regenerate only on document add/delete.
+
+   **Case Summary re-framing.** A new objective changes which facts are decisive, so the Case Summary and Report Summary are re-framed to lead with them, in the SAME call that produces the new objective (they ride the one coalesced `strategy_objective` emit). Re-framing is **emphasis and ordering, never facts**: the summary is the fact-of-record narrative that every other panel's prompt is built on, and its facts belong to the documents, not to the objective. Three deterministic checks enforce that in `_regenerate_strategy_for_new_objective`, because the prompt alone would not — every figure in the previous summary must survive (`find_dropped_case_figures`), no new organisation/party/place may appear (`find_ungrounded_proper_nouns`), and the mandated opening (`This case is about…` / `This matter is about…`) must be intact. A candidate that fails any check is discarded and the previous summary stands, and because the two summaries must state the same facts, one failing holds the other back too. **The new objective lands either way** — the re-frame is best-effort on top of it. The chat acknowledgement names the Case Summary only when it actually moved. `refresh_case_summary=False` restores the old lock-verbatim behaviour and is used by the **role-reassignment** caller, where the trigger changes who is advocated for rather than what is being argued. A **surgical** objective edit ("reword that line") is a different function, `_regenerate_strategic_objective_with_feedback`, and still leaves the summaries byte-for-byte.
+   **Quality score explanation.** The score measures readiness *for an objective*, so the explanation of it moves when the objective moves — a lawyer who has just re-pointed the case and sees the same sentences concludes nothing happened. Two changes make that hold. First, the explanation is **objective-aware everywhere it is produced**: `_ensure_quality_score_explanation` takes the current objective (read from the strategy cache via `_current_strategic_objective`, since the analysis report never carries `strategicObjective`) and passes it to the LLM pass, the deterministic fallback (`_objective_clause_for_explanation`) and the main report prompt, each of which must state how the objective bears on the score. Second, the cascade **forces** the refresh: if the regenerated report's explanation is missing, or byte-identical to the report being replaced, it is regenerated with the new objective in hand and `reportQualityScoreExplanation` is re-derived from it. That second step matters because `qualityScoreExplanation` is one of the first fields lost to JSON truncation, and the generic refill that covers for it is objective-blind. The same objective is now also threaded through the `analysis_report_feedback` and `added_missing_information` regenerations, and through the `workspace_sync` merge.
+
    An up-front `workspace:refresh` (`reason="objective_change_regeneration_started"`) shows the loader across the affected panels; every preserved panel re-emits its cached payload as the terminal state so no loader is left stuck (a failed regeneration also falls back to a cached-or-empty terminal emit).
 
-So a name correction stays surgical and consistent everywhere, while an objective change re-derives the objective-dependent intelligence (objective, analysis, score, laws) and leaves the document-derived panels stable.
+So a name correction stays surgical and consistent everywhere, while an objective change re-derives the objective-dependent intelligence (objective, summaries' framing, analysis, score, laws) and leaves the document-derived panels stable.
 
 **Document deletion** (a `workspace_sync` with removed docs) is the opposite of an objective change: the derived panels must reflect the reduced document set, so the regenerated Analysis Report **replaces** the previous one and the web-search-derived panels (Case Laws, Applicable Laws) are re-derived with `merge_with_previous=False`; uploads keep the merge/accumulate behaviour.
 
@@ -389,11 +393,52 @@ Caches (`_workspace_document_assessments_payload`, `_workspace_strategy_payload`
 
 Similar to workspace_created but triggered when workspace is updated (e.g. new or removed documents). Handler decides whether to re-run document processing; if docs changed, it runs batch processing, then regenerates strategy, analysis report, list_of_dates, and applicable_laws and re-emits the same `document_feature_response` types. Strategy run uses `is_update=True`.
 
+### 4.2b Workspace sharing (participants / askedBy)
+
+A case owner can share a workspace with other users. Two additive fields carry
+that to this service, and **`userId` never changes** on either — it stays the
+case OWNER, so every owner-scoped cache (role, cumulative token usage, panel
+payloads) keeps its existing key.
+
+- **`workspace_sync.participants`** — `[{userId, name, permission}]`, permission
+  `edit` or `view`. **Absent entirely (not an empty array) when the case is not
+  shared**, so on `workspace_sync` an absent field is read as *un-shared* and
+  drops the roster; keeping a stale one would leave a removed collaborator with
+  edit rights. `workspace_version_restore` inherits the field but is **not**
+  authoritative — it is a document-version operation and says nothing about
+  sharing, so an absent field there leaves the roster alone.
+- **`user_message_request.askedBy`** — `{userId, name}`, present only when
+  someone **other than the owner** typed the message.
+
+The roster lives in `app/workspace/participants.py` (module-level, write-through
+to Qdrant as `CacheKinds.PARTICIPANTS`, hydrated on a cold workspace, cleared by
+the `workspace_deleted` purge — participant names are personal data). It exists
+to answer one question, via `resolve_asker(...)`: **may this person change the
+case, or only read it?**
+
+A `view` collaborator may ask anything and gets the same analysis, but every
+chat-driven mutation is skipped for them and the reply says so instead of
+implying the change landed: surgical panel edits, fact corrections, the
+objective-change cascade, AI-marker panel updates, and role selection (the role
+gate is the root of all derived intelligence, so it is the most damaging write a
+reader could make). An asker who is not on a roster we *do* have is treated as
+read-only; an asker on a workspace with **no** roster cached is allowed to edit
+and logged — the sharing sync simply may not have reached this process yet, and
+failing closed there would break every collaborator on a case we have not seen.
+
+Participants are **application users, not parties to the dispute**. They are
+deliberately kept out of every legal prompt (they would corrupt
+`relevant_parties`, which is extracted from evidence). The only prompt exposure
+is a short `WHO IS ASKING` attribution block naming the collaborator and their
+access level, which explicitly instructs the model that access level changes
+nothing about the analysis.
+
 ### 4.3 user_message_request
 
 ```
-Backend emits user_message_request (chatId, workspaceId, userId, content, conversation_history, attachment?)
+Backend emits user_message_request (chatId, workspaceId, userId, content, conversation_history, attachment?, askedBy?)
     → Socket handler (on_user_message_request)
+    → resolve_asker(workspaceId, userId, askedBy) → owner | collaborator(edit|view)
     → workspace_manager.get_workspace(workspace_id) → role, role_context
 
     [if chat_type == "DRAFTING_ASSISTANT" — Drafting Assistant short-circuit]

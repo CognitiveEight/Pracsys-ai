@@ -103,11 +103,16 @@ ROSTER = [
 
 
 class _FakeSocket:
+    # Both return True: SocketClient.emit reports DELIVERY, and a double that
+    # returns None reads as "the socket dropped it", which makes the handlers
+    # buffer for re-delivery and report failure.
     async def emit(self, event, payload):
         EMITS.append((event, payload))
+        return True
 
     async def emit_ai_response(self, payload):
         EMITS.append(("ai_response", payload))
+        return True
 
 
 H._socket_client = _FakeSocket()

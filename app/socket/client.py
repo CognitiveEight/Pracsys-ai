@@ -302,18 +302,24 @@ class SocketClient:
             except Exception as e:
                 logger.error("Error during disconnect: {}", str(e))
 
-    async def emit(self, event: str, data: Dict[str, Any]) -> None:
+    async def emit(self, event: str, data: Dict[str, Any]) -> bool:
         """
         Emit an event to the server. If socket is disconnected or emit fails (e.g. namespace
         closed), logs and returns without raising so long-running handlers can cache and re-emit
         after reconnect.
+
+        Returns ``True`` only when the payload was handed to the socket, ``False`` on every
+        skip/failure path. Callers that must not lose a payload (feature panels, chat
+        responses) use this to buffer it for re-delivery after reconnect — without it a
+        disconnect mid-generation silently discards the result and the frontend loader,
+        which is only ever cleared by the arrival of that payload, spins forever.
         """
         if not self.sio:
             logger.warning(
                 "Socket client not initialized; skipping emit for event: {}",
                 event,
             )
-            return
+            return False
 
         # If temporarily disconnected, wait briefly for reconnection.
         if not self._connected:
@@ -335,19 +341,20 @@ class SocketClient:
                     wait_timeout,
                     event,
                 )
-                return
+                return False
 
         # Now we consider ourselves connected for emitting.
         if not self._connected:
             logger.warning(
                 "Socket connection state not ready; skipping emit for event: {}", event
             )
-            return
+            return False
         try:
             logger.info(f"📤 Emitting event: {event}")
             await self.sio.emit(event, data, namespace=settings.socket_namespace)
             logger.success(f"✅ Event emitted successfully: {event}")
             logger.debug("Event data: {}", data)
+            return True
         except Exception as e:
             err_msg = str(e)
             logger.error("Failed to emit event {}: {}", event, err_msg)
@@ -363,19 +370,24 @@ class SocketClient:
                 except Exception:
                     pass
             # Do not raise: allow caller to cache payload and re-emit after reconnect
+            return False
 
-    async def emit_ai_response(self, data: Dict[str, Any]) -> None:
+    async def emit_ai_response(self, data: Dict[str, Any]) -> bool:
         """
         Emit AI response to the server using ai_response event.
         If socket is disconnected, logs and returns without raising so chat handler does not crash.
         After emit, briefly yields so the socket can flush the payload (reduces disconnect-before-delivery).
+
+        Returns ``True`` only on a confirmed hand-off to the socket, so callers can buffer
+        the payload for re-delivery instead of inferring delivery from the absence of an
+        exception (the silent-skip paths below raise nothing).
         """
         if not self.sio:
             logger.warning(
                 "Socket client not initialized; skipping ai_response for chat: {}",
                 data.get("chatId"),
             )
-            return
+            return False
 
         if not self._connected:
             wait_timeout = (
@@ -396,11 +408,11 @@ class SocketClient:
                     wait_timeout,
                     data.get("chatId"),
                 )
-                return
+                return False
 
         if not self._connected:
             # Safety check
-            return
+            return False
         try:
             await self.sio.emit(
                 "ai_response", data, namespace=settings.socket_namespace
@@ -408,6 +420,7 @@ class SocketClient:
             logger.success("✅ Emitted ai_response for chat: {}", data.get("chatId"))
             logger.debug("AI response data: {}", data)
             await asyncio.sleep(0.25)
+            return True
         except Exception as e:
             logger.error("Failed to emit ai_response: {}", str(e))
             raise
@@ -467,6 +480,7 @@ class SocketClient:
         - workspace_created: New workspace created
         - workspace_sync: Workspace updated
         - workspace_version_restore: Workspace restored to an earlier document version
+        - document_reload_request: One document re-read on user request
         - user_message_request: User sent chat message
         """
 
@@ -500,6 +514,7 @@ class SocketClient:
             logger.info("   - workspace_sync")
             logger.info("   - workspace_version_restore")
             logger.info("   - workspace_transferred")
+            logger.info("   - document_reload_request")
             logger.info("   - workspace_deleted")
             logger.info("   - user_message_request")
             logger.info("   - probing_prompts_request")
@@ -687,6 +702,30 @@ class SocketClient:
                     "📥 workspace_transferred RAW payload (repr): {}", repr(data)
                 )
             await event_handler.handle("workspace_transferred", data)
+
+        @self.sio.event
+        async def document_reload_request(data):
+            """
+            Handle document_reload_request event (Server → AI_Maverick).
+            The user (or the backend, on a poor-quality document) asked for ONE
+            document to be read again: the AI purges everything it holds for
+            that file, re-fetches the freshly-signed URL, and re-runs the
+            workspace features over the full evidenceFiles set.
+            """
+            logger.info("♻️ Received document_reload_request event")
+            try:
+                import json
+
+                raw = json.dumps(data, default=str) if data is not None else "null"
+                logger.info(
+                    "📥 document_reload_request RAW payload: {}",
+                    raw[:2000] + ("..." if len(raw) > 2000 else ""),
+                )
+            except Exception:
+                logger.info(
+                    "📥 document_reload_request RAW payload (repr): {}", repr(data)
+                )
+            await event_handler.handle("document_reload_request", data)
 
         @self.sio.event
         async def user_message_request(data):

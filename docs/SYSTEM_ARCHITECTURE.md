@@ -59,6 +59,7 @@ The AI service is driven by **Socket.IO** events from the backend. Main events:
 | `workspace_created`         | Backend → AI | New workspace: init role, process evidence files, generate the full feature suite |
 | `workspace_sync`            | Backend → AI | Workspace updated: re-run doc processing / regeneration when docs change. Also carries `participants` — the sharing roster (§4.2b) |
 | `workspace_version_restore` | Backend → AI | Workspace rolled back to an earlier document version: reconcile the vector store to that version and regenerate every panel |
+| `document_reload_request`    | Backend → AI | One document re-read on request ("reload" in Supporting Material, or a poor-quality score): purge everything held for that file, re-fetch and re-extract it, regenerate every panel |
 | `user_message_request`      | Backend → AI | User chat message: build context, run Intelligence Chat Agent (or the Drafting Assistant when `chat_type="DRAFTING_ASSISTANT"`), return reply. `askedBy` names a non-owner asker on a shared case (§4.2b) |
 | `template_sync`             | Backend → AI | Lawyer's template library changed (uploaded / renamed / deleted) |
 | `add_case_law`              | Backend → AI | Add a precedent by citation / URL / pasted text ("Add Case Law" button) |
@@ -94,6 +95,55 @@ and reported as `analysis_report.missingInfo` gaps; re-ingesting the same
 own 180 s window — restoring back to a recently-live version must not be
 mistaken for a `workspace_sync` replay.
 
+### `document_reload_request` payload contract
+
+```jsonc
+{
+  "requestId": "dlr_9f2e7c1a_1758067200000",  // de-dupes retries / reconnect re-sends
+  "workspaceId": "…", "userId": "…",          // userId is always the case OWNER
+  "workspaceRole": "PETITIONER",
+  "reason": "user_requested",                 // 'user_requested' | 'poor_quality'
+  "targetFile": {                             // the document being RE-READ
+    /* EvidenceFilePayload, same fileHash as before, freshly-signed url */
+    "previousQualityScore": 27                // advisory; null if never scored
+  },
+  "evidenceFiles": [ /* every ACTIVE file — no soft-deleted entries */ ],
+  "currentState": { /* WorkspaceCurrentState — MANDATORY on this event */ },
+  "participants": [ /* shared cases only; context, access is enforced by BE */ ],
+  "timestamp": "2026-09-17T…"
+}
+```
+
+Handled by `app/socket/handlers/document_reload.py`. A reload is a **re-read,
+not a delete plus an upload**: the document keeps its id, so the handler
+resolves that id from the payload (`targetFile._id` → the `evidenceFiles` entry
+with the same `fileHash` → `storeFileName`/`path` → a unique filename match in
+the cached assessments manifest) and **abandons the reload rather than
+inventing one** — a fabricated id creates a second copy in Qdrant that no later
+delete or sync can reach.
+
+Four rules:
+
+- **Purge before re-fetch.** The document's vectors are deleted and its entry
+  pruned from the cached `document_assessments` manifest *before* re-ingestion,
+  so no prompt is ever built on the stale copy the reload exists to replace.
+- **A successful reload is not a removal.** The removed-evidence ledger is
+  written **only when the re-read fails** (the document really is out of
+  evidence then, and the `missingInfo` gap is the honest report) and cleared via
+  `_forget_removed_documents` when it succeeds.
+- **`currentState` is mandatory.** The re-run replaces every panel, so it is
+  cached and the report tagged against it — otherwise the reload wipes the
+  items the lawyer approved or rejected.
+- **Re-sends are expected.** The backend re-sends on a stall or reconnect under
+  the same `requestId`: a re-send is swallowed while the first attempt is in
+  flight or shortly after it succeeded, but a re-send after a **failed** attempt
+  re-runs, because nothing else would ever retry it.
+
+Scoped to the one document: drift between `evidenceFiles` and the live vector
+store is logged, never acted on — reconciling the whole workspace is
+`workspace_sync`'s job and would spend the user's money on work they did not
+ask for. Offline coverage: `verify_document_reload.py`.
+
 **Outbound (AI → Backend):**
 
 | Event                      | When |
@@ -101,7 +151,7 @@ mistaken for a `workspace_sync` replay.
 | `document_feature_response` | Feature payloads — `featureType` ∈ `document_assessments`, `workspace_metadata`, `strategy_objective`, `analysis_report`, `list_of_dates`, `applicable_laws`, `procedural_timeline`, `case_laws`, `relevant_parties`, `drafting_assistant` |
 | `ai_response`              | After processing a user chat message (augmented with draft fields for the drafting assistant) |
 | `case_law_document_response` | Accept/reject verdict for an uploaded judgment; echoes `requestId`, always terminal |
-| `workspace:refresh`        | Turns on frontend loaders before a regeneration cascade (e.g. an objective change) |
+| `workspace:refresh`        | Turns on frontend loaders before a regeneration cascade (e.g. an objective change). Carries `featureTypes`, `reason` and a `refreshId` for log correlation. **Arming is one-way:** a panel's loader is cleared ONLY by a later `document_feature_response` for the same `featureType` — there is no "refresh done" event and no client-side timeout, so every path that arms a loader must pair it with a terminal emit (see §3.7a) |
 
 ---
 
@@ -281,6 +331,23 @@ A chat message in the Strategy & Objective panel is routed into one of three int
    **Quality score explanation.** The score measures readiness *for an objective*, so the explanation of it moves when the objective moves — a lawyer who has just re-pointed the case and sees the same sentences concludes nothing happened. Two changes make that hold. First, the explanation is **objective-aware everywhere it is produced**: `_ensure_quality_score_explanation` takes the current objective (read from the strategy cache via `_current_strategic_objective`, since the analysis report never carries `strategicObjective`) and passes it to the LLM pass, the deterministic fallback (`_objective_clause_for_explanation`) and the main report prompt, each of which must state how the objective bears on the score. Second, the cascade **forces** the refresh: if the regenerated report's explanation is missing, or byte-identical to the report being replaced, it is regenerated with the new objective in hand and `reportQualityScoreExplanation` is re-derived from it. That second step matters because `qualityScoreExplanation` is one of the first fields lost to JSON truncation, and the generic refill that covers for it is objective-blind. The same objective is now also threaded through the `analysis_report_feedback` and `added_missing_information` regenerations, and through the `workspace_sync` merge.
 
    An up-front `workspace:refresh` (`reason="objective_change_regeneration_started"`) shows the loader across the affected panels; every preserved panel re-emits its cached payload as the terminal state so no loader is left stuck (a failed regeneration also falls back to a cached-or-empty terminal emit).
+
+### 3.7a The loader contract, and surviving a disconnect mid-regeneration
+
+**The rule:** `workspace:refresh` arms a set of panel loaders and **nothing but a `document_feature_response` for the same `featureType` disarms them.** There is no completion event, no correlation echo and no client-side timeout. A path that arms a loader and then returns without emitting leaves that panel spinning for the rest of the session. The featureTypes an objective change arms live in one place, `OBJECTIVE_CHANGE_REFRESH_FEATURES` (`app/socket/event_utils.py`), precisely so the arming site and the release site cannot drift apart.
+
+This is not theoretical: on **2026-09-17** an objective change was accepted at 11:59:56 IST, the socket disconnected 25 s into a ~2-minute regeneration (the successful turn 40 minutes earlier took 116 s), and the work vanished — no `Strategy objective regen emitted`, no `Gemini generation error`, no cascade failure, no emit-skip warning. `asyncio.CancelledError` derives from `BaseException`, so the `except Exception` handlers on that path never saw the cancellation. Six loaders stayed lit with a single missing log line as the only evidence.
+
+Four mechanisms now make that recoverable, and they are ordered deliberately — the goal is that the **real generated output** reaches the user, not that a stale snapshot hides the failure:
+
+1. **Cancellation is explicit.** `_regenerate_strategy_for_new_objective` and `_schedule_objective_change_reanalysis`'s runner catch `asyncio.CancelledError` before `Exception`, log the stage reached, mark the work, release what they armed, and re-raise. Detached tasks go through `_track_background_task`, which holds a strong reference (asyncio holds only a weak one, so a discarded `create_task` handle can be collected mid-flight) and drains the exception through a done-callback.
+2. **Emits report delivery.** `SocketClient.emit` returns `bool` — `True` only once the payload reached the socket, `False` on every silent-skip path — and `_emit_document_feature` propagates it. An undelivered envelope is buffered per `(workspace_id, featureType)` in `CacheKinds.PENDING_FEATURE_DELIVERY` (persisted, because the disconnect that eats an emit is often what restarted the process) and re-sent by `_flush_pending_feature_deliveries` on reconnect, **before** `_do_reemit_after_reconnect` — otherwise the cached replay would ship the pre-change objective for the same featureType.
+3. **Work that produced nothing is re-run.** `CacheKinds.PENDING_OBJECTIVE_CHANGE` holds the instruction of an accepted-but-unfinished change; `_resume_pending_objective_changes` re-runs it once on reconnect (one attempt, 15-minute staleness cut-off). A change whose payload was merely *undelivered* is deliberately **not** re-run — only its cascade is scheduled.
+4. **A last-resort release.** `_release_refresh_loaders` (`app/socket/handlers/_shared.py`) emits the terminal state — preserved cached payload, else the feature's own minimal fallback — for every armed featureType that produced no emit. It is called from all four objective-change failure branches and from a `finally` in the cascade runner. It is a safety net, not the fix: the user is always told, via `OBJECTIVE_CHANGE_FAILED_MESSAGE`, that the objective did not change.
+
+Supporting changes: Gemini calls are bounded by `gemini_request_timeout_seconds` (default 300 s — the legitimate regeneration takes ~2 minutes); `is_generation_error()` stops a returned failure sentinel from masquerading as content (a 429 used to surface as "model returned no JSON"); and every give-up path logs a reason code plus an `objective_change_failed` audit event.
+
+**When you add a path that arms `workspace:refresh`,** pair it with a `_release_refresh_loaders` call on every branch that can exit without emitting — including the cancellation branch. Offline coverage: `verify_objective_change.py` group 12.
 
 So a name correction stays surgical and consistent everywhere, while an objective change re-derives the objective-dependent intelligence (objective, summaries' framing, analysis, score, laws) and leaves the document-derived panels stable.
 

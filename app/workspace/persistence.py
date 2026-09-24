@@ -94,6 +94,21 @@ class CacheKinds:
     # previously-emitted, user-curated panel state used to tag regenerated items
     # as matched (carried over) vs new. See schemas.WorkspaceCurrentState.
     CURRENT_STATE = "current_state"
+    # Feature payloads that were GENERATED but never delivered, because the
+    # socket was down when the emit ran (SocketClient.emit skips silently). A
+    # panel loader is cleared only by the arrival of its
+    # document_feature_response, so an undelivered payload is a permanently
+    # stuck panel. Persisted, not just in-memory, because the disconnect that
+    # loses the emit is often the same event that restarts the process.
+    # Shape: {"<featureType>": {<document_feature_response envelope>}}
+    PENDING_FEATURE_DELIVERY = "pending_feature_delivery"
+    # An objective-change regeneration that was accepted but did not finish —
+    # cancelled with the socket turn, or timed out. There is no payload to
+    # re-deliver in that case, so the instruction itself is kept and re-run once
+    # on reconnect; otherwise the six loaders armed for it spin forever.
+    # Shape: {"userId","workspaceRole","instruction","featureTypes",
+    #         "attempts","startedAt"}
+    PENDING_OBJECTIVE_CHANGE = "pending_objective_change"
 
 
 # All workspace-scoped cache kinds we routinely read on hydrate.
@@ -117,6 +132,8 @@ WORKSPACE_HYDRATION_KINDS = (
     CacheKinds.USER_ASSERTED_FACTS,
     CacheKinds.DRAFTING_SUGGESTIONS,
     CacheKinds.CURRENT_STATE,
+    CacheKinds.PENDING_FEATURE_DELIVERY,
+    CacheKinds.PENDING_OBJECTIVE_CHANGE,
 )
 
 

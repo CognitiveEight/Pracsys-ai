@@ -112,6 +112,7 @@ from app.socket.event_utils import (
 from app.socket.handlers import (
     JsonHelpersMixin,
     DocumentsMixin,
+    DocumentReloadMixin,
     StateRolesMixin,
     ExtractionMixin,
     StrategyMixin,
@@ -139,6 +140,7 @@ from app.socket.handlers import (
 class SocketEventHandler(
     JsonHelpersMixin,
     DocumentsMixin,
+    DocumentReloadMixin,
     StateRolesMixin,
     ExtractionMixin,
     StrategyMixin,
@@ -318,6 +320,32 @@ class SocketEventHandler(
         # pre-matched against. When the library later grows, the panel is
         # regenerated. See _maybe_reemit_drafting_on_templates.
         self._drafting_meta_by_workspace: Dict[str, Dict[str, Any]] = {}
+        # Feature payloads that were generated but NOT delivered (the socket was
+        # down when the emit ran — SocketClient.emit skips silently). Keyed
+        # workspace_id -> {featureType: envelope}, and persisted, because a panel
+        # loader is cleared only by the arrival of its document_feature_response:
+        # an undelivered payload is a stuck panel until it is re-sent. Flushed by
+        # _flush_pending_feature_deliveries on (re)connect.
+        self._pending_feature_deliveries: Dict[str, Dict[str, Any]] = (
+            PersistentWorkspaceDict(CacheKinds.PENDING_FEATURE_DELIVERY)
+        )
+        # An objective change that was accepted but never produced a payload —
+        # cancelled with its socket turn, or timed out. Nothing to re-deliver, so
+        # the instruction itself is kept and re-run once on reconnect. Shape:
+        # {"userId","workspaceRole","instruction","featureTypes","attempts","startedAt"}
+        self._pending_objective_changes: Dict[str, Dict[str, Any]] = (
+            PersistentWorkspaceDict(CacheKinds.PENDING_OBJECTIVE_CHANGE)
+        )
+        # Workspaces whose persisted recovery markers have already been read in
+        # this process. A restart loses the in-memory markers, so they are
+        # re-read on first contact with the workspace — but exactly once, or
+        # every chat turn would re-query Qdrant for them.
+        self._recovered_workspaces: Set[str] = set()
+        # Strong references to detached background tasks. asyncio keeps only a
+        # weak reference to a task, so a fire-and-forget create_task() can be
+        # garbage-collected mid-flight; and a task whose exception is never
+        # retrieved reports nothing. See _track_background_task.
+        self._background_tasks: Set[asyncio.Task] = set()
         # Re-emit after reconnect when socket dropped right after analysis report (so backend gets the update)
         self._had_disconnect: bool = False
         self._pending_reemit_workspace_id: Optional[str] = None
@@ -371,9 +399,6 @@ class SocketEventHandler(
         self._last_workspace_transfer_fingerprint: Dict[str, Dict[str, Any]] = {}
         # Guard against overlapping analysis-report refresh tasks from chat marker misses.
         self._analysis_refresh_inflight: Set[str] = set()
-        # During objective-change regeneration, suppress stale background analysis_report emits
-        # from older pipelines so FE receives only the fresh objective-aligned report.
-        self._suppress_analysis_emit_until_ts: Dict[str, float] = {}
         # --- workspace_deleted / compliance purge (see handlers/workspace_purge.py)
         # Deletions awaiting their purgeAfter deadline.
         #   workspace_id -> {requestId, purgeAfter, deletedAt, userId, reason,
@@ -393,6 +418,15 @@ class SocketEventHandler(
         # text but are keyed by chat_id alone; without this index the purge
         # cannot reach them. Populated at the chat entry point.
         self._chat_workspace_index: Dict[str, str] = {}
+        # --- document_reload_request (see handlers/document_reload.py)
+        # Per-workspace ledger of reload requests: workspace_id -> {requestId ->
+        # {status, ts}}. The backend re-sends a reload on a stall or reconnect
+        # under the SAME requestId, so a re-send while the first attempt is in
+        # flight (or shortly after it succeeded) must be swallowed — but a
+        # re-send after a FAILED attempt must run, because nothing else would
+        # ever retry it. Keyed by workspace_id at the top level so the
+        # compliance purge's self.__dict__ sweep erases it with the workspace.
+        self._document_reload_requests: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._register_default_handlers()
 
     def set_socket_client(self, client):
@@ -426,6 +460,9 @@ class SocketEventHandler(
         # re-emit the features listed in reEmitFeatures (drafting_assistant).
         self.register("workspace_transferred", self.on_workspace_transferred)
         self.register("user_message_request", self.on_user_message_request)
+        # Supporting Material "reload" on one document: purge everything held
+        # for it, re-read it, re-run the workspace features over all evidence.
+        self.register("document_reload_request", self.on_document_reload_request)
         self.register("probing_prompts_request", self.on_probing_prompts_request)
         self.register("analysis_report_feedback", self.on_analysis_report_feedback)
         self.register(

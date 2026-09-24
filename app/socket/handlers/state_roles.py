@@ -121,6 +121,7 @@ class StateRolesMixin:
         workspace_id: str,
         *,
         user_id: Optional[str] = None,
+        recover: bool = True,
     ) -> None:
         """Repopulate in-memory per-workspace caches from Qdrant.
 
@@ -132,6 +133,21 @@ class StateRolesMixin:
         """
         if not workspace_id:
             return
+        # A restart loses the in-memory recovery markers, so the reconnect sweep
+        # in _recover_interrupted_work finds nothing. Hydration is the first
+        # moment we know this workspace exists again, so it is also where a
+        # payload that was generated-but-never-delivered gets picked up.
+        # ``recover=False`` is passed by the recovery path itself to avoid
+        # re-entering here.
+        if recover:
+            try:
+                await self._recover_workspace_after_hydrate(workspace_id, user_id)
+            except Exception as rec_err:
+                logger.debug(
+                    "Post-hydrate recovery skipped (workspace={}): {}",
+                    workspace_id,
+                    rec_err,
+                )
         try:
             # Workspace context (title, status, role, evidence files, metadata)
             from app.workspace.context import context_manager
@@ -206,6 +222,11 @@ class StateRolesMixin:
             CacheKinds.USER_ASSERTED_FACTS: self._workspace_user_facts,
             CacheKinds.DRAFTING_SUGGESTIONS: self._workspace_drafting_payload,
             CacheKinds.CURRENT_STATE: self._workspace_current_state_payload,
+            # Recovery state: an undelivered panel payload and an unfinished
+            # objective change must both survive a restart, since the
+            # disconnect that interrupted them is often what restarted us.
+            CacheKinds.PENDING_FEATURE_DELIVERY: self._pending_feature_deliveries,
+            CacheKinds.PENDING_OBJECTIVE_CHANGE: self._pending_objective_changes,
         }
         for kind, target in kind_to_dict.items():
             payload = cached_kinds.get(kind)

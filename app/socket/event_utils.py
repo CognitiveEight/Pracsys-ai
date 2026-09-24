@@ -19,6 +19,8 @@ __all__ = [
     'EventHandler',
     '_STRATEGY_ROLE_LABELS_RE',
     'OBJECTIVE_UPDATE_OFFER_QUESTION',
+    'OBJECTIVE_CHANGE_REFRESH_FEATURES',
+    'OBJECTIVE_CHANGE_FAILED_MESSAGE',
     'CHAT_SMALL_WORKSPACE_DOC_THRESHOLD',
     'CHAT_SEARCH_CHUNK_LIMIT',
     'CHAT_MAX_DOCS_INCLUDED',
@@ -70,6 +72,31 @@ _STRATEGY_ROLE_LABELS_RE = re.compile(
 OBJECTIVE_UPDATE_OFFER_QUESTION = (
     "Do you want me to update the whole workspace based on this new objective "
     "that you have defined?"
+)
+
+
+# The panels whose loaders an objective change arms via `workspace:refresh`.
+# Kept in ONE place because a loader is cleared only by a
+# document_feature_response for the same featureType: every site that arms this
+# list must be able to release exactly this list when the work fails, and a
+# copy that drifts leaves a panel spinning with no way to notice.
+OBJECTIVE_CHANGE_REFRESH_FEATURES = [
+    "strategy_objective",
+    "analysis_report",
+    "list_of_dates",
+    "applicable_laws",
+    "procedural_timeline",
+    "drafting_assistant",
+]
+
+# What the user is told when an objective change could not be applied. It must
+# never imply the objective changed: the previous objective is still in force,
+# and silently falling through to the general chat agent (the old behaviour)
+# left the lawyer reading an unrelated answer beside six spinning panels.
+OBJECTIVE_CHANGE_FAILED_MESSAGE = (
+    "I could not update the strategic objective just now, so your previous "
+    "objective is unchanged. Nothing else in the workspace was modified. "
+    "Please send the objective again and I will retry."
 )
 
 

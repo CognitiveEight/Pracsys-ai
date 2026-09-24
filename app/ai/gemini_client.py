@@ -50,6 +50,56 @@ _PERMISSIVE_SAFETY_SETTINGS = {
 }
 
 
+# generate() reports failure by RETURNING one of these strings rather than raising,
+# so that a caller expecting prose still gets something printable. The cost is that
+# a 429 / 5xx / safety block is indistinguishable from real content unless the
+# caller checks — a structured (JSON-mode) caller then just fails to parse it and
+# reports "no JSON", hiding the actual cause. Every caller that branches on failure
+# must use is_generation_error() so the real reason reaches the log.
+GENERATION_ERROR_PREFIXES = (
+    "Error generating response:",
+    "Error: Gemini model not available",
+    "Error generating long-form response:",
+)
+
+
+def is_generation_error(text: Optional[str]) -> bool:
+    """True when ``text`` is a generate*() failure sentinel rather than model output."""
+    if not text:
+        return False
+    stripped = text.lstrip()
+    return any(stripped.startswith(prefix) for prefix in GENERATION_ERROR_PREFIXES)
+
+
+def _request_timeout_seconds() -> Optional[float]:
+    """Configured per-request ceiling, or None when disabled (<= 0)."""
+    try:
+        value = float(
+            getattr(settings, "gemini_request_timeout_seconds", 300.0) or 0.0
+        )
+    except (TypeError, ValueError):
+        return 300.0
+    return value if value > 0 else None
+
+
+async def _with_timeout(coro: Any, *, label: str) -> Any:
+    """Await ``coro`` under the configured ceiling.
+
+    A stalled generation is the worst failure mode this client has: the long
+    feature generations are awaited inline by socket handlers, so an unbounded
+    request hangs the whole turn with no output and no error. Raises
+    asyncio.TimeoutError so the caller's failure path runs.
+    """
+    timeout = _request_timeout_seconds()
+    if timeout is None:
+        return await coro
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.error("Gemini request timed out after {:.0f}s ({})", timeout, label)
+        raise
+
+
 class GeminiClient:
     """
     Client for Google Gemini AI services.
@@ -352,16 +402,24 @@ class GeminiClient:
                         ng_cfg_kwargs["system_instruction"] = system_instruction
                     if is_json_mode:
                         ng_cfg_kwargs["response_mime_type"] = "application/json"
-                    ng_response = await ng_client.aio.models.generate_content(
-                        model=self.model_name,
-                        contents=prompt,
-                        config=genai_ng_types.GenerateContentConfig(**ng_cfg_kwargs),
+                    ng_response = await _with_timeout(
+                        ng_client.aio.models.generate_content(
+                            model=self.model_name,
+                            contents=prompt,
+                            config=genai_ng_types.GenerateContentConfig(**ng_cfg_kwargs),
+                        ),
+                        label=f"generate/{self.model_name}/ng",
                     )
                     self._log_generation_diagnostics(
                         ng_response, label=f"{self.model_name}/ng"
                     )
                     self._record_usage(ng_response)
                     result = self._safe_extract_text(ng_response)
+                except asyncio.TimeoutError:
+                    # Do NOT fall back to legacy on a timeout: the caller has
+                    # already waited the full ceiling, and a second full-length
+                    # request would double the stall it was meant to bound.
+                    raise
                 except Exception as ng_err:
                     logger.warning(
                         "google-genai generate failed ({}); falling back to legacy",
@@ -394,7 +452,9 @@ class GeminiClient:
                         safety_settings=_PERMISSIVE_SAFETY_SETTINGS,
                     )
 
-                response = await asyncio.to_thread(_sync_generate)
+                response = await _with_timeout(
+                    asyncio.to_thread(_sync_generate), label="generate/legacy"
+                )
                 self._log_generation_diagnostics(response, label=self.model_name)
                 self._record_usage(response)
                 result = self._safe_extract_text(response)
@@ -426,7 +486,10 @@ class GeminiClient:
                                 safety_settings=_PERMISSIVE_SAFETY_SETTINGS,
                             )
 
-                        repair_response = await asyncio.to_thread(_sync_repair)
+                        repair_response = await _with_timeout(
+                            asyncio.to_thread(_sync_repair),
+                            label="generate/json-repair",
+                        )
                         # A repair round is a full billable generation — record it
                         # like the first pass above, or JSON-mode features
                         # under-report every time their output needs repairing.
@@ -450,6 +513,14 @@ class GeminiClient:
             logger.success("✅ Generated {} characters with Gemini", len(result))
             return result
 
+        except asyncio.TimeoutError:
+            # _with_timeout already logged the ceiling. Return the sentinel so
+            # is_generation_error() callers report a real cause instead of the
+            # misleading "model returned no JSON".
+            return (
+                "Error generating response: timed out after "
+                f"{_request_timeout_seconds()}s"
+            )
         except Exception as e:
             logger.error("Gemini generation error: {}", str(e))
             return f"Error generating response: {str(e)}"
@@ -571,10 +642,13 @@ class GeminiClient:
                     ),
                 )
 
-            response = await client.aio.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=_build_config(thinking_level),
+            response = await _with_timeout(
+                client.aio.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=_build_config(thinking_level),
+                ),
+                label=f"generate_longform/{self.model_name}",
             )
             self._log_generation_diagnostics(
                 response, label=f"{self.model_name}/longform"
@@ -622,10 +696,13 @@ class GeminiClient:
                     "signature, verification, or annexure blocks the template "
                     "requires)."
                 )
-                response = await client.aio.models.generate_content(
-                    model=self.model_name,
-                    contents=continuation_prompt,
-                    config=_build_config("MINIMAL"),
+                response = await _with_timeout(
+                    client.aio.models.generate_content(
+                        model=self.model_name,
+                        contents=continuation_prompt,
+                        config=_build_config("MINIMAL"),
+                    ),
+                    label=f"generate_longform/{self.model_name}/cont",
                 )
                 self._log_generation_diagnostics(
                     response, label=f"{self.model_name}/longform-cont{rounds}"
@@ -767,7 +844,9 @@ class GeminiClient:
                     config=config,
                 )
 
-            response = await asyncio.to_thread(_sync_grounded)
+            response = await _with_timeout(
+                asyncio.to_thread(_sync_grounded), label="generate_grounded"
+            )
             self._log_generation_diagnostics(
                 response, label=f"{self.model_name}/grounded"
             )

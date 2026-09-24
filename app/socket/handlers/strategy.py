@@ -18,6 +18,7 @@ import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
+from app.ai.gemini_client import is_generation_error
 from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
@@ -1288,6 +1289,37 @@ class StrategyMixin:
             pass
         return None
 
+    # Messages like "just revise the strategic objective as per proper
+    # documents" name no new direction. The old fallback passed that sentence
+    # through as ``user_objective_instruction``, i.e. the regeneration prompt was
+    # told to adopt a meta-instruction as the case's objective — a good way to
+    # get back prose instead of JSON, or an empty objective, both of which used
+    # to abort the path silently. What the user actually asked for is a
+    # re-derivation from the evidence, so say that instead.
+    _DOCUMENT_GROUNDED_OBJECTIVE_INSTRUCTION = (
+        "Re-derive the strategic objective strictly from the uploaded documents. "
+        "Keep the existing objective's intent and legal direction, but correct or "
+        "drop anything the documents do not support, and make every assertion "
+        "traceable to the evidence on record. Do not introduce a new objective."
+    )
+
+    # A supplied objective this short cannot be a case objective; it is a
+    # request to refresh one. (The classifier's own floor is 20 chars.)
+    _MIN_OBJECTIVE_INSTRUCTION_CHARS = 20
+
+    def _document_grounded_objective_instruction(self, raw_message: str) -> str:
+        """Instruction to use when the user asked for a revision, not a new objective."""
+        text = (raw_message or "").strip()
+        if len(text) < self._MIN_OBJECTIVE_INSTRUCTION_CHARS:
+            return self._DOCUMENT_GROUNDED_OBJECTIVE_INSTRUCTION
+        # Keep the user's wording for context, but frame it as what it is: a
+        # request about HOW to revise, not the objective text itself.
+        return (
+            f"{self._DOCUMENT_GROUNDED_OBJECTIVE_INSTRUCTION}\n\n"
+            f"The user's request, for context (it is an instruction about the "
+            f"revision, NOT the new objective text): {text}"
+        )
+
     @meter_usage
     async def _regenerate_strategy_for_new_objective(
         self,
@@ -1330,6 +1362,9 @@ class StrategyMixin:
             case_summary = (current_strategy.get("caseSummary") or "").strip()
             report_case_summary = (current_strategy.get("reportCaseSummary") or "").strip()
             if not case_summary:
+                self._log_objective_regen_failure(
+                    workspace_id, "no_case_summary", "cached strategy has no caseSummary"
+                )
                 return False
 
             all_docs = []
@@ -1419,20 +1454,54 @@ class StrategyMixin:
             if custom_suffix:
                 prompt = prompt.rstrip() + "\n\n" + custom_suffix
 
-            raw = await gemini_client.generate(
-                prompt=prompt,
-                system_instruction=get_structured_document_feature_system_instruction(
-                    role
-                ),
-                temperature=0.25,
-                max_tokens=12000,
-                response_mime_type="application/json",
-            )
-            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            # generate() signals failure by RETURNING a sentinel string, so an
+            # unchecked call turns a 429 / 5xx / timeout into the far more
+            # misleading "model returned no JSON". Check it, log the real reason,
+            # and give the objective one more attempt before giving up — this is
+            # the panel the user is actively waiting on.
+            system_instruction = get_structured_document_feature_system_instruction(role)
+            raw = ""
+            json_str = None
+            for attempt in (1, 2):
+                raw = await gemini_client.generate(
+                    prompt=prompt,
+                    system_instruction=system_instruction,
+                    temperature=0.25,
+                    max_tokens=12000,
+                    response_mime_type="application/json",
+                )
+                if is_generation_error(raw):
+                    self._log_objective_regen_failure(
+                        workspace_id,
+                        "llm_error",
+                        f"attempt {attempt}: {str(raw)[:200]}",
+                    )
+                    json_str = None
+                    continue
+                json_str = self._prepare_json_candidate(
+                    (raw or "").strip(), prefer="object"
+                )
+                if json_str:
+                    break
+                self._log_objective_regen_failure(
+                    workspace_id,
+                    "no_json",
+                    f"attempt {attempt}: {len(raw or '')} chars, "
+                    f"prefix={str(raw or '')[:120]!r}",
+                )
             if not json_str:
                 return False
-            data = json.loads(json_str)
+            try:
+                data = json.loads(json_str)
+            except (TypeError, ValueError) as parse_err:
+                self._log_objective_regen_failure(
+                    workspace_id, "bad_json", str(parse_err)
+                )
+                return False
             if not isinstance(data, dict):
+                self._log_objective_regen_failure(
+                    workspace_id, "not_object", f"top-level {type(data).__name__}"
+                )
                 return False
 
             strategic_objective = (data.get("strategicObjective") or "").strip()
@@ -1652,6 +1721,9 @@ class StrategyMixin:
                         break
 
             if not strategic_objective:
+                self._log_objective_regen_failure(
+                    workspace_id, "no_objective", "model returned no strategicObjective"
+                )
                 return False
             if len(possible_next_steps) < 2:
                 possible_next_steps = (
@@ -1683,22 +1755,61 @@ class StrategyMixin:
             self._workspace_suggestion_chips[workspace_id] = list(suggestion_chips)
             self._last_workspace_id_with_chips = workspace_id
 
-            if self._socket_client:
-                await self._emit_document_feature(
-                    feature_type="strategy_objective",
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    payload=merged,
-                    usage=current_usage(),
+            if not self._socket_client:
+                # Nothing was emitted, so the caller must NOT treat this as a
+                # success and schedule the downstream cascade on top of it.
+                self._log_objective_regen_failure(
+                    workspace_id, "no_socket_client", "no socket client to emit on"
                 )
-                logger.success(
-                    "✅ Strategy objective regen emitted (case summary {}) workspace={}",
-                    "re-framed" if new_case_summary else "preserved",
-                    workspace_id[:12] if workspace_id else "",
+                return False
+
+            delivered = await self._emit_document_feature(
+                feature_type="strategy_objective",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=merged,
+                usage=current_usage(),
+            )
+            if not delivered:
+                # The payload is buffered for re-delivery on reconnect, but the
+                # frontend has not seen it yet — so this turn did not land and
+                # the caller must report that rather than claim an update.
+                # The GENERATION succeeded though, so drop any resume marker:
+                # re-running a ~2-minute call whose result is already buffered
+                # would emit the same panel twice for one request.
+                self._log_objective_regen_failure(
+                    workspace_id,
+                    "emit_dropped",
+                    "strategy_objective generated but not delivered; buffered",
                 )
+                self._clear_pending_objective_change(workspace_id)
+                return False
+            logger.success(
+                "✅ Strategy objective regen emitted (case summary {}) workspace={}",
+                "re-framed" if new_case_summary else "preserved",
+                workspace_id[:12] if workspace_id else "",
+            )
             return True
+        except asyncio.CancelledError:
+            # The socket turn that awaited us was torn down (a reconnect, a
+            # shutdown). CancelledError is a BaseException, so the `except
+            # Exception` below never saw it: the regeneration simply stopped
+            # logging and the six loaders armed for it span forever. Record the
+            # instruction so the work is re-run on reconnect, then re-raise to
+            # preserve cancellation semantics.
+            self._log_objective_regen_failure(
+                workspace_id, "cancelled", "regeneration cancelled mid-flight"
+            )
+            self._note_pending_objective_change(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+                instruction=user_objective_instruction,
+            )
+            raise
         except Exception as e:
-            logger.warning("Strategy objective regen failed: {}", e)
+            logger.opt(exception=e).warning("Strategy objective regen failed: {}", e)
+            self._log_objective_regen_failure(workspace_id, "exception", str(e))
             return False
 
     @meter_usage

@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An objective change no longer hangs the workspace on "refreshing" when the
+  socket drops mid-regeneration.** Confirmed root cause of the 2026-09-17
+  incident: the objective change was accepted at 11:59:56 IST, the socket
+  disconnected 25 s into a ~2-minute regeneration, and the work died leaving no
+  log line and no emit — so all six panel loaders armed by `workspace:refresh`
+  span for the rest of the session. `asyncio.CancelledError` derives from
+  `BaseException`, so every `except Exception` on that path missed it.
+
+  Six changes, in the order that matters:
+
+  - **Cancellation is caught, reported and recoverable.**
+    `_regenerate_strategy_for_new_objective` and the objective-change cascade
+    runner now handle `asyncio.CancelledError` explicitly: they log the stage
+    reached, record the instruction for resume, release any loader they armed,
+    and re-raise. Detached tasks are held in `_background_tasks` with a
+    done-callback (`_track_background_task`) — asyncio keeps only a weak
+    reference to a task, so a fire-and-forget `create_task` could be collected
+    mid-flight and reported nothing when it died.
+  - **Emits now report delivery.** `SocketClient.emit` / `emit_ai_response`
+    return `bool` instead of `None` (still never raising), and
+    `_emit_document_feature` propagates it. An undelivered payload is buffered
+    per `(workspace_id, featureType)` and re-sent on reconnect
+    (`_flush_pending_feature_deliveries`), **before** the cached-feature replay,
+    so the frontend receives the genuinely-generated objective rather than the
+    pre-change snapshot. The buffer is persisted
+    (`CacheKinds.PENDING_FEATURE_DELIVERY`) because the disconnect that loses an
+    emit is often what restarted the process.
+  - **Work that produced nothing is re-run.** An interrupted change is recorded
+    as `CacheKinds.PENDING_OBJECTIVE_CHANGE` and resumed once on reconnect
+    (`_resume_pending_objective_changes`), capped at one attempt and dropped
+    after 15 minutes. A change whose payload was merely undelivered is *not*
+    re-run — the cascade is scheduled instead.
+  - **Gemini calls are bounded.** New `gemini_request_timeout_seconds`
+    (default 300 s, env-overridable) applied in `generate`, `generate_longform`
+    and `generate_grounded`; nothing in the service had a timeout before. A
+    timeout on the new-SDK path does not fall back to the legacy SDK, which
+    would have doubled the stall.
+  - **LLM failures are no longer success-shaped.** `generate` reports failure by
+    *returning* a sentinel string, so a 429 / 5xx / safety block used to surface
+    as the far more misleading "model returned no JSON". New
+    `is_generation_error()` is checked before parsing; the objective
+    regeneration logs the real reason and retries once. Every give-up path now
+    emits one structured line plus an `objective_change_failed` audit event with
+    a reason code (`llm_error`, `no_json`, `no_objective`, `emit_dropped`,
+    `cancelled`, …).
+  - **A lit loader can no longer outlive its work.** New shared
+    `_release_refresh_loaders` emits each panel's terminal state for any
+    featureType that was armed but never emitted, and is called from all four
+    objective-change failure branches and from a `finally` in the cascade
+    runner. The chat reply now says plainly that the objective was not updated
+    (`OBJECTIVE_CHANGE_FAILED_MESSAGE`) instead of falling through to the
+    general chat agent.
+
+  Also fixed in the same class: the analysis-report chat-update path armed its
+  loader and skipped the emit when no cached report existed; cascade step 1
+  (the analysis regeneration) was unwrapped, so a raise there aborted the
+  remaining six panels; `_regenerate_strategy_for_new_objective` returned `True`
+  without emitting when there was no socket client; and the dead
+  `_suppress_analysis_emit_until_ts` guard (never assigned, and a no-emit
+  `return False` if it ever had been) was removed.
+
+  `workspace:refresh` now carries a `refreshId` so an arm/release pair can be
+  read end to end in the log — the 2026-09-17 cause had to be reconstructed from
+  the *absence* of lines. The frontend may ignore the field; echoing it back on
+  `document_feature_response` is a follow-up that needs backend agreement.
+
+  A vague request ("just revise the strategic objective as per proper
+  documents") is no longer passed through *as* the new objective: it is
+  reframed as a document re-derivation
+  (`_document_grounded_objective_instruction`), and `revise` / `rework` /
+  `reframe` / `redefine` / `regenerate` were added to the panel-edit verb gate.
+
+  Offline coverage: `verify_objective_change.py` group 12.
+
 ### Changed
 
 - **The quality score explanation is now objective-relative and always
@@ -42,6 +118,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   byte-for-byte.
 
 ### Added
+
+- **New inbound event `document_reload_request`** (`app/socket/schemas.py`,
+  `app/socket/client.py`, `app/socket/events.py`,
+  `app/socket/handlers/document_reload.py`). The lawyer hits "reload" on one
+  document in Supporting Material — or the backend does, because the document
+  scored 0 — and the AI purges everything it holds for that file, re-fetches the
+  freshly-signed URL, re-extracts it, and re-runs the workspace feature suite
+  over the full evidence set. Until now the only recovery for an unreadable
+  upload (a scan whose OCR produced nothing, a failed transcription) was to
+  delete the document and upload it again, which threw away its id and every
+  curated item tied to it. **Socket payload change** —
+  `DocumentReloadRequestPayload` carries `requestId`, `targetFile` (an evidence
+  file plus an advisory `previousQualityScore`), the full active `evidenceFiles`,
+  a MANDATORY `currentState`, and optional `participants`. Steps 6–7 of the flow
+  are the emits a `workspace_sync` re-run already produces
+  (`workspace:refresh`, then `document_feature_response` per feature), so the
+  whole output path is reused. Four rules shape the handler: the document's
+  vectors and its entry in the cached `document_assessments` manifest are purged
+  **before** the re-fetch, so no prompt is built on the copy the reload exists to
+  replace; the document's backend id is **resolved, never invented** (`_id` →
+  matching `fileHash` → `storeFileName`/`path` → a unique filename match in the
+  manifest), and an unresolvable reload is abandoned rather than ingested under a
+  second identity no later delete could reach; the removed-evidence ledger is
+  written **only when the re-read fails** and cleared when it succeeds, so a good
+  reload never reports its own document as a `missingInfo` gap; and re-sends
+  under the same `requestId` are swallowed while in flight or just completed but
+  **re-run after a failure**, since the backend eventually stops retrying. The
+  re-ingestion runs under its own `capture_usage()` scope, and the reload
+  revokes a pending compliance purge like every other live-workspace event.
+  Scoped to the one document: drift between `evidenceFiles` and the live vector
+  store is logged, never acted on.
+
+- `verify_document_reload.py` — offline verification of the reload: schema,
+  id resolution (including the ambiguous cases it must refuse), purge-before-read
+  ordering, manifest merge, ledger behaviour on success and failure, curation
+  survival, the `requestId` de-dupe, and purge revocation. 69 checks, no API key,
+  no backend, no Qdrant.
 
 - `verify_objective_change.py` — offline verification of the re-frame and
   of every case in which it must be refused.

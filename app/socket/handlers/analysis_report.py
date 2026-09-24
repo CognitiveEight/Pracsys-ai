@@ -2477,6 +2477,21 @@ Rules:
                 feature_types=["analysis_report"],
             )
             current_report = self._workspace_analysis_payload.get(workspace_id)
+            if not isinstance(current_report, dict):
+                # The refresh above lit the analysis loader and there is no
+                # cached report to update, so nothing below will emit — the
+                # panel would spin for the rest of the session. Release it.
+                logger.warning(
+                    "Analysis update requested with no cached report "
+                    "(workspace={}) — releasing its loader",
+                    workspace_id[:12] if workspace_id else "",
+                )
+                await self._release_refresh_loaders(
+                    workspace_id,
+                    user_id,
+                    ["analysis_report"],
+                    reason="analysis_update_no_cached_report",
+                )
             if isinstance(current_report, dict):
                 removed_missing = 0
                 removed_weak = 0

@@ -32,6 +32,8 @@ Covers:
  10. ack          — the chat reply names the case summary only if it moved
  11. score expl   — the quality score explanation is objective-aware and is
                     always refreshed by an objective change
+ 12. interruption — a change interrupted by a disconnect is re-delivered or
+                    re-run, and never leaves a panel loader spinning
 
 USAGE
     python verify_objective_change.py            # run everything
@@ -47,6 +49,7 @@ import importlib
 import json
 import os
 import sys
+import time
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -125,11 +128,27 @@ INSTRUCTION = "focus the case on the limitation point"
 
 
 class _FakeSocket:
+    # Both return True: SocketClient.emit reports DELIVERY, and a double that
+    # returns None reads as "the socket dropped it", which makes the handlers
+    # buffer for re-delivery and report failure.
     async def emit(self, event, payload):
         EMITS.append((event, payload))
+        return True
 
     async def emit_ai_response(self, payload):
         EMITS.append(("ai_response", payload))
+        return True
+
+
+class _DownSocket:
+    """A disconnected socket: SocketClient.emit returns False without raising
+    when the connection is gone, so the payload is silently dropped."""
+
+    async def emit(self, event, payload):
+        return False
+
+    async def emit_ai_response(self, payload):
+        return False
 
 
 H._socket_client = _FakeSocket()
@@ -631,6 +650,155 @@ async def check_score_explanation_refreshed_on_objective_change():
               and p.get("featureType") == "analysis_report" for e, p in EMITS))
 
 
+# --------------------------------------------- 12: interruption never strands a loader
+
+async def check_interruption_recovery():
+    """The 2026-09-17 failure: an objective change armed six panel loaders,
+    the socket dropped 25s into the ~2-minute regeneration, and the work died
+    with no log line and no emit — so the panels span for the rest of the
+    session. A loader is cleared ONLY by a document_feature_response for the
+    same featureType, so every way this path can stop must either deliver the
+    real payload later or emit a terminal state now."""
+    print("\n[12] An interrupted objective change never strands a loader")
+    from app.socket.event_utils import OBJECTIVE_CHANGE_REFRESH_FEATURES
+
+    # --- 12a: a dropped emit is buffered, not lost, and reported as failure
+    ws = _ws("verify_ocs_drop")
+    _seed(ws)
+    H._pending_feature_deliveries.pop(ws, None)
+    _stub(BOTH)
+    EMITS.clear()
+    H._socket_client = _DownSocket()
+    try:
+        ok = await H._regenerate_strategy_for_new_objective(
+            workspace_id=ws, user_id=UID, workspace_role="PETITIONER",
+            user_objective_instruction=INSTRUCTION,
+            current_strategy=dict(H._workspace_strategy_payload[ws]),
+        )
+    finally:
+        H._socket_client = _FakeSocket()
+    check("a dropped emit is NOT reported as success", ok is False)
+    buffered = H._pending_feature_deliveries.get(ws) or {}
+    check("the generated payload is buffered for re-delivery",
+          "strategy_objective" in buffered, str(list(buffered)))
+    check("the buffered payload carries the NEW objective",
+          (buffered.get("strategy_objective", {})
+           .get("payload", {}).get("strategicObjective")) == NEW_OBJECTIVE)
+
+    # --- 12b: reconnect re-delivers the real payload (not a cached snapshot)
+    EMITS.clear()
+    delivered = await H._flush_pending_feature_deliveries(ws)
+    check("reconnect re-delivers it",
+          (delivered or {}).get(ws) == ["strategy_objective"], str(delivered))
+    check("and it is the real generated objective, not the old one",
+          any(e == "document_feature_response"
+              and p.get("featureType") == "strategy_objective"
+              and p.get("payload", {}).get("strategicObjective") == NEW_OBJECTIVE
+              for e, p in EMITS))
+    check("the buffer is emptied once delivered",
+          not (H._pending_feature_deliveries.get(ws) or {}))
+
+    # --- 12c: a cancelled regeneration is logged, marked, and re-raises
+    ws = _ws("verify_ocs_cancel")
+    _seed(ws)
+    H._pending_objective_changes.pop(ws, None)
+
+    async def _cancelled_gen(*a, **k):
+        raise asyncio.CancelledError()
+
+    _gc.gemini_client.generate = _cancelled_gen
+    cancelled = False
+    try:
+        await H._regenerate_strategy_for_new_objective(
+            workspace_id=ws, user_id=UID, workspace_role="PETITIONER",
+            user_objective_instruction=INSTRUCTION,
+            current_strategy=dict(H._workspace_strategy_payload[ws]),
+        )
+    except asyncio.CancelledError:
+        cancelled = True
+    check("cancellation propagates (not swallowed as success)", cancelled)
+    marker = H._pending_objective_changes.get(ws) or {}
+    check("the interrupted instruction is marked for resume",
+          marker.get("instruction") == INSTRUCTION, str(marker)[:120])
+    check("the marker records the loaders that were armed",
+          set(marker.get("featureTypes") or [])
+          == set(OBJECTIVE_CHANGE_REFRESH_FEATURES))
+
+    # --- 12d: the resume completes the work the cancellation lost
+    _stub(BOTH)
+    EMITS.clear()
+    resumed = await H._resume_pending_objective_changes(only_workspace_id=ws)
+    check("the interrupted change is re-run on reconnect", resumed == 1,
+          str(resumed))
+    check("and the new objective finally lands",
+          H._workspace_strategy_payload[ws].get("strategicObjective")
+          == NEW_OBJECTIVE)
+    check("the resume marker is cleared once it lands",
+          not (H._pending_objective_changes.get(ws) or {}).get("instruction"))
+
+    # --- 12e: a resume is attempted once, then the loaders are released
+    ws = _ws("verify_ocs_giveup")
+    _seed(ws)
+    H._pending_objective_changes[ws] = {
+        "userId": UID, "workspaceRole": "PETITIONER",
+        "instruction": INSTRUCTION,
+        "featureTypes": list(OBJECTIVE_CHANGE_REFRESH_FEATURES),
+        "attempts": 1, "startedAt": time.time(),
+    }
+    EMITS.clear()
+    resumed = await H._resume_pending_objective_changes(only_workspace_id=ws)
+    check("a second cancellation is not retried forever", resumed == 0)
+    released = {p.get("featureType") for e, p in EMITS
+                if e == "document_feature_response"}
+    check("every armed loader is released when the work is abandoned",
+          set(OBJECTIVE_CHANGE_REFRESH_FEATURES) <= released,
+          str(sorted(released)))
+
+    # --- 12f: an LLM failure is named, retried once, and reported
+    ws = _ws("verify_ocs_llmerr")
+    _seed(ws)
+    calls = {"n": 0}
+
+    async def _err_gen(*a, **k):
+        calls["n"] += 1
+        return "Error generating response: 429 Too Many Requests"
+
+    _gc.gemini_client.generate = _err_gen
+    EMITS.clear()
+    ok = await H._regenerate_strategy_for_new_objective(
+        workspace_id=ws, user_id=UID, workspace_role="PETITIONER",
+        user_objective_instruction=INSTRUCTION,
+        current_strategy=dict(H._workspace_strategy_payload[ws]),
+    )
+    check("an LLM error sentinel is not mistaken for content", ok is False)
+    check("and it is retried once before giving up", calls["n"] == 2,
+          str(calls["n"]))
+    check("nothing was emitted for a failed regeneration",
+          not any(e == "document_feature_response" for e, p in EMITS))
+
+    # --- 12g: the release helper clears exactly the loaders still owed
+    EMITS.clear()
+    released = await H._release_refresh_loaders(
+        ws, UID, list(OBJECTIVE_CHANGE_REFRESH_FEATURES),
+        skip={"strategy_objective"}, reason="verify",
+        workspace_role="PETITIONER",
+    )
+    check("a feature that already emitted is not re-emitted",
+          "strategy_objective" not in released, str(released))
+    check("every other armed loader gets a terminal state",
+          set(released) == set(OBJECTIVE_CHANGE_REFRESH_FEATURES)
+          - {"strategy_objective"}, str(sorted(released)))
+
+    # --- 12h: a vague "revise as per the documents" is not used AS the objective
+    grounded = H._document_grounded_objective_instruction(
+        "just revise the strategic objective as per proper documents")
+    check("a revision request is reframed as a document re-derivation",
+          "Re-derive the strategic objective strictly from the uploaded documents"
+          in grounded)
+    check("and it is explicitly NOT presented as the new objective text",
+          "NOT the new objective text" in grounded)
+
+
 CHECKS = [
     ("figures", check_figures),
     ("accepted", check_accepted),
@@ -645,6 +813,7 @@ CHECKS = [
     ("score-expl-units", check_score_explanation_units),
     ("score-expl-helper", check_score_explanation_helper),
     ("score-expl-refresh", check_score_explanation_refreshed_on_objective_change),
+    ("interruption", check_interruption_recovery),
 ]
 
 

@@ -240,6 +240,67 @@ class WorkspaceVersionRestorePayload(WorkspaceSyncPayload):
         populate_by_name = True
 
 
+class DocumentReloadTargetFile(EvidenceFilePayload):
+    """The one document a ``document_reload_request`` re-reads.
+
+    Same shape as any other evidence file — deliberately, because the reload is
+    a RE-READ of a document that is already in evidence, not a new upload: the
+    ``fileHash`` is unchanged and the same file appears again inside
+    ``evidenceFiles``. Only ``url`` differs (the backend re-signs it) plus:
+
+    - ``previousQualityScore`` — the readability score this service reported
+      last time, or ``None`` if the document was never scored. Advisory: it is
+      logged and audited so a reload can be judged against its predecessor, and
+      never used to decide whether to re-ingest.
+    """
+
+    previousQualityScore: Optional[float] = None
+
+    class Config:
+        populate_by_name = True
+
+
+class DocumentReloadRequestPayload(BaseModel):
+    """
+    Schema for document_reload_request event (Server → AI_Maverick).
+
+    The user hit "reload" on one document in Supporting Material (or the
+    backend did, because the document scored badly). The AI purges everything
+    it holds for that document, re-fetches and re-extracts it, and re-runs the
+    workspace feature suite over the FULL evidence set.
+
+    - ``requestId`` de-dupes retries. The backend records the request in its AI
+      ledger and re-sends on a stall or reconnect, so a re-send under the same
+      id is expected rather than an error.
+    - ``targetFile`` is the document being reloaded. It carries no document id
+      of its own in the backend contract, so the handler resolves one (see
+      ``_resolve_reload_document_id``) — an id-less reload cannot be ingested.
+    - ``evidenceFiles`` is every ACTIVE file, so the feature re-run has full
+      context. Nothing is being removed here, so no soft-deleted entries.
+    - ``currentState`` is MANDATORY on this event: without it the re-run would
+      wipe the items the lawyer already approved or rejected.
+    - ``participants`` is context only (present on shared cases); access is
+      enforced by the backend, and a reload says nothing about sharing, so the
+      handler applies it non-authoritatively.
+    """
+
+    requestId: str  # 'dlr_<docId first 8>_<epochMs>' — de-dupes retries
+    workspaceId: str
+    userId: str  # always the case OWNER, shared or not
+    title: Optional[str] = None
+    status: Optional[str] = None
+    workspaceRole: Optional[str] = None
+    reason: Optional[str] = None  # 'user_requested' | 'poor_quality'
+    targetFile: DocumentReloadTargetFile
+    evidenceFiles: Optional[List[EvidenceFilePayload]] = None
+    currentState: Optional[WorkspaceCurrentState] = None
+    participants: Optional[List[WorkspaceParticipant]] = None
+    timestamp: Optional[str] = None  # ISO timestamp
+
+    class Config:
+        populate_by_name = True
+
+
 class TransferredUserInfo(BaseModel):
     """New owner details embedded in workspace_transferred."""
 

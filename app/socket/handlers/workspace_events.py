@@ -72,6 +72,7 @@ from app.utils.exceptions import SocketEventError
 from app.workspace.custom_instructions import (build_custom_instruction_suffix,
                                                hydrate_custom_instructions_from_cache,
                                                set_custom_instructions)
+from app.workspace.participants import set_participants
 from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
                                        hydrate_workspace_state, persist_state,
                                        restore_state)
@@ -304,10 +305,65 @@ class WorkspaceEventsMixin:
         except Exception as e:
             logger.warning("Failed to re-emit after reconnect: {}", e)
 
+    async def _recover_interrupted_work(self) -> None:
+        """Deliver / re-run whatever the last disconnect interrupted.
+
+        Order matters. Undelivered payloads go FIRST so the frontend receives the
+        genuinely-generated output (e.g. the new strategic objective) before
+        ``_do_reemit_after_reconnect`` can ship the pre-change cached snapshot
+        for the same featureType. Resumes run last because they are slow.
+        """
+        delivered: Dict[str, List[str]] = {}
+        try:
+            delivered = await self._flush_pending_feature_deliveries()
+            if delivered:
+                logger.success(
+                    "✅ Re-delivered held feature payload(s) after reconnect: {}",
+                    {k[:12]: v for k, v in delivered.items()},
+                )
+        except Exception as flush_err:
+            logger.warning(
+                "Pending feature re-delivery failed (non-fatal): {}", flush_err
+            )
+        # A delivered strategy_objective means the regeneration DID complete and
+        # only its delivery failed. Re-running it would waste a ~2-minute call
+        # and emit the same panel twice; what is still owed is the downstream
+        # cascade, so schedule that and drop the resume marker.
+        for ws_id, features in (delivered or {}).items():
+            if "strategy_objective" not in features:
+                continue
+            try:
+                # Read the marker BEFORE clearing it — it is where the asker's
+                # id was recorded when the change was accepted.
+                marker_user = (
+                    (self._pending_objective_changes.get(ws_id) or {}).get("userId")
+                    or self._pending_reemit_user_id
+                    or ""
+                )
+                self._clear_pending_objective_change(ws_id)
+                self._schedule_objective_change_reanalysis(
+                    workspace_id=ws_id,
+                    user_id=marker_user,
+                    log_context=" (after re-delivering a held objective payload)",
+                )
+            except Exception as cascade_err:
+                logger.warning(
+                    "Could not schedule cascade after re-delivery (workspace={}): {}",
+                    str(ws_id)[:12],
+                    cascade_err,
+                )
+        try:
+            await self._resume_pending_objective_changes()
+        except Exception as resume_err:
+            logger.warning(
+                "Objective-change resume failed (non-fatal): {}", resume_err
+            )
+
     async def on_connect(self, data: Any) -> None:
         """Handle connection event. Re-emit pending document_feature_response if we had disconnected during workspace init."""
         logger.info("Socket connected")
         audit_logger.log_event("socket_connect", {"status": "connected"})
+        await self._recover_interrupted_work()
         await self._do_reemit_after_reconnect()
 
     async def on_connected(self, data: Any) -> None:
@@ -321,6 +377,7 @@ class WorkspaceEventsMixin:
         audit_logger.log_event(
             "socket_connected_confirmed", {"status": "confirmed", "data": data}
         )
+        await self._recover_interrupted_work()
         await self._do_reemit_after_reconnect()
         # Re-emit last ai_response if we disconnected right after sending (so backend receives the chat response)
         if self._had_disconnect and self._pending_ai_response and self._socket_client:
@@ -861,6 +918,29 @@ class WorkspaceEventsMixin:
                     )
                 except Exception as cs_err:
                     logger.debug("Failed to cache currentState: {}", cs_err)
+
+            # Workspace sharing: refresh the collaborator roster. AUTHORITATIVE
+            # here — the backend omits `participants` entirely when the case is
+            # not shared, so an absent field is how an un-share reaches us and
+            # must drop the roster rather than leave a removed collaborator
+            # holding edit rights.
+            #
+            # Deliberately ABOVE the idempotency guard, and deliberately NOT in
+            # its fingerprint. Sharing changes no AI output, so a share-only
+            # re-sync should still be swallowed by the guard (no regeneration)
+            # — but the roster must be updated even then, or a permission
+            # change would be dropped for 180s.
+            try:
+                set_participants(
+                    str(payload.workspaceId),
+                    payload.participants,
+                    authoritative=True,
+                )
+            except Exception as participants_err:
+                logger.warning(
+                    "Participant roster update failed (non-fatal): {}",
+                    participants_err,
+                )
 
             # -----------------------------------------------------------------
             # Idempotency guard: skip duplicate/replayed workspace_sync payloads.
@@ -2300,6 +2380,21 @@ class WorkspaceEventsMixin:
 
             # Live workspace: revoke any pending compliance purge.
             self.cancel_pending_purge(workspace_id, trigger="workspace_version_restore")
+
+            # Roster update only when the payload actually carries one. A
+            # version restore is a document-version operation and says nothing
+            # about sharing, so an absent `participants` here must NOT be read
+            # as "un-shared" the way it is on workspace_sync.
+            try:
+                set_participants(
+                    workspace_id, payload.participants, authoritative=False
+                )
+            except Exception as participants_err:
+                logger.warning(
+                    "Participant roster update on version restore failed "
+                    "(non-fatal): {}",
+                    participants_err,
+                )
 
             logger.info(
                 "⏪ Workspace version restore: {} → version {} (User: {})",

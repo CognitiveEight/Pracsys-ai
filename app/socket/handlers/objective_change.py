@@ -78,6 +78,7 @@ from agent import process_analysis_docx_request
 from app.socket.event_utils import (
     EventHandler,
     _STRATEGY_ROLE_LABELS_RE,
+    OBJECTIVE_CHANGE_REFRESH_FEATURES,
     OBJECTIVE_UPDATE_OFFER_QUESTION,
     CHAT_SMALL_WORKSPACE_DOC_THRESHOLD,
     CHAT_SEARCH_CHUNK_LIMIT,
@@ -160,23 +161,41 @@ class ObjectiveChangeMixin:
                     ctx,
                     workspace_id[:12] if workspace_id else "",
                 )
-            async with lock:
-                logger.debug(
-                    "pipeline lock: acquired{} for workspace {}",
+            try:
+                async with lock:
+                    logger.debug(
+                        "pipeline lock: acquired{} for workspace {}",
+                        ctx,
+                        workspace_id[:12] if workspace_id else "",
+                    )
+                    await self._run_list_of_dates_and_applicable_laws(
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        workspace_role=workspace_role,
+                        batch_result=batch_result,
+                        log_context=log_context,
+                        deleted_doc_ids=deleted_doc_ids,
+                    )
+            except asyncio.CancelledError:
+                logger.error(
+                    "Dates/laws pipeline{} CANCELLED (workspace={})",
                     ctx,
                     workspace_id[:12] if workspace_id else "",
                 )
-                await self._run_list_of_dates_and_applicable_laws(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    workspace_role=workspace_role,
-                    batch_result=batch_result,
-                    log_context=log_context,
-                    deleted_doc_ids=deleted_doc_ids,
+                raise
+            except Exception as pipeline_err:
+                # This runner had no handler at all, so anything raised past the
+                # per-step traps inside _run_list_of_dates_and_applicable_laws
+                # disappeared into an unretrieved task exception.
+                logger.opt(exception=pipeline_err).error(
+                    "Dates/laws pipeline{} failed: {}", ctx, pipeline_err
                 )
 
         try:
-            asyncio.create_task(_locked_runner())
+            self._track_background_task(
+                asyncio.create_task(_locked_runner()),
+                label=f"dates/laws pipeline {workspace_id[:12]}",
+            )
             logger.debug(
                 "Scheduled list_of_dates + applicable_laws + procedural_timeline + "
                 "relevant_parties + case_laws + drafting_suggestions{} for workspace {}",
@@ -189,6 +208,325 @@ class ObjectiveChangeMixin:
                 ctx,
                 rt_err,
             )
+
+    # ------------------------------------------------------------------
+    # Objective-change failure bookkeeping
+    #
+    # An objective change arms six panel loaders before it starts work, and a
+    # loader is cleared only by a document_feature_response for the same
+    # featureType. So every way this path can stop early must be (a) named in
+    # the log, so the cause is identifiable after the fact, and (b) either
+    # resumable or terminal. The 2026-09-17 incident was neither: a mid-flight
+    # cancellation produced no log line at all and no emit, and the panels span
+    # for the rest of the session.
+    # ------------------------------------------------------------------
+
+    def _log_objective_regen_failure(
+        self, workspace_id: str, reason: str, detail: str = ""
+    ) -> None:
+        """One structured line + audit event per objective-regen give-up path."""
+        logger.error(
+            "Objective regen give-up: reason={} workspace={} detail={}",
+            reason,
+            str(workspace_id)[:12],
+            detail,
+        )
+        try:
+            audit_logger.log_event(
+                "objective_change_failed",
+                {
+                    "workspace_id": workspace_id,
+                    "reason": reason,
+                    "detail": detail[:500],
+                },
+            )
+        except Exception:
+            pass
+
+    def _note_pending_objective_change(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        instruction: str,
+    ) -> None:
+        """Record an objective change that never produced a payload.
+
+        Unlike a dropped emit there is nothing to re-deliver, so the instruction
+        itself is kept and re-run once on reconnect. Capped at one retry so a
+        request that fails deterministically cannot loop, and stamped so a stale
+        entry is discarded rather than replayed hours later.
+        """
+        if not workspace_id or not (instruction or "").strip():
+            return
+        try:
+            existing = self._pending_objective_changes.get(workspace_id) or {}
+            if not isinstance(existing, dict):
+                existing = {}
+            attempts = int(existing.get("attempts") or 0)
+            self._pending_objective_changes[workspace_id] = {
+                "userId": user_id,
+                "workspaceRole": (workspace_role or "ADJUDICATOR").strip().upper(),
+                "instruction": instruction,
+                "featureTypes": list(OBJECTIVE_CHANGE_REFRESH_FEATURES),
+                "attempts": attempts,
+                "startedAt": time.time(),
+            }
+            logger.warning(
+                "Objective change marked for resume after reconnect "
+                "(workspace={}, attempts={})",
+                str(workspace_id)[:12],
+                attempts,
+            )
+        except Exception as note_err:
+            logger.warning(
+                "Could not mark objective change for resume (workspace={}): {}",
+                str(workspace_id)[:12],
+                note_err,
+            )
+
+    # Beyond this, a marker is stale: the lawyer has moved on, and silently
+    # rewriting their objective from an hour-old instruction would be worse than
+    # doing nothing. Mirrors document_reload's _RELOAD_INFLIGHT_TIMEOUT_SECONDS.
+    _OBJECTIVE_RESUME_MAX_AGE_SECONDS = 900.0
+
+    async def _recover_workspace_after_hydrate(
+        self, workspace_id: str, user_id: Optional[str] = None
+    ) -> None:
+        """Pick up interrupted work for one workspace after a cold start.
+
+        The reconnect sweep only sees markers still in memory, so a RESTART
+        (rather than a bare reconnect) would otherwise leave an undelivered
+        payload buried in Qdrant and its panel spinning. This runs once per
+        workspace per process, reads the persisted markers, and delivers/resumes
+        what it finds.
+        """
+        if not workspace_id or not self._socket_client:
+            return
+        if workspace_id in self._recovered_workspaces:
+            return
+        self._recovered_workspaces.add(workspace_id)
+        try:
+            from app.workspace.persistence import CacheKinds, restore_state
+
+            pending_features = await restore_state(
+                workspace_id=workspace_id,
+                kind=CacheKinds.PENDING_FEATURE_DELIVERY,
+            )
+            if isinstance(pending_features, dict) and pending_features:
+                if hasattr(self._pending_feature_deliveries, "hydrate_from_cache"):
+                    # hydrate_from_cache, not [] — a plain assignment would
+                    # persist straight back to Qdrant for no reason.
+                    self._pending_feature_deliveries.hydrate_from_cache(
+                        workspace_id, pending_features
+                    )
+                else:
+                    self._pending_feature_deliveries[workspace_id] = pending_features
+                delivered = await self._flush_pending_feature_deliveries(
+                    workspace_id
+                )
+                features = (delivered or {}).get(workspace_id) or []
+                if features:
+                    logger.success(
+                        "✅ Re-delivered payload(s) held from before the restart: "
+                        "{} (workspace={})",
+                        features,
+                        str(workspace_id)[:12],
+                    )
+                if "strategy_objective" in features:
+                    # The regeneration had completed; only delivery failed. The
+                    # cascade is what is still owed, so run that instead of
+                    # re-running the objective.
+                    self._clear_pending_objective_change(workspace_id)
+                    self._schedule_objective_change_reanalysis(
+                        workspace_id=workspace_id,
+                        user_id=user_id or "",
+                        log_context=(
+                            " (after re-delivering a held objective payload)"
+                        ),
+                    )
+                    return
+
+            pending_objective = await restore_state(
+                workspace_id=workspace_id,
+                kind=CacheKinds.PENDING_OBJECTIVE_CHANGE,
+            )
+            if isinstance(pending_objective, dict) and pending_objective.get(
+                "instruction"
+            ):
+                if hasattr(self._pending_objective_changes, "hydrate_from_cache"):
+                    self._pending_objective_changes.hydrate_from_cache(
+                        workspace_id, pending_objective
+                    )
+                else:
+                    self._pending_objective_changes[workspace_id] = pending_objective
+                # Detached: the resume runs a full regeneration and must not
+                # delay the handler that triggered hydration.
+                self._track_background_task(
+                    asyncio.create_task(
+                        self._resume_pending_objective_changes(
+                            only_workspace_id=workspace_id
+                        )
+                    ),
+                    label=f"objective-change resume {str(workspace_id)[:12]}",
+                )
+        except Exception as recover_err:
+            logger.warning(
+                "Post-restart recovery failed for workspace {} (non-fatal): {}",
+                str(workspace_id)[:12],
+                recover_err,
+            )
+
+    async def _resume_pending_objective_changes(
+        self, *, only_workspace_id: str = ""
+    ) -> int:
+        """Re-run objective changes that were interrupted before emitting.
+
+        A cancelled regeneration leaves no payload to re-deliver — only the
+        instruction. Re-running it is what turns the 2026-09-17 failure (six
+        loaders lit, nothing ever arriving) into a completed update. Capped at
+        one retry per marker so a deterministically-failing instruction cannot
+        loop, and age-limited so a stale request is dropped, not replayed.
+        """
+        if not self._socket_client:
+            return 0
+        resumed = 0
+        candidates = (
+            [only_workspace_id]
+            if only_workspace_id
+            else [k for k in list(self._pending_objective_changes.keys()) if k]
+        )
+        for workspace_id in candidates:
+            marker = self._pending_objective_changes.get(workspace_id)
+            if not isinstance(marker, dict) or not marker.get("instruction"):
+                continue
+            attempts = int(marker.get("attempts") or 0)
+            started_at = float(marker.get("startedAt") or 0.0)
+            age = time.time() - started_at if started_at else 0.0
+            features = marker.get("featureTypes") or list(
+                OBJECTIVE_CHANGE_REFRESH_FEATURES
+            )
+            user_id = str(marker.get("userId") or "")
+            role = str(marker.get("workspaceRole") or "ADJUDICATOR")
+
+            if attempts >= 1 or age > self._OBJECTIVE_RESUME_MAX_AGE_SECONDS:
+                logger.warning(
+                    "Dropping interrupted objective change (workspace={}, "
+                    "attempts={}, age={:.0f}s) — releasing its loaders",
+                    str(workspace_id)[:12],
+                    attempts,
+                    age,
+                )
+                self._log_objective_regen_failure(
+                    workspace_id,
+                    "resume_abandoned",
+                    f"attempts={attempts} age={age:.0f}s",
+                )
+                self._clear_pending_objective_change(workspace_id)
+                await self._release_refresh_loaders(
+                    workspace_id,
+                    user_id,
+                    list(features),
+                    reason="objective_change_resume_abandoned",
+                    workspace_role=role,
+                )
+                continue
+
+            # Count the attempt BEFORE running it, so a second cancellation
+            # cannot re-queue the same work indefinitely.
+            self._pending_objective_changes[workspace_id] = {
+                **marker,
+                "attempts": attempts + 1,
+            }
+            await self._hydrate_workspace_caches(
+                workspace_id, user_id=user_id, recover=False
+            )
+            current_strategy = self._workspace_strategy_payload.get(workspace_id)
+            if not isinstance(current_strategy, dict) or not (
+                current_strategy.get("caseSummary") or ""
+            ).strip():
+                logger.warning(
+                    "Cannot resume objective change for workspace {} — no cached "
+                    "case summary; releasing its loaders",
+                    str(workspace_id)[:12],
+                )
+                self._clear_pending_objective_change(workspace_id)
+                await self._release_refresh_loaders(
+                    workspace_id,
+                    user_id,
+                    list(features),
+                    reason="objective_change_resume_no_summary",
+                    workspace_role=role,
+                )
+                continue
+
+            logger.info(
+                "Resuming interrupted objective change for workspace {} "
+                "(attempt {})",
+                str(workspace_id)[:12],
+                attempts + 1,
+            )
+            # Re-arm the loaders: this connection may be a fresh page load that
+            # never saw the original workspace:refresh.
+            await self._emit_workspace_refresh(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                reason="objective_change_regeneration_started",
+                feature_types=list(features),
+            )
+            ok = False
+            try:
+                ok = await self._regenerate_strategy_for_new_objective(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=role,
+                    user_objective_instruction=str(marker.get("instruction") or ""),
+                    current_strategy=current_strategy,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as resume_err:
+                logger.opt(exception=resume_err).error(
+                    "Objective-change resume raised for workspace {}: {}",
+                    str(workspace_id)[:12],
+                    resume_err,
+                )
+            if ok:
+                resumed += 1
+                self._clear_pending_objective_change(workspace_id)
+                self._pending_reemit_workspace_id = workspace_id
+                self._pending_reemit_user_id = user_id
+                self._schedule_objective_change_reanalysis(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    log_context=" (resumed after reconnect)",
+                )
+                logger.success(
+                    "✅ Interrupted objective change completed on resume "
+                    "(workspace={})",
+                    str(workspace_id)[:12],
+                )
+            else:
+                self._clear_pending_objective_change(workspace_id)
+                await self._release_refresh_loaders(
+                    workspace_id,
+                    user_id,
+                    list(features),
+                    reason="objective_change_resume_failed",
+                    workspace_role=role,
+                )
+        return resumed
+
+    def _clear_pending_objective_change(self, workspace_id: str) -> None:
+        """Drop the resume marker once the change has landed."""
+        if not workspace_id:
+            return
+        try:
+            if self._pending_objective_changes.get(workspace_id):
+                self._pending_objective_changes[workspace_id] = {}
+        except Exception:
+            pass
 
     def _workspace_pipeline_lock(self, workspace_id: str) -> asyncio.Lock:
         """Per-workspace lock serializing the feature generation/emit pipeline
@@ -372,7 +710,10 @@ class ObjectiveChangeMixin:
                 )
 
         try:
-            asyncio.create_task(_runner())
+            self._track_background_task(
+                asyncio.create_task(_runner()),
+                label=f"applicable_laws only {workspace_id[:12]}",
+            )
         except RuntimeError as rt_err:
             logger.error(
                 "Could not schedule applicable_laws task{}: {}",
@@ -400,10 +741,16 @@ class ObjectiveChangeMixin:
             "applicable_laws",
             "procedural_timeline",
         ]
+        # A correlation id for the arm/release pair. The frontend may ignore it;
+        # its value here is that the log can be read end to end — which refresh
+        # armed which loaders, and whether anything ever released them. The
+        # 2026-09-17 incident had to be reconstructed from the ABSENCE of lines.
+        refresh_id = uuid.uuid4().hex[:12]
         payload: Dict[str, Any] = {
             "workspaceId": workspace_id,
             "featureTypes": features,
             "reason": reason,
+            "refreshId": refresh_id,
             "timestamp": datetime.utcnow().isoformat() + "Z",
         }
         if user_id:
@@ -411,9 +758,11 @@ class ObjectiveChangeMixin:
         try:
             await self._socket_client.emit("workspace:refresh", payload)
             logger.info(
-                "workspace:refresh emitted (reason={}, features={}) for workspace {}",
+                "workspace:refresh emitted (rid={}, reason={}, features={}) "
+                "for workspace {}",
+                refresh_id,
                 reason,
-                len(features),
+                features,
                 workspace_id[:12] if workspace_id else "",
             )
         except Exception as e:
@@ -1671,6 +2020,7 @@ class ObjectiveChangeMixin:
                 risks=merged.get("risks") or [],
                 strengths=merged.get("strengths") or [],
                 existing="",
+                strategic_objective=self._current_strategic_objective(workspace_id),
             )
         except Exception as expl_err:
             logger.warning(
@@ -1715,8 +2065,18 @@ class ObjectiveChangeMixin:
         workspace_role: str,
         *,
         log_context: str = "",
+        emitted: Optional[Set[str]] = None,
     ) -> None:
+        """Regenerate the objective-dependent panels and preserve the rest.
+
+        ``emitted`` is the caller's record of which featureTypes reached the
+        frontend. Every emit below records itself there so the scheduler's
+        terminal release knows what is still owed — without it, a step that
+        raises mid-cascade leaves the remaining panels lit with no way to tell
+        which ones.
+        """
         ctx = log_context or " (objective change)"
+        seen: Set[str] = emitted if emitted is not None else set()
 
         # 1) Analysis report: REGENERATE for the new objective and REPLACE the old
         # one — do NOT merge with the previous report. A change of objective is a
@@ -1730,18 +2090,95 @@ class ObjectiveChangeMixin:
         # fully objective-aligned report with a fresh score and no carryover.
         # (`_merge_analysis_report_with_previous` is unchanged and still used by
         # the document re-upload / sync paths, where incremental merge is correct.)
-        with capture_usage() as _u_obj_analysis:
-            new_analysis = await self._generate_analysis_report_from_documents(
-                workspace_id=workspace_id,
-                user_id=user_id,
-                workspace_role=workspace_role,
-                batch_result=None,
-                is_update=False,
+        new_analysis = None
+        try:
+            with capture_usage() as _u_obj_analysis:
+                new_analysis = await self._generate_analysis_report_from_documents(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=workspace_role,
+                    batch_result=None,
+                    is_update=False,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as analysis_err:
+            # Step 1 used to be unwrapped, so a raise here aborted the whole
+            # cascade and left steps 2-7 (list_of_dates, applicable_laws,
+            # procedural_timeline, relevant_parties, case_laws, drafting) with
+            # their loaders lit and nothing coming. Fall back to the minimal
+            # report and carry on: the other panels are independent of this one.
+            logger.opt(exception=analysis_err).warning(
+                "Objective-change analysis regeneration failed{}: {}; using fallback",
+                ctx,
+                analysis_err,
             )
+            _u_obj_analysis = None
         if not (isinstance(new_analysis, dict) and new_analysis):
             new_analysis = self._analysis_report_fallback(
                 (workspace_role or "ADJUDICATOR").strip().upper()
             )
+
+        # The quality score measures readiness FOR AN OBJECTIVE, so when the
+        # objective changes the explanation of that score has to change with
+        # it — a lawyer who has just re-pointed the case and sees the same
+        # sentences reasonably concludes nothing happened.
+        #
+        # The regeneration above usually supplies a fresh one, but not always:
+        # the report JSON is long and `qualityScoreExplanation` is one of the
+        # first fields to be lost to truncation, in which case
+        # `_ensure_quality_score_explanation` had already filled it from an
+        # objective-blind pass over the gap lists — which can land on text
+        # identical to the previous objective's. So force the issue here:
+        # missing, or unchanged from the report we are replacing, means
+        # regenerate it WITH the new objective in hand.
+        if isinstance(new_analysis, dict):
+            try:
+                _prev_report = self._workspace_analysis_payload.get(workspace_id) or {}
+                _prev_expl = str(
+                    (_prev_report or {}).get("qualityScoreExplanation") or ""
+                ).strip()
+                _new_expl = str(
+                    new_analysis.get("qualityScoreExplanation") or ""
+                ).strip()
+                if not _new_expl or _new_expl == _prev_expl:
+                    try:
+                        _score = int(new_analysis.get("caseResolutionScore") or 0)
+                    except (TypeError, ValueError):
+                        _score = 0
+                    _objective_expl = await self._ensure_quality_score_explanation(
+                        workspace_role=workspace_role,
+                        case_resolution_score=_score,
+                        missing_info=new_analysis.get("missingInfo") or [],
+                        weaknesses=new_analysis.get("weaknesses") or [],
+                        risks=new_analysis.get("risks") or [],
+                        strengths=new_analysis.get("strengths") or [],
+                        existing="",
+                        strategic_objective=self._current_strategic_objective(
+                            workspace_id
+                        ),
+                    )
+                    if _objective_expl:
+                        new_analysis["qualityScoreExplanation"] = _objective_expl
+                        new_analysis["reportQualityScoreExplanation"] = (
+                            self._sanitize_report_quality_score_explanation(
+                                _objective_expl
+                            )
+                        ).strip()
+                        logger.info(
+                            "Objective-change analysis{}: quality score "
+                            "explanation regenerated for the new objective "
+                            "(was {})",
+                            ctx,
+                            "empty" if not _new_expl else "unchanged",
+                        )
+            except Exception as expl_err:
+                logger.warning(
+                    "Objective-change quality score explanation refresh "
+                    "failed{}: {}; keeping the regenerated report's own text",
+                    ctx,
+                    expl_err,
+                )
 
         # Tag the objective-aligned report against the frontend's currentState
         # so items that still textually match the previously-curated ones carry
@@ -1769,13 +2206,12 @@ class ObjectiveChangeMixin:
                 payload=new_analysis,
                 usage=_u_obj_analysis,
             )
+            seen.add("analysis_report")
             logger.success(
                 "✅ Objective-change analysis update emitted "
                 "(fully regenerated for new objective, prev replaced){}",
                 ctx,
             )
-            # Fresh objective-aligned report is emitted; lift suppression so future emits are allowed.
-            self._suppress_analysis_emit_until_ts.pop(workspace_id, None)
 
         # The new objective text (set by the strategy regen that ran before this
         # cascade) drives the list-of-dates relevance re-score and the applicable
@@ -1804,6 +2240,8 @@ class ObjectiveChangeMixin:
                 logger.warning(
                     "List of dates relevance re-eval failed{}: {}", ctx, rel_err
                 )
+        if relevance_done:
+            seen.add("list_of_dates")
         if not relevance_done:
             preserved_dates = (
                 self._workspace_list_of_dates_payload.get(workspace_id) or []
@@ -1823,6 +2261,7 @@ class ObjectiveChangeMixin:
                     },
                     usage=None,
                 )
+                seen.add("list_of_dates")
                 logger.success(
                     "✅ Objective-change list_of_dates preserved (relevance re-eval skipped){}",
                     ctx,
@@ -1843,6 +2282,7 @@ class ObjectiveChangeMixin:
                 merge_with_previous=False,
             )
             laws_done = True
+            seen.add("applicable_laws")
         except Exception as laws_err:
             logger.warning(
                 "Applicable laws regeneration failed{}: {}", ctx, laws_err
@@ -1862,6 +2302,7 @@ class ObjectiveChangeMixin:
                     payload=preserved_laws,
                     usage=None,
                 )
+                seen.add("applicable_laws")
                 logger.success(
                     "✅ Objective-change applicable_laws preserved (regeneration skipped){}",
                     ctx,
@@ -1886,6 +2327,7 @@ class ObjectiveChangeMixin:
                 payload={"proceduralTimeline": preserved_timeline},
                 usage=None,
             )
+            seen.add("procedural_timeline")
             logger.success(
                 "✅ Objective-change preserved procedural_timeline re-emitted{}",
                 ctx,
@@ -1897,6 +2339,7 @@ class ObjectiveChangeMixin:
         # documents are added/deleted (handled by the document-sync scheduler).
         try:
             await self._emit_relevant_parties(workspace_id, user_id)
+            seen.add("relevant_parties")
             logger.success(
                 "✅ Objective-change relevant_parties preserved (regeneration skipped){}",
                 ctx,
@@ -1924,6 +2367,7 @@ class ObjectiveChangeMixin:
                 merge_with_previous=False,
             )
             case_done = True
+            seen.add("case_laws")
             logger.success(
                 "✅ Objective-change case_laws regenerated for new objective{}",
                 ctx,
@@ -1935,6 +2379,7 @@ class ObjectiveChangeMixin:
         if not case_done:
             try:
                 await self._reemit_case_laws_unchanged(workspace_id, user_id)
+                seen.add("case_laws")
             except Exception as case_preserve_err:
                 logger.warning(
                     "Objective-change case_laws preserve fallback failed{}: {}",
@@ -1955,6 +2400,7 @@ class ObjectiveChangeMixin:
                 workspace_role=workspace_role,
             )
             draft_done = True
+            seen.add("drafting_assistant")
             logger.success(
                 "✅ Objective-change drafting regenerated for new objective{}",
                 ctx,
@@ -1968,6 +2414,7 @@ class ObjectiveChangeMixin:
         if not draft_done:
             try:
                 await self._reemit_drafting_unchanged(workspace_id, user_id)
+                seen.add("drafting_assistant")
             except Exception as draft_preserve_err:
                 logger.warning(
                     "Objective-change drafting preserve fallback failed{}: {}",
@@ -2008,7 +2455,17 @@ class ObjectiveChangeMixin:
         except Exception:
             pass
 
+        # The panels this cascade owns. strategy_objective is excluded: the
+        # caller already emitted it before scheduling us, so re-emitting it here
+        # would overwrite the fresh objective with whatever is cached.
+        cascade_features = [
+            f
+            for f in OBJECTIVE_CHANGE_REFRESH_FEATURES
+            if f != "strategy_objective"
+        ]
+
         async def _runner() -> None:
+            emitted: Set[str] = set()
             try:
                 # Take the per-workspace pipeline lock, as
                 # _schedule_strategy_analysis_pipeline already does. This
@@ -2030,16 +2487,63 @@ class ObjectiveChangeMixin:
                         user_id=user_id,
                         workspace_role=role,
                         log_context=ctx,
+                        emitted=emitted,
                     )
+            except asyncio.CancelledError:
+                # Cancellation is a BaseException: the `except Exception` below
+                # never saw it, so a cascade killed by a reconnect or a shutdown
+                # used to vanish without a log line AND without releasing the
+                # loaders it was responsible for.
+                logger.error(
+                    "Objective-change incremental refresh{} CANCELLED "
+                    "(workspace={}, emitted={})",
+                    ctx,
+                    workspace_id[:12] if workspace_id else "",
+                    sorted(emitted),
+                )
+                await self._release_refresh_loaders(
+                    workspace_id,
+                    user_id,
+                    cascade_features,
+                    skip=emitted,
+                    reason="objective_change_cascade_cancelled",
+                    workspace_role=role,
+                )
+                raise
             except Exception as rean_err:
-                logger.warning(
+                logger.opt(exception=rean_err).error(
                     "Objective-change incremental refresh{} failed: {}",
                     ctx,
                     rean_err,
                 )
+                self._log_objective_regen_failure(
+                    workspace_id, "cascade_failed", str(rean_err)
+                )
+            finally:
+                # Whatever happened, no panel this cascade armed may be left
+                # spinning: anything that did not emit gets its terminal state.
+                # A no-op when every step emitted, which is the normal path.
+                try:
+                    await self._release_refresh_loaders(
+                        workspace_id,
+                        user_id,
+                        cascade_features,
+                        skip=emitted,
+                        reason="objective_change_cascade_terminal",
+                        workspace_role=role,
+                    )
+                except Exception as rel_err:
+                    logger.warning(
+                        "Objective-change terminal loader release failed{}: {}",
+                        ctx,
+                        rel_err,
+                    )
 
         try:
-            asyncio.create_task(_runner())
+            self._track_background_task(
+                asyncio.create_task(_runner()),
+                label=f"objective-change cascade {workspace_id[:12]}",
+            )
             logger.info(
                 "Scheduled objective-change reanalysis{} for workspace {}",
                 ctx,
@@ -2171,7 +2675,10 @@ class ObjectiveChangeMixin:
                 )
 
         try:
-            asyncio.create_task(_runner())
+            self._track_background_task(
+                asyncio.create_task(_runner()),
+                label=f"strategy/analysis pipeline {workspace_id[:12]}",
+            )
             logger.info(
                 "Scheduled background strategy + analysis + timeline/laws for workspace {}",
                 workspace_id[:12] if workspace_id else "",
@@ -2244,17 +2751,13 @@ class ObjectiveChangeMixin:
                     "emitting untagged",
                     log_context, tag_err,
                 )
-        # Guard: if objective-change refresh is active, skip stale background emits
-        # so workspace sees only objective-aligned analysis report.
-        suppress_until = self._suppress_analysis_emit_until_ts.get(workspace_id, 0.0)
-        if suppress_until and time.time() < suppress_until:
-            logger.info(
-                "Skipping stale analysis_report emit for workspace {} (suppressed for {:.1f}s more){}",
-                workspace_id[:12] if workspace_id else "",
-                max(0.0, suppress_until - time.time()),
-                log_context,
-            )
-            return False
+        # NOTE: a `_suppress_analysis_emit_until_ts` guard used to sit here,
+        # meant to drop stale background analysis emits during an
+        # objective-change regeneration. Nothing ever SET the flag, so the
+        # branch was unreachable — and had it been armed it would have returned
+        # without emitting, stranding the analysis loader (its only clear ran
+        # after a successful emit). The cascade now serializes on the workspace
+        # pipeline lock, which is what actually prevents the interleaving.
         # Cache and set pending re-emit before emit so re-emit on reconnect has data if emit fails
         self._workspace_analysis_payload[workspace_id] = analysis_report
         self._pending_reemit_workspace_id = workspace_id

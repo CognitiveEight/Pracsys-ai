@@ -812,6 +812,7 @@ pendingActions / nextSteps / suggestedDrafts:
 qualityScoreExplanation RULE:
 - MANDATORY non-empty string of 3-5 sentences.
 - MUST start with "The current score is <N>% because" (where N is the integer caseResolutionScore).
+- MUST include exactly ONE sentence tying the score to the CURRENT STRATEGIC OBJECTIVE above: which gap or risk matters most for pursuing THAT objective, or which strength most advances it, in the objective's own terms. The score measures readiness FOR the objective, so when the objective changes this sentence must change with it. Do NOT restate the objective and do NOT judge whether it is a good objective.
 - MUST cite the SPECIFIC facts driving the score: name at least one missingInfo item by what is missing and from whom (using EXTRACTED FACTS names), one weakness or risk by the named party/date/amount/annexure that triggers it, and one strength by the named fact (party + date + Annexure) that supports it.
 - If the score is 100, say specifically that no missingInfo, weaknesses, or risks were flagged, and name the top 1-2 strengths (parties + dates + Annexures) that justify it.
 - Never use generic phrasing like "gaps in annexures" or "procedural risks identified" without naming WHICH gap, WHICH risk, and FOR WHOM.
@@ -1384,6 +1385,11 @@ Rules:
                 risks=risks,
                 strengths=strengths,
                 existing=quality_score_explanation,
+                strategic_objective=(
+                    ""
+                    if current_strategic_objective == "(not provided)"
+                    else current_strategic_objective
+                ),
             )
             quality_score_explanation = re.sub(
                 r"\bdocuments\b",
@@ -1436,6 +1442,11 @@ Rules:
                             weaknesses,
                             risks,
                             strengths,
+                            strategic_objective=(
+                                ""
+                                if current_strategic_objective == "(not provided)"
+                                else current_strategic_objective
+                            ),
                         )
                     )
                 )
@@ -1719,6 +1730,40 @@ Rules:
             self._ANALYSIS_REPORT_DERIVED_SCORE_FLOOR, min(base, max_allowed)
         )
 
+    def _current_strategic_objective(self, workspace_id: str) -> str:
+        """The workspace's live strategic objective, or "" when unknown.
+
+        Read from the strategy cache rather than the analysis report: the
+        report never carries `strategicObjective`, and the objective-change
+        cascade runs AFTER the strategy regen has written the new one here.
+        """
+        if not workspace_id:
+            return ""
+        payload = self._workspace_strategy_payload.get(workspace_id)
+        if not isinstance(payload, dict):
+            return ""
+        return str(payload.get("strategicObjective") or "").strip()
+
+    @staticmethod
+    def _objective_clause_for_explanation(strategic_objective: str) -> str:
+        """One short sentence tying the score to the current objective.
+
+        Used by the deterministic explanation so that a change of objective
+        still visibly changes the explanation even when no LLM ran (truncated
+        output, failed call). Quotes only the objective's FIRST sentence and
+        caps it, because the whole objective is 10-20 sentences and this is a
+        3-5 sentence explanation.
+        """
+        text = " ".join((strategic_objective or "").split())
+        if not text:
+            return ""
+        first = text.split(". ")[0].strip().rstrip(".")
+        if not first:
+            return ""
+        if len(first) > 160:
+            first = first[:157].rstrip() + "..."
+        return f"This score measures readiness for the current objective: {first}."
+
     def _derive_quality_score_explanation(
         self,
         case_resolution_score: int,
@@ -1726,6 +1771,7 @@ Rules:
         weaknesses: List[Any],
         risks: List[Any],
         strengths: List[Any],
+        strategic_objective: str = "",
     ) -> str:
         """Deterministic explanation when the model omits qualityScoreExplanation or output was truncated."""
         nm = len(missing_info or [])
@@ -1733,10 +1779,17 @@ Rules:
         nr = len(risks or [])
         ns = len(strengths or [])
         lead = f"The current case resolution score is {case_resolution_score}%."
+        objective_clause = self._objective_clause_for_explanation(strategic_objective)
         if nm == 0 and nw == 0 and nr == 0:
-            return (
-                f"{lead} No missing critical information, factual weaknesses, or procedural risks were flagged "
-                "in the annexures for this pass."
+            return " ".join(
+                s
+                for s in (
+                    lead,
+                    "No missing critical information, factual weaknesses, or "
+                    "procedural risks were flagged in the annexures for this pass.",
+                    objective_clause,
+                )
+                if s
             )
         clauses = []
         if nm:
@@ -1755,7 +1808,9 @@ Rules:
             if ns
             else ""
         )
-        return " ".join(s for s in (lead, second, third) if s).strip()
+        return " ".join(
+            s for s in (lead, second, third, objective_clause) if s
+        ).strip()
 
     def _sanitize_report_quality_score_explanation(self, text: str) -> str:
         """Report-facing score explanation: remove disallowed words (legal, respondent) per product rules."""
@@ -1779,8 +1834,17 @@ Rules:
         risks: List[Any],
         strengths: List[Any],
         existing: str,
+        strategic_objective: str = "",
     ) -> str:
-        """Fill qualityScoreExplanation via model output, short LLM pass, or deterministic text."""
+        """Fill qualityScoreExplanation via model output, short LLM pass, or deterministic text.
+
+        ``strategic_objective`` is what makes the explanation move when the
+        objective moves: the score measures readiness FOR an objective, so both
+        the LLM pass and the deterministic fallback state how the current
+        objective bears on it. Callers regenerating after an objective change
+        must pass it (and ``existing=""``), or the explanation will be about
+        the gaps alone and read as stale to the lawyer who just changed course.
+        """
         if (existing or "").strip():
             return (existing or "").strip()
         try:
@@ -1805,7 +1869,7 @@ Rules:
                 ensure_ascii=False,
             )
             prompt = (
-                ensure_quality_score_explanation_prompt(case_resolution_score=case_resolution_score, summary=summary)
+                ensure_quality_score_explanation_prompt(case_resolution_score=case_resolution_score, summary=summary, strategic_objective=strategic_objective)
             )
             txt = await gemini_client.generate(
                 prompt=prompt,
@@ -1850,6 +1914,7 @@ Rules:
             weaknesses,
             risks,
             strengths,
+            strategic_objective=strategic_objective,
         )
 
     def _get_annexure_count(self, workspace_id: str) -> int:
@@ -2412,6 +2477,21 @@ Rules:
                 feature_types=["analysis_report"],
             )
             current_report = self._workspace_analysis_payload.get(workspace_id)
+            if not isinstance(current_report, dict):
+                # The refresh above lit the analysis loader and there is no
+                # cached report to update, so nothing below will emit — the
+                # panel would spin for the rest of the session. Release it.
+                logger.warning(
+                    "Analysis update requested with no cached report "
+                    "(workspace={}) — releasing its loader",
+                    workspace_id[:12] if workspace_id else "",
+                )
+                await self._release_refresh_loaders(
+                    workspace_id,
+                    user_id,
+                    ["analysis_report"],
+                    reason="analysis_update_no_cached_report",
+                )
             if isinstance(current_report, dict):
                 removed_missing = 0
                 removed_weak = 0
@@ -3095,6 +3175,7 @@ Rules:
             risks=updated_risks,
             strengths=updated_strengths,
             existing="",
+            strategic_objective=self._current_strategic_objective(workspace_id),
         )
         report["qualityScoreExplanation"] = fresh_explanation
         report["reportQualityScoreExplanation"] = (
@@ -3490,6 +3571,7 @@ Rules:
             risks=updated_risks,
             strengths=updated_strengths,
             existing="",  # force regeneration so the explanation reflects current state
+            strategic_objective=self._current_strategic_objective(workspace_id),
         )
         report["qualityScoreExplanation"] = fresh_explanation
         report["reportQualityScoreExplanation"] = (

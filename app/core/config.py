@@ -69,6 +69,14 @@ class Settings(BaseSettings):
     google_api_key: Optional[str] = None
     gemini_model: str = "gemini-2.5-flash"
 
+    # Hard ceiling on a single Gemini generation. Without it a stalled request
+    # blocks its caller forever: the long feature generations are awaited inline
+    # by socket handlers, and a strategy/objective regeneration legitimately runs
+    # ~2 minutes, so the bound must sit comfortably above that while still being
+    # finite. On expiry the call raises asyncio.TimeoutError, which the feature
+    # handlers turn into a reported failure instead of a permanent loader.
+    gemini_request_timeout_seconds: float = 300.0
+
     # Token pricing overrides (USD per 1,000,000 tokens). When BOTH are set they
     # take precedence over the built-in per-model table in app/ai/pricing.py, so
     # ops can retune costs without a code change. Leave unset to price by model.

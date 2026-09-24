@@ -111,6 +111,7 @@ from app.socket.event_utils import (
     _normalize_report_mobile_from_overview,
     _overview_conversation_date_to_iso,
     extract_overview_conversation_report_contact_meta,
+    drafting_payload_to_wire,
 )
 
 
@@ -166,6 +167,298 @@ class JsonHelpersMixin:
                     return text[start : i + 1]
             i += 1
         return text[start:].strip() if start >= 0 else None
+
+    # ------------------------------------------------------------------
+    # Background task bookkeeping
+    # ------------------------------------------------------------------
+
+    def _track_background_task(
+        self, task: "asyncio.Task", *, label: str = ""
+    ) -> "asyncio.Task":
+        """Hold a strong reference to a detached task and drain its exception.
+
+        Two problems this solves. asyncio keeps only a WEAK reference to a task,
+        so a bare ``create_task(...)`` whose handle is discarded can be
+        garbage-collected mid-flight. And a task that dies with an exception
+        nobody retrieves reports it, at best, as an unhelpful
+        "Task exception was never retrieved" at interpreter shutdown — which is
+        how a whole feature cascade can disappear leaving only a stuck loader.
+        """
+        self._background_tasks.add(task)
+
+        def _done(finished: "asyncio.Task") -> None:
+            self._background_tasks.discard(finished)
+            try:
+                if finished.cancelled():
+                    logger.warning(
+                        "Background task cancelled{}",
+                        f" ({label})" if label else "",
+                    )
+                    return
+                exc = finished.exception()
+            except Exception:  # pragma: no cover - defensive
+                return
+            if exc is not None:
+                logger.opt(exception=exc).error(
+                    "Background task failed{}: {}",
+                    f" ({label})" if label else "",
+                    exc,
+                )
+
+        task.add_done_callback(_done)
+        return task
+
+    # ------------------------------------------------------------------
+    # Undelivered feature payloads
+    #
+    # SocketClient.emit returns False instead of raising when the socket is down,
+    # so a payload generated during a disconnect is discarded with nothing to
+    # retry it. Since a panel loader is cleared only by the arrival of that
+    # payload, the panel then spins for the rest of the session. These keep the
+    # envelope (persisted, because the disconnect often coincides with a
+    # restart) so the REAL generated output is delivered on reconnect rather
+    # than a stale cached snapshot.
+    # ------------------------------------------------------------------
+
+    def _note_pending_feature_delivery(
+        self, workspace_id: str, feature_type: str, envelope: Dict[str, Any]
+    ) -> None:
+        """Buffer an undelivered ``document_feature_response`` envelope."""
+        if not workspace_id or not feature_type or not isinstance(envelope, dict):
+            return
+        try:
+            existing = self._pending_feature_deliveries.get(workspace_id) or {}
+            if not isinstance(existing, dict):
+                existing = {}
+            # Reassign rather than mutate: the cache is a write-through
+            # PersistentWorkspaceDict and only __setitem__ persists.
+            self._pending_feature_deliveries[workspace_id] = {
+                **existing,
+                feature_type: envelope,
+            }
+        except Exception as note_err:
+            logger.warning(
+                "Could not buffer undelivered {} for workspace {}: {}",
+                feature_type,
+                str(workspace_id)[:12],
+                note_err,
+            )
+
+    def _clear_pending_feature_delivery(
+        self, workspace_id: str, feature_type: str
+    ) -> None:
+        """Drop a buffered envelope once a fresher payload was delivered."""
+        if not workspace_id or not feature_type:
+            return
+        try:
+            existing = self._pending_feature_deliveries.get(workspace_id)
+            if not isinstance(existing, dict) or feature_type not in existing:
+                return
+            remaining = {
+                k: v for k, v in existing.items() if k != feature_type
+            }
+            self._pending_feature_deliveries[workspace_id] = remaining
+        except Exception:
+            # Never let bookkeeping break a successful emit.
+            pass
+
+    async def _flush_pending_feature_deliveries(
+        self, workspace_id: str = ""
+    ) -> Dict[str, List[str]]:
+        """Re-send every buffered feature envelope.
+
+        Returns ``{workspace_id: [featureType, ...]}`` for what was delivered —
+        the caller needs to know WHICH features landed, because a delivered
+        strategy_objective means that regeneration actually completed and only
+        its delivery failed, so it must not also be re-run.
+
+        Runs BEFORE the cached-feature reconnect replay so the frontend gets the
+        genuinely-generated payload (e.g. the new strategic objective) rather
+        than the pre-change snapshot the replay would ship.
+        """
+        if not self._socket_client:
+            return {}
+        workspace_ids = (
+            [workspace_id]
+            if workspace_id
+            else [k for k in list(self._pending_feature_deliveries.keys()) if k]
+        )
+        delivered: Dict[str, List[str]] = {}
+        for ws_id in workspace_ids:
+            buffered = self._pending_feature_deliveries.get(ws_id)
+            if not isinstance(buffered, dict) or not buffered:
+                continue
+            remaining: Dict[str, Any] = {}
+            for feature_type, envelope in list(buffered.items()):
+                if not isinstance(envelope, dict):
+                    continue
+                try:
+                    ok = await self._socket_client.emit(
+                        "document_feature_response", envelope
+                    )
+                except Exception as emit_err:
+                    logger.warning(
+                        "Pending {} re-delivery raised for workspace {}: {}",
+                        feature_type,
+                        str(ws_id)[:12],
+                        emit_err,
+                    )
+                    ok = False
+                if ok:
+                    delivered.setdefault(ws_id, []).append(feature_type)
+                    logger.success(
+                        "✅ Pending {} re-delivered after reconnect (workspace={})",
+                        feature_type,
+                        str(ws_id)[:12],
+                    )
+                else:
+                    # Still down — keep it for the next reconnect.
+                    remaining[feature_type] = envelope
+            self._pending_feature_deliveries[ws_id] = remaining
+        return delivered
+
+    # ------------------------------------------------------------------
+    # Loader release
+    #
+    # A frontend panel loader is armed by ``workspace:refresh`` (which names the
+    # featureTypes to spin) and disarmed ONLY by the arrival of a
+    # ``document_feature_response`` carrying the same featureType. There is no
+    # "refresh finished" event and no client-side timeout, so any path that arms
+    # a loader and then returns without emitting leaves that panel spinning for
+    # the rest of the session.
+    #
+    # This is the last-resort pairing for every such path: it emits the panel's
+    # terminal state (its preserved cached payload, or the feature's own minimal
+    # fallback) for each featureType that produced no emit. It is NOT a way to
+    # paper over a failure — callers must still report the failure to the user —
+    # it only guarantees the spinner cannot outlive the work that armed it.
+    # ------------------------------------------------------------------
+
+    async def _release_refresh_loaders(
+        self,
+        workspace_id: str,
+        user_id: str,
+        feature_types: List[str],
+        *,
+        skip: Optional[Set[str]] = None,
+        reason: str = "",
+        workspace_role: str = "",
+    ) -> List[str]:
+        """Emit a terminal state for every armed loader that never got one.
+
+        ``skip`` names the featureTypes that DID emit during the refresh window.
+        Returns the featureTypes actually released. Each feature is released
+        independently so one failure cannot strand the rest.
+        """
+        if not self._socket_client or not workspace_id or not feature_types:
+            return []
+        already = {str(f) for f in (skip or set())}
+        released: List[str] = []
+        role = (workspace_role or "ADJUDICATOR").strip().upper() or "ADJUDICATOR"
+
+        for feature in feature_types:
+            if not feature or feature in already:
+                continue
+            try:
+                if feature == "strategy_objective":
+                    cached = self._workspace_strategy_payload.get(workspace_id)
+                    payload = (
+                        cached
+                        if isinstance(cached, dict) and cached
+                        else self._strategy_objective_fallback(
+                            workspace_id=workspace_id,
+                            user_id=user_id,
+                            workspace_role=role,
+                            is_update=True,
+                        )
+                    )
+                elif feature == "analysis_report":
+                    cached = self._workspace_analysis_payload.get(workspace_id)
+                    payload = (
+                        cached
+                        if isinstance(cached, dict) and cached
+                        else self._analysis_report_fallback(role)
+                    )
+                elif feature == "list_of_dates":
+                    cached_dates = self._workspace_list_of_dates_payload.get(
+                        workspace_id
+                    )
+                    payload = {
+                        "workspaceId": workspace_id,
+                        "userId": user_id,
+                        "listOfDates": (
+                            cached_dates if isinstance(cached_dates, list) else []
+                        ),
+                    }
+                elif feature == "applicable_laws":
+                    cached_laws = self._workspace_applicable_laws_payload.get(
+                        workspace_id
+                    )
+                    payload = cached_laws if isinstance(cached_laws, dict) else {}
+                elif feature == "procedural_timeline":
+                    cached_timeline = (
+                        self._workspace_procedural_timeline_payload.get(workspace_id)
+                    )
+                    payload = {
+                        "proceduralTimeline": (
+                            cached_timeline
+                            if isinstance(cached_timeline, list)
+                            else []
+                        )
+                    }
+                elif feature == "relevant_parties":
+                    # Delegate: the wire shape for these three lives in one place
+                    # each, and duplicating it here would drift.
+                    await self._emit_relevant_parties(workspace_id, user_id)
+                    released.append(feature)
+                    continue
+                elif feature == "case_laws":
+                    await self._reemit_case_laws_unchanged(workspace_id, user_id)
+                    released.append(feature)
+                    continue
+                elif feature == "drafting_assistant":
+                    # NOT delegated to _reemit_drafting_unchanged: that helper
+                    # returns early when there is no cached payload, which is
+                    # exactly the case where the loader most needs releasing.
+                    cached_drafts = self._workspace_drafting_payload.get(workspace_id)
+                    payload = (
+                        drafting_payload_to_wire(cached_drafts)
+                        if isinstance(cached_drafts, dict) and cached_drafts
+                        else {"suggestedDrafts": []}
+                    )
+                else:
+                    logger.warning(
+                        "Loader release: no terminal state known for featureType {} "
+                        "(workspace={}) — panel may stay lit",
+                        feature,
+                        workspace_id[:12] if workspace_id else "",
+                    )
+                    continue
+
+                await self._emit_document_feature(
+                    feature_type=feature,
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    payload=payload,
+                    usage=None,
+                )
+                released.append(feature)
+            except Exception as release_err:
+                logger.warning(
+                    "Loader release failed for {} (workspace={}): {}",
+                    feature,
+                    workspace_id[:12] if workspace_id else "",
+                    release_err,
+                )
+
+        if released:
+            logger.info(
+                "Loader release ({}): re-emitted terminal state for {} (workspace={})",
+                reason or "unspecified",
+                released,
+                workspace_id[:12] if workspace_id else "",
+            )
+        return released
 
     def _prepare_json_candidate(
         self, raw_text: str, prefer: str = "object"

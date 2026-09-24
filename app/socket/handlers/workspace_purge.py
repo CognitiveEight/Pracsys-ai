@@ -537,6 +537,20 @@ class WorkspacePurgeMixin:
                 ci_error,
             )
 
+        # Collaborator roster (workspace sharing) — holds participant names,
+        # which are personal data and must not outlive the erasure request.
+        try:
+            from app.workspace.participants import clear_participants
+
+            clear_participants(workspace_id)
+            removed += 1
+        except Exception as participants_error:  # pragma: no cover - best effort
+            logger.debug(
+                "Clearing workspace participants failed (workspace={}): {}",
+                workspace_id,
+                participants_error,
+            )
+
         # Scalars pointing at this workspace: leaving them set would make the
         # reconnect re-emit path try to republish a purged workspace's panels.
         if getattr(self, "_pending_reemit_workspace_id", None) == workspace_id:

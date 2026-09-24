@@ -154,6 +154,24 @@ class WorkspaceCurrentState(BaseModel):
     applicableLaws: Optional[List[CurrentStateLawItem]] = None
 
 
+class WorkspaceParticipant(BaseModel):
+    """
+    One collaborator on a SHARED workspace (workspace sharing).
+
+    Arrives inside ``workspace_sync.participants``. ``userId`` identifies the
+    collaborator; the workspace's own ``userId`` stays the case OWNER.
+    ``permission`` is ``edit`` or ``view`` — it is kept as a free string rather
+    than a Literal so an unrecognised value degrades to read-only (see
+    ``app/workspace/participants.py``) instead of rejecting the whole sync.
+    """
+
+    userId: str
+    name: Optional[str] = None
+    permission: Optional[str] = None  # "edit" | "view"
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
 class WorkspaceSyncPayload(BaseModel):
     """
     Schema for workspace_sync event (Server → AI_Maverick).
@@ -184,6 +202,10 @@ class WorkspaceSyncPayload(BaseModel):
     currentState: Optional[WorkspaceCurrentState] = (
         None  # Previously-curated panel state (present only on re-run triggers)
     )
+    # Collaborator roster. ABSENT ENTIRELY (not an empty array) when the case
+    # is not shared, which is how an un-share reaches this service — see
+    # `set_participants(..., authoritative=True)` in app/workspace/participants.py.
+    participants: Optional[List[WorkspaceParticipant]] = None
 
     class Config:
         populate_by_name = True
@@ -213,6 +235,67 @@ class WorkspaceVersionRestorePayload(WorkspaceSyncPayload):
 
     versionId: str  # Version being restored to
     restoredDocumentIds: List[str] = []  # Documents returning to evidence (advisory)
+
+    class Config:
+        populate_by_name = True
+
+
+class DocumentReloadTargetFile(EvidenceFilePayload):
+    """The one document a ``document_reload_request`` re-reads.
+
+    Same shape as any other evidence file — deliberately, because the reload is
+    a RE-READ of a document that is already in evidence, not a new upload: the
+    ``fileHash`` is unchanged and the same file appears again inside
+    ``evidenceFiles``. Only ``url`` differs (the backend re-signs it) plus:
+
+    - ``previousQualityScore`` — the readability score this service reported
+      last time, or ``None`` if the document was never scored. Advisory: it is
+      logged and audited so a reload can be judged against its predecessor, and
+      never used to decide whether to re-ingest.
+    """
+
+    previousQualityScore: Optional[float] = None
+
+    class Config:
+        populate_by_name = True
+
+
+class DocumentReloadRequestPayload(BaseModel):
+    """
+    Schema for document_reload_request event (Server → AI_Maverick).
+
+    The user hit "reload" on one document in Supporting Material (or the
+    backend did, because the document scored badly). The AI purges everything
+    it holds for that document, re-fetches and re-extracts it, and re-runs the
+    workspace feature suite over the FULL evidence set.
+
+    - ``requestId`` de-dupes retries. The backend records the request in its AI
+      ledger and re-sends on a stall or reconnect, so a re-send under the same
+      id is expected rather than an error.
+    - ``targetFile`` is the document being reloaded. It carries no document id
+      of its own in the backend contract, so the handler resolves one (see
+      ``_resolve_reload_document_id``) — an id-less reload cannot be ingested.
+    - ``evidenceFiles`` is every ACTIVE file, so the feature re-run has full
+      context. Nothing is being removed here, so no soft-deleted entries.
+    - ``currentState`` is MANDATORY on this event: without it the re-run would
+      wipe the items the lawyer already approved or rejected.
+    - ``participants`` is context only (present on shared cases); access is
+      enforced by the backend, and a reload says nothing about sharing, so the
+      handler applies it non-authoritatively.
+    """
+
+    requestId: str  # 'dlr_<docId first 8>_<epochMs>' — de-dupes retries
+    workspaceId: str
+    userId: str  # always the case OWNER, shared or not
+    title: Optional[str] = None
+    status: Optional[str] = None
+    workspaceRole: Optional[str] = None
+    reason: Optional[str] = None  # 'user_requested' | 'poor_quality'
+    targetFile: DocumentReloadTargetFile
+    evidenceFiles: Optional[List[EvidenceFilePayload]] = None
+    currentState: Optional[WorkspaceCurrentState] = None
+    participants: Optional[List[WorkspaceParticipant]] = None
+    timestamp: Optional[str] = None  # ISO timestamp
 
     class Config:
         populate_by_name = True
@@ -406,6 +489,22 @@ class ChatAttachmentPayload(BaseModel):
         extra = "ignore"
 
 
+class ChatAskedBy(BaseModel):
+    """
+    Who typed a chat message, when that is not the case owner.
+
+    Present on ``user_message_request`` ONLY for a shared workspace where a
+    collaborator asked the question. The payload's ``userId`` is unchanged (it
+    remains the OWNER), so this is purely additive: it drives attribution in
+    the reply and the read-only gate for ``view`` collaborators.
+    """
+
+    userId: str
+    name: Optional[str] = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
 class UserMessageRequestPayload(BaseModel):
     """
     Schema for user_message_request event (Server → AI_Maverick).
@@ -430,6 +529,10 @@ class UserMessageRequestPayload(BaseModel):
     attachment: Optional[ChatAttachmentPayload] = (
         None  # Document uploaded with this message (e.g. ANALYSIS_REPORT chat)
     )
+    askedBy: Optional[ChatAskedBy] = Field(
+        default=None,
+        validation_alias=AliasChoices("askedBy", "asked_by"),
+    )  # Set only when a shared-workspace collaborator (not the owner) asked.
 
     # Drafting Assistant fields. Optional; present on the kick-off turn when
     # the lawyer starts a draft from a template / suggestion / blank.

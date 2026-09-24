@@ -2,6 +2,7 @@
 
 from app.socket.handlers._shared import JsonHelpersMixin
 from app.socket.handlers.documents import DocumentsMixin
+from app.socket.handlers.document_reload import DocumentReloadMixin
 from app.socket.handlers.state_roles import StateRolesMixin
 from app.socket.handlers.extraction import ExtractionMixin
 from app.socket.handlers.strategy import StrategyMixin
@@ -27,6 +28,7 @@ from app.socket.handlers.suggestion_chips import SuggestionChipsMixin
 __all__ = [
     "JsonHelpersMixin",
     "DocumentsMixin",
+    "DocumentReloadMixin",
     "StateRolesMixin",
     "ExtractionMixin",
     "StrategyMixin",

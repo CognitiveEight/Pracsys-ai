@@ -22,6 +22,7 @@ from app.socket.handlers.template_sync import TemplateSyncMixin
 from app.socket.handlers.workspace_metadata import WorkspaceMetadataMixin
 from app.socket.handlers.workspace_events import WorkspaceEventsMixin
 from app.socket.handlers.workspace_purge import WorkspacePurgeMixin
+from app.socket.handlers.run_control import RunControlMixin
 from app.socket.handlers.chat import ChatMixin
 from app.socket.handlers.suggestion_chips import SuggestionChipsMixin
 
@@ -48,6 +49,7 @@ __all__ = [
     "WorkspaceMetadataMixin",
     "WorkspaceEventsMixin",
     "WorkspacePurgeMixin",
+    "RunControlMixin",
     "ChatMixin",
     "SuggestionChipsMixin",
 ]

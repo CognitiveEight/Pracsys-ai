@@ -183,8 +183,15 @@ class JsonHelpersMixin:
         nobody retrieves reports it, at best, as an unhelpful
         "Task exception was never retrieved" at interpreter shutdown — which is
         how a whole feature cascade can disappear leaving only a stuck loader.
+
+        Also ties the task to the workspace run that spawned it, so a
+        ``workspace_stop_request`` can cancel it (see handlers/run_control.py).
         """
         self._background_tasks.add(task)
+        try:
+            self._adopt_background_task(task)
+        except Exception as adopt_err:  # pragma: no cover - bookkeeping only
+            logger.debug("Could not tie background task to its run: {}", adopt_err)
 
         def _done(finished: "asyncio.Task") -> None:
             self._background_tasks.discard(finished)
@@ -225,6 +232,15 @@ class JsonHelpersMixin:
     ) -> None:
         """Buffer an undelivered ``document_feature_response`` envelope."""
         if not workspace_id or not feature_type or not isinstance(envelope, dict):
+            return
+        if self._is_stale_run(workspace_id):
+            # The run was stopped: its output was fenced, not lost. Buffering it
+            # would re-deliver a stopped panel on the next reconnect or restart.
+            logger.info(
+                "Not buffering {} for workspace {} — its run was stopped",
+                feature_type,
+                str(workspace_id)[:12],
+            )
             return
         try:
             existing = self._pending_feature_deliveries.get(workspace_id) or {}
@@ -416,6 +432,33 @@ class JsonHelpersMixin:
                     await self._reemit_case_laws_unchanged(workspace_id, user_id)
                     released.append(feature)
                     continue
+                elif feature in ("document_assessments", "workspace_metadata"):
+                    # Declared by a resume that stopped before producing them.
+                    # The cache holds the whole envelope; its inner payload is
+                    # the terminal state.
+                    cache = (
+                        self._workspace_document_assessments_payload
+                        if feature == "document_assessments"
+                        else self._workspace_metadata_payload
+                    )
+                    cached_env = cache.get(workspace_id)
+                    inner = (
+                        cached_env.get("payload")
+                        if isinstance(cached_env, dict)
+                        else None
+                    )
+                    if not (isinstance(inner, dict) and inner):
+                        # No invented fallback: an empty manifest or a "General"
+                        # category would overwrite the backend's real state,
+                        # which is worse than one panel left lit.
+                        logger.warning(
+                            "Loader release: no cached {} to settle with "
+                            "(workspace={}) — panel may stay lit",
+                            feature,
+                            workspace_id[:12] if workspace_id else "",
+                        )
+                        continue
+                    payload = inner
                 elif feature == "drafting_assistant":
                     # NOT delegated to _reemit_drafting_unchanged: that helper
                     # returns early when there is no cached payload, which is

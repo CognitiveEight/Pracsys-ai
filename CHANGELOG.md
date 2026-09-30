@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Stop and "Finish update" for a running workspace update**
+  (`workspace_stop_request`, `workspace_resume_request`; new
+  `app/socket/handlers/run_control.py`, schemas `WorkspaceStopRequestPayload` /
+  `WorkspaceResumeRequestPayload`). Socket contract: two new inbound events;
+  the only outbound change is that a resume's `workspace:refresh` carries
+  `reason: "ai_resume_started"`.
+  - **Stop** cancels the running update's tasks (never a chat turn), drops
+    buffered deliveries in memory *and* in the persisted
+    `PENDING_FEATURE_DELIVERY` copy, disarms recovery markers, and never
+    replies. It is backed by a **run fence**: every workspace-scoped event runs
+    in a `(workspace_id, epoch)` context scope, a stop bumps the epoch, and the
+    socket proxy suppresses any `document_feature_response` or
+    `workspace:refresh` from an older scope. So a stale refresh from the stopped
+    run cannot re-arm the frontend's spinners, and a new run started after the
+    stop is untouched. Re-sends under the same `requestId` are swallowed; a stop
+    whose `stoppedAt` predates newer work is ignored as a stale re-send.
+  - An **objective change interrupted by a stop is held**, not dropped (the
+    resume payload does not carry the new objective): never auto-resumed on
+    reconnect or restart, replayed only by a resume that includes
+    `strategy_objective`, dropped by a new full run.
+  - **Resume** declares exactly `reEmitFeatures` (unknown types dropped) in
+    `workspace:refresh`, reconciles `evidenceFiles` against the vector store,
+    produces one `document_feature_response` per feature in product order with
+    `currentState` honoured, and releases any declared loader it could not
+    satisfy. Idempotent on `requestId` (a failed attempt re-runs).
+  - `_release_refresh_loaders` can now settle `document_assessments` and
+    `workspace_metadata` from their cached envelopes.
+  - Offline coverage: `verify_run_control.py`.
+
 ### Fixed
 
 - **An objective change no longer hangs the workspace on "refreshing" when the

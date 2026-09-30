@@ -301,6 +301,91 @@ class DocumentReloadRequestPayload(BaseModel):
         populate_by_name = True
 
 
+class StoppedByInfo(BaseModel):
+    """Who actually clicked Stop — may be a collaborator, never re-keys state.
+
+    ``name`` is personal data: it is accepted so the payload validates, and is
+    never logged or written anywhere.
+    """
+
+    userId: str
+    name: Optional[str] = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
+class WorkspaceStopRequestPayload(BaseModel):
+    """
+    Schema for workspace_stop_request event (Server → AI_Maverick).
+
+    The lawyer clicked Stop on a running update. FIRE-AND-FORGET: the backend
+    never waits for a reply, stamps its own run stopped, and discards every
+    feature response that arrives afterwards. This service's job is to stop
+    paying for work nobody will see — cancel in-flight work, drop buffered
+    deliveries (including the persisted buffer, so a restart cannot resurface
+    them), and disarm recovery markers.
+
+    - ``requestId`` — 'stp_<first 8 of workspaceId>_<epochMs>'. Re-sends under
+      the same id are EXPECTED and swallowed.
+    - ``userId`` — always the case OWNER, as on every other event.
+    - ``stoppedBy`` — who clicked (may be a collaborator). Informational.
+    - ``receivedFeatures`` — delivered and saved; settled. Informational.
+    - ``pendingFeatures`` — abandoned. Decides whether an interrupted objective
+      change is kept for a later ``workspace_resume_request``.
+    - ``stoppedAt`` — ISO instant of the click; used to recognise a stale
+      re-send that arrives after a newer run has already started.
+
+    Every field except ``workspaceId`` is optional on purpose: a malformed stop
+    must still cancel, because the moment a lawyer most wants Stop is when
+    something is already wrong.
+    """
+
+    requestId: Optional[str] = None
+    workspaceId: str
+    userId: Optional[str] = None
+    stoppedBy: Optional[StoppedByInfo] = None
+    receivedFeatures: List[str] = []
+    pendingFeatures: Optional[List[str]] = None
+    stoppedAt: Optional[str] = None
+    timestamp: Optional[str] = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
+class WorkspaceResumeRequestPayload(BaseModel):
+    """
+    Schema for workspace_resume_request event (Server → AI_Maverick).
+
+    The lawyer clicked "Finish update" on a stopped run. Produce EXACTLY the
+    features in ``reEmitFeatures`` — no more — because the frontend arms one
+    spinner per featureType declared in ``workspace:refresh`` and only a
+    ``document_feature_response`` of that type clears it. The other features
+    completed and are settled; re-sending them would overwrite good content.
+
+    - ``requestId`` — 'rsm_<first 8 of workspaceId>_<epochMs>'. De-duped like
+      ``document_reload_request``: a re-send while in flight or just completed
+      is swallowed, a re-send after a failed attempt re-runs.
+    - ``evidenceFiles`` — the FULL active document set (same shape as
+      workspace_sync); authoritative, reconciled against the vector store.
+    - ``currentState`` — required so the resumed features honour isMatched.
+    - ``participants`` — same semantics as workspace_sync (absent = not shared).
+    """
+
+    requestId: Optional[str] = None
+    workspaceId: str
+    userId: str  # always the case OWNER
+    title: Optional[str] = None
+    status: Optional[str] = None
+    workspaceRole: Optional[str] = None
+    reEmitFeatures: List[str] = []
+    evidenceFiles: Optional[List[EvidenceFilePayload]] = None
+    currentState: Optional[WorkspaceCurrentState] = None
+    participants: Optional[List[WorkspaceParticipant]] = None
+    timestamp: Optional[str] = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
 class TransferredUserInfo(BaseModel):
     """New owner details embedded in workspace_transferred."""
 

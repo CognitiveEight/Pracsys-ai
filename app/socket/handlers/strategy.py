@@ -1770,6 +1770,21 @@ class StrategyMixin:
                 payload=merged,
                 usage=current_usage(),
             )
+            if not delivered and self._is_stale_run(workspace_id):
+                # Not a socket drop: the lawyer stopped this run and the fence
+                # refused the emit, so nothing was buffered. Hold the instruction
+                # for workspace_resume_request — the resume payload does not
+                # carry the new objective, and without this it would be lost.
+                self._log_objective_regen_failure(
+                    workspace_id, "stopped", "strategy_objective fenced by a stop"
+                )
+                self._note_pending_objective_change(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=workspace_role,
+                    instruction=user_objective_instruction,
+                )
+                return False
             if not delivered:
                 # The payload is buffered for re-delivery on reconnect, but the
                 # frontend has not seen it yet — so this turn did not land and

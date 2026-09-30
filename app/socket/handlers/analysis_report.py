@@ -2405,7 +2405,10 @@ Rules:
                 self._analysis_refresh_inflight.discard(workspace_id)
 
         try:
-            asyncio.create_task(_runner())
+            self._track_background_task(
+                asyncio.create_task(_runner()),
+                label=f"analysis refresh after marker miss {workspace_id[:12]}",
+            )
             logger.info(
                 "Scheduled analysis report refresh after marker miss (workspace={})",
                 workspace_id[:12],

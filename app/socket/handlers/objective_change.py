@@ -265,7 +265,7 @@ class ObjectiveChangeMixin:
             if not isinstance(existing, dict):
                 existing = {}
             attempts = int(existing.get("attempts") or 0)
-            self._pending_objective_changes[workspace_id] = {
+            marker: Dict[str, Any] = {
                 "userId": user_id,
                 "workspaceRole": (workspace_role or "ADJUDICATOR").strip().upper(),
                 "instruction": instruction,
@@ -273,6 +273,19 @@ class ObjectiveChangeMixin:
                 "attempts": attempts,
                 "startedAt": time.time(),
             }
+            if self._is_stale_run(workspace_id):
+                # Interrupted by a workspace_stop_request, not by the socket.
+                # Kept (the new objective exists nowhere else) but HELD: only a
+                # workspace_resume_request replays it, never a reconnect.
+                marker.update({"heldByStop": True, "heldAt": time.time(), "attempts": 0})
+                self._pending_objective_changes[workspace_id] = marker
+                logger.warning(
+                    "Objective change held for workspace_resume_request — its run "
+                    "was stopped (workspace={})",
+                    str(workspace_id)[:12],
+                )
+                return
+            self._pending_objective_changes[workspace_id] = marker
             logger.warning(
                 "Objective change marked for resume after reconnect "
                 "(workspace={}, attempts={})",
@@ -361,6 +374,15 @@ class ObjectiveChangeMixin:
                     )
                 else:
                     self._pending_objective_changes[workspace_id] = pending_objective
+                if pending_objective.get("heldByStop"):
+                    # Stopped by the lawyer: restored into memory so a
+                    # workspace_resume_request can replay it, never auto-resumed.
+                    logger.info(
+                        "Objective change held by a stop restored (not resumed) "
+                        "for workspace {}",
+                        str(workspace_id)[:12],
+                    )
+                    return
                 # Detached: the resume runs a full regeneration and must not
                 # delay the handler that triggered hydration.
                 self._track_background_task(
@@ -400,6 +422,10 @@ class ObjectiveChangeMixin:
         for workspace_id in candidates:
             marker = self._pending_objective_changes.get(workspace_id)
             if not isinstance(marker, dict) or not marker.get("instruction"):
+                continue
+            if marker.get("heldByStop"):
+                # The lawyer stopped this run; only workspace_resume_request may
+                # replay it (see handlers/run_control.py).
                 continue
             attempts = int(marker.get("attempts") or 0)
             started_at = float(marker.get("startedAt") or 0.0)
@@ -756,10 +782,11 @@ class ObjectiveChangeMixin:
         if user_id:
             payload["userId"] = user_id
         try:
-            await self._socket_client.emit("workspace:refresh", payload)
+            delivered = await self._socket_client.emit("workspace:refresh", payload)
             logger.info(
-                "workspace:refresh emitted (rid={}, reason={}, features={}) "
+                "workspace:refresh {} (rid={}, reason={}, features={}) "
                 "for workspace {}",
+                "emitted" if delivered else "NOT delivered",
                 refresh_id,
                 reason,
                 features,

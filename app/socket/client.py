@@ -515,6 +515,8 @@ class SocketClient:
             logger.info("   - workspace_version_restore")
             logger.info("   - workspace_transferred")
             logger.info("   - document_reload_request")
+            logger.info("   - workspace_stop_request")
+            logger.info("   - workspace_resume_request")
             logger.info("   - workspace_deleted")
             logger.info("   - user_message_request")
             logger.info("   - probing_prompts_request")
@@ -726,6 +728,45 @@ class SocketClient:
                     "📥 document_reload_request RAW payload (repr): {}", repr(data)
                 )
             await event_handler.handle("document_reload_request", data)
+
+        @self.sio.event
+        async def workspace_stop_request(data):
+            """
+            Handle workspace_stop_request event (Server → AI_Maverick).
+            The lawyer clicked Stop on a running update: cancel it, drop its
+            buffered deliveries, disarm its recovery markers. Fire-and-forget —
+            never replied to. Re-sends under the same requestId are expected.
+            """
+            payload = data if isinstance(data, dict) else {}
+            # A summary, not the raw payload: stoppedBy.name is personal data.
+            logger.info(
+                "⏹️ Received workspace_stop_request {} for workspace {} "
+                "(pending={})",
+                payload.get("requestId"),
+                payload.get("workspaceId"),
+                payload.get("pendingFeatures"),
+            )
+            await event_handler.handle("workspace_stop_request", data)
+
+        @self.sio.event
+        async def workspace_resume_request(data):
+            """
+            Handle workspace_resume_request event (Server → AI_Maverick).
+            The lawyer clicked "Finish update": produce ONLY reEmitFeatures,
+            announced by a workspace:refresh naming exactly that set.
+            """
+            payload = data if isinstance(data, dict) else {}
+            # A summary, not the raw payload: evidenceFiles carry signed URLs
+            # and participants carry names.
+            logger.info(
+                "▶️ Received workspace_resume_request {} for workspace {} "
+                "(reEmitFeatures={}, evidenceFiles={})",
+                payload.get("requestId"),
+                payload.get("workspaceId"),
+                payload.get("reEmitFeatures"),
+                len(payload.get("evidenceFiles") or []),
+            )
+            await event_handler.handle("workspace_resume_request", data)
 
         @self.sio.event
         async def user_message_request(data):

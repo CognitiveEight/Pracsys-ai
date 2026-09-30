@@ -132,6 +132,7 @@ from app.socket.handlers import (
     WorkspaceMetadataMixin,
     WorkspaceEventsMixin,
     WorkspacePurgeMixin,
+    RunControlMixin,
     ChatMixin,
     SuggestionChipsMixin,
 )
@@ -160,6 +161,7 @@ class SocketEventHandler(
     WorkspaceMetadataMixin,
     WorkspaceEventsMixin,
     WorkspacePurgeMixin,
+    RunControlMixin,
     ChatMixin,
     SuggestionChipsMixin,
 ):
@@ -427,6 +429,22 @@ class SocketEventHandler(
         # ever retry it. Keyed by workspace_id at the top level so the
         # compliance purge's self.__dict__ sweep erases it with the workspace.
         self._document_reload_requests: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        # --- workspace_stop_request / workspace_resume_request
+        # (see handlers/run_control.py). Every dict below is keyed by
+        # workspace_id at the top level so the compliance purge's sweep erases it.
+        # Run epoch per workspace. A stop bumps it; anything running under an
+        # older epoch is fenced (its panel emits and buffer writes are dropped).
+        self._run_epochs: Dict[str, int] = {}
+        # Tasks that make up a workspace's running update, so a stop can cancel
+        # them: workspace_id -> {task: started_at}.
+        self._workspace_run_tasks: Dict[str, Dict[asyncio.Task, float]] = {}
+        # Local receive time of the latest workspace-scoped event. A stop whose
+        # stoppedAt predates it is a stale re-send and must not fence new work.
+        self._last_workspace_event_at: Dict[str, float] = {}
+        # workspace_id -> {requestId: first-seen}. Stop re-sends are expected.
+        self._stop_requests: Dict[str, Dict[str, float]] = {}
+        # workspace_id -> {requestId: {status, ts}}, as _document_reload_requests.
+        self._resume_requests: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._register_default_handlers()
 
     def set_socket_client(self, client):
@@ -463,6 +481,9 @@ class SocketEventHandler(
         # Supporting Material "reload" on one document: purge everything held
         # for it, re-read it, re-run the workspace features over all evidence.
         self.register("document_reload_request", self.on_document_reload_request)
+        # Stop / "Finish update" on a running workspace update.
+        self.register("workspace_stop_request", self.on_workspace_stop_request)
+        self.register("workspace_resume_request", self.on_workspace_resume_request)
         self.register("probing_prompts_request", self.on_probing_prompts_request)
         self.register("analysis_report_feedback", self.on_analysis_report_feedback)
         self.register(
@@ -527,7 +548,9 @@ class SocketEventHandler(
         if handler:
             try:
                 logger.debug("Handling event: {} with data: {}", event_name, data)
-                await handler(data)
+                # Every workspace-scoped event runs inside its run scope, which
+                # is what lets workspace_stop_request cancel and fence it.
+                await self._dispatch_in_run_scope(event_name, data, handler)
             except Exception as e:
                 logger.error("Error handling event {}: {}", event_name, str(e))
                 logger.exception(e)

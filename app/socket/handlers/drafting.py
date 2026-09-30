@@ -477,12 +477,15 @@ class DraftingMixin:
                 **(meta or {}),
                 "lib_count": current_count,
             }
-            asyncio.create_task(
-                self._refresh_drafting_matches_on_growth(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    workspace_role=role,
-                )
+            self._track_background_task(
+                asyncio.create_task(
+                    self._refresh_drafting_matches_on_growth(
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        workspace_role=role,
+                    )
+                ),
+                label=f"drafting refresh on template growth {workspace_id[:12]}",
             )
 
     @meter_usage

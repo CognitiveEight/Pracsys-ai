@@ -1,4 +1,4 @@
-.PHONY: help install setup test run clean docker-up docker-down docker-logs
+.PHONY: help install setup test e2e run clean docker-up docker-down docker-logs ontology-ddl graph-up
 
 help:
 	@echo "SimplerToday - Available Commands"
@@ -33,8 +33,23 @@ setup:
 	@echo "✅ Setup complete!"
 
 test:
-	@echo "Running setup tests..."
-	python test_setup.py
+	@echo "Running unit tests and offline verification suites..."
+	python -m pytest -q tests
+	@for f in verify_logging.py verify_rag.py verify_run_control.py verify_document_reload.py verify_objective_change.py verify_workspace_share.py verify_fact_corrections.py; do \
+		echo "== $$f"; python $$f | tail -1 || exit 1; \
+	done
+
+e2e:
+	@echo "Pre-deploy end-to-end run against a local stand-in backend (real, billed Gemini calls)..."
+	python scripts/e2e_local_backend.py
+
+ontology-ddl:
+	@echo "Generating the Neo4j ontology schema..."
+	python -m app.ontology.neo4j_ddl
+
+graph-up:
+	@echo "Starting Neo4j (requires NEO4J_PASSWORD in .env)..."
+	docker-compose --profile graph up -d neo4j
 
 run:
 	@echo "Starting SimplerToday..."

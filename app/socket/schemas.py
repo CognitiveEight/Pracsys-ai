@@ -933,6 +933,33 @@ class DraftDocumentPayload(BaseModel):
     downloadUrl: Optional[str] = None
 
 
+class Citation(BaseModel):
+    """
+    One source behind a chat answer, matching an inline ``[index]`` marker.
+
+    ``type`` is ``document`` (an uploaded annexure: ``documentId``,
+    ``annexure``, ``fileName``, ``page``/``pageEnd``, ``timestamp`` for audio,
+    and a verbatim ``quote``), ``case_law`` or ``statute`` (``title`` and
+    ``url``). Every citation has been checked against the evidence that was
+    actually in the prompt — see app/rag/citations.py.
+    """
+
+    index: int
+    type: Literal["document", "case_law", "statute", "web"]
+    documentId: Optional[str] = None
+    annexure: Optional[int] = None
+    fileName: Optional[str] = None
+    page: Optional[int] = None
+    pageEnd: Optional[int] = None
+    timestamp: Optional[str] = None
+    heading: Optional[str] = None
+    quote: Optional[str] = None
+    url: Optional[str] = None
+    title: Optional[str] = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
 class AIResponsePayload(BaseModel):
     """
     Schema for ai_response event (AI_Maverick → Server).
@@ -954,6 +981,9 @@ class AIResponsePayload(BaseModel):
     suggestionChips: Optional[List[str]] = (
         None  # 3-4 contextual, role-based prompts for next turn
     )
+    # Sources behind the answer, one per inline [n] marker in `content`.
+    # Additive: absent/empty when the answer cites nothing.
+    citations: Optional[List[Citation]] = None
 
     # Drafting Assistant fields (omitted for other chat types).
     actionableId: Optional[str] = None

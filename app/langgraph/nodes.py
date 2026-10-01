@@ -42,12 +42,12 @@ def role_gate_node(state: WorkspaceState) -> WorkspaceState:
     """
     workspace_id = state["workspace_id"]
 
-    logger.info("🚧 Role Gate: Checking role status for workspace {}", workspace_id)
+    logger.info("Role Gate: Checking role status for workspace {}", workspace_id)
 
     # ABSOLUTE CHECK: Is role selected and validated?
     if not validate_role_state(state):
         logger.warning(
-            "🚨 Role Gate: BLOCKING operation - No role selected for workspace {}",
+            "Role Gate: BLOCKING operation - No role selected for workspace {}",
             workspace_id,
         )
 
@@ -76,7 +76,7 @@ def role_gate_node(state: WorkspaceState) -> WorkspaceState:
     # Role is valid - allow continuation
     role = state["role_state"]["role"]
     logger.success(
-        "✅ Role Gate: PASSED for workspace {} with role {}", workspace_id, role
+        "Role Gate: PASSED for workspace {} with role {}", workspace_id, role
     )
 
     # Log audit event
@@ -117,7 +117,7 @@ def role_selection_node(state: WorkspaceState) -> WorkspaceState:
     workspace_id = state["workspace_id"]
     user_input = state.get("user_input", "").strip().upper()
 
-    logger.info("🎭 Role Selection: Processing for workspace {}", workspace_id)
+    logger.info("Role Selection: Processing for workspace {}", workspace_id)
 
     # Extract role from user input
     # Expected formats: "PETITIONER", "role:PETITIONER", "select PETITIONER", etc.
@@ -131,7 +131,7 @@ def role_selection_node(state: WorkspaceState) -> WorkspaceState:
 
     # Validate role
     if not role_input or not RoleEnum.validate(role_input):
-        logger.error("❌ Role Selection: Invalid role input: {}", user_input)
+        logger.error("Role Selection: Invalid role input: {}", user_input)
 
         state["error"] = (
             f"Invalid role. Must be one of: {', '.join(RoleEnum.list_roles())}"
@@ -151,7 +151,7 @@ def role_selection_node(state: WorkspaceState) -> WorkspaceState:
 
     if is_role_change:
         logger.warning(
-            "⚠️ Role Selection: Role change detected for workspace {} ({} → {})",
+            "Role Selection: Role change detected for workspace {} ({}  {})",
             workspace_id,
             current_role,
             role_input,
@@ -180,7 +180,7 @@ def role_selection_node(state: WorkspaceState) -> WorkspaceState:
     state = update_role_state(state, role_input, role_context)
 
     logger.success(
-        "✅ Role Selection: Role set to {} for workspace {}", role_input, workspace_id
+        "Role Selection: Role set to {} for workspace {}", role_input, workspace_id
     )
 
     # Log audit event
@@ -233,7 +233,7 @@ def role_context_builder_node(state: WorkspaceState) -> WorkspaceState:
     # SAFETY CHECK: This should never be reached without a role
     if not validate_role_state(state):
         logger.error(
-            "🚨 CRITICAL: Role Context Builder reached without valid role for workspace {}",
+            "CRITICAL: Role Context Builder reached without valid role for workspace {}",
             workspace_id,
         )
         raise RoleSelectionError(
@@ -246,7 +246,7 @@ def role_context_builder_node(state: WorkspaceState) -> WorkspaceState:
     role_context_dict = state["role_state"]["role_context"]
 
     logger.info(
-        "🏗️ Role Context Builder: Building context for role {} in workspace {}",
+        "Role Context Builder: Building context for role {} in workspace {}",
         role,
         workspace_id,
     )
@@ -259,7 +259,7 @@ def role_context_builder_node(state: WorkspaceState) -> WorkspaceState:
     state["metadata"]["downstream_agents_allowed"] = True
 
     logger.success(
-        "✅ Role Context Builder: Context built for {} role in workspace {}",
+        "Role Context Builder: Context built for {} role in workspace {}",
         role,
         workspace_id,
     )
@@ -307,13 +307,13 @@ def role_validation_node(state: WorkspaceState) -> WorkspaceState:
     workspace_id = state["workspace_id"]
 
     logger.debug(
-        "🔍 Role Validation: Checking consistency for workspace {}", workspace_id
+        "Role Validation: Checking consistency for workspace {}", workspace_id
     )
 
     # Check 1: Role state exists
     if "role_state" not in state or not state["role_state"]:
         logger.error(
-            "🚨 Role Validation: FAILED - No role state in workspace {}", workspace_id
+            "Role Validation: FAILED - No role state in workspace {}", workspace_id
         )
         raise RoleSelectionError(
             message="Role state missing from workspace",
@@ -325,7 +325,7 @@ def role_validation_node(state: WorkspaceState) -> WorkspaceState:
     role = state["role_state"].get("role")
     if not role:
         logger.error(
-            "🚨 Role Validation: FAILED - No role selected in workspace {}",
+            "Role Validation: FAILED - No role selected in workspace {}",
             workspace_id,
         )
         raise RoleSelectionError(
@@ -337,7 +337,7 @@ def role_validation_node(state: WorkspaceState) -> WorkspaceState:
     # Check 3: Role is valid
     if not RoleEnum.validate(role):
         logger.error(
-            "🚨 Role Validation: FAILED - Invalid role {} in workspace {}",
+            "Role Validation: FAILED - Invalid role {} in workspace {}",
             role,
             workspace_id,
         )
@@ -350,7 +350,7 @@ def role_validation_node(state: WorkspaceState) -> WorkspaceState:
     # Check 4: Role context exists
     if not state["role_state"].get("role_context"):
         logger.error(
-            "🚨 Role Validation: FAILED - No role context in workspace {}", workspace_id
+            "Role Validation: FAILED - No role context in workspace {}", workspace_id
         )
         raise RoleSelectionError(
             message="Role context missing",
@@ -361,7 +361,7 @@ def role_validation_node(state: WorkspaceState) -> WorkspaceState:
     # Check 5: Role is validated
     if not state["role_state"].get("role_validated"):
         logger.error(
-            "🚨 Role Validation: FAILED - Role not validated in workspace {}",
+            "Role Validation: FAILED - Role not validated in workspace {}",
             workspace_id,
         )
         raise RoleSelectionError(
@@ -371,7 +371,7 @@ def role_validation_node(state: WorkspaceState) -> WorkspaceState:
         )
 
     logger.success(
-        "✅ Role Validation: PASSED for workspace {} with role {}", workspace_id, role
+        "Role Validation: PASSED for workspace {} with role {}", workspace_id, role
     )
 
     state["metadata"]["role_validation_passed"] = True

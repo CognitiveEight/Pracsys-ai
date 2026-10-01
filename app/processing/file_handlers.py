@@ -42,7 +42,12 @@ _PDF_BOILERPLATE_PATTERNS = [
 ]
 
 
-def _strip_repeated_pdf_boilerplate(page_texts: List[str]) -> str:
+def _strip_repeated_pdf_boilerplate(
+    page_texts: List[str],
+    *,
+    page_numbers: Optional[List[int]] = None,
+    mark_pages: bool = False,
+) -> str:
     """Remove per-page publisher header/footer boilerplate from extracted PDF text.
 
     Two signals, combined:
@@ -95,7 +100,13 @@ def _strip_repeated_pdf_boilerplate(page_texts: List[str]) -> str:
         fire. Known watermark patterns are matched separately and are not
         subject to this guard.
         """
-        return len(norm) >= _MIN_BOILERPLATE_LINE_CHARS or len(norm.split()) >= 3
+        # A SINGLE word is never a running header, however long: with one
+        # word per line, "verification" (12 chars) recurring on 3 of 4 pages
+        # was deleted, turning "BCCI Age Verification Committee" into
+        # "BCCI Age Committee" in every panel. Publisher one-word marks
+        # ("Manupatra") are caught by _PDF_BOILERPLATE_PATTERNS instead.
+        words = len(norm.split())
+        return words >= 3 or (words >= 2 and len(norm) >= _MIN_BOILERPLATE_LINE_CHARS)
 
     def _is_boilerplate(raw_line: str) -> bool:
         norm = _norm(raw_line)
@@ -109,11 +120,18 @@ def _strip_repeated_pdf_boilerplate(page_texts: List[str]) -> str:
         return any(pat.search(raw_line) for pat in _PDF_BOILERPLATE_PATTERNS)
 
     cleaned_pages: List[str] = []
-    for page in pages:
+    marked_pages: List[str] = []
+    for pos, page in enumerate(pages):
         kept = [ln for ln in page.splitlines() if not _is_boilerplate(ln)]
         page_body = "\n".join(kept).strip()
         if page_body:
             cleaned_pages.append(page_body)
+            number = (
+                page_numbers[pos]
+                if page_numbers and pos < len(page_numbers)
+                else pos + 1
+            )
+            marked_pages.append(f"--- Page {number} ---\n{page_body}")
     cleaned = "\n".join(cleaned_pages).strip()
 
     # A header/footer strip should shave a few percent. Much more than that
@@ -130,6 +148,10 @@ def _strip_repeated_pdf_boilerplate(page_texts: List[str]) -> str:
             len(cleaned),
             num_pages,
         )
+    if mark_pages:
+        # Physical page numbers, so a citation can say "page 7" and be right.
+        # Blank pages are skipped but keep their numbering.
+        return "\n\n".join(marked_pages).strip()
     return cleaned
 
 try:
@@ -258,7 +280,7 @@ class FileProcessor:
             if texts:
                 extracted_text = texts[0].description
                 logger.success(
-                    f"Extracted {len(extracted_text)} characters from image using API key"
+                    "Extracted {} characters from image using API key", len(extracted_text)
                 )
                 return extracted_text.strip()
 
@@ -266,13 +288,13 @@ class FileProcessor:
             return "[No text detected in image]"
 
         except Exception as e:
-            logger.error(f"Error extracting text from image: {str(e)}")
+            logger.error("Error extracting text from image: {}", str(e))
             return f"[Error extracting text from image: {str(e)}]"
 
     # Service-account OCR auth helpers removed (API key only).
 
     @staticmethod
-    def extract_text_from_pdf(pdf_data: bytes) -> str:
+    def extract_text_from_pdf(pdf_data: bytes, mark_pages: bool = False) -> str:
         """Extract text from PDF file using text extraction and OCR for image-based PDFs."""
         if not PDF_AVAILABLE:
             logger.warning(
@@ -312,6 +334,11 @@ class FileProcessor:
                     len(scrubbed),
                     num_pages,
                 )
+                # The OCR decision above is made on the UNMARKED text: markers
+                # add ~15 chars per page and would tip a boilerplate-only
+                # document over the "real text" threshold.
+                if mark_pages:
+                    return _strip_repeated_pdf_boilerplate(page_texts, mark_pages=True)
                 return scrubbed
 
             # Boilerplate-dominated / image-based → OCR the page images.
@@ -322,7 +349,9 @@ class FileProcessor:
                     len(scrubbed),
                     num_pages,
                 )
-                return FileProcessor._extract_text_from_pdf_with_ocr(pdf_data)
+                return FileProcessor._extract_text_from_pdf_with_ocr(
+                    pdf_data, mark_pages=mark_pages
+                )
             else:
                 logger.warning(
                     "PDF appears to be image-based but pdf2image or GCP Vision API not available"
@@ -334,11 +363,11 @@ class FileProcessor:
                 )
 
         except Exception as e:
-            logger.error(f"Error extracting text from PDF: {str(e)}")
+            logger.error("Error extracting text from PDF: {}", str(e))
             return f"[Error extracting text from PDF: {str(e)}]"
 
     @staticmethod
-    def _extract_text_from_pdf_with_ocr(pdf_data: bytes) -> str:
+    def _extract_text_from_pdf_with_ocr(pdf_data: bytes, mark_pages: bool = False) -> str:
         """Extract text from image-based PDF using OCR."""
         try:
             resample = None
@@ -360,9 +389,10 @@ class FileProcessor:
                     Image.MAX_IMAGE_PIXELS = old_max_pixels
 
             extracted_texts = []
+            extracted_page_numbers: List[int] = []
 
             for i, image in enumerate(images):
-                logger.info(f"Processing PDF page {i+1}/{len(images)} with OCR")
+                logger.info("Processing PDF page {}/{} with OCR", i + 1, len(images))
 
                 # Resize if image exceeds safe pixel count (avoids GCP Vision "Bad image data")
                 if (
@@ -400,22 +430,27 @@ class FileProcessor:
                     and not page_text.startswith("[No text")
                 ):
                     extracted_texts.append(page_text)
+                    extracted_page_numbers.append(i + 1)
 
             if extracted_texts:
                 # OCR also reads the publisher header/footer imprinted on each
                 # page image, so strip the repeated boilerplate here too.
-                full_text = _strip_repeated_pdf_boilerplate(extracted_texts)
+                full_text = _strip_repeated_pdf_boilerplate(
+                    extracted_texts,
+                    page_numbers=extracted_page_numbers,
+                    mark_pages=mark_pages,
+                )
                 if not full_text:
                     full_text = "\n\n".join(extracted_texts)
                 logger.success(
-                    f"Extracted {len(full_text)} characters from PDF using OCR"
+                    "Extracted {} characters from PDF using OCR", len(full_text)
                 )
                 return full_text
             else:
                 return "[No text could be extracted from PDF images]"
 
         except Exception as e:
-            logger.error(f"Error extracting text from PDF with OCR: {str(e)}")
+            logger.error("Error extracting text from PDF with OCR: {}", str(e))
             return f"[Error extracting text from PDF with OCR: {str(e)}]"
 
     @staticmethod
@@ -438,11 +473,11 @@ class FileProcessor:
                 try:
                     text = docx2txt.process(temp_file_path)
                     if text and text.strip():
-                        logger.success(f"Extracted {len(text)} characters from DOC")
+                        logger.success("Extracted {} characters from DOC", len(text))
                         return text.strip()
                 except Exception as e:
                     logger.warning(
-                        f"docx2txt failed: {str(e)}, trying alternative method"
+                        "docx2txt failed: {}, trying alternative method", str(e)
                     )
 
                 # Fallback: try using antiword command if available
@@ -455,7 +490,7 @@ class FileProcessor:
                     )
                     if result.returncode == 0 and result.stdout.strip():
                         logger.success(
-                            f"Extracted {len(result.stdout)} characters from DOC using antiword"
+                            "Extracted {} characters from DOC using antiword", len(result.stdout)
                         )
                         return result.stdout.strip()
                 except (
@@ -498,12 +533,12 @@ class FileProcessor:
                             len(cleaned_text) > 10
                         ):  # Only return if we got substantial text
                             logger.success(
-                                f"Extracted {len(cleaned_text)} characters from DOC using raw extraction"
+                                "Extracted {} characters from DOC using raw extraction", len(cleaned_text)
                             )
                             return cleaned_text
 
                 except Exception as e:
-                    logger.warning(f"Raw text extraction failed: {str(e)}")
+                    logger.warning("Raw text extraction failed: {}", str(e))
 
                 return "[Could not extract text from DOC file - format may be corrupted or unsupported]"
 
@@ -515,7 +550,7 @@ class FileProcessor:
                     pass
 
         except Exception as e:
-            logger.error(f"Error extracting text from DOC: {str(e)}")
+            logger.error("Error extracting text from DOC: {}", str(e))
             return f"[Error extracting text from DOC: {str(e)}]"
 
     @staticmethod
@@ -552,10 +587,10 @@ class FileProcessor:
                 lines.append(f"{marker}{txt}" if marker else txt)
 
             text = "\n".join(lines)
-            logger.success(f"Extracted {len(text)} characters from DOCX")
+            logger.success("Extracted {} characters from DOCX", len(text))
             return text.strip()
         except Exception as e:
-            logger.error(f"Error extracting text from DOCX: {str(e)}")
+            logger.error("Error extracting text from DOCX: {}", str(e))
             return f"[Error extracting text from DOCX: {str(e)}]"
 
     @staticmethod
@@ -686,7 +721,7 @@ class FileProcessor:
             # Try UTF-8 first
             try:
                 text = txt_data.decode("utf-8")
-                logger.success(f"Extracted {len(text)} characters from TXT (UTF-8)")
+                logger.success("Extracted {} characters from TXT (UTF-8)", len(text))
                 return text.strip()
             except UnicodeDecodeError:
                 pass
@@ -696,7 +731,7 @@ class FileProcessor:
                 try:
                     text = txt_data.decode(encoding)
                     logger.success(
-                        f"Extracted {len(text)} characters from TXT ({encoding})"
+                        "Extracted {} characters from TXT ({})", len(text), encoding
                     )
                     return text.strip()
                 except UnicodeDecodeError:
@@ -705,12 +740,12 @@ class FileProcessor:
             # Last resort: decode with errors='ignore'
             text = txt_data.decode("utf-8", errors="ignore")
             logger.warning(
-                f"Extracted {len(text)} characters from TXT with encoding errors ignored"
+                "Extracted {} characters from TXT with encoding errors ignored", len(text)
             )
             return text.strip()
 
         except Exception as e:
-            logger.error(f"Error extracting text from TXT: {str(e)}")
+            logger.error("Error extracting text from TXT: {}", str(e))
             return f"[Error extracting text from TXT: {str(e)}]"
 
     @staticmethod
@@ -718,14 +753,16 @@ class FileProcessor:
         """Extract text from Markdown file."""
         try:
             text = md_data.decode("utf-8", errors="ignore")
-            logger.success(f"Extracted {len(text)} characters from Markdown")
+            logger.success("Extracted {} characters from Markdown", len(text))
             return text.strip()
         except Exception as e:
-            logger.error(f"Error extracting text from Markdown: {str(e)}")
+            logger.error("Error extracting text from Markdown: {}", str(e))
             return f"[Error extracting text from Markdown: {str(e)}]"
 
     @staticmethod
-    def process_file_by_extension(file_data: bytes, filename: str) -> str:
+    def process_file_by_extension(
+        file_data: bytes, filename: str, mark_pages: bool = False
+    ) -> str:
         """
         Process file based on its extension.
 
@@ -752,39 +789,41 @@ class FileProcessor:
             ext in filename_lower
             for ext in [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"]
         ):
-            logger.info(f"Processing image file: {filename}")
+            logger.info("Processing image file: {}", filename)
             return FileProcessor.extract_text_from_image(file_data)
 
         # PDF files
         elif filename_lower.endswith(".pdf"):
-            logger.info(f"Processing PDF file: {filename}")
-            return FileProcessor.extract_text_from_pdf(file_data)
+            logger.info("Processing PDF file: {}", filename)
+            return FileProcessor.extract_text_from_pdf(file_data, mark_pages=mark_pages)
 
         # DOCX files
         elif filename_lower.endswith(".docx"):
-            logger.info(f"Processing DOCX file: {filename}")
+            logger.info("Processing DOCX file: {}", filename)
             return FileProcessor.extract_text_from_docx(file_data)
 
         # DOC files
         elif filename_lower.endswith(".doc"):
-            logger.info(f"Processing DOC file: {filename}")
+            logger.info("Processing DOC file: {}", filename)
             return FileProcessor.extract_text_from_doc(file_data)
 
         # Text files
         elif filename_lower.endswith(".txt"):
-            logger.info(f"Processing TXT file: {filename}")
+            logger.info("Processing TXT file: {}", filename)
             return FileProcessor.extract_text_from_txt(file_data)
 
         # Markdown files
         elif filename_lower.endswith((".md", ".markdown")):
-            logger.info(f"Processing Markdown file: {filename}")
+            logger.info("Processing Markdown file: {}", filename)
             return FileProcessor.extract_text_from_md(file_data)
 
         # Try to detect by content
         else:
-            logger.info(f"Detecting file type by content for: {filename}")
+            logger.info("Detecting file type by content for: {}", filename)
             if file_data.startswith(b"%PDF"):
-                return FileProcessor.extract_text_from_pdf(file_data)
+                return FileProcessor.extract_text_from_pdf(
+                    file_data, mark_pages=mark_pages
+                )
             elif file_data.startswith(b"PK"):  # ZIP-based formats like DOCX
                 return FileProcessor.extract_text_from_docx(file_data)
             elif file_data.startswith(b"\xd0\xcf\x11\xe0"):  # OLE2 format (DOC files)
@@ -795,7 +834,7 @@ class FileProcessor:
                 return FileProcessor.extract_text_from_image(file_data)
             else:
                 # Assume it's a text file
-                logger.warning(f"Unknown file type, treating as text: {filename}")
+                logger.warning("Unknown file type, treating as text: {}", filename)
                 return FileProcessor.extract_text_from_txt(file_data)
 
 

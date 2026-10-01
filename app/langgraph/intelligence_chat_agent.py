@@ -34,7 +34,7 @@ class IntelligenceChatAgent:
         """Initialize the Intelligence Chat Agent."""
         self.graph = self._build_graph()
         self.workflow = self.graph.compile()
-        logger.info("💬 Intelligence Chat Agent initialized")
+        logger.info("Intelligence Chat Agent initialized")
 
     def _build_graph(self) -> StateGraph:
         """
@@ -51,7 +51,7 @@ class IntelligenceChatAgent:
         Returns:
             Compiled StateGraph
         """
-        logger.info("🏗️ Building Intelligence Chat graph...")
+        logger.info("Building Intelligence Chat graph...")
 
         # Create graph
         workflow = StateGraph(ChatState)
@@ -93,14 +93,14 @@ class IntelligenceChatAgent:
         # Governance Validator → END
         workflow.add_edge("governance_validator", END)
 
-        logger.success("✅ Intelligence Chat graph built")
+        logger.success("Intelligence Chat graph built")
 
         return workflow
 
     def _should_continue_after_context(self, state: Dict[str, Any]) -> str:
         """Decide whether to continue after context building."""
         if state.get("error"):
-            logger.error("❌ Context building failed - stopping workflow")
+            logger.error("Context building failed - stopping workflow")
             return "error"
         return "continue"
 
@@ -108,7 +108,7 @@ class IntelligenceChatAgent:
         """Decide whether to continue after intent classification."""
         intent_classification = state.get("intent_classification", {})
         if not intent_classification.get("is_supported"):
-            logger.warning("⚠️ Intent not supported - stopping workflow")
+            logger.warning("Intent not supported - stopping workflow")
             return "error"
         return "continue"
 
@@ -136,14 +136,13 @@ class IntelligenceChatAgent:
         Raises:
             ValueError: If critical inputs are missing
         """
-        logger.info("💬 Processing chat message: {}", message_id)
-        logger.debug("User message: {}", user_message[:100])
+        logger.debug("Chat graph run for message {}", message_id)
 
         # Validate chat context
         is_valid, missing_fields = chat_context.validate()
         if not is_valid:
             error_msg = f"Missing critical context: {', '.join(missing_fields)}"
-            logger.error(f"❌ {error_msg}")
+            logger.error("{}", error_msg)
             raise ValueError(error_msg)
 
         # Build initial state
@@ -157,12 +156,12 @@ class IntelligenceChatAgent:
 
         try:
             # Run workflow
-            logger.info("🚀 Starting chat workflow...")
+            logger.info("Starting chat workflow...")
             result = await self.workflow.ainvoke(initial_state)
 
             # Check for errors
             if result.get("error"):
-                logger.error(f"❌ Workflow error: {result.get('error_message')}")
+                logger.error("Workflow error: {}", result.get('error_message'))
                 return ChatResponse(
                     message_id=message_id,
                     response_text=result.get("error_message", "An error occurred"),
@@ -188,6 +187,7 @@ class IntelligenceChatAgent:
                 suggested_actions=result.get("suggested_actions", []),
                 processing_time_ms=result.get("processing_time_ms"),
                 tokens_used=result.get("tokens_used"),
+                citations=list(result.get("citations") or []),
             )
 
             # Add sources
@@ -199,15 +199,15 @@ class IntelligenceChatAgent:
                     for src in result.get("sources", [])
                 ]
 
-            logger.success("✅ Chat message processed successfully")
+            logger.success("Chat message processed successfully")
             logger.info(
-                f"📊 Intent: {response.detected_intent}, Confidence: {response.confidence}"
+                "Intent: {}, Confidence: {}", response.detected_intent, response.confidence
             )
 
             return response
 
         except Exception as e:
-            logger.error(f"❌ Chat processing error: {e}")
+            logger.error("Chat processing error: {}", e)
             raise
 
     def process_message_sync(

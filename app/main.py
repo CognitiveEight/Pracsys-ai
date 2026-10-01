@@ -32,12 +32,9 @@ class Application:
     async def run(self) -> None:
         """Run the application."""
         try:
-            logger.info("=" * 60)
             logger.info(
                 "Starting {} - {}", settings.app_name.upper(), settings.app_env.upper()
             )
-            logger.info("=" * 60)
-
             # Start application
             await lifecycle.startup()
 
@@ -54,11 +51,7 @@ class Application:
         finally:
             logger.info("Shutting down application...")
             await lifecycle.shutdown()
-            logger.info("=" * 60)
             logger.info("Application stopped")
-            logger.info("=" * 60)
-
-
 async def main() -> None:
     """Main entry point."""
     app = Application()

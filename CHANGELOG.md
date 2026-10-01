@@ -7,6 +7,172 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Chat replies carried no citations.** `ChatState` did not declare
+  `evidence_index` / `citations` / `citation_report`, and LangGraph drops
+  undeclared keys between nodes, so every `ai_response` went out with an empty
+  `citations` list. Guarded by `tests/test_chat_state.py`.
+- **Stop did not stop in-flight Gemini work.** google-genai 2.25 needs
+  `aiohttp.ClientConnectorDNSError`, which aiohttp 3.9.5 lacks. A cancelled or
+  failed request therefore surfaced as `AttributeError`, the client retried on
+  the legacy SDK, and a stopped pipeline kept running, which also delayed a
+  following resume. aiohttp is now 3.14.3, which also clears the 3.9-line
+  security advisories. The Gemini client re-raises a cancellation instead of
+  falling back (`_reraise_if_cancelled`).
+- **Legal notices and past filings appeared on no panel.** The list-of-dates
+  classifier dropped them as procedural, and the procedural timeline excludes
+  them by design. They are now kept on the list of dates.
+- **List of dates empty for undated letters.** Letters and representations
+  often carry their date only in the file name ("25 11 29 Letter KCA.pdf",
+  "30 Nov BCCI Letter.pdf"). The date is now read from the name, including the
+  "annexure-N-" upload prefix (`app/utils/document_dates.py`), and used as the
+  document's date and year anchor. The year backstop no longer moves a date
+  into the future (it had turned a 2025 letter into 2026, which was then
+  dropped as future-dated). The procedural timeline uses the same parser.
+- **"Verification" deleted from ingested PDFs.** With one word per line in the
+  PDF text layer, a 12-character word repeated on 3+ pages counted as a
+  running header. "BCCI Age Verification Committee" became "BCCI Age
+  Committee" in every panel. A single word is no longer a header.
+- **"documents" rewritten to "annexures" everywhere.** Analysis-report text
+  read "Annexure 1 annexures an official representation" and "identity
+  annexures". Only references to uploads are rewritten now
+  (`_upload_wording`).
+- **Party names in logs.** Three log lines carried them: the metadata case
+  title, the analysis-report party list and the applicable-laws payload dump.
+  Two strategy retry warnings and the role-reassignment line did too.
+  `verify_logging.py` now has a personal-data rule.
+
+### Changed
+
+- **Statute check uses India Code.** `check_provision` validates against
+  `app/statutes/data/sections.json`: 165 acts and 12,530 sections fetched from
+  India Code. It flags 16 repealed acts, never reads an Order/Rule as a
+  section, and marks IPC-numbered BNS sections `invalid`.
+- **Exact dependency versions.**
+  - `requirements.lock.txt` is regenerated on Python 3.12 and verified by every
+    suite on a clean venv.
+  - `pytest` moved to `requirements-dev.txt`.
+  - The Dockerfile is on Python 3.12 and installs the lock; it adds ffmpeg,
+    poppler and antiword and runs as a non-root user.
+  - `.dockerignore` excludes the credential files.
+
+### Added
+
+- **`sectionTitle` on applicable-laws rows (socket payload, additive).** This
+  is the official section heading from India Code, e.g. Copyright Act s.19 →
+  "Mode of assignment". `section` is unchanged. The frontend and the backend
+  PDF need to render it (e.g. "Section 19 – Mode of assignment").
+- **Production-readable logs.**
+  - `event … received/finished` per inbound event.
+  - `result <panel> delivered=yes|no items=… price=…` per emit.
+  - The 5-second probing-prompts poll is at DEBUG.
+  - `llm_call` lines name the calling feature instead of `-`.
+- `scripts/e2e_local_backend.py` (`make e2e`): the pre-deploy end-to-end run.
+  `--evidence FILE…` runs real case files.
+- `scripts/fetch_laws_indiacode.py`, `scripts/build_statute_index.py`,
+  `scripts/clean_master_laws.py`: the statute data pipeline.
+
+- **Knowledge-graph retrieval (ontology agentic RAG), behind flags.**
+  - **What it is:** the ontology, Neo4j graph store, fact extraction, entity
+    resolution, contradiction detection and retrieval planner/critic from
+    `feature/data_ingestion`, ported onto this branch's own hybrid RAG. No
+    Keel server.
+  - **Provenance:** facts carry evidence-store chunk ids and the page their
+    text is on.
+  - **Where it is used:** chat gets graph facts tied to citable passages;
+    four panels can take a graph evidence block (augment only).
+  - **Deletion:** every delete or purge withdraws graph facts, and a failed
+    purge clear raises.
+  - **Off by default:** `NEO4J_URL`, `ONTOLOGY_INGEST_ENABLED` and
+    `RETRIEVAL_PANELS` control it. Neo4j 5 Community starts with
+    `make graph-up` (compose profile `graph`).
+  - **Statute register:** the branch's validated register replaces the
+    previous loader, with the same `check_provision` behaviour.
+  - **Tests:** `make test` now runs the 254 ported unit tests plus the
+    offline suites. It used to point at a missing `test_setup.py`.
+
+### Changed
+
+- **Logging rebuilt for tracing and data safety.**
+  - **Correlation:** every log line carries `request_id` / `event` /
+    `workspace_id` from the inbound event, including lines from the tasks it
+    spawns.
+  - **Model calls:** one `llm_call` line per model call, with feature,
+    status, duration and tokens. Failed calls are no longer traced as
+    success.
+  - **Audit log restored.** `logs/audit/audit.log` had stopped receiving
+    events on 2026-04-02 because a second logging setup removed its sink.
+  - **Removed from logs:**
+    - raw socket payloads (dumped up to three times per event);
+    - full model responses and document text;
+    - signed URLs (one valid about 25 years);
+    - a client mobile number, party names, chat and objective text, and
+      fact values.
+  - **Reconnect storm throttled:** one ERROR per refused handshake, with the
+    diagnosis hint once per outage. It had been about 40% of `app.log`.
+  - **Clean-up:**
+    - 99 f-string log calls converted to placeholders;
+    - emoji removed from 303 messages;
+    - 13 duplicate error-then-exception pairs merged;
+    - per-item dumps (about 30 lines per analysis report) replaced by count
+      lines;
+    - three unused example modules deleted.
+  - **Sinks:** `app.log` follows `LOG_LEVEL`; file writes are queued off the
+    event loop; tracebacks no longer include local variables unless
+    `LOG_DIAGNOSE=true`.
+  - **Regression guard:** `verify_logging.py`.
+
+
+### Added
+
+- **Accurate retrieval with verified citations** (`app/rag/`). Socket payloads
+  gain only additive, optional fields, and the frontend should render them:
+  - `ai_response.citations[]`: one entry per inline `[n]` marker, with
+    `type` (document / case_law / statute), `documentId`, `annexure`,
+    `fileName`, `page`, `quote`, or `url` for case laws and statutes;
+  - `list_of_dates` / `procedural_timeline` entries: `evidenceSnippet`,
+    `citation`, plus a corrected `pageNumber` and `sourceDocId`;
+  - `analysis_report` item objects: `citations[]`;
+  - `strategy_objective.caseSummaryCitations[]`;
+  - `applicable_laws` rows: `sourceUrl`, `registerStatus`, `citations[]`;
+  - `case_laws` cards: `citationVerified`.
+- **Hybrid search.** Dense and sparse (legal-aware tokens such as `s.302`,
+  `498A`, case numbers, amounts) with RRF fusion, query rewriting, LLM
+  reranking, per-document diversity, and a rewrite-and-retry when nothing
+  relevant is found.
+- **Page-aware, structure-aware chunking** with overlap, in a new evidence
+  collection. Legacy workspaces are re-indexed on first use or with
+  `scripts/reindex_chunks.py`.
+- **Evaluation:** `scripts/eval_rag.py` plus a golden-set format.
+
+### Changed
+
+- **Model** defaults to `gemini-3.8-flash`. `MINIMAL` thinking maps to `LOW`,
+  because 3.8 Flash rejects `MINIMAL` and long-form continuations would
+  otherwise fail. Pricing is $0.75 / $3.75 per 1M tokens until 2026-12-31.
+- **Embeddings** use the correct task type for queries versus documents, an
+  explicit dimensionality, batching and retries. They are never zero-vector
+  substitutes.
+- **Panels** get relevance-aware excerpts instead of a front cut, with a 200K
+  budget (`PANEL_CONTEXT_CHARS`).
+- **Law signals** are drawn from every document, and cited provisions lead the
+  search query.
+- **`qdrant-client`** 1.7.3 → 1.18.0.
+
+### Fixed
+
+- **Long documents were reassembled in alphabetical chunk order** for every
+  feature.
+- **`get_all_documents` dropped document metadata**, so prompt headers were
+  always empty.
+- **Page numbers were guessed or defaulted to 1.** No page markers were ever
+  written.
+- **Re-ingesting a document duplicated its chunks.**
+- **`CHAT_MIN_SCORE_THRESHOLD` was never applied.**
+- **Deleting a document or workspace now clears both collections.**
+
+
 ### Added
 
 - **Stop and "Finish update" for a running workspace update**

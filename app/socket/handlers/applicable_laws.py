@@ -17,6 +17,8 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.utils.redact import chars
+
 from app.agents.role_models import RoleEnum
 from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
@@ -248,7 +250,7 @@ class ApplicableLawsMixin:
             ):
                 logger.info(
                     "Applicable laws edit produced no change — instruction={!r}",
-                    instruction[:160],
+                    chars(instruction),
                 )
                 if outcome is not None:
                     outcome["status"] = "unchanged"
@@ -265,7 +267,7 @@ class ApplicableLawsMixin:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ Applicable laws name edit emitted workspace={}",
+                    "Applicable laws name edit emitted workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
             if outcome is not None:
@@ -347,6 +349,40 @@ class ApplicableLawsMixin:
         # Final safety net: never surface the application's own brand/platform
         # name in any law row (central chokepoint for the applicable_laws path).
         return scrub_app_brand({"laws": normalized})
+
+    @staticmethod
+    def _link_laws_to_sources(
+        payload: Dict[str, Any], search_results: List[Dict[str, str]]
+    ) -> None:
+        """Give each law row its Indian Kanoon link and a register status.
+
+        The model reads numbered search results but returns rows without
+        their URLs, so the link was lost. A row is linked to a result whose
+        title names the same section number and shares a word of the act
+        name — a deterministic match, never a guess. ``registerStatus`` comes
+        from the statutory register (see app/statutes/register.py): verified,
+        invalid (section beyond the Act's range), or unverified.
+        """
+        from app.statutes.register import annotate_law_rows, section_number
+
+        for row in (payload or {}).get("laws") or []:
+            if not isinstance(row, dict):
+                continue
+            act = str(row.get("act") or "")
+            num = section_number(str(row.get("section") or ""))
+            act_words = {w for w in re.findall(r"[a-z]{4,}", act.lower())} - {"code", "act", "section"}
+            for res in search_results or []:
+                title = str(res.get("title") or "")
+                url = str(res.get("url") or "")
+                if not url or not num:
+                    continue
+                if re.search(rf"\b{re.escape(num)}\b", title, re.I) and (
+                    not act_words or any(w in title.lower() for w in act_words)
+                ):
+                    row["sourceUrl"] = url
+                    row["sourceTitle"] = title
+                    break
+        annotate_law_rows(payload)
 
     def _heuristic_applicable_laws_fallback(
         self, evidence_snippet: str
@@ -621,7 +657,7 @@ class ApplicableLawsMixin:
             max_tokens=12000,
             response_mime_type="application/json",
         )
-        logger.info("Applicable laws: raw LLM response preview={}", (raw or "")[:500])
+        logger.info("Applicable laws: raw LLM response preview={}", chars(raw))
         text = self._prepare_json_candidate(raw or "", prefer="object") or ""
         parsed: Dict[str, Any] = {"laws": []}
         try:
@@ -640,10 +676,12 @@ class ApplicableLawsMixin:
                 parsed = {"laws": []}
 
         normalized = self._normalize_applicable_laws_payload(parsed)
+        self._link_laws_to_sources(normalized, search_results)
+        _statuses = [str(r.get("registerStatus")) for r in normalized.get("laws", []) if isinstance(r, dict)]
         logger.info(
-            "Applicable laws: final normalized payload from LLM count={} payload={}",
+            "Applicable laws: {} row(s) from the model, register status {}",
             len(normalized.get("laws", [])),
-            normalized,
+            {s: _statuses.count(s) for s in set(_statuses)},
         )
         if not normalized.get("laws"):
             heuristic = self._heuristic_applicable_laws_fallback(
@@ -712,6 +750,9 @@ class ApplicableLawsMixin:
             workspace_id[:12] if workspace_id else "",
         )
         signals = await self._extract_case_signals_from_documents(workspace_id, user_id)
+        graph_block = await self._graph_evidence_block("applicable_laws", workspace_id)
+        if graph_block:
+            signals["evidenceSnippet"] = (signals.get("evidenceSnippet") or "") + "\n\n" + graph_block
         # Bias the search query toward the new objective when provided, so a
         # perspective change actually changes which case-law is fetched.
         search_query = signals.get("query", "")
@@ -758,7 +799,7 @@ class ApplicableLawsMixin:
             usage=current_usage(),
         )
         logger.success(
-            "✅ Applicable laws sent to backend ({} laws)",
+            "Applicable laws sent to backend ({} laws)",
             len(payload.get("laws", [])),
         )
         await asyncio.sleep(0.1)

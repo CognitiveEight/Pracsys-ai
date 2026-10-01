@@ -17,6 +17,8 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.utils.redact import chars
+
 from app.agents.role_models import RoleEnum
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
@@ -480,7 +482,7 @@ class WorkspaceMetadataMixin:
                 if len(lines) < 3 and lines:
                     combined_text = " ".join(lines)
                     logger.debug(
-                        "Attempting sentence split on: {}", combined_text[:100]
+                        "Attempting sentence split on: {}", chars(combined_text)
                     )
                     # Split on sentence endings: period, exclamation, or question mark followed by space or end
                     # Use lookahead to keep the punctuation
@@ -540,14 +542,14 @@ class WorkspaceMetadataMixin:
                     logger.warning(
                         "AI summary failed validation (attempt {}): {}",
                         attempt + 1,
-                        summary[:100],
+                        chars(summary),
                     )
                     continue
                 if self._is_generic_description(summary):
                     logger.warning(
                         "AI returned generic description (attempt {}): {}",
                         attempt + 1,
-                        summary[:100],
+                        chars(summary),
                     )
                     if attempt == 0:
                         logger.info("Retrying with stricter prompt")
@@ -1077,7 +1079,7 @@ class WorkspaceMetadataMixin:
                     if ai_summary:
                         result["description"] = ai_summary
                         logger.info(
-                            "✅ Generated case-specific description from documents (AI): {}",
+                            "Generated case-specific description from documents (AI): {}",
                             ai_summary[:80],
                         )
                     elif not result.get("description"):
@@ -1093,12 +1095,12 @@ class WorkspaceMetadataMixin:
                         if ai_summary:
                             result["description"] = ai_summary
                             logger.info(
-                                "✅ Generated case-specific description (retry): {}",
+                                "Generated case-specific description (retry): {}",
                                 ai_summary[:80],
                             )
                         else:
                             logger.error(
-                                "❌ Failed to generate case-specific description after retries - description will be empty"
+                                "Failed to generate case-specific description after retries - description will be empty"
                             )
                             result["description"] = (
                                 ""  # Leave empty rather than use generic
@@ -1125,12 +1127,13 @@ class WorkspaceMetadataMixin:
             # Ensure all fields are complete (fills any missing values)
             result = self._ensure_metadata_complete(result, combined)
 
+            # The case title and description name the parties: log sizes only.
             logger.info(
                 "Workspace metadata: caseTitle={}, caseCategory={}, subcategories={}, description={}",
-                result["caseTitle"][:50] if result["caseTitle"] else "",
+                chars(result.get("caseTitle")),
                 result["caseCategory"],
                 result["subcategories"],
-                result["description"][:50] if result["description"] else "",
+                chars(result.get("description")),
             )
             return result
         except Exception as e:
@@ -1235,7 +1238,7 @@ class WorkspaceMetadataMixin:
         # mirrors it to Qdrant — subsequent process restarts won't re-heal.
         self._workspace_document_assessments_payload[workspace_id] = cached
         logger.success(
-            "✅ Devanagari heal: workspace {} — healed {} cached transcript(s) "
+            "Devanagari heal: workspace {} — healed {} cached transcript(s) "
             "to Hinglish; cache updated.",
             workspace_id[:12] if workspace_id else "",
             healed_count,

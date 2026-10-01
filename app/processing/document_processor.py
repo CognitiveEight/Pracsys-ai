@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional
 import httpx
 from loguru import logger
 
+from app.utils.redact import safe_url
+
 from app.observability.audit import audit_logger
 from app.observability.trace import tracer
 from app.processing.document_classifier import classify_and_extract
@@ -47,9 +49,9 @@ class DocumentProcessor:
         # Initialize vector store
         try:
             await vector_store.initialize()
-            logger.success("✅ Vector store initialized")
+            logger.success("Vector store initialized")
         except Exception as e:
-            logger.warning(f"⚠️ Vector store initialization failed: {e}")
+            logger.warning("Vector store initialization failed: {}", e)
             logger.warning("Documents will be processed but not stored in vector DB")
 
         logger.info("Document processor initialized")
@@ -268,8 +270,13 @@ Document excerpt:
                 # Run in a worker thread: PDF rendering + per-page OCR can block
                 # for minutes, which starves the Socket.IO heartbeat and drops
                 # the connection if run on the event loop.
+                # mark_pages: evidence text carries "--- Page N ---" markers so
+                # chunks, dates and citations can name the physical page.
                 extracted_text = await asyncio.to_thread(
-                    file_processor.process_file_by_extension, file_content, filename
+                    file_processor.process_file_by_extension,
+                    file_content,
+                    filename,
+                    True,
                 )
 
             # Create extraction metadata
@@ -405,7 +412,7 @@ Document excerpt:
                 )
                 stored_in_vector_db = True
             except Exception as vector_error:
-                logger.warning(f"Could not store in vector DB: {vector_error}")
+                logger.warning("Could not store in vector DB: {}", vector_error)
                 # Continue processing even if vector storage fails
                 stored_in_vector_db = False
 
@@ -622,11 +629,11 @@ Document excerpt:
         clean_url = (url or "").strip().rstrip('"')
         if not clean_url.startswith(("http://", "https://")):
             msg = (
-                f"Invalid download URL scheme (must be http/https): {clean_url[:80]}..."
+                f"Invalid download URL scheme (must be http/https): {safe_url(clean_url)}"
             )
             logger.error("{} (filename: {})", msg, filename)
             raise FileProcessingError(
-                msg, details={"filename": filename, "url": clean_url[:200]}
+                msg, details={"filename": filename, "url": safe_url(clean_url)}
             )
 
         max_attempts = (
@@ -638,7 +645,7 @@ Document excerpt:
             try:
                 logger.debug(
                     "Downloading file from: {} (attempt {}/{})",
-                    clean_url[:100],
+                    safe_url(clean_url),
                     attempt,
                     max_attempts,
                 )
@@ -673,7 +680,7 @@ Document excerpt:
                 raise FileProcessingError(
                     f"Failed to download file: {err_msg}",
                     details={
-                        "url": clean_url[:200],
+                        "url": safe_url(clean_url),
                         "filename": filename,
                         "status_code": status,
                     },
@@ -719,7 +726,7 @@ Document excerpt:
                 # Out of retries – raise a clear error
                 raise FileProcessingError(
                     f"Failed to download file due to network/DNS error: {err_msg}",
-                    details={"url": clean_url[:200], "filename": filename},
+                    details={"url": safe_url(clean_url), "filename": filename},
                 )
             except httpx.HTTPError as e:
                 last_error = e
@@ -727,7 +734,7 @@ Document excerpt:
                 logger.error("HTTP error downloading {}: {}", filename, err_msg)
                 raise FileProcessingError(
                     f"Failed to download file: {err_msg}",
-                    details={"url": clean_url[:200], "filename": filename},
+                    details={"url": safe_url(clean_url), "filename": filename},
                 )
             except Exception as e:
                 last_error = e
@@ -754,13 +761,13 @@ Document excerpt:
                     continue
                 raise FileProcessingError(
                     f"Failed to download file: {err_msg}",
-                    details={"url": clean_url[:200], "filename": filename},
+                    details={"url": safe_url(clean_url), "filename": filename},
                 )
 
         msg = str(last_error) if last_error else "Download failed after retries"
         raise FileProcessingError(
             f"Failed to download file: {msg}",
-            details={"filename": filename, "url": clean_url[:200]},
+            details={"filename": filename, "url": safe_url(clean_url)},
         )
 
     async def download_and_extract_text(
@@ -778,7 +785,7 @@ Document excerpt:
             # Threaded for the same reason as process_document: extraction can
             # block long enough to starve the Socket.IO heartbeat.
             text = await asyncio.to_thread(
-                file_processor.process_file_by_extension, file_content, filename
+                file_processor.process_file_by_extension, file_content, filename, True
             )
             if not text or not isinstance(text, str):
                 return ""
@@ -811,35 +818,26 @@ Document excerpt:
         """
         logger.debug("Storing document in vector DB: {}", filename)
 
-        # Chunk text if too large (every 1000 words)
-        words = text.split()
-        chunk_size = 1000
-        chunks = []
+        # Structure- and page-aware chunking, batched embedding, dense + sparse
+        # vectors (see app/rag/chunker.py and QdrantStore.add_document_chunks).
+        stored = await vector_store.add_document_chunks(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            text=text,
+            metadata={
+                **metadata,
+                "user_id": user_id,  # USER-SCOPED
+                "original_document_id": document_id,
+                "filename": filename,
+            },
+        )
+        chunks = [None] * stored
+        if stored:
+            # Ontology extraction into the knowledge graph, in the background
+            # (no-op unless ONTOLOGY_INGEST_ENABLED and a graph is connected).
+            from app.ontology.pipeline import schedule_document_ingest
 
-        for i in range(0, len(words), chunk_size):
-            chunk = " ".join(words[i : i + chunk_size])
-            chunks.append(chunk)
-
-        logger.debug("Split document into {} chunks", len(chunks))
-
-        # Store each chunk
-        for idx, chunk in enumerate(chunks):
-            chunk_id = f"{document_id}_chunk_{idx}"
-
-            await vector_store.add_document(
-                workspace_id=workspace_id,
-                document_id=chunk_id,
-                content=chunk,
-                metadata={
-                    **metadata,
-                    "user_id": user_id,  # USER-SCOPED
-                    "original_document_id": document_id,
-                    "filename": filename,
-                    "chunk_index": idx,
-                    "total_chunks": len(chunks),
-                    "is_chunk": len(chunks) > 1,
-                },
-            )
+            schedule_document_ingest(workspace_id, [document_id])
 
         logger.success(
             "Stored {} chunks for document {} (user: {})",

@@ -41,7 +41,7 @@ async def process_workspace_chat(
     Raises:
         ValueError: If workspace not found or role not set
     """
-    logger.info(f"💬 Processing chat for workspace: {workspace_id}")
+    logger.info("Processing chat for workspace: {}", workspace_id)
 
     # Get workspace context
     workspace_ctx = await workspace_manager.get_workspace(workspace_id)
@@ -125,7 +125,7 @@ async def process_workspace_chat(
     )
     workspace_ctx.set_metadata("chat_history", chat_history[-10:])  # Keep last 10
 
-    logger.success(f"✅ Chat processed: {message_id}")
+    logger.success("Chat processed: {}", message_id)
 
     return response.to_dict()
 

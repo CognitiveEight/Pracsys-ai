@@ -11,6 +11,9 @@ from loguru import logger
 
 from app.agents.role_models import RoleEnum
 from app.ai.gemini_client import gemini_client
+from app.core.config import settings
+from app.rag.citations import verify_and_number
+from app.rag.evidence import EvidencePack
 from app.langgraph.chat_models import (
     ChatIntent,
     ChatIntentEnum,
@@ -150,6 +153,60 @@ def merge_intelligence_chat_history(
     return hist
 
 
+#: Appended to a claim whose figure no uploaded passage contains, when the
+#: one repair attempt did not fix it. Never silently asserted.
+UNVERIFIED_NOTE = " (this figure could not be found in the uploaded documents)"
+
+
+async def _cite_answer(answer: str, evidence_index: Dict[str, Any], *, regenerate):
+    """Verify and number citations; one repair pass for unsupported figures.
+
+    ``regenerate(feedback)`` re-runs the answer with ``feedback`` appended to
+    the prompt. Returns ``(answer, citations, report)``.
+    """
+    from app.ai.gemini_client import is_generation_error
+
+    pack = EvidencePack.from_state(evidence_index)
+    text, citations, report = verify_and_number(answer, pack)
+    if report.unsupported and settings.citation_repair_enabled:
+        issues = "\n".join(
+            f"- \"{sentence[:200]}\" states {', '.join(figs)}, which no passage contains"
+            for sentence, figs in report.unsupported[:6]
+        )
+        feedback = (
+            "\n\nCITATION CHECK FAILED — revise your answer. These statements give "
+            "figures that do not appear in any passage above:\n"
+            f"{issues}\n"
+            "Correct each figure from the passages and cite it, or say plainly that "
+            "the figure is not in the uploaded documents. Keep everything else."
+        )
+        try:
+            retry = await regenerate(feedback)
+            if retry and not is_generation_error(retry):
+                retry = _strip_trailing_sources_block(retry.strip())
+                r_text, r_cites, r_report = verify_and_number(retry, pack)
+                if len(r_report.unsupported) < len(report.unsupported):
+                    text, citations, report = r_text, r_cites, r_report
+        except Exception as repair_err:
+            logger.warning("Citation repair pass failed: {}", repair_err)
+    for sentence, _figs in report.unsupported:
+        # Match the claim without its full stop: after numbering, the stop
+        # sits after the [n] markers ("... 7,77,777 [1].").
+        claim = sentence.strip().rstrip(".!?").rstrip()
+        if claim and claim in text and (claim + UNVERIFIED_NOTE) not in text:
+            text = text.replace(claim, claim + UNVERIFIED_NOTE, 1)
+    logger.info(
+        "Citations: {} kept, {} invented label(s) removed, {} re-pointed, {} added, "
+        "{} unsupported",
+        len(citations),
+        len(report.invalid_labels),
+        len(report.repointed),
+        len(report.added),
+        len(report.unsupported),
+    )
+    return text, citations, report
+
+
 def chat_context_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Node 1: ChatContextBuilderNode
@@ -167,7 +224,7 @@ def chat_context_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Updated state with prompt_context
     """
-    logger.info("🏗️ Building chat context...")
+    logger.info("Building chat context...")
 
     # Extract inputs
     chat_context = state.get("chat_context", {})
@@ -178,7 +235,7 @@ def chat_context_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
     workspace_state = chat_context.get("workspace_state")
 
     if not role_context:
-        logger.error("❌ Missing RoleContext - chat cannot proceed")
+        logger.error("Missing RoleContext - chat cannot proceed")
         return {
             **state,
             "error": "MISSING_ROLE_CONTEXT",
@@ -186,7 +243,7 @@ def chat_context_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if not workspace_state:
-        logger.error("❌ Missing WorkspaceState - chat cannot proceed")
+        logger.error("Missing WorkspaceState - chat cannot proceed")
         return {
             **state,
             "error": "MISSING_WORKSPACE_STATE",
@@ -260,12 +317,25 @@ APPROVED FACTS ({len(approved_facts)} available):
 """
         context_sections.append(facts_section)
 
+    # Evidence pack (labelled passages) when the retrieval layer built one; the
+    # case laws and statutes below join it under [C#] / [S#] labels.
+    _ws_for_evidence = chat_context.get("workspace_state") or {}
+    evidence_pack = None
+    if settings.citations_enabled and _ws_for_evidence.get("evidence_index"):
+        evidence_pack = EvidencePack.from_state(_ws_for_evidence.get("evidence_index"))
+
     # 5. Applicable Laws
     applicable_laws = chat_context.get("applicable_laws", [])
     if applicable_laws:
+        law_lines = []
+        for law in applicable_laws[:8]:
+            label = ""
+            if evidence_pack is not None:
+                label = f"[{evidence_pack.add_statute(law).label}] "
+            law_lines.append(f"- {label}{law.get('title', 'N/A')}")
         laws_section = f"""
 APPLICABLE LAWS ({len(applicable_laws)} available):
-{chr(10).join([f"- {law.get('title', 'N/A')}" for law in applicable_laws[:5]])}
+{chr(10).join(law_lines)}
 """
         context_sections.append(laws_section)
 
@@ -280,7 +350,10 @@ APPLICABLE LAWS ({len(applicable_laws)} available):
             title = (c.get("title") or "N/A").strip()
             summary = (c.get("summary") or "").strip()
             head = " — ".join([p for p in [title, citation, court] if p])
-            case_lines.append(f"- {head}: {summary}".rstrip(": "))
+            label = ""
+            if evidence_pack is not None:
+                label = f"[{evidence_pack.add_case_law(c).label}] "
+            case_lines.append(f"- {label}{head}: {summary}".rstrip(": "))
         case_section = f"""
 CASE LAWS — RELEVANT PRECEDENTS ({len(case_laws)} available, source-verified):
 {chr(10).join(case_lines)}
@@ -418,6 +491,17 @@ CACHED ANALYSIS REPORT (same data as the Analysis Report panel; use for question
             "NUMERIC INTEGRITY: Transcribe purchase price, invoice totals, and other figures exactly as in the "
             "excerpts below; if a figure does not appear here, do not invent it — say it is not in the supplied excerpt.\n"
         )
+        if evidence_pack is not None:
+            docs_section += (
+                "CITATIONS (required): each passage below starts with a label such as "
+                "[E3]. After every sentence that states a fact, date, amount, name or "
+                "event taken from the annexures, put the label(s) of the passage(s) it "
+                "comes from, exactly as written, e.g. \"The notice was served on "
+                "05/04/2024 [E3].\" Cite case laws as [C#] and statutes as [S#] the "
+                "same way. Never cite a label that is not shown, and never attach a "
+                "label to a statement that passage does not make. General legal "
+                "reasoning that does not come from the file needs no label.\n"
+            )
         for idx, doc in enumerate(uploaded_docs, 1):
             content = doc.get("content") or ""
             if content:
@@ -433,6 +517,15 @@ CACHED ANALYSIS REPORT (same data as the Analysis Report panel; use for question
                 header += " ---"
                 docs_section += f"\n{header}\n{content}\n"
         context_sections.append(docs_section)
+
+    # 5b-2. Knowledge-graph facts (ontology), each tied to a passage label.
+    graph_facts = workspace_state.get("graph_facts") or []
+    if graph_facts:
+        context_sections.append(
+            "\nKNOWLEDGE GRAPH FACTS (extracted from the annexures; each ends with the "
+            "label of the passage it comes from — cite that label, exactly as for the "
+            "passages above):\n" + "\n".join(graph_facts[:30]) + "\n"
+        )
 
     # 5c. Chat attachment (file supplied with this message)
     chat_attachment = workspace_state.get("chat_attachment") or []
@@ -474,9 +567,9 @@ CACHED ANALYSIS REPORT (same data as the Analysis Report panel; use for question
     if custom_suffix:
         full_context = full_context.rstrip() + "\n\n" + custom_suffix
 
-    logger.success(f"✅ Context built: {len(full_context)} chars")
+    logger.success("Context built: {} chars", len(full_context))
     logger.info(
-        f"📋 Role: {role}, Module: {active_module}, Facts: {len(approved_facts)}"
+        "Role: {}, Module: {}, Facts: {}", role, active_module, len(approved_facts)
     )
 
     return {
@@ -484,6 +577,7 @@ CACHED ANALYSIS REPORT (same data as the Analysis Report panel; use for question
         "prompt_context": full_context,
         "role": role,
         "context_built": True,
+        "evidence_index": evidence_pack.to_state() if evidence_pack is not None else {},
     }
 
 
@@ -500,7 +594,7 @@ async def intent_classifier_node(state: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Updated state with intent_classification
     """
-    logger.info("🔍 Classifying user intent...")
+    logger.info("Classifying user intent...")
 
     user_message = state.get("user_message", "")
     role = state.get("role")
@@ -605,7 +699,7 @@ TARGET_AGENT: <agent_name or none>
         allowed_intents = {e.value for e in ChatIntentEnum}
         if intent not in allowed_intents:
             logger.warning(
-                "⚠️ Classifier returned non-enum intent {!r}; coercing to EXPLAIN",
+                "Classifier returned non-enum intent {!r}; coercing to EXPLAIN",
                 intent,
             )
             intent = "EXPLAIN"
@@ -619,8 +713,8 @@ TARGET_AGENT: <agent_name or none>
             rejection_reason=None,
         )
 
-        logger.success(f"✅ Intent classified: {intent} (confidence: {confidence:.2f})")
-        logger.info(f"📍 Requires agent: {requires_agent}, Target: {target_agent}")
+        logger.success("Intent classified: {} (confidence: {:.2f})", intent, confidence)
+        logger.info("Requires agent: {}, Target: {}", requires_agent, target_agent)
 
         return {
             **state,
@@ -630,7 +724,7 @@ TARGET_AGENT: <agent_name or none>
         }
 
     except Exception as e:
-        logger.error(f"❌ Intent classification failed: {e}")
+        logger.error("Intent classification failed: {}", e)
         return {
             **state,
             "intent": "EXPLAIN",
@@ -716,7 +810,7 @@ Just respond naturally as a helpful impartial legal assistant (no party slant un
             )
 
         logger.success(
-            f"✅ Generated natural greeting response ({processing_time:.0f}ms)"
+            "Generated natural greeting response ({:.0f}ms)", processing_time
         )
 
         return {
@@ -730,7 +824,7 @@ Just respond naturally as a helpful impartial legal assistant (no party slant un
             "explanation_complete": True,
         }
     except Exception as e:
-        logger.error(f"❌ Failed to generate greeting response: {e}")
+        logger.error("Failed to generate greeting response: {}", e)
         # Fallback to simple greeting
         return {
             **state,
@@ -752,7 +846,7 @@ async def explain_why_node(state: Dict[str, Any]) -> Dict[str, Any]:
     Attaches rationale, sources, and confidence.
     Enforces annexure upload gate: first message after annexures exist shows role confirmation.
     """
-    logger.info("📝 Generating explanation...")
+    logger.info("Generating explanation...")
 
     user_message = state.get("user_message", "")
     prompt_context = state.get("prompt_context", "")
@@ -770,7 +864,7 @@ async def explain_why_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # Special handling for GREETING intent - simple, natural responses
     if intent == "GREETING":
-        logger.info("👋 Handling greeting/conversational message")
+        logger.info("Handling greeting/conversational message")
         return await _handle_greeting(state, user_message, role)
 
     # Annexure upload gate: first message only when workspace has docs but no established
@@ -793,7 +887,7 @@ async def explain_why_node(state: Dict[str, Any]) -> Dict[str, Any]:
             + "\n• ".join(ROLES)
         )
         logger.info(
-            "📋 Annexure upload gate: returning role confirmation message (no analysis)"
+            "Annexure upload gate: returning role confirmation message (no analysis)"
         )
         return {
             **state,
@@ -831,7 +925,7 @@ You are an intelligence assistant. Calibrate response length to the question:
 - If annexures conflict, flag it; do not invent case facts.
 
 Formatting:
-- Routine chat: plain prose only. Do NOT add "SOURCES:" lists or "ANSWER:/EXPLANATION:" labels unless the user asked for a formal structured deliverable.
+- Routine chat: plain prose only. Do NOT add "SOURCES:" lists or "ANSWER:/EXPLANATION:" labels unless the user asked for a formal structured deliverable. Inline evidence labels such as [E3] are NOT a sources list — when the context shows them, use them as instructed.
 - Do not use many "###" markdown headings for simple short questions.
 
 Stay **impartial** in analysis (workspace role only informs how the panel was written). If case-specific facts are missing, say what is missing instead of inventing them.
@@ -915,6 +1009,22 @@ PREVIOUS ASSISTANT MESSAGE:
 
         answer = _strip_trailing_sources_block(answer)
 
+        # Check, repair and number the evidence citations.
+        citations: List[Dict[str, Any]] = []
+        citation_report = None
+        evidence_index = state.get("evidence_index") or {}
+        if evidence_index:
+            answer, citations, citation_report = await _cite_answer(
+                answer,
+                evidence_index,
+                regenerate=lambda feedback: gemini_client.generate(
+                    reasoning_prompt + feedback,
+                    system_instruction=system_instruction,
+                    temperature=0.3,
+                    max_tokens=max_tok,
+                ),
+            )
+
         # Parse sources
         sources = []
         if sources_text:
@@ -939,14 +1049,25 @@ PREVIOUS ASSISTANT MESSAGE:
             else []
         )
 
-        logger.success(f"✅ Explanation generated ({processing_time:.0f}ms)")
-        logger.info(f"📊 Confidence: {confidence.value}, Sources: {len(sources)}")
+        logger.success("Explanation generated ({:.0f}ms)", processing_time)
+        logger.info("Confidence: {}, Sources: {}", confidence.value, len(sources))
 
         return {
             **state,
             "response_text": answer,
             "explanation": explanation,
             "sources": [s.to_dict() for s in sources],
+            "citations": citations,
+            "citation_report": (
+                {
+                    "invalid_labels": citation_report.invalid_labels,
+                    "repointed": len(citation_report.repointed),
+                    "added": len(citation_report.added),
+                    "unsupported": [u[0] for u in citation_report.unsupported],
+                }
+                if citation_report is not None
+                else None
+            ),
             "confidence": confidence.value,
             "suggested_actions": suggested_actions,
             "processing_time_ms": processing_time,
@@ -954,7 +1075,7 @@ PREVIOUS ASSISTANT MESSAGE:
         }
 
     except Exception as e:
-        logger.error(f"❌ Explanation generation failed: {e}")
+        logger.error("Explanation generation failed: {}", e)
         return {
             **state,
             "response_text": "I apologize, but I encountered an error generating a response.",
@@ -979,7 +1100,7 @@ def action_dispatcher_node(state: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Updated state with dispatch information
     """
-    logger.info("🚀 Dispatching action...")
+    logger.info("Dispatching action...")
 
     intent = state.get("intent", "EXPLAIN")
     intent_classification = state.get("intent_classification", {})
@@ -992,44 +1113,44 @@ def action_dispatcher_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # Route based on intent
     if intent == "GREETING":
         # Conversational response, no agent needed
-        logger.info("👋 Conversational greeting - no agent routing required")
+        logger.info("Conversational greeting - no agent routing required")
         dispatch_message = "Conversational response"
 
     elif intent == "EXPLAIN" or intent == "CLARIFY":
         # Direct response, no agent needed
-        logger.info("📖 Direct explanation - no agent routing required")
+        logger.info("Direct explanation - no agent routing required")
         dispatch_message = "Answered directly from workspace intelligence"
 
     elif intent == "VALIDATE":
         routed_to_agent = "fact_validation_agent"
         dispatch_message = "Routing to Fact Validation Agent for verification"
-        logger.info("✅ Routing to Fact Validation Agent")
+        logger.info("Routing to Fact Validation Agent")
 
     elif intent == "DRAFT":
         routed_to_agent = "drafting_agent"
         dispatch_message = "Routing to Drafting Agent for drafting"
-        logger.info("📄 Routing to Drafting Agent")
+        logger.info("Routing to Drafting Agent")
 
     elif intent == "STRATEGY_CHANGE":
         routed_to_agent = "strategy_agent"
         dispatch_message = "Routing to Strategy Agent for strategy modification"
-        logger.info("🎯 Routing to Strategy Agent")
+        logger.info("Routing to Strategy Agent")
 
     elif intent == "REMOVE_INSIGHT":
         routed_to_agent = "fact_validation_agent"
         dispatch_message = "Routing to Fact Validation Agent for insight removal"
-        logger.info("🗑️ Routing to validation for removal")
+        logger.info("Routing to validation for removal")
 
     elif intent == "NEXT_STEPS":
         routed_to_agent = "recommendation_agent"
         dispatch_message = "Routing to Recommendation Agent for next steps"
-        logger.info("➡️ Routing to Recommendation Agent")
+        logger.info("Routing to Recommendation Agent")
 
     else:
-        logger.warning(f"⚠️ Unknown intent: {intent} - providing direct response")
+        logger.warning("Unknown intent: {} - providing direct response", intent)
         dispatch_message = "Intent not recognized - providing general response"
 
-    logger.success(f"✅ Action dispatched: {routed_to_agent or 'direct_response'}")
+    logger.success("Action dispatched: {}", routed_to_agent or 'direct_response')
 
     return {
         **state,
@@ -1046,7 +1167,7 @@ def response_formatter_node(state: Dict[str, Any]) -> Dict[str, Any]:
     Outputs a single clean, natural message for the user (no fixed template).
     The model already responds in role; we avoid adding redundant labels and sections.
     """
-    logger.info("🎨 Formatting response...")
+    logger.info("Formatting response...")
 
     intent = state.get("intent", "EXPLAIN")
     response_text = (state.get("response_text") or "").strip()
@@ -1056,7 +1177,7 @@ def response_formatter_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # Greeting or any intent: primary output is the response text as one clean message
     if intent == "GREETING":
-        logger.info("👋 Using conversational formatting for greeting")
+        logger.info("Using conversational formatting for greeting")
         return {**state, "formatted_response": response_text, "response_complete": True}
 
     # Build one natural message: main response first, then only add extras when they add value
@@ -1082,8 +1203,8 @@ def response_formatter_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     formatted_response = "".join(parts).strip()
 
-    logger.success("✅ Response formatted")
-    logger.info(f"📏 Response length: {len(formatted_response)} chars")
+    logger.success("Response formatted")
+    logger.info("Response length: {} chars", len(formatted_response))
 
     return {
         **state,
@@ -1108,7 +1229,7 @@ def governance_validator_node(state: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Updated state with governance_validation
     """
-    logger.info("🔐 Validating governance compliance...")
+    logger.info("Validating governance compliance...")
 
     role = state.get("role")
     chat_context = state.get("chat_context", {})
@@ -1140,6 +1261,23 @@ def governance_validator_node(state: Dict[str, Any]) -> Dict[str, Any]:
     if not state.get("confidence"):
         warnings.append("Response missing confidence indicator")
 
+    # Check 5: Grounding. A figure that no uploaded passage contains survived
+    # the repair pass; the reply flags it inline, and the confidence reported
+    # to the backend must say so too rather than stay at MEDIUM/HIGH.
+    confidence_override = None
+    report = state.get("citation_report") or {}
+    unsupported = report.get("unsupported") or []
+    if unsupported:
+        warnings.append(
+            f"{len(unsupported)} statement(s) state figures not found in the "
+            "uploaded documents (flagged inline)"
+        )
+        confidence_override = "LOW"
+    if report.get("invalid_labels"):
+        warnings.append(
+            f"Removed citation label(s) not in the evidence: {report['invalid_labels']}"
+        )
+
     is_valid = len(violations) == 0
 
     validation_result = GovernanceValidationResult(
@@ -1154,17 +1292,20 @@ def governance_validator_node(state: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     if is_valid:
-        logger.success("✅ Governance validation passed")
+        logger.success("Governance validation passed")
     else:
-        logger.error(f"❌ Governance violations: {violations}")
+        logger.error("Governance violations: {}", violations)
 
     if warnings:
-        logger.warning(f"⚠️ Warnings: {warnings}")
+        logger.warning("Warnings: {}", warnings)
 
-    return {
+    out = {
         **state,
         "governance_validation": validation_result.to_dict(),
         "role_compliant": is_valid,
         "strategy_compliant": is_valid,
         "governance_validated": True,
     }
+    if confidence_override:
+        out["confidence"] = confidence_override
+    return out

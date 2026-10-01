@@ -17,6 +17,8 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.utils.redact import chars
+
 from app.agents.role_models import RoleEnum
 from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
@@ -76,6 +78,7 @@ from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
                                        restore_state)
 from agent import process_analysis_docx_request
 
+from app.rag.packing import fit_to_budget, panel_context_budget
 from app.socket.event_utils import (
     EventHandler,
     _STRATEGY_ROLE_LABELS_RE,
@@ -106,6 +109,7 @@ from app.socket.event_utils import (
     _coerce_analysis_text_list,
     _strip_strength_point_statute_boilerplate,
     _annexure_wording_for_next_steps,
+    _upload_wording,
     _clamp_annexure_references,
     _format_document_for_prompt,
     _normalize_report_mobile_from_overview,
@@ -244,7 +248,7 @@ class AnalysisReportMixin:
                 ):
                     logger.info(
                         "Analysis report edit produced no change — instruction={!r}",
-                        instruction[:160],
+                        chars(instruction),
                     )
                     if outcome is not None:
                         outcome["status"] = "unchanged"
@@ -276,7 +280,7 @@ class AnalysisReportMixin:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ Analysis report surgical edit emitted workspace={}",
+                    "Analysis report surgical edit emitted workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
             if outcome is not None:
@@ -309,7 +313,7 @@ class AnalysisReportMixin:
             from app.vectorstore.qdrant import vector_store
 
             logger.info(
-                "📊 Generating analysis report for workspace {} with role {}",
+                "Generating analysis report for workspace {} with role {}",
                 workspace_id,
                 workspace_role,
             )
@@ -335,9 +339,8 @@ class AnalysisReportMixin:
 
             # Build parts with per-document cap so ALL documents are represented (no limit on number of docs)
             # Large budget so 100+ docs each get a meaningful slice (100 docs → 1000 chars each, 200 → 500 each)
-            max_total_content = (
-                100000  # Total character budget for all documents combined
-            )
+            graph_block = await self._graph_evidence_block("analysis_report", workspace_id)
+            max_total_content = max(20_000, panel_context_budget() - len(graph_block))
             num_docs = len(
                 [
                     d
@@ -359,7 +362,7 @@ class AnalysisReportMixin:
                 if not content or len(content) < 20:
                     continue
                 if len(content) > per_doc_cap:
-                    content = content[:per_doc_cap] + "\n[... truncated for length ...]"
+                    content = fit_to_budget(content, per_doc_cap, "general")
                 # Build labelled block with metadata header (document_type,
                 # issued_by, addressees, subject, key dates, legal provisions,
                 # drafted_by_assistant marker) so the analysis-report prompt
@@ -375,7 +378,7 @@ class AnalysisReportMixin:
                 "\n\n".join(parts) if parts else "No document content available."
             )
 
-            if num_docs > 0 and len(combined_document_content) > max_total_content:
+            if num_docs > 0 and len(combined_document_content) > int(max_total_content * 1.1):  # headers add a little; never cut the last document
                 combined_document_content = (
                     combined_document_content[:max_total_content]
                     + "\n[... content truncated ...]"
@@ -392,6 +395,8 @@ class AnalysisReportMixin:
                     num_docs,
                     per_doc_cap,
                 )
+            if graph_block:
+                combined_document_content += "\n\n" + graph_block
 
             doc_count = len(all_docs)
             if doc_count == 0:
@@ -490,9 +495,9 @@ class AnalysisReportMixin:
                 if isinstance(p, dict) and (p.get("name") or "").strip()
             ]
             logger.info(
-                "🧠 Analysis-report extraction complete for workspace {}: parties=[{}]",
+                "Analysis-report extraction complete for workspace {}: {} part(ies)",
                 workspace_id[:12] if workspace_id else "",
-                ", ".join(_ar_party_names) if _ar_party_names else "(none)",
+                len(_ar_party_names),
             )
             import json as _json_ar
             try:
@@ -922,7 +927,7 @@ ENTITY-GROUNDING RULE (CRITICAL):
             if not json_str:
                 logger.warning(
                     "No JSON found in analysis report response; using fallback. raw preview: {}",
-                    (raw or "")[:400],
+                    chars(raw),
                 )
                 return self._analysis_report_fallback(role)
 
@@ -1064,12 +1069,7 @@ Rules:
             missing_info = _coerce_analysis_text_list(missing_info)[:10]
             # Product language requirement: refer to uploaded files as annexures in analysis text.
             missing_info = [
-                re.sub(
-                    r"\bdocuments\b",
-                    "annexures",
-                    re.sub(r"\bdocument\b", "annexure", x, flags=re.IGNORECASE),
-                    flags=re.IGNORECASE,
-                )
+                _upload_wording(x)
                 for x in missing_info
             ]
 
@@ -1085,26 +1085,14 @@ Rules:
                         laws = [laws] if laws else []
                     laws = [str(l).strip() for l in laws if l][:5]
                     if point:
-                        point = re.sub(
-                            r"\bdocuments\b",
-                            "annexures",
-                            re.sub(
-                                r"\bdocument\b", "annexure", point, flags=re.IGNORECASE
-                            ),
-                            flags=re.IGNORECASE,
-                        )
+                        point = _upload_wording(point)
                         point = _strip_strength_point_statute_boilerplate(point)
                         if not point:
                             continue
                         strengths.append({"point": point, "laws": laws})
                 elif isinstance(s, str) and s.strip():
                     point = s.strip()
-                    point = re.sub(
-                        r"\bdocuments\b",
-                        "annexures",
-                        re.sub(r"\bdocument\b", "annexure", point, flags=re.IGNORECASE),
-                        flags=re.IGNORECASE,
-                    )
+                    point = _upload_wording(point)
                     point = _strip_strength_point_statute_boilerplate(point)
                     if not point:
                         continue
@@ -1165,17 +1153,7 @@ Rules:
                                             laws = [laws] if laws else []
                                         laws = [str(l).strip() for l in laws if l][:5]
                                         if point:
-                                            point = re.sub(
-                                                r"\bdocuments\b",
-                                                "annexures",
-                                                re.sub(
-                                                    r"\bdocument\b",
-                                                    "annexure",
-                                                    point,
-                                                    flags=re.IGNORECASE,
-                                                ),
-                                                flags=re.IGNORECASE,
-                                            )
+                                            point = _upload_wording(point)
                                             point = _strip_strength_point_statute_boilerplate(
                                                 point
                                             )
@@ -1208,24 +1186,14 @@ Rules:
             # render as a raw Python dict literal in the FE panel).
             weaknesses = _coerce_analysis_text_list(weaknesses)[:8]
             weaknesses = [
-                re.sub(
-                    r"\bdocuments\b",
-                    "annexures",
-                    re.sub(r"\bdocument\b", "annexure", x, flags=re.IGNORECASE),
-                    flags=re.IGNORECASE,
-                )
+                _upload_wording(x)
                 for x in weaknesses
             ]
 
             risks = data.get("risks") or []
             risks = _coerce_analysis_text_list(risks)[:8]
             risks = [
-                re.sub(
-                    r"\bdocuments\b",
-                    "annexures",
-                    re.sub(r"\bdocument\b", "annexure", x, flags=re.IGNORECASE),
-                    flags=re.IGNORECASE,
-                )
+                _upload_wording(x)
                 for x in risks
             ]
 
@@ -1391,17 +1359,7 @@ Rules:
                     else current_strategic_objective
                 ),
             )
-            quality_score_explanation = re.sub(
-                r"\bdocuments\b",
-                "annexures",
-                re.sub(
-                    r"\bdocument\b",
-                    "annexure",
-                    quality_score_explanation,
-                    flags=re.IGNORECASE,
-                ),
-                flags=re.IGNORECASE,
-            )
+            quality_score_explanation = _upload_wording(quality_score_explanation)
 
             report_quality_raw = (
                 data.get("reportQualityScoreExplanation")
@@ -1416,17 +1374,7 @@ Rules:
             report_quality_score_explanation = (
                 self._sanitize_report_quality_score_explanation(report_quality_raw)
             )
-            report_quality_score_explanation = re.sub(
-                r"\bdocuments\b",
-                "annexures",
-                re.sub(
-                    r"\bdocument\b",
-                    "annexure",
-                    report_quality_score_explanation,
-                    flags=re.IGNORECASE,
-                ),
-                flags=re.IGNORECASE,
-            )
+            report_quality_score_explanation = _upload_wording(report_quality_score_explanation)
             if not report_quality_score_explanation:
                 report_quality_score_explanation = (
                     self._sanitize_report_quality_score_explanation(
@@ -1504,70 +1452,19 @@ Rules:
                 "suggestedDrafts": suggested_drafts,
             }
 
-            # Detailed analysis report logs for debugging
-            logger.info("=" * 80)
-            logger.info("📊 ANALYSIS REPORT PAYLOAD (AI-GENERATED)")
-            logger.info("=" * 80)
-            logger.info("📈 caseResolutionScore: {}%", case_resolution_score)
-            if quality_score_explanation:
-                logger.info(
-                    "📝 qualityScoreExplanation: {}",
-                    quality_score_explanation[:200]
-                    + ("..." if len(quality_score_explanation) > 200 else ""),
-                )
-            if report_quality_score_explanation:
-                logger.info(
-                    "📝 reportQualityScoreExplanation: {}",
-                    report_quality_score_explanation[:200]
-                    + (
-                        "..."
-                        if len(report_quality_score_explanation) > 200
-                        else ""
-                    ),
-                )
-            logger.info("")
-            logger.info("❓ MISSING INFO ({} items):", len(missing_info))
-            for idx, item in enumerate(missing_info, 1):
-                logger.info("  {}. {}", idx, item)
-            logger.info("")
-            logger.info("✅ STRENGTHS ({} items):", len(strengths))
-            for idx, s in enumerate(strengths, 1):
-                logger.info(
-                    "  {}. {} | laws: {}", idx, s.get("point", ""), s.get("laws", [])
-                )
-            logger.info("")
-            logger.info("⚠️ WEAKNESSES ({} items):", len(weaknesses))
-            for idx, w in enumerate(weaknesses, 1):
-                logger.info("  {}. {}", idx, w)
-            logger.info("")
-            logger.info("🔴 RISKS ({} items):", len(risks))
-            for idx, r in enumerate(risks, 1):
-                logger.info("  {}. {}", idx, r)
-            logger.info("")
+            # One counts line; item text is case content and stays out of logs.
             logger.info(
-                "📍 RELEVANT JURISDICTION ({} items):", len(relevant_jurisdiction)
-            )
-            for idx, j in enumerate(relevant_jurisdiction, 1):
-                logger.info("  {}. {}", idx, j)
-            logger.info("")
-            logger.info("📋 PENDING ACTIONS ({} items):", len(pending_actions))
-            for idx, a in enumerate(pending_actions, 1):
-                logger.info("  {}. {}", idx, a)
-            logger.info("")
-            logger.info("🚀 NEXT STEPS ({} items):", len(next_steps))
-            for idx, n in enumerate(next_steps, 1):
-                logger.info("  {}. {}", idx, n)
-            logger.info("")
-            logger.info("📄 SUGGESTED DRAFTS ({} items):", len(suggested_drafts))
-            for idx, d in enumerate(suggested_drafts, 1):
-                logger.info("  {}. {}", idx, d)
-            logger.info("=" * 80)
-
-            logger.success(
-                "✅ Analysis report generated: score={}, strengths={}, missingInfo={}",
+                "Analysis report generated: score={} missingInfo={} strengths={} "
+                "weaknesses={} risks={} jurisdiction={} pending={} nextSteps={} drafts={}",
                 case_resolution_score,
-                len(strengths),
                 len(missing_info),
+                len(strengths),
+                len(weaknesses),
+                len(risks),
+                len(relevant_jurisdiction),
+                len(pending_actions),
+                len(next_steps),
+                len(suggested_drafts),
             )
             # Clamp "Annexure N" references in the freshly generated payload
             # against the real upload count so a single-doc workspace never
@@ -1587,8 +1484,7 @@ Rules:
             return payload
 
         except Exception as e:
-            logger.error("Error generating analysis report: {}", e)
-            logger.exception(e)
+            logger.opt(exception=e).error("Analysis report generation failed: {}", e)
             return self._analysis_report_fallback(
                 (workspace_role or "ADJUDICATOR").strip().upper()
             )
@@ -2735,7 +2631,7 @@ Rules:
             if not raw or raw.startswith("Error") or "Error generating" in raw[:50]:
                 logger.warning(
                     "Rejection score delta: Gemini error or empty; using default. raw={}",
-                    (raw or "")[:100],
+                    chars(raw),
                 )
                 return (
                     True,
@@ -2796,7 +2692,7 @@ Rules:
                     "Rejection score delta: AI isValid={} delta={}, reason={}",
                     is_valid,
                     delta,
-                    (reason or "")[:80],
+                    chars(reason),
                 )
                 return (is_valid, delta, reason[:200])
             # Regex fallback: extract scoreIncrease from raw text (e.g. malformed or truncated JSON)
@@ -2838,7 +2734,7 @@ Rules:
                 return (is_valid, delta, reason)
             logger.warning(
                 "Rejection score delta: could not parse response; using default. raw={}",
-                raw[:200],
+                chars(raw),
             )
         except Exception as e:
             logger.warning("Rejection score delta failed: {}; using default bump", e)
@@ -3136,7 +3032,7 @@ Rules:
         # Cap the batch's combined score bump.
         if total_delta > self._feedback_batch_max_score_delta:
             logger.info(
-                "analysis_report_feedback batch: capping combined score delta {} → {}",
+                "analysis_report_feedback batch: capping combined score delta {}  {}",
                 total_delta,
                 self._feedback_batch_max_score_delta,
             )
@@ -3198,7 +3094,7 @@ Rules:
                 usage=current_usage(),
             )
             logger.success(
-                "✅ analysis_report_feedback batch applied: {} rejections, score {}% → {}% (delta +{})",
+                "analysis_report_feedback batch applied: {} rejections, score {}%  {}% (delta +{})",
                 len(removed_events),
                 old_score,
                 new_score,
@@ -3318,7 +3214,7 @@ Rules:
             if not raw or raw.startswith("Error") or "Error generating" in raw[:50]:
                 logger.warning(
                     "added_missing_information score delta: empty/error response; treating as not related. raw={}",
-                    (raw or "")[:120],
+                    chars(raw),
                 )
                 return (False, 0, "")
 
@@ -3349,7 +3245,7 @@ Rules:
             if not (obj and isinstance(obj, dict)):
                 logger.warning(
                     "added_missing_information score delta: could not parse JSON; treating as not related. raw={}",
-                    raw[:200],
+                    chars(raw),
                 )
                 return (False, 0, "")
 
@@ -3496,7 +3392,7 @@ Rules:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ added_missing_information no-op: re-emitted unchanged analysis_report (score stays at {}%)",
+                    "added_missing_information no-op: re-emitted unchanged analysis_report (score stays at {}%)",
                     old_score,
                 )
             else:
@@ -3594,7 +3490,7 @@ Rules:
                 usage=current_usage(),
             )
             logger.success(
-                "✅ added_missing_information applied: score {}% → {}% (-{}), re-emitted analysis_report",
+                "added_missing_information applied: score {}%  {}% (-{}), re-emitted analysis_report",
                 old_score,
                 new_score,
                 score_delta,

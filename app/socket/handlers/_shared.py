@@ -216,6 +216,31 @@ class JsonHelpersMixin:
         return task
 
     # ------------------------------------------------------------------
+    # Knowledge-graph evidence for panels (augment mode)
+    # ------------------------------------------------------------------
+
+    async def _graph_evidence_block(self, panel: str, workspace_id: str) -> str:
+        """Ranked graph + hybrid evidence to ADD to a panel's prompt context.
+
+        Empty unless the graph is connected and ``panel`` is in
+        ``RETRIEVAL_PANELS`` — the existing context is never removed (augment
+        mode). Never raises: retrieval improves a panel, it never gates it.
+        """
+        graph_store = getattr(self, "_graph_store", None)
+        if graph_store is None or not workspace_id:
+            return ""
+        try:
+            from app.retrieval.panel_bridge import is_enabled, retrieve_for_panel
+
+            if not is_enabled(panel):
+                return ""
+            evidence = await retrieve_for_panel(panel, workspace_id, graph_store=graph_store)
+            return evidence.prompt_block
+        except Exception as graph_err:
+            logger.warning("Graph evidence for {} skipped: {}", panel, graph_err)
+            return ""
+
+    # ------------------------------------------------------------------
     # Undelivered feature payloads
     #
     # SocketClient.emit returns False instead of raising when the socket is down,
@@ -323,7 +348,7 @@ class JsonHelpersMixin:
                 if ok:
                     delivered.setdefault(ws_id, []).append(feature_type)
                     logger.success(
-                        "✅ Pending {} re-delivered after reconnect (workspace={})",
+                        "Pending {} re-delivered after reconnect (workspace={})",
                         feature_type,
                         str(ws_id)[:12],
                     )

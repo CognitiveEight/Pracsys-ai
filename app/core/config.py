@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     app_env: str = "development"
     debug: bool = False
     log_level: str = "INFO"
+    # Include local variable values in tracebacks. Off by default: in this
+    # service those values are socket payloads, document text and credentials.
+    log_diagnose: bool = False
 
     # Socket.IO Configuration
     socket_url: str
@@ -67,7 +70,22 @@ class Settings(BaseSettings):
 
     # API Keys - Google Services
     google_api_key: Optional[str] = None
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-3.8-flash"
+    # Gemini 3.8 Flash accepts thinking levels low / medium / high only — a
+    # MINIMAL request is a hard API error. None = infer from the model name;
+    # set explicitly to override for a model not covered by the inference.
+    gemini_minimal_thinking_supported: Optional[bool] = None
+
+    # Embedding model for the vector store. Queries and documents are embedded
+    # with different task types (RETRIEVAL_QUERY / RETRIEVAL_DOCUMENT), and the
+    # dimensionality is requested explicitly rather than truncated after the
+    # fact. Changing either value means a new vector space: re-index before
+    # serving from it.
+    embedding_model: str = "gemini-embedding-001"
+    embedding_dimensions: int = 768
+    # Attempts per embedding call before the chunk is stored as
+    # embedding_failed (kept for full-context reads, excluded from search).
+    embedding_max_attempts: int = 3
 
     # Hard ceiling on a single Gemini generation. Without it a stalled request
     # blocks its caller forever: the long feature generations are awaited inline
@@ -118,6 +136,49 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: Optional[str] = None
     qdrant_collection_name: str = "simplertoday"
+    # Evidence chunks (dense + sparse vectors) live in their own collection; the
+    # collection above keeps the state/role caches. None → "<name>_evidence_v1".
+    qdrant_chunks_collection: Optional[str] = None
+    # Characters of document text one panel prompt may carry (~4 chars/token).
+    # Documents over their share are excerpted by relevance, not cut from the
+    # front (app/rag/packing.py). Raising it improves recall at token cost.
+    panel_context_chars: int = 200_000
+    # Chat retrieval returns passages (hybrid search + rewrite + rerank) and
+    # answers carry checked [n] citations. Off → the previous whole-document
+    # context and uncited answers.
+    # --- Legal knowledge graph (ontology agentic RAG; app/ontology, app/graph,
+    # app/retrieval). Unset NEO4J_URL leaves the graph off: every layer still
+    # imports and runs, and retrieval falls back to hybrid search alone.
+    neo4j_url: Optional[str] = None
+    neo4j_username: str = "neo4j"
+    neo4j_password: Optional[str] = None
+    neo4j_database: str = "neo4j"
+    # "community" or "enterprise" — decides which constraints the generated
+    # schema may create.
+    neo4j_edition: str = "community"
+    # Apply the generated ontology schema on startup (idempotent: IF NOT EXISTS).
+    graph_apply_schema_on_startup: bool = True
+    # Extract ontology facts into the graph after document ingestion. Default
+    # OFF: one LLM call per evidence chunk, opted into deliberately. Runs as a
+    # tracked background task, never delaying the panels.
+    ontology_ingest_enabled: bool = False
+    # Panels using agentic (graph + hybrid) retrieval, comma-separated, e.g.
+    # "list_of_dates,relevant_parties". Empty = none. Enable a panel only when
+    # scripts/eval_rag.py shows it beats the baseline.
+    retrieval_panels: Optional[str] = None
+    # "augment" (evidence added alongside the existing context). "replace" is
+    # not enabled in this release.
+    retrieval_mode: str = "augment"
+
+    @property
+    def graph_enabled(self) -> bool:
+        """True when Neo4j is configured. The graph is optional."""
+        return bool(self.neo4j_url and self.neo4j_password)
+
+    rag_v2_enabled: bool = True
+    citations_enabled: bool = True
+    # One regeneration when an answer states a figure no cited passage holds.
+    citation_repair_enabled: bool = True
     qdrant_timeout_seconds: float = (
         60.0  # Request timeout for Qdrant (delete/index can be slow)
     )

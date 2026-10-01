@@ -1,5 +1,26 @@
 """
-Centralized logging configuration using Loguru.
+Centralised logging configuration (Loguru).
+
+Every line carries the correlation context bound for the inbound event that
+caused it — ``request_id``, ``event``, ``workspace_id`` — set once by
+``SocketEventHandler.handle`` with ``logger.contextualize`` and inherited by
+every task the event spawns (contextvars are copied by ``create_task``). To
+follow one run, filter on its request id.
+
+Sinks:
+
+* console          — ``LOG_LEVEL``, coloured only on a terminal;
+* logs/app.log     — ``LOG_LEVEL``, text, rotated and zipped;
+* logs/errors.log  — ERROR and above;
+* logs/structured.log — JSON (INFO+, plus trace records), for log shipping;
+* logs/audit/audit.log — audit events only, kept a year.
+
+Audit and trace records go only to their own sinks, so they never flood the
+text logs. Tracebacks never include local variable values (``diagnose``)
+unless ``LOG_DIAGNOSE=true`` — those values are payloads, document text and
+credentials.
+
+Rules for log calls are in CLAUDE.md ("Logging").
 """
 
 import sys
@@ -9,78 +30,99 @@ from loguru import logger
 
 from app.core.config import settings
 
+_TEXT_FORMAT = (
+    "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | "
+    "{extra[request_id]} {extra[event]} ws={extra[workspace_id]} | "
+    "{name}:{function}:{line} - {message}"
+)
+_CONSOLE_FORMAT = (
+    "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | "
+    "<magenta>{extra[request_id]}</magenta> {extra[event]} ws={extra[workspace_id]} | "
+    "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+)
+#: Values a line carries when it is not inside an inbound event (startup,
+#: heartbeat, reconnect housekeeping).
+CONTEXT_DEFAULTS = {"request_id": "-", "event": "-", "workspace_id": "-"}
 
-def setup_logging() -> None:
-    """
-    Configure application-wide logging.
-    """
-    # Remove default handler
+_configured = False
+
+
+def _is_plain(record) -> bool:
+    extra = record["extra"]
+    return not extra.get("audit") and not extra.get("trace")
+
+
+def setup_logging(force: bool = False) -> None:
+    """Configure all sinks. Idempotent: later calls are no-ops unless forced,
+    so a second call can no longer remove sinks another module relies on."""
+    global _configured
+    if _configured and not force:
+        return
+    _configured = True
+
     logger.remove()
+    logger.configure(extra=dict(CONTEXT_DEFAULTS))
+    level = (settings.log_level or "INFO").upper()
+    diagnose = bool(getattr(settings, "log_diagnose", False))
 
-    # Console handler with color
     logger.add(
         sys.stderr,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-        level=settings.log_level,
-        colorize=True,
+        format=_CONSOLE_FORMAT,
+        level=level,
+        colorize=sys.stderr.isatty(),
         backtrace=True,
-        diagnose=True,
+        diagnose=diagnose,
+        filter=_is_plain,
     )
 
-    # Create logs directory
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
+    file_opts = dict(enqueue=True, backtrace=True, diagnose=diagnose, compression="zip")
 
-    # File handler for all logs
     logger.add(
         log_dir / "app.log",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-        level="DEBUG",
+        format=_TEXT_FORMAT,
+        level=level,
         rotation="100 MB",
         retention="30 days",
-        compression="zip",
-        backtrace=True,
-        diagnose=True,
+        filter=_is_plain,
+        **file_opts,
     )
-
-    # File handler for errors only
     logger.add(
         log_dir / "errors.log",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+        format=_TEXT_FORMAT,
         level="ERROR",
         rotation="50 MB",
         retention="90 days",
-        compression="zip",
-        backtrace=True,
-        diagnose=True,
+        filter=_is_plain,
+        **file_opts,
     )
-
-    # File handler for JSON structured logs
     logger.add(
         log_dir / "structured.log",
         format="{message}",
         level="INFO",
         rotation="100 MB",
         retention="30 days",
-        serialize=True,  # Output as JSON
+        serialize=True,
+        filter=lambda r: not r["extra"].get("audit"),
+        **file_opts,
     )
+    if settings.enable_audit_log:
+        audit_dir = log_dir / "audit"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        logger.add(
+            audit_dir / "audit.log",
+            format="{message}",
+            level="INFO",
+            rotation="100 MB",
+            retention="1 year",
+            serialize=True,
+            filter=lambda r: bool(r["extra"].get("audit")),
+            **file_opts,
+        )
 
-    logger.info("Logging configured successfully")
-    logger.debug("Debug logging enabled")
+    logger.debug("Logging configured (level={}, diagnose={})", level, diagnose)
 
 
-def get_logger(name: str):
-    """
-    Get a logger instance with a specific name.
-
-    Args:
-        name: Logger name (usually __name__)
-
-    Returns:
-        Logger instance
-    """
-    return logger.bind(name=name)
-
-
-# Setup logging on module import
+# Configure on first import so modules that log at import time are covered.
 setup_logging()

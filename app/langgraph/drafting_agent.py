@@ -35,6 +35,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
+from app.utils.redact import chars, safe_url
+
 from app.ai.gemini_client import gemini_client
 from app.prompts.drafting import (
     DOC_CLASS_CORRESPONDENCE,
@@ -665,7 +667,7 @@ class DraftingAgent:
             logger.debug(
                 "Prematch lock held: title={!r} stays bound to {} "
                 "(ignored re-point to {})",
-                (title or "")[:60],
+                chars(title),
                 existing,
                 template_id,
             )
@@ -842,7 +844,7 @@ class DraftingAgent:
         if not suggestions:
             logger.info(
                 "Drafting suggestions produced no items (raw preview: {})",
-                (raw or "")[:200],
+                chars(raw),
             )
             return suggestions
 
@@ -1362,7 +1364,7 @@ class DraftingAgent:
         except Exception as exc:
             logger.warning(
                 "Template match-score call failed for {!r} (non-fatal): {}",
-                (suggestion_title or "")[:60],
+                chars(suggestion_title),
                 exc,
             )
             return None, None
@@ -1760,7 +1762,7 @@ class DraftingAgent:
                     "Template download failed (user={}, template={}, url={}): {}",
                     user_id,
                     template_id,
-                    (file_url or "")[:80],
+                    chars(file_url),
                     e,
                 )
                 return None
@@ -1833,21 +1835,21 @@ class DraftingAgent:
                         downloaded_bytes = converted
                         ext_lower = "docx"
                         logger.info(
-                            "Template PDF→DOCX conversion succeeded "
+                            "Template PDFDOCX conversion succeeded "
                             "(user={}, template={}, in_bytes={}, out_bytes={})",
                             user_id, template_id,
                             pdf_bytes_len, len(converted),
                         )
                     else:
                         logger.warning(
-                            "Template PDF→DOCX conversion produced no usable "
+                            "Template PDFDOCX conversion produced no usable "
                             "output (user={}, template={}) — llm_diff path will "
                             "fall back to skeleton_clone for this template",
                             user_id, template_id,
                         )
                 except Exception as exc:
                     logger.warning(
-                        "Template PDF→DOCX conversion raised (user={}, "
+                        "Template PDFDOCX conversion raised (user={}, "
                         "template={}): {} — continuing without skeleton",
                         user_id, template_id, exc,
                     )
@@ -2665,7 +2667,7 @@ class DraftingAgent:
         )
         if ok:
             logger.info(
-                "Template renamed (user={}, template={}): {!r} → {!r}",
+                "Template renamed (user={}, template={}): {!r}  {!r}",
                 user_id,
                 template_id,
                 previous_name,
@@ -3117,7 +3119,7 @@ class DraftingAgent:
             logger.info(
                 "Template cleanup ({} chunk) (template={!r}): {} -> {} chars",
                 "1",
-                (name or "")[:60],
+                chars(name),
                 len(body),
                 len(result),
             )
@@ -3147,13 +3149,13 @@ class DraftingAgent:
                 "Chunked template cleanup rejected at merge ({} chunks, "
                 "template={!r}); keeping normalised text",
                 len(chunks),
-                (name or "")[:60],
+                chars(name),
             )
             return body
         logger.info(
             "Template cleanup ({} chunks) (template={!r}): {} -> {} chars",
             len(chunks),
-            (name or "")[:60],
+            chars(name),
             len(body),
             len(merged),
         )
@@ -3620,7 +3622,7 @@ class DraftingAgent:
         result = [deduped[k] for k in order]
         if len(result) < len(ready):
             logger.info(
-                "Template matcher deduped {} → {} entries "
+                "Template matcher deduped {}  {} entries "
                 "(collapsed {} duplicate/same-content template(s))",
                 len(ready),
                 len(result),
@@ -4352,8 +4354,8 @@ class DraftingAgent:
                 # assistant just offered. Treat as a fresh kickoff for
                 # that document type and clear the menu.
                 logger.info(
-                    "Drafting menu pick: '{}' → '{}'",
-                    user_message[:60],
+                    "Drafting menu pick: '{}'  '{}'",
+                    chars(user_message),
                     _picked,
                 )
                 (session_state or {}).pop("last_offered_options", None)
@@ -4937,7 +4939,7 @@ class DraftingAgent:
                     "Suggested-draft click without templateId — reusing "
                     "pre-matched template {} (title={!r}, user={})",
                     recalled_template_id,
-                    (suggestion_title or "")[:60],
+                    chars(suggestion_title),
                     (user_id or "")[:12],
                 )
                 request_fields = {
@@ -6638,7 +6640,7 @@ class DraftingAgent:
             logger.warning(
                 "Drafting router JSON parse failed: {} (raw first 300 chars: {!r})",
                 exc,
-                cleaned[:300],
+                chars(cleaned),
             )
             return {
                 "action": "chat_reply",
@@ -7823,7 +7825,7 @@ OUTPUT FORMAT:
                 actionable_id or "-",
                 version,
                 path_used,
-                url,
+                safe_url(url),
             )
             return url
         except Exception as e:
@@ -7893,7 +7895,7 @@ OUTPUT FORMAT:
                 )
                 if not converted:
                     logger.warning(
-                        "Lazy PDF→DOCX conversion produced no usable output "
+                        "Lazy PDFDOCX conversion produced no usable output "
                         "(template={}) — skipping backfill",
                         template_id,
                     )
@@ -7901,7 +7903,7 @@ OUTPUT FORMAT:
                 content = converted
             except Exception as exc:
                 logger.warning(
-                    "Lazy PDF→DOCX conversion raised (template={}): {}",
+                    "Lazy PDFDOCX conversion raised (template={}): {}",
                     template_id, exc,
                 )
                 return None
@@ -8013,7 +8015,7 @@ OUTPUT FORMAT:
         # issue is upstream (no templateId on the click / template not in the
         # store), not the render prompt.
         logger.info(
-            "🖋️ Draft render: mode={} template_id={} template_name={!r} "
+            "Draft render: mode={} template_id={} template_name={!r} "
             "template_chars={} gathered_facts={}",
             mode,
             template_id or "(none)",

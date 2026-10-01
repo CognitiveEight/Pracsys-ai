@@ -820,7 +820,7 @@ def apply_template_diff(
             keep_set: set = set(keep_sections)
             kept = [s for s in sections if s.number in keep_set]
             logger.info(
-                "Sections detected={} kept={} → {}",
+                "Sections detected={} kept={}  {}",
                 len(sections), len(kept),
                 [(s.number, s.title) for s in kept],
             )

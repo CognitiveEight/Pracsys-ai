@@ -51,6 +51,7 @@ __all__ = [
     'find_dropped_case_figures',
     '_strip_strength_point_statute_boilerplate',
     '_annexure_wording_for_next_steps',
+    '_upload_wording',
     '_clamp_annexure_references',
     '_format_document_for_prompt',
     '_normalize_report_mobile_from_overview',
@@ -642,24 +643,48 @@ def _strip_strength_point_statute_boilerplate(text: str) -> str:
     return cleaned
 
 
-def _annexure_wording_for_next_steps(text: str) -> str:
-    """
-    Product wording for strategy possibleNextSteps: refer to uploads as Annexure N, not Document N;
-    replace standalone document/documents with annexure/annexures.
+_UPLOAD_DETERMINERS = r"(the|this|that|these|those|each|every|both|all|said|uploaded|attached|enclosed|annexed|submitted)"
+
+
+def _upload_wording(text: str) -> str:
+    """Refer to uploaded files as annexures — and nothing else.
+
+    Product rule: an upload is "Annexure N", never "Document N". Converted:
+    "Document N" / "Documents N", and "document(s)" when it names an upload
+    ("the document", "this document", "the uploaded documents").
+
+    Deliberately NOT converted, because it is not an upload:
+    "identity documents including passports" (real-world documents) and the
+    verb in "Annexure 1 documents an official representation". The previous
+    blanket replace produced "statutory identity annexures" and "Annexure 1
+    annexures an official representation".
     """
     if not (text or "").strip():
-        return ""
-    t = text.strip()
-    t = re.sub(r"\b[Dd]ocuments\s+(\d+)\b", r"Annexures \1", t)
+        return text or ""
+    t = re.sub(r"\b[Dd]ocuments\s+(\d+)\b", r"Annexures \1", text)
     t = re.sub(r"\b[Dd]ocument\s+(\d+)\b", r"Annexure \1", t)
+
+    def _keep_case(word: str, repl: str) -> str:
+        return repl.capitalize() if word[:1].isupper() else repl
+
     t = re.sub(
-        r"\bdocuments\b",
-        "annexures",
-        re.sub(r"\bdocument\b", "annexure", t, flags=re.IGNORECASE),
-        flags=re.IGNORECASE,
+        rf"\b{_UPLOAD_DETERMINERS}\s+(documents)\b",
+        lambda m: f"{m.group(1)} {_keep_case(m.group(2), 'annexures')}",
+        t, flags=re.IGNORECASE,
+    )
+    t = re.sub(
+        rf"\b{_UPLOAD_DETERMINERS}\s+(document)\b(?!\s+(?:dated|titled|of\s+title))",
+        lambda m: f"{m.group(1)} {_keep_case(m.group(2), 'annexure')}",
+        t, flags=re.IGNORECASE,
     )
     return t
 
+
+def _annexure_wording_for_next_steps(text: str) -> str:
+    """Product wording for strategy possibleNextSteps (see ``_upload_wording``)."""
+    if not (text or "").strip():
+        return ""
+    return _upload_wording(text.strip())
 
 def _clamp_annexure_references(text: Any, max_annexure: int) -> Any:
     """

@@ -35,7 +35,7 @@ setup:
 test:
 	@echo "Running unit tests and offline verification suites..."
 	python -m pytest -q tests
-	@for f in verify_logging.py verify_rag.py verify_run_control.py verify_document_reload.py verify_objective_change.py verify_workspace_share.py verify_fact_corrections.py; do \
+	@for f in verify_logging.py verify_rag.py verify_run_control.py verify_document_reload.py verify_objective_change.py verify_workspace_share.py verify_fact_corrections.py verify_missing_info_edit.py; do \
 		echo "== $$f"; python $$f | tail -1 || exit 1; \
 	done
 

@@ -501,6 +501,50 @@ class AddedMissingInformationPayload(BaseModel):
         populate_by_name = True
 
 
+class MissingInformationEditedBy(BaseModel):
+    """Who edited the item (``missing_information_edited.editedBy``)."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    userId: Optional[str] = Field(
+        None, validation_alias=AliasChoices("userId", "user_id")
+    )
+
+
+class MissingInformationEditedPayload(BaseModel):
+    """
+    Payload for missing_information_edited (Server → AI service).
+    A lawyer rewrote the wording of one Missing Information item. Only the text
+    changes: no status change, no new fields. The backend emits nothing when the
+    trimmed text is unchanged. ``userId`` is the case OWNER; ``editedBy`` is
+    whoever typed the edit (a collaborator on a shared case).
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    requestId: Optional[str] = Field(
+        None, validation_alias=AliasChoices("requestId", "request_id")
+    )
+    workspaceId: str = Field(
+        ..., validation_alias=AliasChoices("workspaceId", "workspace_id")
+    )
+    userId: Optional[str] = Field(
+        None, validation_alias=AliasChoices("userId", "user_id")
+    )
+    editedBy: Optional[MissingInformationEditedBy] = Field(
+        None, validation_alias=AliasChoices("editedBy", "edited_by")
+    )
+    itemId: str = Field(..., validation_alias=AliasChoices("itemId", "item_id"))
+    previousText: Optional[str] = Field(
+        None, validation_alias=AliasChoices("previousText", "previous_text")
+    )
+    newText: str = Field(..., validation_alias=AliasChoices("newText", "new_text"))
+    editedAt: Optional[str] = Field(
+        None, validation_alias=AliasChoices("editedAt", "edited_at")
+    )
+    timestamp: Optional[str] = None
+
+
 class ApplicableLawItemInRequest(BaseModel):
     """Law object inside applicable_law_relevance_request (Server → AI)."""
 

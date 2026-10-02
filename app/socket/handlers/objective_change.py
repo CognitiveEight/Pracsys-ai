@@ -1831,6 +1831,11 @@ class ObjectiveChangeMixin:
                 prev_items=prev_items if isinstance(prev_items, list) else None,
                 section=report_field,
             )
+        # The lawyer's re-worded items (missing_information_edited) win over the
+        # regenerated wording, and keep their ids.
+        analysis_report["missingInfo"] = self._apply_missing_info_edits(
+            workspace_id, analysis_report.get("missingInfo")
+        )
         return analysis_report
 
     async def _merge_analysis_report_with_previous(

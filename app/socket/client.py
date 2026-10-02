@@ -699,6 +699,16 @@ class SocketClient:
             await event_handler.handle("added_missing_information", data)
 
         @self.sio.event
+        async def missing_information_edited(data):
+            """
+            Handle missing_information_edited (Server → AI_Maverick).
+            A lawyer re-worded one Missing Information item. The item keeps its
+            id; only its text changes. The analysis report is updated in place
+            (no score change) and re-emitted.
+            """
+            await event_handler.handle("missing_information_edited", data)
+
+        @self.sio.event
         async def applicable_law_relevance_request(data):
             """
             Handle applicable_law_relevance_request (Server → AI_Maverick).

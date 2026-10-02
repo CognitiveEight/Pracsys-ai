@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 from datetime import date as date_type
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import unescape
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote_plus
@@ -115,7 +115,10 @@ from app.socket.event_utils import (
     _normalize_report_mobile_from_overview,
     _overview_conversation_date_to_iso,
     extract_overview_conversation_report_contact_meta,
+    _normalize_match_text,
 )
+from app.socket.schemas import MissingInformationEditedPayload
+from app.workspace.participants import resolve_asker
 
 
 from app.prompts.analysis_report_prompts import (
@@ -3499,3 +3502,335 @@ Rules:
             logger.warning(
                 "added_missing_information: no socket client – report updated in cache only"
             )
+
+    # ------------------------------------------------------------------
+    # missing_information_edited — a lawyer re-worded one missingInfo item
+    # ------------------------------------------------------------------
+
+    #: Older wordings remembered per edited item. Used to re-attach the item's
+    #: id when a regeneration reproduces an earlier wording verbatim.
+    _EDITED_MISSING_INFO_PRIOR_TEXTS_CAP = 10
+    #: Edited items remembered per workspace (oldest dropped first).
+    _EDITED_MISSING_INFO_LEDGER_CAP = 100
+
+    @staticmethod
+    def _parse_edit_timestamp(value: Any) -> Optional[datetime]:
+        """Parse an ISO-8601 ``editedAt`` (``Z`` suffix allowed); None if absent
+        or malformed. Returned naive-UTC so two values always compare."""
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is not None:
+            parsed = parsed.replace(tzinfo=None) - (parsed.utcoffset() or timedelta(0))
+        return parsed
+
+    def _apply_missing_info_edits(
+        self, workspace_id: str, items: Any
+    ) -> Any:
+        """Re-apply the lawyer's re-worded missingInfo text to tagged items.
+
+        A regeneration derives missingInfo from the documents, which still carry
+        the model's original wording, so without this every edit is reverted by
+        the next upload / sync / objective change. Two passes over the
+        ``[{id, text, isMatched}]`` list:
+
+        1. an item whose id is in the ledger gets the lawyer's text;
+        2. an item with an unknown id whose text equals (normalised) the edited
+           text or one of its earlier wordings takes over the edited item's id
+           and text — the reconcile step minted a new id because the stored
+           currentState and the regenerated text no longer matched.
+
+        The ledger only rewrites items the report still contains; it never
+        re-introduces a gap a regeneration resolved. Mutates and returns
+        ``items``; anything that is not a list of dicts is returned untouched.
+        """
+        ledger = self._workspace_edited_missing_info.get(workspace_id) or {}
+        if not ledger or not isinstance(items, list):
+            return items
+        claimed: Set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            entry = ledger.get(str(item.get("id") or ""))
+            if isinstance(entry, dict) and entry.get("text"):
+                item["text"] = entry["text"]
+                claimed.add(str(item.get("id")))
+
+        # Lookup: normalised wording -> ledger id, for ids not already present.
+        by_text: Dict[str, str] = {}
+        for eid, entry in ledger.items():
+            if eid in claimed or not isinstance(entry, dict):
+                continue
+            for text in [entry.get("text")] + list(entry.get("priorTexts") or []):
+                key = _normalize_match_text(text)
+                if key:
+                    by_text.setdefault(key, eid)
+        if not by_text:
+            return items
+        for item in items:
+            if not isinstance(item, dict) or str(item.get("id") or "") in claimed:
+                continue
+            eid = by_text.get(_normalize_match_text(item.get("text")))
+            if not eid or eid in claimed:
+                continue
+            item["id"] = eid
+            item["text"] = ledger[eid]["text"]
+            item["isMatched"] = True
+            claimed.add(eid)
+        return items
+
+    def _record_missing_info_edit(
+        self,
+        workspace_id: str,
+        *,
+        item_id: str,
+        new_text: str,
+        prior_texts: List[str],
+        edited_at: str,
+        request_id: str,
+    ) -> None:
+        """Write the edit into the per-workspace ledger (write-through)."""
+        ledger = dict(self._workspace_edited_missing_info.get(workspace_id) or {})
+        previous = ledger.pop(item_id, None) or {}
+        priors: List[str] = []
+        for text in list(previous.get("priorTexts") or []) + list(prior_texts):
+            text = (text or "").strip() if isinstance(text, str) else ""
+            if text and text != new_text and text not in priors:
+                priors.append(text)
+        ledger[item_id] = {
+            "text": new_text,
+            "priorTexts": priors[-self._EDITED_MISSING_INFO_PRIOR_TEXTS_CAP:],
+            "editedAt": edited_at,
+            "requestId": request_id,
+        }
+        # dicts keep insertion order and the edited id was re-inserted last, so
+        # trimming from the front drops the least recently edited items.
+        while len(ledger) > self._EDITED_MISSING_INFO_LEDGER_CAP:
+            ledger.pop(next(iter(ledger)))
+        self._workspace_edited_missing_info[workspace_id] = ledger
+
+    def _rename_missing_info_in_side_state(
+        self,
+        workspace_id: str,
+        *,
+        item_id: str,
+        old_texts: List[str],
+        new_text: str,
+    ) -> None:
+        """Carry an edit into the two caches that hold missingInfo wording.
+
+        - ``currentState.missingInfo``: the reconcile step matches regenerated
+          text against it. Left on the old wording, the next retag sees the
+          edited text as new and mints the item a fresh id.
+        - the user-added bucket: protects a lawyer-added item from the
+          answered-by-upload pass by text, so it must follow the rename.
+        """
+        state = self._workspace_current_state_payload.get(workspace_id)
+        if isinstance(state, dict) and isinstance(state.get("missingInfo"), list):
+            changed = False
+            new_items = []
+            for entry in state["missingInfo"]:
+                if isinstance(entry, dict) and str(entry.get("id") or "") == item_id:
+                    if entry.get("text") != new_text:
+                        entry = {**entry, "text": new_text}
+                        changed = True
+                new_items.append(entry)
+            if changed:
+                self._workspace_current_state_payload[workspace_id] = {
+                    **state,
+                    "missingInfo": new_items,
+                }
+
+        bucket = self._workspace_user_added_missing_info.get(workspace_id) or []
+        old_set = {t for t in old_texts if t}
+        if any(isinstance(t, str) and t in old_set for t in bucket):
+            renamed: List[str] = []
+            for text in bucket:
+                text = new_text if text in old_set else text
+                if text not in renamed:
+                    renamed.append(text)
+            self._workspace_user_added_missing_info[workspace_id] = renamed
+
+    async def on_missing_information_edited(self, data: Dict[str, Any]) -> None:
+        """
+        Handle missing_information_edited: a lawyer re-worded one Missing
+        Information item.
+
+        Text only. The item keeps its id and ``isMatched``. The score,
+        explanations and every other list stay as they are, and no model is
+        called. The edit is applied to the cached analysis report and recorded
+        in ``_workspace_edited_missing_info`` so regenerations keep the
+        lawyer's wording (see ``_apply_missing_info_edits``). The report is then
+        re-emitted so every client of a shared case sees the new text.
+
+        Delivery: the backend re-sends on reconnect under the same
+        ``requestId``. A repeat of an applied ``requestId`` is swallowed, and an
+        edit whose ``editedAt`` is older than the one already applied to that
+        item is dropped as stale. Without that check, a late re-send of edit 1
+        would revert edit 2.
+
+        Sharing: ``userId`` is the owner; ``editedBy`` is who typed it. A
+        ``view`` collaborator's edit is not applied. The unchanged report is
+        re-emitted so the frontend drops its optimistic text.
+        """
+        import copy
+
+        raw = data if isinstance(data, dict) else {}
+        try:
+            payload = MissingInformationEditedPayload.model_validate(raw)
+        except Exception as e:
+            logger.warning(
+                "missing_information_edited: invalid payload (keys={}): {}",
+                sorted(raw.keys()),
+                type(e).__name__,
+            )
+            return
+
+        workspace_id = (payload.workspaceId or "").strip()
+        user_id = (payload.userId or "").strip()
+        item_id = (payload.itemId or "").strip()
+        request_id = (payload.requestId or "").strip()
+        new_text = (payload.newText or "").strip()
+        previous_text = (payload.previousText or "").strip()
+        edited_at = (payload.editedAt or payload.timestamp or "").strip()
+
+        if not workspace_id or not item_id or not new_text:
+            logger.warning(
+                "missing_information_edited: missing workspaceId, itemId or newText – ignoring"
+            )
+            return
+        if new_text == previous_text:
+            logger.info("missing_information_edited: text unchanged – ignoring")
+            return
+
+        # Live workspace traffic revokes a pending compliance purge.
+        self.cancel_pending_purge(workspace_id, trigger="missing_information_edited")
+
+        try:
+            await self._hydrate_workspace_caches(workspace_id, user_id=user_id)
+        except Exception as e:  # pragma: no cover - best-effort hydration
+            logger.debug(
+                "missing_information_edited: hydration failed for workspace {}: {}",
+                workspace_id,
+                type(e).__name__,
+            )
+
+        current = self._workspace_analysis_payload.get(workspace_id)
+        if not isinstance(current, dict) or not current:
+            logger.warning(
+                "missing_information_edited: no cached analysis report – edit not applied"
+            )
+            return
+
+        asker = resolve_asker(
+            workspace_id,
+            user_id,
+            payload.editedBy.model_dump() if payload.editedBy else None,
+        )
+        if not asker.can_edit:
+            logger.warning(
+                "missing_information_edited: rejected edit from {} – re-emitting unchanged report",
+                asker.log_label(),
+            )
+            await self._emit_document_feature(
+                feature_type="analysis_report",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=current,
+                usage=current_usage(),
+            )
+            return
+
+        prior_entry = (self._workspace_edited_missing_info.get(workspace_id) or {}).get(
+            item_id
+        ) or {}
+        if request_id and prior_entry.get("requestId") == request_id:
+            logger.info("missing_information_edited: duplicate requestId – already applied")
+            return
+        incoming_at = self._parse_edit_timestamp(edited_at)
+        applied_at = self._parse_edit_timestamp(prior_entry.get("editedAt"))
+        if incoming_at and applied_at and incoming_at < applied_at:
+            logger.info(
+                "missing_information_edited: stale edit (editedAt older than the applied one) – ignoring"
+            )
+            return
+
+        report = copy.deepcopy(current)
+        items = report.get("missingInfo")
+        if not isinstance(items, list):
+            items = []
+        # Locate by id first. A legacy untagged (plain-string) report has no ids,
+        # so fall back to the previous wording.
+        index: Optional[int] = None
+        for i, item in enumerate(items):
+            if isinstance(item, dict) and str(item.get("id") or "") == item_id:
+                index = i
+                break
+        if index is None and previous_text:
+            wanted = _normalize_match_text(previous_text)
+            for i, item in enumerate(items):
+                if _normalize_match_text(_coerce_analysis_text_item(item)) == wanted:
+                    index = i
+                    break
+
+        old_item_text = (
+            _coerce_analysis_text_item(items[index]) if index is not None else ""
+        )
+        self._record_missing_info_edit(
+            workspace_id,
+            item_id=item_id,
+            new_text=new_text,
+            prior_texts=[previous_text, old_item_text],
+            edited_at=edited_at,
+            request_id=request_id,
+        )
+        self._rename_missing_info_in_side_state(
+            workspace_id,
+            item_id=item_id,
+            old_texts=[previous_text, old_item_text],
+            new_text=new_text,
+        )
+
+        if index is None:
+            # The frontend shows an item our cache does not have (the cache is
+            # behind it). Emitting this report would remove the item the
+            # lawyer just edited. The ledger entry is kept, and the next
+            # regeneration that produces the item applies it.
+            logger.warning(
+                "missing_information_edited: item not in cached report (items={}) – "
+                "edit recorded for the next regeneration, nothing emitted",
+                len(items),
+            )
+            return
+
+        target = items[index]
+        if isinstance(target, dict):
+            items[index] = {**target, "text": new_text}
+            report["missingInfo"] = items
+        else:
+            # Legacy plain-string list: replace, then retag. The ledger written
+            # above makes the retag give this item ``item_id``.
+            items[index] = new_text
+            report["missingInfo"] = items
+            report = await self._retag_analysis_report_safe(workspace_id, report)
+
+        report["timestamp"] = datetime.utcnow().isoformat() + "Z"
+        self._workspace_analysis_payload[workspace_id] = report
+
+        delivered = await self._emit_document_feature(
+            feature_type="analysis_report",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            payload=report,
+            usage=current_usage(),
+        )
+        logger.info(
+            "missing_information_edited applied by {}: chars {} -> {}, delivered={}",
+            asker.log_label(),
+            chars(old_item_text),
+            chars(new_text),
+            delivered,
+        )

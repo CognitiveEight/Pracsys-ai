@@ -121,6 +121,7 @@ _WORK_STARTING_EVENTS = CANCELLABLE_RUN_EVENTS | frozenset(
         "workspace_transferred",
         "analysis_report_feedback",
         "added_missing_information",
+        "missing_information_edited",
     }
 )
 

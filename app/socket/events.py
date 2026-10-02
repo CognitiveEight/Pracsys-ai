@@ -248,6 +248,14 @@ class SocketEventHandler(
         self._workspace_user_added_missing_info: Dict[str, List[str]] = (
             PersistentWorkspaceDict(CacheKinds.USER_ADDED_MISSING_INFO)
         )
+        # Per-workspace ledger of missingInfo items the lawyer re-worded via
+        # missing_information_edited ({itemId: {text, priorTexts, editedAt,
+        # requestId}}). Re-applied by _tag_analysis_report_against_current_state
+        # so a regeneration from the documents cannot revert the lawyer's text.
+        # Instance attribute so the workspace-purge sweep erases it.
+        self._workspace_edited_missing_info: Dict[str, Dict[str, Dict[str, Any]]] = (
+            PersistentWorkspaceDict(CacheKinds.EDITED_MISSING_INFO)
+        )
         # Facts the lawyer corrected in chat ("the disputed amount is 6 lakh USD,
         # not 16 lakh"). Mirrors _workspace_removed_documents: a user decision
         # that outlives the panel it was made on. Every generator prompt carries
@@ -499,6 +507,11 @@ class SocketEventHandler(
         self.register(
             "added_missing_information",
             self.on_added_missing_information,
+        )
+        # Missing Information — lawyer re-worded one item (text only).
+        self.register(
+            "missing_information_edited",
+            self.on_missing_information_edited,
         )
         self.register(
             "applicable_law_relevance_request",

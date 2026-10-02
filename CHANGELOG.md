@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`missing_information_edited` (Server → AI).** A lawyer can re-word a
+  Missing Information item. `on_missing_information_edited` replaces the item's
+  text by `itemId` in the cached analysis report and keeps its id and
+  `isMatched`. Score, explanations and the other lists are left alone, and no
+  model call is made. The report is then re-emitted as `analysis_report`. The
+  edit is recorded in a per-workspace ledger (`CacheKinds.EDITED_MISSING_INFO`)
+  that `_tag_analysis_report_against_current_state` re-applies. Without it, the
+  next upload, sync or objective change would regenerate the model's original
+  wording from the documents. A re-sent `requestId` is swallowed. An edit whose
+  `editedAt` is older than the one already applied is dropped as stale. A
+  `view` collaborator's edit (`editedBy`) is not applied. Offline coverage:
+  `verify_missing_info_edit.py`.
+
 ### Fixed
 
 - **Chat replies carried no citations.** `ChatState` did not declare

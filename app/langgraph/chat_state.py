@@ -30,6 +30,13 @@ class ChatState(TypedDict, total=False):
     intent_classification: Dict[str, Any]
     intent_classified: bool
 
+    # Evidence and citations (app/rag/). These MUST be declared: LangGraph
+    # drops any key a node returns that is not in this schema, which silently
+    # stripped every chat citation before it reached the reply.
+    evidence_index: Dict[str, Dict[str, Any]]  # EvidencePack.to_state()
+    citations: List[Dict[str, Any]]  # checked, numbered [n] citations
+    citation_report: Dict[str, Any]
+
     # Explanation Generation
     response_text: str
     explanation: str

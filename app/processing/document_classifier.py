@@ -35,6 +35,8 @@ from typing import Any, Dict
 
 from loguru import logger
 
+from app.utils.redact import chars
+
 
 SUPPORTED_DOCUMENT_TYPES = (
     # ID
@@ -276,7 +278,7 @@ async def classify_and_extract(
             logger.debug(
                 "Classifier could not find JSON in response for {} (first 300 chars: {})",
                 filename,
-                (raw[:300] if raw else ""),
+                (chars(raw) if raw else ""),
             )
             return safe_default
 
@@ -286,7 +288,7 @@ async def classify_and_extract(
             logger.warning(
                 "Classifier JSON parse failed ({}); first 300 chars: {}",
                 str(e),
-                (cleaned[:300] if cleaned else ""),
+                (chars(cleaned) if cleaned else ""),
             )
             return safe_default
 

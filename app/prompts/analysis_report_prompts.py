@@ -98,7 +98,7 @@ def generate_analysis_report_from_documents_prompt2(*, _entities_block_ar, combi
                         f"- weaknesses: {(data.get('weaknesses') or [])[:6] if isinstance(data.get('weaknesses'), list) else []}\n"
                         f"- risks: {(data.get('risks') or [])[:6] if isinstance(data.get('risks'), list) else []}\n\n"
                         "DOCUMENTS (in upload order):\n"
-                        f"{combined_document_content[:60000]}\n"
+                        f"{combined_document_content}\n"
     )
 
 

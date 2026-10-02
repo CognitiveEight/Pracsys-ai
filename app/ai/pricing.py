@@ -29,6 +29,10 @@ from app.core.config import settings
 # model name -> (input_usd_per_million, output_usd_per_million)
 # Keep in sync with https://ai.google.dev/gemini-api/docs/pricing
 MODEL_PRICING: Dict[str, Tuple[float, float]] = {
+    # Launch rate, valid through 2026-12-31. Google has announced it doubles to
+    # (1.50, 7.50) from 2027-01-01 — update this row (or set
+    # TOKEN_PRICE_INPUT/OUTPUT_PER_MILLION) before then or costs under-report.
+    "gemini-3.8-flash": (0.75, 3.75),
     "gemini-3-flash-preview": (0.50, 3.00),
     "gemini-2.5-flash": (0.30, 2.50),
     "gemini-2.5-flash-lite": (0.10, 0.40),

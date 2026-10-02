@@ -75,6 +75,13 @@ class CacheKinds:
     # added_missing_information, so the answered-by-upload resolution pass
     # never auto-removes them (only analysis_report_feedback can).
     USER_ADDED_MISSING_INFO = "user_added_missing_info"
+    # Per-workspace ledger of Missing Information items the lawyer re-worded via
+    # missing_information_edited, keyed by the item's id. A regeneration
+    # re-derives missingInfo from the documents, which still carry the old
+    # wording; tagging re-applies the lawyer's text through this ledger so the
+    # edit survives. Shape:
+    #   {itemId: {"text", "priorTexts": [str, ...], "editedAt", "requestId"}}
+    EDITED_MISSING_INFO = "edited_missing_info"
     # Per-workspace ledger of FACTS the lawyer corrected in chat ("the disputed
     # amount is 6 lakh USD, not 16 lakh"). Mirrors REMOVED_DOCUMENTS: a user
     # decision that must survive regeneration. Without it, the next document
@@ -129,6 +136,7 @@ WORKSPACE_HYDRATION_KINDS = (
     CacheKinds.STRATEGY_PAYLOAD,
     CacheKinds.REJECTED_ANALYSIS_ITEMS,
     CacheKinds.USER_ADDED_MISSING_INFO,
+    CacheKinds.EDITED_MISSING_INFO,
     CacheKinds.USER_ASSERTED_FACTS,
     CacheKinds.DRAFTING_SUGGESTIONS,
     CacheKinds.CURRENT_STATE,

@@ -17,6 +17,8 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.utils.redact import chars
+
 from app.agents.role_models import RoleEnum
 from app.ai.gemini_client import is_generation_error
 from app.ai.usage import current_usage, meter_usage
@@ -77,6 +79,7 @@ from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
                                        restore_state)
 from agent import process_analysis_docx_request
 
+from app.rag.packing import fit_to_budget, panel_context_budget
 from app.socket.event_utils import (
     EventHandler,
     _STRATEGY_ROLE_LABELS_RE,
@@ -184,7 +187,7 @@ class StrategyMixin:
             from app.vectorstore.qdrant import vector_store
 
             logger.info(
-                f"🧠 Generating detailed strategies for workspace {workspace_id} with role {workspace_role}"
+                "Generating detailed strategies for workspace {} with role {}", workspace_id, workspace_role
             )
 
             # Build documents_info from batch_result when available (for analysis metadata)
@@ -211,11 +214,11 @@ class StrategyMixin:
                     workspace_id=workspace_id
                 )
                 logger.info(
-                    f"Retrieved {len(all_docs)} document(s) from vector store for strategy generation"
+                    "Retrieved {} document(s) from vector store for strategy generation", len(all_docs)
                 )
             except Exception as vector_error:
                 logger.warning(
-                    f"Could not retrieve documents from vector store: {vector_error}"
+                    "Could not retrieve documents from vector store: {}", vector_error
                 )
 
             # Build combined content with a fair per-document cap so all documents are represented.
@@ -226,7 +229,8 @@ class StrategyMixin:
                 if (d.get("content") or "").strip()
                 and len((d.get("content") or "").strip()) >= 20
             ]
-            max_total_content = 100000
+            graph_block = await self._graph_evidence_block("strategy_objective", workspace_id)
+            max_total_content = max(20_000, panel_context_budget() - len(graph_block))
             per_doc_cap = (
                 (max_total_content // max(1, len(valid_docs)))
                 if valid_docs
@@ -241,7 +245,7 @@ class StrategyMixin:
                         continue
                     if len(content) > per_doc_cap:
                         content = (
-                            content[:per_doc_cap] + "\n[... truncated for length ...]"
+                            fit_to_budget(content, per_doc_cap, "general")
                         )
                     # Build labelled block with metadata header so the
                     # prompt distinguishes drafted-by-assistant documents
@@ -256,7 +260,7 @@ class StrategyMixin:
                 combined_document_content = (
                     "\n\n".join(parts) if parts else "No document content available."
                 )
-            if len(combined_document_content) > max_total_content:
+            if len(combined_document_content) > int(max_total_content * 1.1):  # headers add a little; never cut the last document
                 combined_document_content = (
                     combined_document_content[:max_total_content]
                     + "\n[... content truncated ...]"
@@ -267,6 +271,8 @@ class StrategyMixin:
                     len(valid_docs),
                     per_doc_cap,
                 )
+            if graph_block:
+                combined_document_content += "\n\n" + graph_block
             num_annexures = len(valid_docs)
             if num_annexures <= 0:
                 annexure_limit_block = (
@@ -300,17 +306,11 @@ class StrategyMixin:
                 for p in (case_entities.get("parties") or [])
                 if isinstance(p, dict) and (p.get("name") or "").strip()
             ]
+            # Counts only: party names and document text are personal data.
             logger.info(
-                "🧠 Strategy deep-extraction complete for workspace {}: parties=[{}]",
-                workspace_id[:12] if workspace_id else "",
-                ", ".join(_extracted_party_names) if _extracted_party_names else "(none)",
-            )
-            # Diagnostic: dump first 1500 chars of combined_document_content so
-            # we can tell at a glance whether names ARE present in what we send
-            # to Gemini when the extracted parties list comes back empty.
-            logger.debug(
-                "Strategy pass 1 combined_document_content preview (first 1500 chars): {}",
-                (combined_document_content or "")[:1500],
+                "Strategy deep-extraction complete: {} part(ies) from {} chars of document text",
+                len(_extracted_party_names),
+                len(combined_document_content or ""),
             )
 
             # When no documents (e.g. all deleted), return fallback so backend can clear strategy / show empty state
@@ -348,7 +348,7 @@ class StrategyMixin:
 
             # Generate AI-powered case summary and strategic objective
             logger.info(
-                "🤖 Generating AI-powered case analysis (all documents, upload order)..."
+                "Generating AI-powered case analysis (all documents, upload order)..."
             )
 
             # Current-date context for year resolution: a source date stated
@@ -394,12 +394,6 @@ class StrategyMixin:
                     response_mime_type="application/json",
                 )
 
-                logger.info(f"AI generated {len(ai_response)} characters of analysis")
-                logger.info("=" * 80)
-                logger.info("🤖 RAW AI RESPONSE:")
-                logger.info("-" * 80)
-                logger.info(ai_response)
-                logger.info("=" * 80)
 
                 # Try to parse JSON response with shared repair logic
                 import json
@@ -408,9 +402,9 @@ class StrategyMixin:
                 ai_response = ai_response.strip()
                 json_str = self._prepare_json_candidate(ai_response, prefer="object")
                 if json_str:
-                    logger.info("✅ Extracted JSON candidate for strategy analysis")
+                    logger.info("Extracted JSON candidate for strategy analysis")
                 else:
-                    logger.warning("❌ No JSON found in AI response")
+                    logger.warning("No JSON found in AI response")
 
                 if json_str:
                     # Try to parse JSON
@@ -451,11 +445,11 @@ class StrategyMixin:
                         ):
                             logger.warning(
                                 "Strategy synthesis dropped items for workspace {}: "
-                                "parties={} suits={} dates={}; retrying once with explicit directive",
+                                "{} part(ies), {} suit(s), {} date(s); retrying once with explicit directive",
                                 workspace_id[:12] if workspace_id else "",
-                                _missing_parties,
-                                _missing_suits,
-                                _missing_dates,
+                                len(_missing_parties),
+                                len(_missing_suits),
+                                len(_missing_dates),
                             )
                             try:
                                 _report_case_summary = analysis_data.get(
@@ -536,11 +530,11 @@ class StrategyMixin:
                                         if _still_any:
                                             logger.warning(
                                                 "Entity verifier retry STILL missing for "
-                                                "workspace {}: parties={} suits={} dates={}",
+                                                "workspace {}: {} part(ies), {} suit(s), {} date(s)",
                                                 workspace_id[:12] if workspace_id else "",
-                                                _still.get("missing_parties") or [],
-                                                _still.get("missing_suit_numbers") or [],
-                                                _still.get("missing_key_dates") or [],
+                                                len(_still.get("missing_parties") or []),
+                                                len(_still.get("missing_suit_numbers") or []),
+                                                len(_still.get("missing_key_dates") or []),
                                             )
                                         else:
                                             logger.success(
@@ -766,23 +760,23 @@ class StrategyMixin:
 
                         # Validate we got meaningful content
                         if case_summary and strategic_objective:
-                            logger.success("✅ AI analysis completed successfully")
-                            logger.info(f"   - Case Summary: {len(case_summary)} chars")
+                            logger.success("AI analysis completed successfully")
+                            logger.info("- Case Summary: {} chars", len(case_summary))
                             logger.info(
-                                f"   - Report case summary: {len(report_case_summary)} chars"
+                                "- Report case summary: {} chars", len(report_case_summary)
                             )
                             logger.info(
-                                f"   - Strategic Objective: {len(strategic_objective)} chars"
+                                "- Strategic Objective: {} chars", len(strategic_objective)
                             )
                             logger.info(
-                                f"   - Possible Next Steps: {len(possible_next_steps)} items"
+                                "- Possible Next Steps: {} items", len(possible_next_steps)
                             )
                             logger.info(
-                                f"   - Suggestion chips: {len(suggestion_chips)} items"
+                                "- Suggestion chips: {} items", len(suggestion_chips)
                             )
                         else:
                             logger.warning(
-                                "⚠️ AI response incomplete, using partial data + fallback"
+                                "AI response incomplete, using partial data + fallback"
                             )
                             # Use what we got and fill in missing pieces
                             if not case_summary:
@@ -819,7 +813,7 @@ class StrategyMixin:
                                     "Identify parties",
                                     "Plan next steps",
                                 ][:16]
-                            logger.info("✅ Using hybrid AI + fallback content")
+                            logger.info("Using hybrid AI + fallback content")
 
                         if not report_case_summary:
                             report_case_summary = _derive_report_case_summary(
@@ -827,9 +821,9 @@ class StrategyMixin:
                             )
 
                     except json.JSONDecodeError as json_error:
-                        logger.error(f"❌ JSON parsing failed: {json_error}")
+                        logger.error("JSON parsing failed: {}", json_error)
                         logger.info(
-                            f"Failed JSON string (first 500 chars): {json_str[:500]}"
+                            "Failed JSON string (first 500 chars): {}", chars(json_str)
                         )
 
                         # Try to extract partial information using regex
@@ -844,7 +838,7 @@ class StrategyMixin:
                             r'"reportCaseSummary"\s*:\s*"([^"]*)', json_str
                         )
                         if case_summary_match or objective_match:
-                            logger.info("✅ Extracted partial data from malformed JSON")
+                            logger.info("Extracted partial data from malformed JSON")
                             case_summary = (
                                 case_summary_match.group(1)
                                 if case_summary_match
@@ -881,7 +875,7 @@ class StrategyMixin:
                                 ][:5]
 
                             logger.info(
-                                f"   Extracted: Summary={bool(case_summary)}, Objective={bool(strategic_objective)}, NextSteps={len(possible_next_steps)}"
+                                "Extracted: Summary={}, Objective={}, NextSteps={}", bool(case_summary), bool(strategic_objective), len(possible_next_steps)
                             )
 
                             # Fill in missing pieces
@@ -914,16 +908,16 @@ class StrategyMixin:
                                 )
 
                             logger.success(
-                                "✅ Using hybrid: AI-extracted content + fallback where needed"
+                                "Using hybrid: AI-extracted content + fallback where needed"
                             )
                         else:
                             raise  # No usable content, use full fallback
                 else:
-                    logger.error("❌ Could not extract JSON from AI response")
+                    logger.error("Could not extract JSON from AI response")
                     raise ValueError("No JSON in response")
 
             except Exception as ai_error:
-                logger.error(f"AI analysis failed: {ai_error}")
+                logger.error("AI analysis failed: {}", ai_error)
                 logger.warning("Using fallback generic analysis")
                 # Fallback to generic analysis
                 case_summary = f"Analysis of {doc_count} document(s) for {workspace_role} role. The documents have been processed and are ready for detailed review under Indian legal framework (BNS, BNSS, BSA)."
@@ -1034,15 +1028,11 @@ class StrategyMixin:
                 "timestamp": datetime.utcnow().isoformat(),
             }
 
-            logger.success(
-                f"✅ Generated detailed strategy analysis for workspace {workspace_id}"
+            logger.info(
+                "Strategy analysis generated (report mobile present={}, contacted date present={})",
+                bool(report_mobile),
+                bool(report_contact_date),
             )
-            if report_mobile or report_contact_date:
-                logger.info(
-                    "Overview conversation report fields: mobile={}, contactedDate={}",
-                    report_mobile,
-                    report_contact_date,
-                )
 
             # Strip the application's own brand/platform name from the strategy
             # panel (caseSummary / reportCaseSummary / strategicObjective /
@@ -1051,8 +1041,7 @@ class StrategyMixin:
             return strategies_payload
 
         except Exception as e:
-            logger.error(f"Error generating strategies: {e}")
-            logger.exception(e)
+            logger.opt(exception=e).error("Error generating strategies: {}", e)
             return None
 
     def _looks_like_question(self, text: str) -> bool:
@@ -1383,7 +1372,7 @@ class StrategyMixin:
                 if (d.get("content") or "").strip()
                 and len((d.get("content") or "").strip()) >= 20
             ]
-            max_total_content = 100000
+            max_total_content = panel_context_budget()
             per_doc_cap = (
                 (max_total_content // max(1, len(valid_docs)))
                 if valid_docs
@@ -1398,7 +1387,7 @@ class StrategyMixin:
                         continue
                     if len(content) > per_doc_cap:
                         content = (
-                            content[:per_doc_cap] + "\n[... truncated for length ...]"
+                            fit_to_budget(content, per_doc_cap, "general")
                         )
                     # Build labelled block with metadata header so the
                     # prompt distinguishes drafted-by-assistant documents
@@ -1414,7 +1403,7 @@ class StrategyMixin:
                 combined_document_content = (
                     "\n\n".join(parts) if parts else "No document content available."
                 )
-            if len(combined_document_content) > max_total_content:
+            if len(combined_document_content) > int(max_total_content * 1.1):  # headers add a little; never cut the last document
                 combined_document_content = (
                     combined_document_content[:max_total_content]
                     + "\n[... content truncated ...]"
@@ -1800,7 +1789,7 @@ class StrategyMixin:
                 self._clear_pending_objective_change(workspace_id)
                 return False
             logger.success(
-                "✅ Strategy objective regen emitted (case summary {}) workspace={}",
+                "Strategy objective regen emitted (case summary {}) workspace={}",
                 "re-framed" if new_case_summary else "preserved",
                 workspace_id[:12] if workspace_id else "",
             )
@@ -1870,7 +1859,7 @@ class StrategyMixin:
                 if (d.get("content") or "").strip()
                 and len((d.get("content") or "").strip()) >= 20
             ]
-            max_total_content = 100000
+            max_total_content = panel_context_budget()
             per_doc_cap = (
                 (max_total_content // max(1, len(valid_docs)))
                 if valid_docs
@@ -1884,7 +1873,7 @@ class StrategyMixin:
                     if not content or len(content) < 20:
                         continue
                     if len(content) > per_doc_cap:
-                        content = content[:per_doc_cap] + "\n[... truncated for length ...]"
+                        content = fit_to_budget(content, per_doc_cap, "general")
                     doc_with_clip = dict(doc)
                     doc_with_clip["content"] = content
                     parts.append(
@@ -1895,7 +1884,7 @@ class StrategyMixin:
                 combined_document_content = (
                     "\n\n".join(parts) if parts else "No document content available."
                 )
-            if len(combined_document_content) > max_total_content:
+            if len(combined_document_content) > int(max_total_content * 1.1):  # headers add a little; never cut the last document
                 combined_document_content = (
                     combined_document_content[:max_total_content]
                     + "\n[... content truncated ...]"
@@ -1976,7 +1965,7 @@ class StrategyMixin:
             ):
                 logger.info(
                     "Case summary edit produced no change — instruction={!r}",
-                    (user_feedback or "")[:160],
+                    chars(user_feedback),
                 )
                 if outcome is not None:
                     outcome["status"] = "unchanged"
@@ -1993,7 +1982,7 @@ class StrategyMixin:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ Case summary regen emitted (other fields preserved) workspace={}",
+                    "Case summary regen emitted (other fields preserved) workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
             if outcome is not None:
@@ -2125,7 +2114,7 @@ class StrategyMixin:
             ):
                 logger.info(
                     "Possible next steps edit produced no change — instruction={!r}",
-                    (user_feedback or "")[:160],
+                    chars(user_feedback),
                 )
                 if outcome is not None:
                     outcome["status"] = "unchanged"
@@ -2144,7 +2133,7 @@ class StrategyMixin:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ Possible next steps regen emitted (other fields preserved) workspace={}",
+                    "Possible next steps regen emitted (other fields preserved) workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
             if outcome is not None:
@@ -2255,7 +2244,7 @@ class StrategyMixin:
             ):
                 logger.info(
                     "Strategic objective edit produced no change — instruction={!r}",
-                    (user_feedback or "")[:160],
+                    chars(user_feedback),
                 )
                 if outcome is not None:
                     outcome["status"] = "unchanged"
@@ -2272,7 +2261,7 @@ class StrategyMixin:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ Strategic objective surgical edit emitted (other fields preserved) workspace={}",
+                    "Strategic objective surgical edit emitted (other fields preserved) workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
             if outcome is not None:

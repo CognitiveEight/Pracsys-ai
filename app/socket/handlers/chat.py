@@ -54,6 +54,7 @@ from app.langgraph.list_of_dates_agent import (
     snap_hallucinated_year,
 )
 from app.socket.schemas import (
+    Citation,
     AIResponseMetadata,
     AIResponsePayload,
     AnalysisDocxGenerateRequestPayload,
@@ -151,6 +152,29 @@ _CORRECTION_SHAPE_RE = re.compile(
     re.IGNORECASE,
 )
 
+
+#: Panels whose items get verified evidence citations at emit time.
+_CITED_PANELS = frozenset(
+    {"list_of_dates", "procedural_timeline", "analysis_report", "strategy_objective", "applicable_laws"}
+)
+
+
+
+def _feature_payload_summary(payload: Any) -> str:
+    """Item counts of a panel payload, for the emit result line.
+
+    Lists are counted; text fields are reported only as empty when empty.
+    Never includes content (the payload carries names and case facts).
+    """
+    if not isinstance(payload, dict):
+        return "-"
+    parts = []
+    for key, value in payload.items():
+        if isinstance(value, list):
+            parts.append(f"{key}={len(value)}")
+        elif isinstance(value, str) and not value.strip() and not key.startswith("_"):
+            parts.append(f"{key}=empty")
+    return ",".join(parts[:12]) or "no lists"
 
 class ChatMixin:
     """Intelligence chat, drafting-assistant chat, probing prompts."""
@@ -380,6 +404,27 @@ class ChatMixin:
             logger.warning("Failed to build cumulative usage metadata: {}", exc)
             return {}
 
+    @staticmethod
+    def _citations_for_payload(
+        citations: Optional[List[Dict[str, Any]]], content: str
+    ) -> Optional[List[Citation]]:
+        """Validated citations whose [n] marker is still in the emitted text.
+
+        Later steps can rewrite the reply (a read-only notice, a panel-update
+        acknowledgement), so a citation is sent only if its marker survived.
+        """
+        if not citations or not settings.citations_enabled:
+            return None
+        out: List[Citation] = []
+        for c in citations:
+            try:
+                if f"[{int(c.get('index'))}]" not in (content or ""):
+                    continue
+                out.append(Citation(**c))
+            except Exception as cite_err:
+                logger.debug("Dropping malformed citation {}: {}", c, cite_err)
+        return out or None
+
     async def _emit_document_feature(
         self,
         *,
@@ -429,6 +474,20 @@ class ChatMixin:
                 fact_err,
             )
 
+        # Verified source citations on panel items (additive fields only): the
+        # quote is copied from the stored passage and the page is where that
+        # quote is, never a model guess. See app/rag/attribution.py.
+        if feature_type == "applicable_laws":
+            # Every path (fresh, merged, edited, heuristic, cached replay)
+            # leaves with a register status and the official section title.
+            from app.statutes.register import annotate_law_rows
+
+            annotate_law_rows(payload)
+        if settings.citations_enabled and feature_type in _CITED_PANELS:
+            from app.rag.attribution import attach_panel_citations
+
+            await attach_panel_citations(workspace_id, feature_type, payload)
+
         try:
             if usage is not None:
                 metadata = self._token_usage_metadata(workspace_id, usage)
@@ -468,18 +527,23 @@ class ChatMixin:
         delivered = await self._socket_client.emit(
             "document_feature_response", envelope
         )
+        # THE line to read in production: one per panel emit, saying what was
+        # sent (item counts, so an empty panel is visible) and whether it
+        # reached the backend.
+        summary = _feature_payload_summary(payload)
+        price = (metadata or {}).get("price") if isinstance(metadata, dict) else None
         if not delivered:
             # The socket swallowed it (disconnected, or the namespace closed
             # mid-generation). Nothing downstream would ever retry, and the panel
             # that armed its loader for this payload would spin forever.
             logger.warning(
-                "⚠️ {} emit NOT delivered for workspace {} — buffered for re-delivery "
-                "on reconnect",
+                "result {} delivered=no items={} — buffered for re-delivery on reconnect",
                 feature_type,
-                str(workspace_id)[:12],
+                summary,
             )
             self._note_pending_feature_delivery(workspace_id, feature_type, envelope)
             return False
+        logger.info("result {} delivered=yes items={} price={}", feature_type, summary, price)
         self._clear_pending_feature_delivery(workspace_id, feature_type)
         return True
 
@@ -612,8 +676,7 @@ class ChatMixin:
                 conversation_history=conversation_history,
             )
         except Exception as e:
-            logger.error("Drafting agent failed: {}", e)
-            logger.exception(e)
+            logger.opt(exception=e).error("Drafting agent failed: {}", e)
             turn = {
                 "content": (
                     "I ran into an issue while preparing the draft. "
@@ -710,7 +773,7 @@ class ChatMixin:
             # reconnect doesn't re-emit it after we just delivered fresh content.
             self._pending_ai_response = None
             logger.success(
-                "✅ Drafting ai_response emitted (status={}, version={})",
+                "Drafting ai_response emitted (status={}, version={})",
                 ai_response_payload.get("draftStatus"),
                 (turn.get("draftDocument") or {}).get("version"),
             )
@@ -772,12 +835,10 @@ class ChatMixin:
             payload = UserMessageRequestPayload(**data)
 
             logger.info(
-                "💬 User message request: Chat {} (Type: {}, Workspace: {})",
-                payload.chatId,
+                "Chat message: type={} ({} chars)",
                 payload.chat_type,
-                payload.workspaceId,
+                len(payload.content or ""),
             )
-            logger.debug(f"Message: {payload.content[:100]}...")
 
             # Import here to avoid circular dependencies
             from app.langgraph.chat_models import ChatContext
@@ -812,7 +873,7 @@ class ChatMixin:
             asker = resolve_asker(workspace_id, user_id, payload.askedBy)
             if not asker.is_owner:
                 logger.info(
-                    "💬 Chat asked by a {} on shared workspace {} (owner remains {})",
+                    "Chat asked by a {} on shared workspace {} (owner remains {})",
                     asker.log_label(),
                     workspace_id,
                     user_id,
@@ -1078,6 +1139,7 @@ class ChatMixin:
                 # Retrieval query: the user's message, widened with the previous
                 # user turn for short/vague follow-ups ("what about the second one?").
                 retrieval_query = (payload.content or "").strip()
+                prior_user: List[str] = []
                 try:
                     prior_user = [
                         (it.content or "")
@@ -1105,108 +1167,149 @@ class ChatMixin:
                     if name and name.lower() in um_lower and did in doc_by_id:
                         forced_ids.add(did)
 
-                # Select which documents to include.
-                selected_ids: List[str] = []
-                if total_docs <= CHAT_SMALL_WORKSPACE_DOC_THRESHOLD:
-                    # Small workspace: include everything (no retrieval-miss risk).
-                    selected_ids = [
-                        str(d.get("document_id"))
-                        for d in (all_docs or [])
-                        if d.get("document_id") is not None
-                    ]
-                else:
-                    # Large workspace: semantic search as a document selector.
-                    results: List[Dict[str, Any]] = []
+                # Passage-level evidence with citable [E#] labels (app/rag/).
+                # Falls back to the legacy whole-document context below when the
+                # chunk store cannot serve this workspace.
+                evidence = None
+                if settings.rag_v2_enabled and doc_by_id:
                     try:
-                        results = await vector_store.search(
+                        from app.rag.chat_context import build_chat_evidence
+
+                        evidence = await build_chat_evidence(
                             workspace_id=workspace_id,
-                            query=retrieval_query or (payload.content or ""),
-                            limit=CHAT_SEARCH_CHUNK_LIMIT,
+                            question=payload.content or "",
+                            previous_user_turn=prior_user[-1] if prior_user else "",
+                            annexure_of={
+                                did: info["annexure_number"]
+                                for did, info in doc_by_id.items()
+                            },
+                            names=id_to_annexure_name,
+                            forced_ids=forced_ids,
+                            max_total_chars=CHAT_MAX_TOTAL_CHARS,
+                            full_mode_max_docs=CHAT_SMALL_WORKSPACE_DOC_THRESHOLD,
+                            graph_store=getattr(self, "_graph_store", None),
                         )
-                    except Exception as se:
+                    except Exception as ev_err:
                         logger.warning(
-                            "Chat retrieval search failed for workspace {}, "
-                            "falling back to upload order: {}",
+                            "Passage evidence failed for workspace {}; using the "
+                            "whole-document context: {}",
                             workspace_id,
-                            str(se),
+                            ev_err,
                         )
-                        results = []
+                        evidence = None
+                if evidence is not None:
+                    pack, _mode, uploaded = evidence
+                    workspace_state["uploaded_documents"] = uploaded
+                    workspace_state["evidence_index"] = pack.to_state()
+                    if pack.graph_facts:
+                        workspace_state["graph_facts"] = list(pack.graph_facts)
+                else:
+                    # Select which documents to include.
+                    selected_ids: List[str] = []
+                    if total_docs <= CHAT_SMALL_WORKSPACE_DOC_THRESHOLD:
+                        # Small workspace: include everything (no retrieval-miss risk).
+                        selected_ids = [
+                            str(d.get("document_id"))
+                            for d in (all_docs or [])
+                            if d.get("document_id") is not None
+                        ]
+                    else:
+                        # Large workspace: semantic search as a document selector.
+                        results: List[Dict[str, Any]] = []
+                        try:
+                            results = await vector_store.search(
+                                workspace_id=workspace_id,
+                                query=retrieval_query or (payload.content or ""),
+                                limit=CHAT_SEARCH_CHUNK_LIMIT,
+                                # Weak matches picked documents the question is not
+                                # about; below the threshold the upload-order
+                                # fallback below is the better choice.
+                                score_threshold=CHAT_MIN_SCORE_THRESHOLD,
+                            )
+                        except Exception as se:
+                            logger.warning(
+                                "Chat retrieval search failed for workspace {}, "
+                                "falling back to upload order: {}",
+                                workspace_id,
+                                str(se),
+                            )
+                            results = []
 
-                    seen: Set[str] = set()
-                    for r in results:
-                        orig = str(r.get("original_document_id") or "")
-                        if not orig or orig not in doc_by_id or orig in seen:
+                        seen: Set[str] = set()
+                        for r in results:
+                            orig = str(r.get("original_document_id") or "")
+                            if not orig or orig not in doc_by_id or orig in seen:
+                                continue
+                            seen.add(orig)
+                            selected_ids.append(orig)
+                            if len(selected_ids) >= CHAT_MAX_DOCS_INCLUDED:
+                                break
+
+                    # Merge forced docs (explicit references) into the selection.
+                    for did in forced_ids:
+                        if did not in selected_ids:
+                            selected_ids.append(did)
+
+                    # Fallback: never send empty annexure context. Degrade to the
+                    # first N docs by upload order (old behaviour) rather than nothing.
+                    if not selected_ids:
+                        logger.warning(
+                            "Chat retrieval produced no documents for workspace {} "
+                            "(docs={}); falling back to first {} by upload order",
+                            workspace_id,
+                            total_docs,
+                            CHAT_MAX_DOCS_INCLUDED,
+                        )
+                        selected_ids = [
+                            str(d.get("document_id"))
+                            for d in (all_docs or [])[:CHAT_MAX_DOCS_INCLUDED]
+                            if d.get("document_id") is not None
+                        ]
+
+                    # Assemble: ascending annexure order, full combined content per
+                    # doc (chunks have no overlap, so a figure can straddle a boundary),
+                    # truncated to the per-doc and total budgets.
+                    selected_ids = sorted(
+                        dict.fromkeys(selected_ids),
+                        key=lambda d: doc_by_id.get(d, {}).get("annexure_number", 1_000_000),
+                    )
+                    total = 0
+                    doc_snippets = []
+                    for did in selected_ids:
+                        info = doc_by_id.get(did)
+                        if not info or not info["content"]:
                             continue
-                        seen.add(orig)
-                        selected_ids.append(orig)
-                        if len(selected_ids) >= CHAT_MAX_DOCS_INCLUDED:
+                        content = info["content"]
+                        snippet = content[:CHAT_MAX_CHARS_PER_DOC] + (
+                            "..." if len(content) > CHAT_MAX_CHARS_PER_DOC else ""
+                        )
+                        if total + len(snippet) > CHAT_MAX_TOTAL_CHARS:
+                            snippet = snippet[: max(0, CHAT_MAX_TOTAL_CHARS - total)]
+                            if not snippet:
+                                break
+                        entry = {
+                            "document_id": did,
+                            "content": snippet,
+                            "annexure_number": info["annexure_number"],
+                        }
+                        ann_name = id_to_annexure_name.get(str(did))
+                        if ann_name:
+                            entry["fileName"] = ann_name
+                        doc_snippets.append(entry)
+                        total += len(snippet)
+                        if total >= CHAT_MAX_TOTAL_CHARS:
                             break
-
-                # Merge forced docs (explicit references) into the selection.
-                for did in forced_ids:
-                    if did not in selected_ids:
-                        selected_ids.append(did)
-
-                # Fallback: never send empty annexure context. Degrade to the
-                # first N docs by upload order (old behaviour) rather than nothing.
-                if not selected_ids:
-                    logger.warning(
-                        "Chat retrieval produced no documents for workspace {} "
-                        "(docs={}); falling back to first {} by upload order",
+                    if doc_snippets:
+                        workspace_state["uploaded_documents"] = doc_snippets
+                    logger.info(
+                        "Chat doc context: workspace={} total_docs={} mode={} "
+                        "included={} chars={}",
                         workspace_id,
                         total_docs,
-                        CHAT_MAX_DOCS_INCLUDED,
+                        "small" if total_docs <= CHAT_SMALL_WORKSPACE_DOC_THRESHOLD else "retrieval",
+                        len(doc_snippets),
+                        total,
                     )
-                    selected_ids = [
-                        str(d.get("document_id"))
-                        for d in (all_docs or [])[:CHAT_MAX_DOCS_INCLUDED]
-                        if d.get("document_id") is not None
-                    ]
-
-                # Assemble: ascending annexure order, full combined content per
-                # doc (chunks have no overlap, so a figure can straddle a boundary),
-                # truncated to the per-doc and total budgets.
-                selected_ids = sorted(
-                    dict.fromkeys(selected_ids),
-                    key=lambda d: doc_by_id.get(d, {}).get("annexure_number", 1_000_000),
-                )
-                total = 0
-                doc_snippets = []
-                for did in selected_ids:
-                    info = doc_by_id.get(did)
-                    if not info or not info["content"]:
-                        continue
-                    content = info["content"]
-                    snippet = content[:CHAT_MAX_CHARS_PER_DOC] + (
-                        "..." if len(content) > CHAT_MAX_CHARS_PER_DOC else ""
-                    )
-                    if total + len(snippet) > CHAT_MAX_TOTAL_CHARS:
-                        snippet = snippet[: max(0, CHAT_MAX_TOTAL_CHARS - total)]
-                        if not snippet:
-                            break
-                    entry = {
-                        "document_id": did,
-                        "content": snippet,
-                        "annexure_number": info["annexure_number"],
-                    }
-                    ann_name = id_to_annexure_name.get(str(did))
-                    if ann_name:
-                        entry["fileName"] = ann_name
-                    doc_snippets.append(entry)
-                    total += len(snippet)
-                    if total >= CHAT_MAX_TOTAL_CHARS:
-                        break
-                if doc_snippets:
-                    workspace_state["uploaded_documents"] = doc_snippets
-                logger.info(
-                    "Chat doc context: workspace={} total_docs={} mode={} "
-                    "included={} chars={}",
-                    workspace_id,
-                    total_docs,
-                    "small" if total_docs <= CHAT_SMALL_WORKSPACE_DOC_THRESHOLD else "retrieval",
-                    len(doc_snippets),
-                    total,
-                )
             except Exception as doc_err:
                 logger.warning(
                     "Could not load documents for chat context: {}", str(doc_err)
@@ -1594,10 +1697,9 @@ class ChatMixin:
                                             ),
                                         )
                                         logger.success(
-                                            "✅ Role reassignment re-oriented objective: {}={} (workspace={})",
+                                            "Role reassignment re-oriented objective: role={} party={} (workspace={})",
                                             _ws_role,
-                                            _confirmed_party
-                                            or f"opposing {_reassign_party}",
+                                            "confirmed" if _confirmed_party else "opposing side",
                                             workspace_id[:12] if workspace_id else "",
                                         )
                                     else:
@@ -2055,7 +2157,7 @@ class ChatMixin:
                                     usage=None,
                                 )
                                 logger.success(
-                                    "✅ Strategy panel emitted once after edits {} (workspace={})",
+                                    "Strategy panel emitted once after edits {} (workspace={})",
                                     [p for p in panel_edit_applied if p in _strategy_panels],
                                     workspace_id[:12] if workspace_id else "",
                                 )
@@ -2155,7 +2257,7 @@ class ChatMixin:
                                         usage=None,
                                     )
                                     logger.success(
-                                        "✅ Preserved {} re-emitted (no-op edit) workspace={}",
+                                        "Preserved {} re-emitted (no-op edit) workspace={}",
                                         _ft,
                                         workspace_id[:12] if workspace_id else "",
                                     )
@@ -2181,7 +2283,7 @@ class ChatMixin:
                             objective_regen_ok = True
                             objective_ack_kind = "panel_edit_direct"
                             logger.success(
-                                "✅ Panel edits from free-form chat — applied={} unchanged={} failed={} (workspace={})",
+                                "Panel edits from free-form chat — applied={} unchanged={} failed={} (workspace={})",
                                 panel_edit_applied,
                                 panel_edit_unchanged,
                                 panel_edit_failed,
@@ -2418,7 +2520,7 @@ class ChatMixin:
                         )
                     )
                     if update_result.get("applied"):
-                        logger.success("✅ Panel updates applied from chat message")
+                        logger.success("Panel updates applied from chat message")
             except Exception as upd_err:
                 logger.warning(
                     "Panel update attempt failed; continuing with generic chat. err={}",
@@ -2601,7 +2703,7 @@ class ChatMixin:
                 except Exception:
                     pass
             else:
-                logger.info("🤖 Processing message with Intelligence Chat Agent...")
+                logger.info("Processing message with Intelligence Chat Agent...")
                 response = await intelligence_chat_agent.process_message(
                     workspace_id=workspace_id,
                     user_id=user_id,
@@ -2720,7 +2822,7 @@ class ChatMixin:
                         )
                         if ai_update_result.get("applied"):
                             logger.success(
-                                "✅ Panel updates applied from AI response markers"
+                                "Panel updates applied from AI response markers"
                             )
                     except Exception as ai_upd_err:
                         logger.warning(
@@ -2841,6 +2943,9 @@ class ChatMixin:
                     if suggestion_chips_for_payload
                     else None
                 ),
+                citations=self._citations_for_payload(
+                    getattr(response, "citations", None), response_text_to_emit
+                ),
             )
 
             # STEP 6: Emit ai_response back to server. _pending_ai_response is
@@ -2861,7 +2966,7 @@ class ChatMixin:
                     logger.error("Failed to emit ai_response: {}", emit_err)
                 if emit_succeeded:
                     self._pending_ai_response = None
-                    logger.success("✅ AI response sent successfully")
+                    logger.success("AI response sent successfully")
                 else:
                     self._pending_ai_response = payload_dict
                     logger.warning(
@@ -2883,7 +2988,7 @@ class ChatMixin:
                 ):
                     self._intelligence_last_ai_by_chat[chat_id] = _rt
             else:
-                logger.error("❌ Socket client not available to emit response")
+                logger.error("Socket client not available to emit response")
 
             # STEP 7: Log audit event
             audit_logger.log_event(
@@ -2905,8 +3010,7 @@ class ChatMixin:
             )
 
         except Exception as e:
-            logger.error("Error processing user_message_request: {}", str(e))
-            logger.exception(e)
+            logger.opt(exception=e).error("Error processing user_message_request: {}", str(e))
 
             # Try to send error response back (only if payload was successfully parsed)
             try:
@@ -2934,7 +3038,7 @@ class ChatMixin:
                     )
                     logger.info("Error response sent to user")
             except Exception as emit_error:
-                logger.error(f"Failed to emit error response: {emit_error}")
+                logger.error("Failed to emit error response: {}", emit_error)
         finally:
             # Always close the per-turn usage scope opened above.
             try:
@@ -2996,7 +3100,7 @@ class ChatMixin:
                     chips = self._fallback_chips_for_analysis_report(16)
                 count = min(max_prompts, len(chips))
                 prompts = random.sample(chips, count) if count > 0 else []
-                logger.info(
+                logger.debug(
                     "probing_prompts: ANALYSIS_REPORT, returning random {} from {} chips",
                     len(prompts),
                     len(chips),
@@ -3026,7 +3130,7 @@ class ChatMixin:
                     chips = self._fallback_drafting_chips(8)
                 count = min(max_prompts, len(chips))
                 prompts = random.sample(chips, count) if count > 0 else []
-                logger.info(
+                logger.debug(
                     "probing_prompts: DRAFTING_ASSISTANT, returning random {} from {} chips (source={}, actionableId={})",
                     len(prompts),
                     len(chips),
@@ -3044,7 +3148,7 @@ class ChatMixin:
                     prompts = (
                         random.sample(stored_chat_chips, count) if count > 0 else []
                     )
-                    logger.info(
+                    logger.debug(
                         "probing_prompts: returning random {} from {} stored chips (rotation)",
                         len(prompts),
                         len(stored_chat_chips),
@@ -3117,7 +3221,7 @@ class ChatMixin:
                                 prompts = (
                                     random.sample(generated, count) if count > 0 else []
                                 )
-                                logger.info(
+                                logger.debug(
                                     "probing_prompts: generated {} contextual chips, returning random {}",
                                     len(generated),
                                     len(prompts),
@@ -3171,7 +3275,7 @@ class ChatMixin:
                             "Suggest next steps",
                         ]
                         prompts = generic[:max_prompts]
-                        logger.info(
+                        logger.debug(
                             "probing_prompts_request: using generic fallback prompts (count={})",
                             len(prompts),
                         )
@@ -3216,14 +3320,15 @@ class ChatMixin:
                     )
                 else:
                     self._last_probing_emit_time[workspace_id] = now
-                    await self._socket_client.emit("probing_prompts_response", response)
-                    logger.success(
-                        "probing_prompts_response emitted: workspaceId={}, count={}",
-                        workspace_id[:12] if workspace_id else "",
+                    # Polled every ~5s: success is DEBUG, a dropped emit is a WARNING.
+                    delivered = await self._socket_client.emit("probing_prompts_response", response)
+                    logger.log(
+                        "DEBUG" if delivered else "WARNING",
+                        "probing_prompts_response delivered={} count={}",
+                        bool(delivered),
                         len(prompts),
                     )
             else:
                 logger.warning("No socket client to emit probing_prompts_response")
         except Exception as e:
-            logger.exception(e)
-            logger.error("probing_prompts_request failed: {}", str(e))
+            logger.opt(exception=e).error("probing_prompts_request failed: {}", e)

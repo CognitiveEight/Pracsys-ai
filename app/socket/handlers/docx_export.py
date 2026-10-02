@@ -142,16 +142,12 @@ class DocxExportMixin:
         response_body = await asyncio.to_thread(
             process_analysis_docx_request, normalized_request
         )
-        try:
-            preview = json.dumps(response_body, default=str)
-        except Exception:
-            preview = str(response_body)
         logger.info(
-            "analysis_docx_generate_response -> backend (preview): {}",
-            preview[:2000] + ("..." if len(preview) > 2000 else ""),
+            "analysis_docx_generate_response ready (keys: {})",
+            sorted(response_body.keys()) if isinstance(response_body, dict) else type(response_body).__name__,
         )
         await self._socket_client.emit("analysis_docx_generate_response", response_body)
         logger.success(
-            "✅ analysis_docx_generate_response emitted for requestId={}",
+            "analysis_docx_generate_response emitted for requestId={}",
             response_body.get("requestId"),
         )

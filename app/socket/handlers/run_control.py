@@ -121,6 +121,7 @@ _WORK_STARTING_EVENTS = CANCELLABLE_RUN_EVENTS | frozenset(
         "workspace_transferred",
         "analysis_report_feedback",
         "added_missing_information",
+        "missing_information_edited",
     }
 )
 
@@ -263,7 +264,7 @@ class RunControlMixin:
                 str(f) for f in (data.get("featureTypes") or [])
             )
             logger.info(
-                "⛔ {} ({}) suppressed for workspace {} — its run was stopped",
+                "{} ({}) suppressed for workspace {} — its run was stopped",
                 event,
                 label or "-",
                 workspace_id[:12],
@@ -296,6 +297,8 @@ class RunControlMixin:
             self._drop_held_objective_change(workspace_id, trigger=event_name)
 
         token = _RUN_SCOPE.set((workspace_id, self._run_epoch(workspace_id)))
+        epoch_ctx = logger.contextualize(run_epoch=self._run_epoch(workspace_id))
+        epoch_ctx.__enter__()
         task = (
             asyncio.current_task() if event_name in CANCELLABLE_RUN_EVENTS else None
         )
@@ -308,10 +311,11 @@ class RunControlMixin:
             # Name it, so a stopped run is readable in the log rather than
             # inferred from an absence of lines.
             logger.warning(
-                "⏹️ {} for workspace {} cancelled mid-run", event_name, workspace_id[:12]
+                "{} for workspace {} cancelled mid-run", event_name, workspace_id[:12]
             )
             raise
         finally:
+            epoch_ctx.__exit__(None, None, None)
             _RUN_SCOPE.reset(token)
             if task is not None:
                 self._forget_run_task(workspace_id, task)
@@ -597,7 +601,7 @@ class RunControlMixin:
         self._recovered_workspaces.add(workspace_id)
 
         logger.success(
-            "⏹️ Run stopped for workspace {} (request={}, owner={}, stoppedBy={}): "
+            "Run stopped for workspace {} (request={}, owner={}, stoppedBy={}): "
             "{} task(s) cancelled, dropped buffered {}, objective change {}",
             workspace_id[:12],
             request_id or "<none>",
@@ -722,7 +726,7 @@ class RunControlMixin:
 
         features, unknown = self._normalize_resume_features(payload.reEmitFeatures)
         logger.info(
-            "▶️ workspace_resume_request {} for workspace {} (owner={}): resuming {}",
+            "▶ workspace_resume_request {} for workspace {} (owner={}): resuming {}",
             request_id or "<none>",
             workspace_id[:12],
             user_id,
@@ -885,7 +889,7 @@ class RunControlMixin:
                 },
             )
             logger.success(
-                "✅ Resume {} completed for workspace {}: emitted {}{}",
+                "Resume {} completed for workspace {}: emitted {}{}",
                 request_id or "<none>",
                 workspace_id[:12],
                 sorted(emitted),
@@ -1004,7 +1008,7 @@ class RunControlMixin:
         to_ingest = sorted((target_ids - live_ids) | set(partial))
 
         logger.info(
-            "▶️ Resume reconciliation for {}: live={}, target={}, delete={}, "
+            "▶ Resume reconciliation for {}: live={}, target={}, delete={}, "
             "ingest={} (of which re-read unassessed={})",
             workspace_id[:12],
             len(live_ids),

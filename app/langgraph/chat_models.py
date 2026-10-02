@@ -129,6 +129,9 @@ class ChatResponse:
     # Optional next actions
     suggested_actions: List[str] = field(default_factory=list)
 
+    # Checked citations, one per inline [n] marker (schemas.Citation shape).
+    citations: List[Dict[str, Any]] = field(default_factory=list)
+
     # Metadata
     processing_time_ms: Optional[float] = None
     tokens_used: Optional[int] = None

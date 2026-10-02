@@ -755,6 +755,14 @@ async def check_interruption_recovery():
           str(sorted(released)))
 
     # --- 12f: an LLM failure is named, retried once, and reported
+    # Settle background work left by the checks above (the resumed objective
+    # change schedules a cascade): it would otherwise run into the patched
+    # generate below and be counted as this check's calls and emits.
+    _leftover = [t for t in list(H._background_tasks) if not t.done()]
+    for t in _leftover:
+        t.cancel()
+    if _leftover:
+        await asyncio.gather(*_leftover, return_exceptions=True)
     ws = _ws("verify_ocs_llmerr")
     _seed(ws)
     calls = {"n": 0}

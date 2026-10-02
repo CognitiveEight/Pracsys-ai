@@ -52,19 +52,19 @@ def convert_pdf_to_docx(pdf_bytes: bytes, filename: str) -> Optional[bytes]:
         docx_bytes = _convert_with_pdf2docx(pdf_bytes, filename)
         if _docx_has_useful_text(docx_bytes):
             logger.info(
-                "PDF→DOCX: converted via pdf2docx ({} bytes in, {} bytes out, "
+                "PDFDOCX: converted via pdf2docx ({} bytes in, {} bytes out, "
                 "filename={!r})",
                 len(pdf_bytes), len(docx_bytes or b""), filename,
             )
             return docx_bytes
         logger.info(
-            "PDF→DOCX: pdf2docx output had insufficient text — trying OCR fallback "
+            "PDFDOCX: pdf2docx output had insufficient text — trying OCR fallback "
             "(filename={!r})",
             filename,
         )
     except Exception as exc:
         logger.warning(
-            "PDF→DOCX: pdf2docx raised {} — trying OCR fallback (filename={!r})",
+            "PDFDOCX: pdf2docx raised {} — trying OCR fallback (filename={!r})",
             exc, filename,
         )
 
@@ -73,18 +73,18 @@ def convert_pdf_to_docx(pdf_bytes: bytes, filename: str) -> Optional[bytes]:
         docx_bytes = _convert_via_ocr(pdf_bytes, filename)
         if _docx_has_useful_text(docx_bytes):
             logger.info(
-                "PDF→DOCX: converted via OCR ({} bytes in, {} bytes out, "
+                "PDFDOCX: converted via OCR ({} bytes in, {} bytes out, "
                 "filename={!r})",
                 len(pdf_bytes), len(docx_bytes or b""), filename,
             )
             return docx_bytes
         logger.warning(
-            "PDF→DOCX: OCR fallback produced no usable text (filename={!r})",
+            "PDFDOCX: OCR fallback produced no usable text (filename={!r})",
             filename,
         )
     except Exception as exc:
         logger.warning(
-            "PDF→DOCX: OCR fallback raised {} (filename={!r})",
+            "PDFDOCX: OCR fallback raised {} (filename={!r})",
             exc, filename,
         )
 

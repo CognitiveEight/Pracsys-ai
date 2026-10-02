@@ -138,6 +138,10 @@ from app.socket.handlers import (
 )
 
 
+#: Inbound events the frontend/backend polls on a timer.
+_POLLING_EVENTS = frozenset({"probing_prompts_request", "ai_heartbeat_ping"})
+
+
 class SocketEventHandler(
     JsonHelpersMixin,
     DocumentsMixin,
@@ -179,6 +183,8 @@ class SocketEventHandler(
     def __init__(self):
         self._handlers: Dict[str, EventHandler] = {}
         self._socket_client = None  # Will be set by main service
+        # Legal knowledge graph (app/graph/store.py); None when NEO4J_URL is unset.
+        self._graph_store = None
         # NOTE: every per-workspace cache below is a PersistentWorkspaceDict so
         # that writes (`self._workspace_X[workspace_id] = ...`) are mirrored to
         # Qdrant in the background. After an AI service restart we hydrate the
@@ -241,6 +247,14 @@ class SocketEventHandler(
         # resolution pass (only analysis_report_feedback removes them).
         self._workspace_user_added_missing_info: Dict[str, List[str]] = (
             PersistentWorkspaceDict(CacheKinds.USER_ADDED_MISSING_INFO)
+        )
+        # Per-workspace ledger of missingInfo items the lawyer re-worded via
+        # missing_information_edited ({itemId: {text, priorTexts, editedAt,
+        # requestId}}). Re-applied by _tag_analysis_report_against_current_state
+        # so a regeneration from the documents cannot revert the lawyer's text.
+        # Instance attribute so the workspace-purge sweep erases it.
+        self._workspace_edited_missing_info: Dict[str, Dict[str, Dict[str, Any]]] = (
+            PersistentWorkspaceDict(CacheKinds.EDITED_MISSING_INFO)
         )
         # Facts the lawyer corrected in chat ("the disputed amount is 6 lakh USD,
         # not 16 lakh"). Mirrors _workspace_removed_documents: a user decision
@@ -447,6 +461,10 @@ class SocketEventHandler(
         self._resume_requests: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._register_default_handlers()
 
+    def set_graph_store(self, store) -> None:
+        """Register the legal knowledge graph (``GraphStore`` or None)."""
+        self._graph_store = store
+
     def set_socket_client(self, client):
         """Set the socket client for emitting responses."""
         self._socket_client = client
@@ -490,6 +508,11 @@ class SocketEventHandler(
             "added_missing_information",
             self.on_added_missing_information,
         )
+        # Missing Information — lawyer re-worded one item (text only).
+        self.register(
+            "missing_information_edited",
+            self.on_missing_information_edited,
+        )
         self.register(
             "applicable_law_relevance_request",
             self.on_applicable_law_relevance_request,
@@ -522,7 +545,7 @@ class SocketEventHandler(
         self.register("workspace_updated", self.on_workspace_updated)
         self.register("workspace_deleted", self.on_workspace_deleted)
 
-        logger.info("✅ Event handlers registered")
+        logger.info("Event handlers registered")
 
     def register(self, event_name: str, handler: EventHandler) -> None:
         """
@@ -544,22 +567,52 @@ class SocketEventHandler(
             data: Event data
         """
         handler = self._handlers.get(event_name)
+        if not handler:
+            logger.warning("No handler registered for event: {}", event_name)
+            return
 
-        if handler:
+        # Correlation context for every line this event produces, including
+        # lines from tasks it spawns (contextvars are copied by create_task).
+        # Ids only — never the payload: it carries signed URLs, names and
+        # case text.
+        body = data if isinstance(data, dict) else {}
+        context = {
+            "request_id": str(body.get("requestId") or uuid.uuid4().hex[:12]),
+            "event": event_name,
+            "workspace_id": str(body.get("workspaceId") or "-"),
+        }
+        if body.get("chatId"):
+            context["chat_id"] = str(body["chatId"])
+        # Polled every few seconds by the frontend: their start/finish lines
+        # would bury everything else, so they log only at DEBUG (failures
+        # still log at ERROR).
+        level = "DEBUG" if event_name in _POLLING_EVENTS else "INFO"
+        with logger.contextualize(**context):
+            logger.log(level, "event {} received (keys: {})", event_name, sorted(body.keys()))
+            started = time.monotonic()
+            status = "ok"
             try:
-                logger.debug("Handling event: {} with data: {}", event_name, data)
                 # Every workspace-scoped event runs inside its run scope, which
                 # is what lets workspace_stop_request cancel and fence it.
                 await self._dispatch_in_run_scope(event_name, data, handler)
+            except asyncio.CancelledError:
+                status = "cancelled"
+                raise
             except Exception as e:
-                logger.error("Error handling event {}: {}", event_name, str(e))
-                logger.exception(e)
+                status = "error"
+                logger.opt(exception=e).error("Event handler failed: {}", e)
                 raise SocketEventError(
                     f"Failed to handle event: {event_name}",
                     details={"event": event_name, "error": str(e)},
                 )
-        else:
-            logger.warning("No handler registered for event: {}", event_name)
+            finally:
+                # Long panel work runs in background tasks after this returns;
+                # each of those reports its own "result" line when it emits.
+                logger.log(
+                    "WARNING" if status != "ok" else level,
+                    "event {} finished in {:.1f}s status={}",
+                    event_name, time.monotonic() - started, status,
+                )
 
     _EMPTY_CASE_ENTITIES: Dict[str, List[Any]] = {
         "parties": [],

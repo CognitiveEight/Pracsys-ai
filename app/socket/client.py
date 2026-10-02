@@ -56,6 +56,8 @@ class SocketClient:
         # event, and what proves at runtime which scheme the backend actually accepted.
         self._handshake_attempts: int = 0
         self._last_handshake: Optional[Dict[str, Any]] = None
+        # Reset on every successful connect; see _log_handshake_refusal.
+        self._refusal_hint_logged = False
 
     def _get_custom_headers(self) -> Dict[str, str]:
         """
@@ -97,7 +99,7 @@ class SocketClient:
                 "builtAt": _utc_iso_ms_z(),
             }
             logger.error(
-                "🔐 Handshake #{} NOT signed ({}); connecting unsigned - the backend "
+                "Handshake #{} NOT signed ({}); connecting unsigned - the backend "
                 "will refuse this with missing_header",
                 attempt,
                 str(e),
@@ -121,8 +123,8 @@ class SocketClient:
         # signature's length, which is the one thing that catches a padding or
         # encoding mistake (v1 must always be 43 unpadded base64url characters).
         if scheme == SCHEME_V1:
-            logger.info(
-                "🔐 Handshake #{} signed | scheme={} ts={} nonce={} sigLen={}",
+            logger.debug(
+                "Handshake #{} signed | scheme={} ts={} nonce={} sigLen={}",
                 attempt,
                 scheme,
                 headers.get(HEADER_TIMESTAMP),
@@ -139,7 +141,7 @@ class SocketClient:
                 )
         else:
             logger.warning(
-                "🔐 Handshake #{} signed with the LEGACY constant signature "
+                "Handshake #{} signed with the LEGACY constant signature "
                 "(replayable; accepted only while the backend's "
                 "AI_SIGNATURE_ALLOW_LEGACY window is open)",
                 attempt,
@@ -174,15 +176,11 @@ class SocketClient:
         """
         hs = self._handshake_summary()
         if not hs:
-            logger.error(
-                "🔒 Handshake REFUSED before any headers were built | reason={}",
-                reason,
-            )
+            logger.error("Handshake refused before any headers were built | reason={}", reason)
             return
 
         logger.error(
-            "🔒 Handshake #{} REFUSED | scheme={} ts={} nonce={} sigLen={} "
-            "builtAt={} reason={}",
+            "Handshake #{} refused | scheme={} ts={} nonce={} sigLen={} builtAt={} reason={}",
             hs.get("attempt"),
             hs.get("scheme"),
             hs.get("timestamp"),
@@ -191,17 +189,21 @@ class SocketClient:
             hs.get("builtAt"),
             reason,
         )
-        logger.error(
-            "Signed string was 'v1:AI_Maverick:<ts>:<nonce>'. Ask the backend for "
-            "the refusal code. EVERY attempt refused => clock drift >300s (check "
-            "NTP; local UTC now is {}, sent ts was {}) or a SOCKET_SECRET_KEY "
-            "mismatch. Only RECONNECTS refused => the nonce was reused instead of "
-            "re-signed. Refused on the legacy scheme => the backend's "
-            "AI_SIGNATURE_ALLOW_LEGACY window is closed. Report the values above "
-            "- never the signature or the secret.",
-            _utc_iso_ms_z(),
-            hs.get("timestamp"),
-        )
+        # The diagnosis hint once per outage, not once per retry: a reconnect
+        # loop used to write ~8 ERROR lines per attempt (40% of app.log).
+        if not self._refusal_hint_logged:
+            self._refusal_hint_logged = True
+            logger.error(
+                "Signed string was 'v1:AI_Maverick:<ts>:<nonce>'. Ask the backend for "
+                "the refusal code. EVERY attempt refused => clock drift >300s (check "
+                "NTP; local UTC now is {}, sent ts was {}) or a SOCKET_SECRET_KEY "
+                "mismatch. Only RECONNECTS refused => the nonce was reused instead of "
+                "re-signed. Refused on the legacy scheme => the backend's "
+                "AI_SIGNATURE_ALLOW_LEGACY window is closed. Report the values above "
+                "- never the signature or the secret.",
+                _utc_iso_ms_z(),
+                hs.get("timestamp"),
+            )
 
     async def connect(self) -> None:
         """
@@ -237,18 +239,21 @@ class SocketClient:
             self._register_handlers()
 
             # Connect to server
-            logger.info("Connecting to socket server: {}", settings.socket_url)
-            logger.info("Socket path: {}", settings.socket_path)
-            logger.info("Namespace: {}", settings.socket_namespace)
-            logger.info("Auth scheme: {}", settings.socket_auth_scheme)
-
             transports = settings.socket_transports_list
-            if transports:
-                logger.info("Engine.IO transports: {}", transports)
+            from urllib.parse import urlsplit
+
+            logger.info(
+                "Connecting to socket server host={} path={} namespace={} auth={} transports={}",
+                urlsplit(settings.socket_url).netloc,
+                settings.socket_path,
+                settings.socket_namespace,
+                settings.socket_auth_scheme,
+                transports or "default",
+            )
 
             if not settings.socket_secret_key:
                 logger.error(
-                    "⚠️ SOCKET_SECRET_KEY is not configured - the backend will refuse "
+                    "SOCKET_SECRET_KEY is not configured - the backend will refuse "
                     "the handshake"
                 )
 
@@ -271,7 +276,7 @@ class SocketClient:
             await asyncio.sleep(0.5)
 
             if self._connected:
-                logger.success("Successfully connected to socket server as AI_Maverick")
+                logger.info("Connected to socket server as AI_Maverick")
             else:
                 logger.error(
                     "Connection established but immediately lost - check server logs"
@@ -350,10 +355,13 @@ class SocketClient:
             )
             return False
         try:
-            logger.info(f"📤 Emitting event: {event}")
+
             await self.sio.emit(event, data, namespace=settings.socket_namespace)
-            logger.success(f"✅ Event emitted successfully: {event}")
-            logger.debug("Event data: {}", data)
+            logger.debug(
+                "Emitted {}{}",
+                event,
+                f" featureType={data.get('featureType')}" if isinstance(data, dict) and data.get("featureType") else "",
+            )
             return True
         except Exception as e:
             err_msg = str(e)
@@ -384,7 +392,7 @@ class SocketClient:
         """
         if not self.sio:
             logger.warning(
-                "Socket client not initialized; skipping ai_response for chat: {}",
+                "result ai_response delivered=no — socket client not initialized (chat {})",
                 data.get("chatId"),
             )
             return False
@@ -404,7 +412,7 @@ class SocketClient:
                 )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Socket still not connected after {:.1f}s; skipping ai_response for chat: {}",
+                    "result ai_response delivered=no — socket still not connected after {:.1f}s (chat {})",
                     wait_timeout,
                     data.get("chatId"),
                 )
@@ -417,8 +425,15 @@ class SocketClient:
             await self.sio.emit(
                 "ai_response", data, namespace=settings.socket_namespace
             )
-            logger.success("✅ Emitted ai_response for chat: {}", data.get("chatId"))
-            logger.debug("AI response data: {}", data)
+            # The chat counterpart of the panel "result" line: one per reply.
+            meta = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+            logger.info(
+                "result ai_response delivered=yes chars={} citations={} confidence={} price={}",
+                len(str(data.get("content") or data.get("message") or "")),
+                len(data.get("citations") or []),
+                data.get("confidence") or "-",
+                meta.get("price"),
+            )
             await asyncio.sleep(0.25)
             return True
         except Exception as e:
@@ -487,54 +502,25 @@ class SocketClient:
         @self.sio.event
         async def connect():
             """Handle connection event."""
-            logger.info("Socket.IO connected")
-            logger.success("🟢 Connection established with server as AI_Maverick")
-
+            self._refusal_hint_logged = False
             # Which handshake was accepted. During the migration this is the line
             # that proves the service is genuinely on v1 and not silently riding
             # the backend's AI_SIGNATURE_ALLOW_LEGACY window (rollout step 7).
             hs = self._handshake_summary()
-            if hs.get("scheme") == SCHEME_V1:
-                logger.success(
-                    "🔓 Handshake #{} ACCEPTED on scheme {} | ts={} nonce={}",
-                    hs.get("attempt"),
-                    hs.get("scheme"),
-                    hs.get("timestamp"),
-                    hs.get("nonce"),
-                )
-            elif hs:
+            if hs and hs.get("scheme") != SCHEME_V1:
                 logger.warning(
-                    "🔓 Handshake #{} accepted on the LEGACY scheme - the backend "
-                    "still has AI_SIGNATURE_ALLOW_LEGACY open. Move to "
+                    "Connected on the LEGACY handshake scheme (handshake #{}) - the "
+                    "backend still has AI_SIGNATURE_ALLOW_LEGACY open. Move to "
                     "SOCKET_AUTH_SCHEME=v1 before that window closes.",
                     hs.get("attempt"),
                 )
-            logger.info("📡 Listening for events:")
-            logger.info("   - workspace_created")
-            logger.info("   - workspace_sync")
-            logger.info("   - workspace_version_restore")
-            logger.info("   - workspace_transferred")
-            logger.info("   - document_reload_request")
-            logger.info("   - workspace_stop_request")
-            logger.info("   - workspace_resume_request")
-            logger.info("   - workspace_deleted")
-            logger.info("   - user_message_request")
-            logger.info("   - probing_prompts_request")
-            logger.info("   - analysis_report_feedback")
-            logger.info("   - added_missing_information")
-            logger.info("   - applicable_law_relevance_request")
-            logger.info("   - add_case_law")
-            logger.info("   - case_law_document_request")
-            logger.info("   - add_relevant_party")
-            logger.info("   - edit_relevant_party")
-            logger.info("   - delete_relevant_party")
-            logger.info("   - analysis_docx_generate_request")
-            logger.info("   - template_sync")
-            logger.info("   - template_sync_response")
-            logger.info("   - ai_heartbeat_ping")
-            logger.info(
-                "📤 Ready to emit: ai_response, probing_prompts_response, document_feature_response, applicable_law_relevance_response, analysis_docx_generate_response, ai_heartbeat_pong"
-            )
+            else:
+                logger.info(
+                    "Socket connected (handshake #{}, scheme={}, {} event handlers)",
+                    hs.get("attempt"),
+                    hs.get("scheme"),
+                    len(event_handler._handlers),
+                )
             self._connected = True
             self._connected_event.set()
             await event_handler.handle("connect", None)
@@ -544,26 +530,15 @@ class SocketClient:
             """Handle disconnection event with reason."""
             self._connected = False
             self._connected_event.clear()
-            logger.warning("Socket.IO disconnected")
-            if reason:
-                logger.warning("🔴 Disconnect reason: {}", reason)
-                if reason == "transport close":
-                    logger.info(
-                        "Server closed the connection (check server pingTimeout if during long AI work)"
-                    )
-                elif reason == "ping timeout":
-                    logger.info(
-                        "Ping timeout – backend should increase pingTimeout (e.g. 60000) for long-running AI"
-                    )
-                elif reason == "transport error":
-                    logger.warning("Transport error (network/proxy)")
-                elif reason == "server namespace disconnect":
-                    logger.warning("Server disconnected (check auth)")
-            else:
-                logger.warning("🔴 Connection lost (no reason provided)")
-            logger.info(
-                "Reconnecting automatically (delay from config); the next attempt "
-                "re-signs with a fresh timestamp and nonce"
+            hints = {
+                "transport close": "server closed the connection (check the server pingTimeout during long AI work)",
+                "ping timeout": "ping timeout (the backend pingTimeout should allow long AI work, e.g. 60000)",
+                "transport error": "network or proxy error",
+                "server namespace disconnect": "server disconnected the namespace (check auth)",
+            }
+            logger.warning(
+                "Socket disconnected: {}; reconnecting with a freshly signed handshake",
+                hints.get(reason, reason or "no reason given"),
             )
             await event_handler.handle("disconnect", {"reason": reason})
 
@@ -579,24 +554,18 @@ class SocketClient:
             time, the x-signature-timestamp and x-signature-nonce sent (both are
             logged at DEBUG) - never the signature or the secret.
             """
-            logger.error("Socket.IO connection error: {}", data)
-            logger.error(
-                "❌ Connection failed - check authentication and server status"
-            )
             self._log_handshake_refusal(data)
             await event_handler.handle("error", data)
 
         @self.sio.event
         async def error(data):
             """Handle general error event from server."""
-            logger.error("Socket.IO error from server: {}", data)
             await event_handler.handle("error", data)
 
         @self.sio.event
         async def unauthorized(data):
             """Handle unauthorized/authentication failure."""
-            logger.error("🚫 Authentication failed - check SOCKET_SECRET_KEY")
-            logger.error("Server response: {}", data)
+            logger.error("Socket authentication failed - check SOCKET_SECRET_KEY")
 
         # ========================================================================
         # Backend-specified events (AI_Maverick listens to these)
@@ -610,8 +579,8 @@ class SocketClient:
             """
             payload = data if isinstance(data, dict) else {}
             hs = self._handshake_summary()
-            logger.success(
-                "✅ Server confirmed connection | clientType={} userId={} scheme={} "
+            logger.info(
+                "Server confirmed connection | clientType={} userId={} scheme={} "
                 "handshake=#{}",
                 payload.get("clientType"),
                 payload.get("userId"),
@@ -627,7 +596,6 @@ class SocketClient:
                     payload.get("clientType"),
                     CLIENT_ID,
                 )
-            logger.debug("Connection data: {}", data)
             await event_handler.handle("connected", data)
 
         @self.sio.event
@@ -636,7 +604,6 @@ class SocketClient:
             Handle workspace_created event (Server → AI_Maverick).
             New workspace created, emitted to ai_service room.
             """
-            logger.info("📦 Received workspace_created event")
             await event_handler.handle("workspace_created", data)
 
         @self.sio.event
@@ -645,18 +612,6 @@ class SocketClient:
             Handle workspace_sync event (Server → AI_Maverick).
             Workspace updated (title/status/files), emitted to ai_service room.
             """
-            logger.info("🔄 Received workspace_sync event")
-            # Log raw websocket input for debugging (e.g. delete flags, evidenceFiles)
-            try:
-                import json
-
-                raw = json.dumps(data, default=str) if data is not None else "null"
-                logger.info(
-                    "📥 workspace_sync RAW payload: {}",
-                    raw[:2000] + ("..." if len(raw) > 2000 else ""),
-                )
-            except Exception:
-                logger.info("📥 workspace_sync RAW payload (repr): {}", repr(data))
             await event_handler.handle("workspace_sync", data)
 
         @self.sio.event
@@ -667,19 +622,6 @@ class SocketClient:
             evidenceFiles carries the FULL surviving set at that version, so the
             AI reconciles the vector store to it and regenerates every panel.
             """
-            logger.info("⏪ Received workspace_version_restore event")
-            try:
-                import json
-
-                raw = json.dumps(data, default=str) if data is not None else "null"
-                logger.info(
-                    "📥 workspace_version_restore RAW payload: {}",
-                    raw[:2000] + ("..." if len(raw) > 2000 else ""),
-                )
-            except Exception:
-                logger.info(
-                    "📥 workspace_version_restore RAW payload (repr): {}", repr(data)
-                )
             await event_handler.handle("workspace_version_restore", data)
 
         @self.sio.event
@@ -690,19 +632,6 @@ class SocketClient:
             and re-emits the features listed in reEmitFeatures against the new
             owner's template library (drafting_assistant).
             """
-            logger.info("🔁 Received workspace_transferred event")
-            try:
-                import json
-
-                raw = json.dumps(data, default=str) if data is not None else "null"
-                logger.info(
-                    "📥 workspace_transferred RAW payload: {}",
-                    raw[:2000] + ("..." if len(raw) > 2000 else ""),
-                )
-            except Exception:
-                logger.info(
-                    "📥 workspace_transferred RAW payload (repr): {}", repr(data)
-                )
             await event_handler.handle("workspace_transferred", data)
 
         @self.sio.event
@@ -714,19 +643,6 @@ class SocketClient:
             that file, re-fetches the freshly-signed URL, and re-runs the
             workspace features over the full evidenceFiles set.
             """
-            logger.info("♻️ Received document_reload_request event")
-            try:
-                import json
-
-                raw = json.dumps(data, default=str) if data is not None else "null"
-                logger.info(
-                    "📥 document_reload_request RAW payload: {}",
-                    raw[:2000] + ("..." if len(raw) > 2000 else ""),
-                )
-            except Exception:
-                logger.info(
-                    "📥 document_reload_request RAW payload (repr): {}", repr(data)
-                )
             await event_handler.handle("document_reload_request", data)
 
         @self.sio.event
@@ -737,15 +653,6 @@ class SocketClient:
             buffered deliveries, disarm its recovery markers. Fire-and-forget —
             never replied to. Re-sends under the same requestId are expected.
             """
-            payload = data if isinstance(data, dict) else {}
-            # A summary, not the raw payload: stoppedBy.name is personal data.
-            logger.info(
-                "⏹️ Received workspace_stop_request {} for workspace {} "
-                "(pending={})",
-                payload.get("requestId"),
-                payload.get("workspaceId"),
-                payload.get("pendingFeatures"),
-            )
             await event_handler.handle("workspace_stop_request", data)
 
         @self.sio.event
@@ -755,17 +662,6 @@ class SocketClient:
             The lawyer clicked "Finish update": produce ONLY reEmitFeatures,
             announced by a workspace:refresh naming exactly that set.
             """
-            payload = data if isinstance(data, dict) else {}
-            # A summary, not the raw payload: evidenceFiles carry signed URLs
-            # and participants carry names.
-            logger.info(
-                "▶️ Received workspace_resume_request {} for workspace {} "
-                "(reEmitFeatures={}, evidenceFiles={})",
-                payload.get("requestId"),
-                payload.get("workspaceId"),
-                payload.get("reEmitFeatures"),
-                len(payload.get("evidenceFiles") or []),
-            )
             await event_handler.handle("workspace_resume_request", data)
 
         @self.sio.event
@@ -774,7 +670,6 @@ class SocketClient:
             Handle user_message_request event (Server → AI_Maverick).
             User message forwarded to AI service, emitted to ai_service room.
             """
-            logger.info("💬 Received user_message_request event")
             await event_handler.handle("user_message_request", data)
 
         @self.sio.event
@@ -783,7 +678,6 @@ class SocketClient:
             Handle probing_prompts_request (Server → AI_Maverick).
             For STRATEGY_OBJECTIVE chatType, respond with random 4 suggestion chips as prompts.
             """
-            logger.info("📋 Received probing_prompts_request event")
             await event_handler.handle("probing_prompts_request", data)
 
         @self.sio.event
@@ -792,7 +686,6 @@ class SocketClient:
             Handle analysis_report_feedback (App → Backend → AI_Maverick).
             User rejected an analysis report item (missingInfo or riskOrWeakness); recalc score and re-emit report.
             """
-            logger.info("📋 Received analysis_report_feedback event")
             await event_handler.handle("analysis_report_feedback", data)
 
         @self.sio.event
@@ -803,16 +696,17 @@ class SocketClient:
             missingInfo. AI assesses case relevance; if related, the analysis score
             is decreased and qualityScoreExplanation is regenerated, then re-emitted.
             """
-            logger.info("📝 Received added_missing_information event")
-            try:
-                raw = json.dumps(data, default=str) if data is not None else "null"
-                logger.info(
-                    "added_missing_information payload (preview): {}",
-                    raw[:1800] + ("..." if len(raw) > 1800 else ""),
-                )
-            except Exception:
-                logger.info("added_missing_information payload (repr): {}", repr(data))
             await event_handler.handle("added_missing_information", data)
+
+        @self.sio.event
+        async def missing_information_edited(data):
+            """
+            Handle missing_information_edited (Server → AI_Maverick).
+            A lawyer re-worded one Missing Information item. The item keeps its
+            id; only its text changes. The analysis report is updated in place
+            (no score change) and re-emitted.
+            """
+            await event_handler.handle("missing_information_edited", data)
 
         @self.sio.event
         async def applicable_law_relevance_request(data):
@@ -820,19 +714,6 @@ class SocketClient:
             Handle applicable_law_relevance_request (Server → AI_Maverick).
             Lawyer-selected law; AI returns applicability as applicable_law_relevance_response.
             """
-            logger.info(
-                "⚖️ applicable_law_relevance_request ← backend (socket received)"
-            )
-            try:
-                raw = json.dumps(data, default=str) if data is not None else "null"
-                logger.info(
-                    "applicable_law_relevance_request payload (preview): {}",
-                    raw[:1800] + ("..." if len(raw) > 1800 else ""),
-                )
-            except Exception:
-                logger.info(
-                    "applicable_law_relevance_request payload (repr): {}", repr(data)
-                )
             await event_handler.handle("applicable_law_relevance_request", data)
 
         @self.sio.event
@@ -844,15 +725,6 @@ class SocketClient:
             verifies a real source, assesses relevance, appends to the Case Laws
             panel, and re-emits featureType=case_laws.
             """
-            logger.info("📚 Received add_case_law event")
-            try:
-                raw = json.dumps(data, default=str) if data is not None else "null"
-                logger.info(
-                    "add_case_law payload (preview): {}",
-                    raw[:1800] + ("..." if len(raw) > 1800 else ""),
-                )
-            except Exception:
-                logger.info("add_case_law payload (repr): {}", repr(data))
             await event_handler.handle("add_case_law", data)
 
         @self.sio.event
@@ -865,35 +737,21 @@ class SocketClient:
             rejected + rejectionReason). Accepted cases also update the Case Laws
             panel via document_feature_response (featureType=case_laws).
             """
-            logger.info("📄 Received case_law_document_request event")
-            try:
-                raw = json.dumps(data, default=str) if data is not None else "null"
-                logger.info(
-                    "case_law_document_request payload (preview): {}",
-                    raw[:1800] + ("..." if len(raw) > 1800 else ""),
-                )
-            except Exception:
-                logger.info(
-                    "case_law_document_request payload (repr): {}", repr(data)
-                )
             await event_handler.handle("case_law_document_request", data)
 
         @self.sio.event
         async def add_relevant_party(data):
             """Handle add_relevant_party (App → Backend → AI). User adds a party."""
-            logger.info("👥 Received add_relevant_party event")
             await event_handler.handle("add_relevant_party", data)
 
         @self.sio.event
         async def edit_relevant_party(data):
             """Handle edit_relevant_party (App → Backend → AI). Edit a party by id."""
-            logger.info("👥 Received edit_relevant_party event")
             await event_handler.handle("edit_relevant_party", data)
 
         @self.sio.event
         async def delete_relevant_party(data):
             """Handle delete_relevant_party (App → Backend → AI). Delete a party by id."""
-            logger.info("👥 Received delete_relevant_party event")
             await event_handler.handle("delete_relevant_party", data)
 
         @self.sio.event
@@ -902,19 +760,6 @@ class SocketClient:
             Handle analysis_docx_generate_request (Server -> AI_Maverick).
             AI returns processed document text via analysis_docx_generate_response.
             """
-            logger.info(
-                "📝 analysis_docx_generate_request <- backend (socket received)"
-            )
-            try:
-                raw = json.dumps(data, default=str) if data is not None else "null"
-                logger.info(
-                    "analysis_docx_generate_request payload (preview): {}",
-                    raw[:1800] + ("..." if len(raw) > 1800 else ""),
-                )
-            except Exception:
-                logger.info(
-                    "analysis_docx_generate_request payload (repr): {}", repr(data)
-                )
             await event_handler.handle("analysis_docx_generate_request", data)
 
         @self.sio.event
@@ -926,15 +771,6 @@ class SocketClient:
             and the event is silently dropped (only logged at DEBUG level), so
             deletions/renames/uploads never reach the drafting agent.
             """
-            logger.info("📚 template_sync ← backend (socket received)")
-            try:
-                raw = json.dumps(data, default=str) if data is not None else "null"
-                logger.info(
-                    "template_sync payload (preview): {}",
-                    raw[:1800] + ("..." if len(raw) > 1800 else ""),
-                )
-            except Exception:
-                logger.info("template_sync payload (repr): {}", repr(data))
             await event_handler.handle("template_sync", data)
 
         @self.sio.event
@@ -944,15 +780,6 @@ class SocketClient:
             in reply to our request_template_sync emit. Populates the
             in-memory template store on demand (e.g. after an AI restart).
             """
-            logger.info("📚 template_sync_response ← backend (socket received)")
-            try:
-                raw = json.dumps(data, default=str) if data is not None else "null"
-                logger.info(
-                    "template_sync_response payload (preview): {}",
-                    raw[:1800] + ("..." if len(raw) > 1800 else ""),
-                )
-            except Exception:
-                logger.info("template_sync_response payload (repr): {}", repr(data))
             await event_handler.handle("template_sync_response", data)
 
         @self.sio.event
@@ -963,15 +790,6 @@ class SocketClient:
             a fresh template_blueprint_proposal. Without this explicit binding
             the event falls through the catch-all and is silently dropped.
             """
-            logger.info("📚 request_blueprint_proposal ← backend (socket received)")
-            try:
-                raw = json.dumps(data, default=str) if data is not None else "null"
-                logger.info(
-                    "request_blueprint_proposal payload (preview): {}",
-                    raw[:1200] + ("..." if len(raw) > 1200 else ""),
-                )
-            except Exception:
-                logger.info("request_blueprint_proposal payload (repr): {}", repr(data))
             await event_handler.handle("request_blueprint_proposal", data)
 
         @self.sio.on(AI_HEARTBEAT_PING)
@@ -1001,7 +819,6 @@ class SocketClient:
         @self.sio.event
         async def workspace_updated(data):
             """Handle workspace updated event (legacy)."""
-            logger.debug("Received legacy workspace_updated event")
             await event_handler.handle("workspace_updated", data)
 
         @self.sio.event
@@ -1018,31 +835,18 @@ class SocketClient:
             emit is fire-and-forget, so it re-sends every pending deletion on
             reconnect until purgeAfter passes. The handler dedupes.
             """
-            logger.info("🗑️ Received workspace_deleted event")
-            try:
-                logger.info(
-                    "📥 workspace_deleted payload: {}",
-                    json.dumps(data, default=str) if data else "null",
-                )
-            except Exception:
-                logger.info("📥 workspace_deleted payload (repr): {}", repr(data))
             await event_handler.handle("workspace_deleted", data)
 
         @self.sio.on("*")
         async def catch_all(event, *args):
-            """Catch all other events from server."""
-            logger.debug(f"📩 Received unhandled event: {event}")
-            if args:
-                logger.debug(f"   Event data: {args}")
-
-            # Handle common server events
-            if event == "auth_error" or event == "authentication_error":
-                logger.error("🚫 Authentication error from server!")
-                logger.error(f"   Details: {args}")
+            """Catch all other events from server. Event names only: the
+            arguments are server payloads and are never logged."""
+            if event in ("auth_error", "authentication_error"):
+                logger.error("Authentication error event from server: {}", event)
             elif event == "error":
-                logger.error(f"❌ Error from server: {args}")
+                logger.error("Error event from server")
             else:
-                logger.debug(f"Event: {event}, Data: {args}")
+                logger.debug("Unhandled server event: {} ({} arg(s))", event, len(args))
 
     @property
     def is_connected(self) -> bool:

@@ -134,7 +134,9 @@ class WorkspacePurgeMixin:
             payload = WorkspaceDeletedPayload(**(data or {}))
         except Exception as e:
             logger.error(
-                "workspace_deleted payload rejected ({}); raw={}", str(e), repr(data)
+                "workspace_deleted payload rejected ({}); keys={}",
+                str(e),
+                sorted((data or {}).keys()) if isinstance(data, dict) else type(data).__name__,
             )
             return
 
@@ -218,7 +220,7 @@ class WorkspacePurgeMixin:
             self._seen_purge_requests[request_id] = time.time()
 
         logger.warning(
-            "🗑️ workspace_deleted: {} (owner={}, reason={}, request={}) — purge armed "
+            "workspace_deleted: {} (owner={}, reason={}, request={}) — purge armed "
             "for {} (in {:.0f}s)",
             workspace_id,
             payload.userId,
@@ -269,7 +271,7 @@ class WorkspacePurgeMixin:
         if was_pending:
             self._cancel_purge_task(workspace_id, reason=trigger)
             logger.warning(
-                "↩️ Pending purge for {} CANCELLED by {} — workspace is live again",
+                "Pending purge for {} CANCELLED by {} — workspace is live again",
                 workspace_id,
                 trigger,
             )
@@ -363,7 +365,7 @@ class WorkspacePurgeMixin:
             # Every attempt failed. The backend has stopped re-sending by now,
             # so nothing else will trigger this: it needs a human.
             logger.critical(
-                "🚨 COMPLIANCE: purge of workspace {} FAILED after {} attempts. "
+                "COMPLIANCE: purge of workspace {} FAILED after {} attempts. "
                 "Client data is still held by the AI service after the erasure "
                 "deadline. Escalate — this must be completed manually.",
                 workspace_id,
@@ -403,7 +405,7 @@ class WorkspacePurgeMixin:
             Exception: Propagated to the retry loop if any stage fails. The
                 workspace is only marked purged when every stage succeeded.
         """
-        logger.warning("🗑️ Purging workspace {} — erasing all AI-held data", workspace_id)
+        logger.warning("Purging workspace {} — erasing all AI-held data", workspace_id)
 
         # 1. Stop new state from being written for this workspace.
         block_workspace_persistence(workspace_id)
@@ -432,7 +434,7 @@ class WorkspacePurgeMixin:
         }
 
         logger.success(
-            "✅ Workspace {} purged (owner={}, reason={}, request={}) — {} in-memory "
+            "Workspace {} purged (owner={}, reason={}, request={}) — {} in-memory "
             "entr(ies) cleared",
             workspace_id,
             user_id or "<unknown>",

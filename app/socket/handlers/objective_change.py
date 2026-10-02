@@ -75,6 +75,7 @@ from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
                                        restore_state)
 from agent import process_analysis_docx_request
 
+from app.rag.packing import fit_to_budget
 from app.socket.event_utils import (
     EventHandler,
     _STRATEGY_ROLE_LABELS_RE,
@@ -342,7 +343,7 @@ class ObjectiveChangeMixin:
                 features = (delivered or {}).get(workspace_id) or []
                 if features:
                     logger.success(
-                        "✅ Re-delivered payload(s) held from before the restart: "
+                        "Re-delivered payload(s) held from before the restart: "
                         "{} (workspace={})",
                         features,
                         str(workspace_id)[:12],
@@ -529,7 +530,7 @@ class ObjectiveChangeMixin:
                     log_context=" (resumed after reconnect)",
                 )
                 logger.success(
-                    "✅ Interrupted objective change completed on resume "
+                    "Interrupted objective change completed on resume "
                     "(workspace={})",
                     str(workspace_id)[:12],
                 )
@@ -1077,7 +1078,7 @@ class ObjectiveChangeMixin:
                         merged.append(prev_item)
                         seen_lower.add(prev_item.lower())
             logger.info(
-                "LLM merge ({}): prev={} new={} → merged={}",
+                "LLM merge ({}): prev={} new={}  merged={}",
                 item_type, len(prev_clean), len(new_clean), len(merged),
             )
             return merged[:max_keep]
@@ -1160,7 +1161,7 @@ class ObjectiveChangeMixin:
             per_doc = budget // max(1, len(with_content))
             doc_parts = []
             for i, d in enumerate(with_content, 1):
-                content = (d.get("content") or "").strip()[:per_doc]
+                content = fit_to_budget((d.get("content") or "").strip(), per_doc, "general")
                 doc_parts.append(
                     f"--- Document {i} (id: {d.get('document_id') or ''}) ---\n{content}"
                 )
@@ -1295,7 +1296,7 @@ class ObjectiveChangeMixin:
                     merged.append(prev_item)
 
             logger.info(
-                "LLM merge (strengths): prev={} new={} → merged={}",
+                "LLM merge (strengths): prev={} new={}  merged={}",
                 len(prev_clean), len(new_clean), len(merged),
             )
             return merged[:max_keep]
@@ -1435,7 +1436,7 @@ class ObjectiveChangeMixin:
                     merged.append(prev_item)
 
             logger.info(
-                "LLM merge ({}): prev={} new={} → merged={}",
+                "LLM merge ({}): prev={} new={}  merged={}",
                 item_type, len(prev_clean), len(new_clean), len(merged),
             )
             return merged[:max_keep]
@@ -1543,10 +1544,9 @@ class ObjectiveChangeMixin:
                     continue
                 verdict = str(classifications[i] or "").strip().lower()
                 if verdict == "procedural":
-                    logger.info(
+                    logger.debug(
                         "List of dates: LLM classifier dropped procedural entry "
-                        "(title={!r}, eventType={!r}, date={})",
-                        str(entry.get(title_field) or ""),
+                        "(eventType={!r}, date={})",
                         str(entry.get("eventType") or ""),
                         str(entry.get(date_field) or ""),
                     )
@@ -1629,7 +1629,7 @@ class ObjectiveChangeMixin:
         before = len(entries)
         deduped = [entries[i] for i in range(len(entries)) if i in kept_indexes]
         logger.info(
-            "Dedupe ({}): {} entries → {} after per-date semantic dedup",
+            "Dedupe ({}): {} entries  {} after per-date semantic dedup",
             item_type, before, len(deduped),
         )
         return deduped
@@ -1736,7 +1736,7 @@ class ObjectiveChangeMixin:
                     merged.append(dict(prev_law))
 
             logger.info(
-                "LLM merge (applicable laws): prev={} new={} → merged={}",
+                "LLM merge (applicable laws): prev={} new={}  merged={}",
                 len(prev_laws), len(new_laws), len(merged),
             )
         except Exception as e:
@@ -1831,6 +1831,11 @@ class ObjectiveChangeMixin:
                 prev_items=prev_items if isinstance(prev_items, list) else None,
                 section=report_field,
             )
+        # The lawyer's re-worded items (missing_information_edited) win over the
+        # regenerated wording, and keep their ids.
+        analysis_report["missingInfo"] = self._apply_missing_info_edits(
+            workspace_id, analysis_report.get("missingInfo")
+        )
         return analysis_report
 
     async def _merge_analysis_report_with_previous(
@@ -2235,7 +2240,7 @@ class ObjectiveChangeMixin:
             )
             seen.add("analysis_report")
             logger.success(
-                "✅ Objective-change analysis update emitted "
+                "Objective-change analysis update emitted "
                 "(fully regenerated for new objective, prev replaced){}",
                 ctx,
             )
@@ -2290,7 +2295,7 @@ class ObjectiveChangeMixin:
                 )
                 seen.add("list_of_dates")
                 logger.success(
-                    "✅ Objective-change list_of_dates preserved (relevance re-eval skipped){}",
+                    "Objective-change list_of_dates preserved (relevance re-eval skipped){}",
                     ctx,
                 )
 
@@ -2331,7 +2336,7 @@ class ObjectiveChangeMixin:
                 )
                 seen.add("applicable_laws")
                 logger.success(
-                    "✅ Objective-change applicable_laws preserved (regeneration skipped){}",
+                    "Objective-change applicable_laws preserved (regeneration skipped){}",
                     ctx,
                 )
 
@@ -2356,7 +2361,7 @@ class ObjectiveChangeMixin:
             )
             seen.add("procedural_timeline")
             logger.success(
-                "✅ Objective-change preserved procedural_timeline re-emitted{}",
+                "Objective-change preserved procedural_timeline re-emitted{}",
                 ctx,
             )
 
@@ -2368,7 +2373,7 @@ class ObjectiveChangeMixin:
             await self._emit_relevant_parties(workspace_id, user_id)
             seen.add("relevant_parties")
             logger.success(
-                "✅ Objective-change relevant_parties preserved (regeneration skipped){}",
+                "Objective-change relevant_parties preserved (regeneration skipped){}",
                 ctx,
             )
         except Exception as parties_err:
@@ -2396,7 +2401,7 @@ class ObjectiveChangeMixin:
             case_done = True
             seen.add("case_laws")
             logger.success(
-                "✅ Objective-change case_laws regenerated for new objective{}",
+                "Objective-change case_laws regenerated for new objective{}",
                 ctx,
             )
         except Exception as case_err:
@@ -2429,7 +2434,7 @@ class ObjectiveChangeMixin:
             draft_done = True
             seen.add("drafting_assistant")
             logger.success(
-                "✅ Objective-change drafting regenerated for new objective{}",
+                "Objective-change drafting regenerated for new objective{}",
                 ctx,
             )
         except Exception as draft_err:
@@ -2618,7 +2623,7 @@ class ObjectiveChangeMixin:
                     is_update=is_update,
                 )
             if strategies_result and self._socket_client:
-                logger.success("✅ Strategies generated (background), emitting...")
+                logger.success("Strategies generated (background), emitting...")
                 await self._emit_document_feature(
                     feature_type="strategy_objective",
                     workspace_id=workspace_id,
@@ -2631,10 +2636,9 @@ class ObjectiveChangeMixin:
                 if chips:
                     self._workspace_suggestion_chips[workspace_id] = list(chips)
                     self._last_workspace_id_with_chips = workspace_id
-                logger.success("🎉 Strategy & Objectives sent to backend (background)")
+                logger.success("Strategy & Objectives sent to backend (background)")
         except Exception as strategy_error:
-            logger.error("Background strategy generation failed: {}", strategy_error)
-            logger.exception(strategy_error)
+            logger.opt(exception=strategy_error).error("Background strategy generation failed: {}", strategy_error)
             if self._socket_client:
                 try:
                     await self._socket_client.emit(
@@ -2796,7 +2800,7 @@ class ObjectiveChangeMixin:
             payload=analysis_report,
             usage=current_usage(),
         )
-        logger.success("✅ Analysis report sent to backend{}", log_context)
+        logger.success("Analysis report sent to backend{}", log_context)
         # Brief yield so the socket can flush before caller continues (reduces risk of disconnect before delivery)
         await asyncio.sleep(0.15)
         # Generate and cache 15-16 suggestion chips for Analysis Report (probing_prompts_request with chatType ANALYSIS_REPORT)
@@ -2883,7 +2887,7 @@ class ObjectiveChangeMixin:
                     usage=current_usage(),
                 )
                 self._workspace_analysis_payload[workspace_id] = analysis_report
-                logger.success("✅ Analysis report sent to backend (sync)")
+                logger.success("Analysis report sent to backend (sync)")
             self._schedule_list_of_dates_and_applicable_laws(
                 workspace_id=workspace_id,
                 user_id=user_id,
@@ -2912,7 +2916,7 @@ class ObjectiveChangeMixin:
                     )
                     self._workspace_analysis_payload[workspace_id] = fallback
                     logger.success(
-                        "✅ Analysis report (fallback) sent to backend (sync)"
+                        "Analysis report (fallback) sent to backend (sync)"
                     )
                 self._schedule_list_of_dates_and_applicable_laws(
                     workspace_id=workspace_id,

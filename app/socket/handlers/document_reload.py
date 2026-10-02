@@ -265,18 +265,6 @@ class DocumentReloadMixin:
         request_id = str((data or {}).get("requestId") or "")
         workspace_id = str((data or {}).get("workspaceId") or "")
         try:
-            try:
-                import json
-
-                raw_preview = json.dumps(data, default=str) if data else "null"
-                if len(raw_preview) > 1500:
-                    raw_preview = raw_preview[:1500] + "..."
-                logger.info("📥 document_reload_request RAW input: {}", raw_preview)
-            except Exception:
-                logger.info(
-                    "📥 document_reload_request RAW input (repr): {}", repr(data)
-                )
-
             payload = DocumentReloadRequestPayload(**data)
             workspace_id = str(payload.workspaceId)
             user_id = str(payload.userId)
@@ -307,7 +295,7 @@ class DocumentReloadMixin:
             self._mark_reload_request(workspace_id, request_id, "in_flight")
 
             logger.info(
-                "♻️ Document reload: {} in workspace {} (user {}, reason={}, "
+                "Document reload: {} in workspace {} (user {}, reason={}, "
                 "previous score={})",
                 payload.targetFile.originalName,
                 workspace_id,
@@ -473,7 +461,7 @@ class DocumentReloadMixin:
                     workspace_id=workspace_id, document_ids=[document_id]
                 )
                 logger.info(
-                    "🗑️ Reload purged document {} from the vector store", document_id
+                    "Reload purged document {} from the vector store", document_id
                 )
             except Exception as del_err:
                 logger.error(
@@ -524,12 +512,11 @@ class DocumentReloadMixin:
                         user_id=user_id,
                     )
             except Exception as ingest_err:
-                logger.error(
+                logger.opt(exception=ingest_err).error(
                     "Reload re-ingestion of document {} failed: {}",
                     document_id,
                     ingest_err,
                 )
-                logger.exception(ingest_err)
                 batch_result = None
 
             reload_succeeded = bool(batch_result) and bool(
@@ -542,14 +529,14 @@ class DocumentReloadMixin:
                         new_score = r.get("readability_score")
             if reload_succeeded:
                 logger.success(
-                    "✅ Document {} re-read: quality score {} → {}",
+                    "Document {} re-read: quality score {}  {}",
                     payload.targetFile.originalName,
                     payload.targetFile.previousQualityScore,
                     new_score,
                 )
             else:
                 logger.error(
-                    "❌ Document {} could not be re-read; it is no longer in the "
+                    "Document {} could not be re-read; it is no longer in the "
                     "vector store and is now reported as a missing-evidence gap",
                     payload.targetFile.originalName,
                 )
@@ -579,7 +566,7 @@ class DocumentReloadMixin:
                             )
                         )
                         logger.success(
-                            "✅ Document assessments (reload) sent to backend"
+                            "Document assessments (reload) sent to backend"
                         )
                     except Exception as assess_err:
                         logger.error(
@@ -671,7 +658,7 @@ class DocumentReloadMixin:
                         workspace_metadata_payload
                     )
                     logger.success(
-                        "✅ Workspace metadata (reload) sent: title=unchanged, "
+                        "Workspace metadata (reload) sent: title=unchanged, "
                         "category={}",
                         meta.get("caseCategory"),
                     )
@@ -719,7 +706,7 @@ class DocumentReloadMixin:
                         usage=_u_strategy,
                     )
                     self._workspace_strategy_payload[workspace_id] = strategies_result
-                    logger.success("🎉 Strategy & Objectives sent after document reload")
+                    logger.success("Strategy & Objectives sent after document reload")
             except Exception as strat_emit_err:
                 logger.warning(
                     "Strategy emit after document reload failed: {}", strat_emit_err
@@ -770,7 +757,7 @@ class DocumentReloadMixin:
                         usage=_u_analysis,
                     )
                     self._workspace_analysis_payload[workspace_id] = analysis_report
-                    logger.success("✅ Analysis report sent after document reload")
+                    logger.success("Analysis report sent after document reload")
             except Exception as ar_emit_err:
                 logger.warning(
                     "Analysis report emit after document reload failed: {}",
@@ -810,7 +797,7 @@ class DocumentReloadMixin:
                 },
             )
             logger.success(
-                "✅ Document reload completed for workspace {} (document {}, "
+                "Document reload completed for workspace {} (document {}, "
                 "succeeded={})",
                 workspace_id,
                 document_id,
@@ -824,6 +811,5 @@ class DocumentReloadMixin:
                 self._mark_reload_request(workspace_id, request_id, "failed")
             except Exception:
                 pass
-            logger.error("Error processing document_reload_request event: {}", str(e))
-            logger.exception(e)
+            logger.opt(exception=e).error("Error processing document_reload_request event: {}", str(e))
             raise

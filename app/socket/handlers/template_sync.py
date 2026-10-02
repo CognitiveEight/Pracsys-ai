@@ -140,7 +140,7 @@ class TemplateSyncMixin:
         # (top-level keys + action + template count) before validation,
         # so a malformed/unexpected payload is still visible in the logs.
         logger.info(
-            "📥 template_sync RECEIVED: action={} userId={} templates={} keys={}",
+            "template_sync received: action={} userId={} templates={} keys={}",
             (payload_in or {}).get("action"),
             str((payload_in or {}).get("userId") or "")[:12],
             len((payload_in or {}).get("templates") or [])
@@ -167,55 +167,11 @@ class TemplateSyncMixin:
 
         templates = list(payload.templates or [])
         logger.info(
-            "📚 template_sync action={} user={} count={}",
+            "template_sync action={} user={} count={}",
             action,
             user_id[:12],
             len(templates),
         )
-        # Per-item log so it's clear exactly what the backend pushed.
-        # Signed-URL query strings (credentials) are stripped — only the
-        # GCS object path is shown so each file is identifiable.
-        for idx, tpl in enumerate(templates):
-            raw_url = tpl.fileUrl or ""
-            url_path = raw_url.split("?", 1)[0] if raw_url else ""
-            logger.info(
-                "   📄 [{}] id={} name={!r} category={} ext={} "
-                "hasFileUrl={} fileHash={} path={}",
-                idx,
-                tpl.id,
-                tpl.name,
-                tpl.category,
-                tpl.extension,
-                bool(raw_url),
-                tpl.fileHash,
-                tpl.path or url_path or "(none)",
-            )
-
-        # Full field-by-field dump of the raw inbound payload for end-to-end
-        # verification. Signed-URL credentials are stripped from every
-        # template's fileUrl (only the GCS object path is kept) so no
-        # credentials ever land in the logs.
-        try:
-            sanitized = dict(payload_in)
-            raw_templates = payload_in.get("templates")
-            if isinstance(raw_templates, list):
-                redacted = []
-                for tpl_raw in raw_templates:
-                    if isinstance(tpl_raw, dict):
-                        tpl_copy = dict(tpl_raw)
-                        fu = tpl_copy.get("fileUrl")
-                        if isinstance(fu, str) and fu:
-                            tpl_copy["fileUrl"] = fu.split("?", 1)[0]
-                        redacted.append(tpl_copy)
-                    else:
-                        redacted.append(tpl_raw)
-                sanitized["templates"] = redacted
-            logger.info(
-                "📋 template_sync RAW payload (credentials stripped):\n{}",
-                json.dumps(sanitized, indent=2, ensure_ascii=False, default=str),
-            )
-        except Exception as e:
-            logger.warning("template_sync: could not dump raw payload: {}", e)
 
         try:
             from app.langgraph.drafting_agent import drafting_agent
@@ -350,7 +306,7 @@ class TemplateSyncMixin:
                     "template_blueprint_proposal", proposal
                 )
                 logger.success(
-                    "📤 template_blueprint_proposal emitted (template={}, status={}, vars={})",
+                    "template_blueprint_proposal emitted (template={}, status={}, vars={})",
                     tpl.id,
                     proposal.get("status"),
                     len((proposal.get("blueprint") or {}).get("variables") or []),
@@ -440,7 +396,7 @@ class TemplateSyncMixin:
         in-memory store and resolves the awaiting Future (by requestId)."""
         payload_in = data if isinstance(data, dict) else {}
         logger.info(
-            "📥 template_sync_response RECEIVED: userId={} requestId={} count={} keys={}",
+            "template_sync_response received: userId={} requestId={} count={} keys={}",
             str((payload_in or {}).get("userId") or "")[:12],
             (payload_in or {}).get("requestId"),
             (payload_in or {}).get("count"),
@@ -460,28 +416,6 @@ class TemplateSyncMixin:
         request_id = payload.requestId
         templates = list(payload.templates or [])
 
-        # Full sanitized dump (signed-URL credentials stripped) for verification.
-        try:
-            sanitized = dict(payload_in)
-            raw_templates = payload_in.get("templates")
-            if isinstance(raw_templates, list):
-                redacted = []
-                for tpl_raw in raw_templates:
-                    if isinstance(tpl_raw, dict):
-                        tpl_copy = dict(tpl_raw)
-                        fu = tpl_copy.get("fileUrl")
-                        if isinstance(fu, str) and fu:
-                            tpl_copy["fileUrl"] = fu.split("?", 1)[0]
-                        redacted.append(tpl_copy)
-                    else:
-                        redacted.append(tpl_raw)
-                sanitized["templates"] = redacted
-            logger.info(
-                "📋 template_sync_response RAW payload (credentials stripped):\n{}",
-                json.dumps(sanitized, indent=2, ensure_ascii=False, default=str),
-            )
-        except Exception as e:
-            logger.warning("template_sync_response: could not dump raw payload: {}", e)
 
         try:
             if not user_id:
@@ -491,7 +425,7 @@ class TemplateSyncMixin:
             else:
                 ingested = await self._ingest_template_items(user_id, templates)
                 logger.success(
-                    "📚 template_sync_response ingested {}/{} template(s) for user={}",
+                    "template_sync_response ingested {}/{} template(s) for user={}",
                     ingested,
                     len(templates),
                     user_id[:12],
@@ -523,7 +457,7 @@ class TemplateSyncMixin:
                             )
                         if stale_ids:
                             logger.info(
-                                "🧹 template_sync_response reconciled {} stale "
+                                "template_sync_response reconciled {} stale "
                                 "template(s) for user={} (absent from snapshot)",
                                 len(stale_ids),
                                 user_id[:12],
@@ -580,7 +514,7 @@ class TemplateSyncMixin:
         file_url = payload_in.get("fileUrl") or ""
         file_hash = payload_in.get("fileHash") or ""
         logger.info(
-            "📥 request_blueprint_proposal RECEIVED: userId={} templateId={} hasFileUrl={}",
+            "request_blueprint_proposal RECEIVED: userId={} templateId={} hasFileUrl={}",
             user_id[:12],
             template_id,
             bool(file_url),
@@ -659,7 +593,7 @@ class TemplateSyncMixin:
                 "template_blueprint_proposal", proposal
             )
             logger.success(
-                "📤 template_blueprint_proposal (regenerated) emitted "
+                "template_blueprint_proposal (regenerated) emitted "
                 "(template={}, status={}, vars={})",
                 template_id,
                 proposal.get("status"),
@@ -718,7 +652,7 @@ class TemplateSyncMixin:
                 {"userId": user_id, "requestId": request_id},
             )
             logger.info(
-                "📨 request_template_sync emitted (user={}, requestId={})",
+                "request_template_sync emitted (user={}, requestId={})",
                 user_id[:12],
                 request_id,
             )
@@ -728,7 +662,7 @@ class TemplateSyncMixin:
             else:
                 await asyncio.wait_for(fut, timeout=timeout)
             logger.info(
-                "✅ template snapshot received for user={} (requestId={})",
+                "template snapshot received for user={} (requestId={})",
                 user_id[:12],
                 request_id,
             )

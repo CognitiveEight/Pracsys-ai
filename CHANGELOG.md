@@ -63,6 +63,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Scanned PDFs: a failed OCR page was dropped silently.** One transient
+  Vision `503` lost a page of a 19-page judgment, with nothing in the text to
+  say so. Transient failures now retry once. A page that still cannot be read
+  keeps its `--- Page N ---` marker with an `[OCR note: this page could not be
+  read ...]`, and so does a page read with low word confidence.
+- **Scanned PDFs: OCR quality and speed.** `app/processing/ocr.py`:
+  - The scan's own JPEG is sent instead of a 150-DPI re-render, which threw
+    away 30-50% of a phone scan's pixels.
+  - `document_text_detection` runs first (Vision's mode for dense pages and
+    handwriting); the original `text_detection` is the fallback.
+  - Reading order is rebuilt from word boxes on single-column pages. Vision
+    had put "renewed from 02-05-2006 to 02-05-2012" out of order on widely
+    spaced typed text.
+  - Pages run 4 at a time on one shared client: a 15-page scan went from
+    118 s to 5 s.
+  Every step falls back to the previous behaviour. Over 147 real PDFs, the
+  old and new code agree with 0 regressions: text-layer PDFs are
+  byte-identical, and no scanned PDF has a new error, a lost page or a
+  lower-resolution image. Guarded by `tests/test_ocr.py`.
 - **Evidence was routed on a filename with no extension.** The backend's
   `filename` ("annexure-3-...-results") has no suffix. `extension` is the only
   type signal, and `process_batch` never passed it, so every file was routed by

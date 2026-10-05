@@ -8,7 +8,7 @@ import re
 import subprocess
 import tempfile
 from io import BytesIO
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -242,6 +242,46 @@ KNOWN_EXTENSIONS = frozenset(
     + _IMAGE_EXTENSIONS + (".pdf", ".docx", ".doc", ".txt", ".md", ".markdown")
 )
 
+# PDF OCR: DPI for pages that are rendered (not sent as their own photo),
+# and how many pages are OCR'd at once.
+OCR_RENDER_DPI = 200
+OCR_PAGE_WORKERS = 4
+
+
+def _add_ocr_page_notes(text: str, failed: List[int], low: Dict[int, float]) -> str:
+    """Mark pages OCR could not read, or read with low confidence, inside
+    page-marked text, so a reader (and every prompt) knows which pages to
+    distrust. Failed pages keep their marker, in page order."""
+    for number, confidence in low.items():
+        note = (
+            f"[OCR note: this page was read with low confidence ({round(confidence * 100)}%). "
+            "Handwriting or image quality may have caused misread words or figures; "
+            "check the original page before relying on exact wording.]"
+        )
+        text = re.sub(
+            rf"^--- Page {number} ---$",
+            lambda m: f"{m.group(0)}\n{note}",
+            text,
+            count=1,
+            flags=re.M,
+        )
+    for number in sorted(failed):
+        block = (
+            f"--- Page {number} ---\n[OCR note: this page could not be read. Its content "
+            "is missing from this text; check the original page.]"
+        )
+        later = [
+            m for m in re.finditer(r"^--- Page (\d+) ---$", text, flags=re.M)
+            if int(m.group(1)) > number
+        ]
+        if later:
+            at = later[0].start()
+            text = text[:at] + block + "\n\n" + text[at:]
+        else:
+            text = text.rstrip() + "\n\n" + block
+    return text
+
+
 # A slide with less text than this of its own has its pictures OCR'd (it is
 # most likely a scanned page pasted onto a slide). The cap bounds Vision spend
 # on a photo-heavy deck; each OCR'd picture is billed as one ocrUnit.
@@ -318,61 +358,34 @@ class FileProcessor:
 
     @staticmethod
     def extract_text_from_image(image_data: bytes) -> str:
-        """Extract text from image using GCP Vision API OCR."""
+        """Extract text from an image with Google Cloud Vision OCR.
+
+        Returns the text, or one of the bracketed sentinels callers test for
+        (``[No text detected in image]``, ``[Error extracting text from image:
+        …]``, ``[Image content - GCP Vision API not available]``). The engine
+        (mode, retry, billing) is ``app/processing/ocr.py``.
+        """
+        result = FileProcessor.ocr_image_result(image_data)
+        if result.ok:
+            logger.success("Extracted {} characters from image ({} mode)", len(result.text), result.mode)
+            return result.text
+        if result.error and result.error.startswith("["):
+            logger.warning("OCR unavailable: {}", result.error)
+            return result.error
+        if result.error:
+            logger.error("Error extracting text from image: {}", result.error)
+            return f"[Error extracting text from image: {result.error}]"
+        logger.warning("No text detected in image")
+        return "[No text detected in image]"
+
+    @staticmethod
+    def ocr_image_result(image_data: bytes):
+        """The full OCR result (text, mean word confidence, mode) for an image."""
+        from app.processing.ocr import OcrResult, ocr_image
+
         if not GCP_OCR_AVAILABLE:
-            logger.warning(
-                "GCP Vision API not available. Cannot extract text from image."
-            )
-            return "[Image content - GCP Vision API not available]"
-
-        try:
-            import os
-
-            from google.auth.api_key import Credentials as ApiKeyCredentials
-
-            from app.ai.usage import record_ocr_units
-            from app.core.config import settings
-
-            # Vision OCR uses API key only (no service-account credentials).
-            api_key_value = (
-                (getattr(settings, "google_cloud_vision_api_key", None) or "")
-                or os.getenv("GOOGLE_CLOUD_VISION_API_KEY")
-                or ""
-            ).strip()
-            if not api_key_value:
-                logger.error(
-                    "Google Vision API key not configured. Set GOOGLE_CLOUD_VISION_API_KEY."
-                )
-                return "[Error: Vision API key not configured (set GOOGLE_CLOUD_VISION_API_KEY)]"
-
-            api_credentials = ApiKeyCredentials(api_key_value)
-            client = vision.ImageAnnotatorClient(credentials=api_credentials)
-
-            image = vision.Image(content=image_data)
-            response = client.text_detection(image=image)
-            # Cost: one billable Vision unit per call — recorded here, the single
-            # Vision call site, so every OCR path (per-PDF-page loop in
-            # _extract_text_from_pdf_with_ocr, standalone images, content-sniffed
-            # images) is counted exactly once. Recorded BEFORE the error check
-            # below because a response that carries an error was still billed.
-            record_ocr_units(1)
-            if response.error.message:
-                raise Exception(f"GCP Vision API error: {response.error.message}")
-
-            texts = response.text_annotations
-            if texts:
-                extracted_text = texts[0].description
-                logger.success(
-                    "Extracted {} characters from image using API key", len(extracted_text)
-                )
-                return extracted_text.strip()
-
-            logger.warning("No text detected in image")
-            return "[No text detected in image]"
-
-        except Exception as e:
-            logger.error("Error extracting text from image: {}", str(e))
-            return f"[Error extracting text from image: {str(e)}]"
+            return OcrResult(error="[Image content - GCP Vision API not available]")
+        return ocr_image(image_data)
 
     # Service-account OCR auth helpers removed (API key only).
 
@@ -450,87 +463,128 @@ class FileProcessor:
             return f"[Error extracting text from PDF: {str(e)}]"
 
     @staticmethod
-    def _extract_text_from_pdf_with_ocr(pdf_data: bytes, mark_pages: bool = False) -> str:
-        """Extract text from image-based PDF using OCR."""
+    def _pdf_page_count(pdf_data: bytes) -> int:
+        """Pages as poppler sees them: the same engine that renders them."""
+        from pdf2image import pdfinfo_from_bytes
+
+        return int(pdfinfo_from_bytes(pdf_data).get("Pages") or 0)
+
+    @staticmethod
+    def _render_page_for_ocr(pdf_data: bytes, page_number: int, size_in: Optional[Tuple[float, float]]) -> Optional[bytes]:
+        """Render one page and encode it for Vision; None if poppler produced
+        nothing. DPI is lowered only for very large page sizes, so the render
+        stays under the pixel cap without touching PIL's global limits."""
+        from app.processing.ocr import MAX_IMAGE_PIXELS, prepare_image
+
+        dpi = OCR_RENDER_DPI
+        if size_in and size_in[0] > 0 and size_in[1] > 0:
+            dpi = int(min(dpi, (2 * MAX_IMAGE_PIXELS / (size_in[0] * size_in[1])) ** 0.5))
+        images = convert_from_bytes(pdf_data, dpi=max(dpi, 72), first_page=page_number, last_page=page_number)
+        if not images:
+            return None
+        return prepare_image(images[0])
+
+    @staticmethod
+    def _ocr_pdf_page(pdf_data: bytes, page_number: int, native_jpeg: Optional[bytes],
+                      size_in: Optional[Tuple[float, float]]):
+        """OCR one page: its own photo when usable, else a render. Never raises."""
+        from app.processing.ocr import OcrResult, jpeg_for_vision
+
+        source = "native"
+        payload = jpeg_for_vision(native_jpeg) if native_jpeg else None
         try:
-            resample = None
-            old_max_pixels = None
-            if PIL_AVAILABLE:
-                resample = Image.LANCZOS if hasattr(Image, "LANCZOS") else Image.BICUBIC
-                if hasattr(Image, "Resampling") and hasattr(
-                    Image.Resampling, "LANCZOS"
-                ):
-                    resample = Image.Resampling.LANCZOS
-                old_max_pixels = getattr(Image, "MAX_IMAGE_PIXELS", None)
-                if old_max_pixels is not None:
-                    Image.MAX_IMAGE_PIXELS = 200_000_000
-            try:
-                # Convert at 150 DPI to reduce size (default 200 can exceed limits)
-                images = convert_from_bytes(pdf_data, dpi=150)
-            finally:
-                if PIL_AVAILABLE and old_max_pixels is not None:
-                    Image.MAX_IMAGE_PIXELS = old_max_pixels
+            if payload is None:
+                source = "render"
+                payload = FileProcessor._render_page_for_ocr(pdf_data, page_number, size_in)
+            if payload is None:
+                return page_number, source, OcrResult(error="page could not be rendered")
+            return page_number, source, FileProcessor.ocr_image_result(payload)
+        except Exception as err:
+            return page_number, source, OcrResult(error=str(err))
 
-            extracted_texts = []
-            extracted_page_numbers: List[int] = []
+    @staticmethod
+    def _extract_text_from_pdf_with_ocr(pdf_data: bytes, mark_pages: bool = False) -> str:
+        """Extract text from an image-based PDF using OCR, page by page.
 
-            for i, image in enumerate(images):
-                logger.info("Processing PDF page {}/{} with OCR", i + 1, len(images))
+        Each page is OCR'd from its own embedded photo when the page is
+        provably nothing else (``app/processing/ocr.native_page_jpeg``), at
+        the scan's full resolution; any other page is rendered at
+        ``OCR_RENDER_DPI``. Pages run ``OCR_PAGE_WORKERS`` at a time, at most
+        twice that many in memory. A page Vision cannot read is retried, then
+        reported; with ``mark_pages`` it keeps its marker and a note saying it
+        could not be read, and a page read with low confidence gets a note too,
+        so a misread page is never presented as clean text.
+        """
+        import contextvars
+        from concurrent.futures import ThreadPoolExecutor
 
-                # Resize if image exceeds safe pixel count (avoids GCP Vision "Bad image data")
-                if (
-                    PIL_AVAILABLE
-                    and resample is not None
-                    and getattr(image, "width", None)
-                    and getattr(image, "height", None)
-                ):
-                    w, h = image.width, image.height
-                    pixels = w * h
-                    if pixels > OCR_MAX_IMAGE_PIXELS:
-                        ratio = (OCR_MAX_IMAGE_PIXELS / pixels) ** 0.5
-                        new_w = max(1, int(w * ratio))
-                        new_h = max(1, int(h * ratio))
-                        image = image.resize((new_w, new_h), resample)
-                        logger.warning(
-                            "PDF page %s image too large (%s pixels); resized to %sx%s for OCR",
-                            i + 1,
-                            pixels,
-                            new_w,
-                            new_h,
-                        )
+        from app.processing.ocr import native_page_jpeg
 
-                # Convert PIL image to bytes
-                img_byte_arr = BytesIO()
-                image.save(img_byte_arr, format="PNG")
-                img_bytes = img_byte_arr.getvalue()
-
-                # Extract text using GCP Vision API
-                page_text = FileProcessor.extract_text_from_image(img_bytes)
-
-                if (
-                    page_text
-                    and not page_text.startswith("[Error")
-                    and not page_text.startswith("[No text")
-                ):
-                    extracted_texts.append(page_text)
-                    extracted_page_numbers.append(i + 1)
-
-            if extracted_texts:
-                # OCR also reads the publisher header/footer imprinted on each
-                # page image, so strip the repeated boilerplate here too.
-                full_text = _strip_repeated_pdf_boilerplate(
-                    extracted_texts,
-                    page_numbers=extracted_page_numbers,
-                    mark_pages=mark_pages,
-                )
-                if not full_text:
-                    full_text = "\n\n".join(extracted_texts)
-                logger.success(
-                    "Extracted {} characters from PDF using OCR", len(full_text)
-                )
-                return full_text
-            else:
+        try:
+            page_count = FileProcessor._pdf_page_count(pdf_data)
+            if page_count <= 0:
                 return "[No text could be extracted from PDF images]"
+            reader = None
+            try:
+                reader = PyPDF2.PdfReader(BytesIO(pdf_data)) if PDF_AVAILABLE else None
+                if reader is not None and len(reader.pages) != page_count:
+                    reader = None  # disagreeing parsers: render every page
+            except Exception:
+                reader = None
+
+            results = []
+            sources = {"native": 0, "render": 0}
+            with ThreadPoolExecutor(max_workers=OCR_PAGE_WORKERS) as pool:
+                pending = []
+                for number in range(1, page_count + 1):
+                    native, size_in = None, None
+                    if reader is not None:
+                        try:
+                            page = reader.pages[number - 1]
+                            size_in = (float(page.mediabox.width) / 72, float(page.mediabox.height) / 72)
+                            native = native_page_jpeg(page, reader)
+                        except Exception:
+                            native = None
+                    # Each worker runs in a copy of this context: the usage
+                    # scope (OCR billing) and log correlation ids carry over.
+                    ctx = contextvars.copy_context()
+                    pending.append(pool.submit(ctx.run, FileProcessor._ocr_pdf_page, pdf_data, number, native, size_in))
+                    if len(pending) >= OCR_PAGE_WORKERS * 2:
+                        results.append(pending.pop(0).result())
+                results.extend(f.result() for f in pending)
+
+            results.sort(key=lambda r: r[0])
+            texts, numbers, failed, low = [], [], [], {}
+            for number, source, result in results:
+                sources[source] = sources.get(source, 0) + 1
+                if result.ok:
+                    texts.append(result.text)
+                    numbers.append(number)
+                    if result.low_confidence:
+                        low[number] = result.confidence
+                else:
+                    failed.append(number)
+                    if result.error:
+                        logger.warning("OCR could not read PDF page {}: {}", number, result.error)
+            logger.info(
+                "PDF OCR: {} page(s), {} from the scan's own image, {} rendered, "
+                "{} unreadable, {} low-confidence",
+                page_count, sources.get("native", 0), sources.get("render", 0), len(failed), len(low),
+            )
+            if not texts:
+                return "[No text could be extracted from PDF images]"
+
+            # OCR also reads the publisher header/footer imprinted on each
+            # page image, so strip the repeated boilerplate here too.
+            full_text = _strip_repeated_pdf_boilerplate(texts, page_numbers=numbers, mark_pages=mark_pages)
+            if not full_text:
+                full_text = "\n\n".join(texts)
+            if mark_pages:
+                # Notes go in AFTER the boilerplate strip: identical notes on
+                # many pages would otherwise be removed as a running header.
+                full_text = _add_ocr_page_notes(full_text, failed, low)
+            logger.success("Extracted {} characters from PDF using OCR", len(full_text))
+            return full_text
 
         except Exception as e:
             logger.error("Error extracting text from PDF with OCR: {}", str(e))

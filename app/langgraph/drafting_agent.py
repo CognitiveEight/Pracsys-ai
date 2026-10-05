@@ -496,11 +496,9 @@ def _looks_like_forbidden_act(text: str) -> bool:
 
 def _filename_for_extraction(name: Optional[str], extension: Optional[str]) -> str:
     """Produce a filename with extension so FileProcessor can route extraction."""
-    name = (name or "template").strip()
-    ext = (extension or "").strip().lstrip(".").lower()
-    if ext and not name.lower().endswith("." + ext):
-        return f"{name}.{ext}"
-    return name
+    from app.processing.file_handlers import filename_for_extraction
+
+    return filename_for_extraction((name or "").strip() or "template", extension)
 
 
 def _word_count(text: str) -> int:

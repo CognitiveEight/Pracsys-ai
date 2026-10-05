@@ -29,6 +29,8 @@ from app.core.config import settings
 
 _PAGE_MARKER_RE = re.compile(r"^---\s*Page\s+\d+\s*---\s*$", re.I)
 OMISSION = "[… omitted …]"
+#: The label every spreadsheet row block opens with (app/processing/tables.py).
+_SHEET_BLOCK_RE = re.compile(r"^Sheet: (.+?)(?: \(hidden\))? \(rows? (\d+)(?:-(\d+))?\)$")
 
 _DATE = (
     r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b"
@@ -105,6 +107,35 @@ def _page_marker_before(text: str, offset: int) -> str:
     return line if _PAGE_MARKER_RE.match(line) else ""
 
 
+def _omission_marker(content: str, paras: List[Tuple[int, int]], cut: range) -> str:
+    """The cut marker. For spreadsheet blocks it names the rows left out, and
+    points at the workbook summary, whose figures cover every row, so a panel
+    never presents a total over the rows it happened to keep."""
+    ranges: List[List] = []
+    for i in cut:
+        a, b = paras[i]
+        first_line = content[a:b].lstrip().split("\n", 1)[0]
+        m = _SHEET_BLOCK_RE.match(first_line)
+        if not m:
+            return OMISSION
+        sheet, lo = m.group(1), int(m.group(2))
+        hi = int(m.group(3) or lo)
+        if ranges and ranges[-1][0] == sheet:
+            ranges[-1][2] = hi
+        else:
+            ranges.append([sheet, lo, hi])
+    if not ranges:
+        return OMISSION
+    spans = "; ".join(
+        f'sheet "{sh}" row {lo}' if lo == hi else f'sheet "{sh}" rows {lo}-{hi}'
+        for sh, lo, hi in ranges
+    )
+    return (
+        f"[… omitted: {spans}. Counts and totals over every row are in the "
+        "workbook summary at the top of this document …]"
+    )
+
+
 def fit_to_budget(content: str, budget: int, profile: str = "general") -> str:
     """Return ``content`` unchanged if it fits, else a faithful excerpt.
 
@@ -156,12 +187,12 @@ def fit_to_budget(content: str, budget: int, profile: str = "general") -> str:
         a, b = paras[i]
         piece = content[a:b].strip()
         if prev != -1 and i != prev + 1:
-            out.append(OMISSION)
+            out.append(_omission_marker(content, paras, range(prev + 1, i)))
             marker = _page_marker_before(content, a)
             if marker and not piece.startswith("--- Page"):
                 out.append(marker)
         out.append(piece)
         prev = i
     if prev != len(paras) - 1:
-        out.append(OMISSION)
+        out.append(_omission_marker(content, paras, range(prev + 1, len(paras))))
     return "\n\n".join(out)

@@ -207,10 +207,81 @@ except ImportError:
     DOC_AVAILABLE = False
     logger.warning("docx2txt not available")
 
+try:
+    import openpyxl
+
+    XLSX_AVAILABLE = True
+except ImportError:
+    XLSX_AVAILABLE = False
+    logger.warning("openpyxl not available")
+
+try:
+    from pptx import Presentation
+
+    PPTX_AVAILABLE = True
+except ImportError:
+    PPTX_AVAILABLE = False
+    logger.warning("python-pptx not available")
+
 
 AUDIO_EXTENSIONS = (
     ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".opus", ".webm", ".aac",
 )
+
+XLSX_EXTENSIONS = (".xlsx", ".xlsm")
+PPTX_EXTENSIONS = (".pptx",)
+# Legacy binary Office formats. Without a dedicated parser these used to fall
+# into the OLE2 sniff and come out of the DOC extractor as raw-byte noise; they
+# are now rejected explicitly so the readability score reports a failure.
+LEGACY_OFFICE_EXTENSIONS = (".xls", ".ppt")
+_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp")
+#: Every extension routed by name in ``process_file_by_extension``; anything
+#: else is identified from its content.
+KNOWN_EXTENSIONS = frozenset(
+    AUDIO_EXTENSIONS + XLSX_EXTENSIONS + PPTX_EXTENSIONS + LEGACY_OFFICE_EXTENSIONS
+    + _IMAGE_EXTENSIONS + (".pdf", ".docx", ".doc", ".txt", ".md", ".markdown")
+)
+
+# A slide with less text than this of its own has its pictures OCR'd (it is
+# most likely a scanned page pasted onto a slide). The cap bounds Vision spend
+# on a photo-heavy deck; each OCR'd picture is billed as one ocrUnit.
+PPTX_OCR_TEXT_THRESHOLD = 20
+PPTX_MAX_OCR_IMAGES = 50
+
+
+def filename_for_extraction(name: Optional[str], extension: Optional[str]) -> str:
+    """Return ``name`` with ``extension`` appended when it is missing.
+
+    The backend's display ``filename`` ("annexure-3-age-verification-test-results")
+    carries no suffix; the ``extension`` field is the only type signal. Use the
+    result for ROUTING only (``process_file_by_extension``, ``is_audio_file``)
+    and keep the original name for storage and display.
+    """
+    name = (name or "").strip()
+    ext = (extension or "").strip().lstrip(".").lower()
+    if ext and not name.lower().endswith("." + ext):
+        return f"{name}.{ext}"
+    return name
+
+
+def _zip_office_kind(data: bytes) -> str:
+    """Identify a ZIP-based Office file by its parts: ``xlsx``/``pptx``/``docx``.
+
+    Falls back to ``docx``, which is what every ``PK`` payload was treated as
+    before spreadsheets and decks were supported.
+    """
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as zf:
+            names = set(zf.namelist())
+    except (zipfile.BadZipFile, ValueError):
+        return "docx"
+    if "xl/workbook.xml" in names:
+        return "xlsx"
+    if "ppt/presentation.xml" in names:
+        return "pptx"
+    return "docx"
 
 
 class FileProcessor:
@@ -232,6 +303,18 @@ class FileProcessor:
         if not filename:
             return False
         return filename.lower().endswith(AUDIO_EXTENSIONS)
+
+    @staticmethod
+    def is_spreadsheet(filename: str, data: bytes = b"") -> bool:
+        """True for an XLSX/XLSM workbook: by extension, or by content when the
+        name carries no recognised extension (the same sniff
+        ``process_file_by_extension`` falls back to)."""
+        name = (filename or "").lower()
+        if name.endswith(XLSX_EXTENSIONS):
+            return True
+        if os.path.splitext(name)[1] in KNOWN_EXTENSIONS:
+            return False
+        return bool(data) and data.startswith(b"PK") and _zip_office_kind(data) == "xlsx"
 
     @staticmethod
     def extract_text_from_image(image_data: bytes) -> str:
@@ -715,6 +798,186 @@ class FileProcessor:
         return f"{n}."
 
     @staticmethod
+    def extract_text_from_xlsx(xlsx_data: bytes) -> str:
+        """Extract text from an XLSX/XLSM workbook.
+
+        Parsing and rendering live in ``app/processing/tables.py``: a workbook
+        summary computed from every row, then the rows in blocks that each
+        restate the sheet, the row range and the header. Evidence ingestion
+        does not come through here; ``DocumentProcessor`` uses the parsed
+        tables directly so it can redact by column and store the rows. This
+        text-only path serves chat attachments and content-sniffed files.
+        """
+        if not XLSX_AVAILABLE:
+            logger.warning(
+                "XLSX processing library not available. Cannot extract text from XLSX."
+            )
+            return "[XLSX content - XLSX processing not available]"
+        try:
+            from app.processing.tables import extract_text
+
+            return extract_text(xlsx_data).strip()
+        except Exception as e:
+            logger.error("Error extracting text from XLSX: {}", str(e))
+            return f"[Error extracting text from XLSX: {str(e)}]"
+
+    @staticmethod
+    def _pptx_shape_lines(shape, lines: List[str], pictures: List[Any]) -> None:
+        """Append one shape's text to ``lines``, recursing into groups.
+
+        Picture shapes are collected into ``pictures`` for optional OCR.
+        """
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            for child in FileProcessor._pptx_reading_order(shape.shapes):
+                FileProcessor._pptx_shape_lines(child, lines, pictures)
+            return
+        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+            pictures.append(shape)
+            return
+        if getattr(shape, "has_table", False) and shape.has_table:
+            for row in shape.table.rows:
+                cells = [
+                    re.sub(r"\s+", " ", cell.text).strip() for cell in row.cells
+                ]
+                if any(cells):
+                    lines.append(" | ".join(cells))
+            return
+        if getattr(shape, "has_chart", False) and shape.has_chart:
+            FileProcessor._pptx_chart_lines(shape.chart, lines)
+            return
+        if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
+            # python-pptx renders a soft line break (<a:br>) as a vertical tab.
+            text = shape.text_frame.text.replace("\v", "\n").strip()
+            if text:
+                lines.append(text)
+
+    @staticmethod
+    def _pptx_chart_lines(chart, lines: List[str]) -> None:
+        """Append a chart's title and its data points as text.
+
+        A chart in a presentation is often the only place a figure appears,
+        so its numbers are extracted rather than dropped with the graphic.
+        """
+        try:
+            title = ""
+            if chart.has_title and chart.chart_title.has_text_frame:
+                title = chart.chart_title.text_frame.text.strip()
+            lines.append(f"Chart: {title}" if title else "Chart:")
+            for plot in chart.plots:
+                categories = [str(c) for c in plot.categories]
+                for series in plot.series:
+                    from app.processing.tables import make_cell
+
+                    values = [make_cell(v).display for v in series.values]
+                    if categories and len(categories) == len(values):
+                        points = ", ".join(
+                            f"{c} = {v}" for c, v in zip(categories, values)
+                        )
+                    else:
+                        points = ", ".join(values)
+                    lines.append(f"{series.name or 'Series'}: {points}")
+        except Exception as e:
+            # Chart XML varies a lot by producer; a chart that will not parse
+            # must not lose the rest of the slide.
+            logger.warning("Could not read chart data from PPTX: {}", str(e))
+
+    @staticmethod
+    def _pptx_reading_order(shapes) -> list:
+        """Order shapes top-to-bottom, then left-to-right.
+
+        ``slide.shapes`` is in z-order (the order they were drawn), which often
+        puts a caption before the body it belongs under.
+        """
+        return sorted(
+            shapes, key=lambda s: ((s.top or 0), (s.left or 0))
+        )
+
+    @staticmethod
+    def extract_text_from_pptx(pptx_data: bytes, mark_pages: bool = False) -> str:
+        """Extract text from a PPTX deck, slide by slide.
+
+        Each slide gives its title, then its text boxes, tables and chart data
+        in reading order, then its speaker notes. Hidden slides are included
+        and labelled. With ``mark_pages`` each slide is preceded by
+        ``--- Page N ---``, where N is the slide number. That is the page the
+        slide lands on when the deck is exported to PDF, so chunk page ranges
+        and citations point at the slide the lawyer sees.
+
+        A slide with almost no text of its own (a scanned page pasted in as a
+        picture, which is common for annexures) has its pictures OCR'd through
+        ``extract_text_from_image``, so OCR is metered there exactly as it is
+        for PDFs.
+        """
+        if not PPTX_AVAILABLE:
+            logger.warning(
+                "PPTX processing library not available. Cannot extract text from PPTX."
+            )
+            return "[PPTX content - PPTX processing not available]"
+
+        try:
+            deck = Presentation(BytesIO(pptx_data))
+            output: List[str] = []
+            ocr_images = 0
+            for number, slide in enumerate(deck.slides, start=1):
+                title_shape = slide.shapes.title
+                title = (
+                    title_shape.text_frame.text.replace("\v", " ").strip()
+                    if title_shape is not None and title_shape.has_text_frame
+                    else ""
+                )
+                lines: List[str] = []
+                pictures: List[Any] = []
+                for shape in FileProcessor._pptx_reading_order(slide.shapes):
+                    if title_shape is not None and shape.shape_id == title_shape.shape_id:
+                        continue
+                    FileProcessor._pptx_shape_lines(shape, lines, pictures)
+
+                own_text = len(title) + sum(len(line) for line in lines)
+                if pictures and own_text < PPTX_OCR_TEXT_THRESHOLD:
+                    for picture in pictures:
+                        if ocr_images >= PPTX_MAX_OCR_IMAGES:
+                            break
+                        try:
+                            blob = picture.image.blob
+                        except Exception:
+                            continue  # linked, not embedded: nothing to read
+                        ocr_images += 1
+                        ocr_text = FileProcessor.extract_text_from_image(blob)
+                        if ocr_text and not ocr_text.startswith("["):
+                            lines.append(ocr_text.strip())
+
+                notes = ""
+                if slide.has_notes_slide:
+                    notes_frame = slide.notes_slide.notes_text_frame
+                    if notes_frame is not None:
+                        notes = notes_frame.text.replace("\v", "\n").strip()
+
+                heading = f"Slide {number}: {title}" if title else f"Slide {number}"
+                if slide._element.get("show") == "0":
+                    heading += " (hidden)"
+                parts = [heading, *lines]
+                if notes:
+                    parts.append(f"Speaker notes: {notes}")
+                # Same marker layout as the PDF path: marker, newline, body.
+                if mark_pages:
+                    parts.insert(0, f"--- Page {number} ---")
+                output.append("\n".join(parts))
+
+            text = "\n\n".join(output)
+            logger.success(
+                "Extracted {} characters from PPTX ({} slides, {} images OCR'd)",
+                len(text),
+                len(deck.slides),
+                ocr_images,
+            )
+            return text.strip()
+        except Exception as e:
+            logger.error("Error extracting text from PPTX: {}", str(e))
+            return f"[Error extracting text from PPTX: {str(e)}]"
+
+    @staticmethod
     def extract_text_from_txt(txt_data: bytes) -> str:
         """Extract text from TXT file with encoding detection."""
         try:
@@ -784,6 +1047,25 @@ class FileProcessor:
             )
             return "[Audio file - transcription handled by document_processor]"
 
+        # Spreadsheets and decks. Checked before images: the image test below
+        # is a substring match, and a suffix is the stronger signal.
+        if filename_lower.endswith(XLSX_EXTENSIONS):
+            logger.info("Processing XLSX file: {}", filename)
+            return FileProcessor.extract_text_from_xlsx(file_data)
+
+        if filename_lower.endswith(PPTX_EXTENSIONS):
+            logger.info("Processing PPTX file: {}", filename)
+            return FileProcessor.extract_text_from_pptx(
+                file_data, mark_pages=mark_pages
+            )
+
+        if filename_lower.endswith(LEGACY_OFFICE_EXTENSIONS):
+            logger.warning("Unsupported legacy Office format: {}", filename)
+            return (
+                "[Unsupported file format - legacy .xls/.ppt files cannot be read; "
+                "re-save as .xlsx/.pptx]"
+            )
+
         # Image files
         if any(
             ext in filename_lower
@@ -824,7 +1106,14 @@ class FileProcessor:
                 return FileProcessor.extract_text_from_pdf(
                     file_data, mark_pages=mark_pages
                 )
-            elif file_data.startswith(b"PK"):  # ZIP-based formats like DOCX
+            elif file_data.startswith(b"PK"):  # ZIP-based Office: DOCX/XLSX/PPTX
+                kind = _zip_office_kind(file_data)
+                if kind == "xlsx":
+                    return FileProcessor.extract_text_from_xlsx(file_data)
+                if kind == "pptx":
+                    return FileProcessor.extract_text_from_pptx(
+                        file_data, mark_pages=mark_pages
+                    )
                 return FileProcessor.extract_text_from_docx(file_data)
             elif file_data.startswith(b"\xd0\xcf\x11\xe0"):  # OLE2 format (DOC files)
                 return FileProcessor.extract_text_from_doc(file_data)

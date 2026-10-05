@@ -422,7 +422,12 @@ class ChatMixin:
                     continue
                 out.append(Citation(**c))
             except Exception as cite_err:
-                logger.debug("Dropping malformed citation {}: {}", c, cite_err)
+                # Keys only: a citation carries a verbatim document quote.
+                logger.debug(
+                    "Dropping malformed citation (keys={}): {}",
+                    sorted(c) if isinstance(c, dict) else type(c).__name__,
+                    cite_err,
+                )
         return out or None
 
     async def _emit_document_feature(
@@ -1203,6 +1208,10 @@ class ChatMixin:
                     workspace_state["evidence_index"] = pack.to_state()
                     if pack.graph_facts:
                         workspace_state["graph_facts"] = list(pack.graph_facts)
+                    if pack.table_notes:
+                        workspace_state["table_notes"] = list(pack.table_notes)
+                    if any(i.sheet for i in pack.items.values()):
+                        workspace_state["has_spreadsheet_evidence"] = True
                 else:
                     # Select which documents to include.
                     selected_ids: List[str] = []

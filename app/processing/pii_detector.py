@@ -233,7 +233,7 @@ def _looks_like_real_aadhaar(digits: str) -> bool:
     return True
 
 
-def extract_aadhaar(text: str) -> List[PIIMatch]:
+def extract_aadhaar(text: str, allow_checksum_only: bool = True) -> List[PIIMatch]:
     """Aadhaar-aware extraction with cue-based filtering.
 
     A 12-digit run is only treated as Aadhaar when EITHER of:
@@ -245,6 +245,11 @@ def extract_aadhaar(text: str) -> List[PIIMatch]:
     This balance avoids masking long account numbers and transaction IDs
     while still catching Aadhaar numbers in OCR output where the header
     word may be mis-recognised.
+
+    ``allow_checksum_only=False`` drops (b): a cue is then required. About
+    one random 12-digit number in ten passes Verhoeff, so in a spreadsheet,
+    where a column of transaction or roll numbers sits under its own header,
+    (b) alone would mask a tenth of them at random.
     """
     matches: List[PIIMatch] = []
     seen: set = set()
@@ -256,7 +261,11 @@ def extract_aadhaar(text: str) -> List[PIIMatch]:
         window_end = min(len(text), m.end() + 40)
         window = text[window_start:window_end]
         has_cue = bool(cue_re.search(window))
-        passes_shape = _looks_like_real_aadhaar(digits) and _verhoeff_valid(digits)
+        passes_shape = (
+            allow_checksum_only
+            and _looks_like_real_aadhaar(digits)
+            and _verhoeff_valid(digits)
+        )
         if not (has_cue or passes_shape):
             continue
         if digits in seen:
@@ -363,20 +372,54 @@ _EXTRACTORS = (
     extract_bank_accounts,
 )
 
+#: Under ``strict_context``, the shape-only patterns need a word naming them.
+#: "A1234567" is a passport number in a KYC form and a part number in an
+#: inventory sheet; only the context can tell.
+_STRICT_CUES = {
+    "passport_number": re.compile(r"\bpassport\b", re.I),
+    "voter_id_number": re.compile(r"\b(epic|voter|elector(al)?)\b", re.I),
+    "driving_licence_number": re.compile(r"\b(dl|driving|licen[cs]e)\b", re.I),
+}
+#: The fourth character of a real PAN is the holder type (P person, C company,
+#: H HUF, F firm, A AOP, T trust, B BOI, L local authority, J juridical, G govt).
+_PAN_HOLDER_TYPES = frozenset("PCHFATBLJG")
 
-def scan_text(text: str) -> PIIScanResult:
+
+def scan_text(text: str, *, strict_context: bool = False) -> PIIScanResult:
     """Detect identifiers and produce a redacted copy of ``text``.
 
     Overlapping matches are resolved by preferring the earliest match;
     later matches that overlap an already-redacted span are dropped from
     the redaction pass but still recorded (so sensitive_fields is complete).
+
+    ``strict_context`` is for short texts whose context is given explicitly:
+    one spreadsheet cell prefixed with its column header
+    (``app/processing/tables.py``). Each identifier then needs its cue in that
+    text: an Aadhaar number no longer qualifies on checksum alone, passport /
+    voter-ID / licence shapes need their own word, and a PAN must carry a real
+    holder-type letter.
     """
     if not text:
         return PIIScanResult(redacted_text=text or "", matches=[])
 
     all_matches: List[PIIMatch] = []
     for extractor in _EXTRACTORS:
-        all_matches.extend(extractor(text))
+        if extractor is extract_aadhaar:
+            found = extract_aadhaar(text, allow_checksum_only=not strict_context)
+        else:
+            found = extractor(text)
+        if strict_context:
+            found = [
+                m
+                for m in found
+                if (cue := _STRICT_CUES.get(m.field_type)) is None or cue.search(text)
+            ]
+            found = [
+                m
+                for m in found
+                if m.field_type != "pan_number" or m.raw[3:4] in _PAN_HOLDER_TYPES
+            ]
+        all_matches.extend(found)
 
     if not all_matches:
         return PIIScanResult(redacted_text=text, matches=[])

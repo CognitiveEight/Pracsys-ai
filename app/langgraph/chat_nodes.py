@@ -527,6 +527,25 @@ CACHED ANALYSIS REPORT (same data as the Analysis Report panel; use for question
             "passages above):\n" + "\n".join(graph_facts[:30]) + "\n"
         )
 
+    # 5b-3. Spreadsheet calculations (app/rag/table_query.py): computed in code
+    # over every row. The rule applies whenever a spreadsheet is in evidence:
+    # the passages above may show only some of its rows.
+    table_notes = workspace_state.get("table_notes") or []
+    if table_notes or workspace_state.get("has_spreadsheet_evidence"):
+        section = "\nSPREADSHEET CALCULATIONS (computed by the system over every row; exact):\n"
+        section += "\n".join(table_notes) if table_notes else "(none were needed for this question)"
+        section += (
+            "\nRules for spreadsheets: any count, total, average, minimum, maximum, "
+            "percentage or list of matching rows must come from a [T#] result above. "
+            "Copy its figures exactly and cite its [T#] label. Never count, add up or "
+            "average spreadsheet rows yourself from the passages: they may show only "
+            "some rows. If a result is marked NOT COMPUTED, or none covers what was "
+            "asked, say that the figure could not be computed from the spreadsheet; "
+            "do not estimate it. Individual cells may still be quoted from the "
+            "passages with their [E#] label.\n"
+        )
+        context_sections.append(section)
+
     # 5c. Chat attachment (file supplied with this message)
     chat_attachment = workspace_state.get("chat_attachment") or []
     if chat_attachment:

@@ -29,7 +29,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
-from app.rag.citations import _best_quote, _figures, _normalised
+from app.rag.citations import (
+    _best_quote,
+    _figures,
+    _normalised,
+    contains_figure,
+    sheet_location,
+)
 from app.rag.evidence import EvidencePack
 from app.rag.sparse import tokens
 
@@ -77,7 +83,7 @@ class Attributor:
             for item, norm, toks in self.items:
                 if restrict and item.document_id != restrict:
                     continue
-                fig_hits = sum(1 for f in figs if f in norm)
+                fig_hits = sum(1 for f in figs if contains_figure(norm, f))
                 overlap = len(words & toks) / len(words) if words else 0.0
                 if figs and fig_hits == 0:
                     continue
@@ -92,7 +98,7 @@ class Attributor:
             return None
         item = best[1]
         quote, at = _best_quote(item, claim + " " + anchor)
-        return {
+        cite = {
             "type": "document",
             "documentId": item.document_id,
             "annexure": item.annexure,
@@ -101,6 +107,10 @@ class Attributor:
             "timestamp": item.time_start,
             "quote": quote or None,
         }
+        if item.sheet:
+            # Spreadsheets have no pages: the sheet and exact row locate it.
+            cite.update(sheet_location(item, quote, at))
+        return cite
 
 
 async def attributor_for(workspace_id: str) -> Optional[Attributor]:
@@ -163,13 +173,15 @@ def _attribute_dated(entries: Any, attributor: Attributor) -> int:
 
 def _date_forms(iso: str) -> str:
     """Common written forms of an ISO date, so a passage that says
-    12/03/2024 or 12.03.2024 anchors an entry dated 2024-03-12."""
+    12/03/2024 or 12.03.2024 anchors an entry dated 2024-03-12. The ISO form
+    itself is included: spreadsheet cells are written that way, and without it
+    no chronology entry taken from a sheet could ever be cited."""
     m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", iso.strip())
     if not m:
         return iso
     y, mo, d = m.groups()
-    return " ".join({f"{d}/{mo}/{y}", f"{d}.{mo}.{y}", f"{d}-{mo}-{y}",
-                     f"{int(d)}/{int(mo)}/{y}", f"{int(d)}.{int(mo)}.{y}"})
+    return " ".join(sorted({f"{y}-{mo}-{d}", f"{d}/{mo}/{y}", f"{d}.{mo}.{y}", f"{d}-{mo}-{y}",
+                            f"{int(d)}/{int(mo)}/{y}", f"{int(d)}.{int(mo)}.{y}"}))
 
 
 def _attribute_statements(items: Any, attributor: Attributor, *keys: str) -> int:

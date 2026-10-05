@@ -139,6 +139,12 @@ class Settings(BaseSettings):
     # Evidence chunks (dense + sparse vectors) live in their own collection; the
     # collection above keeps the state/role caches. None → "<name>_evidence_v1".
     qdrant_chunks_collection: Optional[str] = None
+    # Spreadsheet rows (no vectors; app/rag/table_query.py computes over them).
+    # None → "<name>_tables_v1".
+    qdrant_tables_collection: Optional[str] = None
+    # Spreadsheet calculations in chat (app/rag/table_query.py). Off → no
+    # [T#] results; the prompt then forbids totals over partial rows.
+    table_query_enabled: bool = True
     # Characters of document text one panel prompt may carry (~4 chars/token).
     # Documents over their share are excerpted by relevance, not cut from the
     # front (app/rag/packing.py). Raising it improves recall at token cost.

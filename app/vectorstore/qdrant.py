@@ -8,7 +8,8 @@ is not dropped during init/timeouts.
 
 import asyncio
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+import bisect
+from typing import Any, Dict, List, Optional, Sequence
 from uuid import NAMESPACE_DNS, uuid5
 
 from loguru import logger
@@ -31,6 +32,13 @@ DENSE_VECTOR = "dense"
 SPARSE_VECTOR = "lexical"
 #: Points per upsert request.
 _UPSERT_BATCH = 64
+#: Spreadsheet rows per upsert request (no vectors, so far smaller points).
+_TABLE_UPSERT_BATCH = 256
+#: Kinds of point in the tables collection.
+TABLE_MANIFEST = "manifest"
+TABLE_ROW = "row"
+#: Row sets kept in memory for repeated calculations in one conversation.
+_TABLE_ROW_CACHE_SIZE = 16
 
 
 #: Per-chunk keys that are not properties of the document as a whole.
@@ -63,6 +71,27 @@ def _document_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in (meta or {}).items() if k not in _CHUNK_ONLY_KEYS}
 
 
+def _chunk_row_metadata(chunk: Any, row_index: Optional[Sequence[Any]]) -> Dict[str, Any]:
+    """Spreadsheet location of one chunk: its sheet, row range, and the row of
+    each line as ``[offset_in_chunk, row, sheet]`` (see EvidenceItem.row_at)."""
+    if not row_index:
+        return {}
+    offsets = [r.offset for r in row_index]
+    lo = bisect.bisect_left(offsets, chunk.char_start)
+    hi = bisect.bisect_left(offsets, chunk.char_end)
+    inside = row_index[lo:hi]
+    if not inside:
+        return {}
+    sheet = inside[0].sheet
+    rows = [r.row for r in inside if r.sheet == sheet]
+    return {
+        "sheet": sheet,
+        "row_start": min(rows),
+        "row_end": max(rows),
+        "row_offsets": [[r.offset - chunk.char_start, r.row, r.sheet] for r in inside],
+    }
+
+
 class QdrantStore:
     """
     Qdrant vector store wrapper for managing document embeddings.
@@ -78,6 +107,13 @@ class QdrantStore:
             settings.qdrant_chunks_collection
             or f"{self.collection_name}_evidence_v1"
         )
+        # Spreadsheet rows and per-workbook manifests (app/processing/tables.py).
+        self.tables_collection = (
+            settings.qdrant_tables_collection
+            or f"{self.collection_name}_tables_v1"
+        )
+        # (workspace, document, sheet_index, evidence_version) -> rows.
+        self._table_row_cache: Dict[tuple, List[Dict[str, Any]]] = {}
         # Workspaces whose legacy chunks have been re-indexed into the chunk
         # collection in this process (see ensure_workspace_indexed).
         self._indexed_workspaces: set = set()
@@ -124,6 +160,7 @@ class QdrantStore:
             logger.debug("Collection already exists: {}", self.collection_name)
         self._ensure_payload_indexes_sync()
         self._ensure_chunks_collection_sync()
+        self._ensure_tables_collection_sync()
 
     def _ensure_chunks_collection_sync(self) -> None:
         """Evidence chunks: a dense vector for meaning and a sparse vector with
@@ -142,6 +179,28 @@ class QdrantStore:
                 },
             )
         self._ensure_payload_indexes_sync(self.chunks_collection)
+
+    def _ensure_tables_collection_sync(self) -> None:
+        """Spreadsheet rows: payload only. They are never searched by vector;
+        the evidence chunks do that. Rows are read whole for computation."""
+        if not self.client.collection_exists(self.tables_collection):
+            logger.info("Creating spreadsheet table collection: {}", self.tables_collection)
+            self.client.create_collection(
+                collection_name=self.tables_collection, vectors_config={}
+            )
+        self._ensure_payload_indexes_sync(self.tables_collection)
+        for field_name, schema in (
+            ("record", PayloadSchemaType.KEYWORD),
+            ("sheet_index", PayloadSchemaType.INTEGER),
+        ):
+            try:
+                self.client.create_payload_index(
+                    collection_name=self.tables_collection,
+                    field_name=field_name,
+                    field_schema=schema,
+                )
+            except Exception as index_err:
+                logger.debug("Payload index on {} not created: {}", field_name, index_err)
 
     def _ensure_payload_indexes_sync(self, collection: Optional[str] = None) -> None:
         """Index the fields every query filters on. Idempotent; best-effort.
@@ -600,6 +659,7 @@ class QdrantStore:
         document_id: str,
         text: str,
         metadata: Optional[Dict[str, Any]] = None,
+        row_index: Optional[Sequence[Any]] = None,
     ) -> int:
         """Chunk, embed and store one document in the evidence collection.
 
@@ -608,11 +668,18 @@ class QdrantStore:
         Embedding failures keep the chunk (flagged ``embedding_failed``) so
         whole-document reads still see the text; only dense search skips it.
 
+        ``row_index`` (spreadsheets: ``RenderedRow`` offsets from
+        ``app/processing/tables.py``) gives each chunk its ``sheet``,
+        ``row_start``/``row_end`` and the row of every line, so a citation names
+        the spreadsheet row. Spreadsheet chunks carry no overlap: repeated rows
+        would be counted twice by anything that reads two adjacent chunks.
+
         Returns the number of chunks stored.
         """
         if self.client is None:
             await self.initialize()
-        chunks = chunk_text(text)
+        is_table = bool(row_index) or (metadata or {}).get("format") == "spreadsheet"
+        chunks = chunk_text(text, with_overlap=not is_table)
         if not chunks:
             return 0
         doc_meta = {k: v for k, v in (metadata or {}).items() if k not in _CHUNK_ONLY_KEYS}
@@ -659,6 +726,7 @@ class QdrantStore:
             chunk_meta = {
                 **doc_meta,
                 **chunk.as_metadata(),
+                **_chunk_row_metadata(chunk, row_index),
                 "original_document_id": document_id,
                 "total_chunks": len(chunks),
                 "is_chunk": len(chunks) > 1,
@@ -702,6 +770,162 @@ class QdrantStore:
             workspace_id,
         )
         return len(points)
+
+    # ------------------------------------------------------------------
+    # Spreadsheet rows (app/processing/tables.py, app/rag/table_query.py)
+    # ------------------------------------------------------------------
+
+    def _drop_table_cache(self, workspace_id: str) -> None:
+        for key in [k for k in self._table_row_cache if k[0] == workspace_id]:
+            del self._table_row_cache[key]
+
+    def _table_filter(
+        self,
+        workspace_id: str,
+        document_id: Optional[str] = None,
+        record: Optional[str] = None,
+        sheet_index: Optional[int] = None,
+    ) -> Filter:
+        must = [FieldCondition(key="workspace_id", match=MatchValue(value=workspace_id))]
+        if document_id is not None:
+            must.append(
+                FieldCondition(key="original_document_id", match=MatchValue(value=document_id))
+            )
+        if record is not None:
+            must.append(FieldCondition(key="record", match=MatchValue(value=record)))
+        if sheet_index is not None:
+            must.append(FieldCondition(key="sheet_index", match=MatchValue(value=sheet_index)))
+        return Filter(must=must)
+
+    async def replace_document_tables(
+        self,
+        workspace_id: str,
+        document_id: str,
+        manifest: Dict[str, Any],
+        rows: Sequence[Dict[str, Any]],
+        filename: str = "",
+    ) -> int:
+        """Store a workbook's manifest and rows, replacing any earlier version.
+
+        The old rows are deleted first, so a re-read workbook with fewer rows
+        leaves no stale tail. The manifest is written LAST: a reader that finds
+        it can trust the rows are complete, and an interrupted write leaves no
+        manifest, so the workbook is simply not computable rather than
+        computed over half its rows.
+        """
+        if self.client is None:
+            await self.initialize()
+        await asyncio.to_thread(
+            self.client.delete,
+            collection_name=self.tables_collection,
+            points_selector=models.FilterSelector(
+                filter=self._table_filter(workspace_id, document_id)
+            ),
+        )
+        self._drop_table_cache(workspace_id)
+        base = {"workspace_id": workspace_id, "original_document_id": document_id}
+
+        def _pid(key: str) -> str:
+            return str(uuid5(NAMESPACE_DNS, f"table:{workspace_id}:{document_id}:{key}"))
+
+        points = [
+            PointStruct(
+                id=_pid(f"{r['sheet_index']}:{r['row']}"),
+                vector={},
+                payload={**base, "record": TABLE_ROW, **r},
+            )
+            for r in rows
+        ]
+        for i in range(0, len(points), _TABLE_UPSERT_BATCH):
+            await asyncio.to_thread(
+                self.client.upsert,
+                collection_name=self.tables_collection,
+                points=points[i : i + _TABLE_UPSERT_BATCH],
+            )
+        await asyncio.to_thread(
+            self.client.upsert,
+            collection_name=self.tables_collection,
+            points=[
+                PointStruct(
+                    id=_pid("manifest"),
+                    vector={},
+                    payload={
+                        **base,
+                        "record": TABLE_MANIFEST,
+                        "filename": filename,
+                        "row_count": len(rows),
+                        "manifest": manifest,
+                    },
+                )
+            ],
+        )
+        self._bump_evidence_version(workspace_id)
+        logger.debug(
+            "Stored {} spreadsheet row(s) for document {} (workspace {})",
+            len(points),
+            document_id,
+            workspace_id,
+        )
+        return len(points)
+
+    async def delete_document_tables(self, workspace_id: str, document_id: str) -> None:
+        """Remove one document's rows and manifest (no-op when it has none)."""
+        if self.client is None:
+            await self.initialize()
+        await asyncio.to_thread(
+            self.client.delete,
+            collection_name=self.tables_collection,
+            points_selector=models.FilterSelector(
+                filter=self._table_filter(workspace_id, document_id)
+            ),
+        )
+        self._drop_table_cache(workspace_id)
+
+    async def get_table_manifests(self, workspace_id: str) -> List[Dict[str, Any]]:
+        """``[{document_id, filename, row_count, manifest}]`` for every stored
+        workbook of the workspace. Empty when it has none."""
+        if self.client is None:
+            await self.initialize()
+        points = await asyncio.to_thread(
+            self._scroll_sync,
+            self.tables_collection,
+            self._table_filter(workspace_id, record=TABLE_MANIFEST),
+            100,
+        )
+        out = []
+        for p in points:
+            pl = p.payload or {}
+            out.append(
+                {
+                    "document_id": str(pl.get("original_document_id") or ""),
+                    "filename": pl.get("filename") or "",
+                    "row_count": pl.get("row_count") or 0,
+                    "manifest": pl.get("manifest") or {},
+                }
+            )
+        return out
+
+    async def get_table_rows(
+        self, workspace_id: str, document_id: str, sheet_index: int
+    ) -> List[Dict[str, Any]]:
+        """Every stored row of one sheet, in spreadsheet order."""
+        if self.client is None:
+            await self.initialize()
+        key = (workspace_id, document_id, sheet_index, self.evidence_version(workspace_id))
+        cached = self._table_row_cache.get(key)
+        if cached is not None:
+            return cached
+        points = await asyncio.to_thread(
+            self._scroll_sync,
+            self.tables_collection,
+            self._table_filter(workspace_id, document_id, TABLE_ROW, sheet_index),
+            1000,
+        )
+        rows = sorted((p.payload or {} for p in points), key=lambda r: int(r.get("row") or 0))
+        if len(self._table_row_cache) >= _TABLE_ROW_CACHE_SIZE:
+            self._table_row_cache.pop(next(iter(self._table_row_cache)))
+        self._table_row_cache[key] = rows
+        return rows
 
     async def get_document_chunks(
         self, workspace_id: str, document_ids: Optional[List[str]] = None
@@ -898,6 +1122,16 @@ class QdrantStore:
                     filter=self._chunk_filter(workspace_id, document_ids)
                 ),
             )
+            # And the spreadsheet rows: a deleted workbook must not stay
+            # computable.
+            await asyncio.to_thread(
+                self.client.delete,
+                collection_name=self.tables_collection,
+                points_selector=models.FilterSelector(
+                    filter=self._chunk_filter(workspace_id, document_ids)
+                ),
+            )
+            self._drop_table_cache(workspace_id)
             self._bump_evidence_version(workspace_id)
             if self._graph_withdrawal is not None:
                 await self._graph_withdrawal(workspace_id, list(document_ids))
@@ -940,16 +1174,21 @@ class QdrantStore:
 
             if self.client is None:
                 await self.initialize()
-            # Both collections: the legacy one holds the state caches, the
-            # evidence one holds the document chunks. A compliance purge that
-            # misses either leaves client data behind.
-            for collection in (self.collection_name, self.chunks_collection):
+            # Every collection: the legacy one holds the state caches, the
+            # evidence one the document chunks, the tables one the spreadsheet
+            # rows. A compliance purge that misses any leaves client data behind.
+            for collection in (
+                self.collection_name,
+                self.chunks_collection,
+                self.tables_collection,
+            ):
                 await asyncio.to_thread(
                     self.client.delete,
                     collection_name=collection,
                     points_selector=models.FilterSelector(filter=workspace_filter),
                 )
             self._indexed_workspaces.discard(workspace_id)
+            self._drop_table_cache(workspace_id)
             self._bump_evidence_version(workspace_id)
             if self._graph_withdrawal is not None:
                 # Raises on failure: the compliance purge must retry, not

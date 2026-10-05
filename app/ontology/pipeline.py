@@ -89,12 +89,21 @@ class IngestReport:
 
 
 def chunks_for_extraction(stored: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    """Evidence-store chunk payloads in the shape ``extract_facts`` reads."""
+    """Evidence-store chunk payloads in the shape ``extract_facts`` reads.
+
+    Spreadsheet chunks are left out. The extractor reads legal prose: it has no
+    node for a measurement or a test result, checks no extracted value against
+    the row, and would turn every row into a Party/Event guess (one LLM call per
+    block of a 200K-cell workbook). Spreadsheet facts are served exactly by the
+    row store instead (app/rag/table_query.py).
+    """
     out = []
     for payload in stored:
         meta = payload.get("metadata") or {}
         text = str(payload.get("content") or "").strip()
         if not text or meta.get("is_low_content_marker"):
+            continue
+        if meta.get("format") == "spreadsheet" or meta.get("sheet"):
             continue
         out.append(
             {

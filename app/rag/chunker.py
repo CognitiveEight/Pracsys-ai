@@ -159,8 +159,13 @@ def _overlap_start(text: str, start: int, end: int) -> int:
     return candidate
 
 
-def chunk_text(text: str) -> List[Chunk]:
-    """Chunk extracted document text. Deterministic for the same input."""
+def chunk_text(text: str, with_overlap: bool = True) -> List[Chunk]:
+    """Chunk extracted document text. Deterministic for the same input.
+
+    ``with_overlap=False`` for spreadsheets: a repeated row is harmless in prose
+    and wrong in a table, where reading two adjacent chunks would count it
+    twice.
+    """
     text = text or ""
     if not text.strip():
         return []
@@ -210,7 +215,7 @@ def chunk_text(text: str) -> List[Chunk]:
     for i, (a, b) in enumerate(packed):
         start = a
         overlap = 0
-        if i > 0:
+        if i > 0 and with_overlap:
             start = _overlap_start(text, packed[i - 1][0], packed[i - 1][1])
             start = min(start, a)
             overlap = a - start

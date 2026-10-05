@@ -20,8 +20,8 @@ from app.utils.redact import safe_url
 from app.observability.audit import audit_logger
 from app.observability.trace import tracer
 from app.processing.document_classifier import classify_and_extract
-from app.processing.file_handlers import file_processor
-from app.processing.pii_detector import PIIScanResult, scan_text
+from app.processing.file_handlers import file_processor, filename_for_extraction
+from app.processing.pii_detector import scan_text
 from app.processing.readability import readability_scorer
 from app.utils.exceptions import FileProcessingError
 from app.vectorstore.qdrant import vector_store
@@ -202,6 +202,10 @@ Document excerpt:
             return "doc"
         if suffix in {"txt", "md"}:
             return "text"
+        if suffix in {"xlsx", "xlsm"}:
+            return "spreadsheet"
+        if suffix in {"pptx"}:
+            return "presentation"
         return suffix
 
     @tracer.trace("process_document")
@@ -213,6 +217,7 @@ Document excerpt:
         user_id: str,
         document_id: str,
         metadata: Dict[str, Any] = None,
+        extension: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Process a single document: download, extract, score, store.
@@ -224,6 +229,9 @@ Document excerpt:
             user_id: User identifier
             document_id: Document identifier
             metadata: Additional metadata
+            extension: The backend's ``extension`` field. The display
+                ``filename`` usually has no suffix, so this is the only type
+                signal; it is used to route extraction, never stored.
 
         Returns:
             Processing result with readability score
@@ -235,17 +243,44 @@ Document excerpt:
             workspace_id,
         )
 
+        # Routing name only: storage, display and manifest matching keep the
+        # original ``filename`` so no existing document changes identity.
+        type_name = filename_for_extraction(filename, extension)
+
         try:
             # Download file
             file_content, file_size = await self._download_file(file_url, filename)
 
-            # Audio path: transcribe + diarize via Chirp 3, then treat the formatted
-            # transcript as the document's extracted text so summary/strength/vector
-            # store all keep working unchanged.
             audio_extras: Dict[str, Any] = {}
-            if file_processor.is_audio_file(filename):
+            # Spreadsheets are parsed once into typed tables; text, redaction
+            # and the computable row store all derive from that one parse.
+            table_set = None
+            if file_processor.is_spreadsheet(type_name, file_content):
+                from app.processing.tables import parse_workbook, render_text
+
+                try:
+                    table_set = await asyncio.to_thread(parse_workbook, file_content)
+                    extracted_text, _ = render_text(table_set)
+                    logger.info(
+                        "Spreadsheet parsed: {} sheet(s), {} cell(s), truncated={}",
+                        len(table_set.sheets),
+                        table_set.cell_count,
+                        table_set.truncated,
+                    )
+                except Exception as parse_err:
+                    logger.opt(exception=parse_err).error(
+                        "Spreadsheet parse failed for document {}: {}",
+                        document_id,
+                        parse_err,
+                    )
+                    table_set = None
+                    extracted_text = f"[Error extracting text from XLSX: {parse_err}]"
+            elif file_processor.is_audio_file(type_name):
+                # Audio path: transcribe + diarize via Chirp 3, then treat the
+                # formatted transcript as the document's extracted text so
+                # summary/strength/vector store all keep working unchanged.
                 audio_result = await self._transcribe_audio_bytes(
-                    file_content, filename
+                    file_content, type_name
                 )
                 if audio_result.success:
                     extracted_text = audio_result.transcript or audio_result.raw_transcript
@@ -275,7 +310,7 @@ Document excerpt:
                 extracted_text = await asyncio.to_thread(
                     file_processor.process_file_by_extension,
                     file_content,
-                    filename,
+                    type_name,
                     True,
                 )
 
@@ -287,7 +322,7 @@ Document excerpt:
                     else (
                         "gcp_vision"
                         if any(
-                            ext in filename.lower()
+                            ext in type_name.lower()
                             for ext in [".jpg", ".jpeg", ".png", ".gif", ".bmp"]
                         )
                         else "direct"
@@ -299,13 +334,17 @@ Document excerpt:
                 # Readability scorer expects these fields (it uses them for extraction_score).
                 "character_count": len(extracted_text),
                 "word_count": len(extracted_text.split()),
-                "format": self._infer_format_from_filename(filename),
+                "format": self._infer_format_from_filename(type_name),
             }
 
             # Calculate readability score (uses raw text length, not redacted)
             readability_result = readability_scorer.calculate_score(
                 extracted_text, extraction_metadata, file_size
             )
+            if table_set is not None and table_set.cell_count:
+                readability_result = readability_scorer.apply_lossless_floor(
+                    readability_result
+                )
 
             # PII redaction: scan the raw extracted text for Indian
             # identifier patterns (Aadhaar, PAN, GSTIN, Udyam, passport,
@@ -314,7 +353,17 @@ Document excerpt:
             # the public ``summary`` / ``extracted_fields`` payload all
             # use ``redacted_text``. Full values stay only in ``sensitive_fields``
             # which downstream is expected to encrypt at rest.
-            pii_scan: PIIScanResult = scan_text(extracted_text)
+            row_index = None
+            redacted_tables = None
+            if table_set is not None:
+                # Column-aware: each cell judged by its own header, so one
+                # "Account No" column cannot mask the Mobile column beside it.
+                from app.processing.tables import redact_tableset, render_text
+
+                redacted_tables, pii_scan = redact_tableset(table_set)
+                pii_scan.redacted_text, row_index = render_text(redacted_tables)
+            else:
+                pii_scan = scan_text(extracted_text)
             redacted_text = pii_scan.redacted_text
             sensitive_fields = pii_scan.sensitive_fields()
             masked_pii_fields = pii_scan.masked_fields()
@@ -400,6 +449,8 @@ Document excerpt:
                     document_id=document_id,
                     text=text_for_store,
                     filename=filename,
+                    row_index=None if is_low_content_marker else row_index,
+                    tables=None if is_low_content_marker else redacted_tables,
                     metadata={
                         **(metadata or {}),
                         **extraction_metadata,
@@ -492,7 +543,7 @@ Document excerpt:
                 "extracted_fields": {},
                 "sensitive_fields": {},
             }
-            if file_processor.is_audio_file(filename):
+            if file_processor.is_audio_file(type_name):
                 failure_result["is_audio"] = True
                 failure_result["transcript"] = ""
                 failure_result["transcript_status"] = "failed"
@@ -583,6 +634,7 @@ Document excerpt:
                     "uploaded_at": file_info.get("uploadedAt"),
                     "path": file_info.get("path"),
                 },
+                extension=file_info.get("extension"),
             )
 
             results.append(result)
@@ -810,11 +862,17 @@ Document excerpt:
         text: str,
         filename: str,
         metadata: Dict[str, Any],
+        row_index: Optional[List[Any]] = None,
+        tables: Any = None,
     ):
         """
         Store document in vector database (user-scoped).
 
-        Chunks large documents for better retrieval.
+        Chunks large documents for better retrieval. A spreadsheet
+        (``tables``, already redacted) also has its rows stored for exact
+        computation; any other document clears rows a previous version of the
+        same document may have left, so a re-read never computes over stale
+        rows.
         """
         logger.debug("Storing document in vector DB: {}", filename)
 
@@ -830,7 +888,9 @@ Document excerpt:
                 "original_document_id": document_id,
                 "filename": filename,
             },
+            row_index=row_index,
         )
+        await self._store_tables(workspace_id, document_id, filename, tables)
         chunks = [None] * stored
         if stored:
             # Ontology extraction into the knowledge graph, in the background
@@ -845,6 +905,47 @@ Document excerpt:
             filename,
             user_id,
         )
+
+
+    async def _store_tables(
+        self, workspace_id: str, document_id: str, filename: str, tables: Any
+    ) -> None:
+        """Write (or clear) the document's computable rows. Never raises.
+
+        A failed write is cleaned up rather than left half-done: rows without
+        their manifest are never read, and a cleared document is reported as
+        not computable instead of being computed over part of its rows.
+        """
+        from app.processing.tables import manifest, row_records
+
+        try:
+            if tables is not None and not tables.is_empty:
+                stored = await vector_store.replace_document_tables(
+                    workspace_id,
+                    document_id,
+                    manifest(tables),
+                    row_records(tables),
+                    filename=filename,
+                )
+                logger.info("Spreadsheet rows stored: {} for document {}", stored, document_id)
+            else:
+                await vector_store.delete_document_tables(workspace_id, document_id)
+        except Exception as table_err:
+            logger.opt(exception=table_err).error(
+                "Spreadsheet rows not stored for document {}; calculations over it "
+                "are unavailable: {}",
+                document_id,
+                table_err,
+            )
+            try:
+                await vector_store.delete_document_tables(workspace_id, document_id)
+            except Exception as cleanup_err:
+                logger.opt(exception=cleanup_err).critical(
+                    "Could not clear spreadsheet rows for document {} after a failed "
+                    "write; stale rows may remain until the next re-read: {}",
+                    document_id,
+                    cleanup_err,
+                )
 
 
 # Global document processor instance

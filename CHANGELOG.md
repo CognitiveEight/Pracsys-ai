@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Excel (`.xlsx`/`.xlsm`) and PowerPoint (`.pptx`) evidence.** Both now go
+  through `process_document` like any other file. Spreadsheets are read sheet
+  by sheet (openpyxl, cached formula values), in blocks sized to one chunk.
+  Each block opens with the sheet name, its row range and the header row, so
+  any chunk retrieved from a long sheet keeps its column names. Hidden sheets
+  are included and labelled. Spreadsheets are capped at 200K cells, and the
+  text says so when the cap is hit. Decks are read slide by slide: title, text,
+  tables, chart data and speaker notes. Each slide is marked
+  `--- Page N ---` with N = the slide number, so citations name the slide.
+  Slides that are only a pasted picture are OCR'd, up to 50 images per deck. Legacy `.xls`/`.ppt` now fail with an explicit
+  "unsupported format" message, where they used to come out of the DOC
+  extractor as byte noise. New deps: `openpyxl`, `python-pptx`.
+  Workbooks are parsed once into typed tables (`app/processing/tables.py`):
+  - the header is found below any title rows;
+  - numbers and day-first dates typed as text are read as values;
+  - percentages are shown as the sheet shows them;
+  - formulas with no saved value are kept as formula text, counted, and
+    excluded from every figure.
+  The text opens with a workbook summary computed from every row.
+
 - **`missing_information_edited` (Server → AI).** A lawyer can re-word a
   Missing Information item. `on_missing_information_edited` replaces the item's
   text by `itemId` in the cached analysis report and keeps its id and
@@ -22,8 +42,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `view` collaborator's edit (`editedBy`) is not applied. Offline coverage:
   `verify_missing_info_edit.py`.
 
+- **Exact spreadsheet calculations in chat (`[T#]`).** A question asking for a
+  count, total, average, minimum, maximum, percentage or list of rows is now
+  computed in code over every row (`app/rag/table_query.py`). The model only
+  turns the question into a JSON spec. Code validates it against the real
+  columns and refuses anything it cannot run, then computes with exact
+  decimals. Each result joins the evidence pack as `[T#]`, and the citation
+  checker verifies every figure the answer quotes against it. The sheet's own
+  Total rows are excluded so nothing is counted twice; blank and non-numeric
+  cells are counted and stated. When nothing could be computed, the prompt
+  says so and forbids totals from partial rows. Rows are stored in a new
+  vector-less collection, `<collection>_tables_v1`, cleared by
+  `delete_documents` and `delete_workspace` (the compliance purge). New
+  settings: `QDRANT_TABLES_COLLECTION`, `TABLE_QUERY_ENABLED`.
+- **Spreadsheet citations name the sheet and row.** `ai_response.citations`
+  and panel citations gain optional `sheet`, `rowStart`, `rowEnd` and
+  `computed`, and a cell quote is prefixed with its column header. **Socket
+  payload change (additive):** the `Citation` schema has these four optional
+  fields.
+
 ### Fixed
 
+- **Evidence was routed on a filename with no extension.** The backend's
+  `filename` ("annexure-3-...-results") has no suffix. `extension` is the only
+  type signal, and `process_batch` never passed it, so every file was routed by
+  content sniffing and any ZIP went to the DOCX parser. `process_document` now
+  takes `extension` and routes on `filename_for_extraction(filename,
+  extension)`. The stored and displayed `filename` is unchanged. This also
+  fixes audio sent with an extension-less `filename`, which was never sent for
+  transcription. Guarded by `tests/test_office_extraction.py`.
+- **PII redaction masked whole spreadsheet columns that are not
+  identifiers.** The prose redactor decides from an 80-char window, and in a
+  table that window reaches the "Account No" header from the next rows. On a
+  500-row ledger it masked all 500 mobile numbers as bank accounts, plus 52 of
+  500 transaction refs, about 10% of which pass the Aadhaar checksum alone.
+  Spreadsheets are now redacted by column: each cell is judged with its own
+  header as context (`scan_text(strict_context=True)`). The same ledger now
+  has 0 mobiles and 0 refs masked, and all 500 account numbers masked.
+- **Spreadsheet chunks repeated rows.** Chunk overlap duplicated 71 rows of a
+  500-row sheet across chunks, so anything reading adjacent chunks counted
+  them twice. Sheets are chunked without overlap; prose is unchanged.
+- **Citation figures matched inside longer numbers and ISO dates were checked
+  by year only.** "15.5" was supported by "115.5", and "2026-09-02" by any 2026
+  date. Figures now match as whole numbers and equal by value across trailing
+  zeros ("₹1,05,47,271.00" matches 10547271). ISO dates are checked whole.
+  `_date_forms` now includes the ISO form, without which no chronology entry
+  taken from a spreadsheet could be cited.
+- **Entity resolution merged numbered parties.** "Player 1" vs "Player 10"
+  scored 94 against a merge threshold of 92, so 40 players became 9 entities;
+  "Accused No. 1" / "No. 10" had the same risk. Names whose numbers (or roman
+  ordinals) differ are never merged.
+- **Spreadsheets in the knowledge graph.** Graph ingest now skips spreadsheet
+  chunks. The prose extractor has no node for a measurement and checks nothing
+  against the row.
+- **A debug log line could include a document quote.** Dropped citations are
+  logged by keys only.
 - **Chat replies carried no citations.** `ChatState` did not declare
   `evidence_index` / `citations` / `citation_report`, and LangGraph drops
   undeclared keys between nodes, so every `ai_response` went out with an empty

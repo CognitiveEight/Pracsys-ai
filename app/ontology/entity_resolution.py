@@ -24,7 +24,7 @@ candidates for merging, however alike their names.
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from loguru import logger
 from rapidfuzz import fuzz
@@ -169,6 +169,40 @@ def is_role_referent(name: str) -> bool:
 _MIN_SHARED_TOKENS_FOR_SUBSET = 2
 
 
+#: Roman numerals used to number parties ("Respondent No. II"). Single
+#: letters (i, v, x) are left out: they are initials far more often.
+_ROMAN_ORDINALS = {
+    numeral: value
+    for value, numeral in enumerate(
+        "_ _ ii iii iv _ vi vii viii ix _ xi xii xiii xiv xv xvi xvii xviii xix xx".split()
+    )
+    if numeral != "_"
+}
+
+
+def _ordinals(name: str) -> Tuple[int, ...]:
+    out = []
+    for token in name.split():
+        if token.isdigit():
+            out.append(int(token))
+        elif token in _ROMAN_ORDINALS:
+            out.append(_ROMAN_ORDINALS[token])
+    return tuple(sorted(out))
+
+
+def _distinct_ordinals(a: str, b: str) -> bool:
+    """True when both names carry numbers and the numbers differ.
+
+    "Accused No. 1" and "Accused No. 10", or "Player 1" and "Player 10", are
+    different people that token-set similarity scores at 94 (above the merge
+    threshold): one character apart, everything else shared. The number is the
+    identity, so a mismatch rules a merge out. Zero-padding is ignored ("Vendor
+    001" is "Vendor 1"), and a name with no number is unaffected.
+    """
+    oa, ob = _ordinals(a), _ordinals(b)
+    return bool(oa) and bool(ob) and oa != ob
+
+
 def name_similarity(left: str, right: str) -> float:
     """
     Similarity of two names in [0, 100], after normalisation.
@@ -187,6 +221,8 @@ def name_similarity(left: str, right: str) -> float:
         return 0.0
     if a == b:
         return 100.0
+    if _distinct_ordinals(a, b):
+        return 0.0
 
     a_tokens, b_tokens = set(a.split()), set(b.split())
     shared = a_tokens & b_tokens

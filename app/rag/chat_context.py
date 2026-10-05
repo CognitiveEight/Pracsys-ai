@@ -13,6 +13,12 @@ Two modes, chosen by size:
 Either way the result is an :class:`EvidencePack` (label → passage, page,
 annexure) and the ``uploaded_documents`` blocks the prompt renders, where each
 passage carries its ``[E#]`` label.
+
+When the workspace holds spreadsheets and the question asks for a count, total
+or filtered list, the figures are computed in code over every row
+(app/rag/table_query.py) and join the pack as ``[T#]`` items. Neither mode can
+otherwise be trusted for that: retrieval shows a few blocks of a sheet, and
+even a whole sheet in the prompt leaves the model adding up rows by eye.
 """
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -113,6 +119,10 @@ async def build_chat_evidence(
         if item is not None:
             by_doc.setdefault(did, []).append(item)
 
+    await _add_table_calculations(
+        pack, workspace_id, question, previous_user_turn, annexure_of, names
+    )
+
     if graph_store is not None:
         try:
             await _add_graph_facts(
@@ -133,13 +143,56 @@ async def build_chat_evidence(
         uploaded.append(entry)
     uploaded.sort(key=lambda e: e.get("annexure_number") or 10**6)
     logger.info(
-        "Chat evidence: mode={} documents={} passages={} graph_facts={}",
+        "Chat evidence: mode={} documents={} passages={} graph_facts={} table_notes={}",
         mode,
         len(uploaded),
         len(pack.items),
         len(pack.graph_facts),
+        len(pack.table_notes),
     )
     return pack, mode, uploaded
+
+
+async def _add_table_calculations(
+    pack: EvidencePack,
+    workspace_id: str,
+    question: str,
+    previous_user_turn: str,
+    annexure_of: Dict[str, int],
+    names: Dict[str, str],
+) -> None:
+    """Exact spreadsheet calculations for this turn, as ``[T#]`` items plus
+    the prompt notes that present them (or say why none could be made)."""
+    from app.core.config import settings
+    from app.rag.table_query import answer_table_questions
+
+    if not getattr(settings, "table_query_enabled", True):
+        return
+    try:
+        answers = await answer_table_questions(
+            workspace_id=workspace_id,
+            question=question,
+            previous_user_turn=previous_user_turn,
+            annexure_of=annexure_of,
+            names=names,
+        )
+    except Exception as err:  # calculations improve chat; they never gate it
+        logger.opt(exception=err).warning("Spreadsheet calculations skipped for this turn: {}", err)
+        return
+    for result in answers.results:
+        ref = result.query.ref
+        item = pack.add_computed(
+            result.text,
+            document_id=ref.document_id,
+            annexure=ref.annexure,
+            file_name=ref.file_name or None,
+            sheet=str(ref.sheet.get("sheet") or ""),
+            row_start=result.row_start,
+            row_end=result.row_end,
+        )
+        pack.table_notes.append(f"[{item.label}] {result.text}")
+    for note in answers.notes:
+        pack.table_notes.append(f"NOT COMPUTED: {note}")
 
 
 #: Graph facts added to one chat turn, at most.

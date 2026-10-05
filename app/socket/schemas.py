@@ -986,6 +986,11 @@ class Citation(BaseModel):
     and a verbatim ``quote``), ``case_law`` or ``statute`` (``title`` and
     ``url``). Every citation has been checked against the evidence that was
     actually in the prompt — see app/rag/citations.py.
+
+    Spreadsheet sources add ``sheet`` and ``rowStart``/``rowEnd`` (the exact
+    row of the quote). ``computed: true`` marks a figure the system calculated
+    over every row of that sheet (app/rag/table_query.py); its ``quote`` states
+    the calculation. All four are optional and additive.
     """
 
     index: int
@@ -1000,6 +1005,10 @@ class Citation(BaseModel):
     quote: Optional[str] = None
     url: Optional[str] = None
     title: Optional[str] = None
+    sheet: Optional[str] = None
+    rowStart: Optional[int] = None
+    rowEnd: Optional[int] = None
+    computed: Optional[bool] = None
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 

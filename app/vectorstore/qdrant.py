@@ -23,6 +23,7 @@ from qdrant_client.models import (Distance, FieldCondition, Filter,
                                   VectorParams)
 
 from app.core.config import settings
+from app.llm.config import embedding_space_suffix
 from app.rag.chunker import chunk_text, reassemble
 from app.rag.sparse import encode_document, encode_query
 from app.utils.exceptions import VectorStoreError
@@ -103,9 +104,17 @@ class QdrantStore:
         # Must equal the embedding model's requested output size; a mismatch is
         # rejected, never padded or truncated (see _generate_embedding).
         self.vector_size = int(settings.embedding_dimensions or 768)
+        # The original collection holds state caches (zero vectors) and legacy
+        # chunks. Its size is fixed when it is created, so after an embedding
+        # change it keeps the OLD size: read back in _initialize_sync.
+        self.state_vector_size = self.vector_size
+        # One evidence collection per embedding space (provider + model +
+        # dimensions): vectors from different models are not comparable, so a
+        # model change writes to a new collection rather than mixing spaces.
+        # The pre-portability space keeps its original name (no re-index).
         self.chunks_collection = (
             settings.qdrant_chunks_collection
-            or f"{self.collection_name}_evidence_v1"
+            or f"{self.collection_name}_evidence_v1{embedding_space_suffix()}"
         )
         # Spreadsheet rows and per-workbook manifests (app/processing/tables.py).
         self.tables_collection = (
@@ -152,20 +161,60 @@ class QdrantStore:
             self.client.create_collection(
                 collection_name=self.collection_name,
                 vectors_config=VectorParams(
-                    size=self.vector_size, distance=Distance.COSINE
+                    size=self.state_vector_size, distance=Distance.COSINE
                 ),
             )
             logger.success("Collection created: {}", self.collection_name)
         else:
             logger.debug("Collection already exists: {}", self.collection_name)
+            existing = self._dense_size_sync(self.collection_name)
+            if existing:
+                self.state_vector_size = existing
+        if self.state_vector_size != self.vector_size:
+            logger.warning(
+                "Embedding dimensions ({}) differ from the legacy collection's ({}); "
+                "legacy chunks are not searchable in this embedding space — run "
+                "scripts/reindex_chunks.py",
+                self.vector_size,
+                self.state_vector_size,
+            )
         self._ensure_payload_indexes_sync()
         self._ensure_chunks_collection_sync()
         self._ensure_tables_collection_sync()
 
+    def _dense_size_sync(self, collection: str, name: Optional[str] = None) -> Optional[int]:
+        """Dense vector size of an existing collection (``name`` for a named
+        vector), or None when it cannot be read."""
+        try:
+            vectors = self.client.get_collection(collection).config.params.vectors
+            if isinstance(vectors, dict):
+                params = vectors.get(name) if name else next(iter(vectors.values()), None)
+            else:
+                params = vectors
+            return int(params.size) if params is not None else None
+        except Exception as exc:
+            logger.warning("Could not read vector size of {}: {}", collection, exc)
+            return None
+
     def _ensure_chunks_collection_sync(self) -> None:
         """Evidence chunks: a dense vector for meaning and a sparse vector with
         server-side IDF for exact legal tokens (sections, case numbers)."""
-        if not self.client.collection_exists(self.chunks_collection):
+        if self.client.collection_exists(self.chunks_collection):
+            existing = self._dense_size_sync(self.chunks_collection, DENSE_VECTOR)
+            if existing and existing != self.vector_size:
+                # Refuse to serve: every insert would fail and every search
+                # would compare vectors from two different models.
+                raise VectorStoreError(
+                    "Evidence collection vector size does not match the embedding model",
+                    details={
+                        "collection": self.chunks_collection,
+                        "collection_size": existing,
+                        "embedding_dimensions": self.vector_size,
+                        "fix": "set QDRANT_CHUNKS_COLLECTION to a new name (or unset it) "
+                        "and run scripts/reindex_chunks.py --from-collection <old>",
+                    },
+                )
+        else:
             logger.info("Creating evidence chunk collection: {}", self.chunks_collection)
             self.client.create_collection(
                 collection_name=self.chunks_collection,
@@ -245,7 +294,7 @@ class QdrantStore:
                 self.client.create_collection(
                     collection_name=self.collection_name,
                     vectors_config=VectorParams(
-                        size=self.vector_size, distance=Distance.COSINE
+                        size=self.state_vector_size, distance=Distance.COSINE
                     ),
                 )
 
@@ -279,6 +328,11 @@ class QdrantStore:
         try:
             meta = dict(metadata or {})
             try:
+                if self.state_vector_size != self.vector_size:
+                    raise VectorStoreError(
+                        "legacy collection is in a different embedding space",
+                        details={"expected": self.state_vector_size, "got": self.vector_size},
+                    )
                 embedding = await self._generate_embedding(content)
                 meta.pop("embedding_failed", None)
             except Exception as embed_err:
@@ -293,7 +347,7 @@ class QdrantStore:
                     workspace_id,
                     embed_err,
                 )
-                embedding = [0.0] * self.vector_size
+                embedding = [0.0] * self.state_vector_size
                 meta["embedding_failed"] = True
 
             # Deterministic id: re-ingesting the same chunk overwrites it instead
@@ -496,6 +550,13 @@ class QdrantStore:
     ) -> List[Dict[str, Any]]:
         """Dense search on the legacy collection, used only while a workspace
         has not been re-indexed."""
+        if self.state_vector_size != self.vector_size:
+            logger.warning(
+                "Legacy search skipped for workspace {}: legacy collection is in a "
+                "different embedding space (run scripts/reindex_chunks.py)",
+                workspace_id,
+            )
+            return []
         query_embedding = await self._generate_embedding(query, task_type="RETRIEVAL_QUERY")
         response = await asyncio.to_thread(
             self.client.query_points,
@@ -1282,7 +1343,7 @@ class QdrantStore:
             },
         }
         points.append(
-            PointStruct(id=_point_id("__default__"), vector=[0.0] * self.vector_size, payload=user_payload)
+            PointStruct(id=_point_id("__default__"), vector=[0.0] * self.state_vector_size, payload=user_payload)
         )
 
         if chat_id:
@@ -1299,7 +1360,7 @@ class QdrantStore:
             points.append(
                 PointStruct(
                     id=_point_id(str(chat_id)),
-                    vector=[0.0] * self.vector_size,
+                    vector=[0.0] * self.state_vector_size,
                     payload=chat_payload,
                 )
             )
@@ -1435,7 +1496,7 @@ class QdrantStore:
             },
         }
         point = PointStruct(
-            id=point_id, vector=[0.0] * self.vector_size, payload=payload
+            id=point_id, vector=[0.0] * self.state_vector_size, payload=payload
         )
         try:
             await asyncio.to_thread(
@@ -1582,7 +1643,7 @@ class QdrantStore:
             },
         }
         point = PointStruct(
-            id=point_id, vector=[0.0] * self.vector_size, payload=payload
+            id=point_id, vector=[0.0] * self.state_vector_size, payload=payload
         )
         try:
             await asyncio.to_thread(

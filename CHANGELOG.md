@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Model portability: one provider-neutral model layer**
+  (`app/llm/`, `docs/MODEL_PORTABILITY.md`). Every model call can now be served
+  by Gemini, OpenAI, Azure OpenAI, Azure AI Foundry, AWS Bedrock (Converse),
+  AWS SageMaker endpoints, or any OpenAI-compatible server. That last option
+  covers open-weight DeepSeek, Qwen, Llama and Mistral on vLLM, Ollama or TGI,
+  or through the hosted DeepSeek, DashScope, Together and Groq APIs.
+  - **Routing.** It is set per task: `LLM_DEFAULT`, `LLM_ROUTES` (the key is
+    the `feature=` on the `llm_call` log line) and `LLM_FALLBACKS`. Calls fall
+    back on error or timeout, never after a content block. A transient
+    429/5xx/network error is retried once on the same profile.
+  - **Capability checks.** A request needing images, audio or grounding skips
+    profiles that cannot take it. `LLM_MODEL_OPTIONS` clamps the output budget
+    to each model's ceiling. A misconfigured explicit profile stops startup.
+    With no `LLM_*` settings, behaviour is exactly as before (Gemini).
+  - **Facade.** `gemini_client` keeps its name and API. Callers and the offline
+    suites are unchanged, except `verify_rag.py`, which patched the old
+    client's internals. The `llm_call` log line gains `provider=`.
+  - **Embeddings.** `EMBEDDING_PROVIDER` takes Gemini, OpenAI, Azure, Bedrock
+    Titan/Cohere or OpenAI-compatible models. Each embedding space has its own
+    evidence collection, and the legacy Gemini space keeps its name, so
+    nothing is re-indexed on deploy. A vector-size mismatch refuses to start.
+    `scripts/reindex_chunks.py --from-collection` migrates chunks to a new
+    space.
+  - **Cost.** Each call is priced by the model that served it, so a turn mixing
+    providers is billed correctly. `metadata.aiModel` is the model actually
+    used. Non-Gemini rates come from `LLM_PRICING_OVERRIDES`; none are
+    hard-coded.
+  - **Audio and `agent.py`.** The audio diarization and transliteration
+    helpers, and the `agent.py` text filters, no longer call the Gemini SDK
+    directly. They are routed, bounded by the request timeout, and logged.
+  - **Clean-ups.** `google-generativeai`, `google-ai-generativelanguage` and
+    `langchain-google-genai` are removed. Ad-hoc `startswith("Error")` checks
+    now use `is_generation_error`.
+  - **New deps:** `openai`, `azure-identity`, `aioboto3`.
+  - **New tests:** `tests/test_llm_router.py` and `tests/test_llm_providers.py`.
+  - **New script:** `scripts/smoke_llm_providers.py` (live, billed).
+- **Gate0 gateway mode** (`app/llm/providers/gate0.py`). Profiles
+  `gate0:<model>` send model calls through ViitorCloud's gate0 gateway (LiteLLM
+  proxy), which holds the provider keys, budgets and spend records.
+  - **Governance.** `GATE0_ENFORCE=true` makes gate0 the only path. Startup
+    refuses any direct profile, and the router never calls one.
+  - **Attribution.** Each request carries `metadata` and `tags` (app, feature,
+    workspace and request ids).
+  - **Billing.** SimplerToday bills the gateway's own cost (the
+    `x-litellm-response-cost` header).
+  - **Gemini features through gate0:** thinking level, BLOCK_NONE safety,
+    Google Search grounding with sources, and embedding task types.
+  - **Budgets.** A budget-exhausted 429 is final; a rate-limit 429 is retried
+    once.
+  - **Default.** Off by default. See `docs/MODEL_PORTABILITY.md` for the
+    gate0-side configuration this needs: model groups by name, a timeout of at
+    least 300 s, `drop_params: false`, no fallbacks across classes, and high
+    availability.
+
 - **Excel (`.xlsx`/`.xlsm`) and PowerPoint (`.pptx`) evidence.** Both now go
   through `process_document` like any other file. Spreadsheets are read sheet
   by sheet (openpyxl, cached formula values), in blocks sized to one chunk.

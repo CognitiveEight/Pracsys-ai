@@ -45,6 +45,7 @@ settings.qdrant_collection_name = f"verify_rag_{RUN}"
 settings.qdrant_chunks_collection = f"verify_rag_{RUN}_evidence"
 
 from app.ai.gemini_client import GeminiClient, gemini_client  # noqa: E402
+from app.llm.providers.gemini import thinking_level as gemini_thinking_level  # noqa: E402
 from app.rag.chunker import chunk_text, reassemble  # noqa: E402
 from app.rag.sparse import tokens  # noqa: E402
 from app.vectorstore.qdrant import QdrantStore  # noqa: E402
@@ -230,10 +231,10 @@ async def check_model_client():
     try:
         settings.gemini_model = "gemini-3.8-flash"
         check("MINIMAL thinking becomes LOW on Gemini 3.8 Flash",
-              GeminiClient._ng_thinking_level("MINIMAL").name == "LOW")
+              gemini_thinking_level("MINIMAL").name == "LOW")
         settings.gemini_model = "gemini-3-flash-preview"
         check("MINIMAL is kept on models that accept it",
-              GeminiClient._ng_thinking_level("MINIMAL").name == "MINIMAL")
+              gemini_thinking_level("MINIMAL").name == "MINIMAL")
     finally:
         settings.gemini_model = saved
 
@@ -255,16 +256,16 @@ async def check_model_client():
             self.aio = type("A", (), {"models": _Models(vecs)})()
 
     settings.embedding_max_attempts = 1
+    gemini = real.router.provider_for(real.router.embedding_profile())
     for label, vecs in [("wrong-size embedding is rejected", [[0.1] * 3072]),
                         ("all-zero embedding is rejected", [[0.0] * DIM])]:
-        real._get_ng_client = lambda v=vecs: _Client(v)
-        real._initialized = True
+        gemini._client.set(_Client(vecs))
         try:
             await real.embed_text("x")
             check(label, False, "no error raised")
         except Exception as e:
             check(label, "EmbeddingError" in type(e).__name__, repr(e))
-    real._get_ng_client = lambda: _Client([[3.0, 4.0] + [0.0] * (DIM - 2)])
+    gemini._client.set(_Client([[3.0, 4.0] + [0.0] * (DIM - 2)]))
     v = await real.embed_text("x")
     check("embeddings are unit length", abs(sum(x * x for x in v) - 1.0) < 1e-9)
 

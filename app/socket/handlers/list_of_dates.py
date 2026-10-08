@@ -17,6 +17,8 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.llm.errors import is_generation_error
+
 from app.utils.document_dates import date_from_document_name
 
 from app.utils.redact import chars
@@ -418,7 +420,7 @@ class ListOfDatesMixin:
             from app.ai.gemini_client import gemini_client
 
             gemini_client.initialize()
-            if not gemini_client.model:
+            if not gemini_client.is_available():
                 return []
 
             from datetime import timedelta as _timedelta
@@ -443,7 +445,7 @@ class ListOfDatesMixin:
                 response_mime_type="application/json",
             )
             raw = (raw or "").strip()
-            if not raw or raw.startswith("Error"):
+            if not raw or is_generation_error(raw):
                 logger.warning("List of dates: Gemini error or empty response")
                 return []
 

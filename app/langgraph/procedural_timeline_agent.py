@@ -36,6 +36,8 @@ from typing import Any, Dict, List, Optional, TypedDict
 from langgraph.graph import END, START, StateGraph
 from loguru import logger
 
+from app.llm.errors import is_generation_error
+
 from app.utils.redact import chars
 
 from app.langgraph.list_of_dates_agent import snap_hallucinated_year
@@ -53,7 +55,7 @@ from app.prompts.legal_intelligence_system import (
 def _is_safety_error(raw: str) -> bool:
     """Return True when Gemini returned a safety-block error string."""
     s = (raw or "").strip()
-    return s.startswith("Error") and (
+    return is_generation_error(s) and (
         "finish_reason" in s
         or "finish reason" in s.lower()
         or "safety" in s.lower()
@@ -415,7 +417,7 @@ class ProceduralTimelineAgent:
                 )
                 continue
 
-            if not raw or raw.startswith("Error"):
+            if not raw or is_generation_error(raw):
                 break
 
             try:
@@ -470,7 +472,7 @@ class ProceduralTimelineAgent:
             return {"raw_entries": []}
 
         gemini_client.initialize()
-        if not gemini_client.model:
+        if not gemini_client.is_available():
             logger.warning("Procedural timeline: Gemini unavailable — returning empty")
             return {"raw_entries": []}
 
@@ -520,7 +522,7 @@ class ProceduralTimelineAgent:
             return {"consolidated_entries": raw_entries}
 
         gemini_client.initialize()
-        if not gemini_client.model:
+        if not gemini_client.is_available():
             return {"consolidated_entries": raw_entries}
 
         # Present entries to the model with source-doc tags so it can see WHY duplicates arose
@@ -607,7 +609,7 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
             len(raw), chars(raw),
         )
 
-        if _is_safety_error(raw) or not raw or raw.startswith("Error"):
+        if _is_safety_error(raw) or not raw or is_generation_error(raw):
             logger.warning("Procedural timeline consolidate: falling back to raw entries")
             return {"consolidated_entries": raw_entries}
 

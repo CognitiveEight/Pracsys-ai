@@ -95,6 +95,7 @@ google-application-credentials.json
 !**/SYSTEM_ARCHITECTURE.md
 !**/RELEASE.md
 !**/CHANGELOG.md
+!docs/MODEL_PORTABILITY.md
 # Statute pipeline inputs/outputs (large, regenerable; see scripts/fetch_laws_indiacode.py)
 /masterLaws*.json
 # Local reference material, not part of the service

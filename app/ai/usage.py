@@ -40,6 +40,13 @@ class UsageAccumulator:
 
     input_tokens: int = 0
     output_tokens: int = 0
+    # LLM cost, priced per call at record time by the model that served it — a
+    # scope can mix models once tasks are routed to different providers, so
+    # pricing the token totals by one model at the end would be wrong.
+    input_price: float = 0.0
+    output_price: float = 0.0
+    # model -> tokens (in + out) it consumed in this scope.
+    models: dict = field(default_factory=dict)
     # Set once the turn's totals have been billed into the workspace cumulative,
     # so a second emit in the same turn (e.g. an error path after the main
     # response) does not double-count the same tokens.
@@ -65,11 +72,38 @@ class UsageAccumulator:
         default_factory=threading.Lock, repr=False, compare=False
     )
 
-    def add(self, prompt_tokens: int, output_tokens: int) -> None:
-        """Add one generation's tokens. Negative/None values are treated as 0."""
+    def add(
+        self,
+        prompt_tokens: int,
+        output_tokens: int,
+        model: Optional[str] = None,
+        cost: Optional[float] = None,
+    ) -> None:
+        """Add one generation's tokens, priced by ``model`` (default: the
+        configured Gemini model). ``cost`` — an authoritative USD figure from a
+        gateway — replaces the table price; it is split into input/output in
+        the table's proportion so the per-side fields still add up to it.
+        Negative/None values are treated as 0."""
+        from app.ai.pricing import price_for
+        from app.core.config import settings
+
+        in_tok = max(int(prompt_tokens or 0), 0)
+        out_tok = max(int(output_tokens or 0), 0)
+        name = model or settings.gemini_model
+        price = price_for(name, in_tok, out_tok)
+        if cost is not None and cost >= 0:
+            table_total = price["inputPrice"] + price["outputPrice"]
+            in_share = price["inputPrice"] / table_total if table_total else 0.0
+            price = {
+                "inputPrice": round(cost * in_share, 6),
+                "outputPrice": round(cost * (1 - in_share), 6),
+            }
         with self._lock:
-            self.input_tokens += max(int(prompt_tokens or 0), 0)
-            self.output_tokens += max(int(output_tokens or 0), 0)
+            self.input_tokens += in_tok
+            self.output_tokens += out_tok
+            self.input_price += price["inputPrice"]
+            self.output_price += price["outputPrice"]
+            self.models[name] = self.models.get(name, 0) + in_tok + out_tok
 
     def add_ocr_units(self, units: int) -> None:
         """Add Vision OCR units. Negative/None values are treated as 0."""
@@ -170,6 +204,40 @@ def meter_usage(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[
     return wrapper
 
 
+def llm_price(usage: Any) -> "dict[str, float]":
+    """LLM cost of a scope: ``{inputPrice, outputPrice, price}``.
+
+    Uses the per-call prices accumulated at record time. An object without
+    them (a test double, or a scope from before per-model pricing) is priced by
+    the configured Gemini model, which is what every scope used to be.
+    """
+    from app.ai.pricing import price_for
+    from app.core.config import settings
+
+    in_tok = int(getattr(usage, "input_tokens", 0) or 0)
+    out_tok = int(getattr(usage, "output_tokens", 0) or 0)
+    models = getattr(usage, "models", None)
+    if isinstance(models, dict) and models:
+        in_price = round(float(getattr(usage, "input_price", 0.0) or 0.0), 6)
+        out_price = round(float(getattr(usage, "output_price", 0.0) or 0.0), 6)
+        return {
+            "inputPrice": in_price,
+            "outputPrice": out_price,
+            "price": round(in_price + out_price, 6),
+        }
+    return price_for(settings.gemini_model, in_tok, out_tok)
+
+
+def primary_model(usage: Any) -> str:
+    """The model that did most of a scope's work (for ``aiModel`` labels)."""
+    from app.core.config import settings
+
+    models = getattr(usage, "models", None)
+    if isinstance(models, dict) and models:
+        return max(models.items(), key=lambda kv: kv[1])[0]
+    return settings.gemini_model
+
+
 def begin_usage() -> "tuple[object, UsageAccumulator]":
     """Open a usage-capture scope imperatively (for try/finally call sites).
 
@@ -191,21 +259,30 @@ def reset_usage(token: object) -> None:
         logger.debug("reset_usage failed: {}", exc)
 
 
-def record_usage(prompt_tokens: int, output_tokens: int) -> None:
+def record_usage(
+    prompt_tokens: int,
+    output_tokens: int,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    cost: Optional[float] = None,
+) -> None:
     """Report one generation's token usage to the active scope, if any.
 
     Safe to call from anywhere: when no :func:`capture_usage` scope is open
     this does nothing but warns once (see ``_warned_unscoped_kinds`` below) —
     tokens spent outside a scope are billed to nobody, and that must be visible
     in the logs rather than silently swallowed. ``output_tokens`` should already
-    include thinking tokens (Gemini bills them as output).
+    include thinking tokens (every supported provider bills them as output).
+    ``model`` prices the call; ``cost`` (a gateway's own USD figure) overrides
+    the table price. ``provider`` is accepted for symmetry with the
+    ``llm_call`` log line and is not needed for pricing.
     """
     accumulator = _current_usage.get()
     if accumulator is None:
         _warn_unscoped_once("LLM tokens", (prompt_tokens or 0) + (output_tokens or 0))
         return
     try:
-        accumulator.add(prompt_tokens, output_tokens)
+        accumulator.add(prompt_tokens, output_tokens, model, cost)
     except Exception as exc:  # usage tracking must never break generation
         logger.debug("record_usage failed: {}", exc)
 
@@ -294,8 +371,7 @@ def log_unbilled_usage(label: str, usage: Optional[UsageAccumulator]) -> None:
     if usage is None:
         return
     try:
-        from app.ai.pricing import price_for, service_price_for
-        from app.core.config import settings
+        from app.ai.pricing import service_price_for
 
         in_tok = int(getattr(usage, "input_tokens", 0) or 0)
         out_tok = int(getattr(usage, "output_tokens", 0) or 0)
@@ -306,7 +382,7 @@ def log_unbilled_usage(label: str, usage: Optional[UsageAccumulator]) -> None:
             grounding_requests=int(getattr(usage, "grounding_requests", 0) or 0),
             embed_tokens=int(getattr(usage, "embed_tokens", 0) or 0),
         )
-        llm = price_for(settings.gemini_model, in_tok, out_tok)
+        llm = llm_price(usage)
         total = round(llm["price"] + service["servicePrice"], 6)
         if not (in_tok or out_tok or service["servicePrice"]):
             return

@@ -17,6 +17,7 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.ai.usage import current_usage, primary_model
 from app.agents.role_models import RoleEnum
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
@@ -198,13 +199,15 @@ class ChatMixin:
         blocks a response. Call exactly once per emitted response.
         """
         try:
-            from app.ai.pricing import price_for, service_price_for
+            from app.ai.pricing import service_price_for
+            from app.ai.usage import llm_price
             from app.workspace.context import context_manager
 
             input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
             output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
-            model = settings.gemini_model
-            price = price_for(model, input_tokens, output_tokens)
+            # Priced per call by the model that served it (a turn can mix
+            # models once tasks are routed to different providers).
+            price = llm_price(usage)
             total_tokens = input_tokens + output_tokens
 
             # Paid non-LLM units consumed inside the same capture scope.
@@ -298,7 +301,7 @@ class ChatMixin:
         metadata = self._token_usage_metadata(workspace_id, usage)
         if isinstance(metadata, dict):
             metadata.setdefault("messageId", uuid.uuid4().hex)
-            metadata.setdefault("aiModel", settings.gemini_model)
+            metadata.setdefault("aiModel", primary_model(usage))
             # Hand-built payloads bypass _emit_document_feature's check, so run it
             # here too — same reason: an unknown key means an unrecorded cost.
             self._warn_unknown_metadata_keys("ingestion payload", metadata)
@@ -504,7 +507,7 @@ class ChatMixin:
                 # (usage-based) metadata block has no messageId, so mint a unique
                 # one per emit here. aiModel mirrors the ai_response contract.
                 metadata.setdefault("messageId", uuid.uuid4().hex)
-                metadata.setdefault("aiModel", settings.gemini_model)
+                metadata.setdefault("aiModel", primary_model(usage))
                 self._warn_unknown_metadata_keys(feature_type, metadata)
         except Exception as exc:
             logger.warning(
@@ -712,7 +715,7 @@ class ChatMixin:
             "draftDocument": turn.get("draftDocument"),
             "metadata": {
                 "messageId": chat_id,
-                "aiModel": settings.gemini_model,
+                "aiModel": primary_model(current_usage()),
                 # Per-response token/price + incremented workspace totals for
                 # this drafting turn (scope opened in on_user_message_request).
                 **self._token_usage_metadata(workspace_id, current_usage()),
@@ -1079,7 +1082,7 @@ class ChatMixin:
                                 ),
                                 metadata=AIResponseMetadata(
                                     messageId=chat_id,
-                                    aiModel=settings.gemini_model,
+                                    aiModel=primary_model(current_usage()),
                                     **self._token_usage_metadata(
                                         workspace_id, current_usage()
                                     ),
@@ -2935,7 +2938,7 @@ class ChatMixin:
                 content=response_text_to_emit,
                 metadata=AIResponseMetadata(
                     messageId=response.message_id,
-                    aiModel=settings.gemini_model,
+                    aiModel=primary_model(current_usage()),
                     responseTime=processing_time,
                     confidence=(
                         response.confidence.value
@@ -3031,7 +3034,7 @@ class ChatMixin:
                 if self._socket_client and chat_id:
                     error_meta = AIResponseMetadata(
                         messageId=chat_id,
-                        aiModel=settings.gemini_model,
+                        aiModel=primary_model(current_usage()),
                         error=str(e),
                         **self._token_usage_metadata(workspace_id, current_usage()),
                     )

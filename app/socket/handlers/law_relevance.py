@@ -17,6 +17,8 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.llm.errors import is_generation_error
+
 from app.agents.role_models import RoleEnum
 from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
@@ -328,7 +330,7 @@ class LawRelevanceMixin:
             response_mime_type="application/json",
         )
         text = (raw or "").strip()
-        if text.startswith("Error generating"):
+        if is_generation_error(text):
             return "not relevant", "Assessment failed (model error)."
         if "```" in text:
             m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.I)

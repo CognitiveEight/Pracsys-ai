@@ -2,17 +2,14 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 from typing import Any, Dict, TypedDict
 
-import google.generativeai as genai
 from langgraph.graph import END, START, StateGraph
-from app.ai.gemini_client import gemini_client
-from app.core.config import settings
+from app.ai.gemini_client import gemini_client, is_generation_error
 from app.prompts.applicable_acts import TARGETED_INDIAN_ACTS
 
 # Must match SYSTEM "Forbidden words" list (case-sensitive fast path = LLM path).
@@ -196,31 +193,26 @@ def node_text_filter(state: TextFilterState) -> dict[str, str]:
         return {"output": _direct_filter(text)}
 
     try:
-        # Use same Gemini wiring as app/ai/gemini_client.py
+        # Routed like every other model call (LLM_ROUTES key "text_filter").
         gemini_client.initialize()
-        if not gemini_client.model:
+        if not gemini_client.is_available():
             return {"output": _direct_filter(text)}
 
-        model_name = os.environ.get("GEMINI_MODEL") or settings.gemini_model
-        if model_name and model_name != gemini_client.model_name:
-            gemini_client.model_name = model_name
-            gemini_client.model = genai.GenerativeModel(model_name)
-
-        full_prompt = f"{SYSTEM}\n\n{text}"
         future = _LLM_EXECUTOR.submit(
-            lambda: gemini_client.model.generate_content(
-                full_prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.0, max_output_tokens=8000
-                ),
-            )
+            gemini_client.generate_sync,
+            text,
+            system_instruction=SYSTEM,
+            temperature=0.0,
+            max_tokens=8000,
+            task="text_filter",
         )
         try:
-            response = future.result(timeout=6)
+            out = future.result(timeout=6)
         except FuturesTimeoutError:
             _LLM_FILTER_DISABLED = True
             return {"output": _direct_filter(text)}
-        out = getattr(response, "text", "") or ""
+        if is_generation_error(out):
+            raise RuntimeError(out)
         if not isinstance(out, str) or not out:
             return {"output": _direct_filter(text)}
         # Hard safety: enforce deterministic forbidden-word replacement
@@ -575,32 +567,28 @@ def _gemini_law_strip_call(text: str, extra_instruction: str = "") -> str | None
         return None
     try:
         gemini_client.initialize()
-        if not gemini_client.model:
+        if not gemini_client.is_available():
             return None
-
-        model_name = os.environ.get("GEMINI_MODEL") or settings.gemini_model
-        if model_name and model_name != gemini_client.model_name:
-            gemini_client.model_name = model_name
-            gemini_client.model = genai.GenerativeModel(model_name)
 
         prompt_body = LAW_STRIP_SYSTEM
         if extra_instruction:
             prompt_body = f"{LAW_STRIP_SYSTEM}\n\n{extra_instruction}"
         full_prompt = f"{prompt_body}\n\nINPUT:\n{text}\n\nOUTPUT:"
 
+        # Routed like every other model call (LLM_ROUTES key "law_strip").
         future = _LLM_EXECUTOR.submit(
-            lambda: gemini_client.model.generate_content(
-                full_prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.0, max_output_tokens=8000
-                ),
-            )
+            gemini_client.generate_sync,
+            full_prompt,
+            temperature=0.0,
+            max_tokens=8000,
+            task="law_strip",
         )
         try:
-            response = future.result(timeout=20)
+            out = future.result(timeout=20)
         except FuturesTimeoutError:
             return None
-        out = getattr(response, "text", "") or ""
+        if is_generation_error(out):
+            raise RuntimeError(out)
         if not isinstance(out, str) or not out.strip():
             return None
         return out.strip()

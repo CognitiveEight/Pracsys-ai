@@ -38,7 +38,7 @@ def require_role(operation_name: str):
             # CRITICAL CHECK: Role must be selected
             if not validate_role_state(state):
                 logger.error(
-                    "🚨 GUARD BLOCKED: {} attempted without role selection in workspace {}",
+                    "GUARD BLOCKED: {} attempted without role selection in workspace {}",
                     operation_name,
                     workspace_id,
                 )
@@ -65,7 +65,7 @@ def require_role(operation_name: str):
             # Log successful guard pass
             role = state["role_state"]["role"]
             logger.debug(
-                "✅ GUARD PASSED: {} allowed for role {} in workspace {}",
+                "GUARD PASSED: {} allowed for role {} in workspace {}",
                 operation_name,
                 role,
                 workspace_id,
@@ -81,7 +81,7 @@ def require_role(operation_name: str):
             # CRITICAL CHECK: Role must be selected
             if not validate_role_state(state):
                 logger.error(
-                    "🚨 GUARD BLOCKED: {} attempted without role selection in workspace {}",
+                    "GUARD BLOCKED: {} attempted without role selection in workspace {}",
                     operation_name,
                     workspace_id,
                 )
@@ -95,7 +95,7 @@ def require_role(operation_name: str):
             # Log successful guard pass
             role = state["role_state"]["role"]
             logger.debug(
-                "✅ GUARD PASSED: {} allowed for role {} in workspace {}",
+                "GUARD PASSED: {} allowed for role {} in workspace {}",
                 operation_name,
                 role,
                 workspace_id,
@@ -169,7 +169,7 @@ def validate_role_context(state: WorkspaceState, operation: str = "operation"):
             attempted_operation=operation,
         )
 
-    logger.debug("✅ Role context validation passed for workspace {}", workspace_id)
+    logger.debug("Role context validation passed for workspace {}", workspace_id)
 
 
 class RoleGuard:
@@ -243,7 +243,7 @@ def assert_role(state: WorkspaceState, expected_role: Role, operation: str):
         workspace_id = state.get("workspace_id", "unknown")
 
         logger.error(
-            "🚨 Role assertion failed: expected {} but got {} for {} in workspace {}",
+            "Role assertion failed: expected {} but got {} for {} in workspace {}",
             expected_role,
             current_role,
             operation,

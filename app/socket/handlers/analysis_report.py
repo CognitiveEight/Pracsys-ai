@@ -9,13 +9,15 @@ import re
 import time
 import uuid
 from datetime import date as date_type
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import unescape
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote_plus
 
 import httpx
 from loguru import logger
+
+from app.utils.redact import chars
 
 from app.agents.role_models import RoleEnum
 from app.ai.usage import current_usage, meter_usage
@@ -76,6 +78,7 @@ from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
                                        restore_state)
 from agent import process_analysis_docx_request
 
+from app.rag.packing import fit_to_budget, panel_context_budget
 from app.socket.event_utils import (
     EventHandler,
     _STRATEGY_ROLE_LABELS_RE,
@@ -106,12 +109,16 @@ from app.socket.event_utils import (
     _coerce_analysis_text_list,
     _strip_strength_point_statute_boilerplate,
     _annexure_wording_for_next_steps,
+    _upload_wording,
     _clamp_annexure_references,
     _format_document_for_prompt,
     _normalize_report_mobile_from_overview,
     _overview_conversation_date_to_iso,
     extract_overview_conversation_report_contact_meta,
+    _normalize_match_text,
 )
+from app.socket.schemas import MissingInformationEditedPayload
+from app.workspace.participants import resolve_asker
 
 
 from app.prompts.analysis_report_prompts import (
@@ -137,6 +144,7 @@ class AnalysisReportMixin:
         workspace_role: str,
         user_feedback: str,
         current_report: Dict[str, Any],
+        outcome: Optional[Dict[str, str]] = None,
     ) -> bool:
         """
         Apply a free-form user edit instruction (rename, rephrase, add / change /
@@ -180,6 +188,9 @@ class AnalysisReportMixin:
 
             prompt = regenerate_analysis_report_with_feedback_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, current_report_json=current_report_json, instruction=instruction, role=role)
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 prompt = prompt.rstrip() + "\n\n" + custom_suffix
@@ -200,6 +211,18 @@ class AnalysisReportMixin:
             if not isinstance(edited, dict):
                 return False
 
+            # Merge-back: keys the model omitted must survive. The editor
+            # caches the model's output wholesale, and
+            # _normalize_analysis_report_lists preserves keys it FINDS but does
+            # not restore keys that are absent — so a model that returned only
+            # the sections it changed used to silently blank nextSteps,
+            # pendingActions and caseResolutionScore. Layering the edit over a
+            # copy of the current report makes unmentioned keys survive by
+            # construction rather than by prompt compliance.
+            _merged_edit = dict(current_report_norm)
+            _merged_edit.update(edited)
+            edited = _merged_edit
+
             edited = self._normalize_analysis_report_lists(
                 edited, max_annexure=self._get_annexure_count(workspace_id)
             )
@@ -210,14 +233,28 @@ class AnalysisReportMixin:
             # was not present), nothing actually changed — return False so the
             # caller does NOT report "analysis report" as Updated and does not
             # emit a no-op payload.
+            # Compare against a baseline put through the SAME normalisation, or
+            # the guard reports "changed" purely because normalisation clamped an
+            # annexure reference that was already in the cache.
+            try:
+                _baseline = self._normalize_analysis_report_lists(
+                    json.loads(json.dumps(current_report_norm, ensure_ascii=True)),
+                    max_annexure=self._get_annexure_count(workspace_id),
+                )
+                if not isinstance(_baseline, dict):
+                    _baseline = current_report_norm
+            except Exception:
+                _baseline = current_report_norm
             try:
                 if json.dumps(edited, sort_keys=True, ensure_ascii=True) == json.dumps(
-                    current_report_norm, sort_keys=True, ensure_ascii=True
+                    _baseline, sort_keys=True, ensure_ascii=True
                 ):
                     logger.info(
                         "Analysis report edit produced no change — instruction={!r}",
-                        instruction[:160],
+                        chars(instruction),
                     )
+                    if outcome is not None:
+                        outcome["status"] = "unchanged"
                     return False
             except Exception:
                 pass
@@ -246,9 +283,11 @@ class AnalysisReportMixin:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ Analysis report surgical edit emitted workspace={}",
+                    "Analysis report surgical edit emitted workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
+            if outcome is not None:
+                outcome["status"] = "applied"
             return True
         except Exception as e:
             logger.warning("Analysis report surgical edit failed: {}", e)
@@ -277,7 +316,7 @@ class AnalysisReportMixin:
             from app.vectorstore.qdrant import vector_store
 
             logger.info(
-                "📊 Generating analysis report for workspace {} with role {}",
+                "Generating analysis report for workspace {} with role {}",
                 workspace_id,
                 workspace_role,
             )
@@ -303,9 +342,8 @@ class AnalysisReportMixin:
 
             # Build parts with per-document cap so ALL documents are represented (no limit on number of docs)
             # Large budget so 100+ docs each get a meaningful slice (100 docs → 1000 chars each, 200 → 500 each)
-            max_total_content = (
-                100000  # Total character budget for all documents combined
-            )
+            graph_block = await self._graph_evidence_block("analysis_report", workspace_id)
+            max_total_content = max(20_000, panel_context_budget() - len(graph_block))
             num_docs = len(
                 [
                     d
@@ -327,7 +365,7 @@ class AnalysisReportMixin:
                 if not content or len(content) < 20:
                     continue
                 if len(content) > per_doc_cap:
-                    content = content[:per_doc_cap] + "\n[... truncated for length ...]"
+                    content = fit_to_budget(content, per_doc_cap, "general")
                 # Build labelled block with metadata header (document_type,
                 # issued_by, addressees, subject, key dates, legal provisions,
                 # drafted_by_assistant marker) so the analysis-report prompt
@@ -343,7 +381,7 @@ class AnalysisReportMixin:
                 "\n\n".join(parts) if parts else "No document content available."
             )
 
-            if num_docs > 0 and len(combined_document_content) > max_total_content:
+            if num_docs > 0 and len(combined_document_content) > int(max_total_content * 1.1):  # headers add a little; never cut the last document
                 combined_document_content = (
                     combined_document_content[:max_total_content]
                     + "\n[... content truncated ...]"
@@ -360,6 +398,8 @@ class AnalysisReportMixin:
                     num_docs,
                     per_doc_cap,
                 )
+            if graph_block:
+                combined_document_content += "\n\n" + graph_block
 
             doc_count = len(all_docs)
             if doc_count == 0:
@@ -458,9 +498,9 @@ class AnalysisReportMixin:
                 if isinstance(p, dict) and (p.get("name") or "").strip()
             ]
             logger.info(
-                "🧠 Analysis-report extraction complete for workspace {}: parties=[{}]",
+                "Analysis-report extraction complete for workspace {}: {} part(ies)",
                 workspace_id[:12] if workspace_id else "",
-                ", ".join(_ar_party_names) if _ar_party_names else "(none)",
+                len(_ar_party_names),
             )
             import json as _json_ar
             try:
@@ -780,6 +820,7 @@ pendingActions / nextSteps / suggestedDrafts:
 qualityScoreExplanation RULE:
 - MANDATORY non-empty string of 3-5 sentences.
 - MUST start with "The current score is <N>% because" (where N is the integer caseResolutionScore).
+- MUST include exactly ONE sentence tying the score to the CURRENT STRATEGIC OBJECTIVE above: which gap or risk matters most for pursuing THAT objective, or which strength most advances it, in the objective's own terms. The score measures readiness FOR the objective, so when the objective changes this sentence must change with it. Do NOT restate the objective and do NOT judge whether it is a good objective.
 - MUST cite the SPECIFIC facts driving the score: name at least one missingInfo item by what is missing and from whom (using EXTRACTED FACTS names), one weakness or risk by the named party/date/amount/annexure that triggers it, and one strength by the named fact (party + date + Annexure) that supports it.
 - If the score is 100, say specifically that no missingInfo, weaknesses, or risks were flagged, and name the top 1-2 strengths (parties + dates + Annexures) that justify it.
 - Never use generic phrasing like "gaps in annexures" or "procedural risks identified" without naming WHICH gap, WHICH risk, and FOR WHOM.
@@ -813,6 +854,9 @@ ENTITY-GROUNDING RULE (CRITICAL):
                 removed_evidence_block=removed_evidence_block,
             )
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            analysis_prompt = self._with_user_facts(workspace_id, analysis_prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 analysis_prompt = analysis_prompt.rstrip() + "\n\n" + custom_suffix
@@ -886,7 +930,7 @@ ENTITY-GROUNDING RULE (CRITICAL):
             if not json_str:
                 logger.warning(
                     "No JSON found in analysis report response; using fallback. raw preview: {}",
-                    (raw or "")[:400],
+                    chars(raw),
                 )
                 return self._analysis_report_fallback(role)
 
@@ -1028,12 +1072,7 @@ Rules:
             missing_info = _coerce_analysis_text_list(missing_info)[:10]
             # Product language requirement: refer to uploaded files as annexures in analysis text.
             missing_info = [
-                re.sub(
-                    r"\bdocuments\b",
-                    "annexures",
-                    re.sub(r"\bdocument\b", "annexure", x, flags=re.IGNORECASE),
-                    flags=re.IGNORECASE,
-                )
+                _upload_wording(x)
                 for x in missing_info
             ]
 
@@ -1049,26 +1088,14 @@ Rules:
                         laws = [laws] if laws else []
                     laws = [str(l).strip() for l in laws if l][:5]
                     if point:
-                        point = re.sub(
-                            r"\bdocuments\b",
-                            "annexures",
-                            re.sub(
-                                r"\bdocument\b", "annexure", point, flags=re.IGNORECASE
-                            ),
-                            flags=re.IGNORECASE,
-                        )
+                        point = _upload_wording(point)
                         point = _strip_strength_point_statute_boilerplate(point)
                         if not point:
                             continue
                         strengths.append({"point": point, "laws": laws})
                 elif isinstance(s, str) and s.strip():
                     point = s.strip()
-                    point = re.sub(
-                        r"\bdocuments\b",
-                        "annexures",
-                        re.sub(r"\bdocument\b", "annexure", point, flags=re.IGNORECASE),
-                        flags=re.IGNORECASE,
-                    )
+                    point = _upload_wording(point)
                     point = _strip_strength_point_statute_boilerplate(point)
                     if not point:
                         continue
@@ -1129,17 +1156,7 @@ Rules:
                                             laws = [laws] if laws else []
                                         laws = [str(l).strip() for l in laws if l][:5]
                                         if point:
-                                            point = re.sub(
-                                                r"\bdocuments\b",
-                                                "annexures",
-                                                re.sub(
-                                                    r"\bdocument\b",
-                                                    "annexure",
-                                                    point,
-                                                    flags=re.IGNORECASE,
-                                                ),
-                                                flags=re.IGNORECASE,
-                                            )
+                                            point = _upload_wording(point)
                                             point = _strip_strength_point_statute_boilerplate(
                                                 point
                                             )
@@ -1172,24 +1189,14 @@ Rules:
             # render as a raw Python dict literal in the FE panel).
             weaknesses = _coerce_analysis_text_list(weaknesses)[:8]
             weaknesses = [
-                re.sub(
-                    r"\bdocuments\b",
-                    "annexures",
-                    re.sub(r"\bdocument\b", "annexure", x, flags=re.IGNORECASE),
-                    flags=re.IGNORECASE,
-                )
+                _upload_wording(x)
                 for x in weaknesses
             ]
 
             risks = data.get("risks") or []
             risks = _coerce_analysis_text_list(risks)[:8]
             risks = [
-                re.sub(
-                    r"\bdocuments\b",
-                    "annexures",
-                    re.sub(r"\bdocument\b", "annexure", x, flags=re.IGNORECASE),
-                    flags=re.IGNORECASE,
-                )
+                _upload_wording(x)
                 for x in risks
             ]
 
@@ -1349,18 +1356,13 @@ Rules:
                 risks=risks,
                 strengths=strengths,
                 existing=quality_score_explanation,
-            )
-            quality_score_explanation = re.sub(
-                r"\bdocuments\b",
-                "annexures",
-                re.sub(
-                    r"\bdocument\b",
-                    "annexure",
-                    quality_score_explanation,
-                    flags=re.IGNORECASE,
+                strategic_objective=(
+                    ""
+                    if current_strategic_objective == "(not provided)"
+                    else current_strategic_objective
                 ),
-                flags=re.IGNORECASE,
             )
+            quality_score_explanation = _upload_wording(quality_score_explanation)
 
             report_quality_raw = (
                 data.get("reportQualityScoreExplanation")
@@ -1375,17 +1377,7 @@ Rules:
             report_quality_score_explanation = (
                 self._sanitize_report_quality_score_explanation(report_quality_raw)
             )
-            report_quality_score_explanation = re.sub(
-                r"\bdocuments\b",
-                "annexures",
-                re.sub(
-                    r"\bdocument\b",
-                    "annexure",
-                    report_quality_score_explanation,
-                    flags=re.IGNORECASE,
-                ),
-                flags=re.IGNORECASE,
-            )
+            report_quality_score_explanation = _upload_wording(report_quality_score_explanation)
             if not report_quality_score_explanation:
                 report_quality_score_explanation = (
                     self._sanitize_report_quality_score_explanation(
@@ -1401,6 +1393,11 @@ Rules:
                             weaknesses,
                             risks,
                             strengths,
+                            strategic_objective=(
+                                ""
+                                if current_strategic_objective == "(not provided)"
+                                else current_strategic_objective
+                            ),
                         )
                     )
                 )
@@ -1458,70 +1455,19 @@ Rules:
                 "suggestedDrafts": suggested_drafts,
             }
 
-            # Detailed analysis report logs for debugging
-            logger.info("=" * 80)
-            logger.info("📊 ANALYSIS REPORT PAYLOAD (AI-GENERATED)")
-            logger.info("=" * 80)
-            logger.info("📈 caseResolutionScore: {}%", case_resolution_score)
-            if quality_score_explanation:
-                logger.info(
-                    "📝 qualityScoreExplanation: {}",
-                    quality_score_explanation[:200]
-                    + ("..." if len(quality_score_explanation) > 200 else ""),
-                )
-            if report_quality_score_explanation:
-                logger.info(
-                    "📝 reportQualityScoreExplanation: {}",
-                    report_quality_score_explanation[:200]
-                    + (
-                        "..."
-                        if len(report_quality_score_explanation) > 200
-                        else ""
-                    ),
-                )
-            logger.info("")
-            logger.info("❓ MISSING INFO ({} items):", len(missing_info))
-            for idx, item in enumerate(missing_info, 1):
-                logger.info("  {}. {}", idx, item)
-            logger.info("")
-            logger.info("✅ STRENGTHS ({} items):", len(strengths))
-            for idx, s in enumerate(strengths, 1):
-                logger.info(
-                    "  {}. {} | laws: {}", idx, s.get("point", ""), s.get("laws", [])
-                )
-            logger.info("")
-            logger.info("⚠️ WEAKNESSES ({} items):", len(weaknesses))
-            for idx, w in enumerate(weaknesses, 1):
-                logger.info("  {}. {}", idx, w)
-            logger.info("")
-            logger.info("🔴 RISKS ({} items):", len(risks))
-            for idx, r in enumerate(risks, 1):
-                logger.info("  {}. {}", idx, r)
-            logger.info("")
+            # One counts line; item text is case content and stays out of logs.
             logger.info(
-                "📍 RELEVANT JURISDICTION ({} items):", len(relevant_jurisdiction)
-            )
-            for idx, j in enumerate(relevant_jurisdiction, 1):
-                logger.info("  {}. {}", idx, j)
-            logger.info("")
-            logger.info("📋 PENDING ACTIONS ({} items):", len(pending_actions))
-            for idx, a in enumerate(pending_actions, 1):
-                logger.info("  {}. {}", idx, a)
-            logger.info("")
-            logger.info("🚀 NEXT STEPS ({} items):", len(next_steps))
-            for idx, n in enumerate(next_steps, 1):
-                logger.info("  {}. {}", idx, n)
-            logger.info("")
-            logger.info("📄 SUGGESTED DRAFTS ({} items):", len(suggested_drafts))
-            for idx, d in enumerate(suggested_drafts, 1):
-                logger.info("  {}. {}", idx, d)
-            logger.info("=" * 80)
-
-            logger.success(
-                "✅ Analysis report generated: score={}, strengths={}, missingInfo={}",
+                "Analysis report generated: score={} missingInfo={} strengths={} "
+                "weaknesses={} risks={} jurisdiction={} pending={} nextSteps={} drafts={}",
                 case_resolution_score,
-                len(strengths),
                 len(missing_info),
+                len(strengths),
+                len(weaknesses),
+                len(risks),
+                len(relevant_jurisdiction),
+                len(pending_actions),
+                len(next_steps),
+                len(suggested_drafts),
             )
             # Clamp "Annexure N" references in the freshly generated payload
             # against the real upload count so a single-doc workspace never
@@ -1541,8 +1487,7 @@ Rules:
             return payload
 
         except Exception as e:
-            logger.error("Error generating analysis report: {}", e)
-            logger.exception(e)
+            logger.opt(exception=e).error("Analysis report generation failed: {}", e)
             return self._analysis_report_fallback(
                 (workspace_role or "ADJUDICATOR").strip().upper()
             )
@@ -1684,6 +1629,40 @@ Rules:
             self._ANALYSIS_REPORT_DERIVED_SCORE_FLOOR, min(base, max_allowed)
         )
 
+    def _current_strategic_objective(self, workspace_id: str) -> str:
+        """The workspace's live strategic objective, or "" when unknown.
+
+        Read from the strategy cache rather than the analysis report: the
+        report never carries `strategicObjective`, and the objective-change
+        cascade runs AFTER the strategy regen has written the new one here.
+        """
+        if not workspace_id:
+            return ""
+        payload = self._workspace_strategy_payload.get(workspace_id)
+        if not isinstance(payload, dict):
+            return ""
+        return str(payload.get("strategicObjective") or "").strip()
+
+    @staticmethod
+    def _objective_clause_for_explanation(strategic_objective: str) -> str:
+        """One short sentence tying the score to the current objective.
+
+        Used by the deterministic explanation so that a change of objective
+        still visibly changes the explanation even when no LLM ran (truncated
+        output, failed call). Quotes only the objective's FIRST sentence and
+        caps it, because the whole objective is 10-20 sentences and this is a
+        3-5 sentence explanation.
+        """
+        text = " ".join((strategic_objective or "").split())
+        if not text:
+            return ""
+        first = text.split(". ")[0].strip().rstrip(".")
+        if not first:
+            return ""
+        if len(first) > 160:
+            first = first[:157].rstrip() + "..."
+        return f"This score measures readiness for the current objective: {first}."
+
     def _derive_quality_score_explanation(
         self,
         case_resolution_score: int,
@@ -1691,6 +1670,7 @@ Rules:
         weaknesses: List[Any],
         risks: List[Any],
         strengths: List[Any],
+        strategic_objective: str = "",
     ) -> str:
         """Deterministic explanation when the model omits qualityScoreExplanation or output was truncated."""
         nm = len(missing_info or [])
@@ -1698,10 +1678,17 @@ Rules:
         nr = len(risks or [])
         ns = len(strengths or [])
         lead = f"The current case resolution score is {case_resolution_score}%."
+        objective_clause = self._objective_clause_for_explanation(strategic_objective)
         if nm == 0 and nw == 0 and nr == 0:
-            return (
-                f"{lead} No missing critical information, factual weaknesses, or procedural risks were flagged "
-                "in the annexures for this pass."
+            return " ".join(
+                s
+                for s in (
+                    lead,
+                    "No missing critical information, factual weaknesses, or "
+                    "procedural risks were flagged in the annexures for this pass.",
+                    objective_clause,
+                )
+                if s
             )
         clauses = []
         if nm:
@@ -1720,7 +1707,9 @@ Rules:
             if ns
             else ""
         )
-        return " ".join(s for s in (lead, second, third) if s).strip()
+        return " ".join(
+            s for s in (lead, second, third, objective_clause) if s
+        ).strip()
 
     def _sanitize_report_quality_score_explanation(self, text: str) -> str:
         """Report-facing score explanation: remove disallowed words (legal, respondent) per product rules."""
@@ -1744,8 +1733,17 @@ Rules:
         risks: List[Any],
         strengths: List[Any],
         existing: str,
+        strategic_objective: str = "",
     ) -> str:
-        """Fill qualityScoreExplanation via model output, short LLM pass, or deterministic text."""
+        """Fill qualityScoreExplanation via model output, short LLM pass, or deterministic text.
+
+        ``strategic_objective`` is what makes the explanation move when the
+        objective moves: the score measures readiness FOR an objective, so both
+        the LLM pass and the deterministic fallback state how the current
+        objective bears on it. Callers regenerating after an objective change
+        must pass it (and ``existing=""``), or the explanation will be about
+        the gaps alone and read as stale to the lawyer who just changed course.
+        """
         if (existing or "").strip():
             return (existing or "").strip()
         try:
@@ -1770,7 +1768,7 @@ Rules:
                 ensure_ascii=False,
             )
             prompt = (
-                ensure_quality_score_explanation_prompt(case_resolution_score=case_resolution_score, summary=summary)
+                ensure_quality_score_explanation_prompt(case_resolution_score=case_resolution_score, summary=summary, strategic_objective=strategic_objective)
             )
             txt = await gemini_client.generate(
                 prompt=prompt,
@@ -1815,6 +1813,7 @@ Rules:
             weaknesses,
             risks,
             strengths,
+            strategic_objective=strategic_objective,
         )
 
     def _get_annexure_count(self, workspace_id: str) -> int:
@@ -2305,7 +2304,10 @@ Rules:
                 self._analysis_refresh_inflight.discard(workspace_id)
 
         try:
-            asyncio.create_task(_runner())
+            self._track_background_task(
+                asyncio.create_task(_runner()),
+                label=f"analysis refresh after marker miss {workspace_id[:12]}",
+            )
             logger.info(
                 "Scheduled analysis report refresh after marker miss (workspace={})",
                 workspace_id[:12],
@@ -2377,6 +2379,21 @@ Rules:
                 feature_types=["analysis_report"],
             )
             current_report = self._workspace_analysis_payload.get(workspace_id)
+            if not isinstance(current_report, dict):
+                # The refresh above lit the analysis loader and there is no
+                # cached report to update, so nothing below will emit — the
+                # panel would spin for the rest of the session. Release it.
+                logger.warning(
+                    "Analysis update requested with no cached report "
+                    "(workspace={}) — releasing its loader",
+                    workspace_id[:12] if workspace_id else "",
+                )
+                await self._release_refresh_loaders(
+                    workspace_id,
+                    user_id,
+                    ["analysis_report"],
+                    reason="analysis_update_no_cached_report",
+                )
             if isinstance(current_report, dict):
                 removed_missing = 0
                 removed_weak = 0
@@ -2515,6 +2532,7 @@ Rules:
         section: str,
         rejected_value: str,
         report: Dict[str, Any],
+        workspace_id: str = "",
     ) -> Tuple[bool, int, str]:
         """
         Ask AI to (a) decide if the user's rejection is VALID — i.e. the rejected
@@ -2547,16 +2565,35 @@ Rules:
             remaining_weak = len(report.get("weaknesses") or [])
             remaining_risks = len(report.get("risks") or [])
 
+            # The case description lives in the STRATEGY payload, not in the
+            # analysis report: _generate_analysis_report_from_documents never
+            # writes caseSummary / reportCaseSummary / strategicObjective, so
+            # reading them off `report` always yielded "" and the prompt below
+            # rendered the literal "(not available)" — i.e. this scoring call
+            # judged relevance with no case description at all. Fall back to
+            # `report` so a caller that does pass an enriched dict still works.
+            _strategy_src = (
+                self._workspace_strategy_payload.get(workspace_id) or {}
+                if workspace_id
+                else {}
+            )
+            if not isinstance(_strategy_src, dict):
+                _strategy_src = {}
             case_summary = (
-                report.get("caseSummary") or report.get("case_summary") or ""
+                _strategy_src.get("caseSummary")
+                or report.get("caseSummary")
+                or report.get("case_summary")
+                or ""
             ).strip()
             report_summary = (
-                report.get("reportCaseSummary")
+                _strategy_src.get("reportCaseSummary")
+                or report.get("reportCaseSummary")
                 or report.get("report_case_summary")
                 or ""
             ).strip()
             strategic_objective = (
-                report.get("strategicObjective")
+                _strategy_src.get("strategicObjective")
+                or report.get("strategicObjective")
                 or report.get("strategic_objective")
                 or ""
             ).strip()
@@ -2597,7 +2634,7 @@ Rules:
             if not raw or raw.startswith("Error") or "Error generating" in raw[:50]:
                 logger.warning(
                     "Rejection score delta: Gemini error or empty; using default. raw={}",
-                    (raw or "")[:100],
+                    chars(raw),
                 )
                 return (
                     True,
@@ -2658,7 +2695,7 @@ Rules:
                     "Rejection score delta: AI isValid={} delta={}, reason={}",
                     is_valid,
                     delta,
-                    (reason or "")[:80],
+                    chars(reason),
                 )
                 return (is_valid, delta, reason[:200])
             # Regex fallback: extract scoreIncrease from raw text (e.g. malformed or truncated JSON)
@@ -2700,7 +2737,7 @@ Rules:
                 return (is_valid, delta, reason)
             logger.warning(
                 "Rejection score delta: could not parse response; using default. raw={}",
-                raw[:200],
+                chars(raw),
             )
         except Exception as e:
             logger.warning("Rejection score delta failed: {}; using default bump", e)
@@ -2971,6 +3008,7 @@ Rules:
                 section=ev["section"],
                 rejected_value=ev["rejected_value"],
                 report=report,
+                workspace_id=workspace_id,
             )
             for ev in removed_events
         ]
@@ -2997,7 +3035,7 @@ Rules:
         # Cap the batch's combined score bump.
         if total_delta > self._feedback_batch_max_score_delta:
             logger.info(
-                "analysis_report_feedback batch: capping combined score delta {} → {}",
+                "analysis_report_feedback batch: capping combined score delta {}  {}",
                 total_delta,
                 self._feedback_batch_max_score_delta,
             )
@@ -3039,6 +3077,7 @@ Rules:
             risks=updated_risks,
             strengths=updated_strengths,
             existing="",
+            strategic_objective=self._current_strategic_objective(workspace_id),
         )
         report["qualityScoreExplanation"] = fresh_explanation
         report["reportQualityScoreExplanation"] = (
@@ -3058,7 +3097,7 @@ Rules:
                 usage=current_usage(),
             )
             logger.success(
-                "✅ analysis_report_feedback batch applied: {} rejections, score {}% → {}% (delta +{})",
+                "analysis_report_feedback batch applied: {} rejections, score {}%  {}% (delta +{})",
                 len(removed_events),
                 old_score,
                 new_score,
@@ -3075,6 +3114,7 @@ Rules:
         title: str,
         description: str,
         report: Dict[str, Any],
+        workspace_id: str = "",
     ) -> Tuple[bool, int, str]:
         """
         Ask AI to (a) decide if user-supplied title+description is RELATED to the case
@@ -3094,16 +3134,35 @@ Rules:
                 )
                 return (False, 0, "")
 
+            # The case description lives in the STRATEGY payload, not in the
+            # analysis report: _generate_analysis_report_from_documents never
+            # writes caseSummary / reportCaseSummary / strategicObjective, so
+            # reading them off `report` always yielded "" and the prompt below
+            # rendered the literal "(not available)" — i.e. this scoring call
+            # judged relevance with no case description at all. Fall back to
+            # `report` so a caller that does pass an enriched dict still works.
+            _strategy_src = (
+                self._workspace_strategy_payload.get(workspace_id) or {}
+                if workspace_id
+                else {}
+            )
+            if not isinstance(_strategy_src, dict):
+                _strategy_src = {}
             case_summary = (
-                report.get("caseSummary") or report.get("case_summary") or ""
+                _strategy_src.get("caseSummary")
+                or report.get("caseSummary")
+                or report.get("case_summary")
+                or ""
             ).strip()
             report_summary = (
-                report.get("reportCaseSummary")
+                _strategy_src.get("reportCaseSummary")
+                or report.get("reportCaseSummary")
                 or report.get("report_case_summary")
                 or ""
             ).strip()
             strategic_objective = (
-                report.get("strategicObjective")
+                _strategy_src.get("strategicObjective")
+                or report.get("strategicObjective")
                 or report.get("strategic_objective")
                 or ""
             ).strip()
@@ -3158,7 +3217,7 @@ Rules:
             if not raw or raw.startswith("Error") or "Error generating" in raw[:50]:
                 logger.warning(
                     "added_missing_information score delta: empty/error response; treating as not related. raw={}",
-                    (raw or "")[:120],
+                    chars(raw),
                 )
                 return (False, 0, "")
 
@@ -3189,7 +3248,7 @@ Rules:
             if not (obj and isinstance(obj, dict)):
                 logger.warning(
                     "added_missing_information score delta: could not parse JSON; treating as not related. raw={}",
-                    raw[:200],
+                    chars(raw),
                 )
                 return (False, 0, "")
 
@@ -3310,6 +3369,7 @@ Rules:
                 title=title,
                 description=description,
                 report=report,
+                workspace_id=workspace_id,
             )
         )
 
@@ -3335,7 +3395,7 @@ Rules:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ added_missing_information no-op: re-emitted unchanged analysis_report (score stays at {}%)",
+                    "added_missing_information no-op: re-emitted unchanged analysis_report (score stays at {}%)",
                     old_score,
                 )
             else:
@@ -3413,6 +3473,7 @@ Rules:
             risks=updated_risks,
             strengths=updated_strengths,
             existing="",  # force regeneration so the explanation reflects current state
+            strategic_objective=self._current_strategic_objective(workspace_id),
         )
         report["qualityScoreExplanation"] = fresh_explanation
         report["reportQualityScoreExplanation"] = (
@@ -3432,7 +3493,7 @@ Rules:
                 usage=current_usage(),
             )
             logger.success(
-                "✅ added_missing_information applied: score {}% → {}% (-{}), re-emitted analysis_report",
+                "added_missing_information applied: score {}%  {}% (-{}), re-emitted analysis_report",
                 old_score,
                 new_score,
                 score_delta,
@@ -3441,3 +3502,335 @@ Rules:
             logger.warning(
                 "added_missing_information: no socket client – report updated in cache only"
             )
+
+    # ------------------------------------------------------------------
+    # missing_information_edited — a lawyer re-worded one missingInfo item
+    # ------------------------------------------------------------------
+
+    #: Older wordings remembered per edited item. Used to re-attach the item's
+    #: id when a regeneration reproduces an earlier wording verbatim.
+    _EDITED_MISSING_INFO_PRIOR_TEXTS_CAP = 10
+    #: Edited items remembered per workspace (oldest dropped first).
+    _EDITED_MISSING_INFO_LEDGER_CAP = 100
+
+    @staticmethod
+    def _parse_edit_timestamp(value: Any) -> Optional[datetime]:
+        """Parse an ISO-8601 ``editedAt`` (``Z`` suffix allowed); None if absent
+        or malformed. Returned naive-UTC so two values always compare."""
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is not None:
+            parsed = parsed.replace(tzinfo=None) - (parsed.utcoffset() or timedelta(0))
+        return parsed
+
+    def _apply_missing_info_edits(
+        self, workspace_id: str, items: Any
+    ) -> Any:
+        """Re-apply the lawyer's re-worded missingInfo text to tagged items.
+
+        A regeneration derives missingInfo from the documents, which still carry
+        the model's original wording, so without this every edit is reverted by
+        the next upload / sync / objective change. Two passes over the
+        ``[{id, text, isMatched}]`` list:
+
+        1. an item whose id is in the ledger gets the lawyer's text;
+        2. an item with an unknown id whose text equals (normalised) the edited
+           text or one of its earlier wordings takes over the edited item's id
+           and text — the reconcile step minted a new id because the stored
+           currentState and the regenerated text no longer matched.
+
+        The ledger only rewrites items the report still contains; it never
+        re-introduces a gap a regeneration resolved. Mutates and returns
+        ``items``; anything that is not a list of dicts is returned untouched.
+        """
+        ledger = self._workspace_edited_missing_info.get(workspace_id) or {}
+        if not ledger or not isinstance(items, list):
+            return items
+        claimed: Set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            entry = ledger.get(str(item.get("id") or ""))
+            if isinstance(entry, dict) and entry.get("text"):
+                item["text"] = entry["text"]
+                claimed.add(str(item.get("id")))
+
+        # Lookup: normalised wording -> ledger id, for ids not already present.
+        by_text: Dict[str, str] = {}
+        for eid, entry in ledger.items():
+            if eid in claimed or not isinstance(entry, dict):
+                continue
+            for text in [entry.get("text")] + list(entry.get("priorTexts") or []):
+                key = _normalize_match_text(text)
+                if key:
+                    by_text.setdefault(key, eid)
+        if not by_text:
+            return items
+        for item in items:
+            if not isinstance(item, dict) or str(item.get("id") or "") in claimed:
+                continue
+            eid = by_text.get(_normalize_match_text(item.get("text")))
+            if not eid or eid in claimed:
+                continue
+            item["id"] = eid
+            item["text"] = ledger[eid]["text"]
+            item["isMatched"] = True
+            claimed.add(eid)
+        return items
+
+    def _record_missing_info_edit(
+        self,
+        workspace_id: str,
+        *,
+        item_id: str,
+        new_text: str,
+        prior_texts: List[str],
+        edited_at: str,
+        request_id: str,
+    ) -> None:
+        """Write the edit into the per-workspace ledger (write-through)."""
+        ledger = dict(self._workspace_edited_missing_info.get(workspace_id) or {})
+        previous = ledger.pop(item_id, None) or {}
+        priors: List[str] = []
+        for text in list(previous.get("priorTexts") or []) + list(prior_texts):
+            text = (text or "").strip() if isinstance(text, str) else ""
+            if text and text != new_text and text not in priors:
+                priors.append(text)
+        ledger[item_id] = {
+            "text": new_text,
+            "priorTexts": priors[-self._EDITED_MISSING_INFO_PRIOR_TEXTS_CAP:],
+            "editedAt": edited_at,
+            "requestId": request_id,
+        }
+        # dicts keep insertion order and the edited id was re-inserted last, so
+        # trimming from the front drops the least recently edited items.
+        while len(ledger) > self._EDITED_MISSING_INFO_LEDGER_CAP:
+            ledger.pop(next(iter(ledger)))
+        self._workspace_edited_missing_info[workspace_id] = ledger
+
+    def _rename_missing_info_in_side_state(
+        self,
+        workspace_id: str,
+        *,
+        item_id: str,
+        old_texts: List[str],
+        new_text: str,
+    ) -> None:
+        """Carry an edit into the two caches that hold missingInfo wording.
+
+        - ``currentState.missingInfo``: the reconcile step matches regenerated
+          text against it. Left on the old wording, the next retag sees the
+          edited text as new and mints the item a fresh id.
+        - the user-added bucket: protects a lawyer-added item from the
+          answered-by-upload pass by text, so it must follow the rename.
+        """
+        state = self._workspace_current_state_payload.get(workspace_id)
+        if isinstance(state, dict) and isinstance(state.get("missingInfo"), list):
+            changed = False
+            new_items = []
+            for entry in state["missingInfo"]:
+                if isinstance(entry, dict) and str(entry.get("id") or "") == item_id:
+                    if entry.get("text") != new_text:
+                        entry = {**entry, "text": new_text}
+                        changed = True
+                new_items.append(entry)
+            if changed:
+                self._workspace_current_state_payload[workspace_id] = {
+                    **state,
+                    "missingInfo": new_items,
+                }
+
+        bucket = self._workspace_user_added_missing_info.get(workspace_id) or []
+        old_set = {t for t in old_texts if t}
+        if any(isinstance(t, str) and t in old_set for t in bucket):
+            renamed: List[str] = []
+            for text in bucket:
+                text = new_text if text in old_set else text
+                if text not in renamed:
+                    renamed.append(text)
+            self._workspace_user_added_missing_info[workspace_id] = renamed
+
+    async def on_missing_information_edited(self, data: Dict[str, Any]) -> None:
+        """
+        Handle missing_information_edited: a lawyer re-worded one Missing
+        Information item.
+
+        Text only. The item keeps its id and ``isMatched``. The score,
+        explanations and every other list stay as they are, and no model is
+        called. The edit is applied to the cached analysis report and recorded
+        in ``_workspace_edited_missing_info`` so regenerations keep the
+        lawyer's wording (see ``_apply_missing_info_edits``). The report is then
+        re-emitted so every client of a shared case sees the new text.
+
+        Delivery: the backend re-sends on reconnect under the same
+        ``requestId``. A repeat of an applied ``requestId`` is swallowed, and an
+        edit whose ``editedAt`` is older than the one already applied to that
+        item is dropped as stale. Without that check, a late re-send of edit 1
+        would revert edit 2.
+
+        Sharing: ``userId`` is the owner; ``editedBy`` is who typed it. A
+        ``view`` collaborator's edit is not applied. The unchanged report is
+        re-emitted so the frontend drops its optimistic text.
+        """
+        import copy
+
+        raw = data if isinstance(data, dict) else {}
+        try:
+            payload = MissingInformationEditedPayload.model_validate(raw)
+        except Exception as e:
+            logger.warning(
+                "missing_information_edited: invalid payload (keys={}): {}",
+                sorted(raw.keys()),
+                type(e).__name__,
+            )
+            return
+
+        workspace_id = (payload.workspaceId or "").strip()
+        user_id = (payload.userId or "").strip()
+        item_id = (payload.itemId or "").strip()
+        request_id = (payload.requestId or "").strip()
+        new_text = (payload.newText or "").strip()
+        previous_text = (payload.previousText or "").strip()
+        edited_at = (payload.editedAt or payload.timestamp or "").strip()
+
+        if not workspace_id or not item_id or not new_text:
+            logger.warning(
+                "missing_information_edited: missing workspaceId, itemId or newText – ignoring"
+            )
+            return
+        if new_text == previous_text:
+            logger.info("missing_information_edited: text unchanged – ignoring")
+            return
+
+        # Live workspace traffic revokes a pending compliance purge.
+        self.cancel_pending_purge(workspace_id, trigger="missing_information_edited")
+
+        try:
+            await self._hydrate_workspace_caches(workspace_id, user_id=user_id)
+        except Exception as e:  # pragma: no cover - best-effort hydration
+            logger.debug(
+                "missing_information_edited: hydration failed for workspace {}: {}",
+                workspace_id,
+                type(e).__name__,
+            )
+
+        current = self._workspace_analysis_payload.get(workspace_id)
+        if not isinstance(current, dict) or not current:
+            logger.warning(
+                "missing_information_edited: no cached analysis report – edit not applied"
+            )
+            return
+
+        asker = resolve_asker(
+            workspace_id,
+            user_id,
+            payload.editedBy.model_dump() if payload.editedBy else None,
+        )
+        if not asker.can_edit:
+            logger.warning(
+                "missing_information_edited: rejected edit from {} – re-emitting unchanged report",
+                asker.log_label(),
+            )
+            await self._emit_document_feature(
+                feature_type="analysis_report",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=current,
+                usage=current_usage(),
+            )
+            return
+
+        prior_entry = (self._workspace_edited_missing_info.get(workspace_id) or {}).get(
+            item_id
+        ) or {}
+        if request_id and prior_entry.get("requestId") == request_id:
+            logger.info("missing_information_edited: duplicate requestId – already applied")
+            return
+        incoming_at = self._parse_edit_timestamp(edited_at)
+        applied_at = self._parse_edit_timestamp(prior_entry.get("editedAt"))
+        if incoming_at and applied_at and incoming_at < applied_at:
+            logger.info(
+                "missing_information_edited: stale edit (editedAt older than the applied one) – ignoring"
+            )
+            return
+
+        report = copy.deepcopy(current)
+        items = report.get("missingInfo")
+        if not isinstance(items, list):
+            items = []
+        # Locate by id first. A legacy untagged (plain-string) report has no ids,
+        # so fall back to the previous wording.
+        index: Optional[int] = None
+        for i, item in enumerate(items):
+            if isinstance(item, dict) and str(item.get("id") or "") == item_id:
+                index = i
+                break
+        if index is None and previous_text:
+            wanted = _normalize_match_text(previous_text)
+            for i, item in enumerate(items):
+                if _normalize_match_text(_coerce_analysis_text_item(item)) == wanted:
+                    index = i
+                    break
+
+        old_item_text = (
+            _coerce_analysis_text_item(items[index]) if index is not None else ""
+        )
+        self._record_missing_info_edit(
+            workspace_id,
+            item_id=item_id,
+            new_text=new_text,
+            prior_texts=[previous_text, old_item_text],
+            edited_at=edited_at,
+            request_id=request_id,
+        )
+        self._rename_missing_info_in_side_state(
+            workspace_id,
+            item_id=item_id,
+            old_texts=[previous_text, old_item_text],
+            new_text=new_text,
+        )
+
+        if index is None:
+            # The frontend shows an item our cache does not have (the cache is
+            # behind it). Emitting this report would remove the item the
+            # lawyer just edited. The ledger entry is kept, and the next
+            # regeneration that produces the item applies it.
+            logger.warning(
+                "missing_information_edited: item not in cached report (items={}) – "
+                "edit recorded for the next regeneration, nothing emitted",
+                len(items),
+            )
+            return
+
+        target = items[index]
+        if isinstance(target, dict):
+            items[index] = {**target, "text": new_text}
+            report["missingInfo"] = items
+        else:
+            # Legacy plain-string list: replace, then retag. The ledger written
+            # above makes the retag give this item ``item_id``.
+            items[index] = new_text
+            report["missingInfo"] = items
+            report = await self._retag_analysis_report_safe(workspace_id, report)
+
+        report["timestamp"] = datetime.utcnow().isoformat() + "Z"
+        self._workspace_analysis_payload[workspace_id] = report
+
+        delivered = await self._emit_document_feature(
+            feature_type="analysis_report",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            payload=report,
+            usage=current_usage(),
+        )
+        logger.info(
+            "missing_information_edited applied by {}: chars {} -> {}, delivered={}",
+            asker.log_label(),
+            chars(old_item_text),
+            chars(new_text),
+            delivered,
+        )

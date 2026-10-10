@@ -154,6 +154,24 @@ class WorkspaceCurrentState(BaseModel):
     applicableLaws: Optional[List[CurrentStateLawItem]] = None
 
 
+class WorkspaceParticipant(BaseModel):
+    """
+    One collaborator on a SHARED workspace (workspace sharing).
+
+    Arrives inside ``workspace_sync.participants``. ``userId`` identifies the
+    collaborator; the workspace's own ``userId`` stays the case OWNER.
+    ``permission`` is ``edit`` or ``view`` — it is kept as a free string rather
+    than a Literal so an unrecognised value degrades to read-only (see
+    ``app/workspace/participants.py``) instead of rejecting the whole sync.
+    """
+
+    userId: str
+    name: Optional[str] = None
+    permission: Optional[str] = None  # "edit" | "view"
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
 class WorkspaceSyncPayload(BaseModel):
     """
     Schema for workspace_sync event (Server → AI_Maverick).
@@ -184,6 +202,10 @@ class WorkspaceSyncPayload(BaseModel):
     currentState: Optional[WorkspaceCurrentState] = (
         None  # Previously-curated panel state (present only on re-run triggers)
     )
+    # Collaborator roster. ABSENT ENTIRELY (not an empty array) when the case
+    # is not shared, which is how an un-share reaches this service — see
+    # `set_participants(..., authoritative=True)` in app/workspace/participants.py.
+    participants: Optional[List[WorkspaceParticipant]] = None
 
     class Config:
         populate_by_name = True
@@ -218,6 +240,152 @@ class WorkspaceVersionRestorePayload(WorkspaceSyncPayload):
         populate_by_name = True
 
 
+class DocumentReloadTargetFile(EvidenceFilePayload):
+    """The one document a ``document_reload_request`` re-reads.
+
+    Same shape as any other evidence file — deliberately, because the reload is
+    a RE-READ of a document that is already in evidence, not a new upload: the
+    ``fileHash`` is unchanged and the same file appears again inside
+    ``evidenceFiles``. Only ``url`` differs (the backend re-signs it) plus:
+
+    - ``previousQualityScore`` — the readability score this service reported
+      last time, or ``None`` if the document was never scored. Advisory: it is
+      logged and audited so a reload can be judged against its predecessor, and
+      never used to decide whether to re-ingest.
+    """
+
+    previousQualityScore: Optional[float] = None
+
+    class Config:
+        populate_by_name = True
+
+
+class DocumentReloadRequestPayload(BaseModel):
+    """
+    Schema for document_reload_request event (Server → AI_Maverick).
+
+    The user hit "reload" on one document in Supporting Material (or the
+    backend did, because the document scored badly). The AI purges everything
+    it holds for that document, re-fetches and re-extracts it, and re-runs the
+    workspace feature suite over the FULL evidence set.
+
+    - ``requestId`` de-dupes retries. The backend records the request in its AI
+      ledger and re-sends on a stall or reconnect, so a re-send under the same
+      id is expected rather than an error.
+    - ``targetFile`` is the document being reloaded. It carries no document id
+      of its own in the backend contract, so the handler resolves one (see
+      ``_resolve_reload_document_id``) — an id-less reload cannot be ingested.
+    - ``evidenceFiles`` is every ACTIVE file, so the feature re-run has full
+      context. Nothing is being removed here, so no soft-deleted entries.
+    - ``currentState`` is MANDATORY on this event: without it the re-run would
+      wipe the items the lawyer already approved or rejected.
+    - ``participants`` is context only (present on shared cases); access is
+      enforced by the backend, and a reload says nothing about sharing, so the
+      handler applies it non-authoritatively.
+    """
+
+    requestId: str  # 'dlr_<docId first 8>_<epochMs>' — de-dupes retries
+    workspaceId: str
+    userId: str  # always the case OWNER, shared or not
+    title: Optional[str] = None
+    status: Optional[str] = None
+    workspaceRole: Optional[str] = None
+    reason: Optional[str] = None  # 'user_requested' | 'poor_quality'
+    targetFile: DocumentReloadTargetFile
+    evidenceFiles: Optional[List[EvidenceFilePayload]] = None
+    currentState: Optional[WorkspaceCurrentState] = None
+    participants: Optional[List[WorkspaceParticipant]] = None
+    timestamp: Optional[str] = None  # ISO timestamp
+
+    class Config:
+        populate_by_name = True
+
+
+class StoppedByInfo(BaseModel):
+    """Who actually clicked Stop — may be a collaborator, never re-keys state.
+
+    ``name`` is personal data: it is accepted so the payload validates, and is
+    never logged or written anywhere.
+    """
+
+    userId: str
+    name: Optional[str] = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
+class WorkspaceStopRequestPayload(BaseModel):
+    """
+    Schema for workspace_stop_request event (Server → AI_Maverick).
+
+    The lawyer clicked Stop on a running update. FIRE-AND-FORGET: the backend
+    never waits for a reply, stamps its own run stopped, and discards every
+    feature response that arrives afterwards. This service's job is to stop
+    paying for work nobody will see — cancel in-flight work, drop buffered
+    deliveries (including the persisted buffer, so a restart cannot resurface
+    them), and disarm recovery markers.
+
+    - ``requestId`` — 'stp_<first 8 of workspaceId>_<epochMs>'. Re-sends under
+      the same id are EXPECTED and swallowed.
+    - ``userId`` — always the case OWNER, as on every other event.
+    - ``stoppedBy`` — who clicked (may be a collaborator). Informational.
+    - ``receivedFeatures`` — delivered and saved; settled. Informational.
+    - ``pendingFeatures`` — abandoned. Decides whether an interrupted objective
+      change is kept for a later ``workspace_resume_request``.
+    - ``stoppedAt`` — ISO instant of the click; used to recognise a stale
+      re-send that arrives after a newer run has already started.
+
+    Every field except ``workspaceId`` is optional on purpose: a malformed stop
+    must still cancel, because the moment a lawyer most wants Stop is when
+    something is already wrong.
+    """
+
+    requestId: Optional[str] = None
+    workspaceId: str
+    userId: Optional[str] = None
+    stoppedBy: Optional[StoppedByInfo] = None
+    receivedFeatures: List[str] = []
+    pendingFeatures: Optional[List[str]] = None
+    stoppedAt: Optional[str] = None
+    timestamp: Optional[str] = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
+class WorkspaceResumeRequestPayload(BaseModel):
+    """
+    Schema for workspace_resume_request event (Server → AI_Maverick).
+
+    The lawyer clicked "Finish update" on a stopped run. Produce EXACTLY the
+    features in ``reEmitFeatures`` — no more — because the frontend arms one
+    spinner per featureType declared in ``workspace:refresh`` and only a
+    ``document_feature_response`` of that type clears it. The other features
+    completed and are settled; re-sending them would overwrite good content.
+
+    - ``requestId`` — 'rsm_<first 8 of workspaceId>_<epochMs>'. De-duped like
+      ``document_reload_request``: a re-send while in flight or just completed
+      is swallowed, a re-send after a failed attempt re-runs.
+    - ``evidenceFiles`` — the FULL active document set (same shape as
+      workspace_sync); authoritative, reconciled against the vector store.
+    - ``currentState`` — required so the resumed features honour isMatched.
+    - ``participants`` — same semantics as workspace_sync (absent = not shared).
+    """
+
+    requestId: Optional[str] = None
+    workspaceId: str
+    userId: str  # always the case OWNER
+    title: Optional[str] = None
+    status: Optional[str] = None
+    workspaceRole: Optional[str] = None
+    reEmitFeatures: List[str] = []
+    evidenceFiles: Optional[List[EvidenceFilePayload]] = None
+    currentState: Optional[WorkspaceCurrentState] = None
+    participants: Optional[List[WorkspaceParticipant]] = None
+    timestamp: Optional[str] = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
 class TransferredUserInfo(BaseModel):
     """New owner details embedded in workspace_transferred."""
 
@@ -227,6 +395,46 @@ class TransferredUserInfo(BaseModel):
 
     class Config:
         populate_by_name = True
+
+
+class WorkspaceDeletedPayload(BaseModel):
+    """
+    Schema for workspace_deleted event (Server → AI_Maverick).
+
+    The backend's erasure cascade does not reach this service: when a lawyer
+    deletes a case, the backend drops its own records and files, but the copy
+    embedded in our vector store is outside that cascade and used to survive
+    indefinitely. This event is the instruction to erase it, so that "your case
+    is deleted" is true of the AI's copy too.
+
+    Three properties of this event drive the handler:
+
+    - ``purgeAfter`` is ABSOLUTE and authoritative. Delete at or after that
+      instant; never recompute it from ``purgeAfterDays`` (which is
+      informational) or from a local clock offset. A timestamp rather than a
+      duration means there is nothing to configure here and no clock-skew
+      argument between the two services.
+    - DUPLICATES ARE EXPECTED. The backend emit is fire-and-forget, so an event
+      sent while this service is mid-deploy evaporates with no error. The
+      backend therefore persists every pending deletion and re-sends it on each
+      reconnect, with the SAME ``requestId``, until ``purgeAfter`` passes. The
+      handler dedupes on ``requestId`` and is idempotent per workspace.
+    - The deletion is REVOCABLE until it runs. A restore inside the grace
+      window arrives as ordinary workspace traffic (created / sync / restore /
+      transfer), which cancels the pending purge — without that, a workspace
+      restored on day 2 would be silently erased on day 7.
+    """
+
+    workspaceId: str  # 24-hex MongoDB ObjectId; the only key needed to purge
+    userId: str  # Case OWNER, always — never whoever pressed delete
+    deletedAt: str  # ISO 8601 UTC
+    purgeAfter: str  # ISO 8601 UTC — absolute; delete at or after this instant
+    purgeAfterDays: Optional[int] = None  # Informational; purgeAfter wins
+    reason: Optional[str] = None  # "user_deleted" | "admin_deleted"
+    requestId: Optional[str] = None  # wd_<first8-of-workspaceId>_<epoch_ms>
+    event: Optional[str] = None  # Always "workspace_deleted"
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
 
 
 class WorkspaceTransferredPayload(BaseModel):
@@ -291,6 +499,50 @@ class AddedMissingInformationPayload(BaseModel):
 
     class Config:
         populate_by_name = True
+
+
+class MissingInformationEditedBy(BaseModel):
+    """Who edited the item (``missing_information_edited.editedBy``)."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    userId: Optional[str] = Field(
+        None, validation_alias=AliasChoices("userId", "user_id")
+    )
+
+
+class MissingInformationEditedPayload(BaseModel):
+    """
+    Payload for missing_information_edited (Server → AI service).
+    A lawyer rewrote the wording of one Missing Information item. Only the text
+    changes: no status change, no new fields. The backend emits nothing when the
+    trimmed text is unchanged. ``userId`` is the case OWNER; ``editedBy`` is
+    whoever typed the edit (a collaborator on a shared case).
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    requestId: Optional[str] = Field(
+        None, validation_alias=AliasChoices("requestId", "request_id")
+    )
+    workspaceId: str = Field(
+        ..., validation_alias=AliasChoices("workspaceId", "workspace_id")
+    )
+    userId: Optional[str] = Field(
+        None, validation_alias=AliasChoices("userId", "user_id")
+    )
+    editedBy: Optional[MissingInformationEditedBy] = Field(
+        None, validation_alias=AliasChoices("editedBy", "edited_by")
+    )
+    itemId: str = Field(..., validation_alias=AliasChoices("itemId", "item_id"))
+    previousText: Optional[str] = Field(
+        None, validation_alias=AliasChoices("previousText", "previous_text")
+    )
+    newText: str = Field(..., validation_alias=AliasChoices("newText", "new_text"))
+    editedAt: Optional[str] = Field(
+        None, validation_alias=AliasChoices("editedAt", "edited_at")
+    )
+    timestamp: Optional[str] = None
 
 
 class ApplicableLawItemInRequest(BaseModel):
@@ -366,6 +618,22 @@ class ChatAttachmentPayload(BaseModel):
         extra = "ignore"
 
 
+class ChatAskedBy(BaseModel):
+    """
+    Who typed a chat message, when that is not the case owner.
+
+    Present on ``user_message_request`` ONLY for a shared workspace where a
+    collaborator asked the question. The payload's ``userId`` is unchanged (it
+    remains the OWNER), so this is purely additive: it drives attribution in
+    the reply and the read-only gate for ``view`` collaborators.
+    """
+
+    userId: str
+    name: Optional[str] = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
 class UserMessageRequestPayload(BaseModel):
     """
     Schema for user_message_request event (Server → AI_Maverick).
@@ -390,6 +658,10 @@ class UserMessageRequestPayload(BaseModel):
     attachment: Optional[ChatAttachmentPayload] = (
         None  # Document uploaded with this message (e.g. ANALYSIS_REPORT chat)
     )
+    askedBy: Optional[ChatAskedBy] = Field(
+        default=None,
+        validation_alias=AliasChoices("askedBy", "asked_by"),
+    )  # Set only when a shared-workspace collaborator (not the owner) asked.
 
     # Drafting Assistant fields. Optional; present on the kick-off turn when
     # the lawyer starts a draft from a template / suggestion / blank.
@@ -705,6 +977,42 @@ class DraftDocumentPayload(BaseModel):
     downloadUrl: Optional[str] = None
 
 
+class Citation(BaseModel):
+    """
+    One source behind a chat answer, matching an inline ``[index]`` marker.
+
+    ``type`` is ``document`` (an uploaded annexure: ``documentId``,
+    ``annexure``, ``fileName``, ``page``/``pageEnd``, ``timestamp`` for audio,
+    and a verbatim ``quote``), ``case_law`` or ``statute`` (``title`` and
+    ``url``). Every citation has been checked against the evidence that was
+    actually in the prompt — see app/rag/citations.py.
+
+    Spreadsheet sources add ``sheet`` and ``rowStart``/``rowEnd`` (the exact
+    row of the quote). ``computed: true`` marks a figure the system calculated
+    over every row of that sheet (app/rag/table_query.py); its ``quote`` states
+    the calculation. All four are optional and additive.
+    """
+
+    index: int
+    type: Literal["document", "case_law", "statute", "web"]
+    documentId: Optional[str] = None
+    annexure: Optional[int] = None
+    fileName: Optional[str] = None
+    page: Optional[int] = None
+    pageEnd: Optional[int] = None
+    timestamp: Optional[str] = None
+    heading: Optional[str] = None
+    quote: Optional[str] = None
+    url: Optional[str] = None
+    title: Optional[str] = None
+    sheet: Optional[str] = None
+    rowStart: Optional[int] = None
+    rowEnd: Optional[int] = None
+    computed: Optional[bool] = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
 class AIResponsePayload(BaseModel):
     """
     Schema for ai_response event (AI_Maverick → Server).
@@ -726,6 +1034,9 @@ class AIResponsePayload(BaseModel):
     suggestionChips: Optional[List[str]] = (
         None  # 3-4 contextual, role-based prompts for next turn
     )
+    # Sources behind the answer, one per inline [n] marker in `content`.
+    # Additive: absent/empty when the answer cites nothing.
+    citations: Optional[List[Citation]] = None
 
     # Drafting Assistant fields (omitted for other chat types).
     actionableId: Optional[str] = None

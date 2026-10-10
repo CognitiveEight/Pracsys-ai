@@ -17,7 +17,10 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.utils.redact import chars
+
 from app.agents.role_models import RoleEnum
+from app.ai.gemini_client import is_generation_error
 from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
@@ -76,6 +79,7 @@ from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
                                        restore_state)
 from agent import process_analysis_docx_request
 
+from app.rag.packing import fit_to_budget, panel_context_budget
 from app.socket.event_utils import (
     EventHandler,
     _STRATEGY_ROLE_LABELS_RE,
@@ -104,6 +108,7 @@ from app.socket.event_utils import (
     _strip_ui_truncated_tokens,
     scrub_app_brand,
     _coerce_analysis_text_list,
+    find_dropped_case_figures,
     find_ungrounded_proper_nouns,
     _strip_strength_point_statute_boilerplate,
     _annexure_wording_for_next_steps,
@@ -122,7 +127,7 @@ from app.prompts.strategy_prompts import (
     generate_strategies_from_documents_prompt4,
     generate_strategies_from_documents_prompt5,
     generate_strategies_from_documents_prompt6,
-    regenerate_strategy_objective_preserving_case_summary_prompt,
+    regenerate_strategy_for_new_objective_prompt,
     reground_strategy_objective_prompt,
     regenerate_case_summary_with_feedback_prompt,
     regenerate_next_steps_with_feedback_prompt,
@@ -134,6 +139,20 @@ from app.prompts.strategy_prompts import (
     llm_classify_panel_edit_intent_prompt2,
     panel_edit_ack_prompt,
 )
+
+
+def _noop_key(value: Any) -> Any:
+    """Normalise a panel field for the surgical-edit no-op comparison.
+
+    Collapses whitespace so a model that returns the same prose with different
+    wrapping or a trailing newline still counts as "unchanged". Lists are
+    normalised element-wise so ``possibleNextSteps`` compares by content.
+    """
+    if isinstance(value, str):
+        return re.sub(r"\s+", " ", value).strip()
+    if isinstance(value, list):
+        return [_noop_key(v) for v in value]
+    return value
 
 
 class StrategyMixin:
@@ -168,7 +187,7 @@ class StrategyMixin:
             from app.vectorstore.qdrant import vector_store
 
             logger.info(
-                f"🧠 Generating detailed strategies for workspace {workspace_id} with role {workspace_role}"
+                "Generating detailed strategies for workspace {} with role {}", workspace_id, workspace_role
             )
 
             # Build documents_info from batch_result when available (for analysis metadata)
@@ -195,11 +214,11 @@ class StrategyMixin:
                     workspace_id=workspace_id
                 )
                 logger.info(
-                    f"Retrieved {len(all_docs)} document(s) from vector store for strategy generation"
+                    "Retrieved {} document(s) from vector store for strategy generation", len(all_docs)
                 )
             except Exception as vector_error:
                 logger.warning(
-                    f"Could not retrieve documents from vector store: {vector_error}"
+                    "Could not retrieve documents from vector store: {}", vector_error
                 )
 
             # Build combined content with a fair per-document cap so all documents are represented.
@@ -210,7 +229,8 @@ class StrategyMixin:
                 if (d.get("content") or "").strip()
                 and len((d.get("content") or "").strip()) >= 20
             ]
-            max_total_content = 100000
+            graph_block = await self._graph_evidence_block("strategy_objective", workspace_id)
+            max_total_content = max(20_000, panel_context_budget() - len(graph_block))
             per_doc_cap = (
                 (max_total_content // max(1, len(valid_docs)))
                 if valid_docs
@@ -225,7 +245,7 @@ class StrategyMixin:
                         continue
                     if len(content) > per_doc_cap:
                         content = (
-                            content[:per_doc_cap] + "\n[... truncated for length ...]"
+                            fit_to_budget(content, per_doc_cap, "general")
                         )
                     # Build labelled block with metadata header so the
                     # prompt distinguishes drafted-by-assistant documents
@@ -240,7 +260,7 @@ class StrategyMixin:
                 combined_document_content = (
                     "\n\n".join(parts) if parts else "No document content available."
                 )
-            if len(combined_document_content) > max_total_content:
+            if len(combined_document_content) > int(max_total_content * 1.1):  # headers add a little; never cut the last document
                 combined_document_content = (
                     combined_document_content[:max_total_content]
                     + "\n[... content truncated ...]"
@@ -251,6 +271,8 @@ class StrategyMixin:
                     len(valid_docs),
                     per_doc_cap,
                 )
+            if graph_block:
+                combined_document_content += "\n\n" + graph_block
             num_annexures = len(valid_docs)
             if num_annexures <= 0:
                 annexure_limit_block = (
@@ -284,17 +306,11 @@ class StrategyMixin:
                 for p in (case_entities.get("parties") or [])
                 if isinstance(p, dict) and (p.get("name") or "").strip()
             ]
+            # Counts only: party names and document text are personal data.
             logger.info(
-                "🧠 Strategy deep-extraction complete for workspace {}: parties=[{}]",
-                workspace_id[:12] if workspace_id else "",
-                ", ".join(_extracted_party_names) if _extracted_party_names else "(none)",
-            )
-            # Diagnostic: dump first 1500 chars of combined_document_content so
-            # we can tell at a glance whether names ARE present in what we send
-            # to Gemini when the extracted parties list comes back empty.
-            logger.debug(
-                "Strategy pass 1 combined_document_content preview (first 1500 chars): {}",
-                (combined_document_content or "")[:1500],
+                "Strategy deep-extraction complete: {} part(ies) from {} chars of document text",
+                len(_extracted_party_names),
+                len(combined_document_content or ""),
             )
 
             # When no documents (e.g. all deleted), return fallback so backend can clear strategy / show empty state
@@ -332,7 +348,7 @@ class StrategyMixin:
 
             # Generate AI-powered case summary and strategic objective
             logger.info(
-                "🤖 Generating AI-powered case analysis (all documents, upload order)..."
+                "Generating AI-powered case analysis (all documents, upload order)..."
             )
 
             # Current-date context for year resolution: a source date stated
@@ -361,6 +377,9 @@ class StrategyMixin:
                 )
                 structured_prompt = generate_strategies_from_documents_prompt2(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, _entities_block=_entities_block, annexure_limit_block=annexure_limit_block, combined_document_content=combined_document_content, strategy_inventory=strategy_inventory, workspace_role=workspace_role, current_year=current_year, today_str=today_str, confirmed_party=_confirmed_party)
                 custom_suffix = build_custom_instruction_suffix(workspace_id)
+                structured_prompt = self._with_user_facts(
+                    workspace_id, structured_prompt
+                )
                 if custom_suffix:
                     structured_prompt = (
                         structured_prompt.rstrip() + "\n\n" + custom_suffix
@@ -375,12 +394,6 @@ class StrategyMixin:
                     response_mime_type="application/json",
                 )
 
-                logger.info(f"AI generated {len(ai_response)} characters of analysis")
-                logger.info("=" * 80)
-                logger.info("🤖 RAW AI RESPONSE:")
-                logger.info("-" * 80)
-                logger.info(ai_response)
-                logger.info("=" * 80)
 
                 # Try to parse JSON response with shared repair logic
                 import json
@@ -389,9 +402,9 @@ class StrategyMixin:
                 ai_response = ai_response.strip()
                 json_str = self._prepare_json_candidate(ai_response, prefer="object")
                 if json_str:
-                    logger.info("✅ Extracted JSON candidate for strategy analysis")
+                    logger.info("Extracted JSON candidate for strategy analysis")
                 else:
-                    logger.warning("❌ No JSON found in AI response")
+                    logger.warning("No JSON found in AI response")
 
                 if json_str:
                     # Try to parse JSON
@@ -432,11 +445,11 @@ class StrategyMixin:
                         ):
                             logger.warning(
                                 "Strategy synthesis dropped items for workspace {}: "
-                                "parties={} suits={} dates={}; retrying once with explicit directive",
+                                "{} part(ies), {} suit(s), {} date(s); retrying once with explicit directive",
                                 workspace_id[:12] if workspace_id else "",
-                                _missing_parties,
-                                _missing_suits,
-                                _missing_dates,
+                                len(_missing_parties),
+                                len(_missing_suits),
+                                len(_missing_dates),
                             )
                             try:
                                 _report_case_summary = analysis_data.get(
@@ -517,11 +530,11 @@ class StrategyMixin:
                                         if _still_any:
                                             logger.warning(
                                                 "Entity verifier retry STILL missing for "
-                                                "workspace {}: parties={} suits={} dates={}",
+                                                "workspace {}: {} part(ies), {} suit(s), {} date(s)",
                                                 workspace_id[:12] if workspace_id else "",
-                                                _still.get("missing_parties") or [],
-                                                _still.get("missing_suit_numbers") or [],
-                                                _still.get("missing_key_dates") or [],
+                                                len(_still.get("missing_parties") or []),
+                                                len(_still.get("missing_suit_numbers") or []),
+                                                len(_still.get("missing_key_dates") or []),
                                             )
                                         else:
                                             logger.success(
@@ -747,23 +760,23 @@ class StrategyMixin:
 
                         # Validate we got meaningful content
                         if case_summary and strategic_objective:
-                            logger.success("✅ AI analysis completed successfully")
-                            logger.info(f"   - Case Summary: {len(case_summary)} chars")
+                            logger.success("AI analysis completed successfully")
+                            logger.info("- Case Summary: {} chars", len(case_summary))
                             logger.info(
-                                f"   - Report case summary: {len(report_case_summary)} chars"
+                                "- Report case summary: {} chars", len(report_case_summary)
                             )
                             logger.info(
-                                f"   - Strategic Objective: {len(strategic_objective)} chars"
+                                "- Strategic Objective: {} chars", len(strategic_objective)
                             )
                             logger.info(
-                                f"   - Possible Next Steps: {len(possible_next_steps)} items"
+                                "- Possible Next Steps: {} items", len(possible_next_steps)
                             )
                             logger.info(
-                                f"   - Suggestion chips: {len(suggestion_chips)} items"
+                                "- Suggestion chips: {} items", len(suggestion_chips)
                             )
                         else:
                             logger.warning(
-                                "⚠️ AI response incomplete, using partial data + fallback"
+                                "AI response incomplete, using partial data + fallback"
                             )
                             # Use what we got and fill in missing pieces
                             if not case_summary:
@@ -800,7 +813,7 @@ class StrategyMixin:
                                     "Identify parties",
                                     "Plan next steps",
                                 ][:16]
-                            logger.info("✅ Using hybrid AI + fallback content")
+                            logger.info("Using hybrid AI + fallback content")
 
                         if not report_case_summary:
                             report_case_summary = _derive_report_case_summary(
@@ -808,9 +821,9 @@ class StrategyMixin:
                             )
 
                     except json.JSONDecodeError as json_error:
-                        logger.error(f"❌ JSON parsing failed: {json_error}")
+                        logger.error("JSON parsing failed: {}", json_error)
                         logger.info(
-                            f"Failed JSON string (first 500 chars): {json_str[:500]}"
+                            "Failed JSON string (first 500 chars): {}", chars(json_str)
                         )
 
                         # Try to extract partial information using regex
@@ -825,7 +838,7 @@ class StrategyMixin:
                             r'"reportCaseSummary"\s*:\s*"([^"]*)', json_str
                         )
                         if case_summary_match or objective_match:
-                            logger.info("✅ Extracted partial data from malformed JSON")
+                            logger.info("Extracted partial data from malformed JSON")
                             case_summary = (
                                 case_summary_match.group(1)
                                 if case_summary_match
@@ -862,7 +875,7 @@ class StrategyMixin:
                                 ][:5]
 
                             logger.info(
-                                f"   Extracted: Summary={bool(case_summary)}, Objective={bool(strategic_objective)}, NextSteps={len(possible_next_steps)}"
+                                "Extracted: Summary={}, Objective={}, NextSteps={}", bool(case_summary), bool(strategic_objective), len(possible_next_steps)
                             )
 
                             # Fill in missing pieces
@@ -895,16 +908,16 @@ class StrategyMixin:
                                 )
 
                             logger.success(
-                                "✅ Using hybrid: AI-extracted content + fallback where needed"
+                                "Using hybrid: AI-extracted content + fallback where needed"
                             )
                         else:
                             raise  # No usable content, use full fallback
                 else:
-                    logger.error("❌ Could not extract JSON from AI response")
+                    logger.error("Could not extract JSON from AI response")
                     raise ValueError("No JSON in response")
 
             except Exception as ai_error:
-                logger.error(f"AI analysis failed: {ai_error}")
+                logger.error("AI analysis failed: {}", ai_error)
                 logger.warning("Using fallback generic analysis")
                 # Fallback to generic analysis
                 case_summary = f"Analysis of {doc_count} document(s) for {workspace_role} role. The documents have been processed and are ready for detailed review under Indian legal framework (BNS, BNSS, BSA)."
@@ -1015,15 +1028,11 @@ class StrategyMixin:
                 "timestamp": datetime.utcnow().isoformat(),
             }
 
-            logger.success(
-                f"✅ Generated detailed strategy analysis for workspace {workspace_id}"
+            logger.info(
+                "Strategy analysis generated (report mobile present={}, contacted date present={})",
+                bool(report_mobile),
+                bool(report_contact_date),
             )
-            if report_mobile or report_contact_date:
-                logger.info(
-                    "Overview conversation report fields: mobile={}, contactedDate={}",
-                    report_mobile,
-                    report_contact_date,
-                )
 
             # Strip the application's own brand/platform name from the strategy
             # panel (caseSummary / reportCaseSummary / strategicObjective /
@@ -1032,8 +1041,7 @@ class StrategyMixin:
             return strategies_payload
 
         except Exception as e:
-            logger.error(f"Error generating strategies: {e}")
-            logger.exception(e)
+            logger.opt(exception=e).error("Error generating strategies: {}", e)
             return None
 
     def _looks_like_question(self, text: str) -> bool:
@@ -1270,8 +1278,39 @@ class StrategyMixin:
             pass
         return None
 
+    # Messages like "just revise the strategic objective as per proper
+    # documents" name no new direction. The old fallback passed that sentence
+    # through as ``user_objective_instruction``, i.e. the regeneration prompt was
+    # told to adopt a meta-instruction as the case's objective — a good way to
+    # get back prose instead of JSON, or an empty objective, both of which used
+    # to abort the path silently. What the user actually asked for is a
+    # re-derivation from the evidence, so say that instead.
+    _DOCUMENT_GROUNDED_OBJECTIVE_INSTRUCTION = (
+        "Re-derive the strategic objective strictly from the uploaded documents. "
+        "Keep the existing objective's intent and legal direction, but correct or "
+        "drop anything the documents do not support, and make every assertion "
+        "traceable to the evidence on record. Do not introduce a new objective."
+    )
+
+    # A supplied objective this short cannot be a case objective; it is a
+    # request to refresh one. (The classifier's own floor is 20 chars.)
+    _MIN_OBJECTIVE_INSTRUCTION_CHARS = 20
+
+    def _document_grounded_objective_instruction(self, raw_message: str) -> str:
+        """Instruction to use when the user asked for a revision, not a new objective."""
+        text = (raw_message or "").strip()
+        if len(text) < self._MIN_OBJECTIVE_INSTRUCTION_CHARS:
+            return self._DOCUMENT_GROUNDED_OBJECTIVE_INSTRUCTION
+        # Keep the user's wording for context, but frame it as what it is: a
+        # request about HOW to revise, not the objective text itself.
+        return (
+            f"{self._DOCUMENT_GROUNDED_OBJECTIVE_INSTRUCTION}\n\n"
+            f"The user's request, for context (it is an instruction about the "
+            f"revision, NOT the new objective text): {text}"
+        )
+
     @meter_usage
-    async def _regenerate_strategy_objective_preserving_case_summary(
+    async def _regenerate_strategy_for_new_objective(
         self,
         workspace_id: str,
         user_id: str,
@@ -1279,10 +1318,26 @@ class StrategyMixin:
         user_objective_instruction: str,
         current_strategy: Dict[str, Any],
         confirmed_party: Optional[str] = None,
+        refresh_case_summary: bool = True,
     ) -> bool:
         """
-        Regenerate strategicObjective, possibleNextSteps, and suggestionChips from the user's new
-        objective instruction. Keeps caseSummary and reportCaseSummary unchanged; emits strategy_objective.
+        Regenerate strategicObjective, possibleNextSteps and suggestionChips from the user's new
+        objective instruction, and (by default) RE-FRAME caseSummary + reportCaseSummary to match.
+        Emits strategy_objective.
+
+        ``refresh_case_summary`` — when True (an objective change), the two case summaries are
+        re-framed so they lead with the facts the new objective makes decisive. **Re-framing is
+        emphasis and ordering, never facts**: the case summary is defined as a fact-rich narrative
+        (named parties, exact amounts, dates, suit numbers, identifiers), and those facts belong to
+        the documents, not to the objective. Three things enforce that, because a prompt alone
+        would not: every figure in the previous summary must survive
+        (:func:`find_dropped_case_figures`), no new organisation/party/place may appear
+        (:func:`find_ungrounded_proper_nouns`), and either summary failing its check falls back to
+        the previous text while the new objective still lands. A model that returns no summary at
+        all is treated the same way — the existing text is kept.
+
+        Pass False where the trigger changes who is advocated for rather than what is being argued
+        (role reassignment): there the summary's facts and framing are both already correct.
 
         ``confirmed_party`` is the user-confirmed named party who holds the workspace role
         (from a role-reassignment). When set, it is injected as an authoritative anchor so the
@@ -1296,6 +1351,9 @@ class StrategyMixin:
             case_summary = (current_strategy.get("caseSummary") or "").strip()
             report_case_summary = (current_strategy.get("reportCaseSummary") or "").strip()
             if not case_summary:
+                self._log_objective_regen_failure(
+                    workspace_id, "no_case_summary", "cached strategy has no caseSummary"
+                )
                 return False
 
             all_docs = []
@@ -1314,7 +1372,7 @@ class StrategyMixin:
                 if (d.get("content") or "").strip()
                 and len((d.get("content") or "").strip()) >= 20
             ]
-            max_total_content = 100000
+            max_total_content = panel_context_budget()
             per_doc_cap = (
                 (max_total_content // max(1, len(valid_docs)))
                 if valid_docs
@@ -1329,7 +1387,7 @@ class StrategyMixin:
                         continue
                     if len(content) > per_doc_cap:
                         content = (
-                            content[:per_doc_cap] + "\n[... truncated for length ...]"
+                            fit_to_budget(content, per_doc_cap, "general")
                         )
                     # Build labelled block with metadata header so the
                     # prompt distinguishes drafted-by-assistant documents
@@ -1345,7 +1403,7 @@ class StrategyMixin:
                 combined_document_content = (
                     "\n\n".join(parts) if parts else "No document content available."
                 )
-            if len(combined_document_content) > max_total_content:
+            if len(combined_document_content) > int(max_total_content * 1.1):  # headers add a little; never cut the last document
                 combined_document_content = (
                     combined_document_content[:max_total_content]
                     + "\n[... content truncated ...]"
@@ -1376,26 +1434,63 @@ class StrategyMixin:
             except Exception:
                 entities_block = "{}"
 
-            prompt = regenerate_strategy_objective_preserving_case_summary_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, case_summary=case_summary, combined_document_content=combined_document_content, current_strategy=current_strategy, report_case_summary=report_case_summary, role=role, user_objective_instruction=user_objective_instruction, entities_block=entities_block, confirmed_party=confirmed_party)
+            prompt = regenerate_strategy_for_new_objective_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, case_summary=case_summary, combined_document_content=combined_document_content, current_strategy=current_strategy, report_case_summary=report_case_summary, role=role, user_objective_instruction=user_objective_instruction, entities_block=entities_block, confirmed_party=confirmed_party, refresh_case_summary=refresh_case_summary)
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 prompt = prompt.rstrip() + "\n\n" + custom_suffix
 
-            raw = await gemini_client.generate(
-                prompt=prompt,
-                system_instruction=get_structured_document_feature_system_instruction(
-                    role
-                ),
-                temperature=0.25,
-                max_tokens=12000,
-                response_mime_type="application/json",
-            )
-            json_str = self._prepare_json_candidate((raw or "").strip(), prefer="object")
+            # generate() signals failure by RETURNING a sentinel string, so an
+            # unchecked call turns a 429 / 5xx / timeout into the far more
+            # misleading "model returned no JSON". Check it, log the real reason,
+            # and give the objective one more attempt before giving up — this is
+            # the panel the user is actively waiting on.
+            system_instruction = get_structured_document_feature_system_instruction(role)
+            raw = ""
+            json_str = None
+            for attempt in (1, 2):
+                raw = await gemini_client.generate(
+                    prompt=prompt,
+                    system_instruction=system_instruction,
+                    temperature=0.25,
+                    max_tokens=12000,
+                    response_mime_type="application/json",
+                )
+                if is_generation_error(raw):
+                    self._log_objective_regen_failure(
+                        workspace_id,
+                        "llm_error",
+                        f"attempt {attempt}: {str(raw)[:200]}",
+                    )
+                    json_str = None
+                    continue
+                json_str = self._prepare_json_candidate(
+                    (raw or "").strip(), prefer="object"
+                )
+                if json_str:
+                    break
+                self._log_objective_regen_failure(
+                    workspace_id,
+                    "no_json",
+                    f"attempt {attempt}: {len(raw or '')} chars, "
+                    f"prefix={str(raw or '')[:120]!r}",
+                )
             if not json_str:
                 return False
-            data = json.loads(json_str)
+            try:
+                data = json.loads(json_str)
+            except (TypeError, ValueError) as parse_err:
+                self._log_objective_regen_failure(
+                    workspace_id, "bad_json", str(parse_err)
+                )
+                return False
             if not isinstance(data, dict):
+                self._log_objective_regen_failure(
+                    workspace_id, "not_object", f"top-level {type(data).__name__}"
+                )
                 return False
 
             strategic_objective = (data.get("strategicObjective") or "").strip()
@@ -1409,6 +1504,106 @@ class StrategyMixin:
                 for s in possible_next_steps
                 if s
             ][:5]
+
+            # ---------------------------------------------------------------
+            # Re-framed case summaries (objective change only).
+            #
+            # A new objective changes which facts matter, so the summary that
+            # leads every downstream prompt should lead with those facts. It
+            # does NOT change what the facts ARE — the summary is the
+            # fact-of-record narrative and the analysis report, list of dates
+            # and applicable laws are all derived from it. So each candidate
+            # has to earn its way in: keep every figure the previous text
+            # asserted, introduce no organisation/party/place the case does not
+            # have, and keep the mandated opening. A candidate that fails any
+            # of those is discarded and the previous summary stands — the
+            # objective still updates either way, which is the part the lawyer
+            # actually asked for.
+            # ---------------------------------------------------------------
+            new_case_summary = ""
+            new_report_case_summary = ""
+            if refresh_case_summary:
+                summary_allowed_texts = [
+                    combined_document_content,
+                    user_objective_instruction,
+                    entities_block,
+                    case_summary,
+                    report_case_summary,
+                ]
+
+                def _accept_summary(
+                    candidate: Any,
+                    previous: str,
+                    *,
+                    label: str,
+                    required_opening: str,
+                ) -> str:
+                    """Return the candidate if it is a safe re-frame of
+                    ``previous``, else "" (caller keeps ``previous``)."""
+                    text = (candidate or "").strip() if isinstance(candidate, str) else ""
+                    if not text or not previous:
+                        return ""
+                    if text == previous:
+                        return ""  # unchanged: nothing to emit, not a failure
+                    if not text.lower().startswith(required_opening.lower()):
+                        logger.warning(
+                            "Objective regen: re-framed {} dropped its required "
+                            "opening — keeping the previous text (workspace {})",
+                            label,
+                            workspace_id[:12] if workspace_id else "",
+                        )
+                        return ""
+                    dropped = find_dropped_case_figures(previous, text)
+                    if dropped:
+                        logger.warning(
+                            "Objective regen: re-framed {} dropped figure(s) {} — "
+                            "keeping the previous text (workspace {})",
+                            label,
+                            dropped,
+                            workspace_id[:12] if workspace_id else "",
+                        )
+                        return ""
+                    invented = find_ungrounded_proper_nouns(
+                        text, summary_allowed_texts
+                    )
+                    if invented:
+                        logger.warning(
+                            "Objective regen: re-framed {} introduced ungrounded "
+                            "entities {} — keeping the previous text (workspace {})",
+                            label,
+                            invented,
+                            workspace_id[:12] if workspace_id else "",
+                        )
+                        return ""
+                    return text
+
+                new_case_summary = _accept_summary(
+                    data.get("caseSummary"),
+                    case_summary,
+                    label="caseSummary",
+                    required_opening="This case is about",
+                )
+                new_report_case_summary = _accept_summary(
+                    data.get("reportCaseSummary"),
+                    report_case_summary,
+                    label="reportCaseSummary",
+                    required_opening="This matter is about",
+                )
+                # The two summaries must state the same facts. If only one
+                # survived its checks, re-framing one and not the other would
+                # leave them inconsistent, so neither is taken.
+                if bool(new_case_summary) != bool(new_report_case_summary):
+                    # Unless the workspace never had a reportCaseSummary to
+                    # begin with — then caseSummary alone is the whole record.
+                    if report_case_summary:
+                        logger.warning(
+                            "Objective regen: only one of the two case summaries "
+                            "re-framed cleanly — keeping both previous texts "
+                            "(workspace {})",
+                            workspace_id[:12] if workspace_id else "",
+                        )
+                        new_case_summary = ""
+                        new_report_case_summary = ""
 
             # Deterministic anti-fabrication backstop: the objective must not
             # name any organisation/body/place absent from the documents,
@@ -1515,6 +1710,9 @@ class StrategyMixin:
                         break
 
             if not strategic_objective:
+                self._log_objective_regen_failure(
+                    workspace_id, "no_objective", "model returned no strategicObjective"
+                )
                 return False
             if len(possible_next_steps) < 2:
                 possible_next_steps = (
@@ -1526,9 +1724,11 @@ class StrategyMixin:
                 )[:5]
 
             merged = dict(current_strategy)
-            merged["caseSummary"] = current_strategy.get("caseSummary", case_summary)
-            merged["reportCaseSummary"] = current_strategy.get(
-                "reportCaseSummary", report_case_summary
+            merged["caseSummary"] = new_case_summary or current_strategy.get(
+                "caseSummary", case_summary
+            )
+            merged["reportCaseSummary"] = new_report_case_summary or (
+                current_strategy.get("reportCaseSummary", report_case_summary)
             )
             merged["strategicObjective"] = strategic_objective
             merged["possibleNextSteps"] = possible_next_steps
@@ -1544,21 +1744,76 @@ class StrategyMixin:
             self._workspace_suggestion_chips[workspace_id] = list(suggestion_chips)
             self._last_workspace_id_with_chips = workspace_id
 
-            if self._socket_client:
-                await self._emit_document_feature(
-                    feature_type="strategy_objective",
+            if not self._socket_client:
+                # Nothing was emitted, so the caller must NOT treat this as a
+                # success and schedule the downstream cascade on top of it.
+                self._log_objective_regen_failure(
+                    workspace_id, "no_socket_client", "no socket client to emit on"
+                )
+                return False
+
+            delivered = await self._emit_document_feature(
+                feature_type="strategy_objective",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=merged,
+                usage=current_usage(),
+            )
+            if not delivered and self._is_stale_run(workspace_id):
+                # Not a socket drop: the lawyer stopped this run and the fence
+                # refused the emit, so nothing was buffered. Hold the instruction
+                # for workspace_resume_request — the resume payload does not
+                # carry the new objective, and without this it would be lost.
+                self._log_objective_regen_failure(
+                    workspace_id, "stopped", "strategy_objective fenced by a stop"
+                )
+                self._note_pending_objective_change(
                     workspace_id=workspace_id,
                     user_id=user_id,
-                    payload=merged,
-                    usage=current_usage(),
+                    workspace_role=workspace_role,
+                    instruction=user_objective_instruction,
                 )
-                logger.success(
-                    "✅ Strategy objective regen emitted (case summary preserved) workspace={}",
-                    workspace_id[:12] if workspace_id else "",
+                return False
+            if not delivered:
+                # The payload is buffered for re-delivery on reconnect, but the
+                # frontend has not seen it yet — so this turn did not land and
+                # the caller must report that rather than claim an update.
+                # The GENERATION succeeded though, so drop any resume marker:
+                # re-running a ~2-minute call whose result is already buffered
+                # would emit the same panel twice for one request.
+                self._log_objective_regen_failure(
+                    workspace_id,
+                    "emit_dropped",
+                    "strategy_objective generated but not delivered; buffered",
                 )
+                self._clear_pending_objective_change(workspace_id)
+                return False
+            logger.success(
+                "Strategy objective regen emitted (case summary {}) workspace={}",
+                "re-framed" if new_case_summary else "preserved",
+                workspace_id[:12] if workspace_id else "",
+            )
             return True
+        except asyncio.CancelledError:
+            # The socket turn that awaited us was torn down (a reconnect, a
+            # shutdown). CancelledError is a BaseException, so the `except
+            # Exception` below never saw it: the regeneration simply stopped
+            # logging and the six loaders armed for it span forever. Record the
+            # instruction so the work is re-run on reconnect, then re-raise to
+            # preserve cancellation semantics.
+            self._log_objective_regen_failure(
+                workspace_id, "cancelled", "regeneration cancelled mid-flight"
+            )
+            self._note_pending_objective_change(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_role=workspace_role,
+                instruction=user_objective_instruction,
+            )
+            raise
         except Exception as e:
-            logger.warning("Strategy objective regen failed: {}", e)
+            logger.opt(exception=e).warning("Strategy objective regen failed: {}", e)
+            self._log_objective_regen_failure(workspace_id, "exception", str(e))
             return False
 
     @meter_usage
@@ -1571,6 +1826,7 @@ class StrategyMixin:
         user_feedback: str,
         current_strategy: Dict[str, Any],
         emit_result: bool = True,
+        outcome: Optional[Dict[str, str]] = None,
     ) -> bool:
         """
         Regenerate caseSummary + reportCaseSummary applying the user's edit
@@ -1603,7 +1859,7 @@ class StrategyMixin:
                 if (d.get("content") or "").strip()
                 and len((d.get("content") or "").strip()) >= 20
             ]
-            max_total_content = 100000
+            max_total_content = panel_context_budget()
             per_doc_cap = (
                 (max_total_content // max(1, len(valid_docs)))
                 if valid_docs
@@ -1617,7 +1873,7 @@ class StrategyMixin:
                     if not content or len(content) < 20:
                         continue
                     if len(content) > per_doc_cap:
-                        content = content[:per_doc_cap] + "\n[... truncated for length ...]"
+                        content = fit_to_budget(content, per_doc_cap, "general")
                     doc_with_clip = dict(doc)
                     doc_with_clip["content"] = content
                     parts.append(
@@ -1628,7 +1884,7 @@ class StrategyMixin:
                 combined_document_content = (
                     "\n\n".join(parts) if parts else "No document content available."
                 )
-            if len(combined_document_content) > max_total_content:
+            if len(combined_document_content) > int(max_total_content * 1.1):  # headers add a little; never cut the last document
                 combined_document_content = (
                     combined_document_content[:max_total_content]
                     + "\n[... content truncated ...]"
@@ -1640,6 +1896,9 @@ class StrategyMixin:
 
             prompt = regenerate_case_summary_with_feedback_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, combined_document_content=combined_document_content, current_case_summary=current_case_summary, current_report_case_summary=current_report_case_summary, current_strategy=current_strategy, role=role, user_feedback=user_feedback)
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 prompt = prompt.rstrip() + "\n\n" + custom_suffix
@@ -1690,6 +1949,28 @@ class StrategyMixin:
             merged["timestamp"] = datetime.utcnow().isoformat()
 
             merged = scrub_app_brand(merged)
+
+            # No-op guard (mirrors _regenerate_analysis_report_with_feedback):
+            # the model can return the case summary verbatim when the text the
+            # user named is not present. Without this the editor returned True,
+            # the caller listed "case summary" as updated, and the chat ack
+            # claimed a change that never happened. Compare the EDITED FIELDS
+            # only — `merged` always carries a fresh timestamp. The two summaries
+            # are compared independently because the fallback above mirrors
+            # caseSummary into reportCaseSummary when the model omits it.
+            if _noop_key(merged.get("caseSummary")) == _noop_key(
+                current_strategy.get("caseSummary")
+            ) and _noop_key(merged.get("reportCaseSummary")) == _noop_key(
+                current_strategy.get("reportCaseSummary")
+            ):
+                logger.info(
+                    "Case summary edit produced no change — instruction={!r}",
+                    chars(user_feedback),
+                )
+                if outcome is not None:
+                    outcome["status"] = "unchanged"
+                return False
+
             self._workspace_strategy_payload[workspace_id] = merged
 
             if emit_result and self._socket_client:
@@ -1701,9 +1982,11 @@ class StrategyMixin:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ Case summary regen emitted (other fields preserved) workspace={}",
+                    "Case summary regen emitted (other fields preserved) workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
+            if outcome is not None:
+                outcome["status"] = "applied"
             return True
         except Exception as e:
             logger.warning("Case summary regen failed: {}", e)
@@ -1719,6 +2002,7 @@ class StrategyMixin:
         user_feedback: str,
         current_strategy: Dict[str, Any],
         emit_result: bool = True,
+        outcome: Optional[Dict[str, str]] = None,
     ) -> bool:
         """
         Regenerate possibleNextSteps + suggestionChips applying the user's edit
@@ -1742,6 +2026,9 @@ class StrategyMixin:
 
             prompt = regenerate_next_steps_with_feedback_prompt(current_case_summary=current_case_summary, current_strategic_objective=current_strategic_objective, current_strategy=current_strategy, role=role, user_feedback=user_feedback)
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 prompt = prompt.rstrip() + "\n\n" + custom_suffix
@@ -1817,6 +2104,22 @@ class StrategyMixin:
             merged["timestamp"] = datetime.utcnow().isoformat()
 
             merged = scrub_app_brand(merged)
+
+            # No-op guard. Compare possibleNextSteps ONLY: suggestionChips are
+            # regenerated at temperature 0.25 and then padded from
+            # _fallback_chips_for_role above, so they differ on essentially every
+            # call and would defeat a whole-payload comparison.
+            if _noop_key(merged.get("possibleNextSteps")) == _noop_key(
+                current_strategy.get("possibleNextSteps") or []
+            ):
+                logger.info(
+                    "Possible next steps edit produced no change — instruction={!r}",
+                    chars(user_feedback),
+                )
+                if outcome is not None:
+                    outcome["status"] = "unchanged"
+                return False
+
             self._workspace_strategy_payload[workspace_id] = merged
             self._workspace_suggestion_chips[workspace_id] = list(suggestion_chips)
             self._last_workspace_id_with_chips = workspace_id
@@ -1830,9 +2133,11 @@ class StrategyMixin:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ Possible next steps regen emitted (other fields preserved) workspace={}",
+                    "Possible next steps regen emitted (other fields preserved) workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
+            if outcome is not None:
+                outcome["status"] = "applied"
             return True
         except Exception as e:
             logger.warning("Possible next steps regen failed: {}", e)
@@ -1848,6 +2153,7 @@ class StrategyMixin:
         user_feedback: str,
         current_strategy: Dict[str, Any],
         emit_result: bool = True,
+        outcome: Optional[Dict[str, str]] = None,
     ) -> bool:
         """
         Regenerate strategicObjective applying the user's surgical edit
@@ -1856,12 +2162,13 @@ class StrategyMixin:
         suggestionChips byte-for-byte. Updates cache and emits
         document_feature_response with featureType=strategy_objective.
 
-        Distinct from _regenerate_strategy_objective_preserving_case_summary,
-        which is used by the legacy STRATEGY_OBJECTIVE chat_type flow when
-        the user DECLARES a brand-new objective (and therefore needs the
-        next steps + chips to refresh). This surgical variant assumes the
-        user wants the existing content reproduced verbatim except for the
-        specific change they named.
+        Distinct from _regenerate_strategy_for_new_objective, which is used
+        when the user DECLARES a brand-new objective (and therefore needs the
+        next steps + chips to refresh, and the case summaries re-framed).
+        This surgical variant assumes the user wants the existing content
+        reproduced verbatim except for the specific change they named — a
+        request to reword one line of the objective is not a new objective,
+        so the case summary must not move.
         """
         try:
             from app.ai.gemini_client import gemini_client
@@ -1879,6 +2186,9 @@ class StrategyMixin:
 
             prompt = regenerate_strategic_objective_with_feedback_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, current_case_summary=current_case_summary, current_strategic_objective=current_strategic_objective, current_strategy=current_strategy, role=role, user_feedback=user_feedback)
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 prompt = prompt.rstrip() + "\n\n" + custom_suffix
@@ -1924,6 +2234,22 @@ class StrategyMixin:
             merged["timestamp"] = datetime.utcnow().isoformat()
 
             merged = scrub_app_brand(merged)
+
+            # No-op guard: a surgical instruction whose target text is absent
+            # from the objective makes the model echo it back verbatim. Returning
+            # True there is what let the chat ack report "I've updated the
+            # strategic objective" while the panel still showed the old figure.
+            if _noop_key(merged.get("strategicObjective")) == _noop_key(
+                current_strategy.get("strategicObjective")
+            ):
+                logger.info(
+                    "Strategic objective edit produced no change — instruction={!r}",
+                    chars(user_feedback),
+                )
+                if outcome is not None:
+                    outcome["status"] = "unchanged"
+                return False
+
             self._workspace_strategy_payload[workspace_id] = merged
 
             if emit_result and self._socket_client:
@@ -1935,9 +2261,11 @@ class StrategyMixin:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ Strategic objective surgical edit emitted (other fields preserved) workspace={}",
+                    "Strategic objective surgical edit emitted (other fields preserved) workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
+            if outcome is not None:
+                outcome["status"] = "applied"
             return True
         except Exception as e:
             logger.warning("Strategic objective surgical edit failed: {}", e)
@@ -2311,6 +2639,10 @@ class StrategyMixin:
             "isRoleReassignment": False,
             "reassignRole": "",
             "reassignParty": "",
+            "isFactCorrection": False,
+            "factCorrections": [],
+            "isObjectiveDeclaration": False,
+            "objectiveDeclarationText": "",
             "isQuestionLike": False,
         }
         msg = (user_message or "").strip()
@@ -2362,6 +2694,29 @@ class StrategyMixin:
             if not isinstance(data, dict):
                 return empty
 
+            def _fact_corrections(raw: Any) -> List[Dict[str, str]]:
+                """Validate factCorrections: `now` and `description` are required
+                (`was` may be absent — the user need not quote the wrong value).
+                Malformed entries are dropped rather than guessed at."""
+                if not isinstance(raw, list):
+                    return []
+                out: List[Dict[str, str]] = []
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    now_v = str(item.get("now") or "").strip()
+                    desc = str(item.get("description") or "").strip()
+                    if not now_v or not desc:
+                        continue
+                    out.append({
+                        "was": str(item.get("was") or "").strip(),
+                        "now": now_v,
+                        "description": desc,
+                    })
+                    if len(out) >= 5:
+                        break
+                return out
+
             def _slot(key: str) -> Dict[str, Any]:
                 val = data.get(key)
                 if not isinstance(val, dict):
@@ -2389,13 +2744,34 @@ class StrategyMixin:
                 "isRoleReassignment": bool(data.get("isRoleReassignment") is True),
                 "reassignRole": str(data.get("reassignRole") or "").strip().upper(),
                 "reassignParty": str(data.get("reassignParty") or "").strip(),
+                "isFactCorrection": bool(data.get("isFactCorrection") is True),
+                "factCorrections": _fact_corrections(data.get("factCorrections")),
+                "isObjectiveDeclaration": bool(
+                    data.get("isObjectiveDeclaration") is True
+                ),
+                "objectiveDeclarationText": str(
+                    data.get("objectiveDeclarationText") or ""
+                ).strip(),
                 "isQuestionLike": bool(data.get("isQuestionLike") is True),
             }
+            # A flag with nothing usable behind it is a partial classification —
+            # same defensive shape as the isRoleReassignment/reassignParty pair.
+            if not result["factCorrections"]:
+                result["isFactCorrection"] = False
+            # A declaration with no text behind it is a partial classification.
+            if not result["objectiveDeclarationText"]:
+                result["isObjectiveDeclaration"] = False
             # A role reassignment re-orients advocacy via a dedicated flow — it is
             # never a cosmetic rename and never a surgical per-panel edit. Enforce
             # that here so a stray classifier flag can't double-dispatch.
             if result["isRoleReassignment"] and result["reassignParty"]:
                 result["isRename"] = False
+                # A role reassignment re-orients WHOSE SIDE the strategy argues
+                # for. "The respondent is Pradeep Mehra, not Rakesh" is also
+                # literally a value correction, so the flags can collide — the
+                # advocacy flip must win.
+                result["isFactCorrection"] = False
+                result["factCorrections"] = []
                 for k in (
                     "caseSummary",
                     "reportCaseSummary",
@@ -2414,6 +2790,10 @@ class StrategyMixin:
             # trust the question signal and drop the edit flags — safer
             # default for "explain X" / "what about X" style messages.
             if result["isQuestionLike"]:
+                result["isFactCorrection"] = False
+                result["factCorrections"] = []
+                result["isObjectiveDeclaration"] = False
+                result["objectiveDeclarationText"] = ""
                 for k in (
                     "caseSummary",
                     "reportCaseSummary",
@@ -2424,12 +2804,14 @@ class StrategyMixin:
                 ):
                     result[k] = {"shouldEdit": False, "instruction": ""}
             logger.info(
-                "Panel-edit classifier: msg_len={} isQuestion={} isRoleReassignment={} reassign={}:{} caseSummary={} reportCaseSummary={} strategicObjective={} possibleNextSteps={} analysisReport={} listOfDates={}",
+                "Panel-edit classifier: msg_len={} isQuestion={} isRoleReassignment={} reassign={}:{} isFactCorrection={} facts={} caseSummary={} reportCaseSummary={} strategicObjective={} possibleNextSteps={} analysisReport={} listOfDates={}",
                 len(msg),
                 result["isQuestionLike"],
                 result["isRoleReassignment"],
                 result["reassignRole"] or "-",
                 result["reassignParty"] or "-",
+                result["isFactCorrection"],
+                len(result["factCorrections"]),
                 "yes" if result["caseSummary"]["shouldEdit"] else "no",
                 "yes" if result["reportCaseSummary"]["shouldEdit"] else "no",
                 "yes" if result["strategicObjective"]["shouldEdit"] else "no",
@@ -2450,9 +2832,17 @@ class StrategyMixin:
         panels: List[str],
         instructions: Dict[str, str],
         is_rename: bool = False,
+        unchanged: Optional[List[str]] = None,
+        failed: Optional[List[str]] = None,
     ) -> str:
         """
         Compose the chat confirmation after surgical panel edits were applied.
+
+        ``panels`` are the panels that ACTUALLY changed; ``unchanged`` were
+        attempted but did not contain the text the user named; ``failed`` were
+        attempted and errored. Keeping the three apart is the point: the ack was
+        previously built from the classifier's *instructions* alone, so it
+        confidently reported panels that were never touched.
 
         Returns a short natural-language message describing what changed (and,
         for possible-next-steps edits, the resulting list state), or "" so the
@@ -2466,7 +2856,7 @@ class StrategyMixin:
                 for panel in panels
             ]
             edits = [(p, i) for p, i in edits if i]
-            if not edits:
+            if not edits and not (unchanged or failed):
                 return ""
 
             updated_next_steps: List[str] = []
@@ -2482,6 +2872,8 @@ class StrategyMixin:
                 edits=edits,
                 updated_next_steps=updated_next_steps,
                 is_rename=is_rename,
+                unchanged=list(unchanged or []),
+                failed=list(failed or []),
             )
             raw = await gemini_client.generate(
                 prompt=prompt,

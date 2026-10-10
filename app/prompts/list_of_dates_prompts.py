@@ -71,6 +71,8 @@ f"""You are a legal case analyst. From the following annexures, extract a chrono
 **Annexure content** (each file is labeled Annexure 1, Annexure 2, etc. with id and name):
 {combined}
 
+**Document dates from file names.** A header may carry "document date from its file name". Letters, representations and notices often state no date in their body; the file name is then the record of when the document was written or sent. Record each such document itself on that date (who wrote it, to whom, and what it raises or demands) unless the text gives a different date for it.
+
 **Task**:
 1) Identify dates directly tied to this dispute: agreements, payments, notices, hearings where an order/action occurred, deadlines, possession, filings, and key communications.
 2) For every such date, write a short, single-sentence description (max 12 words) of what actually happened.

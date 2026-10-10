@@ -17,6 +17,8 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.utils.redact import chars
+
 from app.agents.role_models import RoleEnum
 from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
@@ -130,6 +132,7 @@ class ProceduralTimelineMixin:
         workspace_role: str,
         user_feedback: str,
         emit_result: bool = True,
+        outcome: Optional[Dict[str, str]] = None,
     ) -> bool:
         """
         Apply a surgical find-and-replace / correction to the EXISTING Procedural
@@ -157,6 +160,9 @@ class ProceduralTimelineMixin:
             current_json = json.dumps(current, ensure_ascii=True)
             prompt = regenerate_procedural_timeline_with_feedback_prompt(current_json=current_json, instruction=instruction)
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 prompt = prompt.rstrip() + "\n\n" + custom_suffix
@@ -186,6 +192,12 @@ class ProceduralTimelineMixin:
             if json.dumps(edited, sort_keys=True, ensure_ascii=True) == json.dumps(
                 current, sort_keys=True, ensure_ascii=True
             ):
+                logger.info(
+                    "Procedural timeline edit produced no change — instruction={!r}",
+                    chars(user_feedback),
+                )
+                if outcome is not None:
+                    outcome["status"] = "unchanged"
                 return False  # nothing changed
 
             self._workspace_procedural_timeline_payload[workspace_id] = edited
@@ -199,9 +211,11 @@ class ProceduralTimelineMixin:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ Procedural timeline name edit emitted workspace={}",
+                    "Procedural timeline name edit emitted workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
+            if outcome is not None:
+                outcome["status"] = "applied"
             return True
         except Exception as e:
             logger.warning("Procedural timeline name edit failed: {}", e)
@@ -339,8 +353,8 @@ class ProceduralTimelineMixin:
                 usage=current_usage(),
             )
             logger.success(
-                "✅ Procedural timeline filtered+emitted after deletion (no LLM regen): "
-                "{} → {} entries (dropped {})",
+                "Procedural timeline filtered+emitted after deletion (no LLM regen): "
+                "{}  {} entries (dropped {})",
                 before_count,
                 len(prior_fast),
                 before_count - len(prior_fast),
@@ -428,6 +442,6 @@ class ProceduralTimelineMixin:
             usage=current_usage(),
         )
         logger.success(
-            "✅ Procedural timeline sent to backend ({} entries)", len(timeline)
+            "Procedural timeline sent to backend ({} entries)", len(timeline)
         )
         await asyncio.sleep(0.1)

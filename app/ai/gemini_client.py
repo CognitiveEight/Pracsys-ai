@@ -6,6 +6,7 @@ Handles all interactions with Gemini 2.0 Flash model.
 import asyncio
 import json
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 import google.generativeai as genai
@@ -27,12 +28,12 @@ except Exception:  # pragma: no cover - depends on installed deps
     _NG_SDK_AVAILABLE = False
 
 from app.ai.usage import (
+    current_feature,
     record_embed_tokens,
     record_grounding_requests,
     record_usage,
 )
 from app.core.config import settings
-from app.observability.trace import tracer
 
 
 # Permissive safety settings for legal document analysis.
@@ -48,6 +49,96 @@ _PERMISSIVE_SAFETY_SETTINGS = {
     HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
 }
+
+
+# generate() reports failure by RETURNING one of these strings rather than raising,
+# so that a caller expecting prose still gets something printable. The cost is that
+# a 429 / 5xx / safety block is indistinguishable from real content unless the
+# caller checks — a structured (JSON-mode) caller then just fails to parse it and
+# reports "no JSON", hiding the actual cause. Every caller that branches on failure
+# must use is_generation_error() so the real reason reaches the log.
+GENERATION_ERROR_PREFIXES = (
+    "Error generating response:",
+    "Error: Gemini model not available",
+    "Error generating long-form response:",
+)
+
+
+def is_generation_error(text: Optional[str]) -> bool:
+    """True when ``text`` is a generate*() failure sentinel rather than model output."""
+    if not text:
+        return False
+    stripped = text.lstrip()
+    return any(stripped.startswith(prefix) for prefix in GENERATION_ERROR_PREFIXES)
+
+
+def _request_timeout_seconds() -> Optional[float]:
+    """Configured per-request ceiling, or None when disabled (<= 0)."""
+    try:
+        value = float(
+            getattr(settings, "gemini_request_timeout_seconds", 300.0) or 0.0
+        )
+    except (TypeError, ValueError):
+        return 300.0
+    return value if value > 0 else None
+
+
+async def _with_timeout(coro: Any, *, label: str) -> Any:
+    """Await ``coro`` under the configured ceiling.
+
+    A stalled generation is the worst failure mode this client has: the long
+    feature generations are awaited inline by socket handlers, so an unbounded
+    request hangs the whole turn with no output and no error. Raises
+    asyncio.TimeoutError so the caller's failure path runs.
+    """
+    timeout = _request_timeout_seconds()
+    if timeout is None:
+        return await coro
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.error("Gemini request timed out after {:.0f}s ({})", timeout, label)
+        raise
+
+
+#: Texts per embed_content request.
+_EMBED_BATCH = 100
+
+
+class EmbeddingError(RuntimeError):
+    """An embedding could not be produced. Callers decide the fallback."""
+
+
+
+def _calling_feature() -> str:
+    """Label for an LLM call made outside any ``@meter_usage`` feature: the
+    nearest app function up the stack (e.g. ``strategies_from_documents``),
+    so the ``llm_call`` line never says ``feature=-``."""
+    import sys
+
+    from app.ai.usage import _feature_label
+
+    frame = sys._getframe(2)
+    while frame is not None:
+        module = frame.f_globals.get("__name__", "")
+        if module.startswith("app.") and module not in ("app.ai.gemini_client", "app.ai.usage"):
+            return _feature_label(frame.f_code.co_name)
+        frame = frame.f_back
+    return "-"
+
+
+def _reraise_if_cancelled() -> None:
+    """Re-raise a cancellation that arrived disguised as an ordinary error.
+
+    Called first in every ``except Exception`` around a model call. A stop
+    (``workspace_stop_request``) or shutdown cancels the task, but the SDK can
+    surface that as another exception (google-genai raised ``AttributeError``
+    against aiohttp 3.9). Caught as a plain failure, the cancellation was lost:
+    the client retried on the legacy SDK and a stopped pipeline kept running.
+    """
+    task = asyncio.current_task()
+    if task is not None and task.cancelling():
+        raise asyncio.CancelledError()
 
 
 class GeminiClient:
@@ -86,9 +177,7 @@ class GeminiClient:
             # Initialize generation model
             self.model = genai.GenerativeModel(self.model_name)
 
-            logger.success(
-                "✅ Gemini client initialized with model: {}", self.model_name
-            )
+            logger.info("Gemini client initialised (model={})", self.model_name)
             self._initialized = True
 
         except Exception as e:
@@ -137,47 +226,68 @@ class GeminiClient:
             i += 1
         return text[start:].strip()
 
-    @staticmethod
-    def _log_generation_diagnostics(response: Any, label: str = "") -> None:
-        """Surface *why* a generation stopped and how the token budget was spent.
+    def _log_llm_call(
+        self,
+        response: Any,
+        *,
+        kind: str,
+        started: float,
+        status: str = "ok",
+        error: Optional[str] = None,
+    ) -> None:
+        """The ONE log line per model call: who called (feature), what
+        (kind/model), how it ended (status + finish reason), how long, and the
+        token spend. Never logs prompt or output text.
 
-        Without this, a response with finish_reason=MAX_TOKENS (or SAFETY /
-        RECITATION) still returns its partial text via _safe_extract_text and
-        ships silently — a draft cut off mid-sentence with no trace of the
-        cause. This logs the finish_reason and usage_metadata so we can tell a
-        genuine token-budget exhaustion (candidates+thoughts ≈ requested cap)
-        apart from an early STOP or a content-filter cut. Best-effort only:
-        never raises, and field names are read defensively because the
-        google-generativeai 0.8.x usage_metadata shape varies by version /
-        model (Gemini 3 thinking models add thoughts_token_count)."""
+        WARNING when the call failed, was blocked or was truncated; INFO
+        otherwise. Request/event/workspace ids come from the bound context.
+        """
         try:
-            candidates = list(getattr(response, "candidates", None) or [])
-            fr_repr = "none"
-            if candidates:
-                fr = getattr(candidates[0], "finish_reason", None)
-                fr_repr = getattr(fr, "name", None) or str(fr)
-            usage = getattr(response, "usage_metadata", None)
-            prompt_t = getattr(usage, "prompt_token_count", None)
-            out_t = getattr(usage, "candidates_token_count", None)
-            think_t = getattr(usage, "thoughts_token_count", None)
-            total_t = getattr(usage, "total_token_count", None)
-            # WARNING when the stop reason indicates truncation/blocking, INFO
-            # otherwise — so normal STOP completions don't spam prod logs but a
-            # truncated draft is loud and greppable.
-            truncated = fr_repr not in ("STOP", "1", "none")
-            log = logger.warning if truncated else logger.info
-            log(
-                "Gemini generation diagnostics [{}]: finish_reason={} "
-                "prompt_tokens={} output_tokens={} thinking_tokens={} total_tokens={}",
-                label or "generate",
-                fr_repr,
+            finish = "-"
+            prompt_t = out_t = think_t = None
+            if response is not None:
+                candidates = list(getattr(response, "candidates", None) or [])
+                if candidates:
+                    fr = getattr(candidates[0], "finish_reason", None)
+                    finish = getattr(fr, "name", None) or str(fr)
+                usage = getattr(response, "usage_metadata", None)
+                prompt_t = getattr(usage, "prompt_token_count", None)
+                out_t = getattr(usage, "candidates_token_count", None)
+                think_t = getattr(usage, "thoughts_token_count", None)
+                if status == "ok" and finish not in ("STOP", "1", "-", "None"):
+                    status = "blocked" if "SAFETY" in finish or "BLOCK" in finish else "truncated"
+            duration_ms = round((time.perf_counter() - started) * 1000)
+            feature = current_feature() or _calling_feature()
+            fields = dict(
+                llm=True,
+                llm_kind=kind,
+                llm_feature=feature,
+                llm_model=self.model_name,
+                llm_status=status,
+                llm_finish=finish,
+                llm_ms=duration_ms,
+                llm_in=prompt_t,
+                llm_out=out_t,
+                llm_think=think_t,
+            )
+            log = logger.bind(**fields)
+            emit = log.info if status == "ok" else log.warning
+            emit(
+                "llm_call {} feature={} model={} status={} finish={} ms={} "
+                "in={} out={} think={}{}",
+                kind,
+                feature,
+                self.model_name,
+                status,
+                finish,
+                duration_ms,
                 prompt_t,
                 out_t,
                 think_t,
-                total_t,
+                f" error={error}" if error else "",
             )
-        except Exception as exc:  # diagnostics must never break generation
-            logger.debug("Gemini diagnostics logging failed: {}", exc)
+        except Exception as exc:  # logging must never break generation
+            logger.debug("llm_call logging failed: {}", exc)
 
     @staticmethod
     def _record_usage(response: Any) -> None:
@@ -272,7 +382,6 @@ class GeminiClient:
         except Exception:
             return None
 
-    @tracer.trace("gemini_generate")
     async def generate(
         self,
         prompt: str,
@@ -306,9 +415,8 @@ class GeminiClient:
             logger.error("Gemini model not initialized")
             return "Error: Gemini model not available"
 
+        started = time.perf_counter()
         try:
-            logger.debug("Generating with Gemini...")
-
             # gemini-3 is a thinking model: its hidden reasoning tokens are billed
             # against max_output_tokens, and with an uncapped budget it reasons
             # for tens of thousands of tokens on EVERY call (slow). We instead
@@ -352,20 +460,27 @@ class GeminiClient:
                         ng_cfg_kwargs["system_instruction"] = system_instruction
                     if is_json_mode:
                         ng_cfg_kwargs["response_mime_type"] = "application/json"
-                    ng_response = await ng_client.aio.models.generate_content(
-                        model=self.model_name,
-                        contents=prompt,
-                        config=genai_ng_types.GenerateContentConfig(**ng_cfg_kwargs),
+                    ng_response = await _with_timeout(
+                        ng_client.aio.models.generate_content(
+                            model=self.model_name,
+                            contents=prompt,
+                            config=genai_ng_types.GenerateContentConfig(**ng_cfg_kwargs),
+                        ),
+                        label=f"generate/{self.model_name}/ng",
                     )
-                    self._log_generation_diagnostics(
-                        ng_response, label=f"{self.model_name}/ng"
-                    )
+                    self._log_llm_call(ng_response, kind="generate", started=started)
                     self._record_usage(ng_response)
                     result = self._safe_extract_text(ng_response)
+                except asyncio.TimeoutError:
+                    # Do NOT fall back to legacy on a timeout: the caller has
+                    # already waited the full ceiling, and a second full-length
+                    # request would double the stall it was meant to bound.
+                    raise
                 except Exception as ng_err:
-                    logger.warning(
-                        "google-genai generate failed ({}); falling back to legacy",
-                        ng_err,
+                    _reraise_if_cancelled()
+                    self._log_llm_call(
+                        None, kind="generate", started=started, status="error",
+                        error=f"{type(ng_err).__name__}: {str(ng_err)[:160]}; falling back to legacy SDK",
                     )
                     result = None
 
@@ -394,8 +509,11 @@ class GeminiClient:
                         safety_settings=_PERMISSIVE_SAFETY_SETTINGS,
                     )
 
-                response = await asyncio.to_thread(_sync_generate)
-                self._log_generation_diagnostics(response, label=self.model_name)
+                legacy_started = time.perf_counter()
+                response = await _with_timeout(
+                    asyncio.to_thread(_sync_generate), label="generate/legacy"
+                )
+                self._log_llm_call(response, kind="generate_legacy", started=legacy_started)
                 self._record_usage(response)
                 result = self._safe_extract_text(response)
 
@@ -426,7 +544,14 @@ class GeminiClient:
                                 safety_settings=_PERMISSIVE_SAFETY_SETTINGS,
                             )
 
-                        repair_response = await asyncio.to_thread(_sync_repair)
+                        repair_started = time.perf_counter()
+                        repair_response = await _with_timeout(
+                            asyncio.to_thread(_sync_repair),
+                            label="generate/json-repair",
+                        )
+                        self._log_llm_call(
+                            repair_response, kind="json_repair", started=repair_started
+                        )
                         # A repair round is a full billable generation — record it
                         # like the first pass above, or JSON-mode features
                         # under-report every time their output needs repairing.
@@ -447,11 +572,21 @@ class GeminiClient:
                 else:
                     result = valid
 
-            logger.success("✅ Generated {} characters with Gemini", len(result))
             return result
 
+        except asyncio.TimeoutError:
+            # Return the sentinel so is_generation_error() callers report a
+            # real cause instead of the misleading "model returned no JSON".
+            self._log_llm_call(None, kind="generate", started=started, status="timeout")
+            return (
+                "Error generating response: timed out after "
+                f"{_request_timeout_seconds()}s"
+            )
         except Exception as e:
-            logger.error("Gemini generation error: {}", str(e))
+            _reraise_if_cancelled()
+            # Returned as a sentinel, not raised — so it must be logged as a
+            # failure here, or the call reads as a success everywhere else.
+            self._log_llm_call(None, kind="generate", started=started, status="error", error=str(e)[:300])
             return f"Error generating response: {str(e)}"
 
     def _get_ng_client(self):
@@ -472,18 +607,36 @@ class GeminiClient:
         return self._ng_client
 
     @staticmethod
+    def _minimal_thinking_supported() -> bool:
+        """Whether the configured model accepts ``thinking_level=MINIMAL``.
+
+        Gemini 3.8 Flash rejects MINIMAL with a hard error, and the long-form
+        continuation rounds ask for MINIMAL — so on that model every truncated
+        long answer would fail instead of continuing.
+        """
+        override = getattr(settings, "gemini_minimal_thinking_supported", None)
+        if override is not None:
+            return bool(override)
+        model = (getattr(settings, "gemini_model", "") or "").lower()
+        return not model.startswith("gemini-3.8")
+
+    @staticmethod
     def _ng_thinking_level(level: str):
         """Map a string thinking level to the SDK enum, defaulting to LOW.
 
         LOW keeps the Gemini 3 reasoning pass cheap so the bulk of
-        max_output_tokens is spent on the actual draft, not on hidden thoughts."""
+        max_output_tokens is spent on the actual draft, not on hidden thoughts.
+        MINIMAL degrades to LOW on models that reject it."""
         mapping = {
             "MINIMAL": genai_ng_types.ThinkingLevel.MINIMAL,
             "LOW": genai_ng_types.ThinkingLevel.LOW,
             "MEDIUM": genai_ng_types.ThinkingLevel.MEDIUM,
             "HIGH": genai_ng_types.ThinkingLevel.HIGH,
         }
-        return mapping.get((level or "LOW").upper(), genai_ng_types.ThinkingLevel.LOW)
+        key = (level or "LOW").upper()
+        if key == "MINIMAL" and not GeminiClient._minimal_thinking_supported():
+            key = "LOW"
+        return mapping.get(key, genai_ng_types.ThinkingLevel.LOW)
 
     @staticmethod
     def _ng_finish_reason(response: Any) -> str:
@@ -499,7 +652,6 @@ class GeminiClient:
         except Exception:
             return ""
 
-    @tracer.trace("gemini_generate_longform")
     async def generate_longform(
         self,
         prompt: str,
@@ -571,14 +723,16 @@ class GeminiClient:
                     ),
                 )
 
-            response = await client.aio.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=_build_config(thinking_level),
+            started = time.perf_counter()
+            response = await _with_timeout(
+                client.aio.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=_build_config(thinking_level),
+                ),
+                label=f"generate_longform/{self.model_name}",
             )
-            self._log_generation_diagnostics(
-                response, label=f"{self.model_name}/longform"
-            )
+            self._log_llm_call(response, kind="longform", started=started)
             self._record_usage(response)
             result = self._safe_extract_text(response)
             if not result:
@@ -622,14 +776,16 @@ class GeminiClient:
                     "signature, verification, or annexure blocks the template "
                     "requires)."
                 )
-                response = await client.aio.models.generate_content(
-                    model=self.model_name,
-                    contents=continuation_prompt,
-                    config=_build_config("MINIMAL"),
+                started = time.perf_counter()
+                response = await _with_timeout(
+                    client.aio.models.generate_content(
+                        model=self.model_name,
+                        contents=continuation_prompt,
+                        config=_build_config("MINIMAL"),
+                    ),
+                    label=f"generate_longform/{self.model_name}/cont",
                 )
-                self._log_generation_diagnostics(
-                    response, label=f"{self.model_name}/longform-cont{rounds}"
-                )
+                self._log_llm_call(response, kind=f"longform_cont{rounds}", started=started)
                 self._record_usage(response)
                 piece = self._safe_extract_text(response)
                 if not piece:
@@ -647,14 +803,9 @@ class GeminiClient:
                     len(result),
                 )
 
-            logger.success(
-                "✅ Generated {} characters via google-genai long-form path "
-                "({} continuation round(s))",
-                len(result),
-                rounds,
-            )
             return result
         except Exception as exc:
+            _reraise_if_cancelled()
             logger.error(
                 "Long-form generation failed ({}); falling back to legacy generate()",
                 exc,
@@ -683,7 +834,18 @@ class GeminiClient:
                 return sources
             meta = getattr(candidates[0], "grounding_metadata", None)
             chunks = list(getattr(meta, "grounding_chunks", None) or [])
-            for chunk in chunks:
+            # grounding_supports map answer segments to the chunks backing them;
+            # keep that, so a claim can be traced to the page that supports it
+            # rather than only to "one of these URLs".
+            supports_by_chunk: Dict[int, List[str]] = {}
+            for support in list(getattr(meta, "grounding_supports", None) or []):
+                segment = getattr(support, "segment", None)
+                seg_text = str(getattr(segment, "text", "") or "").strip()
+                if not seg_text:
+                    continue
+                for idx in list(getattr(support, "grounding_chunk_indices", None) or []):
+                    supports_by_chunk.setdefault(int(idx), []).append(seg_text)
+            for idx, chunk in enumerate(chunks):
                 web = getattr(chunk, "web", None)
                 if web is None:
                     continue
@@ -692,12 +854,14 @@ class GeminiClient:
                 if not url or url in seen:
                     continue
                 seen.add(url)
-                sources.append({"title": title, "url": url})
+                entry: Dict[str, Any] = {"title": title, "url": url}
+                if supports_by_chunk.get(idx):
+                    entry["supports"] = supports_by_chunk[idx][:5]
+                sources.append(entry)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Failed to extract grounding sources: {}", exc)
         return sources
 
-    @tracer.trace("gemini_generate_grounded")
     async def generate_grounded(
         self,
         prompt: str,
@@ -767,27 +931,24 @@ class GeminiClient:
                     config=config,
                 )
 
-            response = await asyncio.to_thread(_sync_grounded)
-            self._log_generation_diagnostics(
-                response, label=f"{self.model_name}/grounded"
+            started = time.perf_counter()
+            response = await _with_timeout(
+                asyncio.to_thread(_sync_grounded), label="generate_grounded"
             )
+            self._log_llm_call(response, kind="grounded", started=started)
             self._record_usage(response)
             # Grounding with Google Search is billed PER REQUEST on top of the
             # tokens recorded above, so both are counted here.
             record_grounding_requests(1)
             text = self._safe_extract_text(response) or ""
             sources = self._extract_grounding_sources(response)
-            logger.info(
-                "Grounded generation: {} chars, {} source(s)",
-                len(text),
-                len(sources),
-            )
+            logger.debug("Grounded generation returned {} source(s)", len(sources))
             return text, sources
         except Exception as exc:
+            _reraise_if_cancelled()
             logger.warning("Grounded generation failed: {}", exc)
             return "", []
 
-    @tracer.trace("gemini_chat")
     async def chat(
         self,
         messages: List[Dict[str, str]],
@@ -847,80 +1008,141 @@ class GeminiClient:
                     safety_settings=_PERMISSIVE_SAFETY_SETTINGS,
                 )
 
+            started = time.perf_counter()
             response = await asyncio.to_thread(_sync_chat)
-
+            self._log_llm_call(response, kind="chat", started=started)
             self._record_usage(response)
-            result = self._safe_extract_text(response)
-
-            logger.success("✅ Chat response: {} characters", len(result))
-            return result
+            return self._safe_extract_text(response)
 
         except Exception as e:
-            logger.error("Gemini chat error: {}", str(e))
+            _reraise_if_cancelled()
+            self._log_llm_call(None, kind="chat", started=started if "started" in locals() else time.perf_counter(), status="error", error=str(e)[:300])
             return f"Error in chat: {str(e)}"
 
-    @tracer.trace("gemini_embed")
-    async def embed_text(self, text: str) -> List[float]:
+    @staticmethod
+    def _l2_normalise(vector: List[float]) -> List[float]:
+        """Unit-length copy. A reduced-dimension embedding is not unit length."""
+        norm = sum(v * v for v in vector) ** 0.5
+        if not norm:
+            return list(vector)
+        return [v / norm for v in vector]
+
+    def _embedding_model_id(self) -> str:
+        name = (getattr(settings, "embedding_model", "") or "gemini-embedding-001").strip()
+        return name[len("models/"):] if name.startswith("models/") else name
+
+    async def _embed_batch_once(
+        self, texts: List[str], task_type: str
+    ) -> List[List[float]]:
+        """One embedding request for up to ``_EMBED_BATCH`` texts. Raises on failure."""
+        dims = int(getattr(settings, "embedding_dimensions", 768) or 768)
+        started = time.perf_counter()
+        ng_client = self._get_ng_client()
+        if ng_client is not None:
+            response = await _with_timeout(
+                ng_client.aio.models.embed_content(
+                    model=self._embedding_model_id(),
+                    contents=list(texts),
+                    config=genai_ng_types.EmbedContentConfig(
+                        task_type=task_type, output_dimensionality=dims
+                    ),
+                ),
+                label="embed_content",
+            )
+            vectors = [list(e.values or []) for e in (response.embeddings or [])]
+        else:
+            # Legacy SDK fallback: one text per call.
+            def _sync_embed(text: str):
+                return genai.embed_content(
+                    model=f"models/{self._embedding_model_id()}",
+                    content=text,
+                    task_type=task_type.lower(),
+                    output_dimensionality=dims,
+                )
+
+            vectors = []
+            for text in texts:
+                result = await asyncio.to_thread(_sync_embed, text)
+                vectors.append(list(result["embedding"]))
+        if len(vectors) != len(texts):
+            raise EmbeddingError(
+                f"embedding returned {len(vectors)} vectors for {len(texts)} inputs"
+            )
+        for v in vectors:
+            if len(v) != dims:
+                raise EmbeddingError(
+                    f"embedding has {len(v)} dimensions, expected {dims} — the "
+                    f"model does not honour output_dimensionality"
+                )
+            if not any(v):
+                raise EmbeddingError("embedding came back all zeros")
+        # Billed per input token; the SDK gives no usage block, so estimate
+        # (~4 chars per token) rather than leave the spend invisible.
+        record_embed_tokens(sum(len(t or "") for t in texts) // 4)
+        logger.debug(
+            "embed_call texts={} task={} dims={} ms={}",
+            len(texts), task_type, dims, round((time.perf_counter() - started) * 1000),
+        )
+        return [self._l2_normalise(v) for v in vectors]
+
+    async def _embed_with_retry(
+        self, texts: List[str], task_type: str
+    ) -> List[List[float]]:
+        attempts = max(1, int(getattr(settings, "embedding_max_attempts", 3) or 3))
+        last_error: Optional[BaseException] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self._embed_batch_once(texts, task_type)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _reraise_if_cancelled()
+                last_error = exc
+                logger.warning(
+                    "Embedding attempt {}/{} failed ({} text(s), {}): {}",
+                    attempt,
+                    attempts,
+                    len(texts),
+                    task_type,
+                    exc,
+                )
+                if attempt < attempts:
+                    await asyncio.sleep(min(8.0, 0.5 * (2 ** (attempt - 1))))
+        raise EmbeddingError(f"embedding failed after {attempts} attempts: {last_error}")
+
+    async def embed_text(
+        self, text: str, task_type: str = "RETRIEVAL_DOCUMENT"
+    ) -> List[float]:
         """
-        Generate embeddings for text using Google's embedding model.
+        Embed one text. ``task_type`` is RETRIEVAL_DOCUMENT for stored chunks and
+        RETRIEVAL_QUERY for search queries — using the document type for queries
+        measurably lowers retrieval quality.
 
-        Args:
-            text: Text to embed
-
-        Returns:
-            Embedding vector (768 dimensions)
+        Raises:
+            EmbeddingError: after ``embedding_max_attempts`` failures. Never
+                returns a zero vector: a zero vector matches nothing and hides
+                the failure.
         """
         if not self._initialized:
             self.initialize()
+        vectors = await self._embed_with_retry([text or " "], task_type)
+        return vectors[0]
 
-        try:
+    async def embed_query(self, text: str) -> List[float]:
+        """Embed a search query (RETRIEVAL_QUERY task type)."""
+        return await self.embed_text(text, task_type="RETRIEVAL_QUERY")
 
-            def _sync_embed():
-                return genai.embed_content(
-                    model=self.embedding_model_name,
-                    content=text,
-                    task_type="retrieval_document",
-                )
-
-            result = await asyncio.to_thread(_sync_embed)
-
-            # Cost: embeddings are billed per input token, but the legacy
-            # ``genai.embed_content`` result is a plain {"embedding": [...]} dict
-            # with no usage_metadata — the real count is unavailable here. Record
-            # a ~4-chars-per-token ESTIMATE so the spend is not invisible;
-            # ``embedPrice`` is therefore approximate (at $0.15/1M the absolute
-            # error is negligible next to OCR/STT).
-            record_embed_tokens(len(text or "") // 4)
-
-            embedding = result["embedding"]
-
-            logger.debug("✅ Generated embedding: {} dimensions", len(embedding))
-            return embedding
-
-        except Exception as e:
-            logger.error("Gemini embedding error: {}", str(e))
-            # Return zero vector on error
-            return [0.0] * 768
-
-    @tracer.trace("gemini_embed_batch")
-    async def embed_texts(self, texts: List[str]) -> List[List[float]]:
-        """
-        Generate embeddings for multiple texts.
-
-        Args:
-            texts: List of texts to embed
-
-        Returns:
-            List of embedding vectors
-        """
-        embeddings = []
-
-        for text in texts:
-            embedding = await self.embed_text(text)
-            embeddings.append(embedding)
-
-        logger.debug("✅ Generated {} embeddings", len(embeddings))
-        return embeddings
+    async def embed_texts(
+        self, texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT"
+    ) -> List[List[float]]:
+        """Embed many texts, batched. Raises EmbeddingError like embed_text."""
+        if not self._initialized:
+            self.initialize()
+        out: List[List[float]] = []
+        for i in range(0, len(texts), _EMBED_BATCH):
+            batch = [t or " " for t in texts[i : i + _EMBED_BATCH]]
+            out.extend(await self._embed_with_retry(batch, task_type))
+        return out
 
     def is_available(self) -> bool:
         """Check if Gemini is available."""

@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from app.utils.redact import chars
+
 from app.socket.schemas import EvidenceFile, WorkspaceData
 from app.workspace.persistence import CacheKinds, persist_state
 

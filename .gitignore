@@ -55,6 +55,10 @@ ENV/
 logs/
 *.log
 data/
+# The statutory register is source, not data: the law checks read it.
+!app/statutes/data/
+!app/statutes/data/register.json
+!app/statutes/data/sections.json
 *.db
 *.sqlite
 
@@ -91,3 +95,10 @@ google-application-credentials.json
 !**/SYSTEM_ARCHITECTURE.md
 !**/RELEASE.md
 !**/CHANGELOG.md
+# Statute pipeline inputs/outputs (large, regenerable; see scripts/fetch_laws_indiacode.py)
+/masterLaws*.json
+# Local reference material, not part of the service
+/SimplerToday_Cloud_Services_Migration-1.pdf
+/docs/SYSTEM_ARCHITECTURE.drawio
+/docs/TARGET_ARCHITECTURE.drawio
+/pracsys2.0/

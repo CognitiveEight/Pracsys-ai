@@ -72,7 +72,7 @@ from app.utils.exceptions import SocketEventError
 from app.workspace.custom_instructions import (build_custom_instruction_suffix,
                                                hydrate_custom_instructions_from_cache,
                                                set_custom_instructions)
-from app.workspace.manager import workspace_manager
+from app.workspace.participants import set_participants
 from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
                                        hydrate_workspace_state, persist_state,
                                        restore_state)
@@ -174,7 +174,7 @@ class WorkspaceEventsMixin:
                     doc_assess,
                 )
                 logger.success(
-                    "✅ Document assessments re-emitted to backend after reconnect"
+                    "Document assessments re-emitted to backend after reconnect"
                 )
                 await asyncio.sleep(0.1)
             # 2) Workspace metadata (if available)
@@ -186,7 +186,7 @@ class WorkspaceEventsMixin:
                     metadata,
                 )
                 logger.success(
-                    "✅ Workspace metadata re-emitted to backend after reconnect"
+                    "Workspace metadata re-emitted to backend after reconnect"
                 )
                 await asyncio.sleep(0.1)
             # 3) Strategy & objectives
@@ -199,7 +199,7 @@ class WorkspaceEventsMixin:
                     payload=strategies_result,
                     usage=None,
                 )
-                logger.success("✅ Strategy re-emitted to backend after reconnect")
+                logger.success("Strategy re-emitted to backend after reconnect")
                 await asyncio.sleep(0.2)
             # 4) Analysis report
             analysis_report = self._workspace_analysis_payload.get(workspace_id)
@@ -212,7 +212,7 @@ class WorkspaceEventsMixin:
                     usage=None,
                 )
                 logger.success(
-                    "✅ Analysis report re-emitted to backend after reconnect"
+                    "Analysis report re-emitted to backend after reconnect"
                 )
             # 5) List of dates timeline
             list_of_dates = self._workspace_list_of_dates_payload.get(workspace_id)
@@ -228,7 +228,7 @@ class WorkspaceEventsMixin:
                     },
                     usage=None,
                 )
-                logger.success("✅ List of dates re-emitted to backend after reconnect")
+                logger.success("List of dates re-emitted to backend after reconnect")
                 self._log_list_of_dates_outbound(
                     workspace_id=workspace_id,
                     user_id=user_id,
@@ -246,7 +246,7 @@ class WorkspaceEventsMixin:
                     usage=None,
                 )
                 logger.success(
-                    "✅ Applicable laws re-emitted to backend after reconnect"
+                    "Applicable laws re-emitted to backend after reconnect"
                 )
             # 7) Procedural timeline (product order: timeline → parties → case laws)
             procedural_timeline = self._workspace_procedural_timeline_payload.get(workspace_id)
@@ -259,7 +259,7 @@ class WorkspaceEventsMixin:
                     usage=None,
                 )
                 logger.success(
-                    "✅ Procedural timeline re-emitted to backend after reconnect"
+                    "Procedural timeline re-emitted to backend after reconnect"
                 )
             # 8) Relevant parties
             relevant_parties = self._workspace_relevant_parties_payload.get(workspace_id)
@@ -272,7 +272,7 @@ class WorkspaceEventsMixin:
                     usage=None,
                 )
                 logger.success(
-                    "✅ Relevant parties re-emitted to backend after reconnect"
+                    "Relevant parties re-emitted to backend after reconnect"
                 )
             # 9) Case laws
             case_laws = self._workspace_case_laws_payload.get(workspace_id)
@@ -285,7 +285,7 @@ class WorkspaceEventsMixin:
                     usage=None,
                 )
                 logger.success(
-                    "✅ Case laws re-emitted to backend after reconnect"
+                    "Case laws re-emitted to backend after reconnect"
                 )
             # 10) Drafting Assistant — proactive suggestions panel
             drafting_payload = self._workspace_drafting_payload.get(workspace_id)
@@ -300,15 +300,70 @@ class WorkspaceEventsMixin:
                     usage=None,
                 )
                 logger.success(
-                    "✅ Drafting suggestions re-emitted to backend after reconnect"
+                    "Drafting suggestions re-emitted to backend after reconnect"
                 )
         except Exception as e:
             logger.warning("Failed to re-emit after reconnect: {}", e)
+
+    async def _recover_interrupted_work(self) -> None:
+        """Deliver / re-run whatever the last disconnect interrupted.
+
+        Order matters. Undelivered payloads go FIRST so the frontend receives the
+        genuinely-generated output (e.g. the new strategic objective) before
+        ``_do_reemit_after_reconnect`` can ship the pre-change cached snapshot
+        for the same featureType. Resumes run last because they are slow.
+        """
+        delivered: Dict[str, List[str]] = {}
+        try:
+            delivered = await self._flush_pending_feature_deliveries()
+            if delivered:
+                logger.success(
+                    "Re-delivered held feature payload(s) after reconnect: {}",
+                    {k[:12]: v for k, v in delivered.items()},
+                )
+        except Exception as flush_err:
+            logger.warning(
+                "Pending feature re-delivery failed (non-fatal): {}", flush_err
+            )
+        # A delivered strategy_objective means the regeneration DID complete and
+        # only its delivery failed. Re-running it would waste a ~2-minute call
+        # and emit the same panel twice; what is still owed is the downstream
+        # cascade, so schedule that and drop the resume marker.
+        for ws_id, features in (delivered or {}).items():
+            if "strategy_objective" not in features:
+                continue
+            try:
+                # Read the marker BEFORE clearing it — it is where the asker's
+                # id was recorded when the change was accepted.
+                marker_user = (
+                    (self._pending_objective_changes.get(ws_id) or {}).get("userId")
+                    or self._pending_reemit_user_id
+                    or ""
+                )
+                self._clear_pending_objective_change(ws_id)
+                self._schedule_objective_change_reanalysis(
+                    workspace_id=ws_id,
+                    user_id=marker_user,
+                    log_context=" (after re-delivering a held objective payload)",
+                )
+            except Exception as cascade_err:
+                logger.warning(
+                    "Could not schedule cascade after re-delivery (workspace={}): {}",
+                    str(ws_id)[:12],
+                    cascade_err,
+                )
+        try:
+            await self._resume_pending_objective_changes()
+        except Exception as resume_err:
+            logger.warning(
+                "Objective-change resume failed (non-fatal): {}", resume_err
+            )
 
     async def on_connect(self, data: Any) -> None:
         """Handle connection event. Re-emit pending document_feature_response if we had disconnected during workspace init."""
         logger.info("Socket connected")
         audit_logger.log_event("socket_connect", {"status": "connected"})
+        await self._recover_interrupted_work()
         await self._do_reemit_after_reconnect()
 
     async def on_connected(self, data: Any) -> None:
@@ -317,18 +372,22 @@ class WorkspaceEventsMixin:
         Confirms successful connection with userId and clientType.
         If we had a disconnect right after emitting analysis report, re-emit from cache so backend gets the update.
         """
-        logger.success("✅ Server confirmed connection as AI_Maverick")
-        logger.info(f"Connection details: {data}")
+        logger.debug("Server confirmed connection as AI_Maverick")
         audit_logger.log_event(
-            "socket_connected_confirmed", {"status": "confirmed", "data": data}
+            "socket_connected_confirmed",
+            {
+                "status": "confirmed",
+                "clientType": (data or {}).get("clientType") if isinstance(data, dict) else None,
+            }
         )
+        await self._recover_interrupted_work()
         await self._do_reemit_after_reconnect()
         # Re-emit last ai_response if we disconnected right after sending (so backend receives the chat response)
         if self._had_disconnect and self._pending_ai_response and self._socket_client:
             try:
                 await self._socket_client.emit_ai_response(self._pending_ai_response)
                 logger.success(
-                    "✅ AI chat response re-emitted to backend after reconnect (chat: {})",
+                    "AI chat response re-emitted to backend after reconnect (chat: {})",
                     self._pending_ai_response.get("chatId"),
                 )
             except Exception as e:
@@ -346,8 +405,9 @@ class WorkspaceEventsMixin:
 
     async def on_error(self, data: Any) -> None:
         """Handle error event."""
-        logger.error("Socket error received: {}", data)
-        audit_logger.log_event("socket_error", {"error": str(data)})
+        # Connection-level errors are already logged with their diagnosis by
+        # the socket client; this records the audit event only.
+        audit_logger.log_event("socket_error", {"error": str(data)[:200]})
 
     async def on_workspace_created(self, data: Dict[str, Any]) -> None:
         """
@@ -377,6 +437,12 @@ class WorkspaceEventsMixin:
             # Validate and parse payload
             payload = WorkspaceCreatedPayload(**data)
 
+            # A workspace showing signs of life revokes any pending compliance
+            # purge (see handlers/workspace_purge.py). Without this a case
+            # deleted then restored inside the grace window would keep its armed
+            # timer and be erased on schedule days later.
+            self.cancel_pending_purge(payload.workspaceId, trigger="workspace_created")
+
             # Store custom instructions if provided (structure, tone, description)
             custom = data.get("customInstructions") or {}
             structure = getattr(payload, "structure", None) or custom.get("structure")
@@ -403,7 +469,7 @@ class WorkspaceEventsMixin:
                 )
 
             logger.info(
-                "📦 Workspace created: {} - {} (User: {}, Role: {})",
+                "Workspace created: {} - {} (User: {}, Role: {})",
                 payload.workspaceId,
                 payload.title,
                 payload.userId,
@@ -465,7 +531,7 @@ class WorkspaceEventsMixin:
                 )
 
                 logger.success(
-                    "✅ Role-based agent initialized for workspace {} with role {}",
+                    "Role-based agent initialized for workspace {} with role {}",
                     payload.workspaceId,
                     workspace_role,
                 )
@@ -522,7 +588,7 @@ class WorkspaceEventsMixin:
                         )
 
                     logger.success(
-                        "✅ Document processing complete: {}/{} successful, avg readability: {:.2f}%",
+                        "Document processing complete: {}/{} successful, avg readability: {:.2f}%",
                         batch_result.get("successful", 0),
                         batch_result.get("total_files", 0),
                         batch_result.get("average_readability_score", 0),
@@ -547,7 +613,7 @@ class WorkspaceEventsMixin:
                                 "documentAssessments"
                             ]
                             logger.info(
-                                f"📤 Emitting document_feature_response (document_assessments) with {len(document_results)} documents"
+                                "Emitting document_feature_response (document_assessments) with {} documents", len(document_results)
                             )
                             # Bill the ingestion spend captured above (OCR units, STT
                             # seconds, embedding + per-document Gemini tokens) to
@@ -588,7 +654,7 @@ class WorkspaceEventsMixin:
                                     ledger_err,
                                 )
                             logger.success(
-                                "✅ Document assessments sent (or cached for re-emit) to backend"
+                                "Document assessments sent (or cached for re-emit) to backend"
                             )
                         except Exception as e:
                             logger.error("Failed to emit document_assessments: {}", e)
@@ -634,7 +700,7 @@ class WorkspaceEventsMixin:
                                     payload.workspaceId
                                 ] = workspace_metadata_payload
                                 logger.success(
-                                    "✅ Workspace metadata sent (or cached for re-emit)"
+                                    "Workspace metadata sent (or cached for re-emit)"
                                 )
                             except Exception as meta_err:
                                 logger.warning(
@@ -645,7 +711,7 @@ class WorkspaceEventsMixin:
                         # 3–4) Strategy, analysis, list_of_dates, applicable_laws: background so chat events are not blocked
                         if batch_result.get("successful", 0) > 0:
                             logger.info(
-                                "🎯 Scheduling strategy + analysis + list_of_dates + "
+                                "Scheduling strategy + analysis + list_of_dates + "
                                 "applicable_laws + procedural_timeline (background)…"
                             )
                             self._schedule_strategy_analysis_pipeline(
@@ -676,7 +742,7 @@ class WorkspaceEventsMixin:
                                         payload.workspaceId
                                     ] = fallback
                                     logger.info(
-                                        "✅ Analysis report (fallback, 0 successful docs) sent to backend"
+                                        "Analysis report (fallback, 0 successful docs) sent to backend"
                                     )
                                     await self._emit_document_feature(
                                         feature_type="list_of_dates",
@@ -729,10 +795,10 @@ class WorkspaceEventsMixin:
                             await self._socket_client.emit(
                                 "document_feature_response", error_payload
                             )
-                            logger.error("❌ Document processing error sent to backend")
+                            logger.error("Document processing error sent to backend")
                         except Exception as emit_error:
                             logger.error(
-                                f"Failed to emit error notification: {emit_error}"
+                                "Failed to emit error notification: {}", emit_error
                             )
 
             # When workspace has no evidence files, still emit analysis report (fallback) and empty list of dates
@@ -751,7 +817,7 @@ class WorkspaceEventsMixin:
                     )
                     self._workspace_analysis_payload[payload.workspaceId] = fallback
                     logger.info(
-                        "✅ Analysis report (fallback, no docs) sent to backend"
+                        "Analysis report (fallback, no docs) sent to backend"
                     )
                     await self._emit_document_feature(
                         feature_type="list_of_dates",
@@ -765,7 +831,7 @@ class WorkspaceEventsMixin:
                         usage=None,
                     )
                     self._workspace_list_of_dates_payload[payload.workspaceId] = []
-                    logger.info("✅ List of dates (empty, no docs) sent to backend")
+                    logger.info("List of dates (empty, no docs) sent to backend")
                     self._schedule_list_of_dates_and_applicable_laws(
                         workspace_id=str(payload.workspaceId),
                         user_id=str(payload.userId),
@@ -789,14 +855,13 @@ class WorkspaceEventsMixin:
             )
 
             logger.success(
-                "🎉 Workspace fully initialized: {} with role {}",
+                "Workspace fully initialized: {} with role {}",
                 payload.workspaceId,
                 workspace_role,
             )
 
         except Exception as e:
-            logger.error("Error processing workspace_created event: {}", str(e))
-            logger.exception(e)
+            logger.opt(exception=e).error("Error processing workspace_created event: {}", str(e))
             raise
 
     async def on_workspace_sync(self, data: Dict[str, Any]) -> None:
@@ -824,19 +889,25 @@ class WorkspaceEventsMixin:
             data: Workspace sync payload
         """
         try:
-            # Log raw websocket input for debugging (delete flags, evidenceFiles, etc.)
-            try:
-                import json
-
-                raw_preview = json.dumps(data, default=str) if data else "null"
-                if len(raw_preview) > 1500:
-                    raw_preview = raw_preview[:1500] + "..."
-                logger.info("📥 workspace_sync RAW input: {}", raw_preview)
-            except Exception:
-                logger.info("📥 workspace_sync RAW input (repr): {}", repr(data))
+            # Summary only: the payload carries signed URLs and participant names.
+            _body = data if isinstance(data, dict) else {}
+            logger.info(
+                "workspace_sync: {} evidence file(s), {} deleted id(s), currentState={}, "
+                "participants={}",
+                len(_body.get("evidenceFiles") or []),
+                len(_body.get("deletedDocumentIds") or []),
+                "currentState" in _body,
+                len(_body.get("participants") or []) if "participants" in _body else "absent",
+            )
 
             # Validate and parse payload
             payload = WorkspaceSyncPayload(**data)
+
+            # A workspace showing signs of life revokes any pending compliance
+            # purge (see handlers/workspace_purge.py). Without this a case
+            # deleted then restored inside the grace window would keep its armed
+            # timer and be erased on schedule days later.
+            self.cancel_pending_purge(payload.workspaceId, trigger="workspace_sync")
 
             # Cache the previously-emitted, user-curated panel state so every
             # regeneration path (upload/delete here AND the chat-triggered
@@ -850,6 +921,29 @@ class WorkspaceEventsMixin:
                     )
                 except Exception as cs_err:
                     logger.debug("Failed to cache currentState: {}", cs_err)
+
+            # Workspace sharing: refresh the collaborator roster. AUTHORITATIVE
+            # here — the backend omits `participants` entirely when the case is
+            # not shared, so an absent field is how an un-share reaches us and
+            # must drop the roster rather than leave a removed collaborator
+            # holding edit rights.
+            #
+            # Deliberately ABOVE the idempotency guard, and deliberately NOT in
+            # its fingerprint. Sharing changes no AI output, so a share-only
+            # re-sync should still be swallowed by the guard (no regeneration)
+            # — but the roster must be updated even then, or a permission
+            # change would be dropped for 180s.
+            try:
+                set_participants(
+                    str(payload.workspaceId),
+                    payload.participants,
+                    authoritative=True,
+                )
+            except Exception as participants_err:
+                logger.warning(
+                    "Participant roster update failed (non-fatal): {}",
+                    participants_err,
+                )
 
             # -----------------------------------------------------------------
             # Idempotency guard: skip duplicate/replayed workspace_sync payloads.
@@ -1012,7 +1106,7 @@ class WorkspaceEventsMixin:
                                 deleted_ids.append(oid)
                         if orphan_ids:
                             logger.info(
-                                "🗑️ Inferred {} removed document(s) (in vector store but not in evidenceFiles): {}",
+                                "Inferred {} removed document(s) (in vector store but not in evidenceFiles): {}",
                                 len(orphan_ids),
                                 orphan_ids,
                             )
@@ -1024,12 +1118,12 @@ class WorkspaceEventsMixin:
 
             if deleted_ids:
                 logger.info(
-                    "🗑️ Document IDs to remove from vector store (explicit + inferred): {}",
+                    "Document IDs to remove from vector store (explicit + inferred): {}",
                     deleted_ids,
                 )
 
             logger.info(
-                "🔄 Workspace sync: {} (User: {}, Role: {})",
+                "Workspace sync: {} (User: {}, Role: {})",
                 payload.workspaceId,
                 payload.userId,
                 payload.workspaceRole or "unchanged",
@@ -1125,7 +1219,7 @@ class WorkspaceEventsMixin:
             )
             if role_changed:
                 logger.info(
-                    "🔁 Workspace role changed: {} → {} (workspace {})",
+                    "Workspace role changed: {}  {} (workspace {})",
                     _prev_upper,
                     _new_upper,
                     str(payload.workspaceId)[:12],
@@ -1164,14 +1258,14 @@ class WorkspaceEventsMixin:
             if payload.workspaceRole:
                 updates["workspaceRole"] = payload.workspaceRole
 
-            logger.info(f"Workspace updates: {updates}")
+            logger.info("Workspace updates: {}", updates)
 
             # Handle document deletion: remove from vector store and regenerate strategy from remaining docs
             if deleted_ids:
                 from app.vectorstore.qdrant import vector_store
 
                 logger.info(
-                    "🗑️ Deleting {} document(s) from vector store: {}",
+                    "Deleting {} document(s) from vector store: {}",
                     len(deleted_ids),
                     deleted_ids,
                 )
@@ -1183,8 +1277,7 @@ class WorkspaceEventsMixin:
                     )
                     delete_ok = True
                 except Exception as del_err:
-                    logger.error("Vector store delete failed: {}", str(del_err))
-                    logger.exception(del_err)
+                    logger.opt(exception=del_err).error("Vector store delete failed: {}", str(del_err))
                 if delete_ok:
                     # Prune the assessments cache BEFORE any regeneration below:
                     # _build_document_inventory feeds that cache into every
@@ -1267,7 +1360,7 @@ class WorkspaceEventsMixin:
                                 strategies_result
                             )
                             logger.success(
-                                "🎉 Strategy & Objectives sent after document deletion"
+                                "Strategy & Objectives sent after document deletion"
                             )
                     except Exception as strat_emit_err:
                         logger.warning(
@@ -1332,7 +1425,7 @@ class WorkspaceEventsMixin:
                                 analysis_report
                             )
                             logger.success(
-                                "✅ Analysis report sent after document deletion"
+                                "Analysis report sent after document deletion"
                             )
                     except Exception as ar_emit_err:
                         logger.warning(
@@ -1529,7 +1622,7 @@ class WorkspaceEventsMixin:
                         )
 
                     logger.success(
-                        "✅ Document sync complete: {}/{} successful",
+                        "Document sync complete: {}/{} successful",
                         batch_result.get("successful", 0),
                         batch_result.get("total_files", 0),
                     )
@@ -1593,7 +1686,7 @@ class WorkspaceEventsMixin:
                                     ledger_err,
                                 )
                             logger.success(
-                                "✅ Document assessments (sync) sent to backend"
+                                "Document assessments (sync) sent to backend"
                             )
 
                             # Emit workspace_metadata on sync: do NOT send title (send empty) so backend keeps existing title unchanged
@@ -1632,7 +1725,7 @@ class WorkspaceEventsMixin:
                                         workspace_metadata_payload,
                                     )
                                     logger.success(
-                                        "✅ Workspace metadata (sync) sent: title=unchanged, category={}, subcategories={}, description={}",
+                                        "Workspace metadata (sync) sent: title=unchanged, category={}, subcategories={}, description={}",
                                         meta.get("caseCategory"),
                                         meta.get("subcategories"),
                                         (meta.get("description") or "")[:50],
@@ -1650,7 +1743,7 @@ class WorkspaceEventsMixin:
                                     workspace_role,
                                 )
                                 logger.info(
-                                    "🎯 Scheduling strategy + analysis + list_of_dates + "
+                                    "Scheduling strategy + analysis + list_of_dates + "
                                     "applicable_laws + procedural_timeline on sync (background)…"
                                 )
                                 # NOTE: workspace:refresh is now emitted earlier
@@ -1685,7 +1778,7 @@ class WorkspaceEventsMixin:
                                             payload.workspaceId
                                         ] = fallback
                                         logger.info(
-                                            "✅ Analysis report (fallback, 0 successful sync) sent to backend"
+                                            "Analysis report (fallback, 0 successful sync) sent to backend"
                                         )
                                         await self._emit_document_feature(
                                             feature_type="list_of_dates",
@@ -1714,7 +1807,7 @@ class WorkspaceEventsMixin:
                                             e,
                                         )
                         except Exception as emit_error:
-                            logger.error(f"Failed to emit sync results: {emit_error}")
+                            logger.error("Failed to emit sync results: {}", emit_error)
                 except Exception as doc_error:
                     logger.error("Error syncing documents: {}", str(doc_error))
 
@@ -1738,7 +1831,7 @@ class WorkspaceEventsMixin:
                                 "document_feature_response", error_payload
                             )
                             logger.error(
-                                "❌ Document sync error sent to backend (with partial spend)"
+                                "Document sync error sent to backend (with partial spend)"
                             )
                         except Exception as emit_error:
                             logger.error(
@@ -1762,7 +1855,7 @@ class WorkspaceEventsMixin:
                         usage=None,
                     )
                     logger.success(
-                        "✅ Strategy & Objectives re-emitted to backend (from cache)"
+                        "Strategy & Objectives re-emitted to backend (from cache)"
                     )
                     await asyncio.sleep(
                         0.2
@@ -1797,7 +1890,7 @@ class WorkspaceEventsMixin:
                             strategies_result
                         )
                         logger.success(
-                            "✅ Strategy & Objectives emitted to backend (skip_reprocess, generated once)"
+                            "Strategy & Objectives emitted to backend (skip_reprocess, generated once)"
                         )
 
                 analysis_report = self._workspace_analysis_payload.get(workspace_id)
@@ -1810,7 +1903,7 @@ class WorkspaceEventsMixin:
                         usage=None,
                     )
                     logger.success(
-                        "✅ Analysis report re-emitted to backend (from cache)"
+                        "Analysis report re-emitted to backend (from cache)"
                     )
                     await asyncio.sleep(
                         0.15
@@ -1831,7 +1924,7 @@ class WorkspaceEventsMixin:
                             usage=None,
                         )
                         logger.success(
-                            "✅ List of dates re-emitted to backend (from cache)"
+                            "List of dates re-emitted to backend (from cache)"
                         )
                     applicable_laws = self._workspace_applicable_laws_payload.get(
                         workspace_id
@@ -1845,7 +1938,7 @@ class WorkspaceEventsMixin:
                             usage=None,
                         )
                         logger.success(
-                            "✅ Applicable laws re-emitted to backend (from cache)"
+                            "Applicable laws re-emitted to backend (from cache)"
                         )
                     # Procedural timeline ("Upcoming Dates"): re-emit from
                     # cache if present (product order: timeline → parties →
@@ -1868,7 +1961,7 @@ class WorkspaceEventsMixin:
                             usage=None,
                         )
                         logger.success(
-                            "✅ Procedural timeline re-emitted to backend (from cache)"
+                            "Procedural timeline re-emitted to backend (from cache)"
                         )
                     relevant_parties = self._workspace_relevant_parties_payload.get(
                         workspace_id
@@ -1882,7 +1975,7 @@ class WorkspaceEventsMixin:
                             usage=None,
                         )
                         logger.success(
-                            "✅ Relevant parties re-emitted to backend (from cache)"
+                            "Relevant parties re-emitted to backend (from cache)"
                         )
                     case_laws = self._workspace_case_laws_payload.get(workspace_id)
                     if case_laws is not None:
@@ -1894,7 +1987,7 @@ class WorkspaceEventsMixin:
                             usage=None,
                         )
                         logger.success(
-                            "✅ Case laws re-emitted to backend (from cache)"
+                            "Case laws re-emitted to backend (from cache)"
                         )
                     self._schedule_list_of_dates_and_applicable_laws(
                         workspace_id=workspace_id,
@@ -1961,7 +2054,7 @@ class WorkspaceEventsMixin:
                         usage=None,
                     )
                     logger.success(
-                        "✅ Document assessments re-emitted{} (from cache)", log_ctx
+                        "Document assessments re-emitted{} (from cache)", log_ctx
                     )
 
                 cached_metadata = self._workspace_metadata_payload.get(workspace_id)
@@ -1974,7 +2067,7 @@ class WorkspaceEventsMixin:
                         usage=None,
                     )
                     logger.success(
-                        "✅ Workspace metadata re-emitted{} (from cache)", log_ctx
+                        "Workspace metadata re-emitted{} (from cache)", log_ctx
                     )
 
                 # NOTE: list_of_dates and procedural_timeline are re-emitted
@@ -2014,7 +2107,7 @@ class WorkspaceEventsMixin:
                     usage=_u4,
                 )
                 self._workspace_strategy_payload[workspace_id] = strategies_result
-                logger.success("🎉 Strategy & Objectives regenerated{}", log_ctx)
+                logger.success("Strategy & Objectives regenerated{}", log_ctx)
                 await asyncio.sleep(0.15)
 
                 # 4) Regenerate analysis_report for the new role, emit + cache.
@@ -2068,7 +2161,7 @@ class WorkspaceEventsMixin:
                     usage=_u5,
                 )
                 self._workspace_analysis_payload[workspace_id] = analysis_report
-                logger.success("✅ Analysis report regenerated{}", log_ctx)
+                logger.success("Analysis report regenerated{}", log_ctx)
                 # Allow socket to flush analysis_report before the next emit
                 # (mirrors skip_reprocess branch pattern).
                 await asyncio.sleep(0.15)
@@ -2093,7 +2186,7 @@ class WorkspaceEventsMixin:
                         usage=None,
                     )
                     logger.success(
-                        "✅ List of dates re-emitted{} (from cache)", log_ctx
+                        "List of dates re-emitted{} (from cache)", log_ctx
                     )
 
                 # 6) Re-emit procedural_timeline from cache (role-independent).
@@ -2111,7 +2204,7 @@ class WorkspaceEventsMixin:
                         usage=None,
                     )
                     logger.success(
-                        "✅ Procedural timeline re-emitted{} (from cache)", log_ctx
+                        "Procedural timeline re-emitted{} (from cache)", log_ctx
                     )
 
                 # 7) Regenerate applicable_laws only (do not touch list_of_dates
@@ -2142,7 +2235,7 @@ class WorkspaceEventsMixin:
                                 workspace_id=workspace_id
                             )
                             logger.info(
-                                "🗑️ Cleared all vectors for workspace {} (evidenceFiles is empty list)",
+                                "Cleared all vectors for workspace {} (evidenceFiles is empty list)",
                                 workspace_id,
                             )
                         except Exception as clear_err:
@@ -2226,7 +2319,7 @@ class WorkspaceEventsMixin:
                         log_context=" (sync, no documents)",
                     )
                     logger.success(
-                        "✅ Strategy & Analysis report & list of dates (empty) sent to backend (no documents); applicable laws scheduled"
+                        "Strategy & Analysis report & list of dates (empty) sent to backend (no documents); applicable laws scheduled"
                     )
                 except Exception as e:
                     logger.error(
@@ -2248,11 +2341,10 @@ class WorkspaceEventsMixin:
                 },
             )
 
-            logger.success("✅ Workspace sync completed: {}", payload.workspaceId)
+            logger.success("Workspace sync completed: {}", payload.workspaceId)
 
         except Exception as e:
-            logger.error("Error processing workspace_sync event: {}", str(e))
-            logger.exception(e)
+            logger.opt(exception=e).error("Error processing workspace_sync event: {}", str(e))
             raise
 
     async def on_workspace_version_restore(self, data: Dict[str, Any]) -> None:
@@ -2287,8 +2379,26 @@ class WorkspaceEventsMixin:
             user_id = str(payload.userId)
             version_id = str(payload.versionId)
 
+            # Live workspace: revoke any pending compliance purge.
+            self.cancel_pending_purge(workspace_id, trigger="workspace_version_restore")
+
+            # Roster update only when the payload actually carries one. A
+            # version restore is a document-version operation and says nothing
+            # about sharing, so an absent `participants` here must NOT be read
+            # as "un-shared" the way it is on workspace_sync.
+            try:
+                set_participants(
+                    workspace_id, payload.participants, authoritative=False
+                )
+            except Exception as participants_err:
+                logger.warning(
+                    "Participant roster update on version restore failed "
+                    "(non-fatal): {}",
+                    participants_err,
+                )
+
             logger.info(
-                "⏪ Workspace version restore: {} → version {} (User: {})",
+                "Workspace version restore: {}  version {} (User: {})",
                 workspace_id,
                 version_id,
                 user_id,
@@ -2469,7 +2579,7 @@ class WorkspaceEventsMixin:
             to_delete = sorted(live_ids - target_ids)
             to_ingest = sorted(target_ids - live_ids)
             logger.info(
-                "⏪ Restore reconciliation for workspace {}: live={}, target={}, "
+                "Restore reconciliation for workspace {}: live={}, target={}, "
                 "to_delete={}, to_ingest={}",
                 workspace_id[:12],
                 len(live_ids),
@@ -2513,7 +2623,7 @@ class WorkspaceEventsMixin:
                         workspace_id=workspace_id, document_ids=to_delete
                     )
                     logger.info(
-                        "🗑️ Restore removed {} document(s) from the vector store: {}",
+                        "Restore removed {} document(s) from the vector store: {}",
                         len(to_delete),
                         to_delete,
                     )
@@ -2572,17 +2682,16 @@ class WorkspaceEventsMixin:
                             user_id=user_id,
                         )
                     logger.success(
-                        "✅ Restore re-ingestion complete: {}/{} successful",
+                        "Restore re-ingestion complete: {}/{} successful",
                         batch_result.get("successful", 0),
                         batch_result.get("total_files", 0),
                     )
                 except Exception as ingest_err:
-                    logger.error(
+                    logger.opt(exception=ingest_err).error(
                         "Restore re-ingestion failed: {}; continuing with the "
                         "documents that are present",
                         ingest_err,
                     )
-                    logger.exception(ingest_err)
                     batch_result = None
 
                 if not batch_result and self._socket_client:
@@ -2644,7 +2753,7 @@ class WorkspaceEventsMixin:
                             ],
                         )
                         logger.success(
-                            "✅ Document assessments (version restore) sent to backend"
+                            "Document assessments (version restore) sent to backend"
                         )
                     except Exception as assess_err:
                         logger.error(
@@ -2690,7 +2799,7 @@ class WorkspaceEventsMixin:
                                 workspace_metadata_payload
                             )
                             logger.success(
-                                "✅ Workspace metadata (version restore) sent: "
+                                "Workspace metadata (version restore) sent: "
                                 "title=unchanged, category={}",
                                 meta.get("caseCategory"),
                             )
@@ -2739,7 +2848,7 @@ class WorkspaceEventsMixin:
                         usage=_u_strategy,
                     )
                     self._workspace_strategy_payload[workspace_id] = strategies_result
-                    logger.success("🎉 Strategy & Objectives sent after version restore")
+                    logger.success("Strategy & Objectives sent after version restore")
             except Exception as strat_emit_err:
                 logger.warning(
                     "Strategy emit after version restore failed: {}", strat_emit_err
@@ -2788,7 +2897,7 @@ class WorkspaceEventsMixin:
                         usage=_u_analysis,
                     )
                     self._workspace_analysis_payload[workspace_id] = analysis_report
-                    logger.success("✅ Analysis report sent after version restore")
+                    logger.success("Analysis report sent after version restore")
             except Exception as ar_emit_err:
                 logger.warning(
                     "Analysis report emit after version restore failed: {}",
@@ -2823,14 +2932,13 @@ class WorkspaceEventsMixin:
                 },
             )
             logger.success(
-                "✅ Workspace version restore completed: {} (version {})",
+                "Workspace version restore completed: {} (version {})",
                 workspace_id,
                 version_id,
             )
 
         except Exception as e:
-            logger.error("Error processing workspace_version_restore event: {}", str(e))
-            logger.exception(e)
+            logger.opt(exception=e).error("Error processing workspace_version_restore event: {}", str(e))
             raise
 
     async def on_workspace_transferred(self, data: Dict[str, Any]) -> None:
@@ -2864,6 +2972,9 @@ class WorkspaceEventsMixin:
                 "workspace_transferred: missing workspaceId/newUserId — dropping event"
             )
             return
+
+        # Live workspace: revoke any pending compliance purge.
+        self.cancel_pending_purge(workspace_id, trigger="workspace_transferred")
 
         # De-dup guard for replayed transfers (e.g. reconnect replay), same
         # 180s fingerprint window as workspace_sync.
@@ -2902,7 +3013,7 @@ class WorkspaceEventsMixin:
 
         same_owner = bool(prev_user_id) and prev_user_id == new_user_id
         logger.info(
-            "🔁 Workspace transferred: {} — {} → {} (role={}, status={}, files={}, reEmit={})",
+            "Workspace transferred: {} — {}  {} (role={}, status={}, files={}, reEmit={})",
             workspace_id,
             prev_user_id[:12],
             new_user_id[:12],
@@ -3117,7 +3228,7 @@ class WorkspaceEventsMixin:
         # snapshot ingest and suggestion generation is an LLM call.
         asyncio.create_task(_runner())
         logger.success(
-            "✅ workspace_transferred processed for {} — {} feature re-emit(s) scheduled",
+            "workspace_transferred processed for {} — {} feature re-emit(s) scheduled",
             workspace_id,
             len(re_emit_features),
         )
@@ -3127,25 +3238,20 @@ class WorkspaceEventsMixin:
         try:
             logger.debug("Processing legacy workspace_updated event")
             workspace_id = data.get("workspace_id") or data.get("workspaceId")
-            logger.info(f"Workspace updated (legacy): {workspace_id}")
+            logger.info("Workspace updated (legacy): {}", workspace_id)
 
             audit_logger.log_event(
                 "workspace_updated_legacy", {"workspace_id": workspace_id}
             )
         except Exception as e:
-            logger.error(f"Error processing workspace_updated: {e}")
+            logger.error("Error processing workspace_updated: {}", e)
             raise
 
-    async def on_workspace_deleted(self, data: Dict[str, Any]) -> None:
-        """Handle workspace deletion event (legacy)."""
-        try:
-            workspace_id = data.get("workspace_id") or data.get("workspaceId")
-            logger.info(f"Workspace deleted (legacy): {workspace_id}")
-
-            # Delete the workspace
-            await workspace_manager.delete_workspace(workspace_id)
-
-            audit_logger.log_event("workspace_deleted", {"workspace_id": workspace_id})
-        except Exception as e:
-            logger.error(f"Error processing workspace_deleted: {e}")
-            raise
+    # NOTE: on_workspace_deleted lives in WorkspacePurgeMixin
+    # (app/socket/handlers/workspace_purge.py). The legacy version that used to
+    # sit here deleted the workspace the instant the event arrived, which
+    # ignored the backend's grace window: a case restored on day 2 of 7 would
+    # already have lost its index. It also had no de-duplication, so the
+    # backend's deliberate re-sends each re-ran the delete. Keep this file free
+    # of a competing definition — WorkspaceEventsMixin precedes
+    # WorkspacePurgeMixin in the MRO, so one here would silently win.

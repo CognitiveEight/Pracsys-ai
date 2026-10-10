@@ -104,6 +104,25 @@ _current_usage: ContextVar[Optional[UsageAccumulator]] = ContextVar(
 )
 
 
+#: Name of the feature whose work is running (the @meter_usage-decorated
+#: function), so every model call can say who made it without each of the
+#: ~80 call sites passing a label.
+_current_feature: ContextVar[str] = ContextVar("current_feature", default="")
+
+
+def current_feature() -> str:
+    """The feature label for the running work, or "" outside any feature."""
+    return _current_feature.get()
+
+
+def _feature_label(func_name: str) -> str:
+    name = func_name.lstrip("_")
+    for prefix in ("generate_and_emit_", "generate_", "regenerate_", "run_"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
 @contextlib.contextmanager
 def capture_usage() -> Iterator[UsageAccumulator]:
     """Open a usage-capture scope and yield its accumulator.
@@ -137,10 +156,16 @@ def meter_usage(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[
     the workspace cumulative and the chat ``ai_response`` is not double-charged.
     """
 
+    label = _feature_label(func.__name__)
+
     @functools.wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
-        with capture_usage():
-            return await func(*args, **kwargs)
+        token = _current_feature.set(label)
+        try:
+            with capture_usage():
+                return await func(*args, **kwargs)
+        finally:
+            _current_feature.reset(token)
 
     return wrapper
 

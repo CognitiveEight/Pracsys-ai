@@ -17,6 +17,8 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.utils.redact import chars
+
 from app.agents.role_models import RoleEnum
 from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
@@ -131,6 +133,7 @@ class ApplicableLawsMixin:
         workspace_role: str,
         user_feedback: str,
         emit_result: bool = True,
+        outcome: Optional[Dict[str, str]] = None,
     ) -> bool:
         """
         Apply a surgical find-and-replace / correction to the EXISTING Applicable
@@ -160,6 +163,9 @@ class ApplicableLawsMixin:
             current_json = json.dumps(current, ensure_ascii=True)
             prompt = regenerate_applicable_laws_with_feedback_prompt(current_json=current_json, instruction=instruction)
 
+            # Authoritative user corrections lead the prompt so they
+            # outrank the document content they contradict.
+            prompt = self._with_user_facts(workspace_id, prompt)
             custom_suffix = build_custom_instruction_suffix(workspace_id)
             if custom_suffix:
                 prompt = prompt.rstrip() + "\n\n" + custom_suffix
@@ -180,14 +186,74 @@ class ApplicableLawsMixin:
             edited_laws = edited.get("laws") if isinstance(edited, dict) else None
             if not isinstance(edited_laws, list) or len(edited_laws) != len(laws):
                 logger.warning(
-                    "Applicable laws name edit rejected (count mismatch); keeping cache"
+                    "Applicable laws edit rejected (count mismatch); keeping cache"
                 )
                 return False
 
-            edited = self._normalize_applicable_laws_payload(edited)
+            # Index-merge, the same contract as _reeval_list_of_dates_relevance:
+            # take ONLY `description` from the model and reproduce every other
+            # field from the cached row. Rebuilding from the model's output ran
+            # it through _normalize_applicable_laws_payload, which reconstructs
+            # each row as exactly {id, act, section, description, relevance} and
+            # therefore DROPPED the `isMatched` flag written by
+            # _tag_laws_against_current_state — which both lost the frontend's
+            # matched/new tagging and made the no-op comparison below unequal,
+            # so the guard never fired and every edit emitted.
+            merged_laws: List[Dict[str, Any]] = []
+            for idx, cached_law in enumerate(laws):
+                if not isinstance(cached_law, dict):
+                    return False
+                row = dict(cached_law)
+                candidate = edited_laws[idx]
+                if isinstance(candidate, dict):
+                    new_desc = str(candidate.get("description") or "").strip()
+                    if new_desc:
+                        row["description"] = new_desc
+                merged_laws.append(row)
+
+            # Run the normaliser purely as a validity check (it drops rows with a
+            # blank description or an IPC / CrPC / IEA-1872 leak). It used to run
+            # AFTER the count guard, so a row the model blanked or contaminated
+            # vanished silently with the guard already satisfied. Reject the whole
+            # edit on shrinkage instead of shipping a shorter panel.
+            _validated = self._normalize_applicable_laws_payload(
+                {"laws": [dict(r) for r in merged_laws]}
+            )
+            _validated_laws = (
+                _validated.get("laws") if isinstance(_validated, dict) else None
+            )
+            if (
+                not isinstance(_validated_laws, list)
+                or len(_validated_laws) != len(merged_laws)
+            ):
+                logger.warning(
+                    "Applicable laws edit rejected (normalisation dropped {} of {} "
+                    "rows — blank description or IPC/CrPC leak); keeping cache",
+                    len(merged_laws) - len(_validated_laws or []),
+                    len(merged_laws),
+                )
+                return False
+
+            # Overlay the normalised description/section/relevance back onto the
+            # merged rows so cleanup applies without losing `isMatched` or any
+            # other field the cached row carried.
+            for row, clean in zip(merged_laws, _validated_laws):
+                if isinstance(clean, dict):
+                    row["description"] = clean.get("description", row.get("description"))
+                    row["section"] = clean.get("section", row.get("section"))
+                    row["relevance"] = clean.get("relevance", row.get("relevance"))
+
+            edited = dict(current)
+            edited["laws"] = merged_laws
             if json.dumps(edited, sort_keys=True, ensure_ascii=True) == json.dumps(
                 current, sort_keys=True, ensure_ascii=True
             ):
+                logger.info(
+                    "Applicable laws edit produced no change — instruction={!r}",
+                    chars(instruction),
+                )
+                if outcome is not None:
+                    outcome["status"] = "unchanged"
                 return False  # nothing changed
 
             self._workspace_applicable_laws_payload[workspace_id] = edited
@@ -201,9 +267,11 @@ class ApplicableLawsMixin:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ Applicable laws name edit emitted workspace={}",
+                    "Applicable laws name edit emitted workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
+            if outcome is not None:
+                outcome["status"] = "applied"
             return True
         except Exception as e:
             logger.warning("Applicable laws name edit failed: {}", e)
@@ -281,6 +349,40 @@ class ApplicableLawsMixin:
         # Final safety net: never surface the application's own brand/platform
         # name in any law row (central chokepoint for the applicable_laws path).
         return scrub_app_brand({"laws": normalized})
+
+    @staticmethod
+    def _link_laws_to_sources(
+        payload: Dict[str, Any], search_results: List[Dict[str, str]]
+    ) -> None:
+        """Give each law row its Indian Kanoon link and a register status.
+
+        The model reads numbered search results but returns rows without
+        their URLs, so the link was lost. A row is linked to a result whose
+        title names the same section number and shares a word of the act
+        name — a deterministic match, never a guess. ``registerStatus`` comes
+        from the statutory register (see app/statutes/register.py): verified,
+        invalid (section beyond the Act's range), or unverified.
+        """
+        from app.statutes.register import annotate_law_rows, section_number
+
+        for row in (payload or {}).get("laws") or []:
+            if not isinstance(row, dict):
+                continue
+            act = str(row.get("act") or "")
+            num = section_number(str(row.get("section") or ""))
+            act_words = {w for w in re.findall(r"[a-z]{4,}", act.lower())} - {"code", "act", "section"}
+            for res in search_results or []:
+                title = str(res.get("title") or "")
+                url = str(res.get("url") or "")
+                if not url or not num:
+                    continue
+                if re.search(rf"\b{re.escape(num)}\b", title, re.I) and (
+                    not act_words or any(w in title.lower() for w in act_words)
+                ):
+                    row["sourceUrl"] = url
+                    row["sourceTitle"] = title
+                    break
+        annotate_law_rows(payload)
 
     def _heuristic_applicable_laws_fallback(
         self, evidence_snippet: str
@@ -543,6 +645,9 @@ class ApplicableLawsMixin:
             else ""
         )
         prompt = generate_applicable_laws_from_sources_prompt(objective_block=objective_block, self=self, signals=signals, source_blob=source_blob, targeted_acts_block=targeted_acts_block, targeted_acts_count=targeted_acts_count, workspace_id=workspace_id, workspace_role=workspace_role)
+        # Authoritative user corrections lead the prompt so they outrank
+        # the document content they contradict.
+        prompt = self._with_user_facts(workspace_id, prompt)
         raw = await gemini_client.generate(
             prompt=prompt,
             system_instruction=get_structured_document_feature_system_instruction(
@@ -552,7 +657,7 @@ class ApplicableLawsMixin:
             max_tokens=12000,
             response_mime_type="application/json",
         )
-        logger.info("Applicable laws: raw LLM response preview={}", (raw or "")[:500])
+        logger.info("Applicable laws: raw LLM response preview={}", chars(raw))
         text = self._prepare_json_candidate(raw or "", prefer="object") or ""
         parsed: Dict[str, Any] = {"laws": []}
         try:
@@ -571,10 +676,12 @@ class ApplicableLawsMixin:
                 parsed = {"laws": []}
 
         normalized = self._normalize_applicable_laws_payload(parsed)
+        self._link_laws_to_sources(normalized, search_results)
+        _statuses = [str(r.get("registerStatus")) for r in normalized.get("laws", []) if isinstance(r, dict)]
         logger.info(
-            "Applicable laws: final normalized payload from LLM count={} payload={}",
+            "Applicable laws: {} row(s) from the model, register status {}",
             len(normalized.get("laws", [])),
-            normalized,
+            {s: _statuses.count(s) for s in set(_statuses)},
         )
         if not normalized.get("laws"):
             heuristic = self._heuristic_applicable_laws_fallback(
@@ -643,6 +750,9 @@ class ApplicableLawsMixin:
             workspace_id[:12] if workspace_id else "",
         )
         signals = await self._extract_case_signals_from_documents(workspace_id, user_id)
+        graph_block = await self._graph_evidence_block("applicable_laws", workspace_id)
+        if graph_block:
+            signals["evidenceSnippet"] = (signals.get("evidenceSnippet") or "") + "\n\n" + graph_block
         # Bias the search query toward the new objective when provided, so a
         # perspective change actually changes which case-law is fetched.
         search_query = signals.get("query", "")
@@ -689,7 +799,7 @@ class ApplicableLawsMixin:
             usage=current_usage(),
         )
         logger.success(
-            "✅ Applicable laws sent to backend ({} laws)",
+            "Applicable laws sent to backend ({} laws)",
             len(payload.get("laws", [])),
         )
         await asyncio.sleep(0.1)

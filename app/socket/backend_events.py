@@ -217,6 +217,30 @@ class WorkspaceCreatedPayload(BaseModel):
     createdAt: str  # ISO date string
 
 
+class WorkspaceDeletedNotice(BaseModel):
+    """
+    Payload for workspace_deleted event (Server → AI_Maverick).
+
+    The backend's erasure cascade does not reach this service, so this event is
+    the explicit instruction to erase the AI-held copy of a deleted case.
+    ``purgeAfter`` is absolute and authoritative; ``purgeAfterDays`` is
+    informational. Re-sends under the same ``requestId`` are expected until
+    ``purgeAfter`` passes, because the backend emit is fire-and-forget.
+
+    Handled by ``WorkspacePurgeMixin``; the validated schema used at runtime is
+    ``app.socket.schemas.WorkspaceDeletedPayload``.
+    """
+
+    event: Optional[str] = None
+    workspaceId: str
+    userId: str
+    deletedAt: str
+    purgeAfter: str
+    purgeAfterDays: Optional[int] = None
+    reason: Optional[str] = None
+    requestId: Optional[str] = None
+
+
 class WorkspaceSyncPayload(BaseModel):
     """
     Payload for workspace_sync event (Server → AI_Maverick).
@@ -397,8 +421,13 @@ Connection Requirements:
   - Query parameter: token
   - Header: Authorization: Bearer <token>
 
-- AI_Maverick: Signature-based authentication
-  - Header: x-signature (HMAC-SHA256 signature of AI user JSON)
+- AI_Maverick: Replay-resistant signature authentication (scheme v1)
+  - Header: x-signature (HMAC-SHA256 over "v1:AI_Maverick:<ts>:<nonce>",
+    base64url, unpadded, 43 chars)
+  - Header: x-signature-timestamp (UTC Unix seconds, +/-300s window)
+  - Header: x-signature-nonce (32 lowercase hex chars, single-use)
+  - Fresh headers per connection attempt, reconnects included.
+    See app/socket/auth.py and docs/AI_SERVICE_AUTH_MIGRATION.md.
 
 Client Type:
 - Must be specified via query parameter or header: x-client-type

@@ -57,6 +57,11 @@ class CacheKinds:
     REMOVED_DOCUMENTS = "removed_documents"
     PROCEDURAL_TIMELINE = "procedural_timeline"
     CUSTOM_INSTRUCTIONS = "custom_instructions"
+    # Collaborator roster for a shared workspace, from workspace_sync's
+    # `participants`. Read on a cold workspace so an `askedBy` chat message
+    # arriving after a restart can still be resolved to a permission.
+    # Shape: [{"userId","name","permission"}, ...]
+    PARTICIPANTS = "participants"
     LIST_OF_DATES = "list_of_dates"
     WORKSPACE_METADATA_PAYLOAD = "workspace_metadata_payload"
     DOCUMENT_ASSESSMENTS = "document_assessments"
@@ -70,6 +75,24 @@ class CacheKinds:
     # added_missing_information, so the answered-by-upload resolution pass
     # never auto-removes them (only analysis_report_feedback can).
     USER_ADDED_MISSING_INFO = "user_added_missing_info"
+    # Per-workspace ledger of Missing Information items the lawyer re-worded via
+    # missing_information_edited, keyed by the item's id. A regeneration
+    # re-derives missingInfo from the documents, which still carry the old
+    # wording; tagging re-applies the lawyer's text through this ledger so the
+    # edit survives. Shape:
+    #   {itemId: {"text", "priorTexts": [str, ...], "editedAt", "requestId"}}
+    EDITED_MISSING_INFO = "edited_missing_info"
+    # Per-workspace ledger of FACTS the lawyer corrected in chat ("the disputed
+    # amount is 6 lakh USD, not 16 lakh"). Mirrors REMOVED_DOCUMENTS: a user
+    # decision that must survive regeneration. Without it, the next document
+    # upload regenerates every panel from the documents — which still state the
+    # old value — and silently reverts the correction. Read by every generator
+    # prompt (as an AUTHORITATIVE USER CORRECTIONS block) and enforced
+    # deterministically by _apply_fact_corrections_to_payload. One entry per
+    # corrected slot; a later correction of the same slot supersedes it. Shape:
+    #   [{"id","slot","description","was","now","superseded",
+    #     "assertedAt","source"}, ...]
+    USER_ASSERTED_FACTS = "user_asserted_facts"
     # Drafting Assistant — proactive suggested drafts panel (one entry per
     # workspace, regenerated on workspace_created / workspace_sync, re-emitted
     # on reconnect like analysis_report).
@@ -78,6 +101,21 @@ class CacheKinds:
     # previously-emitted, user-curated panel state used to tag regenerated items
     # as matched (carried over) vs new. See schemas.WorkspaceCurrentState.
     CURRENT_STATE = "current_state"
+    # Feature payloads that were GENERATED but never delivered, because the
+    # socket was down when the emit ran (SocketClient.emit skips silently). A
+    # panel loader is cleared only by the arrival of its
+    # document_feature_response, so an undelivered payload is a permanently
+    # stuck panel. Persisted, not just in-memory, because the disconnect that
+    # loses the emit is often the same event that restarts the process.
+    # Shape: {"<featureType>": {<document_feature_response envelope>}}
+    PENDING_FEATURE_DELIVERY = "pending_feature_delivery"
+    # An objective-change regeneration that was accepted but did not finish —
+    # cancelled with the socket turn, or timed out. There is no payload to
+    # re-deliver in that case, so the instruction itself is kept and re-run once
+    # on reconnect; otherwise the six loaders armed for it spin forever.
+    # Shape: {"userId","workspaceRole","instruction","featureTypes",
+    #         "attempts","startedAt"}
+    PENDING_OBJECTIVE_CHANGE = "pending_objective_change"
 
 
 # All workspace-scoped cache kinds we routinely read on hydrate.
@@ -91,14 +129,19 @@ WORKSPACE_HYDRATION_KINDS = (
     CacheKinds.REMOVED_DOCUMENTS,
     CacheKinds.PROCEDURAL_TIMELINE,
     CacheKinds.CUSTOM_INSTRUCTIONS,
+    CacheKinds.PARTICIPANTS,
     CacheKinds.LIST_OF_DATES,
     CacheKinds.WORKSPACE_METADATA_PAYLOAD,
     CacheKinds.DOCUMENT_ASSESSMENTS,
     CacheKinds.STRATEGY_PAYLOAD,
     CacheKinds.REJECTED_ANALYSIS_ITEMS,
     CacheKinds.USER_ADDED_MISSING_INFO,
+    CacheKinds.EDITED_MISSING_INFO,
+    CacheKinds.USER_ASSERTED_FACTS,
     CacheKinds.DRAFTING_SUGGESTIONS,
     CacheKinds.CURRENT_STATE,
+    CacheKinds.PENDING_FEATURE_DELIVERY,
+    CacheKinds.PENDING_OBJECTIVE_CHANGE,
 )
 
 
@@ -191,6 +234,47 @@ async def _preserve_token_usage(workspace_id: str, data: Any) -> Any:
     return data
 
 
+# ---------------------------------------------------------------------------
+# Purge suppression
+# ---------------------------------------------------------------------------
+# `persist_state` is fire-and-forget: the Qdrant upsert is scheduled and the
+# caller moves on. That is fine normally, but it races the compliance purge in
+# `workspace_deleted` — an upsert scheduled just before the purge can land just
+# after it, silently recreating a cache point for data we told the client was
+# erased. A deletion that half-works is worse than one that fails loudly.
+#
+# So a purged workspace is recorded here and every subsequent write for it is
+# dropped at the source. `allow_workspace_persistence` lifts the block when the
+# workspace legitimately comes back (a restore inside the grace window, or a
+# fresh workspace_sync after it) — see WorkspacePurgeMixin.
+_purge_blocked_workspaces: set = set()
+_purge_lock = threading.Lock()
+
+
+def block_workspace_persistence(workspace_id: str) -> None:
+    """Drop all future state writes for a workspace (called by the purge)."""
+    if not workspace_id:
+        return
+    with _purge_lock:
+        _purge_blocked_workspaces.add(str(workspace_id))
+
+
+def allow_workspace_persistence(workspace_id: str) -> None:
+    """Re-enable state writes for a workspace that has legitimately returned."""
+    if not workspace_id:
+        return
+    with _purge_lock:
+        _purge_blocked_workspaces.discard(str(workspace_id))
+
+
+def is_workspace_persistence_blocked(workspace_id: str) -> bool:
+    """True when a purge has disabled writes for this workspace."""
+    if not workspace_id:
+        return False
+    with _purge_lock:
+        return str(workspace_id) in _purge_blocked_workspaces
+
+
 def persist_state(
     workspace_id: str,
     kind: str,
@@ -202,6 +286,14 @@ def persist_state(
     if not workspace_id or not kind:
         return
     if data is None:
+        return
+    # Refuse to resurrect state for a purged workspace (see the note above).
+    if is_workspace_persistence_blocked(workspace_id):
+        logger.debug(
+            "Dropping state write for purged workspace (workspace={}, kind={})",
+            workspace_id,
+            kind,
+        )
         return
 
     async def _do_persist():

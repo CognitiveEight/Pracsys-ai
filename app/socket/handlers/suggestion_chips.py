@@ -17,6 +17,8 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.utils.redact import chars
+
 from app.agents.role_models import RoleEnum
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
@@ -386,7 +388,7 @@ class SuggestionChipsMixin:
             "Drafting chips: generated {} for workspace={} actionable={} status={}",
             len(chips),
             (workspace_id or "")[:12],
-            (actionable_id or "")[:24],
+            (actionable_id or "")[:12],
             status,
         )
         return chips
@@ -518,14 +520,14 @@ class SuggestionChipsMixin:
             if raw.startswith("Error") or "Error generating" in (raw[:80] or ""):
                 logger.warning(
                     "Analysis report chips: Gemini error response; using fallback. raw preview={}",
-                    raw[:120],
+                    chars(raw),
                 )
                 return self._fallback_chips_for_analysis_report(16)
             start = raw.find("[")
             if start < 0:
                 logger.warning(
                     "Analysis report chips: no '[' found in raw response; falling back. raw preview={}",
-                    raw[:200],
+                    chars(raw),
                 )
                 # Salvage any double-quoted strings as a last resort before full fallback
                 import re as _re
@@ -556,7 +558,7 @@ class SuggestionChipsMixin:
                         "Analysis report chips: could not find matching ']' (start={}, end={}); raw preview={}",
                         start,
                         end,
-                        raw[:200],
+                        chars(raw),
                     )
                     # Try salvage from quoted strings
                     import re as _re
@@ -575,9 +577,9 @@ class SuggestionChipsMixin:
                         arr = json.loads(raw[start:end])
                     except json.JSONDecodeError as je:
                         logger.warning(
-                            "Analysis report chips: JSON decode failed; attempting salvage. error={}, raw segment preview={}",
+                            "Analysis report chips: JSON decode failed; attempting salvage. error={}, raw segment={}",
                             je,
-                            raw[start : start + 200],
+                            chars(raw[start:end]),
                         )
                         import re as _re
 

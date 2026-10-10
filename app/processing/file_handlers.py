@@ -8,7 +8,7 @@ import re
 import subprocess
 import tempfile
 from io import BytesIO
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -18,6 +18,11 @@ from loguru import logger
 # ``_strip_repeated_pdf_boilerplate`` so the publisher header/footer never
 # dominates extracted content (which previously caused image-only judgments to
 # skip OCR and be rejected as "repetitive headers").
+# Minimum length for a repeated line to be treated as a running header/footer.
+# Below this, a recurring line is far more likely to be a body word emitted on
+# its own line by the PDF text layer than a header. See _has_header_substance.
+_MIN_BOILERPLATE_LINE_CHARS = 12
+
 _PDF_BOILERPLATE_PATTERNS = [
     re.compile(r"scc\s*online", re.I),
     re.compile(r"trueprint", re.I),
@@ -37,7 +42,12 @@ _PDF_BOILERPLATE_PATTERNS = [
 ]
 
 
-def _strip_repeated_pdf_boilerplate(page_texts: List[str]) -> str:
+def _strip_repeated_pdf_boilerplate(
+    page_texts: List[str],
+    *,
+    page_numbers: Optional[List[int]] = None,
+    mark_pages: bool = False,
+) -> str:
     """Remove per-page publisher header/footer boilerplate from extracted PDF text.
 
     Two signals, combined:
@@ -72,21 +82,77 @@ def _strip_repeated_pdf_boilerplate(page_texts: List[str]) -> str:
 
     repeat_threshold = max(3, int(0.4 * num_pages))
 
+    def _has_header_substance(norm: str) -> bool:
+        """Could this line plausibly BE a running header/footer?
+
+        The cross-page-repetition signal assumes a line is a whole header or
+        footer. That assumption collapses when the PDF's text layer comes out
+        one word per line — which PyPDF2 does for many documents. Ordinary
+        function words ("the", "and", "of", "to", "is") then recur on every
+        page and get deleted as boilerplate, silently gutting the body text:
+        "our mission is to improve the effectiveness and sophistication of
+        partnership" became "our mission improve effectiveness sophistication
+        partnership". The model is then left to reconstruct the missing
+        connective tissue, which is where invented facts come from.
+
+        A genuine running header carries substance — a publisher name, a case
+        citation, a page marker. Require that before the repetition signal may
+        fire. Known watermark patterns are matched separately and are not
+        subject to this guard.
+        """
+        # A SINGLE word is never a running header, however long: with one
+        # word per line, "verification" (12 chars) recurring on 3 of 4 pages
+        # was deleted, turning "BCCI Age Verification Committee" into
+        # "BCCI Age Committee" in every panel. Publisher one-word marks
+        # ("Manupatra") are caught by _PDF_BOILERPLATE_PATTERNS instead.
+        words = len(norm.split())
+        return words >= 3 or (words >= 2 and len(norm) >= _MIN_BOILERPLATE_LINE_CHARS)
+
     def _is_boilerplate(raw_line: str) -> bool:
         norm = _norm(raw_line)
         if not norm:
             return False
-        if line_page_count.get(norm, 0) >= repeat_threshold:
+        if (
+            line_page_count.get(norm, 0) >= repeat_threshold
+            and _has_header_substance(norm)
+        ):
             return True
         return any(pat.search(raw_line) for pat in _PDF_BOILERPLATE_PATTERNS)
 
     cleaned_pages: List[str] = []
-    for page in pages:
+    marked_pages: List[str] = []
+    for pos, page in enumerate(pages):
         kept = [ln for ln in page.splitlines() if not _is_boilerplate(ln)]
         page_body = "\n".join(kept).strip()
         if page_body:
             cleaned_pages.append(page_body)
-    return "\n".join(cleaned_pages).strip()
+            number = (
+                page_numbers[pos]
+                if page_numbers and pos < len(page_numbers)
+                else pos + 1
+            )
+            marked_pages.append(f"--- Page {number} ---\n{page_body}")
+    cleaned = "\n".join(cleaned_pages).strip()
+
+    # A header/footer strip should shave a few percent. Much more than that
+    # means the repetition heuristic is eating body text, which corrupts every
+    # downstream prompt — surface it instead of failing silently.
+    original_len = sum(len(p) for p in pages)
+    if original_len and (original_len - len(cleaned)) / original_len > 0.25:
+        logger.warning(
+            "PDF boilerplate strip removed {:.0f}% of the text layer ({} -> {} "
+            "chars over {} pages) — the repetition heuristic may be eating body "
+            "text; check the PDF's text layer",
+            100 * (original_len - len(cleaned)) / original_len,
+            original_len,
+            len(cleaned),
+            num_pages,
+        )
+    if mark_pages:
+        # Physical page numbers, so a citation can say "page 7" and be right.
+        # Blank pages are skipped but keep their numbering.
+        return "\n\n".join(marked_pages).strip()
+    return cleaned
 
 try:
     from google.auth.exceptions import DefaultCredentialsError
@@ -141,10 +207,121 @@ except ImportError:
     DOC_AVAILABLE = False
     logger.warning("docx2txt not available")
 
+try:
+    import openpyxl
+
+    XLSX_AVAILABLE = True
+except ImportError:
+    XLSX_AVAILABLE = False
+    logger.warning("openpyxl not available")
+
+try:
+    from pptx import Presentation
+
+    PPTX_AVAILABLE = True
+except ImportError:
+    PPTX_AVAILABLE = False
+    logger.warning("python-pptx not available")
+
 
 AUDIO_EXTENSIONS = (
     ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".opus", ".webm", ".aac",
 )
+
+XLSX_EXTENSIONS = (".xlsx", ".xlsm")
+PPTX_EXTENSIONS = (".pptx",)
+# Legacy binary Office formats. Without a dedicated parser these used to fall
+# into the OLE2 sniff and come out of the DOC extractor as raw-byte noise; they
+# are now rejected explicitly so the readability score reports a failure.
+LEGACY_OFFICE_EXTENSIONS = (".xls", ".ppt")
+_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp")
+#: Every extension routed by name in ``process_file_by_extension``; anything
+#: else is identified from its content.
+KNOWN_EXTENSIONS = frozenset(
+    AUDIO_EXTENSIONS + XLSX_EXTENSIONS + PPTX_EXTENSIONS + LEGACY_OFFICE_EXTENSIONS
+    + _IMAGE_EXTENSIONS + (".pdf", ".docx", ".doc", ".txt", ".md", ".markdown")
+)
+
+# PDF OCR: DPI for pages that are rendered (not sent as their own photo),
+# and how many pages are OCR'd at once.
+OCR_RENDER_DPI = 200
+OCR_PAGE_WORKERS = 4
+
+
+def _add_ocr_page_notes(text: str, failed: List[int], low: Dict[int, float]) -> str:
+    """Mark pages OCR could not read, or read with low confidence, inside
+    page-marked text, so a reader (and every prompt) knows which pages to
+    distrust. Failed pages keep their marker, in page order."""
+    for number, confidence in low.items():
+        note = (
+            f"[OCR note: this page was read with low confidence ({round(confidence * 100)}%). "
+            "Handwriting or image quality may have caused misread words or figures; "
+            "check the original page before relying on exact wording.]"
+        )
+        text = re.sub(
+            rf"^--- Page {number} ---$",
+            lambda m: f"{m.group(0)}\n{note}",
+            text,
+            count=1,
+            flags=re.M,
+        )
+    for number in sorted(failed):
+        block = (
+            f"--- Page {number} ---\n[OCR note: this page could not be read. Its content "
+            "is missing from this text; check the original page.]"
+        )
+        later = [
+            m for m in re.finditer(r"^--- Page (\d+) ---$", text, flags=re.M)
+            if int(m.group(1)) > number
+        ]
+        if later:
+            at = later[0].start()
+            text = text[:at] + block + "\n\n" + text[at:]
+        else:
+            text = text.rstrip() + "\n\n" + block
+    return text
+
+
+# A slide with less text than this of its own has its pictures OCR'd (it is
+# most likely a scanned page pasted onto a slide). The cap bounds Vision spend
+# on a photo-heavy deck; each OCR'd picture is billed as one ocrUnit.
+PPTX_OCR_TEXT_THRESHOLD = 20
+PPTX_MAX_OCR_IMAGES = 50
+
+
+def filename_for_extraction(name: Optional[str], extension: Optional[str]) -> str:
+    """Return ``name`` with ``extension`` appended when it is missing.
+
+    The backend's display ``filename`` ("annexure-3-age-verification-test-results")
+    carries no suffix; the ``extension`` field is the only type signal. Use the
+    result for ROUTING only (``process_file_by_extension``, ``is_audio_file``)
+    and keep the original name for storage and display.
+    """
+    name = (name or "").strip()
+    ext = (extension or "").strip().lstrip(".").lower()
+    if ext and not name.lower().endswith("." + ext):
+        return f"{name}.{ext}"
+    return name
+
+
+def _zip_office_kind(data: bytes) -> str:
+    """Identify a ZIP-based Office file by its parts: ``xlsx``/``pptx``/``docx``.
+
+    Falls back to ``docx``, which is what every ``PK`` payload was treated as
+    before spreadsheets and decks were supported.
+    """
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as zf:
+            names = set(zf.namelist())
+    except (zipfile.BadZipFile, ValueError):
+        return "docx"
+    if "xl/workbook.xml" in names:
+        return "xlsx"
+    if "ppt/presentation.xml" in names:
+        return "pptx"
+    return "docx"
 
 
 class FileProcessor:
@@ -168,67 +345,52 @@ class FileProcessor:
         return filename.lower().endswith(AUDIO_EXTENSIONS)
 
     @staticmethod
+    def is_spreadsheet(filename: str, data: bytes = b"") -> bool:
+        """True for an XLSX/XLSM workbook: by extension, or by content when the
+        name carries no recognised extension (the same sniff
+        ``process_file_by_extension`` falls back to)."""
+        name = (filename or "").lower()
+        if name.endswith(XLSX_EXTENSIONS):
+            return True
+        if os.path.splitext(name)[1] in KNOWN_EXTENSIONS:
+            return False
+        return bool(data) and data.startswith(b"PK") and _zip_office_kind(data) == "xlsx"
+
+    @staticmethod
     def extract_text_from_image(image_data: bytes) -> str:
-        """Extract text from image using GCP Vision API OCR."""
+        """Extract text from an image with Google Cloud Vision OCR.
+
+        Returns the text, or one of the bracketed sentinels callers test for
+        (``[No text detected in image]``, ``[Error extracting text from image:
+        …]``, ``[Image content - GCP Vision API not available]``). The engine
+        (mode, retry, billing) is ``app/processing/ocr.py``.
+        """
+        result = FileProcessor.ocr_image_result(image_data)
+        if result.ok:
+            logger.success("Extracted {} characters from image ({} mode)", len(result.text), result.mode)
+            return result.text
+        if result.error and result.error.startswith("["):
+            logger.warning("OCR unavailable: {}", result.error)
+            return result.error
+        if result.error:
+            logger.error("Error extracting text from image: {}", result.error)
+            return f"[Error extracting text from image: {result.error}]"
+        logger.warning("No text detected in image")
+        return "[No text detected in image]"
+
+    @staticmethod
+    def ocr_image_result(image_data: bytes):
+        """The full OCR result (text, mean word confidence, mode) for an image."""
+        from app.processing.ocr import OcrResult, ocr_image
+
         if not GCP_OCR_AVAILABLE:
-            logger.warning(
-                "GCP Vision API not available. Cannot extract text from image."
-            )
-            return "[Image content - GCP Vision API not available]"
-
-        try:
-            import os
-
-            from google.auth.api_key import Credentials as ApiKeyCredentials
-
-            from app.ai.usage import record_ocr_units
-            from app.core.config import settings
-
-            # Vision OCR uses API key only (no service-account credentials).
-            api_key_value = (
-                (getattr(settings, "google_cloud_vision_api_key", None) or "")
-                or os.getenv("GOOGLE_CLOUD_VISION_API_KEY")
-                or ""
-            ).strip()
-            if not api_key_value:
-                logger.error(
-                    "Google Vision API key not configured. Set GOOGLE_CLOUD_VISION_API_KEY."
-                )
-                return "[Error: Vision API key not configured (set GOOGLE_CLOUD_VISION_API_KEY)]"
-
-            api_credentials = ApiKeyCredentials(api_key_value)
-            client = vision.ImageAnnotatorClient(credentials=api_credentials)
-
-            image = vision.Image(content=image_data)
-            response = client.text_detection(image=image)
-            # Cost: one billable Vision unit per call — recorded here, the single
-            # Vision call site, so every OCR path (per-PDF-page loop in
-            # _extract_text_from_pdf_with_ocr, standalone images, content-sniffed
-            # images) is counted exactly once. Recorded BEFORE the error check
-            # below because a response that carries an error was still billed.
-            record_ocr_units(1)
-            if response.error.message:
-                raise Exception(f"GCP Vision API error: {response.error.message}")
-
-            texts = response.text_annotations
-            if texts:
-                extracted_text = texts[0].description
-                logger.success(
-                    f"Extracted {len(extracted_text)} characters from image using API key"
-                )
-                return extracted_text.strip()
-
-            logger.warning("No text detected in image")
-            return "[No text detected in image]"
-
-        except Exception as e:
-            logger.error(f"Error extracting text from image: {str(e)}")
-            return f"[Error extracting text from image: {str(e)}]"
+            return OcrResult(error="[Image content - GCP Vision API not available]")
+        return ocr_image(image_data)
 
     # Service-account OCR auth helpers removed (API key only).
 
     @staticmethod
-    def extract_text_from_pdf(pdf_data: bytes) -> str:
+    def extract_text_from_pdf(pdf_data: bytes, mark_pages: bool = False) -> str:
         """Extract text from PDF file using text extraction and OCR for image-based PDFs."""
         if not PDF_AVAILABLE:
             logger.warning(
@@ -268,6 +430,11 @@ class FileProcessor:
                     len(scrubbed),
                     num_pages,
                 )
+                # The OCR decision above is made on the UNMARKED text: markers
+                # add ~15 chars per page and would tip a boilerplate-only
+                # document over the "real text" threshold.
+                if mark_pages:
+                    return _strip_repeated_pdf_boilerplate(page_texts, mark_pages=True)
                 return scrubbed
 
             # Boilerplate-dominated / image-based → OCR the page images.
@@ -278,7 +445,9 @@ class FileProcessor:
                     len(scrubbed),
                     num_pages,
                 )
-                return FileProcessor._extract_text_from_pdf_with_ocr(pdf_data)
+                return FileProcessor._extract_text_from_pdf_with_ocr(
+                    pdf_data, mark_pages=mark_pages
+                )
             else:
                 logger.warning(
                     "PDF appears to be image-based but pdf2image or GCP Vision API not available"
@@ -290,88 +459,135 @@ class FileProcessor:
                 )
 
         except Exception as e:
-            logger.error(f"Error extracting text from PDF: {str(e)}")
+            logger.error("Error extracting text from PDF: {}", str(e))
             return f"[Error extracting text from PDF: {str(e)}]"
 
     @staticmethod
-    def _extract_text_from_pdf_with_ocr(pdf_data: bytes) -> str:
-        """Extract text from image-based PDF using OCR."""
+    def _pdf_page_count(pdf_data: bytes) -> int:
+        """Pages as poppler sees them: the same engine that renders them."""
+        from pdf2image import pdfinfo_from_bytes
+
+        return int(pdfinfo_from_bytes(pdf_data).get("Pages") or 0)
+
+    @staticmethod
+    def _render_page_for_ocr(pdf_data: bytes, page_number: int, size_in: Optional[Tuple[float, float]]) -> Optional[bytes]:
+        """Render one page and encode it for Vision; None if poppler produced
+        nothing. DPI is lowered only for very large page sizes, so the render
+        stays under the pixel cap without touching PIL's global limits."""
+        from app.processing.ocr import MAX_IMAGE_PIXELS, prepare_image
+
+        dpi = OCR_RENDER_DPI
+        if size_in and size_in[0] > 0 and size_in[1] > 0:
+            dpi = int(min(dpi, (2 * MAX_IMAGE_PIXELS / (size_in[0] * size_in[1])) ** 0.5))
+        images = convert_from_bytes(pdf_data, dpi=max(dpi, 72), first_page=page_number, last_page=page_number)
+        if not images:
+            return None
+        return prepare_image(images[0])
+
+    @staticmethod
+    def _ocr_pdf_page(pdf_data: bytes, page_number: int, native_jpeg: Optional[bytes],
+                      size_in: Optional[Tuple[float, float]]):
+        """OCR one page: its own photo when usable, else a render. Never raises."""
+        from app.processing.ocr import OcrResult, jpeg_for_vision
+
+        source = "native"
+        payload = jpeg_for_vision(native_jpeg) if native_jpeg else None
         try:
-            resample = None
-            old_max_pixels = None
-            if PIL_AVAILABLE:
-                resample = Image.LANCZOS if hasattr(Image, "LANCZOS") else Image.BICUBIC
-                if hasattr(Image, "Resampling") and hasattr(
-                    Image.Resampling, "LANCZOS"
-                ):
-                    resample = Image.Resampling.LANCZOS
-                old_max_pixels = getattr(Image, "MAX_IMAGE_PIXELS", None)
-                if old_max_pixels is not None:
-                    Image.MAX_IMAGE_PIXELS = 200_000_000
+            if payload is None:
+                source = "render"
+                payload = FileProcessor._render_page_for_ocr(pdf_data, page_number, size_in)
+            if payload is None:
+                return page_number, source, OcrResult(error="page could not be rendered")
+            return page_number, source, FileProcessor.ocr_image_result(payload)
+        except Exception as err:
+            return page_number, source, OcrResult(error=str(err))
+
+    @staticmethod
+    def _extract_text_from_pdf_with_ocr(pdf_data: bytes, mark_pages: bool = False) -> str:
+        """Extract text from an image-based PDF using OCR, page by page.
+
+        Each page is OCR'd from its own embedded photo when the page is
+        provably nothing else (``app/processing/ocr.native_page_jpeg``), at
+        the scan's full resolution; any other page is rendered at
+        ``OCR_RENDER_DPI``. Pages run ``OCR_PAGE_WORKERS`` at a time, at most
+        twice that many in memory. A page Vision cannot read is retried, then
+        reported; with ``mark_pages`` it keeps its marker and a note saying it
+        could not be read, and a page read with low confidence gets a note too,
+        so a misread page is never presented as clean text.
+        """
+        import contextvars
+        from concurrent.futures import ThreadPoolExecutor
+
+        from app.processing.ocr import native_page_jpeg
+
+        try:
+            page_count = FileProcessor._pdf_page_count(pdf_data)
+            if page_count <= 0:
+                return "[No text could be extracted from PDF images]"
+            reader = None
             try:
-                # Convert at 150 DPI to reduce size (default 200 can exceed limits)
-                images = convert_from_bytes(pdf_data, dpi=150)
-            finally:
-                if PIL_AVAILABLE and old_max_pixels is not None:
-                    Image.MAX_IMAGE_PIXELS = old_max_pixels
+                reader = PyPDF2.PdfReader(BytesIO(pdf_data)) if PDF_AVAILABLE else None
+                if reader is not None and len(reader.pages) != page_count:
+                    reader = None  # disagreeing parsers: render every page
+            except Exception:
+                reader = None
 
-            extracted_texts = []
+            results = []
+            sources = {"native": 0, "render": 0}
+            with ThreadPoolExecutor(max_workers=OCR_PAGE_WORKERS) as pool:
+                pending = []
+                for number in range(1, page_count + 1):
+                    native, size_in = None, None
+                    if reader is not None:
+                        try:
+                            page = reader.pages[number - 1]
+                            size_in = (float(page.mediabox.width) / 72, float(page.mediabox.height) / 72)
+                            native = native_page_jpeg(page, reader)
+                        except Exception:
+                            native = None
+                    # Each worker runs in a copy of this context: the usage
+                    # scope (OCR billing) and log correlation ids carry over.
+                    ctx = contextvars.copy_context()
+                    pending.append(pool.submit(ctx.run, FileProcessor._ocr_pdf_page, pdf_data, number, native, size_in))
+                    if len(pending) >= OCR_PAGE_WORKERS * 2:
+                        results.append(pending.pop(0).result())
+                results.extend(f.result() for f in pending)
 
-            for i, image in enumerate(images):
-                logger.info(f"Processing PDF page {i+1}/{len(images)} with OCR")
-
-                # Resize if image exceeds safe pixel count (avoids GCP Vision "Bad image data")
-                if (
-                    PIL_AVAILABLE
-                    and resample is not None
-                    and getattr(image, "width", None)
-                    and getattr(image, "height", None)
-                ):
-                    w, h = image.width, image.height
-                    pixels = w * h
-                    if pixels > OCR_MAX_IMAGE_PIXELS:
-                        ratio = (OCR_MAX_IMAGE_PIXELS / pixels) ** 0.5
-                        new_w = max(1, int(w * ratio))
-                        new_h = max(1, int(h * ratio))
-                        image = image.resize((new_w, new_h), resample)
-                        logger.warning(
-                            "PDF page %s image too large (%s pixels); resized to %sx%s for OCR",
-                            i + 1,
-                            pixels,
-                            new_w,
-                            new_h,
-                        )
-
-                # Convert PIL image to bytes
-                img_byte_arr = BytesIO()
-                image.save(img_byte_arr, format="PNG")
-                img_bytes = img_byte_arr.getvalue()
-
-                # Extract text using GCP Vision API
-                page_text = FileProcessor.extract_text_from_image(img_bytes)
-
-                if (
-                    page_text
-                    and not page_text.startswith("[Error")
-                    and not page_text.startswith("[No text")
-                ):
-                    extracted_texts.append(page_text)
-
-            if extracted_texts:
-                # OCR also reads the publisher header/footer imprinted on each
-                # page image, so strip the repeated boilerplate here too.
-                full_text = _strip_repeated_pdf_boilerplate(extracted_texts)
-                if not full_text:
-                    full_text = "\n\n".join(extracted_texts)
-                logger.success(
-                    f"Extracted {len(full_text)} characters from PDF using OCR"
-                )
-                return full_text
-            else:
+            results.sort(key=lambda r: r[0])
+            texts, numbers, failed, low = [], [], [], {}
+            for number, source, result in results:
+                sources[source] = sources.get(source, 0) + 1
+                if result.ok:
+                    texts.append(result.text)
+                    numbers.append(number)
+                    if result.low_confidence:
+                        low[number] = result.confidence
+                else:
+                    failed.append(number)
+                    if result.error:
+                        logger.warning("OCR could not read PDF page {}: {}", number, result.error)
+            logger.info(
+                "PDF OCR: {} page(s), {} from the scan's own image, {} rendered, "
+                "{} unreadable, {} low-confidence",
+                page_count, sources.get("native", 0), sources.get("render", 0), len(failed), len(low),
+            )
+            if not texts:
                 return "[No text could be extracted from PDF images]"
 
+            # OCR also reads the publisher header/footer imprinted on each
+            # page image, so strip the repeated boilerplate here too.
+            full_text = _strip_repeated_pdf_boilerplate(texts, page_numbers=numbers, mark_pages=mark_pages)
+            if not full_text:
+                full_text = "\n\n".join(texts)
+            if mark_pages:
+                # Notes go in AFTER the boilerplate strip: identical notes on
+                # many pages would otherwise be removed as a running header.
+                full_text = _add_ocr_page_notes(full_text, failed, low)
+            logger.success("Extracted {} characters from PDF using OCR", len(full_text))
+            return full_text
+
         except Exception as e:
-            logger.error(f"Error extracting text from PDF with OCR: {str(e)}")
+            logger.error("Error extracting text from PDF with OCR: {}", str(e))
             return f"[Error extracting text from PDF with OCR: {str(e)}]"
 
     @staticmethod
@@ -394,11 +610,11 @@ class FileProcessor:
                 try:
                     text = docx2txt.process(temp_file_path)
                     if text and text.strip():
-                        logger.success(f"Extracted {len(text)} characters from DOC")
+                        logger.success("Extracted {} characters from DOC", len(text))
                         return text.strip()
                 except Exception as e:
                     logger.warning(
-                        f"docx2txt failed: {str(e)}, trying alternative method"
+                        "docx2txt failed: {}, trying alternative method", str(e)
                     )
 
                 # Fallback: try using antiword command if available
@@ -411,7 +627,7 @@ class FileProcessor:
                     )
                     if result.returncode == 0 and result.stdout.strip():
                         logger.success(
-                            f"Extracted {len(result.stdout)} characters from DOC using antiword"
+                            "Extracted {} characters from DOC using antiword", len(result.stdout)
                         )
                         return result.stdout.strip()
                 except (
@@ -454,12 +670,12 @@ class FileProcessor:
                             len(cleaned_text) > 10
                         ):  # Only return if we got substantial text
                             logger.success(
-                                f"Extracted {len(cleaned_text)} characters from DOC using raw extraction"
+                                "Extracted {} characters from DOC using raw extraction", len(cleaned_text)
                             )
                             return cleaned_text
 
                 except Exception as e:
-                    logger.warning(f"Raw text extraction failed: {str(e)}")
+                    logger.warning("Raw text extraction failed: {}", str(e))
 
                 return "[Could not extract text from DOC file - format may be corrupted or unsupported]"
 
@@ -471,7 +687,7 @@ class FileProcessor:
                     pass
 
         except Exception as e:
-            logger.error(f"Error extracting text from DOC: {str(e)}")
+            logger.error("Error extracting text from DOC: {}", str(e))
             return f"[Error extracting text from DOC: {str(e)}]"
 
     @staticmethod
@@ -508,10 +724,10 @@ class FileProcessor:
                 lines.append(f"{marker}{txt}" if marker else txt)
 
             text = "\n".join(lines)
-            logger.success(f"Extracted {len(text)} characters from DOCX")
+            logger.success("Extracted {} characters from DOCX", len(text))
             return text.strip()
         except Exception as e:
-            logger.error(f"Error extracting text from DOCX: {str(e)}")
+            logger.error("Error extracting text from DOCX: {}", str(e))
             return f"[Error extracting text from DOCX: {str(e)}]"
 
     @staticmethod
@@ -636,13 +852,193 @@ class FileProcessor:
         return f"{n}."
 
     @staticmethod
+    def extract_text_from_xlsx(xlsx_data: bytes) -> str:
+        """Extract text from an XLSX/XLSM workbook.
+
+        Parsing and rendering live in ``app/processing/tables.py``: a workbook
+        summary computed from every row, then the rows in blocks that each
+        restate the sheet, the row range and the header. Evidence ingestion
+        does not come through here; ``DocumentProcessor`` uses the parsed
+        tables directly so it can redact by column and store the rows. This
+        text-only path serves chat attachments and content-sniffed files.
+        """
+        if not XLSX_AVAILABLE:
+            logger.warning(
+                "XLSX processing library not available. Cannot extract text from XLSX."
+            )
+            return "[XLSX content - XLSX processing not available]"
+        try:
+            from app.processing.tables import extract_text
+
+            return extract_text(xlsx_data).strip()
+        except Exception as e:
+            logger.error("Error extracting text from XLSX: {}", str(e))
+            return f"[Error extracting text from XLSX: {str(e)}]"
+
+    @staticmethod
+    def _pptx_shape_lines(shape, lines: List[str], pictures: List[Any]) -> None:
+        """Append one shape's text to ``lines``, recursing into groups.
+
+        Picture shapes are collected into ``pictures`` for optional OCR.
+        """
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            for child in FileProcessor._pptx_reading_order(shape.shapes):
+                FileProcessor._pptx_shape_lines(child, lines, pictures)
+            return
+        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+            pictures.append(shape)
+            return
+        if getattr(shape, "has_table", False) and shape.has_table:
+            for row in shape.table.rows:
+                cells = [
+                    re.sub(r"\s+", " ", cell.text).strip() for cell in row.cells
+                ]
+                if any(cells):
+                    lines.append(" | ".join(cells))
+            return
+        if getattr(shape, "has_chart", False) and shape.has_chart:
+            FileProcessor._pptx_chart_lines(shape.chart, lines)
+            return
+        if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
+            # python-pptx renders a soft line break (<a:br>) as a vertical tab.
+            text = shape.text_frame.text.replace("\v", "\n").strip()
+            if text:
+                lines.append(text)
+
+    @staticmethod
+    def _pptx_chart_lines(chart, lines: List[str]) -> None:
+        """Append a chart's title and its data points as text.
+
+        A chart in a presentation is often the only place a figure appears,
+        so its numbers are extracted rather than dropped with the graphic.
+        """
+        try:
+            title = ""
+            if chart.has_title and chart.chart_title.has_text_frame:
+                title = chart.chart_title.text_frame.text.strip()
+            lines.append(f"Chart: {title}" if title else "Chart:")
+            for plot in chart.plots:
+                categories = [str(c) for c in plot.categories]
+                for series in plot.series:
+                    from app.processing.tables import make_cell
+
+                    values = [make_cell(v).display for v in series.values]
+                    if categories and len(categories) == len(values):
+                        points = ", ".join(
+                            f"{c} = {v}" for c, v in zip(categories, values)
+                        )
+                    else:
+                        points = ", ".join(values)
+                    lines.append(f"{series.name or 'Series'}: {points}")
+        except Exception as e:
+            # Chart XML varies a lot by producer; a chart that will not parse
+            # must not lose the rest of the slide.
+            logger.warning("Could not read chart data from PPTX: {}", str(e))
+
+    @staticmethod
+    def _pptx_reading_order(shapes) -> list:
+        """Order shapes top-to-bottom, then left-to-right.
+
+        ``slide.shapes`` is in z-order (the order they were drawn), which often
+        puts a caption before the body it belongs under.
+        """
+        return sorted(
+            shapes, key=lambda s: ((s.top or 0), (s.left or 0))
+        )
+
+    @staticmethod
+    def extract_text_from_pptx(pptx_data: bytes, mark_pages: bool = False) -> str:
+        """Extract text from a PPTX deck, slide by slide.
+
+        Each slide gives its title, then its text boxes, tables and chart data
+        in reading order, then its speaker notes. Hidden slides are included
+        and labelled. With ``mark_pages`` each slide is preceded by
+        ``--- Page N ---``, where N is the slide number. That is the page the
+        slide lands on when the deck is exported to PDF, so chunk page ranges
+        and citations point at the slide the lawyer sees.
+
+        A slide with almost no text of its own (a scanned page pasted in as a
+        picture, which is common for annexures) has its pictures OCR'd through
+        ``extract_text_from_image``, so OCR is metered there exactly as it is
+        for PDFs.
+        """
+        if not PPTX_AVAILABLE:
+            logger.warning(
+                "PPTX processing library not available. Cannot extract text from PPTX."
+            )
+            return "[PPTX content - PPTX processing not available]"
+
+        try:
+            deck = Presentation(BytesIO(pptx_data))
+            output: List[str] = []
+            ocr_images = 0
+            for number, slide in enumerate(deck.slides, start=1):
+                title_shape = slide.shapes.title
+                title = (
+                    title_shape.text_frame.text.replace("\v", " ").strip()
+                    if title_shape is not None and title_shape.has_text_frame
+                    else ""
+                )
+                lines: List[str] = []
+                pictures: List[Any] = []
+                for shape in FileProcessor._pptx_reading_order(slide.shapes):
+                    if title_shape is not None and shape.shape_id == title_shape.shape_id:
+                        continue
+                    FileProcessor._pptx_shape_lines(shape, lines, pictures)
+
+                own_text = len(title) + sum(len(line) for line in lines)
+                if pictures and own_text < PPTX_OCR_TEXT_THRESHOLD:
+                    for picture in pictures:
+                        if ocr_images >= PPTX_MAX_OCR_IMAGES:
+                            break
+                        try:
+                            blob = picture.image.blob
+                        except Exception:
+                            continue  # linked, not embedded: nothing to read
+                        ocr_images += 1
+                        ocr_text = FileProcessor.extract_text_from_image(blob)
+                        if ocr_text and not ocr_text.startswith("["):
+                            lines.append(ocr_text.strip())
+
+                notes = ""
+                if slide.has_notes_slide:
+                    notes_frame = slide.notes_slide.notes_text_frame
+                    if notes_frame is not None:
+                        notes = notes_frame.text.replace("\v", "\n").strip()
+
+                heading = f"Slide {number}: {title}" if title else f"Slide {number}"
+                if slide._element.get("show") == "0":
+                    heading += " (hidden)"
+                parts = [heading, *lines]
+                if notes:
+                    parts.append(f"Speaker notes: {notes}")
+                # Same marker layout as the PDF path: marker, newline, body.
+                if mark_pages:
+                    parts.insert(0, f"--- Page {number} ---")
+                output.append("\n".join(parts))
+
+            text = "\n\n".join(output)
+            logger.success(
+                "Extracted {} characters from PPTX ({} slides, {} images OCR'd)",
+                len(text),
+                len(deck.slides),
+                ocr_images,
+            )
+            return text.strip()
+        except Exception as e:
+            logger.error("Error extracting text from PPTX: {}", str(e))
+            return f"[Error extracting text from PPTX: {str(e)}]"
+
+    @staticmethod
     def extract_text_from_txt(txt_data: bytes) -> str:
         """Extract text from TXT file with encoding detection."""
         try:
             # Try UTF-8 first
             try:
                 text = txt_data.decode("utf-8")
-                logger.success(f"Extracted {len(text)} characters from TXT (UTF-8)")
+                logger.success("Extracted {} characters from TXT (UTF-8)", len(text))
                 return text.strip()
             except UnicodeDecodeError:
                 pass
@@ -652,7 +1048,7 @@ class FileProcessor:
                 try:
                     text = txt_data.decode(encoding)
                     logger.success(
-                        f"Extracted {len(text)} characters from TXT ({encoding})"
+                        "Extracted {} characters from TXT ({})", len(text), encoding
                     )
                     return text.strip()
                 except UnicodeDecodeError:
@@ -661,12 +1057,12 @@ class FileProcessor:
             # Last resort: decode with errors='ignore'
             text = txt_data.decode("utf-8", errors="ignore")
             logger.warning(
-                f"Extracted {len(text)} characters from TXT with encoding errors ignored"
+                "Extracted {} characters from TXT with encoding errors ignored", len(text)
             )
             return text.strip()
 
         except Exception as e:
-            logger.error(f"Error extracting text from TXT: {str(e)}")
+            logger.error("Error extracting text from TXT: {}", str(e))
             return f"[Error extracting text from TXT: {str(e)}]"
 
     @staticmethod
@@ -674,14 +1070,16 @@ class FileProcessor:
         """Extract text from Markdown file."""
         try:
             text = md_data.decode("utf-8", errors="ignore")
-            logger.success(f"Extracted {len(text)} characters from Markdown")
+            logger.success("Extracted {} characters from Markdown", len(text))
             return text.strip()
         except Exception as e:
-            logger.error(f"Error extracting text from Markdown: {str(e)}")
+            logger.error("Error extracting text from Markdown: {}", str(e))
             return f"[Error extracting text from Markdown: {str(e)}]"
 
     @staticmethod
-    def process_file_by_extension(file_data: bytes, filename: str) -> str:
+    def process_file_by_extension(
+        file_data: bytes, filename: str, mark_pages: bool = False
+    ) -> str:
         """
         Process file based on its extension.
 
@@ -703,45 +1101,73 @@ class FileProcessor:
             )
             return "[Audio file - transcription handled by document_processor]"
 
+        # Spreadsheets and decks. Checked before images: the image test below
+        # is a substring match, and a suffix is the stronger signal.
+        if filename_lower.endswith(XLSX_EXTENSIONS):
+            logger.info("Processing XLSX file: {}", filename)
+            return FileProcessor.extract_text_from_xlsx(file_data)
+
+        if filename_lower.endswith(PPTX_EXTENSIONS):
+            logger.info("Processing PPTX file: {}", filename)
+            return FileProcessor.extract_text_from_pptx(
+                file_data, mark_pages=mark_pages
+            )
+
+        if filename_lower.endswith(LEGACY_OFFICE_EXTENSIONS):
+            logger.warning("Unsupported legacy Office format: {}", filename)
+            return (
+                "[Unsupported file format - legacy .xls/.ppt files cannot be read; "
+                "re-save as .xlsx/.pptx]"
+            )
+
         # Image files
         if any(
             ext in filename_lower
             for ext in [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"]
         ):
-            logger.info(f"Processing image file: {filename}")
+            logger.info("Processing image file: {}", filename)
             return FileProcessor.extract_text_from_image(file_data)
 
         # PDF files
         elif filename_lower.endswith(".pdf"):
-            logger.info(f"Processing PDF file: {filename}")
-            return FileProcessor.extract_text_from_pdf(file_data)
+            logger.info("Processing PDF file: {}", filename)
+            return FileProcessor.extract_text_from_pdf(file_data, mark_pages=mark_pages)
 
         # DOCX files
         elif filename_lower.endswith(".docx"):
-            logger.info(f"Processing DOCX file: {filename}")
+            logger.info("Processing DOCX file: {}", filename)
             return FileProcessor.extract_text_from_docx(file_data)
 
         # DOC files
         elif filename_lower.endswith(".doc"):
-            logger.info(f"Processing DOC file: {filename}")
+            logger.info("Processing DOC file: {}", filename)
             return FileProcessor.extract_text_from_doc(file_data)
 
         # Text files
         elif filename_lower.endswith(".txt"):
-            logger.info(f"Processing TXT file: {filename}")
+            logger.info("Processing TXT file: {}", filename)
             return FileProcessor.extract_text_from_txt(file_data)
 
         # Markdown files
         elif filename_lower.endswith((".md", ".markdown")):
-            logger.info(f"Processing Markdown file: {filename}")
+            logger.info("Processing Markdown file: {}", filename)
             return FileProcessor.extract_text_from_md(file_data)
 
         # Try to detect by content
         else:
-            logger.info(f"Detecting file type by content for: {filename}")
+            logger.info("Detecting file type by content for: {}", filename)
             if file_data.startswith(b"%PDF"):
-                return FileProcessor.extract_text_from_pdf(file_data)
-            elif file_data.startswith(b"PK"):  # ZIP-based formats like DOCX
+                return FileProcessor.extract_text_from_pdf(
+                    file_data, mark_pages=mark_pages
+                )
+            elif file_data.startswith(b"PK"):  # ZIP-based Office: DOCX/XLSX/PPTX
+                kind = _zip_office_kind(file_data)
+                if kind == "xlsx":
+                    return FileProcessor.extract_text_from_xlsx(file_data)
+                if kind == "pptx":
+                    return FileProcessor.extract_text_from_pptx(
+                        file_data, mark_pages=mark_pages
+                    )
                 return FileProcessor.extract_text_from_docx(file_data)
             elif file_data.startswith(b"\xd0\xcf\x11\xe0"):  # OLE2 format (DOC files)
                 return FileProcessor.extract_text_from_doc(file_data)
@@ -751,7 +1177,7 @@ class FileProcessor:
                 return FileProcessor.extract_text_from_image(file_data)
             else:
                 # Assume it's a text file
-                logger.warning(f"Unknown file type, treating as text: {filename}")
+                logger.warning("Unknown file type, treating as text: {}", filename)
                 return FileProcessor.extract_text_from_txt(file_data)
 
 

@@ -69,6 +69,7 @@ from app.workspace.custom_instructions import (build_custom_instruction_suffix,
                                                hydrate_custom_instructions_from_cache,
                                                set_custom_instructions)
 from app.workspace.manager import workspace_manager
+from app.workspace.participants import hydrate_participants_from_cache
 from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
                                        hydrate_workspace_state, persist_state,
                                        restore_state)
@@ -120,6 +121,7 @@ class StateRolesMixin:
         workspace_id: str,
         *,
         user_id: Optional[str] = None,
+        recover: bool = True,
     ) -> None:
         """Repopulate in-memory per-workspace caches from Qdrant.
 
@@ -131,6 +133,21 @@ class StateRolesMixin:
         """
         if not workspace_id:
             return
+        # A restart loses the in-memory recovery markers, so the reconnect sweep
+        # in _recover_interrupted_work finds nothing. Hydration is the first
+        # moment we know this workspace exists again, so it is also where a
+        # payload that was generated-but-never-delivered gets picked up.
+        # ``recover=False`` is passed by the recovery path itself to avoid
+        # re-entering here.
+        if recover:
+            try:
+                await self._recover_workspace_after_hydrate(workspace_id, user_id)
+            except Exception as rec_err:
+                logger.debug(
+                    "Post-hydrate recovery skipped (workspace={}): {}",
+                    workspace_id,
+                    rec_err,
+                )
         try:
             # Workspace context (title, status, role, evidence files, metadata)
             from app.workspace.context import context_manager
@@ -202,8 +219,15 @@ class StateRolesMixin:
             CacheKinds.STRATEGY_PAYLOAD: self._workspace_strategy_payload,
             CacheKinds.REJECTED_ANALYSIS_ITEMS: self._workspace_rejected_analysis_items,
             CacheKinds.USER_ADDED_MISSING_INFO: self._workspace_user_added_missing_info,
+            CacheKinds.EDITED_MISSING_INFO: self._workspace_edited_missing_info,
+            CacheKinds.USER_ASSERTED_FACTS: self._workspace_user_facts,
             CacheKinds.DRAFTING_SUGGESTIONS: self._workspace_drafting_payload,
             CacheKinds.CURRENT_STATE: self._workspace_current_state_payload,
+            # Recovery state: an undelivered panel payload and an unfinished
+            # objective change must both survive a restart, since the
+            # disconnect that interrupted them is often what restarted us.
+            CacheKinds.PENDING_FEATURE_DELIVERY: self._pending_feature_deliveries,
+            CacheKinds.PENDING_OBJECTIVE_CHANGE: self._pending_objective_changes,
         }
         for kind, target in kind_to_dict.items():
             payload = cached_kinds.get(kind)
@@ -246,6 +270,17 @@ class StateRolesMixin:
         if isinstance(ci_payload, dict):
             try:
                 hydrate_custom_instructions_from_cache(workspace_id, ci_payload)
+            except Exception:
+                pass
+
+        # Collaborator roster (workspace sharing). Hydrated like custom
+        # instructions because it lives in a module-level dict, not in one of
+        # the handler's per-workspace caches above. Without it, a chat carrying
+        # askedBy after a restart would resolve against an empty roster.
+        participants_payload = cached_kinds.get(CacheKinds.PARTICIPANTS)
+        if participants_payload:
+            try:
+                hydrate_participants_from_cache(workspace_id, participants_payload)
             except Exception:
                 pass
 

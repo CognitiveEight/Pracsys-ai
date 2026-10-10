@@ -187,6 +187,11 @@ class ExtractionMixin:
         prompt = (
             extract_parties_subagent_prompt(combined_document_content=combined_document_content)
         )
+        # SPEAKER_LABEL_GUARDRAIL was imported here but never used, so the
+        # extractors ran without it and returned diarization placeholders
+        # ("Caller", "Receiver") as real entities — which the EXTRACTED
+        # FACTS block then authorised for every downstream prompt.
+        prompt = prompt + "\n\n" + SPEAKER_LABEL_GUARDRAIL
         return await self._run_extraction_subagent(
             workspace_id, prompt, "parties", ["parties"]
         )
@@ -200,6 +205,11 @@ class ExtractionMixin:
         prompt = (
             extract_timeline_subagent_prompt(combined_document_content=combined_document_content)
         )
+        # SPEAKER_LABEL_GUARDRAIL was imported here but never used, so the
+        # extractors ran without it and returned diarization placeholders
+        # ("Caller", "Receiver") as real entities — which the EXTRACTED
+        # FACTS block then authorised for every downstream prompt.
+        prompt = prompt + "\n\n" + SPEAKER_LABEL_GUARDRAIL
         return await self._run_extraction_subagent(
             workspace_id, prompt, "timeline", ["dates", "suit_numbers"]
         )
@@ -213,6 +223,11 @@ class ExtractionMixin:
         prompt = (
             extract_assets_and_law_subagent_prompt(combined_document_content=combined_document_content)
         )
+        # SPEAKER_LABEL_GUARDRAIL was imported here but never used, so the
+        # extractors ran without it and returned diarization placeholders
+        # ("Caller", "Receiver") as real entities — which the EXTRACTED
+        # FACTS block then authorised for every downstream prompt.
+        prompt = prompt + "\n\n" + SPEAKER_LABEL_GUARDRAIL
         return await self._run_extraction_subagent(
             workspace_id,
             prompt,
@@ -278,7 +293,7 @@ class ExtractionMixin:
             _cached = self._workspace_case_entities_cache.get(workspace_id)
             if _cached and _cached[0] == _content_hash:
                 logger.info(
-                    "🧠 case_entities cache HIT for workspace {} (skipping 3 sub-extractors)",
+                    "case_entities cache HIT for workspace {} (skipping 3 sub-extractors)",
                     workspace_id[:12],
                 )
                 return _cached[1]
@@ -306,21 +321,29 @@ class ExtractionMixin:
         merged = self._merge_case_entities(
             parties_result, timeline_result, assets_result
         )
+        # Deterministic backstop for the party exclusions the prompt asks for.
+        # These entities become the "EXTRACTED FACTS" block, which downstream
+        # prompts describe as "the ONLY organisations, authorities, bodies,
+        # parties and places you may name" — so anything that leaks here is not
+        # merely tolerated downstream, it is authorised and then propagated into
+        # the case summary, the objective and the analysis report as fact.
+        # Prompt compliance alone is not enough for that.
+        merged["parties"] = self._drop_non_party_entities(merged.get("parties"))
         # Per-sub-agent diagnostic logs so future thin-summary failures can be
         # traced to whichever sub-agent came back empty.
         logger.info(
-            "🔎 Strategy sub-extractor PARTIES: {} party/entity record(s) for workspace {}",
+            "Strategy sub-extractor PARTIES: {} party/entity record(s) for workspace {}",
             len(merged.get("parties") or []),
             workspace_id[:12] if workspace_id else "",
         )
         logger.info(
-            "🔎 Strategy sub-extractor TIMELINE: {} dated event(s), {} suit/case number(s) for workspace {}",
+            "Strategy sub-extractor TIMELINE: {} dated event(s), {} suit/case number(s) for workspace {}",
             len(merged.get("dates") or []),
             len(merged.get("suit_numbers") or []),
             workspace_id[:12] if workspace_id else "",
         )
         logger.info(
-            "🔎 Strategy sub-extractor ASSETS+LAW: {} property/ies, {} amount(s), {} statute(s), {} annexure(s) for workspace {}",
+            "Strategy sub-extractor ASSETS+LAW: {} property/ies, {} amount(s), {} statute(s), {} annexure(s) for workspace {}",
             len(merged.get("properties") or []),
             len(merged.get("amounts") or []),
             len(merged.get("statutes") or []),
@@ -332,6 +355,71 @@ class ExtractionMixin:
         if _content_hash and workspace_id:
             self._workspace_case_entities_cache[workspace_id] = (_content_hash, merged)
         return merged
+
+
+    # Diarization placeholders emitted by the audio transcription path. They are
+    # speaker slots, never names — see SPEAKER_LABEL_GUARDRAIL.
+    _SPEAKER_PLACEHOLDER_RE = re.compile(
+        r"^(?:caller|receiver|speaker\s*[a-z0-9]?|participant\s*\d*|"
+        r"person\s*[a-z0-9]?|unknown(?:\s+speaker)?|agent|customer)$",
+        re.IGNORECASE,
+    )
+    # Version-control roles from an uploaded policy/manual's own front or back
+    # matter ("Document Control", "Summary of Changes", "Approvals"). The person
+    # authored or signed off the DOCUMENT; they are not in the dispute.
+    _DOC_CONTROL_ROLE_RE = re.compile(
+        r"\b(?:author|owner|approved\s*by|approver|reviewed\s*(?:and\s*approved)?"
+        r"|reviewer|version\s*(?:number|date)|document\s*control|"
+        r"summary\s*of\s*changes|initial\s*draft|new\s*logo)\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _drop_non_party_entities(cls, parties: Any) -> List[Dict[str, Any]]:
+        """Remove extracted "parties" that are not parties to the matter.
+
+        Two families, both observed in production:
+
+        1. Diarization placeholders ("Caller", "Receiver", "Speaker A") from an
+           audio annexure, which then appeared in the case summary as though
+           they were named individuals.
+        2. Document-control metadata from a boilerplate annexure. An uploaded
+           Acceptable Use Policy carries an "Approvals" table; its Author,
+           Reviewer and "Approved By" names were extracted as case
+           participants and reported as "key individuals involved in the
+           communications and operations".
+
+        Returns the filtered list; logs what it dropped so the cause stays
+        visible rather than silently corrected.
+        """
+        if not isinstance(parties, list):
+            return []
+        kept: List[Dict[str, Any]] = []
+        dropped: List[str] = []
+        for entry in parties:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "").strip()
+            if not name:
+                continue
+            if cls._SPEAKER_PLACEHOLDER_RE.match(name):
+                dropped.append(f"{name} (speaker placeholder)")
+                continue
+            context = " ".join(
+                str(entry.get(k) or "")
+                for k in ("designation", "role_in_matter")
+            )
+            if cls._DOC_CONTROL_ROLE_RE.search(context):
+                dropped.append(f"{name} (document-control metadata)")
+                continue
+            kept.append(entry)
+        if dropped:
+            logger.info(
+                "Dropped {} non-party entity/ies from extraction: {}",
+                len(dropped),
+                "; ".join(dropped[:8]),
+            )
+        return kept
 
     @staticmethod
     def _verify_entities_in_summary(

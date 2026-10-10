@@ -300,6 +300,29 @@ class ReadabilityScorer:
 
         return min(score, 100.0)
 
+    #: Floor for a file whose text was read exactly from its structure (a
+    #: spreadsheet's cells), not recognised from an image.
+    LOSSLESS_FLOOR = 90.0
+
+    def apply_lossless_floor(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Raise the score of an exactly-parsed file to ``LOSSLESS_FLOOR``.
+
+        The scorer's heuristics estimate OCR quality from prose features
+        (sentences, paragraphs, word variety). A table of short numeric cells
+        has none of them, so a perfectly read 3-row sheet can score under 50,
+        and an unreadable score replaces the stored text with a low-content
+        marker, discarding every row. Nothing about a parsed spreadsheet is
+        uncertain, so its score says so. Callers apply this only when cells
+        were actually read.
+        """
+        out = dict(result)
+        if out.get("total_score", 0) < self.LOSSLESS_FLOOR:
+            out["total_score"] = self.LOSSLESS_FLOOR
+        out["readable"] = True
+        out["rating"] = self._get_rating(out["total_score"])
+        out["details"] = {**(out.get("details") or {}), "lossless_parse": True}
+        return out
+
     def _get_rating(self, score: float) -> str:
         """Get text rating based on score."""
         if score >= 90:

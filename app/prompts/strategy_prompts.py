@@ -9,7 +9,7 @@ __all__ = [
     "generate_strategies_from_documents_prompt4",
     "generate_strategies_from_documents_prompt5",
     "generate_strategies_from_documents_prompt6",
-    "regenerate_strategy_objective_preserving_case_summary_prompt",
+    "regenerate_strategy_for_new_objective_prompt",
     "reground_strategy_objective_prompt",
     "regenerate_case_summary_with_feedback_prompt",
     "regenerate_next_steps_with_feedback_prompt",
@@ -45,6 +45,8 @@ def role_to_party_resolution_block(workspace_role, *, confirmed_party=None):
     return (
 f"""ROLE -> NAMED-PARTY RESOLUTION (CRITICAL — do this BEFORE writing strategicObjective / possibleNextSteps / suggestionChips):
 - Your selected role is {workspace_role}. This is an ABSTRACT posture that MUST be bound to a SPECIFIC NAMED PARTY in this matter. It is NOT a generic label and is NOT automatically the company, promoter, builder, bank, authority, or the opponent.
+- Annexures marked [CITED INSTRUMENT] are standard-form policies and terms. Identify the role-holder from the documents that describe THIS dispute — correspondence, transcripts, pleadings, orders — and only then reconcile with the instruments. A cited instrument that a party uploaded as ITS OWN standard agreement does identify that party (e.g. a Terms of Service naming "The Service Provider — <Company>" uploaded by the claimant identifies the claimant's company); a cited instrument belonging to the COUNTERPARTY or the platform does NOT — its publisher, its "Client"/"Buyer" role placeholders and its document-control signatories are not the role-holder. When the evidence names a real actor in the dispute and an instrument names a company, prefer the entity the EVIDENCE supports; if they are the same commercial side, name the company.
+- ADVISERS ARE NOT PARTIES. A consultation transcript has at least two sides: the client describing the problem, and the lawyer/consultant assessing it. Whoever offers to send a team member, collect documents, produce a consultation report, opine on "the merit" or "the strength" of the case, or quote a fee IS THE LAWYER — never the client, never the {workspace_role}. Do not make the advising side the role-holder. If the client is a company represented in the conversation by an individual, name the COMPANY as the role-holder.
 - These documents may contain MULTIPLE, CONSOLIDATED proceedings (an original complaint/suit, appeals, revisions, execution). The SAME named person can be the complainant/petitioner in one proceeding and the respondent/appellant in another. Procedural roles INVERT on appeal: the party that WON below and DEFENDS the order is the RESPONDENT in the appeal, while the party that LOST and CHALLENGES it is the APPELLANT/PETITIONER. Do NOT inherit a party's role from the ORIGINAL/lower proceeding.
 - STEP 1 — Identify the DOMINANT / LIVE proceeding: the most recent, currently-pending matter (latest dated orders, still awaiting decision). That proceeding governs role assignment.
 - STEP 2 — Within that live proceeding, resolve which NAMED party occupies your role {workspace_role}: RESPONDENT / DEFENDANT = the party defending or opposing the live appeal / petition / execution; PETITIONER / APPELLANT / COMPLAINANT = the party who initiated the live challenge. For ADJUDICATOR / MEDIATOR there is NO represented party — stay neutral.
@@ -320,20 +322,74 @@ def generate_strategies_from_documents_prompt6(*, workspace_role):
     )
 
 
-def regenerate_strategy_objective_preserving_case_summary_prompt(*, SPEAKER_LABEL_GUARDRAIL, case_summary, combined_document_content, current_strategy, report_case_summary, role, user_objective_instruction, entities_block="{}", confirmed_party=None):
-    return (
-f"""You are a legal strategy analyst for Indian law.
+def regenerate_strategy_for_new_objective_prompt(*, SPEAKER_LABEL_GUARDRAIL, case_summary, combined_document_content, current_strategy, report_case_summary, role, user_objective_instruction, entities_block="{}", confirmed_party=None, refresh_case_summary=True):
+    """Regenerate the strategy panel for a NEWLY DECLARED objective.
 
-The following case summaries are FIXED. Do NOT change, paraphrase, or contradict them.
+    ``refresh_case_summary`` decides what happens to the two case summaries:
+
+    * ``True`` (the objective-change default) — they are RE-FRAMED to lead with
+      the facts the new objective makes decisive. Re-framing is emphasis and
+      ordering only: the facts themselves are fixed, and the caller enforces
+      that with a deterministic dropped-figure check.
+    * ``False`` — they are locked verbatim, the pre-existing behaviour, used
+      where the trigger changes who is advocated for rather than what is being
+      argued (role reassignment).
+    """
+    if refresh_case_summary:
+        summary_block = f"""The two case summaries below are the CURRENT text. You will RE-FRAME them for the new
+objective (see the RE-FRAME RULES) — you will NOT re-state the facts in them.
+
+CURRENT caseSummary (re-frame this; every fact in it must survive):
+{case_summary}
+
+CURRENT reportCaseSummary (apply the SAME re-frame; keep it neutral):
+{report_case_summary or "(same facts as case summary; neutral report narrative)"}
+"""
+    else:
+        summary_block = f"""The following case summaries are FIXED. Do NOT change, paraphrase, or contradict them.
 
 LOCKED caseSummary (verbatim context):
 {case_summary}
 
 LOCKED reportCaseSummary (verbatim context):
 {report_case_summary or "(same facts as case summary; neutral report narrative)"}
+"""
 
+    if refresh_case_summary:
+        summary_keys = """  "caseSummary": "the CURRENT caseSummary re-framed for the new objective; MUST start EXACTLY with 'This case is about...'; 10-20 sentences; EVERY named party, amount, date, suit/FIR number, property/document identifier and statute from the current text must still be present",
+  "reportCaseSummary": "the same re-frame applied to reportCaseSummary; MUST start EXACTLY with 'This matter is about...'; neutral expanded narrative; do NOT use the words Petitioner/Respondent/Client/Case/Adjudicator/Mediator",
+"""
+        summary_rules = """- RE-FRAME RULES for caseSummary / reportCaseSummary (CRITICAL — read as a whole):
+   (a) RE-FRAME MEANS EMPHASIS, NOT FACTS. Lead with the facts the new objective makes decisive, give them the detail the objective demands, and move what is now secondary later. That is the ONLY licence you have over these two fields.
+   (b) EVERY FACT SURVIVES. Every named party, exact amount (in the same notation), every date, every suit/FIR/case number, every property or document identifier, every named statute and every Annexure reference present in the CURRENT text MUST appear in your re-framed text. Dropping one is a failure, not a summary. If a fact no longer seems relevant, keep it anyway and simply place it later.
+   (c) NOTHING IS ADDED. Do not introduce a fact, party, figure, date or body that is not already in the CURRENT summaries or the document content. The new objective is a direction, not evidence.
+   (d) THE SUMMARY IS NOT THE OBJECTIVE. caseSummary states what happened; strategicObjective states what is now sought. Do not turn the summary into advocacy, do not write the objective's aims into it, and do not predict outcomes in it.
+   (e) IF NOTHING GENUINELY NEEDS RE-FRAMING for this objective, return the CURRENT text unchanged. An unnecessary rewrite is worse than no rewrite.
+"""
+    else:
+        summary_keys = ""
+        summary_rules = "- Do not restate or replace caseSummary/reportCaseSummary in the output.\n"
+
+    document_content_note = (
+        "ground truth for every fact; the case summaries above may be re-framed but never contradicted"
+        if refresh_case_summary
+        else "for fact consistency only; do not rewrite the case summaries"
+    )
+
+    return (
+f"""You are a legal strategy analyst for Indian law.
+
+{summary_block}
 **User's new strategic priority / instruction** (follow this as the primary constraint):
 {user_objective_instruction.strip()}
+
+VERBATIM RULE (CRITICAL): if the instruction above is ALREADY A DRAFTED STRATEGIC OBJECTIVE — i.e. it is
+several sentences of finished prose stating what the party seeks and how, rather than a short
+direction like "focus on quashing the FIR" — then the lawyer has written the objective themselves.
+REPRODUCE IT VERBATIM as "strategicObjective": same sentences, same order, same wording, same
+figures, same names. Do NOT paraphrase, summarise, re-order, shorten, expand, or "improve" it, and
+do NOT apply the length target below to it. Only then derive possibleNextSteps and suggestionChips
+from it. A lawyer who hands you finished drafting expects that drafting back, not a rewrite of it.
 
 Current strategic objective (to replace):
 {(current_strategy.get("strategicObjective") or "").strip()}
@@ -348,19 +404,18 @@ Current possible next steps (to replace):
 EXTRACTED FACTS (authoritative entities pulled from the documents — the ONLY organisations, authorities, bodies, parties, and places you may name):
 {entities_block}
 
-**Document content** (for fact consistency only; do not rewrite the case summaries):
+**Document content** ({document_content_note}):
 {combined_document_content}
 
 Return JSON ONLY with these keys:
 {{
-  "strategicObjective": "10-20 sentences, role-tailored for {role}, advocacy anchored to the specific named party who holds the role in the live/dominant proceeding (per ROLE -> NAMED-PARTY RESOLUTION above), aligned with the user's instruction and the case facts",
+{summary_keys}  "strategicObjective": "10-20 sentences, role-tailored for {role}, advocacy anchored to the specific named party who holds the role in the live/dominant proceeding (per ROLE -> NAMED-PARTY RESOLUTION above), aligned with the user's instruction and the case facts",
   "possibleNextSteps": ["3-5 concrete immediate actions; use Annexure N for uploads, never Document N"],
   "suggestionChips": ["15-16 short labels, 2-5 words each, actionable"]
 }}
 
 Rules:
-- Do not restate or replace caseSummary/reportCaseSummary in the output.
-- The new strategicObjective and possibleNextSteps MUST reflect the new user instruction and MUST NOT just repeat the current objective/steps.
+{summary_rules}- The new strategicObjective and possibleNextSteps MUST reflect the new user instruction and MUST NOT just repeat the CURRENT objective/steps shown above. (This does not conflict with the VERBATIM RULE: reproducing the user's OWN drafted objective is required; repeating the previous objective is not.)
 - BNS/BNSS/BSA naming (not IPC/CrPC/IEA where replaced).
 - GROUNDING (MANDATORY): Do NOT name any organisation, authority, board, association, committee, party, or place that does not appear in EXTRACTED FACTS or the document content above. Use only the real entities from this case — never introduce a new body or location to fit the instruction.
 - FORUM/VENUE instructions: when the user's instruction only names a place, court, or body (e.g. "file in Patna", "file to ICC"), treat it STRICTLY as a forum preference. Do NOT invent local organisations, offices, tournaments, or a local "leg"/branch of an event to match that place. Keep the actual parties and bodies named in the documents (e.g. a national board or a specific state association) — do NOT rename or relocate them.
@@ -369,6 +424,7 @@ Rules:
    (b) AUTHORITY / SUBJECT-MATTER — the named forum has no power to grant the requested relief for this kind of matter (e.g. an international or global body, a regulator, or a wrong-tier forum that does not adjudicate this domestic dispute). Name which forum actually has jurisdiction, and describe the ONLY realistic route to the requested forum if one exists (e.g. a representation citing breach of that body's guidelines, or an internal referral) — do NOT present it as a straightforward "filing" when it is not.
 - ALIGN next steps to the realistic route implied by the CONFLICT analysis. Do NOT silently revert possibleNextSteps to the previous forum's domestic steps while claiming to pursue the new forum — every step must be consistent with what is actually possible before the chosen forum.
 - No invented facts of any kind.
+- AMBIGUOUS FIGURES: when EXTRACTED FACTS marks an amount "ambiguous": true, the source states it unclearly (typically a speech-to-text disfluency). State it as the source does and name both readings once — e.g. "a pending amount stated in the recording as either 6 lakh or 16 lakh USD (to be confirmed)". Do NOT pick one silently, do NOT average them, and do NOT present them as a range the source never gave. Carry the same wording into possibleNextSteps so confirming the figure appears as an action.
 - {SPEAKER_LABEL_GUARDRAIL}
 - JSON only; complete strings and arrays."""
     )
@@ -804,12 +860,13 @@ def llm_classify_panel_edit_intent_prompt(*, msg, scoped_panel_rule):
     return (
 f"""You are a STRICT intent classifier for a legal-strategy workspace chat.
 
-The user is viewing a workspace with FIVE editable panels:
+The user is viewing a workspace with SIX editable panels:
 - CASE SUMMARY (caseSummary): a 10-20 sentence factual narrative of the case.
 - REPORT CASE SUMMARY (reportCaseSummary): the same facts rewritten as a neutral, expanded narrative for formal reports.
 - STRATEGIC OBJECTIVE (strategicObjective): the role-tailored strategic plan, 10-20 sentences.
 - POSSIBLE NEXT STEPS (possibleNextSteps): 3-5 immediate actionable bullets.
 - ANALYSIS REPORT (analysisReport): the case analysis — strengths, weaknesses, risks, missing information, and score explanations.
+- LIST OF DATES (listOfDates): the dated chronology of case events. Editable ONLY via Rule 12 (rename) or Rule 14 (fact correction) — never by a general line edit.
 
 Your job: decide whether the user is DIRECTLY asking to edit one or more of these panels, and split the user's instruction into per-panel chunks.
 
@@ -825,6 +882,12 @@ OUTPUT FORMAT (JSON ONLY):
   "analysisReport":     {{"shouldEdit": true | false, "instruction": "ONLY the per-panel edit text for the analysis report; empty when shouldEdit=false"}},
   "listOfDates":        {{"shouldEdit": true | false, "instruction": "set true ONLY for a NAME change / rename (Rule 12) so the person's name is replaced in the existing dated events; empty otherwise"}},
   "isRename":           true | false,
+  "isObjectiveDeclaration": true | false,
+  "objectiveDeclarationText": "the NEW strategic direction the user declared (Rule 4); empty otherwise",
+  "isFactCorrection":   true | false,
+  "factCorrections":    [{{"was": "the incorrect value as it currently appears, verbatim; empty string if the user did not state it",
+                          "now": "the corrected value, verbatim as the user gave it",
+                          "description": "what this value IS, in the user's own words (e.g. 'the disputed amount', 'the date of the FIR', 'the number of defendants')"}}],
   "isRoleReassignment": true | false,
   "reassignRole":       "the litigation role named by the user in a Rule 13 reassignment — one of PETITIONER / APPELLANT / COMPLAINANT / PLAINTIFF / RESPONDENT / DEFENDANT, or CLIENT when the user says 'we represent' / 'our client' / 'my client' without a role word; empty when isRoleReassignment=false",
   "reassignParty":      "the EXACT named party the user assigned to that role (verbatim, e.g. 'Pradeep Mehra'); empty when isRoleReassignment=false",
@@ -832,10 +895,11 @@ OUTPUT FORMAT (JSON ONLY):
 }}
 ("isRename" = true ONLY for a workspace-wide NAME change / rename / name-assignment per Rule 12; false for every other kind of edit.)
 ("isRoleReassignment" = true ONLY for a Rule 13 advocacy-role reassignment; when true, set "isRename" false and all six panel shouldEdit false — a dedicated flow re-orients the strategy.)
+("isFactCorrection" = true ONLY for a Rule 14 correction of a factual VALUE where the user SUPPLIES the corrected value; false otherwise. "factCorrections" MUST be non-empty whenever it is true.)
 
 DECISION RULES:
 
-1) QUESTIONS / EXPLANATIONS / GREETINGS → all four shouldEdit = false, isQuestionLike = true.
+1) QUESTIONS / EXPLANATIONS / GREETINGS → ALL SIX shouldEdit = false, isQuestionLike = true.
    Examples: "what laws apply?", "explain the case summary", "hi", "can you describe this?",
    "is X applicable?", "tell me about ...".
 
@@ -866,9 +930,12 @@ DECISION RULES:
    "the objective should be <direction>", "change/set/update the objective to <new direction>",
    "we want to pursue <direction>" (e.g. "objective is to focus on recovering ₹12,000 first",
    "change the objective to quashing the false FIR") — this is NOT a surgical panel edit.
-   Set strategicObjective.shouldEdit=FALSE and isQuestionLike=false. A separate objective-change
-   flow regenerates the whole strategy + analysis from the new objective; this classifier must
-   NOT claim it.
+   Set strategicObjective.shouldEdit=FALSE and isQuestionLike=false, AND set
+   "isObjectiveDeclaration": true with "objectiveDeclarationText" = the new direction the user
+   stated (their words, verbatim where possible). A separate objective-change flow regenerates
+   the whole strategy + analysis from it; this classifier must NOT claim it as a surgical edit,
+   but it MUST flag it — without the flag the declaration is silently dropped in any chat that
+   is not the Strategy & Objective panel.
    Set strategicObjective.shouldEdit=TRUE ONLY for a SURGICAL edit to the EXISTING objective TEXT —
    remove / delete / drop / rephrase / replace a specific sentence, phrase, or quoted text in the
    objective — or for a workspace-wide rename (see Rule 12).
@@ -897,7 +964,7 @@ DECISION RULES:
 
 7) `instruction` MUST be non-empty whenever shouldEdit=true. If you cannot extract a clean per-panel instruction with the targeted text, set shouldEdit=false for that panel instead of guessing.
 
-8) AMBIGUITY: if the user says "remove this" / "the response" / "that paragraph" without naming a panel, set ALL four shouldEdit=false. The chat agent will ask for clarification.
+8) AMBIGUITY: if the user says "remove this" / "the response" / "that paragraph" without naming a panel, set ALL SIX shouldEdit=false. The chat agent will ask for clarification.
 
 9) NEVER trigger an edit when the message is a question, even if a panel name appears.
    "Explain the objective" → strategicObjective.shouldEdit = false, isQuestionLike = true.
@@ -957,6 +1024,54 @@ DECISION RULES:
     party (gender/descriptor, e.g. "the female employee is heena") and only LABELS text. Rule 13
     reassigns a LITIGATION ROLE to a named party and changes WHOSE SIDE the advocacy is written
     for. When both could apply (a litigation-role word plus a name), Rule 13 wins.
+
+14) FACTUAL CORRECTION OF A VALUE (OVERRIDES RULES 4, 8, 11 AND 12 — BUT NOT RULE 13):
+    When the user CORRECTS a factual VALUE about the case AND SUPPLIES THE CORRECTED VALUE —
+    a monetary amount, a date, a quantity, a count, a case / FIR / section number, a place, a
+    duration — this is a FACT CORRECTION. The value can appear in ANY panel, so it is never
+    scoped to one panel, EVEN IF the user names a single panel or names none at all.
+    An imperative edit verb is NOT required.
+    Triggers:
+      - "the disputed amount is 6 lakh USD, not 16 lakh"
+      - "it's showing 16 lakh, it should be 6 lakh"
+      - "the FIR was filed on 12/03/2024, not 12/03/2023"
+      - "there are three defendants, not two"
+      - "update the entire intelligence panel — the disputed amount is 6 lakh USD"
+    Set "isFactCorrection": true and populate "factCorrections" with ONE ENTRY PER CORRECTED
+    VALUE. Set shouldEdit=true for ALL SIX panels — caseSummary, reportCaseSummary,
+    strategicObjective, possibleNextSteps, analysisReport AND listOfDates — and give EACH the
+    SAME instruction, in this form:
+      The <description> is <now>, NOT <was>. Correct this value wherever it appears in this
+      panel, including any figure written in words, in a different currency or numeric
+      notation, and any calculation that depends on it. Preserve every other word exactly;
+      change nothing else. If this panel does not mention the value at all, return it
+      UNCHANGED, byte for byte.
+    (Substitute the actual description / now / was. Preserve the user's exact spelling and units.)
+    Set "isRename": false and "isQuestionLike": false.
+
+    THE CORRECTED VALUE IS MANDATORY. If the user only says a value is WRONG without saying
+    what it SHOULD be, this is NOT a fact correction — it is Rule 10 fact discussion. Set
+    "isFactCorrection": false and all six shouldEdit=false. We never guess a replacement value.
+    Worked contrasts:
+      - "the amount in the invoice is not correct"          -> isFactCorrection=FALSE (no corrected value; Rule 10)
+      - "I think the pending amount looks too high"          -> isFactCorrection=FALSE (opinion, no value)
+      - "is the disputed amount 16 lakh or 6 lakh?"          -> isFactCorrection=FALSE (question; isQuestionLike=true)
+      - "the disputed amount is 6 lakh USD, not 16 lakh"     -> isFactCorrection=TRUE
+      - "the hearing is on 22.09.2026, not 02.09.2026"       -> isFactCorrection=TRUE
+
+    PRECEDENCE:
+    - Rule 13 WINS over Rule 14. "The respondent is Pradeep Mehra, not Rakesh" changes WHOSE
+      SIDE the advocacy is written for, which is a re-orientation, not a value substitution.
+    - Rule 14 WINS over Rule 12. A rename swaps a LABEL and the meaning is unchanged; a fact
+      correction changes a VALUE, and the reasoning that depends on it must follow. If the
+      user corrects a NAME and nothing else, prefer Rule 12. If the user corrects an amount,
+      date, count or other value, prefer Rule 14 — even when a name is also mentioned.
+    - Rule 4 WINS over Rule 14 when the user changes the strategic DIRECTION or GOAL — what
+      the case is trying to ACHIEVE ("objective is to focus on quashing the FIR"). Rule 14
+      WINS when the user states what is TRUE about the case. The test: is the user telling you
+      what is TRUE, or what they want to ACHIEVE?
+    - Rule 14 WINS over Rules 8 and 11: a fact correction is never ambiguous for lack of a
+      panel name, and is never scoped to the default panel.
 {scoped_panel_rule}
 Return JSON only — no markdown, no commentary."""
     )
@@ -979,7 +1094,9 @@ def llm_classify_panel_edit_intent_prompt2(*, _PANEL_LABELS, default_panel):
     )
 
 
-def panel_edit_ack_prompt(*, user_message, edits, updated_next_steps, is_rename):
+def panel_edit_ack_prompt(
+    *, user_message, edits, updated_next_steps, is_rename, unchanged=None, failed=None
+):
     """Confirmation message after a surgical panel edit was applied.
 
     edits: list of (panel_human_name, instruction) pairs that actually applied.
@@ -1002,6 +1119,27 @@ def panel_edit_ack_prompt(*, user_message, edits, updated_next_steps, is_rename)
         if is_rename
         else ""
     )
+    # Panels that were checked but genuinely did not contain the text the user
+    # named. This is a normal outcome for a workspace-wide edit, NOT a failure —
+    # say so plainly rather than silently implying they were updated.
+    unchanged_block = ""
+    if unchanged:
+        unchanged_block = (
+            "\nPANELS CHECKED THAT DID NOT CONTAIN THE TARGETED CONTENT (left as-is):\n"
+            + "\n".join(f"- {p}" for p in unchanged)
+            + "\nMention these in ONE short clause, phrased as information — e.g. "
+            '"no other panel referenced that figure" — NOT as a failure and NOT as '
+            "an apology.\n"
+        )
+    # Panels whose edit genuinely errored. The lawyer must know these are stale.
+    failed_block = ""
+    if failed:
+        failed_block = (
+            "\nPANELS THAT COULD NOT BE UPDATED (an error occurred):\n"
+            + "\n".join(f"- {p}" for p in failed)
+            + "\nState plainly that these were NOT updated and invite the lawyer to "
+            "retry. Do not speculate about why.\n"
+        )
     return (
 f"""You are the assistant in a legal-strategy workspace chat. The user asked for an edit, and it has ALREADY been applied to the panels — the updated panels are already visible to the user. Write the short chat confirmation.
 
@@ -1010,8 +1148,9 @@ USER'S EDIT REQUEST:
 
 EDITS THAT WERE APPLIED (panel: instruction):
 {edits_block}
-{next_steps_block}{rename_block}
+{next_steps_block}{rename_block}{unchanged_block}{failed_block}
 WRITE THE CONFIRMATION MESSAGE. RULES:
+- NEVER claim a panel was updated unless it appears under "EDITS THAT WERE APPLIED" above. Panels listed as not containing the content, or as not updated, MUST NOT be described as changed. This is the single most important rule.
 - Plain text only: no JSON, no markdown headings, no bullet lists.
 - 2 to 4 sentences.
 - State concretely WHAT was changed, briefly quoting or paraphrasing the removed/changed/added content (a short fragment is enough — never reproduce a whole panel).

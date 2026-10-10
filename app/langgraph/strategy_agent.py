@@ -80,7 +80,7 @@ class StrategyAgent:
     def __init__(self):
         self.graph: Optional[StateGraph] = None
         self.compiled_graph = None
-        logger.info("🎯 Strategy Agent initialized")
+        logger.info("Strategy Agent initialized")
 
     def _build_graph(self) -> StateGraph:
         """
@@ -92,7 +92,7 @@ class StrategyAgent:
         3. Validate Strategy → Check compatibility and constraints
         4. Lock Strategy → Activate and trigger downstream reconfiguration
         """
-        logger.info("🏗️ Building Strategy Agent graph...")
+        logger.info("Building Strategy Agent graph...")
 
         # Create graph with state schema
         graph = StateGraph(StrategyWorkflowState)
@@ -151,7 +151,7 @@ class StrategyAgent:
         # Lock Strategy → END (always terminal)
         graph.add_edge("lock_strategy", END)
 
-        logger.success("✅ Strategy Agent graph built")
+        logger.success("Strategy Agent graph built")
         return graph
 
     def compile(self) -> None:
@@ -159,9 +159,9 @@ class StrategyAgent:
         if not self.graph:
             self.graph = self._build_graph()
 
-        logger.info("⚙️ Compiling Strategy Agent graph...")
+        logger.info("Compiling Strategy Agent graph...")
         self.compiled_graph = self.graph.compile()
-        logger.success("✅ Strategy Agent graph compiled")
+        logger.success("Strategy Agent graph compiled")
 
     @tracer.trace("strategy_agent_suggest")
     def suggest_strategies(
@@ -188,7 +188,7 @@ class StrategyAgent:
         Raises:
             ValueError: If role_context is missing
         """
-        logger.info(f"🎯 Suggesting strategies for workspace: {workspace_id}")
+        logger.info("Suggesting strategies for workspace: {}", workspace_id)
 
         if not self.compiled_graph:
             self.compile()
@@ -205,7 +205,7 @@ class StrategyAgent:
         result = self.compiled_graph.invoke(initial_state)
 
         logger.success(
-            f"✅ Generated {len(result.get('suggested_strategies', []))} strategies"
+            "Generated {} strategies", len(result.get('suggested_strategies', []))
         )
 
         return {
@@ -238,7 +238,7 @@ class StrategyAgent:
         Returns:
             Dictionary with active_strategy and downstream_trigger
         """
-        logger.info(f"🔒 Selecting and locking strategy: {strategy_id}")
+        logger.info("Selecting and locking strategy: {}", strategy_id)
 
         if not self.compiled_graph:
             self.compile()
@@ -257,9 +257,9 @@ class StrategyAgent:
         result = self.compiled_graph.invoke(initial_state)
 
         if result.get("strategy_locked"):
-            logger.success(f"✅ Strategy locked: {strategy_id}")
+            logger.success("Strategy locked: {}", strategy_id)
         else:
-            logger.error(f"❌ Failed to lock strategy: {result.get('lock_error')}")
+            logger.error("Failed to lock strategy: {}", result.get('lock_error'))
 
         return {
             "workspace_id": workspace_id,
@@ -294,7 +294,7 @@ class StrategyAgent:
         Returns:
             Dictionary with active_strategy and downstream_trigger
         """
-        logger.info(f"🎯 Creating strategy from objective: {user_objective[:100]}...")
+        logger.info("Creating strategy from objective ({} chars)", len(user_objective or ""))
 
         if not self.compiled_graph:
             self.compile()
@@ -312,10 +312,10 @@ class StrategyAgent:
         result = self.compiled_graph.invoke(initial_state)
 
         if result.get("strategy_locked"):
-            logger.success(f"✅ Strategy created and locked from objective")
+            logger.success("Strategy created and locked from objective")
         else:
             logger.error(
-                f"❌ Failed to create strategy: {result.get('objective_mapping_error') or result.get('lock_error')}"
+                "Failed to create strategy: {}", result.get('objective_mapping_error') or result.get('lock_error')
             )
 
         return {
@@ -340,7 +340,7 @@ class StrategyAgent:
             Active StrategyOption or None
         """
         # In production, fetch from workspace state/database
-        logger.info(f"📋 Fetching active strategy for workspace: {workspace_id}")
+        logger.info("Fetching active strategy for workspace: {}", workspace_id)
         return None
 
     def change_strategy(
@@ -368,7 +368,7 @@ class StrategyAgent:
         Returns:
             Dictionary with updated active_strategy
         """
-        logger.info(f"🔄 Changing strategy: {old_strategy_id} → {new_strategy_id}")
+        logger.info("Changing strategy: {}  {}", old_strategy_id, new_strategy_id)
 
         # This uses the same select_and_lock logic
         result = self.select_and_lock_strategy(
@@ -381,7 +381,7 @@ class StrategyAgent:
 
         if result.get("active_strategy"):
             logger.success(
-                "✅ Strategy changed successfully, downstream reconfiguration triggered"
+                "Strategy changed successfully, downstream reconfiguration triggered"
             )
 
             # Log audit event

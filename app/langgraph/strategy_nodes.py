@@ -34,7 +34,7 @@ def strategy_suggestion_node(state: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Updated state with suggested_strategies
     """
-    logger.info("🧠 Strategy Suggestion: Analyzing workspace and generating options")
+    logger.info("Strategy Suggestion: Analyzing workspace and generating options")
 
     # Extract required inputs
     role_context = state.get("role_context")
@@ -44,7 +44,7 @@ def strategy_suggestion_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # Validate mandatory inputs
     if not role_context:
         error_msg = "Strategy Suggestion requires RoleContext from Role-Based Agent"
-        logger.error(f"❌ {error_msg}")
+        logger.error("{}", error_msg)
         raise ValueError(error_msg)
 
     role = (
@@ -53,13 +53,13 @@ def strategy_suggestion_node(state: Dict[str, Any]) -> Dict[str, Any]:
         else role_context.role
     )
 
-    logger.info(f"📋 Generating strategies for role: {role}")
+    logger.info("Generating strategies for role: {}", role)
 
     # Get compatible strategy types for this role
     compatible_strategies = ROLE_STRATEGY_COMPATIBILITY.get(role, [])
 
     if not compatible_strategies:
-        logger.warning(f"⚠️ No compatible strategies found for role: {role}")
+        logger.warning("No compatible strategies found for role: {}", role)
         return {
             **state,
             "suggested_strategies": [],
@@ -92,7 +92,7 @@ def strategy_suggestion_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # Take top 3
     top_suggestions = suggestions[:3]
 
-    logger.success(f"✅ Generated {len(top_suggestions)} strategy options")
+    logger.success("Generated {} strategy options", len(top_suggestions))
 
     # Log audit event
     audit_logger.log_event(
@@ -129,7 +129,7 @@ def user_objective_mapper_node(state: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Updated state with mapped_strategy or new_strategy
     """
-    logger.info("🎯 User Objective Mapper: Processing user objective")
+    logger.info("User Objective Mapper: Processing user objective")
 
     user_objective_text = state.get("user_objective_text")
     suggested_strategies = state.get("suggested_strategies", [])
@@ -137,7 +137,7 @@ def user_objective_mapper_node(state: Dict[str, Any]) -> Dict[str, Any]:
     workspace_id = state.get("workspace_id")
 
     if not user_objective_text:
-        logger.info("ℹ️ No user objective provided, skipping mapping")
+        logger.info("ℹ No user objective provided, skipping mapping")
         return {**state, "objective_mapping_skipped": True}
 
     # Create UserObjective object
@@ -152,7 +152,7 @@ def user_objective_mapper_node(state: Dict[str, Any]) -> Dict[str, Any]:
         else role_context.role
     )
 
-    logger.info(f"📝 Mapping objective: '{user_objective_text[:100]}...'")
+    logger.info("Mapping objective ({} chars)", len(user_objective_text or ""))
 
     # Try to map to existing strategy
     mapped_strategy = None
@@ -168,7 +168,7 @@ def user_objective_mapper_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     if mapped_strategy and mapping_confidence > 0.6:
         logger.success(
-            f"✅ Mapped to strategy: {mapped_strategy.strategy_id} (confidence: {mapping_confidence:.2f})"
+            "Mapped to strategy: {} (confidence: {:.2f})", mapped_strategy.strategy_id, mapping_confidence
         )
 
         return {
@@ -180,7 +180,7 @@ def user_objective_mapper_node(state: Dict[str, Any]) -> Dict[str, Any]:
         }
     else:
         # Generate new strategy from objective
-        logger.info("🆕 Generating new strategy from user objective")
+        logger.info("Generating new strategy from user objective")
 
         new_strategy = _derive_strategy_from_objective(
             user_objective, role, workspace_id, len(suggested_strategies) + 1
@@ -189,7 +189,7 @@ def user_objective_mapper_node(state: Dict[str, Any]) -> Dict[str, Any]:
         # Validate compatibility
         if not is_strategy_compatible_with_role(new_strategy.strategy_type, role):
             logger.warning(
-                f"⚠️ Derived strategy {new_strategy.strategy_type} incompatible with role {role}"
+                "Derived strategy {} incompatible with role {}", new_strategy.strategy_type, role
             )
 
             return {
@@ -202,7 +202,7 @@ def user_objective_mapper_node(state: Dict[str, Any]) -> Dict[str, Any]:
             }
 
         logger.success(
-            f"✅ Created new strategy from objective: {new_strategy.strategy_id}"
+            "Created new strategy from objective: {}", new_strategy.strategy_id
         )
 
         return {
@@ -229,7 +229,7 @@ def strategy_validation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Updated state with validation_result
     """
-    logger.info("✅ Strategy Validation: Checking strategy validity")
+    logger.info("Strategy Validation: Checking strategy validity")
 
     selected_strategy_id = state.get("selected_strategy_id")
     suggested_strategies = state.get("suggested_strategies", [])
@@ -251,7 +251,7 @@ def strategy_validation_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     if not strategy_to_validate:
         error_msg = f"Strategy {selected_strategy_id} not found for validation"
-        logger.error(f"❌ {error_msg}")
+        logger.error("{}", error_msg)
         return {
             **state,
             "validation_result": StrategyValidationResult(
@@ -266,7 +266,7 @@ def strategy_validation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     logger.info(
-        f"🔍 Validating strategy: {strategy_to_validate.strategy_id} ({strategy_to_validate.strategy_type})"
+        "Validating strategy: {} ({})", strategy_to_validate.strategy_id, strategy_to_validate.strategy_type
     )
 
     conflicts = []
@@ -314,10 +314,10 @@ def strategy_validation_node(state: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     if is_valid:
-        logger.success(f"✅ Strategy validated successfully")
+        logger.success("Strategy validated successfully")
         strategy_to_validate.status = StrategyStatus.VALIDATED
     else:
-        logger.error(f"❌ Strategy validation failed: {', '.join(conflicts)}")
+        logger.error("Strategy validation failed: {}", ', '.join(conflicts))
         strategy_to_validate.status = StrategyStatus.REJECTED
 
     # Log audit event
@@ -356,7 +356,7 @@ def strategy_lock_node(state: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Updated state with active_strategy and reanalysis_trigger
     """
-    logger.info("🔒 Strategy Lock: Activating strategy")
+    logger.info("Strategy Lock: Activating strategy")
 
     validated_strategy = state.get("validated_strategy")
     validation_result = state.get("validation_result")
@@ -364,25 +364,25 @@ def strategy_lock_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     if not validated_strategy:
         error_msg = "No validated strategy to lock"
-        logger.error(f"❌ {error_msg}")
+        logger.error("{}", error_msg)
         return {**state, "lock_error": error_msg}
 
     if not validation_result or not validation_result.is_valid:
         error_msg = "Cannot lock invalid strategy"
-        logger.error(f"❌ {error_msg}")
+        logger.error("{}", error_msg)
         return {**state, "lock_error": error_msg}
 
     # Supersede old strategy if exists
     old_strategy = state.get("active_strategy")
     if old_strategy:
         old_strategy.status = StrategyStatus.SUPERSEDED
-        logger.info(f"📝 Superseded previous strategy: {old_strategy.strategy_id}")
+        logger.info("Superseded previous strategy: {}", old_strategy.strategy_id)
 
     # Activate new strategy
     validated_strategy.status = StrategyStatus.ACTIVE
 
     logger.success(
-        f"✅ Strategy locked: {validated_strategy.strategy_id} - {validated_strategy.title}"
+        "Strategy locked: {} - {}", validated_strategy.strategy_id, validated_strategy.title
     )
 
     # Trigger downstream reconfiguration

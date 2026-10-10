@@ -229,7 +229,7 @@ class PanelEditsMixin:
                 usage=current_usage(),
             )
             logger.success(
-                "✅ add_case_law: appended {} case(s); panel now has {} (workspace={})",
+                "add_case_law: appended {} case(s); panel now has {} (workspace={})",
                 len(new_items),
                 len(merged.get("caseLaws", [])),
                 workspace_id,
@@ -299,9 +299,7 @@ class PanelEditsMixin:
             p["id"] = f"party_{i + 1}"
         self._workspace_relevant_parties_payload[workspace_id] = {"parties": parties}
         await self._emit_relevant_parties(workspace_id, user_id)
-        logger.success(
-            "✅ add_relevant_party: '{}' added ({} total)", name, len(parties)
-        )
+        logger.info("add_relevant_party: party added ({} total)", len(parties))
 
     async def on_edit_relevant_party(self, data: Dict[str, Any]) -> None:
         """Handle edit_relevant_party: update a party's fields by id."""
@@ -351,7 +349,7 @@ class PanelEditsMixin:
             return
         self._workspace_relevant_parties_payload[workspace_id] = {"parties": parties}
         await self._emit_relevant_parties(workspace_id, user_id)
-        logger.success("✅ edit_relevant_party: {} updated", party_id)
+        logger.success("edit_relevant_party: {} updated", party_id)
 
     async def on_delete_relevant_party(self, data: Dict[str, Any]) -> None:
         """Handle delete_relevant_party: remove a party by id and remember it."""
@@ -394,8 +392,4 @@ class PanelEditsMixin:
                 deleted.append(key)
             self._workspace_deleted_parties[workspace_id] = deleted
         await self._emit_relevant_parties(workspace_id, user_id)
-        logger.success(
-            "✅ delete_relevant_party: '{}' removed ({} remain)",
-            removed.get("name"),
-            len(parties),
-        )
+        logger.info("delete_relevant_party: party removed ({} remain)", len(parties))

@@ -243,6 +243,7 @@ class RelevantPartiesMixin:
         workspace_role: str,
         raw_parties: List[Dict[str, Any]],
         evidence_snippet: str,
+        workspace_id: str = "",
     ) -> Dict[str, Any]:
         """Classify already-extracted parties into the normalized role enum."""
         from app.ai.gemini_client import gemini_client
@@ -262,6 +263,9 @@ class RelevantPartiesMixin:
         parties_blob = "\n".join(listing)
 
         prompt = classify_relevant_parties_prompt(evidence_snippet=evidence_snippet, parties_blob=parties_blob, workspace_role=workspace_role)
+        # Authoritative user corrections lead the prompt so they outrank
+        # the document content they contradict.
+        prompt = self._with_user_facts(workspace_id, prompt)
         raw = await gemini_client.generate(
             prompt=prompt,
             system_instruction=get_structured_document_feature_system_instruction(
@@ -594,7 +598,7 @@ class RelevantPartiesMixin:
 
             if raw_all:
                 classified = await self._classify_relevant_parties(
-                    role, raw_all, evidence
+                    role, raw_all, evidence, workspace_id=workspace_id
                 )
                 for cp in classified.get("parties") or []:
                     if not isinstance(cp, dict):
@@ -636,7 +640,7 @@ class RelevantPartiesMixin:
             usage=current_usage(),
         )
         logger.success(
-            "✅ Relevant parties sent to backend ({} parties)",
+            "Relevant parties sent to backend ({} parties)",
             len(payload.get("parties", [])),
         )
         await asyncio.sleep(0.1)

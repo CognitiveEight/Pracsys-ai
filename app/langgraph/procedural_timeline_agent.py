@@ -36,6 +36,8 @@ from typing import Any, Dict, List, Optional, TypedDict
 from langgraph.graph import END, START, StateGraph
 from loguru import logger
 
+from app.utils.redact import chars
+
 from app.langgraph.list_of_dates_agent import snap_hallucinated_year
 from app.prompts.legal_intelligence_system import (
     APP_BRAND_EXCLUSION_DIRECTIVE,
@@ -60,49 +62,17 @@ def _is_safety_error(raw: str) -> bool:
 
 
 def _extract_filename_date_hint(doc_name: str) -> Optional[str]:
+    """Date in the file name with an explicit year, as YYYY-MM-DD, else None.
+
+    Delegates to app/utils/document_dates.py, which also strips the stored
+    upload prefix ("annexure-2-25_11_29_Letter_KCA.pdf") that the earlier
+    start-anchored parser never got past. Year-less names ("30 Nov") are not
+    used here: a deadline must never be computed from a guessed year.
     """
-    Detect YY-MM-DD / YY MM DD / YYMMDD / YYYY-MM-DD prefixes in filenames
-    commonly used for Indian legal documents (e.g. "26 03 13 Legal Notice...").
+    from app.utils.document_dates import date_from_document_name
 
-    Returns the date as YYYY-MM-DD if a plausible prefix is found, else None.
-    We assume 2-digit years in 00-49 are 20xx, 50-99 are 19xx.
-    """
-    if not doc_name:
-        return None
-
-    name = doc_name.strip()
-    # Strip any leading path separators
-    name = name.rsplit("/", 1)[-1]
-
-    # Use `(?=\D|$)` lookahead instead of `\b` so underscore/dot separators are
-    # treated as boundaries (Python regex word-boundary treats `_` as a word char).
-    patterns = [
-        # "2026-03-13 ..."  or  "2026_03_13 ..."  or  "2026.03.13 ..."
-        r"^(?P<y>20\d{2})[-_. ](?P<m>\d{1,2})[-_. ](?P<d>\d{1,2})(?=\D|$)",
-        # "26 03 13 ..."  or  "26-03-13 ..."  or  "26_03_13 ..."  or  "26.03.13 ..."
-        r"^(?P<y>\d{2})[-_. ](?P<m>\d{1,2})[-_. ](?P<d>\d{1,2})(?=\D|$)",
-        # "20260313" (compact 4-digit year) — check BEFORE 6-digit to avoid greedy match
-        r"^(?P<y>20\d{2})(?P<m>\d{2})(?P<d>\d{2})(?=\D|$)",
-        # "260313 ..." (compact 2-digit year)
-        r"^(?P<y>\d{2})(?P<m>\d{2})(?P<d>\d{2})(?=\D|$)",
-    ]
-
-    for pat in patterns:
-        m = re.match(pat, name)
-        if not m:
-            continue
-        try:
-            y = int(m.group("y"))
-            mo = int(m.group("m"))
-            d = int(m.group("d"))
-            if y < 100:
-                y = 2000 + y if y <= 49 else 1900 + y
-            if not (1900 <= y <= 2099 and 1 <= mo <= 12 and 1 <= d <= 31):
-                continue
-            return datetime(y, mo, d).strftime("%Y-%m-%d")
-        except Exception:
-            continue
-    return None
+    found = date_from_document_name(doc_name)
+    return found[0] if found and found[1] else None
 
 
 def _sanitize_content(text: str, max_chars: int = 15000) -> str:
@@ -401,7 +371,7 @@ class ProceduralTimelineAgent:
         filename_date_hint = _extract_filename_date_hint(doc_name)
         if filename_date_hint:
             logger.info(
-                "Procedural timeline: filename date hint doc='{}' → {}",
+                "Procedural timeline: filename date hint doc='{}'  {}",
                 doc_name, filename_date_hint,
             )
 
@@ -434,7 +404,7 @@ class ProceduralTimelineAgent:
             logger.info(
                 "Procedural timeline extract: doc='{}' attempt={} ({} chars excerpt) "
                 "response ({} chars): {}",
-                doc_name, attempt_idx, max_chars, len(raw), raw[:300],
+                doc_name, attempt_idx, max_chars, len(raw), chars(raw),
             )
 
             if _is_safety_error(raw):
@@ -453,7 +423,7 @@ class ProceduralTimelineAgent:
             except Exception as exc:
                 logger.warning(
                     "Procedural timeline: JSON parse error doc='{}': {} (raw preview={})",
-                    doc_name, exc, raw[:200],
+                    doc_name, exc, chars(raw),
                 )
                 break
 
@@ -634,7 +604,7 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
         raw = (raw or "").strip()
         logger.info(
             "Procedural timeline consolidate: response ({} chars): {}",
-            len(raw), raw[:400],
+            len(raw), chars(raw),
         )
 
         if _is_safety_error(raw) or not raw or raw.startswith("Error"):
@@ -676,7 +646,7 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
         consolidated = self._reattach_source_metadata(consolidated, raw_entries)
 
         logger.info(
-            "Procedural timeline consolidate: {} raw → {} consolidated",
+            "Procedural timeline consolidate: {} raw  {} consolidated",
             len(raw_entries), len(consolidated),
         )
         return {"consolidated_entries": consolidated}
@@ -914,19 +884,15 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
             if raw_type_check not in ("hearing", "adjournment", "court hearing"):
                 days_delta = (parsed_date - today_dt).days
                 if days_delta > 365 * 2:
-                    logger.info(
-                        "Procedural timeline: ❌ dropped (too far in future, {} days) "
-                        "title='{}' date={} type={}",
-                        days_delta, (item.get("title") or "").strip(), date_val,
-                        raw_type_check,
+                    logger.debug(
+                        "Procedural timeline: dropped (too far in future, {} days) date={} type={}",
+                        days_delta, date_val, raw_type_check,
                     )
                     continue
                 if days_delta < -365 * 3:
-                    logger.info(
-                        "Procedural timeline: ❌ dropped (too far in past, {} days) "
-                        "title='{}' date={} type={}",
-                        days_delta, (item.get("title") or "").strip(), date_val,
-                        raw_type_check,
+                    logger.debug(
+                        "Procedural timeline: dropped (too far in past, {} days) date={} type={}",
+                        days_delta, date_val, raw_type_check,
                     )
                     continue
 
@@ -959,10 +925,9 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
                     if title_cased in _ALLOWED_TYPES:
                         raw_type = title_cased
             if not raw_type:
-                logger.info(
-                    "Procedural timeline: ❌ dropped (unrecognised type '{}') "
-                    "title='{}' date={}",
-                    item.get("type", ""), title, date_val,
+                logger.debug(
+                    "Procedural timeline: dropped (unrecognised type '{}') date={}",
+                    item.get("type", ""), date_val,
                 )
                 continue
 
@@ -973,10 +938,9 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
             # filings) — defense-in-depth so a non-procedural entry can never
             # reach the panel even if it slipped past the prompt.
             if raw_type not in ("Court Hearing", "Deadline"):
-                logger.info(
-                    "Procedural timeline: ❌ dropped (non-procedural type '{}') "
-                    "title='{}' date={}",
-                    raw_type, title, date_val,
+                logger.debug(
+                    "Procedural timeline: dropped (non-procedural type '{}') date={}",
+                    raw_type, date_val,
                 )
                 continue
 
@@ -986,10 +950,7 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
             title_key = " ".join(title_words[:3]) if title_words else title.lower()[:20]
             key = (date_val, raw_type, title_key)
             if key in seen_keys:
-                logger.info(
-                    "Procedural timeline: 🔁 deduped near-duplicate title='{}' date={}",
-                    title, date_val,
-                )
+                logger.debug("Procedural timeline: deduped near-duplicate date={}", date_val)
                 continue
             seen_keys.add(key)
 
@@ -1026,11 +987,9 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
             if page_number and page_number > 0:
                 entry["pageNumber"] = page_number
 
-            logger.info(
-                "Procedural timeline: ✅ keeping title='{}' date={} eventType={} "
-                "source='{}' page={}",
-                title, date_val, raw_type, source_doc_name or "—",
-                page_number if page_number else "—",
+            logger.debug(
+                "Procedural timeline: keeping date={} eventType={} page={}",
+                date_val, raw_type, page_number or "-",
             )
             result.append(entry)
 

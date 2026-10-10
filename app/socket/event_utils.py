@@ -19,6 +19,8 @@ __all__ = [
     'EventHandler',
     '_STRATEGY_ROLE_LABELS_RE',
     'OBJECTIVE_UPDATE_OFFER_QUESTION',
+    'OBJECTIVE_CHANGE_REFRESH_FEATURES',
+    'OBJECTIVE_CHANGE_FAILED_MESSAGE',
     'CHAT_SMALL_WORKSPACE_DOC_THRESHOLD',
     'CHAT_SEARCH_CHUNK_LIMIT',
     'CHAT_MAX_DOCS_INCLUDED',
@@ -46,8 +48,10 @@ __all__ = [
     '_mint_item_id',
     '_normalize_match_text',
     'find_ungrounded_proper_nouns',
+    'find_dropped_case_figures',
     '_strip_strength_point_statute_boilerplate',
     '_annexure_wording_for_next_steps',
+    '_upload_wording',
     '_clamp_annexure_references',
     '_format_document_for_prompt',
     '_normalize_report_mobile_from_overview',
@@ -69,6 +73,31 @@ _STRATEGY_ROLE_LABELS_RE = re.compile(
 OBJECTIVE_UPDATE_OFFER_QUESTION = (
     "Do you want me to update the whole workspace based on this new objective "
     "that you have defined?"
+)
+
+
+# The panels whose loaders an objective change arms via `workspace:refresh`.
+# Kept in ONE place because a loader is cleared only by a
+# document_feature_response for the same featureType: every site that arms this
+# list must be able to release exactly this list when the work fails, and a
+# copy that drifts leaves a panel spinning with no way to notice.
+OBJECTIVE_CHANGE_REFRESH_FEATURES = [
+    "strategy_objective",
+    "analysis_report",
+    "list_of_dates",
+    "applicable_laws",
+    "procedural_timeline",
+    "drafting_assistant",
+]
+
+# What the user is told when an objective change could not be applied. It must
+# never imply the objective changed: the previous objective is still in force,
+# and silently falling through to the general chat agent (the old behaviour)
+# left the lawyer reading an unrelated answer beside six spinning panels.
+OBJECTIVE_CHANGE_FAILED_MESSAGE = (
+    "I could not update the strategic objective just now, so your previous "
+    "objective is unchanged. Nothing else in the workspace was modified. "
+    "Please send the objective again and I will retry."
 )
 
 
@@ -465,6 +494,100 @@ def find_ungrounded_proper_nouns(
     return flagged
 
 
+#: Magnitude words that make even a one- or two-digit number a case fact
+#: ("6 lakh", "18%"). Without these the significance filter below would let
+#: "6 lakh" vs "16 lakh" — the exact confusion the user-fact ledger exists to
+#: pin — slip through unnoticed.
+_FIGURE_MAGNITUDE_WORDS = (
+    "lakh", "lakhs", "crore", "crores", "thousand", "million", "billion",
+    "percent", "per cent", "%", "hectare", "hectares", "acre", "acres",
+)
+
+#: A number as legal documents write it: digit groups with comma separators
+#: (Indian or Western) and an optional decimal tail — 11,64,000 / 1,000.50 /
+#: 0.263 / 2019.
+_FIGURE_TOKEN_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def _normalize_figure(raw: str) -> str:
+    """Comparable form of a written figure: separators dropped, trailing
+    zero-decimals dropped, leading zeros dropped. ``Rs. 11,64,000`` and
+    ``1164000`` compare equal; ``0.263`` keeps its decimal."""
+    cleaned = (raw or "").replace(",", "").strip(" .")
+    if not cleaned:
+        return ""
+    if "." in cleaned:
+        cleaned = cleaned.rstrip("0").rstrip(".")
+    if not cleaned:
+        return "0"
+    intpart, _, frac = cleaned.partition(".")
+    intpart = intpart.lstrip("0") or "0"
+    return f"{intpart}.{frac}" if frac else intpart
+
+
+def _significant_figures(text: str) -> Dict[str, str]:
+    """Map normalized figure -> as-written form, for the figures in ``text``
+    that carry case meaning.
+
+    Significant means: at least three digits (amounts, years, suit numbers,
+    identifiers like Arazi No. 262) OR immediately followed by a magnitude
+    word. One- and two-digit numbers are otherwise skipped — "3 defendants"
+    or a day-of-month re-worded from ``03/04/2019`` to ``3 April 2019`` are
+    re-wordings, not dropped facts, and flagging them would veto every
+    legitimate re-frame.
+    """
+    found: Dict[str, str] = {}
+    if not text:
+        return found
+    lowered = text.lower()
+    for m in _FIGURE_TOKEN_RE.finditer(text):
+        raw = m.group(0).strip(" .,")
+        digits = raw.replace(",", "").replace(".", "")
+        if not digits:
+            continue
+        tail = lowered[m.end():m.end() + 12].lstrip(" \t")
+        significant = len(digits) >= 3 or any(
+            tail.startswith(w) for w in _FIGURE_MAGNITUDE_WORDS
+        )
+        if not significant:
+            continue
+        key = _normalize_figure(raw)
+        if key:
+            found.setdefault(key, raw)
+    return found
+
+
+def find_dropped_case_figures(
+    previous: str,
+    candidate: str,
+    *,
+    max_results: int = 12,
+) -> List[str]:
+    """Return the significant figures present in ``previous`` but missing from
+    ``candidate``.
+
+    The counterpart to :func:`find_ungrounded_proper_nouns`: that one catches
+    facts the model INVENTED, this one catches facts it DROPPED. Used when a
+    panel is re-framed rather than regenerated — a re-frame may re-order and
+    re-emphasise, but every amount, year, suit number and identifier the
+    previous text asserted must still be there. Comparison is on the
+    normalized form, so re-notation (``Rs. 11,64,000`` → ``1164000``) does not
+    count as a loss.
+    """
+    if not previous or not isinstance(previous, str):
+        return []
+    if not isinstance(candidate, str):
+        candidate = ""
+    kept = set(_significant_figures(candidate))
+    dropped: List[str] = []
+    for key, as_written in _significant_figures(previous).items():
+        if key not in kept:
+            dropped.append(as_written)
+        if len(dropped) >= max_results:
+            break
+    return dropped
+
+
 def _strip_strength_point_statute_boilerplate(text: str) -> str:
     """
     Remove trailing citation boilerplate from analysis strength points (statutes belong in `laws`, not prose).
@@ -520,24 +643,48 @@ def _strip_strength_point_statute_boilerplate(text: str) -> str:
     return cleaned
 
 
-def _annexure_wording_for_next_steps(text: str) -> str:
-    """
-    Product wording for strategy possibleNextSteps: refer to uploads as Annexure N, not Document N;
-    replace standalone document/documents with annexure/annexures.
+_UPLOAD_DETERMINERS = r"(the|this|that|these|those|each|every|both|all|said|uploaded|attached|enclosed|annexed|submitted)"
+
+
+def _upload_wording(text: str) -> str:
+    """Refer to uploaded files as annexures — and nothing else.
+
+    Product rule: an upload is "Annexure N", never "Document N". Converted:
+    "Document N" / "Documents N", and "document(s)" when it names an upload
+    ("the document", "this document", "the uploaded documents").
+
+    Deliberately NOT converted, because it is not an upload:
+    "identity documents including passports" (real-world documents) and the
+    verb in "Annexure 1 documents an official representation". The previous
+    blanket replace produced "statutory identity annexures" and "Annexure 1
+    annexures an official representation".
     """
     if not (text or "").strip():
-        return ""
-    t = text.strip()
-    t = re.sub(r"\b[Dd]ocuments\s+(\d+)\b", r"Annexures \1", t)
+        return text or ""
+    t = re.sub(r"\b[Dd]ocuments\s+(\d+)\b", r"Annexures \1", text)
     t = re.sub(r"\b[Dd]ocument\s+(\d+)\b", r"Annexure \1", t)
+
+    def _keep_case(word: str, repl: str) -> str:
+        return repl.capitalize() if word[:1].isupper() else repl
+
     t = re.sub(
-        r"\bdocuments\b",
-        "annexures",
-        re.sub(r"\bdocument\b", "annexure", t, flags=re.IGNORECASE),
-        flags=re.IGNORECASE,
+        rf"\b{_UPLOAD_DETERMINERS}\s+(documents)\b",
+        lambda m: f"{m.group(1)} {_keep_case(m.group(2), 'annexures')}",
+        t, flags=re.IGNORECASE,
+    )
+    t = re.sub(
+        rf"\b{_UPLOAD_DETERMINERS}\s+(document)\b(?!\s+(?:dated|titled|of\s+title))",
+        lambda m: f"{m.group(1)} {_keep_case(m.group(2), 'annexure')}",
+        t, flags=re.IGNORECASE,
     )
     return t
 
+
+def _annexure_wording_for_next_steps(text: str) -> str:
+    """Product wording for strategy possibleNextSteps (see ``_upload_wording``)."""
+    if not (text or "").strip():
+        return ""
+    return _upload_wording(text.strip())
 
 def _clamp_annexure_references(text: Any, max_annexure: int) -> Any:
     """
@@ -623,6 +770,41 @@ def _format_document_for_prompt(
     header_lines: List[str] = []
     if document_type and document_type.lower() != "other":
         header_lines.append(f"[DOCUMENT TYPE: {document_type}]")
+
+    # Standard-form instruments (terms of service, privacy statements,
+    # acceptable-use policies) are uploaded for reference, but every person and
+    # company they name belongs to the DOCUMENT, not the dispute: its publisher,
+    # its version-control signatories, its third-party vendors, and role
+    # placeholders like "the Client" / "the Service Provider". Read as evidence,
+    # a boilerplate template's own Service Provider outranked the actual client
+    # in party selection, and a policy's approval table was reported as "key
+    # individuals involved in the communications". Label them so every prompt
+    # treats them as cited instruments instead.
+    try:
+        from app.processing.document_classifier import is_policy_boilerplate
+
+        _file_name = str(
+            metadata.get("file_name")
+            or metadata.get("filename")
+            or doc.get("file_name")
+            or ""
+        )
+        if is_policy_boilerplate(_file_name, body, document_type):
+            header_lines.append(
+                "[CITED INSTRUMENT — standard-form policy/terms uploaded for "
+                "reference. Its clauses MAY be cited and the CONTRACTING ENTITY "
+                "it is made by or for may well be a party to this matter (a "
+                "party often uploads its own standard agreement). But the "
+                "INDIVIDUALS it names — document-control authors, owners, "
+                "reviewers, 'Approved By' signatories — and the third-party "
+                "vendors, analytics providers and regulators it mentions are "
+                "part of the DOCUMENT, not the dispute: never describe them as "
+                "case participants. Take the FACTS of the dispute (what "
+                "happened, when, how much, who did what) from the other "
+                "annexures, not from this one.]"
+            )
+    except Exception:  # pragma: no cover - labelling must never block a prompt
+        pass
 
     def _coerce_str_list(val: Any) -> List[str]:
         if val is None:

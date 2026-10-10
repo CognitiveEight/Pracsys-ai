@@ -4,7 +4,6 @@ Audit logging for tracking important system events and user actions.
 
 import json
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 from loguru import logger
@@ -18,32 +17,11 @@ class AuditLogger:
     """
 
     def __init__(self):
+        # The sink itself is registered by setup_logging() (logger.py). It used
+        # to be added here, at import time — and setup_logging()'s
+        # logger.remove() then deleted it, so audit.log silently stopped being
+        # written on 2026-04-02.
         self.enabled = settings.enable_audit_log
-        self._setup_audit_log()
-
-    def _setup_audit_log(self) -> None:
-        """Setup dedicated audit log file."""
-        if not self.enabled:
-            logger.info("Audit logging is disabled")
-            return
-
-        # Create audit logs directory
-        audit_dir = Path("logs/audit")
-        audit_dir.mkdir(parents=True, exist_ok=True)
-
-        # Add audit log handler
-        logger.add(
-            audit_dir / "audit.log",
-            format="{message}",
-            level="INFO",
-            rotation="100 MB",
-            retention="1 year",
-            compression="zip",
-            serialize=True,
-            filter=lambda record: record["extra"].get("audit", False),
-        )
-
-        logger.info("Audit logging configured")
 
     def log_event(
         self,

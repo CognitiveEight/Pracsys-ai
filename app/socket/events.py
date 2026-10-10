@@ -112,6 +112,7 @@ from app.socket.event_utils import (
 from app.socket.handlers import (
     JsonHelpersMixin,
     DocumentsMixin,
+    DocumentReloadMixin,
     StateRolesMixin,
     ExtractionMixin,
     StrategyMixin,
@@ -125,18 +126,26 @@ from app.socket.handlers import (
     ObjectiveChangeMixin,
     LawRelevanceMixin,
     PanelEditsMixin,
+    UserFactsMixin,
     DocxExportMixin,
     TemplateSyncMixin,
     WorkspaceMetadataMixin,
     WorkspaceEventsMixin,
+    WorkspacePurgeMixin,
+    RunControlMixin,
     ChatMixin,
     SuggestionChipsMixin,
 )
 
 
+#: Inbound events the frontend/backend polls on a timer.
+_POLLING_EVENTS = frozenset({"probing_prompts_request", "ai_heartbeat_ping"})
+
+
 class SocketEventHandler(
     JsonHelpersMixin,
     DocumentsMixin,
+    DocumentReloadMixin,
     StateRolesMixin,
     ExtractionMixin,
     StrategyMixin,
@@ -150,10 +159,13 @@ class SocketEventHandler(
     ObjectiveChangeMixin,
     LawRelevanceMixin,
     PanelEditsMixin,
+    UserFactsMixin,
     DocxExportMixin,
     TemplateSyncMixin,
     WorkspaceMetadataMixin,
     WorkspaceEventsMixin,
+    WorkspacePurgeMixin,
+    RunControlMixin,
     ChatMixin,
     SuggestionChipsMixin,
 ):
@@ -171,6 +183,8 @@ class SocketEventHandler(
     def __init__(self):
         self._handlers: Dict[str, EventHandler] = {}
         self._socket_client = None  # Will be set by main service
+        # Legal knowledge graph (app/graph/store.py); None when NEO4J_URL is unset.
+        self._graph_store = None
         # NOTE: every per-workspace cache below is a PersistentWorkspaceDict so
         # that writes (`self._workspace_X[workspace_id] = ...`) are mirrored to
         # Qdrant in the background. After an AI service restart we hydrate the
@@ -233,6 +247,29 @@ class SocketEventHandler(
         # resolution pass (only analysis_report_feedback removes them).
         self._workspace_user_added_missing_info: Dict[str, List[str]] = (
             PersistentWorkspaceDict(CacheKinds.USER_ADDED_MISSING_INFO)
+        )
+        # Per-workspace ledger of missingInfo items the lawyer re-worded via
+        # missing_information_edited ({itemId: {text, priorTexts, editedAt,
+        # requestId}}). Re-applied by _tag_analysis_report_against_current_state
+        # so a regeneration from the documents cannot revert the lawyer's text.
+        # Instance attribute so the workspace-purge sweep erases it.
+        self._workspace_edited_missing_info: Dict[str, Dict[str, Dict[str, Any]]] = (
+            PersistentWorkspaceDict(CacheKinds.EDITED_MISSING_INFO)
+        )
+        # Facts the lawyer corrected in chat ("the disputed amount is 6 lakh USD,
+        # not 16 lakh"). Mirrors _workspace_removed_documents: a user decision
+        # that outlives the panel it was made on. Every generator prompt carries
+        # it as an AUTHORITATIVE USER CORRECTIONS block, and
+        # _apply_fact_corrections_to_payload enforces it deterministically on the
+        # way out — without both, the next document upload regenerates from
+        # documents that still say 16 lakh and reverts the correction.
+        # Deliberately an instance attribute (not a module-level dict like
+        # app/workspace/custom_instructions.py) so the workspace-purge sweep over
+        # self.__dict__ erases it: these entries hold verbatim case facts.
+        # Shape: {workspace_id: [{id, slot, description, was, now, superseded,
+        #                         assertedAt, source}, ...]}
+        self._workspace_user_facts: Dict[str, List[Dict[str, Any]]] = (
+            PersistentWorkspaceDict(CacheKinds.USER_ASSERTED_FACTS)
         )
         # List of Dates timeline per workspace (chronological events from case documents)
         self._workspace_list_of_dates_payload: Dict[str, List[Dict[str, Any]]] = (
@@ -299,6 +336,32 @@ class SocketEventHandler(
         # pre-matched against. When the library later grows, the panel is
         # regenerated. See _maybe_reemit_drafting_on_templates.
         self._drafting_meta_by_workspace: Dict[str, Dict[str, Any]] = {}
+        # Feature payloads that were generated but NOT delivered (the socket was
+        # down when the emit ran — SocketClient.emit skips silently). Keyed
+        # workspace_id -> {featureType: envelope}, and persisted, because a panel
+        # loader is cleared only by the arrival of its document_feature_response:
+        # an undelivered payload is a stuck panel until it is re-sent. Flushed by
+        # _flush_pending_feature_deliveries on (re)connect.
+        self._pending_feature_deliveries: Dict[str, Dict[str, Any]] = (
+            PersistentWorkspaceDict(CacheKinds.PENDING_FEATURE_DELIVERY)
+        )
+        # An objective change that was accepted but never produced a payload —
+        # cancelled with its socket turn, or timed out. Nothing to re-deliver, so
+        # the instruction itself is kept and re-run once on reconnect. Shape:
+        # {"userId","workspaceRole","instruction","featureTypes","attempts","startedAt"}
+        self._pending_objective_changes: Dict[str, Dict[str, Any]] = (
+            PersistentWorkspaceDict(CacheKinds.PENDING_OBJECTIVE_CHANGE)
+        )
+        # Workspaces whose persisted recovery markers have already been read in
+        # this process. A restart loses the in-memory markers, so they are
+        # re-read on first contact with the workspace — but exactly once, or
+        # every chat turn would re-query Qdrant for them.
+        self._recovered_workspaces: Set[str] = set()
+        # Strong references to detached background tasks. asyncio keeps only a
+        # weak reference to a task, so a fire-and-forget create_task() can be
+        # garbage-collected mid-flight; and a task whose exception is never
+        # retrieved reports nothing. See _track_background_task.
+        self._background_tasks: Set[asyncio.Task] = set()
         # Re-emit after reconnect when socket dropped right after analysis report (so backend gets the update)
         self._had_disconnect: bool = False
         self._pending_reemit_workspace_id: Optional[str] = None
@@ -352,10 +415,55 @@ class SocketEventHandler(
         self._last_workspace_transfer_fingerprint: Dict[str, Dict[str, Any]] = {}
         # Guard against overlapping analysis-report refresh tasks from chat marker misses.
         self._analysis_refresh_inflight: Set[str] = set()
-        # During objective-change regeneration, suppress stale background analysis_report emits
-        # from older pipelines so FE receives only the fresh objective-aligned report.
-        self._suppress_analysis_emit_until_ts: Dict[str, float] = {}
+        # --- workspace_deleted / compliance purge (see handlers/workspace_purge.py)
+        # Deletions awaiting their purgeAfter deadline.
+        #   workspace_id -> {requestId, purgeAfter, deletedAt, userId, reason,
+        #                    armedAt, task}
+        # Held in memory only, by design: a restart loses the timer, and the
+        # backend re-sends every pending deletion on reconnect under the same
+        # requestId until purgeAfter passes, which re-arms it.
+        self._pending_purges: Dict[str, Dict[str, Any]] = {}
+        # requestId -> first-seen time. The backend's de-duplication key.
+        self._seen_purge_requests: Dict[str, float] = {}
+        # Workspaces already erased. Keeps a re-send that races the purgeAfter
+        # boundary from re-arming a purge for data that is already gone, and
+        # marks the workspace as needing a rebuild-from-scratch on the next sync.
+        #   workspace_id -> {purgedAt, requestId, userId, reason}
+        self._purged_workspaces: Dict[str, Dict[str, Any]] = {}
+        # chat_id -> workspace_id. Chat-scoped caches hold extracted document
+        # text but are keyed by chat_id alone; without this index the purge
+        # cannot reach them. Populated at the chat entry point.
+        self._chat_workspace_index: Dict[str, str] = {}
+        # --- document_reload_request (see handlers/document_reload.py)
+        # Per-workspace ledger of reload requests: workspace_id -> {requestId ->
+        # {status, ts}}. The backend re-sends a reload on a stall or reconnect
+        # under the SAME requestId, so a re-send while the first attempt is in
+        # flight (or shortly after it succeeded) must be swallowed — but a
+        # re-send after a FAILED attempt must run, because nothing else would
+        # ever retry it. Keyed by workspace_id at the top level so the
+        # compliance purge's self.__dict__ sweep erases it with the workspace.
+        self._document_reload_requests: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        # --- workspace_stop_request / workspace_resume_request
+        # (see handlers/run_control.py). Every dict below is keyed by
+        # workspace_id at the top level so the compliance purge's sweep erases it.
+        # Run epoch per workspace. A stop bumps it; anything running under an
+        # older epoch is fenced (its panel emits and buffer writes are dropped).
+        self._run_epochs: Dict[str, int] = {}
+        # Tasks that make up a workspace's running update, so a stop can cancel
+        # them: workspace_id -> {task: started_at}.
+        self._workspace_run_tasks: Dict[str, Dict[asyncio.Task, float]] = {}
+        # Local receive time of the latest workspace-scoped event. A stop whose
+        # stoppedAt predates it is a stale re-send and must not fence new work.
+        self._last_workspace_event_at: Dict[str, float] = {}
+        # workspace_id -> {requestId: first-seen}. Stop re-sends are expected.
+        self._stop_requests: Dict[str, Dict[str, float]] = {}
+        # workspace_id -> {requestId: {status, ts}}, as _document_reload_requests.
+        self._resume_requests: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._register_default_handlers()
+
+    def set_graph_store(self, store) -> None:
+        """Register the legal knowledge graph (``GraphStore`` or None)."""
+        self._graph_store = store
 
     def set_socket_client(self, client):
         """Set the socket client for emitting responses."""
@@ -388,11 +496,22 @@ class SocketEventHandler(
         # re-emit the features listed in reEmitFeatures (drafting_assistant).
         self.register("workspace_transferred", self.on_workspace_transferred)
         self.register("user_message_request", self.on_user_message_request)
+        # Supporting Material "reload" on one document: purge everything held
+        # for it, re-read it, re-run the workspace features over all evidence.
+        self.register("document_reload_request", self.on_document_reload_request)
+        # Stop / "Finish update" on a running workspace update.
+        self.register("workspace_stop_request", self.on_workspace_stop_request)
+        self.register("workspace_resume_request", self.on_workspace_resume_request)
         self.register("probing_prompts_request", self.on_probing_prompts_request)
         self.register("analysis_report_feedback", self.on_analysis_report_feedback)
         self.register(
             "added_missing_information",
             self.on_added_missing_information,
+        )
+        # Missing Information — lawyer re-worded one item (text only).
+        self.register(
+            "missing_information_edited",
+            self.on_missing_information_edited,
         )
         self.register(
             "applicable_law_relevance_request",
@@ -426,7 +545,7 @@ class SocketEventHandler(
         self.register("workspace_updated", self.on_workspace_updated)
         self.register("workspace_deleted", self.on_workspace_deleted)
 
-        logger.info("✅ Event handlers registered")
+        logger.info("Event handlers registered")
 
     def register(self, event_name: str, handler: EventHandler) -> None:
         """
@@ -448,20 +567,52 @@ class SocketEventHandler(
             data: Event data
         """
         handler = self._handlers.get(event_name)
+        if not handler:
+            logger.warning("No handler registered for event: {}", event_name)
+            return
 
-        if handler:
+        # Correlation context for every line this event produces, including
+        # lines from tasks it spawns (contextvars are copied by create_task).
+        # Ids only — never the payload: it carries signed URLs, names and
+        # case text.
+        body = data if isinstance(data, dict) else {}
+        context = {
+            "request_id": str(body.get("requestId") or uuid.uuid4().hex[:12]),
+            "event": event_name,
+            "workspace_id": str(body.get("workspaceId") or "-"),
+        }
+        if body.get("chatId"):
+            context["chat_id"] = str(body["chatId"])
+        # Polled every few seconds by the frontend: their start/finish lines
+        # would bury everything else, so they log only at DEBUG (failures
+        # still log at ERROR).
+        level = "DEBUG" if event_name in _POLLING_EVENTS else "INFO"
+        with logger.contextualize(**context):
+            logger.log(level, "event {} received (keys: {})", event_name, sorted(body.keys()))
+            started = time.monotonic()
+            status = "ok"
             try:
-                logger.debug("Handling event: {} with data: {}", event_name, data)
-                await handler(data)
+                # Every workspace-scoped event runs inside its run scope, which
+                # is what lets workspace_stop_request cancel and fence it.
+                await self._dispatch_in_run_scope(event_name, data, handler)
+            except asyncio.CancelledError:
+                status = "cancelled"
+                raise
             except Exception as e:
-                logger.error("Error handling event {}: {}", event_name, str(e))
-                logger.exception(e)
+                status = "error"
+                logger.opt(exception=e).error("Event handler failed: {}", e)
                 raise SocketEventError(
                     f"Failed to handle event: {event_name}",
                     details={"event": event_name, "error": str(e)},
                 )
-        else:
-            logger.warning("No handler registered for event: {}", event_name)
+            finally:
+                # Long panel work runs in background tasks after this returns;
+                # each of those reports its own "result" line when it emits.
+                logger.log(
+                    "WARNING" if status != "ok" else level,
+                    "event {} finished in {:.1f}s status={}",
+                    event_name, time.monotonic() - started, status,
+                )
 
     _EMPTY_CASE_ENTITIES: Dict[str, List[Any]] = {
         "parties": [],

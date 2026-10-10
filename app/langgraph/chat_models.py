@@ -129,6 +129,9 @@ class ChatResponse:
     # Optional next actions
     suggested_actions: List[str] = field(default_factory=list)
 
+    # Checked citations, one per inline [n] marker (schemas.Citation shape).
+    citations: List[Dict[str, Any]] = field(default_factory=list)
+
     # Metadata
     processing_time_ms: Optional[float] = None
     tokens_used: Optional[int] = None
@@ -184,6 +187,12 @@ class ChatContext:
     # Optional custom instructions (structure, tone, description) - appended to prompts when set
     custom_instruction_suffix: Optional[str] = None
 
+    # Workspace sharing: who typed this message when it was NOT the case owner
+    # ({"userId","name","isOwner","permission","canEdit"}). ``user_id`` above
+    # stays the owner, so this is attribution only — it never re-keys state.
+    # None for the owner and for unshared cases.
+    asked_by: Optional[Dict[str, Any]] = None
+
     def validate(self) -> tuple[bool, List[str]]:
         """
         Validate that critical inputs are present.
@@ -217,6 +226,7 @@ class ChatContext:
             "chat_history_length": len(self.chat_history),
             "custom_instruction_suffix": self.custom_instruction_suffix,
             "chat_history": self.chat_history,
+            "asked_by": self.asked_by,
         }
 
 

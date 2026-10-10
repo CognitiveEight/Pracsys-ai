@@ -17,6 +17,10 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.utils.redact import chars
+
+from app.rag.packing import fit_to_budget
+
 from app.agents.role_models import RoleEnum
 from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
@@ -145,12 +149,12 @@ class DraftingMixin:
         for i, doc in enumerate(valid, 1):
             content = (doc.get("content") or "").strip()
             if len(content) > per_doc:
-                content = content[:per_doc] + "\n[... truncated for length ...]"
+                content = fit_to_budget(content, per_doc, "general")
             doc_clip = dict(doc)
             doc_clip["content"] = content
             parts.append(_format_document_for_prompt(doc_clip, i, len(valid)))
         out = "\n\n".join(parts)
-        if len(out) > cap:
+        if len(out) > int(cap * 1.1):  # headers add a little; never cut the last document
             out = out[:cap] + "\n[... content truncated ...]"
         logger.info(
             "drafting evidence brief built (workspace={}, docs={}, chars={})",
@@ -343,7 +347,7 @@ class DraftingMixin:
             # title + the pre-matched template fields the frontend uses to
             # render the "Uses <template>" badge and pass templateId on click.
             logger.info(
-                "📤 drafting_assistant suggestions payload (workspace={}, user={}): "
+                "drafting_assistant suggestions payload (workspace={}, user={}): "
                 "{} suggestion(s)",
                 workspace_id,
                 (user_id or "")[:12],
@@ -351,10 +355,10 @@ class DraftingMixin:
             )
             for idx, s in enumerate(payload["suggestedDrafts"]):
                 if not isinstance(s, dict):
-                    logger.info("   ✏️ [{}] (non-dict: {})", idx, type(s).__name__)
+                    logger.debug("  suggestion [{}] is not a dict ({})", idx, type(s).__name__)
                     continue
-                logger.info(
-                    "   ✏️ [{}] title={!r} relevance={} matchScore={} matchMode={} "
+                logger.debug(
+                    "  suggestion [{}] title={!r} relevance={} matchScore={} matchMode={} "
                     "templateId={} templateName={!r} matchedDrafts={}",
                     idx,
                     s.get("title"),
@@ -374,16 +378,10 @@ class DraftingMixin:
                 "userId": user_id,
                 "payload": drafting_payload_to_wire(payload),
             }
-            # Full dump of the exact response body sent to the backend for
-            # end-to-end verification (titles/descriptions/templateId/
-            # templateName only — no credentials, so no redaction needed).
-            try:
-                logger.info(
-                    "📦 drafting_assistant RESPONSE body to backend:\n{}",
-                    json.dumps(response_body, indent=2, ensure_ascii=False, default=str),
-                )
-            except Exception as e:
-                logger.warning("Drafting suggestions: could not dump response body: {}", e)
+            logger.info(
+                "drafting_assistant: {} suggestion(s) ready",
+                len((response_body.get("payload") or {}).get("suggestedDrafts") or []),
+            )
 
             await self._emit_document_feature(
                 feature_type="drafting_assistant",
@@ -393,7 +391,7 @@ class DraftingMixin:
                 usage=current_usage(),
             )
             logger.success(
-                "✅ Drafting suggestions sent to backend ({} item(s))",
+                "Drafting suggestions sent to backend ({} item(s))",
                 len(payload["suggestedDrafts"]),
             )
             await asyncio.sleep(0.05)
@@ -423,7 +421,7 @@ class DraftingMixin:
             usage=None,
         )
         logger.success(
-            "✅ Objective-change drafting suggestions preserved (regeneration skipped)"
+            "Objective-change drafting suggestions preserved (regeneration skipped)"
         )
 
     async def _maybe_reemit_drafting_on_templates(self, user_id: str) -> None:
@@ -462,7 +460,7 @@ class DraftingMixin:
                 continue  # library unchanged — no-op snapshot, nothing to do
             role = (meta or {}).get("role") or "ADJUDICATOR"
             logger.info(
-                "🔁 Template library changed ({}→{}) — refreshing drafting "
+                "Template library changed ({}{}) — refreshing drafting "
                 "suggestions for workspace={} (user={}) — matched cards whose "
                 "template still exists stay frozen; deleted-template cards are "
                 "demoted and re-matched",
@@ -477,12 +475,15 @@ class DraftingMixin:
                 **(meta or {}),
                 "lib_count": current_count,
             }
-            asyncio.create_task(
-                self._refresh_drafting_matches_on_growth(
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    workspace_role=role,
-                )
+            self._track_background_task(
+                asyncio.create_task(
+                    self._refresh_drafting_matches_on_growth(
+                        workspace_id=workspace_id,
+                        user_id=user_id,
+                        workspace_role=role,
+                    )
+                ),
+                label=f"drafting refresh on template growth {workspace_id[:12]}",
             )
 
     @meter_usage
@@ -539,8 +540,8 @@ class DraftingMixin:
             for idx, s in enumerate(payload["suggestedDrafts"]):
                 if not isinstance(s, dict):
                     continue
-                logger.info(
-                    "   ✏️ [{}] title={!r} matchScore={} matchMode={} templateId={} "
+                logger.debug(
+                    "  suggestion [{}] title={!r} matchScore={} matchMode={} templateId={} "
                     "templateName={!r}",
                     idx,
                     s.get("title"),
@@ -558,7 +559,7 @@ class DraftingMixin:
                 usage=current_usage(),
             )
             logger.success(
-                "✅ Drafting panel refreshed (frozen matched cards) — "
+                "Drafting panel refreshed (frozen matched cards) — "
                 "{} item(s) re-emitted (workspace={})",
                 len(payload["suggestedDrafts"]),
                 workspace_id,

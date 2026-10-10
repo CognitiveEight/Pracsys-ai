@@ -2,6 +2,7 @@
 
 from app.socket.handlers._shared import JsonHelpersMixin
 from app.socket.handlers.documents import DocumentsMixin
+from app.socket.handlers.document_reload import DocumentReloadMixin
 from app.socket.handlers.state_roles import StateRolesMixin
 from app.socket.handlers.extraction import ExtractionMixin
 from app.socket.handlers.strategy import StrategyMixin
@@ -20,12 +21,15 @@ from app.socket.handlers.docx_export import DocxExportMixin
 from app.socket.handlers.template_sync import TemplateSyncMixin
 from app.socket.handlers.workspace_metadata import WorkspaceMetadataMixin
 from app.socket.handlers.workspace_events import WorkspaceEventsMixin
+from app.socket.handlers.workspace_purge import WorkspacePurgeMixin
+from app.socket.handlers.run_control import RunControlMixin
 from app.socket.handlers.chat import ChatMixin
 from app.socket.handlers.suggestion_chips import SuggestionChipsMixin
 
 __all__ = [
     "JsonHelpersMixin",
     "DocumentsMixin",
+    "DocumentReloadMixin",
     "StateRolesMixin",
     "ExtractionMixin",
     "StrategyMixin",
@@ -44,6 +48,8 @@ __all__ = [
     "TemplateSyncMixin",
     "WorkspaceMetadataMixin",
     "WorkspaceEventsMixin",
+    "WorkspacePurgeMixin",
+    "RunControlMixin",
     "ChatMixin",
     "SuggestionChipsMixin",
 ]

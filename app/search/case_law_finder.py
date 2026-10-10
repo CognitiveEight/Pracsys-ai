@@ -97,7 +97,7 @@ async def scrape_indiankanoon(query: str, *, limit: int = 8) -> List[Dict[str, s
     if not query.strip():
         return []
     search_url = f"https://indiankanoon.org/search/?formInput={quote_plus(query)}"
-    logger.info("Case-law search: Indian Kanoon query={}", query[:180])
+    logger.debug("Case-law search: Indian Kanoon query ({} chars)", len(query))
     try:
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
             res = await client.get(search_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -265,7 +265,5 @@ async def find_case_law_sources(
         if len(out) >= limit:
             break
 
-    logger.info(
-        "Case-law search: {} unique source(s) for query={}", len(out), query[:120]
-    )
+    logger.info("Case-law search: {} unique source(s)", len(out))
     return out, research_notes

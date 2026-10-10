@@ -1,58 +1,61 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-*.egg-info/
-dist/
-build/
+# The image needs only app/ and requirements.lock.txt (see Dockerfile).
+# Everything else stays out of the build context.
 
-# Virtual Environment
-venv/
-env/
-ENV/
-.venv
-
-# Environment Variables
+# Credentials and secrets — never send these to the Docker daemon.
 .env
-.env.local
-.env.*.local
+.env.*
+!env.example
+*.pem
+*.key
+bns-ai-*.json
+gcp-*.json
+*-service-account*.json
+*-serviceaccount*.json
+google-application-credentials.json
 
-# IDEs
+# Version control, tooling, caches
+.git/
+.gitignore
+.claude/
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
-.DS_Store
+.cursor/
+.codex/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# Logs
+# Virtual environments
+env/
+venv/
+.venv/
+ENV/
+
+# Runtime output and local data
 logs/
-*.log
-
-# Data
 data/
+*.log
 *.db
 *.sqlite
 
-# Test
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-
-# Git
-.git/
-.gitignore
-
-# Documentation (not needed in container)
+# Not part of the service
+keel/
+tests/
+docs/
+scripts/
+verify_*.py
+masterLaws*.json
+my_case.txt
+*.docx
 *.md
-!README.md
-
-# Development files
 Makefile
 docker-compose.yml
-test_setup.py
+dev.sh
 run.sh
-
+agent.py
+pytest.ini
+requirements-dev.txt

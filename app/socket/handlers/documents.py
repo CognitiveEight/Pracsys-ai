@@ -74,6 +74,7 @@ from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
                                        restore_state)
 from agent import process_analysis_docx_request
 
+from app.rag.packing import fit_to_budget, panel_context_budget
 from app.socket.event_utils import (
     EventHandler,
     _STRATEGY_ROLE_LABELS_RE,
@@ -733,7 +734,7 @@ class DocumentsMixin:
             if isinstance(score, (int, float)) and score > max_allowed:
                 report["caseResolutionScore"] = max_allowed
                 logger.info(
-                    "Re-clamped caseResolutionScore {} → {} after adding "
+                    "Re-clamped caseResolutionScore {}  {} after adding "
                     "removed-evidence gaps",
                     score,
                     max_allowed,
@@ -859,13 +860,27 @@ class DocumentsMixin:
             )
             all_docs = []
 
-        for doc in all_docs[:5]:
+        # Every document, excerpted toward statutory content — the first 1,200
+        # characters of the first five documents (the old rule) rarely reach
+        # the paragraph that names the offence or the provision relied on.
+        for doc in all_docs[:20]:
             content = str(doc.get("content") or "").strip()
             if not content:
                 continue
-            snippets.append(content[:1200])
+            snippets.append(fit_to_budget(content, 2500, "laws"))
 
         joined = " ".join(snippets)
+        # Provisions the documents cite verbatim are the strongest signal of
+        # what applies; they lead the search query.
+        cited = []
+        for m in re.finditer(
+            r"\b(?:section|sec\.|u/s|s\.)\s*(\d+[A-Z]?)\s*(?:of\s+(?:the\s+)?([A-Z][A-Za-z ,]{3,60}?(?:Act|Sanhita|Adhiniyam|Code)))?",
+            joined,
+            flags=re.IGNORECASE,
+        ):
+            ref = f"Section {m.group(1)}" + (f" {m.group(2).strip()}" if m.group(2) else "")
+            if ref not in cited:
+                cited.append(ref)
         tokens = re.findall(r"[A-Za-z][A-Za-z0-9]{3,}", joined)
         stop = {
             "this",
@@ -905,7 +920,7 @@ class DocumentsMixin:
         ranked = sorted(freq.items(), key=lambda x: x[1], reverse=True)
         keywords = [k for k, _v in ranked[:8]]
 
-        query_parts = [p for p in [workspace_title, " ".join(keywords)] if p]
+        query_parts = [p for p in [workspace_title, " ".join(cited[:4]), " ".join(keywords)] if p]
         query = " ".join(query_parts).strip()
         if not query:
             query = "Indian legal case applicable sections"
@@ -921,7 +936,8 @@ class DocumentsMixin:
             "workspaceTitle": workspace_title,
             "query": query,
             "keywords": keywords,
-            "evidenceSnippet": joined[:5000],
+            "citedProvisions": cited[:12],
+            "evidenceSnippet": joined[:12000],
         }
 
     async def _assemble_combined_document_content(self, workspace_id: str) -> str:
@@ -946,7 +962,7 @@ class DocumentsMixin:
             if (d.get("content") or "").strip()
             and len((d.get("content") or "").strip()) >= 20
         ]
-        max_total_content = 100000
+        max_total_content = panel_context_budget()
         per_doc_cap = (
             (max_total_content // max(1, len(valid_docs)))
             if valid_docs
@@ -958,11 +974,11 @@ class DocumentsMixin:
             if not content or len(content) < 20:
                 continue
             if len(content) > per_doc_cap:
-                content = content[:per_doc_cap] + "\n[... truncated for length ...]"
+                content = fit_to_budget(content, per_doc_cap, "general")
             doc_with_clip = dict(doc)
             doc_with_clip["content"] = content
             parts.append(_format_document_for_prompt(doc_with_clip, i, len(all_docs)))
         combined = "\n\n".join(parts) if parts else "No document content available."
-        if len(combined) > max_total_content:
+        if len(combined) > int(max_total_content * 1.1):  # headers add a little; never cut the last document
             combined = combined[:max_total_content] + "\n[... content truncated ...]"
         return combined

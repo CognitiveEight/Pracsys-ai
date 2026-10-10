@@ -17,6 +17,8 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.utils.redact import chars
+
 from app.agents.role_models import RoleEnum
 from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
@@ -192,7 +194,7 @@ class ProceduralTimelineMixin:
             ):
                 logger.info(
                     "Procedural timeline edit produced no change — instruction={!r}",
-                    (user_feedback or "")[:160],
+                    chars(user_feedback),
                 )
                 if outcome is not None:
                     outcome["status"] = "unchanged"
@@ -209,7 +211,7 @@ class ProceduralTimelineMixin:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ Procedural timeline name edit emitted workspace={}",
+                    "Procedural timeline name edit emitted workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
             if outcome is not None:
@@ -351,8 +353,8 @@ class ProceduralTimelineMixin:
                 usage=current_usage(),
             )
             logger.success(
-                "✅ Procedural timeline filtered+emitted after deletion (no LLM regen): "
-                "{} → {} entries (dropped {})",
+                "Procedural timeline filtered+emitted after deletion (no LLM regen): "
+                "{}  {} entries (dropped {})",
                 before_count,
                 len(prior_fast),
                 before_count - len(prior_fast),
@@ -440,6 +442,6 @@ class ProceduralTimelineMixin:
             usage=current_usage(),
         )
         logger.success(
-            "✅ Procedural timeline sent to backend ({} entries)", len(timeline)
+            "Procedural timeline sent to backend ({} entries)", len(timeline)
         )
         await asyncio.sleep(0.1)

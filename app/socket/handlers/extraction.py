@@ -293,7 +293,7 @@ class ExtractionMixin:
             _cached = self._workspace_case_entities_cache.get(workspace_id)
             if _cached and _cached[0] == _content_hash:
                 logger.info(
-                    "🧠 case_entities cache HIT for workspace {} (skipping 3 sub-extractors)",
+                    "case_entities cache HIT for workspace {} (skipping 3 sub-extractors)",
                     workspace_id[:12],
                 )
                 return _cached[1]
@@ -332,18 +332,18 @@ class ExtractionMixin:
         # Per-sub-agent diagnostic logs so future thin-summary failures can be
         # traced to whichever sub-agent came back empty.
         logger.info(
-            "🔎 Strategy sub-extractor PARTIES: {} party/entity record(s) for workspace {}",
+            "Strategy sub-extractor PARTIES: {} party/entity record(s) for workspace {}",
             len(merged.get("parties") or []),
             workspace_id[:12] if workspace_id else "",
         )
         logger.info(
-            "🔎 Strategy sub-extractor TIMELINE: {} dated event(s), {} suit/case number(s) for workspace {}",
+            "Strategy sub-extractor TIMELINE: {} dated event(s), {} suit/case number(s) for workspace {}",
             len(merged.get("dates") or []),
             len(merged.get("suit_numbers") or []),
             workspace_id[:12] if workspace_id else "",
         )
         logger.info(
-            "🔎 Strategy sub-extractor ASSETS+LAW: {} property/ies, {} amount(s), {} statute(s), {} annexure(s) for workspace {}",
+            "Strategy sub-extractor ASSETS+LAW: {} property/ies, {} amount(s), {} statute(s), {} annexure(s) for workspace {}",
             len(merged.get("properties") or []),
             len(merged.get("amounts") or []),
             len(merged.get("statutes") or []),
@@ -415,7 +415,7 @@ class ExtractionMixin:
             kept.append(entry)
         if dropped:
             logger.info(
-                "🧹 Dropped {} non-party entity/ies from extraction: {}",
+                "Dropped {} non-party entity/ies from extraction: {}",
                 len(dropped),
                 "; ".join(dropped[:8]),
             )

@@ -196,13 +196,8 @@ class UserFactsMixin:
         for idx, entry in enumerate(ledger, start=1):
             entry["id"] = f"fact_{idx}"
         self._workspace_user_facts[workspace_id] = ledger
-        logger.info(
-            "Pinned user-asserted fact: {} = {!r} (was {!r}) — ledger now {} entry(ies)",
-            desc,
-            now_v,
-            was_v or "unstated",
-            len(ledger),
-        )
+        # The slot, never the values: they are case facts.
+        logger.info("Pinned user-asserted fact for slot {} — ledger now {} entry(ies)", slot, len(ledger))
         return entry_out
 
     def get_user_asserted_facts(self, workspace_id: str) -> List[Dict[str, Any]]:

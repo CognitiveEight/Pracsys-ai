@@ -17,6 +17,10 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.utils.document_dates import date_from_document_name
+
+from app.utils.redact import chars
+
 from app.agents.role_models import RoleEnum
 from app.ai.usage import current_usage, meter_usage
 from app.core.config import settings
@@ -75,6 +79,7 @@ from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
                                        restore_state)
 from agent import process_analysis_docx_request
 
+from app.rag.packing import fit_to_budget, panel_context_budget
 from app.socket.event_utils import (
     EventHandler,
     _STRATEGY_ROLE_LABELS_RE,
@@ -200,7 +205,7 @@ class ListOfDatesMixin:
             ):
                 logger.info(
                     "List of dates edit produced no change — instruction={!r}",
-                    (user_feedback or "")[:160],
+                    chars(user_feedback),
                 )
                 if outcome is not None:
                     outcome["status"] = "unchanged"
@@ -221,7 +226,7 @@ class ListOfDatesMixin:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ List of dates name edit emitted workspace={}",
+                    "List of dates name edit emitted workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
             if outcome is not None:
@@ -321,7 +326,7 @@ class ListOfDatesMixin:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ List of dates relevance re-evaluated for new objective workspace={}",
+                    "List of dates relevance re-evaluated for new objective workspace={}",
                     workspace_id[:12] if workspace_id else "",
                 )
             return True
@@ -355,6 +360,10 @@ class ListOfDatesMixin:
         doc_explicit_dates_by_index: Dict[int, set[str]] = {}
         doc_explicit_years_by_index: Dict[int, set[int]] = {}
         doc_anchor_year_by_index: Dict[int, Optional[int]] = {}
+        # The date in each file's name ("25 11 29 Letter KCA.pdf"). For a
+        # letter whose body states no date it is the only record of when it
+        # was written; it counts as grounded and anchors the year.
+        doc_name_date_by_index: Dict[int, str] = {}
         id_to_name: Dict[str, str] = {}
         if batch_result:
             for r in batch_result.get("results") or []:
@@ -369,7 +378,8 @@ class ListOfDatesMixin:
             if (d.get("content") or "").strip()
             and len((d.get("content") or "").strip()) >= 20
         ]
-        max_total_content = 100000
+        graph_block = await self._graph_evidence_block("list_of_dates", workspace_id)
+        max_total_content = max(20_000, panel_context_budget() - len(graph_block))
         per_doc_cap = (
             (max_total_content // max(1, len(valid_docs)))
             if valid_docs
@@ -386,16 +396,23 @@ class ListOfDatesMixin:
             doc_name_by_index[i] = name
             doc_content_by_index[i] = content
             if len(content) > per_doc_cap:
-                content = content[:per_doc_cap] + "\n[... truncated for length ...]"
+                content = fit_to_budget(content, per_doc_cap, "dates")
+            name_date = date_from_document_name(name, datetime.utcnow().strftime("%Y-%m-%d"))
+            date_note = ""
+            if name_date:
+                doc_name_date_by_index[i] = name_date[0]
+                date_note = f", document date from its file name: {name_date[0]}"
             parts.append(
-                f"--- Annexure {i} (id: {doc_id}, name: {name}) ---\n{content}"
+                f"--- Annexure {i} (id: {doc_id}, name: {name}{date_note}) ---\n{content}"
             )
         combined = "\n\n".join(parts) if parts else ""
         if not combined:
             return []
 
-        if len(combined) > max_total_content:
+        if len(combined) > int(max_total_content * 1.1):  # headers add a little; never cut the last document
             combined = combined[:max_total_content] + "\n[... content truncated ...]"
+        if graph_block:
+            combined += "\n\n" + graph_block
 
         try:
             from app.ai.gemini_client import gemini_client
@@ -456,7 +473,7 @@ class ListOfDatesMixin:
                 if start < 0 and search_region.find("{") < 0:
                     logger.warning(
                         "List of dates: no JSON markers found in response; raw preview={}",
-                        (search_region or "")[:150],
+                        chars(search_region),
                     )
                     return []
                 salvage = []
@@ -985,6 +1002,8 @@ class ListOfDatesMixin:
                     doc_anchor_year_by_index[idx] = _resolve_anchor_year(
                         source_content, explicit_dates
                     )
+                    if doc_anchor_year_by_index[idx] is None and idx in doc_name_date_by_index:
+                        doc_anchor_year_by_index[idx] = int(doc_name_date_by_index[idx][:4])
                 explicit_dates = doc_explicit_dates_by_index.get(idx, set())
                 explicit_years = doc_explicit_years_by_index.get(idx, set())
                 anchor_year = doc_anchor_year_by_index.get(idx)
@@ -995,20 +1014,25 @@ class ListOfDatesMixin:
                 # the LLM had an explicit anchor or the year is genuinely in
                 # the source text. Same helper used by the langgraph agent path
                 # so both paths agree on year correction.
-                date_val = snap_hallucinated_year(
+                _snapped = snap_hallucinated_year(
                     date_iso=date_val,
                     document_text=source_content,
                     today_iso=today_str,
                     anchor_year=anchor_year if isinstance(anchor_year, int) else None,
                     log_prefix="List of dates",
                 )
+                # Past-only panel: never "correct" a date into the future.
+                if _snapped <= today_str:
+                    date_val = _snapped
 
                 # Keep only grounded dates:
                 # 1) exact explicit date appears in source, OR
                 # 2) explicit year appears in source with YYYY-01-01 normalization, OR
                 # 3) derived from relative "X years" phrase anchored to explicit year in same source.
                 year_val = int(date_val[:4]) if len(date_val) >= 4 and date_val[:4].isdigit() else None
-                is_explicit_full_date = date_val in explicit_dates
+                is_explicit_full_date = (
+                    date_val in explicit_dates or date_val == doc_name_date_by_index.get(idx)
+                )
                 is_explicit_year_only = (
                     date_val.endswith("-01-01")
                     and year_val is not None
@@ -1019,10 +1043,9 @@ class ListOfDatesMixin:
                 )
                 if not (is_explicit_full_date or is_explicit_year_only or is_allowed_relative):
                     logger.debug(
-                        "List of dates: dropping ungrounded date={} title='{}' doc='{}'",
+                        "List of dates: dropping ungrounded date={} (doc {})",
                         date_val,
-                        (item.get("title") or "").strip(),
-                        source_doc_name or source_doc_id or str(idx),
+                        source_doc_id or str(idx),
                     )
                     continue
                 page_number = _resolve_page_number(item, source_content)
@@ -1062,10 +1085,10 @@ class ListOfDatesMixin:
                 # appear on list_of_dates (this is the user-visible "factual
                 # narrative" panel).
                 if normalized_event_type == _PROCEDURAL_SENTINEL:
-                    logger.info(
-                        "List of dates: dropped procedural-type entry "
-                        "(eventType={!r}, title={!r}) — belongs in procedural_timeline",
-                        raw_event_type, raw_title,
+                    logger.debug(
+                        "List of dates: dropped procedural-type entry (eventType={!r}) — "
+                        "belongs in procedural_timeline",
+                        raw_event_type,
                     )
                     continue
                 # NOTE: title-based procedural detection moved AFTER the entry
@@ -1078,10 +1101,9 @@ class ListOfDatesMixin:
                 # what HAS HAPPENED. Future dates (deadlines, scheduled
                 # hearings, upcoming events) belong on procedural_timeline.
                 if date_val > today_str:
-                    logger.info(
-                        "List of dates: dropped future-dated entry "
-                        "(date={}, today={}, title={!r}) — list_of_dates is past-only",
-                        date_val, today_str, raw_title,
+                    logger.debug(
+                        "List of dates: dropped future-dated entry (date={}, today={})",
+                        date_val, today_str,
                     )
                     continue
                 # Drop fake YYYY-01-01 placeholders that the LLM synthesized
@@ -1094,11 +1116,9 @@ class ListOfDatesMixin:
                     date_val.endswith("-01-01")
                     and re.search(rf"\b{date_val[:4]}\b", source_content or "") is None
                 ):
-                    logger.info(
-                        "List of dates: dropped fake YYYY-01-01 placeholder "
-                        "(date={}, title={!r}) — relative phrase only, no concrete "
-                        "day/month and year not in source",
-                        date_val, raw_title,
+                    logger.debug(
+                        "List of dates: dropped fake YYYY-01-01 placeholder (date={})",
+                        date_val,
                     )
                     continue
                 entry = {
@@ -1157,6 +1177,7 @@ class ListOfDatesMixin:
                         source_doc_name=source_doc_name,
                         anchor_year=anchor_year,
                         today_str=today_str,
+                        document_date=doc_name_date_by_index.get(idx),
                     )
                 except Exception as temporal_err:
                     logger.debug(
@@ -1241,7 +1262,7 @@ class ListOfDatesMixin:
                 if len(result) < before_semantic:
                     logger.info(
                         "List of dates: per-date semantic dedupe collapsed "
-                        "{} entries → {}",
+                        "{} entries  {}",
                         before_semantic, len(result),
                     )
             except Exception as dedupe_err:
@@ -1400,8 +1421,8 @@ class ListOfDatesMixin:
                 usage=current_usage(),
             )
             logger.success(
-                "✅ List of dates filtered+emitted after deletion (no LLM regen): "
-                "{} → {} entries (dropped {})",
+                "List of dates filtered+emitted after deletion (no LLM regen): "
+                "{}  {} entries (dropped {})",
                 before_count,
                 len(prior_fast),
                 before_count - len(prior_fast),
@@ -1520,7 +1541,7 @@ class ListOfDatesMixin:
             usage=current_usage(),
         )
         logger.success(
-            "✅ List of dates sent to backend ({} entries)", len(list_of_dates)
+            "List of dates sent to backend ({} entries)", len(list_of_dates)
         )
         self._log_list_of_dates_outbound(
             workspace_id=workspace_id,
@@ -1554,8 +1575,8 @@ class ListOfDatesMixin:
             "context": context,
         }
         logger.info(
-            "📤 list_of_dates outbound at {} [{}]: {}",
-            generated_at,
+            "list_of_dates outbound [{}]: {} entr(ies), {} with a source citation",
             context,
-            json.dumps(outbound, ensure_ascii=False),
+            len(list_of_dates or []),
+            sum(1 for e in (list_of_dates or []) if isinstance(e, dict) and e.get("citation")),
         )

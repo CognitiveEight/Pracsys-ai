@@ -44,7 +44,7 @@ class AISocketService:
         self.client: Optional[SocketClient] = None
         self._running = False
         self._background_task: Optional[asyncio.Task] = None
-        logger.info("🤖 AI Socket Service initialized")
+        logger.info("AI Socket Service initialized")
 
     async def start(self) -> None:
         """
@@ -63,7 +63,7 @@ class AISocketService:
             return
 
         try:
-            logger.info("🚀 Starting AI Socket Service...")
+            logger.info("Starting AI Socket Service...")
 
             # Delegate to the shared application lifecycle rather than only
             # opening the socket. This method used to create a SocketClient and
@@ -83,18 +83,10 @@ class AISocketService:
             self.client = lifecycle.socket_client
             self._running = True
 
-            logger.success("✅ AI Socket Service started successfully")
-            logger.info("📡 Listening for events:")
-            logger.info("   - workspace_created: New workspace created")
-            logger.info("   - workspace_sync: Workspace updated")
-            logger.info("   - user_message_request: User chat message")
-            logger.info("   - analysis_docx_generate_request: Analysis DOCX text processing")
-            logger.info("   - ai_heartbeat_ping: Backend keepalive (replies with ai_heartbeat_pong)")
-            logger.info("📤 Ready to emit:")
-            logger.info("   - ai_response: AI chat response")
+            logger.success("AI Socket Service started successfully")
 
         except Exception as e:
-            logger.error(f"❌ Failed to start AI Socket Service: {e}")
+            logger.error("Failed to start AI Socket Service: {}", e)
             self._running = False
             raise
 
@@ -111,7 +103,7 @@ class AISocketService:
             return
 
         try:
-            logger.info("🛑 Stopping AI Socket Service...")
+            logger.info("Stopping AI Socket Service...")
 
             # Mirror start(): tear the whole stack down, not just the socket.
             # Disconnecting alone left the document processor's temp files and
@@ -122,10 +114,10 @@ class AISocketService:
             self.client = None
             self._running = False
 
-            logger.success("✅ AI Socket Service stopped")
+            logger.success("AI Socket Service stopped")
 
         except Exception as e:
-            logger.error(f"Error stopping AI Socket Service: {e}")
+            logger.error("Error stopping AI Socket Service: {}", e)
             raise
 
     async def run_forever(self) -> None:
@@ -138,7 +130,7 @@ class AISocketService:
         await self.start()
 
         try:
-            logger.info("🔄 AI Socket Service running... (Press Ctrl+C to stop)")
+            logger.info("AI Socket Service running... (Press Ctrl+C to stop)")
 
             # Keep the service running
             while self._running:
@@ -147,14 +139,14 @@ class AISocketService:
                 # Check connection health
                 if self.client and not self.client.is_connected:
                     logger.warning(
-                        "⚠️ Socket disconnected, reconnection will be attempted automatically"
+                        "Socket disconnected, reconnection will be attempted automatically"
                     )
                     # Socket.IO client will handle reconnection automatically
 
         except KeyboardInterrupt:
-            logger.info("⌨️ Keyboard interrupt received")
+            logger.info("Keyboard interrupt received")
         except Exception as e:
-            logger.error(f"❌ Error in AI Socket Service: {e}")
+            logger.error("Error in AI Socket Service: {}", e)
             raise
         finally:
             await self.stop()
@@ -226,13 +218,7 @@ async def main():
     """
     from app.main import Application
 
-    logger.info("=" * 80)
-    logger.info("AI SOCKET.IO SERVICE")
-    logger.info("=" * 80)
-    logger.info("Client Type: AI_Maverick")
-    logger.info("Authentication: HMAC-SHA256 signature")
-    logger.info("=" * 80)
-
+    logger.info("AI Socket.IO service (client type AI_Maverick, HMAC-SHA256 handshake)")
     await Application().run()
 
 

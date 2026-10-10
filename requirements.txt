@@ -7,7 +7,7 @@ pydantic-settings>=2.1.0
 # Socket.IO Client
 python-socketio==5.11.1
 python-engineio==4.9.1
-aiohttp==3.9.5
+aiohttp==3.14.3
 
 # AI/ML - Google Gemini
 google-generativeai>=0.4.0
@@ -36,7 +36,7 @@ google-cloud-discoveryengine>=0.11.0
 langgraph>=0.0.62
 
 # Vector Store
-qdrant-client==1.7.3
+qdrant-client==1.18.0
 
 # Database & Caching
 redis==5.0.1
@@ -61,6 +61,9 @@ PyPDF2==3.0.1
 python-docx==1.1.0
 pdf2image>=1.16.0
 docx2txt>=0.8
+# Spreadsheet (.xlsx/.xlsm) and slide-deck (.pptx) evidence extraction.
+openpyxl>=3.1
+python-pptx>=1.0
 
 # Drafting Assistant — DOCX generation from AI Markdown
 markdown-it-py>=3.0
@@ -81,3 +84,6 @@ PyMuPDF>=1.23
 # numbering and page flow byte-for-byte.
 docxtpl>=0.16.7
 
+# Legal knowledge graph (ontology agentic RAG). Optional at runtime: without
+# NEO4J_URL the ontology and retrieval layers import and run with no graph.
+neo4j>=5.26,<6

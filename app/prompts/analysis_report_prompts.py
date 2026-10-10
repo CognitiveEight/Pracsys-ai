@@ -98,7 +98,7 @@ def generate_analysis_report_from_documents_prompt2(*, _entities_block_ar, combi
                         f"- weaknesses: {(data.get('weaknesses') or [])[:6] if isinstance(data.get('weaknesses'), list) else []}\n"
                         f"- risks: {(data.get('risks') or [])[:6] if isinstance(data.get('risks'), list) else []}\n\n"
                         "DOCUMENTS (in upload order):\n"
-                        f"{combined_document_content[:60000]}\n"
+                        f"{combined_document_content}\n"
     )
 
 
@@ -133,11 +133,25 @@ Rules:
     )
 
 
-def ensure_quality_score_explanation_prompt(*, case_resolution_score, summary):
+def ensure_quality_score_explanation_prompt(*, case_resolution_score, summary, strategic_objective=""):
+    objective_rule = (
+        (
+            "The workspace's CURRENT strategic objective is:\n"
+            f"{strategic_objective.strip()}\n\n"
+            "OBJECTIVE RULE (MANDATORY): the score measures readiness FOR THIS OBJECTIVE, so exactly one "
+            "of your sentences must say how the objective bears on it — which gap or risk matters most "
+            "for pursuing this objective, or which strength most advances it. Use the objective's own "
+            "terms. Do NOT restate the objective, do NOT evaluate whether it is a good objective, and do "
+            "NOT invent any fact that is not in the summary below.\n\n"
+        )
+        if (strategic_objective or "").strip()
+        else ""
+    )
     return (
 f"You are a senior legal analyst. Given this case analysis summary (JSON only), "
                 f"write exactly 3-5 sentences for an Indian-law workspace. "
                 f'Start with "The current score is {case_resolution_score}% because". '
+                f"{objective_rule}"
                 "Then anchor the explanation to SPECIFIC items from the summary — quote (do not paraphrase generically) "
                 "at least one missingInfo item by what is missing and from whom, one weakness or risk by the "
                 "named party / date / amount / annexure that triggers it, and one strength by the named fact "

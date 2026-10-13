@@ -637,3 +637,14 @@ touching it, and note the `.gitignore` `*.md` trap documented there.
 - Prompt edits (legal framing, guardrails) → `app/prompts/`.
 - Knowledge plane / Keel → `keel/` + `docs/KEEL_VENDORED.md`. Ontology, statutory register and eval harness → `app/ontology/`, `app/statutes/`, `app/eval/` + `docs/AGENTIC_ONTOLOGY_RAG_FOUNDATIONS.md`.
 - Full event-flow narrative → `docs/SYSTEM_ARCHITECTURE.md`. Recent feature-level history → `CHANGELOG.md`.
+- Architecture map (start here) → `docs/architecture.md`.
+
+## How work is done here
+
+Every non-trivial change follows `docs/development-workflow.md`: Jira ticket →
+specs in `specs/` (requirements, technical design, acceptance criteria) →
+ticket branch off `development` → PR → `development` → `staging` → `main`.
+Project subagents in `.claude/agents/` cover each stage (`planner`,
+`developer`, `tester`, `reviewer`), and `.claude/rules/` holds short
+path-scoped checklists distilled from this file. Never push, merge or bypass
+the pre-commit hook; a human does that.

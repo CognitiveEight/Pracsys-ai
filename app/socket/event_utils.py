@@ -590,7 +590,7 @@ def _strip_strength_point_statute_boilerplate(text: str) -> str:
     Guard: if stripping would collapse the point below ``_STRENGTH_POINT_MIN_LEN``
     characters (i.e. the model produced a label + boilerplate single-sentence form
     like "Youth of the accused, which is a relevant fact under <Act>, YYYY."), we
-    return the ORIGINAL prose instead. The universal law-strip in ``agent.py`` will
+    return the ORIGINAL prose instead. The universal law-strip in ``app/langgraph/output_filters.py`` will
     then remove the citation in a context-aware way without collapsing the whole
     point to a two-word fragment.
     """

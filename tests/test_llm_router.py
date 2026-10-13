@@ -343,7 +343,7 @@ _SDK_MODULES = ("google.generativeai", "google.genai", "openai", "anthropic", "b
 def test_no_provider_sdk_is_imported_outside_the_adapters():
     root = pathlib.Path(__file__).resolve().parents[1]
     offenders = []
-    for path in list((root / "app").rglob("*.py")) + [root / "agent.py"]:
+    for path in (root / "app").rglob("*.py"):
         if "app/llm/providers" in path.as_posix():
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))

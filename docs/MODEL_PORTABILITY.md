@@ -87,8 +87,8 @@ Some tasks are named explicitly:
 |---|---|
 | `audio_diarization` | Transcript speaker diarization and roles |
 | `audio_transliteration` | Hinglish transliteration |
-| `text_filter` | Forbidden-word filter in `agent.py` |
-| `law_strip` | Law-citation strip in `agent.py` |
+| `text_filter` | Forbidden-word filter in `app/langgraph/output_filters.py` |
+| `law_strip` | Law-citation strip in `app/langgraph/output_filters.py` |
 
 **Startup validation.** `lifecycle.startup` → `gemini_client.initialize()`
 checks every configured profile.

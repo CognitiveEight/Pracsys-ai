@@ -11,7 +11,7 @@ from loguru import logger
 from app.socket.schemas import (
     AnalysisDocxGenerateRequestPayload,
 )
-from agent import process_analysis_docx_request
+from app.langgraph.output_filters import process_analysis_docx_request
 
 
 

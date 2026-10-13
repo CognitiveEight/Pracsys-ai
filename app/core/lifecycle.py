@@ -2,7 +2,6 @@
 Application lifecycle management.
 """
 
-import asyncio
 from typing import Optional
 
 from loguru import logger

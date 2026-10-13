@@ -27,7 +27,6 @@ import asyncio
 import copy
 from typing import Any, Dict, List, Optional
 
-from loguru import logger
 
 
 class TemplateStore:

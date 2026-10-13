@@ -1,4 +1,4 @@
-.PHONY: help install setup test e2e run clean docker-up docker-down docker-logs ontology-ddl graph-up
+.PHONY: help install setup test lint e2e run clean docker-up docker-down docker-logs ontology-ddl graph-up
 
 help:
 	@echo "SimplerToday - Available Commands"
@@ -83,12 +83,8 @@ docker-logs:
 	docker-compose logs -f
 
 lint:
-	@echo "Running linters..."
-	@if command -v pylint >/dev/null 2>&1; then \
-		pylint app/ || true; \
-	else \
-		echo "pylint not installed. Skipping..."; \
-	fi
+	@echo "Running ruff (rules in pyproject.toml)..."
+	ruff check .
 
 format:
 	@echo "Formatting code..."

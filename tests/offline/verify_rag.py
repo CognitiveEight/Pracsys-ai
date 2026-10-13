@@ -121,7 +121,6 @@ def check_chunker():
         rebuilt = reassemble([{"content": c.text, "overlap_prev": c.overlap_prev} for c in chunks])
         ok_exact &= rebuilt == text
         for c in chunks:
-            first = text.rfind("--- Page ", 0, c.char_start + c.overlap_prev + 1)
             ok_pages &= c.page_start is not None
     check("chunks rebuild the document byte for byte (20 random documents)", ok_exact)
     check("every chunk of a paginated document has a page number", ok_pages)
@@ -375,7 +374,6 @@ async def check_chat_pipeline(store: QdrantStore, ws: str):
     # Answer node: invented label + unsupported figure, repaired on the retry.
     label = next(iter(pack.items))
     item = pack.items[label]
-    fig = next(iter(__import__("app.rag.citations", fromlist=["_figures"])._figures(item.text)), None)
     state = {
         "user_message": "What does the file say?", "intent": "EXPLAIN", "role": "PETITIONER",
         "prompt_context": "CONTEXT", "evidence_index": pack.to_state(),
@@ -427,7 +425,7 @@ async def check_panel_citations(store: QdrantStore):
          "sourceDocId": "fir", "pageNumber": 1},
         {"date": "2030-01-01", "title": "Invented event", "description": "Nothing supports this"},
     ]}
-    n = await attribution.attach_panel_citations(ws, "list_of_dates", dates)
+    await attribution.attach_panel_citations(ws, "list_of_dates", dates)
     e0, e1, e2 = dates["listOfDates"]
     check("a date attributed to the wrong document is re-pointed to the one containing it",
           e0["sourceDocId"] == "notice" and e0["sourceDocName"] == "Notice.pdf", str(e0))

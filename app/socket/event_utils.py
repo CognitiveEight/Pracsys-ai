@@ -4,16 +4,10 @@ Extracted verbatim from the original events.py. Stdlib-only (a dependency
 leaf) so any handler module can import these without circular-import risk.
 """
 
-import asyncio
-import json
 import re
-import time
 import uuid
 from datetime import date as date_type
-from datetime import datetime
-from html import unescape
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import quote_plus
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 __all__ = [
     'EventHandler',

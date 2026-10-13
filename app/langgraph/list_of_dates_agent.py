@@ -648,11 +648,6 @@ Legal text:
         today_str_for_check = (
             state.get("today_str") or datetime.utcnow().strftime("%Y-%m-%d")
         )
-        try:
-            current_year_int = int(today_str_for_check[:4])
-        except (TypeError, ValueError):
-            current_year_int = datetime.utcnow().year
-
         normalized: List[Dict[str, Any]] = []
         seen_dates: set = set()
         for item in arr:

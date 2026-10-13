@@ -3,7 +3,7 @@ Agent router for determining which agent should handle a request.
 """
 
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 from loguru import logger
 
@@ -127,8 +127,6 @@ class AgentRouter:
             AgentType to handle the request
         """
         # Simple keyword-based routing (placeholder)
-        message_lower = message.lower()
-
         # TODO: Implement more sophisticated routing logic
         # For now, default to chat agent
 

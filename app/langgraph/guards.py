@@ -4,7 +4,7 @@ These enforce role consistency throughout the application.
 """
 
 import functools
-from typing import Any, Callable
+from typing import Callable
 
 from loguru import logger
 

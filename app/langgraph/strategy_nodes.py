@@ -10,7 +10,6 @@ from loguru import logger
 from app.agents.role_models import Role, RoleEnum
 from app.langgraph.strategy_models import (ROLE_STRATEGY_COMPATIBILITY,
                                            StrategyOption, StrategyStatus,
-                                           StrategyType,
                                            StrategyValidationResult,
                                            UserObjective,
                                            get_incompatibility_reason,

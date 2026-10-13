@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional, TypedDict
 from langgraph.graph import END, StateGraph
 from loguru import logger
 
-from app.langgraph.strategy_models import StrategyOption, StrategyState
+from app.langgraph.strategy_models import StrategyOption
 from app.langgraph.strategy_nodes import (strategy_lock_node,
                                           strategy_suggestion_node,
                                           strategy_validation_node,

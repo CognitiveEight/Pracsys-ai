@@ -3,14 +3,10 @@ LangGraph nodes for role-based agent system.
 These nodes enforce role selection and conditioning.
 """
 
-from typing import Any, Dict
 
 from loguru import logger
 
-from app.agents.role_models import (ROLE_GATE_MESSAGE, Role,
-                                    RoleBehaviorContract, RoleContext,
-                                    RoleEnum, RoleSelectionError,
-                                    create_role_gate_response)
+from app.agents.role_models import (ROLE_GATE_MESSAGE, RoleBehaviorContract, RoleEnum, RoleSelectionError)
 from app.langgraph.state import (WorkspaceState,
                                  invalidate_role_derived_intelligence,
                                  update_role_state, validate_role_state)
@@ -64,8 +60,6 @@ def role_gate_node(state: WorkspaceState) -> WorkspaceState:
         )
 
         # Return ONLY the role gate message
-        gate_response = create_role_gate_response()
-
         state["agent_output"] = ROLE_GATE_MESSAGE
         state["metadata"]["role_gate_blocked"] = True
         state["metadata"]["requires_role_selection"] = True

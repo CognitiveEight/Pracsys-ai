@@ -658,6 +658,7 @@ The Claude Code set-up, all committed except the `*.local.*` files:
 | `.claude/hooks/` | `block-secrets.sh` (credential files, incl. via Bash), `protect-branch.sh` (no commit on `development`/`staging`/`main`, no `--no-verify`, no push), `validate-code.sh` (ruff after each edit) |
 | `.claude/commands/` | `/spec`, `/implement`, `/verify`, `/review`, `/release-check`, `/retro`, `/meeting`, each taking a Jira key, branch or topic |
 | `.claude/skills/` | `spec-writing`, `testing-patterns`, `confluence-docs`, loaded when the task needs them |
+| `.claude/settings.local.json`, `CLAUDE.local.md` | Personal, gitignored |
 
 Every workflow step also records its result in Confluence. The space's
 **SimplerToday – SDLC Templates** tree holds one template per record:
@@ -665,4 +666,3 @@ Business Requirement, Product Management, Cross Functional Requirements, Risk
 & Backlogs, Release Management, Retrospective, Meeting & Discussion, Developer
 Onboarding. The `confluence-docs` skill maps each command to its page, and
 nothing is written to Confluence or Jira without the user's yes.
-| `.claude/settings.local.json`, `CLAUDE.local.md` | Personal, gitignored |

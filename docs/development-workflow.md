@@ -1,18 +1,19 @@
 # Development workflow
 
-How a change goes from a Jira ticket to production. `ST` stands for the Jira
-project key.
+How a change goes from a Jira ticket to production. The Jira project key is
+`SIM`.
 
 ## Branches
 
 ```
-feature/ST-123-short-name ──PR──► development ──PR──► staging ──PR──► main
-fix/ST-124-short-name     ──PR──┘
+feature/SIM-123-short-name ──PR──► development ──PR──► staging ──PR──► main
+fix/SIM-124-short-name     ──PR──┘
 ```
 
 - Branch from `development`. Name it with the ticket key so Jira links the
   branch, commits and PR automatically (GitHub for Jira).
-- Commits: `feat(ST-123): …`, `fix(ST-123): …`, `chore: …`.
+- Commits: `feat(SIM-123): …`, `fix(SIM-123): …`, `docs(SIM-123): …`,
+  `chore: …`.
 - Nobody, human or agent, commits directly to `development`, `staging` or
   `main`.
 
@@ -25,8 +26,8 @@ fix/ST-124-short-name     ──PR──┘
 | 3 | Implementation | `developer` agent or developer | commits on the ticket branch | In Progress |
 | 4 | Tests | `tester` agent | tests mapped to each AC; `make test` green | In Progress |
 | 5 | Review | `reviewer` agent, then a human approver | findings + verdict on the PR | In Review |
-| 6 | Merge to `development` | human | — | Done (dev) |
-| 7 | Promote to `staging`, then `main` | release owner | release PR, CHANGELOG | Released |
+| 6 | Merge to `development` | human | — | Done |
+| 7 | Promote to `staging`, then `main` | release owner | release PR, CHANGELOG, Release Management page | (no Jira status) |
 
 Run each step from Claude Code in this repo with its command. Each one reads
 the Jira issue and asks before writing anything back to Jira:
@@ -46,6 +47,25 @@ The templates live under **SimplerToday – SDLC Templates** in Confluence; the
 The rules are enforced, not only written down: `.claude/settings.json` denies
 credential files, `git push`/`merge` and `make e2e`, and the hooks in
 `.claude/hooks/` block commits on protected branches and `--no-verify`.
+
+## Jira
+
+Project key `SIM`. Board columns, in order:
+
+| Status | Meaning |
+|---|---|
+| To Do | Ticket written; no spec yet |
+| Spec Review | Specs written; waiting for owner and tech lead approval |
+| In Progress | Design approved; code and tests on the ticket branch |
+| In Review | PR open; reviewer agent and a human approver |
+| Done | Merged to `development` |
+
+Spec Review is being added to the board by the Jira admin. Until it exists,
+an issue with specs under review stays in To Do, and `/spec` skips the
+transition.
+
+Work types: Epic, Task, Bug, Subtask. There is no Story type. A Subtask
+can track one step of a spec's task list.
 
 ## Gates
 
@@ -79,8 +99,11 @@ make lint && make test
 
 ## Not set up yet
 
-- CI (GitHub Actions running `make lint` and `make test` on every PR) and
-  branch protection on `development` / `staging` / `main`.
-- The Jira project, its workflow statuses and the GitHub for Jira link.
+- The Jira project exists (`SIM`). The Spec Review status is pending (see
+  "Jira" above).
+- CI (GitHub Actions running `make lint` and `make test` on every PR) is
+  being added in SIM-23.
+- Branch protection on `development` / `staging` / `main` and the GitHub for
+  Jira link are pending (SIM-24).
 - Running agents from CI (`anthropics/claude-code-action@v1`, which needs an
   `ANTHROPIC_API_KEY` repository secret added by an admin).

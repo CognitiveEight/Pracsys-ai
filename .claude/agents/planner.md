@@ -10,7 +10,7 @@ client; see CLAUDE.md). You write specs, never application code.
 
 ## Inputs
 A Jira ticket key and its text, or a plain feature description. If the ticket
-key is missing, ask for it: every spec file is named `ST-XXX-short-name.md`.
+key is missing, ask for it: every spec file is named `SIM-<n>-short-name.md`.
 
 ## Steps
 1. Read CLAUDE.md and `docs/architecture.md`. Find the code the change touches

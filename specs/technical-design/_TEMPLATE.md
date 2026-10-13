@@ -1,6 +1,6 @@
-# ST-XXX: <title> — technical design
+# SIM-<n>: <title> — technical design
 
-- **Requirements:** `specs/requirements/ST-XXX-….md`
+- **Requirements:** `specs/requirements/SIM-<n>-….md`
 - **Status:** draft | approved
 - **Approver:** <tech lead role>
 

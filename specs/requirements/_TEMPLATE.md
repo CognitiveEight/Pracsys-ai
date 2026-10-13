@@ -1,9 +1,9 @@
-# ST-XXX: <title>
+# SIM-<n>: <title>
 
-- **Jira:** ST-XXX
+- **Jira:** SIM-<n>
 - **Owner:** <role, e.g. product owner>
 - **Status:** draft | approved
-- **Target branch flow:** feature/ST-XXX-… → development → staging → main
+- **Target branch flow:** feature/SIM-<n>-… → development → staging → main
 
 ## Problem
 What the lawyer (or the backend) cannot do today, and what it costs them.

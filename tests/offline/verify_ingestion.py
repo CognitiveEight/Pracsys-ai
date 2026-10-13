@@ -12,8 +12,8 @@ Covers:
                               document-control metadata of policy annexures
 
 USAGE
-    python verify_ingestion.py
-    python verify_ingestion.py --pdf path/to/file.pdf   # also dump one PDF's text
+    python tests/offline/verify_ingestion.py
+    python tests/offline/verify_ingestion.py --pdf path/to/file.pdf   # also dump one PDF's text
 
 REQUIREMENTS
     Run inside the project venv. No API key, network or Qdrant needed.
@@ -23,7 +23,7 @@ import argparse
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # repo root
 
 import app.socket.events  # noqa: E402,F401  (import-order workaround for a pre-existing cycle)
 from app.processing.file_handlers import (  # noqa: E402

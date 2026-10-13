@@ -36,8 +36,8 @@ Covers:
                     re-run, and never leaves a panel loader spinning
 
 USAGE
-    python verify_objective_change.py            # run everything
-    python verify_objective_change.py --list     # show the check names
+    python tests/offline/verify_objective_change.py            # run everything
+    python tests/offline/verify_objective_change.py --list     # show the check names
 
 REQUIREMENTS
     Run inside the project venv so `app` is importable. Nothing else.
@@ -52,7 +52,7 @@ import sys
 import time
 import uuid
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # repo root
 
 from app.prompts.strategy_prompts import \
     regenerate_strategy_for_new_objective_prompt  # noqa: E402

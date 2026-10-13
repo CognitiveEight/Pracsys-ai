@@ -21,7 +21,7 @@ Functional checks (in a temporary directory, with dummy settings):
   * audit and trace records stay out of app.log.
 
 USAGE
-    python verify_logging.py
+    python tests/offline/verify_logging.py
 """
 
 import ast
@@ -32,7 +32,7 @@ import subprocess
 import sys
 import tempfile
 
-ROOT = pathlib.Path(__file__).resolve().parent
+ROOT = pathlib.Path(__file__).resolve().parents[2]  # repo root
 LEVELS = {"debug", "info", "success", "warning", "error", "exception", "critical"}
 EMOJI = re.compile("[\U0001F300-\U0001FAFF☀-➿⭐⬆⬇✅❌]")
 CONTENT = re.compile(

@@ -36,8 +36,8 @@ Covers:
   7. lifecycle     — pending purge revoked, roster not clobbered, role resolved
 
 USAGE
-    python verify_document_reload.py            # run everything
-    python verify_document_reload.py --list     # show the check names
+    python tests/offline/verify_document_reload.py            # run everything
+    python tests/offline/verify_document_reload.py --list     # show the check names
 
 REQUIREMENTS
     Run inside the project venv so `app` is importable. Nothing else.
@@ -50,7 +50,7 @@ import os
 import sys
 import uuid
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # repo root
 
 # Silence the write-through persistence before any handler state is touched:
 # every cache assignment would otherwise fire a background Qdrant upsert.

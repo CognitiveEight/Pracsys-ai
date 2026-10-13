@@ -89,13 +89,9 @@ bns-ai-*.json
 gcp-vision.json
 gcp-bucket-dev.json
 google-application-credentials.json
-# Auto-generated Documentation
-*.md
-!README.md
-!**/SYSTEM_ARCHITECTURE.md
-!**/RELEASE.md
-!**/CHANGELOG.md
-!docs/MODEL_PORTABILITY.md
+# Documentation is source: CLAUDE.md, docs/, specs/ and .claude/agents|rules
+# are committed. Retired root-level notes live in the local-only archive.
+/docs/archive/
 # Statute pipeline inputs/outputs (large, regenerable; see scripts/fetch_laws_indiacode.py)
 /masterLaws*.json
 # Local reference material, not part of the service
@@ -104,6 +100,13 @@ google-application-credentials.json
 /docs/TARGET_ARCHITECTURE.drawio
 /pracsys2.0/
 
-
 application-service-*.json
 Central Creds.txt
+*creds*.txt
+*Creds*.txt
+
+# Claude Code: share agents/rules/settings.json, keep personal settings local
+.claude/settings.local.json
+
+# Sample case text for scripts/verify_case_laws.py (may hold personal data, keep local)
+/my_case.txt

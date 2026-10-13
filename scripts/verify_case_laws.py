@@ -10,14 +10,14 @@ precedents WITH their source URLs so you can click through and verify each one.
 USAGE
 -----
   # 1) From a text file containing your case summary:
-  python verify_case_laws.py my_case.txt
+  python scripts/verify_case_laws.py my_case.txt
 
   # 2) Paste / pipe the case text on stdin:
-  python verify_case_laws.py < my_case.txt
-  cat my_case.txt | python verify_case_laws.py
+  python scripts/verify_case_laws.py < my_case.txt
+  cat my_case.txt | python scripts/verify_case_laws.py
 
   # 3) Inline text:
-  python verify_case_laws.py --text "Trademark infringement dispute over the mark BLOOM ..."
+  python scripts/verify_case_laws.py --text "Trademark infringement dispute over the mark BLOOM ..."
 
 OPTIONS
   --query "<words>"   Override the search query sent to Indian Kanoon / grounding
@@ -49,7 +49,7 @@ _INVOCATION_CWD = os.getcwd()
 
 # Make `app.*` importable and ensure .env is found, regardless of where this is
 # run from (this file lives at the project root).
-_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _PROJECT_ROOT)
 os.chdir(_PROJECT_ROOT)
 

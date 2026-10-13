@@ -31,8 +31,8 @@ Covers:
   8. prompt        — the asker reaches the chat prompt as attribution only
 
 USAGE
-    python verify_workspace_share.py            # run everything
-    python verify_workspace_share.py --list     # show the check names
+    python tests/offline/verify_workspace_share.py            # run everything
+    python tests/offline/verify_workspace_share.py --list     # show the check names
 
 REQUIREMENTS
     Run inside the project venv so `app` is importable. Nothing else.
@@ -46,7 +46,7 @@ import os
 import sys
 import uuid
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # repo root
 
 from app.socket.events import event_handler as H  # noqa: E402
 from app.socket.schemas import (UserMessageRequestPayload,  # noqa: E402

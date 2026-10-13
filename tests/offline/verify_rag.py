@@ -23,7 +23,7 @@ collections and deletes them at the end. Embeddings are stubbed — no API key,
 no network calls to Google.
 
 USAGE
-    python verify_rag.py
+    python tests/offline/verify_rag.py
 """
 
 import asyncio
@@ -34,7 +34,7 @@ import random
 import sys
 import uuid
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # repo root
 
 from app.core.config import settings  # noqa: E402
 
@@ -256,18 +256,26 @@ async def check_model_client():
             self.aio = type("A", (), {"models": _Models(vecs)})()
 
     settings.embedding_max_attempts = 1
-    gemini = real.router.provider_for(real.router.embedding_profile())
-    for label, vecs in [("wrong-size embedding is rejected", [[0.1] * 3072]),
-                        ("all-zero embedding is rejected", [[0.0] * DIM])]:
-        gemini._client.set(_Client(vecs))
-        try:
-            await real.embed_text("x")
-            check(label, False, "no error raised")
-        except Exception as e:
-            check(label, "EmbeddingError" in type(e).__name__, repr(e))
-    gemini._client.set(_Client([[3.0, 4.0] + [0.0] * (DIM - 2)]))
-    v = await real.embed_text("x")
-    check("embeddings are unit length", abs(sum(x * x for x in v) - 1.0) < 1e-9)
+    # The fake client below is Gemini-shaped, so pin the Gemini provider: a
+    # local .env routing embeddings elsewhere (EMBEDDING_PROVIDER=gate0) would
+    # otherwise send these calls to a real, differently shaped client.
+    saved_provider = settings.embedding_provider
+    settings.embedding_provider = "gemini"
+    try:
+        gemini = real.router.provider_for(real.router.embedding_profile())
+        for label, vecs in [("wrong-size embedding is rejected", [[0.1] * 3072]),
+                            ("all-zero embedding is rejected", [[0.0] * DIM])]:
+            gemini._client.set(_Client(vecs))
+            try:
+                await real.embed_text("x")
+                check(label, False, "no error raised")
+            except Exception as e:
+                check(label, "EmbeddingError" in type(e).__name__, repr(e))
+        gemini._client.set(_Client([[3.0, 4.0] + [0.0] * (DIM - 2)]))
+        v = await real.embed_text("x")
+        check("embeddings are unit length", abs(sum(x * x for x in v) - 1.0) < 1e-9)
+    finally:
+        settings.embedding_provider = saved_provider
 
 
 def check_page_markers():

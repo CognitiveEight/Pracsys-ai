@@ -28,8 +28,8 @@ apply) with Qdrant, the document processor, the generators and the socket
 stubbed. No API key, no backend, no Qdrant.
 
 USAGE
-    python verify_run_control.py            # run everything
-    python verify_run_control.py --list     # show the check names
+    python tests/offline/verify_run_control.py            # run everything
+    python tests/offline/verify_run_control.py --list     # show the check names
 """
 
 import argparse
@@ -40,7 +40,7 @@ import sys
 import time
 import uuid
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # repo root
 
 # Record (rather than perform) the write-through persistence, so the checks can
 # assert that a stop overwrote the PERSISTED buffer, not just the memory copy.

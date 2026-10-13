@@ -17,8 +17,8 @@ Covers:
   7. rename regression    — the pre-existing rename path is unchanged
 
 USAGE
-    python verify_fact_corrections.py            # run everything
-    python verify_fact_corrections.py --list     # show the check names
+    python tests/offline/verify_fact_corrections.py            # run everything
+    python tests/offline/verify_fact_corrections.py --list     # show the check names
 
 REQUIREMENTS
     Run inside the project venv so `app` is importable. Nothing else.
@@ -32,7 +32,7 @@ import os
 import re
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # repo root
 
 from app.core.config import settings  # noqa: E402
 

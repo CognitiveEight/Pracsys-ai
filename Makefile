@@ -35,8 +35,12 @@ setup:
 test:
 	@echo "Running unit tests and offline verification suites..."
 	python -m pytest -q tests
-	@for f in verify_logging.py verify_rag.py verify_run_control.py verify_document_reload.py verify_objective_change.py verify_workspace_share.py verify_fact_corrections.py verify_missing_info_edit.py; do \
-		echo "== $$f"; python $$f | tail -1 || exit 1; \
+	@# Capture each suite's output so its exit status is checked: piping into
+	@# `tail` reported tail's status, which let a failing suite pass the build.
+	@for f in tests/offline/verify_*.py; do \
+		echo "== $$f"; \
+		out=$$(python $$f 2>&1) || { echo "$$out" | tail -30; echo "FAILED: $$f"; exit 1; }; \
+		echo "$$out" | tail -1; \
 	done
 
 e2e:

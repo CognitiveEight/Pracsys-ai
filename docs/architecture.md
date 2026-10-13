@@ -61,6 +61,7 @@ Backend
 | Model providers and routing | `docs/MODEL_PORTABILITY.md` |
 | Knowledge graph / ontology RAG | `docs/AGENTIC_ONTOLOGY_RAG_FOUNDATIONS.md` |
 | Vendored Keel copy | `docs/KEEL_VENDORED.md` |
+| Architecture decisions and why | `docs/adr/` |
 | How work flows from Jira to release | `docs/development-workflow.md` |
 | Specs for individual changes | `specs/` |
 | Feature history | `CHANGELOG.md` |

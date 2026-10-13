@@ -1,5 +1,5 @@
 ---
-description: Write the spec files for a Jira issue (reads the ticket from Jira, then runs the planner agent)
+description: Write the spec folder for a Jira issue (reads the ticket from Jira, then runs the planner agent)
 argument-hint: <JIRA-KEY e.g. SIM-20>
 ---
 
@@ -9,10 +9,10 @@ Write the specs for Jira issue **$ARGUMENTS**.
 2. Read the issue with the Atlassian (Jira) MCP tools: summary, description,
    acceptance criteria, parent epic, linked issues. If it cannot be read,
    stop and say why; never invent ticket content.
-3. Use the **planner** agent with the ticket text to write the spec files
-   under `specs/`, named `$ARGUMENTS-<short-name>.md`, following the
-   **spec-writing** skill.
-4. Report: the paths written, open questions, and the risk level
+3. Use the **planner** agent with the ticket text to write the spec folder
+   `specs/$ARGUMENTS-<short-name>/` (requirements, technical design, tasks,
+   acceptance criteria, test cases), following the **spec-writing** skill.
+4. Report: the folder written, open questions, and the risk level
    (low / needs-human-review).
 5. Confluence, following the **confluence-docs** skill (each page needs my
    yes before it is written):
@@ -21,7 +21,7 @@ Write the specs for Jira issue **$ARGUMENTS**.
      **Risk & Backlogs** row for each new risk.
    - Epic: draft the **Product Management** child page instead.
 6. Ask me before writing anything to Jira. With my yes, add one comment to
-   the issue listing the spec paths, the Confluence page links and open
+   the issue listing the spec folder, the Confluence page links and open
    questions (no code, no payloads), and move it to **Spec Review** if that
    status exists.
 

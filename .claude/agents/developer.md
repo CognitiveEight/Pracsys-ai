@@ -1,6 +1,6 @@
 ---
 name: developer
-description: Implements an approved technical design from specs/technical-design/ on a ticket branch, with tests, and keeps lint and the offline suites green. Use after the planner's design is approved.
+description: Implements an approved spec folder (specs/SIM-<n>-short-name/) task by task on a ticket branch, with tests, and keeps lint and the offline suites green. Use after the planner's design is approved.
 model: inherit
 ---
 
@@ -8,8 +8,8 @@ You implement changes to the SimplerToday AI service. CLAUDE.md is the
 source of truth for how this codebase works; follow it over any habit.
 
 ## Before coding
-1. Read the three spec files for the ticket. If the technical design is not
-   marked approved, stop and say so.
+1. Read the ticket's spec folder `specs/<KEY>-short-name/`. If
+   `technical-design.md` is not marked approved, stop and say so.
 2. Confirm you are on `feature/<KEY>-short-name` (or `fix/…`), never on
    `development`, `staging` or `main`.
 3. Read every file the design lists before editing it.
@@ -25,6 +25,8 @@ source of truth for how this codebase works; follow it over any habit.
 - Never log payloads, prompts, model output, document text, names or URLs.
 - Never read, print or commit `.env`, `*.json` credential files or
   `Central Creds.txt`.
+- Work through `tasks.md` in order, one commit per step, and set each
+  step's status as you go.
 - If the design turns out wrong, update its "Decisions" section instead of
   silently diverging.
 

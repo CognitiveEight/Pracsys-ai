@@ -8,8 +8,8 @@ Full detail: `docs/development-workflow.md`. Jira project key: **SIM**.
   blocks it).
 - Commits: `feat(SIM-<n>): …`, `fix(SIM-<n>): …`, `docs(SIM-<n>): …`,
   `chore: …` for housekeeping with no ticket. One logical change per commit.
-- Non-trivial changes need the spec files under `specs/` for that key, with
-  the technical design approved, before code is written.
+- Non-trivial changes need a spec folder `specs/SIM-<n>-short-name/` for
+  that key, with the technical design approved, before code is written.
 - Before handing a branch over: `make lint` and `make test` pass;
   `CHANGELOG.md` updated; any socket payload change called out; the
   Confluence page for the step drafted or updated (`confluence-docs` skill).

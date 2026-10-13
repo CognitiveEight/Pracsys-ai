@@ -3,6 +3,7 @@
 - **Jira:** SIM-<n>
 - **Owner:** <role, e.g. product owner>
 - **Status:** draft | approved
+- **Work type:** Epic | Task | Bug
 - **Target branch flow:** feature/SIM-<n>-… → development → staging → main
 
 ## Problem

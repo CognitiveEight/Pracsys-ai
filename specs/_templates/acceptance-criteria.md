@@ -1,10 +1,12 @@
 # SIM-<n>: <title> — acceptance criteria
 
-- **Requirements:** `specs/requirements/SIM-<n>-….md`
-- **Design:** `specs/technical-design/SIM-<n>-….md`
+- **Requirements:** `requirements.md` (same folder)
+- **Design:** `technical-design.md` (same folder)
+- **Test cases:** `test-cases.md` (same folder)
 
 Each criterion is testable and maps to exactly one automated check, or is
-marked **manual** with the reason (e.g. needs a live backend).
+marked **manual** with the reason (e.g. needs a live backend). The check is
+described in `test-cases.md`; "Verified by" names its file and test.
 
 | ID | Given | When | Then | Verified by |
 |---|---|---|---|---|

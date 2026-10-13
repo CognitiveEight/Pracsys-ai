@@ -1,19 +1,22 @@
 ---
 name: spec-writing
-description: How to write the spec files (requirements, technical design, acceptance criteria) for a Jira issue in the SimplerToday AI service. Use when creating or updating anything under specs/, when running /spec, or when the planner agent is asked to plan a change.
+description: How to write the spec folder (requirements, technical design, tasks, acceptance criteria, test cases) for a Jira issue in the SimplerToday AI service. Use when creating or updating anything under specs/, when running /spec, or when the planner agent is asked to plan a change.
 ---
 
 # Writing specs for a Jira issue
 
-Specs live under `specs/` and are named by the Jira key:
+Each Jira issue gets one folder under `specs/`, named by its key:
 
 ```
-specs/requirements/SIM-<n>-short-name.md         what and why
-specs/technical-design/SIM-<n>-short-name.md     how
-specs/acceptance-criteria/SIM-<n>-short-name.md  how we prove it
+specs/SIM-<n>-short-name/
+  requirements.md         what and why
+  technical-design.md     how
+  tasks.md                ordered steps, one commit each
+  acceptance-criteria.md  how we prove it
+  test-cases.md           the check behind each criterion
 ```
 
-Start each from the `_TEMPLATE.md` in its directory. `specs/README.md` says
+Copy each file from `specs/_templates/` (same name). `specs/README.md` says
 who writes and who approves each file.
 
 ## Requirements
@@ -42,9 +45,14 @@ who writes and who approves each file.
 - **Risks and rollback**: name the flag or env var that switches it off.
 - **Test plan**: which pytest file, which `verify_*.py` group, and whether
   `make e2e` is required.
-- **Implementation tasks**: an ordered list of small steps, each small enough
-  for one commit. They may become Jira Subtasks.
 - Status starts as `draft`. Only a human sets `approved`.
+
+## Tasks
+
+- An ordered list of small steps in `tasks.md`, each small enough for one
+  commit that leaves `make lint` and `make test` green.
+- Name the files each step touches. A step may become a Jira Subtask; its
+  key goes in the Subtask column.
 
 ## Acceptance criteria
 
@@ -53,6 +61,13 @@ who writes and who approves each file.
   the reason.
 - Always consider the edge cases in the template: duplicate `requestId`,
   stop mid-run, disconnect, `view` collaborator, model error/timeout/block.
+
+## Test cases
+
+- At least one row in `test-cases.md` per AC: id (`TC-n`), the AC it
+  covers, type (unit, offline, e2e, manual), steps, expected result and the
+  check as `file::name`.
+- `e2e` and `manual` rows say why an automated offline check is not enough.
 
 ## Never
 

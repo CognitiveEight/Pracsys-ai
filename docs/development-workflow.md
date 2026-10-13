@@ -22,9 +22,9 @@ fix/SIM-124-short-name     ──PR──┘
 | # | Step | Who | Output | Jira status |
 |---|---|---|---|---|
 | 1 | Ticket written with goal and scope | product owner | Jira ticket | To Do |
-| 2 | Specs | `planner` agent → reviewed by owner + tech lead | `specs/requirements`, `technical-design`, `acceptance-criteria` | Spec Review |
-| 3 | Implementation | `developer` agent or developer | commits on the ticket branch | In Progress |
-| 4 | Tests | `tester` agent | tests mapped to each AC; `make test` green | In Progress |
+| 2 | Specs | `planner` agent → reviewed by owner + tech lead | `specs/SIM-<n>-short-name/` (requirements, design, tasks, AC, test cases) | Spec Review |
+| 3 | Implementation | `developer` agent or developer | one commit per step in `tasks.md` | In Progress |
+| 4 | Tests | `tester` agent | the checks in `test-cases.md`; `make test` green | In Progress |
 | 5 | Review | `reviewer` agent, then a human approver | findings + verdict on the PR | In Review |
 | 6 | Merge to `development` | human | — | Done |
 | 7 | Promote to `staging`, then `main` | release owner | release PR, CHANGELOG, Release Management page | (no Jira status) |

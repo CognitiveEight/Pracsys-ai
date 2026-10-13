@@ -54,6 +54,7 @@ Backend
 | Topic | Document |
 |---|---|
 | Full event flow and multi-agent design | `docs/SYSTEM_ARCHITECTURE.md` |
+| Every socket event, payload shape and idempotency key | `docs/socket-events.md` |
 | Handler module map and conventions | `docs/SOCKET_EVENTS_ARCHITECTURE.md` |
 | Reconnects and socket stability | `docs/socket-reconnection-and-stability.md` |
 | Handshake authentication | `docs/AI_SERVICE_AUTH_MIGRATION.md` |

@@ -28,9 +28,20 @@ fix/ST-124-short-name     ──PR──┘
 | 6 | Merge to `development` | human | — | Done (dev) |
 | 7 | Promote to `staging`, then `main` | release owner | release PR, CHANGELOG | Released |
 
-Run the agents from Claude Code in this repo, for example:
-"Use the planner agent for ST-123: <ticket text>", then "Use the developer
-agent to implement specs/technical-design/ST-123-….md".
+Run each step from Claude Code in this repo with its command. Each one reads
+the Jira issue and asks before writing anything back to Jira:
+
+| Step | Command | Agent(s) |
+|---|---|---|
+| 2 Specs | `/spec SIM-123` | `planner` |
+| 3 Implementation | `/implement SIM-123` | `developer` |
+| 4 Tests | `/verify SIM-123` | `tester` |
+| 5 Review | `/review feature/SIM-123-short-name` | `reviewer` + `security-auditor` |
+| 7 Promotion | `/release-check staging` (or `main`) | none; checks only, never deploys |
+
+The rules are enforced, not only written down: `.claude/settings.json` denies
+credential files, `git push`/`merge` and `make e2e`, and the hooks in
+`.claude/hooks/` block commits on protected branches and `--no-verify`.
 
 ## Gates
 

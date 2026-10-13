@@ -645,6 +645,17 @@ Every non-trivial change follows `docs/development-workflow.md`: Jira ticket →
 specs in `specs/` (requirements, technical design, acceptance criteria) →
 ticket branch off `development` → PR → `development` → `staging` → `main`.
 Project subagents in `.claude/agents/` cover each stage (`planner`,
-`developer`, `tester`, `reviewer`), and `.claude/rules/` holds short
-path-scoped checklists distilled from this file. Never push, merge or bypass
-the pre-commit hook; a human does that.
+`developer`, `tester`, `reviewer`, `security-auditor`), and `.claude/rules/`
+holds short path-scoped checklists distilled from this file. Never push, merge
+or bypass the pre-commit hook; a human does that.
+
+The Claude Code set-up, all committed except the `*.local.*` files:
+
+| Path | Purpose |
+|---|---|
+| `.mcp.json` | Atlassian (Jira) MCP server; sign-in is per user, no keys in the file |
+| `.claude/settings.json` | Team permissions: credential files, push, merge and `make e2e` denied; hooks wired |
+| `.claude/hooks/` | `block-secrets.sh` (credential files, incl. via Bash), `protect-branch.sh` (no commit on `development`/`staging`/`main`, no `--no-verify`, no push), `validate-code.sh` (ruff after each edit) |
+| `.claude/commands/` | `/spec`, `/implement`, `/verify`, `/review`, `/release-check`, each taking a Jira key or branch |
+| `.claude/skills/` | `spec-writing`, `testing-patterns`, loaded when the task needs them |
+| `.claude/settings.local.json`, `CLAUDE.local.md` | Personal, gitignored |

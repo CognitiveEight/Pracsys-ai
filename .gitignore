@@ -107,6 +107,7 @@ Central Creds.txt
 
 # Claude Code: share agents/rules/settings.json, keep personal settings local
 .claude/settings.local.json
+CLAUDE.local.md
 
 # Sample case text for scripts/verify_case_laws.py (may hold personal data, keep local)
 /my_case.txt

@@ -31,13 +31,17 @@ fix/ST-124-short-name     ──PR──┘
 Run each step from Claude Code in this repo with its command. Each one reads
 the Jira issue and asks before writing anything back to Jira:
 
-| Step | Command | Agent(s) |
-|---|---|---|
-| 2 Specs | `/spec SIM-123` | `planner` |
-| 3 Implementation | `/implement SIM-123` | `developer` |
-| 4 Tests | `/verify SIM-123` | `tester` |
-| 5 Review | `/review feature/SIM-123-short-name` | `reviewer` + `security-auditor` |
-| 7 Promotion | `/release-check staging` (or `main`) | none; checks only, never deploys |
+| Step | Command | Agent(s) | Confluence record |
+|---|---|---|---|
+| 2 Specs | `/spec SIM-123` | `planner` | Business Requirement (Product Management for an epic), Cross Functional Requirements check, Risk & Backlogs rows |
+| 3 Implementation | `/implement SIM-123` | `developer` | Developer Onboarding Process, if setup changed |
+| 4 Tests | `/verify SIM-123` | `tester` | none |
+| 5 Review | `/review feature/SIM-123-short-name` | `reviewer` + `security-auditor` | Risk & Backlogs rows for open risks |
+| 7 Promotion | `/release-check staging` (or `main`) | none; checks only, never deploys | Release Management page |
+| Any time | `/meeting <topic>`, `/retro <period>` | none | Meeting & Discussion, Retrospective |
+
+The templates live under **SimplerToday – SDLC Templates** in Confluence; the
+`confluence-docs` skill holds the page map.
 
 The rules are enforced, not only written down: `.claude/settings.json` denies
 credential files, `git push`/`merge` and `make e2e`, and the hooks in

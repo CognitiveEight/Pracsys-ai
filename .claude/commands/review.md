@@ -15,5 +15,8 @@ Review branch: **$ARGUMENTS** (if empty, use the current branch).
 4. Give one overall verdict: approve / approve with follow-ups / request
    changes. Say whether the PR needs the `needs-human-review` label and
    whether `make e2e` must be run before deploy.
-5. Ask me before posting anything to Jira or GitHub. Do not push, merge or
-   approve a PR yourself.
+5. For each risk the PR leaves open, propose a **Risk & Backlogs** row
+   (**confluence-docs** skill); likelihood, impact and owner stay blank for
+   a human.
+6. Ask me before posting anything to Jira, Confluence or GitHub. Do not push,
+   merge or approve a PR yourself.

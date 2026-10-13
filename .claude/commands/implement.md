@@ -17,5 +17,9 @@ Implement Jira issue **$ARGUMENTS**.
    `fix($ARGUMENTS): …`. Do not push.
 6. Report what changed, what was verified, what was not, and whether
    `make e2e` is required before deploy.
-7. Ask me before updating Jira. With my yes, move the issue to
+7. If the change touched setup (Makefile, requirements, `env.example`
+   variable names, docker-compose, `.claude/`), propose an update to the
+   **Developer Onboarding Process** page (**confluence-docs** skill) and
+   write it only with my yes.
+8. Ask me before updating Jira. With my yes, move the issue to
    **In Progress** and comment with the branch name.

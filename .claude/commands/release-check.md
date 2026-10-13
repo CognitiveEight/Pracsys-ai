@@ -28,3 +28,8 @@ steps above proved and leaving the rest open:
 - [ ] Rollback path known (previous image tag / feature flag)
 
 Do not run `make e2e` or the Gate0 reconciliation yourself.
+
+Finally, offer to draft the **Release Management** child page
+(**confluence-docs** skill) with the scope, the checks above and their real
+results. Write it only with my yes; leave unverified boxes and the sign-off
+empty.

@@ -14,9 +14,15 @@ Write the specs for Jira issue **$ARGUMENTS**.
    **spec-writing** skill.
 4. Report: the paths written, open questions, and the risk level
    (low / needs-human-review).
-5. Ask me before writing anything to Jira. With my yes, add one comment to
-   the issue listing the spec paths and open questions (paths and questions
-   only, no code, no payloads), and move it to **Spec Review** if that status
-   exists.
+5. Confluence, following the **confluence-docs** skill (each page needs my
+   yes before it is written):
+   - Task or Bug: draft the **Business Requirement** child page, answer the
+     **Cross Functional Requirements** checklist, and propose a
+     **Risk & Backlogs** row for each new risk.
+   - Epic: draft the **Product Management** child page instead.
+6. Ask me before writing anything to Jira. With my yes, add one comment to
+   the issue listing the spec paths, the Confluence page links and open
+   questions (no code, no payloads), and move it to **Spec Review** if that
+   status exists.
 
 Do not write application code in this step.

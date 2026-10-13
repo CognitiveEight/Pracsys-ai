@@ -11,7 +11,8 @@ Full detail: `docs/development-workflow.md`. Jira project key: **SIM**.
 - Non-trivial changes need the spec files under `specs/` for that key, with
   the technical design approved, before code is written.
 - Before handing a branch over: `make lint` and `make test` pass;
-  `CHANGELOG.md` updated; any socket payload change called out.
+  `CHANGELOG.md` updated; any socket payload change called out; the
+  Confluence page for the step drafted or updated (`confluence-docs` skill).
 - State whether `make e2e` is required (handlers, panels or ingestion
   touched). A human runs it: it makes real, billed model calls.
 - Label the PR `needs-human-review` when it changes a socket payload, the

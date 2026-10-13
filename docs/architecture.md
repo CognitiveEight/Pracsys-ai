@@ -64,6 +64,7 @@ Backend
 | Vendored Keel copy | `docs/KEEL_VENDORED.md` |
 | Architecture decisions and why | `docs/adr/` |
 | How work flows from Jira to release | `docs/development-workflow.md` |
+| Tests: suites, fakes, `make e2e` | `docs/testing.md` |
 | Specs for individual changes | `specs/` |
 | Feature history | `CHANGELOG.md` |
 

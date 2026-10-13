@@ -19,3 +19,6 @@ Types:
 | offline | `make test` | a check group in `tests/offline/verify_<area>.py` |
 | e2e | `make e2e` | real, billed model calls; a human runs it |
 | manual | by a person | say why it is not automated |
+
+See `docs/testing.md` for the fakes, settings pinning and what each suite
+covers.

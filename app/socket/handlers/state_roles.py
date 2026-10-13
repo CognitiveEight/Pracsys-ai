@@ -284,6 +284,16 @@ class StateRolesMixin:
             except Exception:
                 pass
 
+        # The model the user chose for this case (module-level, like the roster).
+        selection_payload = cached_kinds.get(CacheKinds.MODEL_SELECTION)
+        if selection_payload:
+            try:
+                from app.workspace.model_selection import hydrate_from_cache
+
+                hydrate_from_cache(workspace_id, selection_payload)
+            except Exception:
+                pass
+
         logger.info(
             "Hydrated workspace caches from Qdrant: {} (kinds={})",
             workspace_id,

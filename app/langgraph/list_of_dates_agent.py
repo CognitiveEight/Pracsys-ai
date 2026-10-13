@@ -368,7 +368,7 @@ class ListOfDatesTemporalAgent:
             return {"raw_response": "[]"}
 
         gemini_client.initialize()
-        if not gemini_client.model:
+        if not gemini_client.is_available():
             return {"raw_response": "[]"}
 
         # "Deep agents" pre-pass: extract the named entities in this document

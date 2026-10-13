@@ -9,11 +9,17 @@ python-socketio==5.11.1
 python-engineio==4.9.1
 aiohttp==3.14.3
 
-# AI/ML - Google Gemini
-google-generativeai>=0.4.0
-google-ai-generativelanguage>=0.4.0
-# New unified SDK — required for long-form drafting (thinking_level control).
+# AI/ML — model providers (app/llm/providers/). Each adapter imports its SDK
+# lazily, but all are installed so any route can be switched on by config.
+# Gemini (default provider): the unified google-genai SDK.
 google-genai>=1.75.0
+# OpenAI, Azure OpenAI, Azure AI Foundry and every OpenAI-compatible server
+# (vLLM / Ollama / TGI / DeepSeek / Qwen / Together / Groq).
+openai>=3.26.1,<4
+# Entra ID (managed identity) auth for Azure OpenAI / Azure AI Foundry.
+azure-identity>=1.26.0
+# AWS Bedrock (Converse) and SageMaker endpoints; credentials from the AWS chain.
+aioboto3>=15.5.0
 
 # Google Cloud (for Vision API OCR)
 google-cloud-vision>=3.4.0
@@ -23,9 +29,8 @@ google-cloud-speech>=2.29.0
 # Required for GCS-backed BatchRecognize (native Chirp 3 speaker diarization)
 google-cloud-storage>=2.10.0
 
-# LangChain with Google (compatible versions)
+# LangChain (graph drawing + Vertex AI Search retriever only; no LLM wrappers)
 langchain>=0.1.6
-langchain-google-genai>=0.0.11
 langchain-core>=0.1.52
 
 # Vertex AI Search retriever (replaces deprecated Google Custom Search / CSE)

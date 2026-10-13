@@ -140,10 +140,15 @@ class _FakeVision:
         self.calls = []
         self.script = list(script or [])
         self.confidence = confidence
+        # Image sizes that always fail. Pages are OCR'd concurrently, so a
+        # per-CALL script cannot target one page; a per-image rule can.
+        self.fail_sizes = set()
 
     def _respond(self, method, image):
         self.calls.append(method)
         action = self.script.pop(0) if self.script else "ok"
+        if self.fail_sizes and Image.open(io.BytesIO(image.content)).size in self.fail_sizes:
+            action = "error"
         if action == "transient":
             from google.api_core import exceptions
 
@@ -259,15 +264,16 @@ def test_usage_is_counted_from_worker_threads(vision):
 
 
 def test_unreadable_page_is_marked_in_place_not_dropped(vision):
-    # Page 2 fails in both modes (and its retry): it keeps its place.
-    vision.script = ["ok", "error", "error"]
-    pdf = _pdf(lambda d: [_scan_page(d) for _ in range(3)])
+    # Page 2 (its own photo size) fails in both modes: it keeps its place.
+    vision.fail_sizes = {(1400, 1980)}
+    pdf = _pdf(lambda d: [
+        _scan_page(d), _scan_page(d, image=_jpeg(1400, 1980)), _scan_page(d)])
     text = fh.FileProcessor.extract_text_from_pdf(pdf, mark_pages=True)
     markers = [l for l in text.splitlines() if l.startswith("--- Page")]
     assert markers == ["--- Page 1 ---", "--- Page 2 ---", "--- Page 3 ---"]
-    assert "[OCR note: this page could not be read." in text.split("--- Page 3 ---")[0]
+    page2 = text.split("--- Page 2 ---")[1].split("--- Page 3 ---")[0]
+    assert "[OCR note: this page could not be read." in page2
     # Without page marks (templates, pdf_to_docx) the old output is kept: no notes.
-    vision.script = ["ok", "error", "error"]
     plain = fh.FileProcessor.extract_text_from_pdf(pdf, mark_pages=False)
     assert "OCR note" not in plain and plain.count("Page text") == 2
 

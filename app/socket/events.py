@@ -591,6 +591,7 @@ class SocketEventHandler(
             logger.log(level, "event {} received (keys: {})", event_name, sorted(body.keys()))
             started = time.monotonic()
             status = "ok"
+            model_token = self._apply_model_selection(event_name, body)
             try:
                 # Every workspace-scoped event runs inside its run scope, which
                 # is what lets workspace_stop_request cancel and fence it.
@@ -606,6 +607,9 @@ class SocketEventHandler(
                     details={"event": event_name, "error": str(e)},
                 )
             finally:
+                from app.workspace.model_selection import reset_message_model
+
+                reset_message_model(model_token)
                 # Long panel work runs in background tasks after this returns;
                 # each of those reports its own "result" line when it emits.
                 logger.log(
@@ -613,6 +617,27 @@ class SocketEventHandler(
                     "event {} finished in {:.1f}s status={}",
                     event_name, time.monotonic() - started, status,
                 )
+
+    #: Events whose ``aiModel`` sets the CASE's model (see model_selection.py).
+    _CASE_MODEL_EVENTS = frozenset(
+        {"workspace_created", "workspace_sync", "workspace_version_restore"}
+    )
+
+    def _apply_model_selection(self, event_name: str, body: Dict[str, Any]) -> Any:
+        """Apply ``aiModel`` from an inbound event. Workspace events set the
+        case's model (absent = unchanged, null/"" = default); a chat message
+        overrides it for that turn only. Returns the turn-override token for
+        ``handle`` to reset. Never raises."""
+        try:
+            from app.workspace.model_selection import set_message_model, set_workspace_model
+
+            if event_name in self._CASE_MODEL_EVENTS and "aiModel" in body:
+                set_workspace_model(str(body.get("workspaceId") or ""), body.get("aiModel"))
+            elif event_name == "user_message_request" and body.get("aiModel"):
+                return set_message_model(body.get("aiModel"))
+        except Exception as exc:  # a bad selection must never block the event
+            logger.warning("aiModel not applied: {}", exc)
+        return None
 
     _EMPTY_CASE_ENTITIES: Dict[str, List[Any]] = {
         "parties": [],

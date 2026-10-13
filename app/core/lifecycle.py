@@ -47,8 +47,9 @@ class ApplicationLifecycle:
             logger.info("Initializing document processor...")
             await self.document_processor.initialize()
 
-            # Initialize Gemini AI client
-            logger.info("Initializing Google Gemini AI client...")
+            # Initialize the model client (validates LLM_* routing; an
+            # explicitly configured profile that cannot be served stops startup)
+            logger.info("Initializing model client...")
             gemini_client.initialize()
 
             # Legal knowledge graph. Non-strict: an unreachable graph is

@@ -17,6 +17,8 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.llm.errors import is_generation_error
+
 from app.utils.redact import chars
 
 from app.agents.role_models import RoleEnum
@@ -2553,7 +2555,7 @@ Rules:
             from app.ai.gemini_client import gemini_client
 
             gemini_client.initialize()
-            if not gemini_client.model:
+            if not gemini_client.is_available():
                 return (
                     True,
                     self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT,
@@ -2631,7 +2633,7 @@ Rules:
                 response_mime_type="application/json",
             )
             raw = (raw or "").strip()
-            if not raw or raw.startswith("Error") or "Error generating" in raw[:50]:
+            if not raw or is_generation_error(raw):
                 logger.warning(
                     "Rejection score delta: Gemini error or empty; using default. raw={}",
                     chars(raw),
@@ -3128,7 +3130,7 @@ Rules:
             from app.ai.gemini_client import gemini_client
 
             gemini_client.initialize()
-            if not gemini_client.model:
+            if not gemini_client.is_available():
                 logger.warning(
                     "added_missing_information: Gemini unavailable; assuming not related"
                 )
@@ -3214,7 +3216,7 @@ Rules:
                 response_mime_type="application/json",
             )
             raw = (raw or "").strip()
-            if not raw or raw.startswith("Error") or "Error generating" in raw[:50]:
+            if not raw or is_generation_error(raw):
                 logger.warning(
                     "added_missing_information score delta: empty/error response; treating as not related. raw={}",
                     chars(raw),

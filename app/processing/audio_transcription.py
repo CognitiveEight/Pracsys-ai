@@ -37,19 +37,8 @@ from loguru import logger
 
 from app.utils.redact import chars
 
-from app.ai.usage import record_stt_seconds, record_usage
+from app.ai.usage import record_stt_seconds
 from app.core.config import settings
-
-try:
-    import google.generativeai as _genai
-    from google.generativeai.types import HarmBlockThreshold, HarmCategory
-
-    _GENAI_AVAILABLE = True
-except Exception:  # pragma: no cover - optional dep, also configured elsewhere
-    _genai = None
-    HarmBlockThreshold = None  # type: ignore[assignment]
-    HarmCategory = None  # type: ignore[assignment]
-    _GENAI_AVAILABLE = False
 
 try:
     from google.api_core.client_options import ClientOptions
@@ -107,18 +96,6 @@ MIN_CHUNK_SECONDS = 12.0
 SILENCE_NOISE_THRESHOLD_DB = -35
 DEFAULT_CHIRP_REGION = "us"
 _PYANNOTE_PIPELINE = None
-
-# Gemini safety settings (legal call recordings often trip default filters).
-if HarmBlockThreshold is not None and HarmCategory is not None:
-    _PERMISSIVE_SAFETY_SETTINGS = {
-        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-    }
-else:
-    _PERMISSIVE_SAFETY_SETTINGS = {}
-
 
 # ── Dataclasses ───────────────────────────────────────────────────────────────
 @dataclass
@@ -187,19 +164,22 @@ class AudioTranscriptionResult:
     duration_seconds: Optional[float] = None
 
 
-# ── Gemini helpers (use existing google-generativeai SDK) ─────────────────────
+# ── Model helpers ─────────────────────────────────────────────────────────────
+# Text-only calls over the transcript (diarization, speaker roles, Hinglish
+# transliteration). They run inside the asyncio.to_thread transcription worker,
+# so they go through gemini_client.generate_sync: routed per task like every
+# other call (LLM_ROUTES keys "audio_diarization" / "audio_transliteration"),
+# bounded by the request timeout, logged as llm_call and billed to the scope
+# that started the transcription.
+_TASK_DIARIZATION = "audio_diarization"
+_TASK_TRANSLITERATION = "audio_transliteration"
+
+
 def _gemini_configured() -> bool:
-    if not _GENAI_AVAILABLE or not settings.google_api_key:
-        return False
-    try:
-        _genai.configure(api_key=settings.google_api_key)
-        return True
-    except Exception:
-        return False
+    """Whether a model can serve the audio calls (name kept for callers)."""
+    from app.ai.gemini_client import gemini_client
 
-
-def _gemini_model_name() -> str:
-    return (settings.gemini_model or "gemini-2.5-flash").strip()
+    return gemini_client.is_available()
 
 
 def _extract_json_object(text: str) -> Optional[dict | list]:
@@ -238,62 +218,50 @@ def _coerce_valid_json_text(raw: str) -> Optional[str]:
         return None
 
 
-def _record_audio_gemini_usage(response: Any) -> None:
-    """Bill one raw-SDK audio Gemini call to the active usage scope.
+def _generate_model_text(
+    prompt: str, *, max_output_tokens: int, json_mode: bool, task: str
+) -> Optional[str]:
+    """One blocking model call from the transcription worker thread. Returns
+    None when the call fails or yields no text."""
+    from app.ai.gemini_client import gemini_client, is_generation_error
 
-    The three helpers below call ``_genai.GenerativeModel(...).generate_content``
-    directly rather than going through ``GeminiClient``, so they bypass its
-    ``_record_usage`` hook and their tokens would otherwise be billed to nobody.
-    Field names and the thinking-tokens-as-output rule mirror
-    ``GeminiClient._record_usage``. Never raises.
-    """
-    try:
-        usage = getattr(response, "usage_metadata", None)
-        prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
-        output_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
-        thinking_tokens = int(getattr(usage, "thoughts_token_count", 0) or 0)
-        record_usage(prompt_tokens, output_tokens + thinking_tokens)
-    except Exception as exc:  # cost metering must never break transcription
-        logger.debug("Audio Gemini usage metering failed: {}", exc)
+    # JSON callers repair truncated arrays themselves (_try_repair_truncated_json_array)
+    # from the FULL text; a model repair round only sees a preview of it.
+    kwargs: dict = (
+        {"response_mime_type": "application/json", "repair_json": False} if json_mode else {}
+    )
+    text = gemini_client.generate_sync(
+        prompt, temperature=0.0, max_tokens=max_output_tokens, task=task, **kwargs
+    )
+    if is_generation_error(text):
+        logger.warning("Audio model call failed ({}): {}", task, (text or "")[:200])
+        return None
+    text = (text or "").strip()
+    return text or None
 
 
 def _generate_gemini_json_raw(
-    prompt: str, *, max_output_tokens: int = 2048
+    prompt: str, *, max_output_tokens: int = 2048, task: str = _TASK_DIARIZATION
 ) -> Optional[str]:
-    """Run a JSON-mode Gemini call and return the RAW response text (no parse).
-    Returns None only when the API call itself fails or yields no text.
+    """Run a JSON-mode model call and return the response text.
+    Returns None only when the call itself fails or yields no text.
 
-    Use this when callers want a chance to repair a truncated streaming
-    response that ``_generate_gemini_json`` would discard wholesale.
+    Use this when callers want a chance to repair a truncated response that
+    ``_generate_gemini_json`` would discard wholesale.
     """
     if not _gemini_configured():
-        logger.warning("Audio Gemini JSON call skipped: GOOGLE_API_KEY not configured")
+        logger.warning("Audio JSON call skipped: no model configured")
         return None
-    try:
-        model = _genai.GenerativeModel(_gemini_model_name())
-        config = _genai.types.GenerationConfig(
-            temperature=0.0,
-            max_output_tokens=max_output_tokens,
-            response_mime_type="application/json",
-        )
-        response = model.generate_content(
-            prompt,
-            generation_config=config,
-            safety_settings=_PERMISSIVE_SAFETY_SETTINGS,
-        )
-    except Exception as e:
-        logger.warning("Audio Gemini JSON call failed: {}", e)
-        return None
-    _record_audio_gemini_usage(response)
-    text = getattr(response, "text", "") or ""
+    text = _generate_model_text(
+        prompt, max_output_tokens=max_output_tokens, json_mode=True, task=task
+    )
     if not text:
-        logger.warning("Audio Gemini JSON call returned empty text")
-        return None
+        logger.warning("Audio JSON call returned empty text")
     return text
 
 
 def _generate_gemini_json(prompt: str, *, max_output_tokens: int = 2048) -> Optional[dict]:
-    """Run a JSON-mode Gemini call. Returns None on any failure."""
+    """Run a JSON-mode model call. Returns None on any failure."""
     text = _generate_gemini_json_raw(prompt, max_output_tokens=max_output_tokens)
     if not text:
         return None
@@ -315,64 +283,31 @@ def _generate_gemini_json(prompt: str, *, max_output_tokens: int = 2048) -> Opti
 def _generate_gemini_plaintext_raw(
     prompt: str, *, max_output_tokens: int = 4096
 ) -> Optional[str]:
-    """Run a Gemini call WITHOUT response_mime_type='application/json' and
-    return the raw text response.
+    """Run a model call WITHOUT JSON mode and return the raw text response.
 
     Used by the Hinglish backstop. Plain-text mode has two advantages over
     JSON mode for guaranteed transliteration coverage:
       1. No JSON wrapper to truncate. The response is just the converted
-         text — even if the stream cuts off mid-sentence, the part that
+         text — even if the output cuts off mid-sentence, the part that
          arrived is USABLE Hinglish (not invalid syntax we throw away).
       2. Smaller response footprint per token — the model spends every
          token on actual content, not on structural punctuation.
 
-    Returns None only when the API call itself errors or yields no text.
+    Returns None only when the call itself errors or yields no text.
     """
     if not _gemini_configured():
         return None
-    try:
-        model = _genai.GenerativeModel(_gemini_model_name())
-        config = _genai.types.GenerationConfig(
-            temperature=0.0, max_output_tokens=max_output_tokens
-        )
-        response = model.generate_content(
-            prompt,
-            generation_config=config,
-            safety_settings=_PERMISSIVE_SAFETY_SETTINGS,
-        )
-    except Exception as e:
-        logger.warning("Audio Gemini plain-text call failed: {}", e)
-        return None
-    _record_audio_gemini_usage(response)
-    text = (getattr(response, "text", "") or "").strip()
-    return text or None
+    return _generate_model_text(
+        prompt, max_output_tokens=max_output_tokens, json_mode=False, task=_TASK_TRANSLITERATION
+    )
 
 
 def _generate_gemini_text(prompt: str, *, max_output_tokens: int = 128) -> Optional[str]:
     if not _gemini_configured():
         return None
-    try:
-        model = _genai.GenerativeModel(_gemini_model_name())
-        config = _genai.types.GenerationConfig(
-            temperature=0.0, max_output_tokens=max_output_tokens
-        )
-        response = model.generate_content(
-            prompt,
-            generation_config=config,
-            safety_settings=_PERMISSIVE_SAFETY_SETTINGS,
-        )
-    except Exception as e:
-        logger.debug("Audio Gemini text call failed: {}", e)
-        return None
-    _record_audio_gemini_usage(response)
-    text = (getattr(response, "text", "") or "").strip()
-    return text or None
-
-
-# ── Project + credentials resolution ──────────────────────────────────────────
-# Cached so we resolve only once per process.
-_RESOLVED_CREDENTIALS_PATH: Optional[str] = None
-_CREDENTIALS_RESOLVED: bool = False
+    return _generate_model_text(
+        prompt, max_output_tokens=max_output_tokens, json_mode=False, task=_TASK_DIARIZATION
+    )
 
 
 def _candidate_base_dirs() -> list[str]:
@@ -2020,7 +1955,7 @@ Utterances:
     # Smaller per-batch budget — the response is just N short strings, so we
     # don't need 65k tokens (which on some preview models silently downgrades
     # the actual cap). 8000 is plenty for 25 utterances of typical length.
-    raw = _generate_gemini_json_raw(prompt, max_output_tokens=8000)
+    raw = _generate_gemini_json_raw(prompt, max_output_tokens=8000, task=_TASK_TRANSLITERATION)
 
     arr: Optional[list] = None
     if raw:
@@ -2061,7 +1996,7 @@ Utterances:
             "commentary. Array length must be exactly "
             f"{len(expanded_texts)}.\n\nUtterances:\n{numbered}"
         )
-        retry_raw = _generate_gemini_json_raw(terse_prompt, max_output_tokens=8000)
+        retry_raw = _generate_gemini_json_raw(terse_prompt, max_output_tokens=8000, task=_TASK_TRANSLITERATION)
         if retry_raw:
             valid = _coerce_valid_json_text(retry_raw)
             if valid:

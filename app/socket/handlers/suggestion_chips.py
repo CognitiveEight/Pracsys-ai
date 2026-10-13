@@ -17,6 +17,8 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.llm.errors import is_generation_error
+
 from app.utils.redact import chars
 
 from app.agents.role_models import RoleEnum
@@ -517,7 +519,7 @@ class SuggestionChipsMixin:
                 return self._fallback_chips_for_analysis_report(16)
             raw = (raw or "").strip()
             # Treat only leading \"Error...\" as fatal; allow 'error' words inside JSON
-            if raw.startswith("Error") or "Error generating" in (raw[:80] or ""):
+            if is_generation_error(raw):
                 logger.warning(
                     "Analysis report chips: Gemini error response; using fallback. raw preview={}",
                     chars(raw),

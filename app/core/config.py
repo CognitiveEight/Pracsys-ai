@@ -4,6 +4,7 @@ Application configuration management.
 
 from typing import List, Optional
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -86,6 +87,99 @@ class Settings(BaseSettings):
     # Attempts per embedding call before the chunk is stored as
     # embedding_failed (kept for full-context reads, excluded from search).
     embedding_max_attempts: int = 3
+
+    # ── Model portability (app/llm/) ──────────────────────────────────────
+    # Every model call goes gemini_client -> app.llm router -> a provider
+    # adapter. A "profile" is "<provider>:<model>" or, for the providers that
+    # hold several named accounts, "<provider>:<account>:<model>":
+    #   gemini:<model>                     Google AI Studio (GOOGLE_API_KEY)
+    #   openai:<model>                     api.openai.com (OPENAI_API_KEY)
+    #   azure_openai:<model>               Azure OpenAI; <model> is looked up in
+    #                                      AZURE_OPENAI_DEPLOYMENTS, else used as
+    #                                      the deployment name
+    #   azure_foundry:<model>              Azure AI Foundry (OpenAI-compatible)
+    #   bedrock:<model-id>                 AWS Bedrock Converse API
+    #   sagemaker:<endpoint-name>          SageMaker endpoint (SAGEMAKER_ENDPOINTS)
+    #   openai_compat:<account>:<model>    any OpenAI-compatible server — vLLM,
+    #                                      Ollama, TGI, DeepSeek, Qwen/DashScope,
+    #                                      Together, Groq (OPENAI_COMPAT_PROFILES)
+    # Unset LLM_DEFAULT means "gemini:<GEMINI_MODEL>" — today's behaviour.
+    llm_default: Optional[str] = None
+    # JSON {task: [profile, fallback, ...]}; task = the @meter_usage feature
+    # label (see docs/MODEL_PORTABILITY.md). Unlisted tasks use the default.
+    llm_routes: Optional[str] = None
+    # JSON [profile, ...] tried after a task's own chain on error/timeout.
+    llm_fallbacks: Optional[str] = None
+    # Models the user may choose per case (the `aiModel` field on workspace /
+    # chat events). JSON {"<id>": "<profile>"} — the id is what the frontend
+    # sends, e.g. {"gemini-3.8-flash": "gate0:gemini-3.8-flash",
+    # "gpt-4o": "gate0:gpt-4o"} — or a JSON list of profiles (id = model part).
+    # The LLM_DEFAULT model is always selectable. An unknown id is ignored and
+    # the case keeps its model. Tasks listed in LLM_ROUTES are pinned to their
+    # route and ignore the selection; grounding and embeddings never follow it.
+    llm_selectable_models: Optional[str] = None
+    # Profiles allowed to serve Google-Search-grounded calls (only Gemini can).
+    llm_grounding_profiles: Optional[str] = None
+    # Extra attempts on the SAME profile for a transient error (429/5xx/network)
+    # before moving down the chain. Timeouts are never retried.
+    llm_transient_retries: int = 1
+    # JSON {model: [input_usd_per_million, output_usd_per_million]}.
+    llm_pricing_overrides: Optional[str] = None
+    # JSON {model: {"max_output_tokens": 8192, "supports_images": false,
+    #   "json_mode": true}} — per-model limits the adapters cannot know (output
+    # ceilings differ widely across Bedrock / open-weight models, and a request
+    # above the ceiling is a hard 400). Applies to every provider.
+    llm_model_options: Optional[str] = None
+
+    # OpenAI (api.openai.com, or OPENAI_BASE_URL for a gateway)
+    openai_api_key: Optional[SecretStr] = None
+    openai_base_url: Optional[str] = None
+    openai_organization: Optional[str] = None
+    # Azure OpenAI. With no API key, Entra ID (DefaultAzureCredential) is used.
+    azure_openai_endpoint: Optional[str] = None
+    azure_openai_api_key: Optional[SecretStr] = None
+    azure_openai_api_version: str = "2024-10-21"
+    azure_openai_deployments: Optional[str] = None  # JSON {model: deployment}
+    # Azure AI Foundry, OpenAI-compatible endpoint (…/openai/v1). With no API
+    # key, Entra ID is used.
+    azure_foundry_endpoint: Optional[str] = None
+    azure_foundry_api_key: Optional[SecretStr] = None
+    # AWS. Credentials come ONLY from the standard boto3 chain (env, profile,
+    # instance/task role) — never from this file.
+    aws_region: Optional[str] = None
+    bedrock_region: Optional[str] = None
+    bedrock_guardrail_id: Optional[str] = None
+    bedrock_guardrail_version: Optional[str] = None
+    # JSON {name: {"endpoint": "...", "payload_format": "openai_messages"|"tgi_generate",
+    #              "region": "...", "max_output_tokens": 4096}}
+    sagemaker_endpoints: Optional[str] = None
+    # JSON {account: {"base_url": "...", "api_key_env": "DEEPSEEK_API_KEY",
+    #   "json_mode": true, "supports_images": false, "max_output_tokens": 8192,
+    #   "query_prefix": "..."}}
+    openai_compat_profiles: Optional[str] = None
+    # Gate0 — ViitorCloud's governed AI gateway (LiteLLM proxy). Profiles are
+    # "gate0:<model>" where <model> is whatever name gate0 serves (a model
+    # group such as "gemini-3.8-flash", or a task class such as "gate0/lite").
+    gate0_base_url: Optional[str] = None  # e.g. https://gate0.example.internal/v1
+    gate0_api_key: Optional[SecretStr] = None  # a gate0 virtual key for this service
+    # Governance mode: every model call (generation, grounding, embeddings) MUST
+    # go through gate0. Startup refuses any direct-provider profile, and the
+    # router never calls one, so nothing can bypass the gateway's keys,
+    # budgets and audit trail.
+    gate0_enforce: bool = False
+    # Tag every request with app / feature / workspace / request ids (sent as
+    # LiteLLM request metadata + tags) for per-workspace spend in gate0.
+    gate0_tag_requests: bool = True
+    gate0_app_name: str = "simplertoday"
+    # Send Gemini safety_settings BLOCK_NONE for Gemini-backed gate0 models
+    # (legal evidence trips the default filters; same policy as direct Gemini).
+    gate0_gemini_block_none: bool = True
+    # Embeddings: EMBEDDING_MODEL / EMBEDDING_DIMENSIONS above name the model.
+    # gemini | openai | azure_openai | azure_foundry | bedrock | openai_compat:<account>
+    embedding_provider: str = "gemini"
+    # Prepended to queries for embedding models without task types
+    # (e.g. Qwen3-Embedding expects an instruction prefix on queries).
+    embedding_query_prefix: str = ""
 
     # Hard ceiling on a single Gemini generation. Without it a stalled request
     # blocks its caller forever: the long feature generations are awaited inline

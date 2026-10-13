@@ -17,6 +17,7 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.ai.usage import current_usage, primary_model
 from app.agents.role_models import RoleEnum
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
@@ -182,29 +183,36 @@ class ChatMixin:
     def _token_usage_metadata(
         self, workspace_id: str, usage: Any
     ) -> Dict[str, Any]:
-        """Build the usage/price metadata fields for one ai_response.
+        """Build the usage/price metadata fields for one emitted response.
 
-        Prices this turn's accumulated tokens with the active model's rate AND the
-        paid non-LLM work it triggered (Vision OCR units, Speech-to-Text seconds,
-        Vertex AI Search queries, Google Search grounding requests, embedding
-        tokens), increments the workspace's cumulative totals (persisted to
-        Qdrant), and returns a dict merged into ``AIResponseMetadata``.
+        Reports the workspace's spend since its previous emit
+        (``drain_for_emit``): every model call and paid non-LLM unit (Vision OCR,
+        Speech-to-Text, Vertex AI Search, grounding, embeddings) charged to this
+        workspace at record time — this turn's own work and any background work
+        that has no emit of its own (knowledge-graph ingestion, re-evaluations)
+        — plus the part of ``usage`` recorded with no workspace in context.
+        Adds exactly that to the workspace's cumulative totals (persisted to
+        Qdrant). Each charge is reported by exactly one emit, so the sum of
+        per-response ``price`` equals ``totalPrice`` and, for model calls
+        through gate0, LiteLLM's spend for the same ``workspace_id`` tag.
 
-        ``price`` is the FULL cost of this response — ``inputPrice + outputPrice
-        + servicePrice`` — with each component also exposed on its own field so
-        the backend can break the bill down by source.
+        ``price`` is the FULL cost reported — ``inputPrice + outputPrice +
+        servicePrice`` — with each component on its own field.
 
         Best-effort: returns ``{}`` if anything fails so a pricing hiccup never
-        blocks a response. Call exactly once per emitted response.
+        blocks a response.
         """
         try:
-            from app.ai.pricing import price_for, service_price_for
+            from app.ai.pricing import service_price_for
+            from app.ai.usage import drain_for_emit, llm_price
             from app.workspace.context import context_manager
 
+            usage = drain_for_emit(workspace_id, usage)
             input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
             output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
-            model = settings.gemini_model
-            price = price_for(model, input_tokens, output_tokens)
+            # Priced per call by the model that served it (a turn can mix
+            # models once tasks are routed to different providers).
+            price = llm_price(usage)
             total_tokens = input_tokens + output_tokens
 
             # Paid non-LLM units consumed inside the same capture scope.
@@ -240,12 +248,8 @@ class ChatMixin:
 
             ctx = context_manager.get_context(workspace_id)
             if ctx is not None:
-                already_counted = bool(getattr(usage, "counted", False))
-                if already_counted:
-                    # Second emit in the same turn — don't bill again; report the
-                    # totals as they already stand.
-                    totals = ctx.get_metadata("token_usage") or {}
-                else:
+                spent = input_tokens or output_tokens or price["price"] or service["servicePrice"]
+                if spent:
                     totals = ctx.add_token_usage(
                         input_tokens,
                         output_tokens,
@@ -253,10 +257,8 @@ class ChatMixin:
                         service=service,
                         service_units=service_units,
                     )
-                    try:
-                        usage.counted = True
-                    except Exception:
-                        pass
+                else:
+                    totals = ctx.get_metadata("token_usage") or {}
                 fields.update(
                     {
                         "totalInputTokens": totals.get("totalInputTokens", 0),
@@ -287,18 +289,16 @@ class ChatMixin:
         this wrapper adds the same two fields. Without ``messageId`` the backend
         ``WorkspaceCostService`` drops the cost record entirely.
 
-        Idempotent per accumulator: once a scope's spend has been reported the
-        accumulator is flagged ``counted``, and any further call degrades to the
-        cumulative-only block. That makes this safe to call from both the success
-        emit and the ingestion error path — whichever runs first reports the real
-        (possibly partial) spend, and the other cannot double-report it.
+        Safe to call from both the success emit and the ingestion error path:
+        reporting drains the ledger, so whichever runs first reports the real
+        (possibly partial) spend and the other reports only what was spent since.
         """
-        if usage is None or bool(getattr(usage, "counted", False)):
+        if usage is None:
             return self._cumulative_usage_metadata(workspace_id)
         metadata = self._token_usage_metadata(workspace_id, usage)
         if isinstance(metadata, dict):
             metadata.setdefault("messageId", uuid.uuid4().hex)
-            metadata.setdefault("aiModel", settings.gemini_model)
+            metadata.setdefault("aiModel", primary_model(usage))
             # Hand-built payloads bypass _emit_document_feature's check, so run it
             # here too — same reason: an unknown key means an unrecorded cost.
             self._warn_unknown_metadata_keys("ingestion payload", metadata)
@@ -446,11 +446,12 @@ class ChatMixin:
         permanently-stuck panel unless the caller knows. On a drop the envelope is
         recorded via ``_note_pending_feature_delivery`` and re-sent on reconnect.
 
-        ``usage`` is the ``capture_usage()`` accumulator for a FRESH generation —
-        its tokens are priced and the workspace cumulative is incremented exactly
-        once (guarded by the accumulator's ``counted`` flag). Pass ``usage=None``
-        for a re-emit (reconnect replay, cached / no-op re-emit): the block reports
-        per-response zeros plus the current cumulative, with no increment.
+        ``usage`` is the ``capture_usage()`` accumulator for a FRESH generation.
+        The block reports the workspace's spend since its last emit (drained
+        from the usage ledger, so each cost is reported exactly once) and adds
+        it to the cumulative. Pass ``usage=None`` for a re-emit (reconnect
+        replay, cached / no-op re-emit): the block reports per-response zeros
+        plus the current cumulative, with no increment.
 
         The metadata block uses the same field names as ``AIResponseMetadata`` so
         the backend reads it identically to the chat ``ai_response`` contract.
@@ -504,7 +505,7 @@ class ChatMixin:
                 # (usage-based) metadata block has no messageId, so mint a unique
                 # one per emit here. aiModel mirrors the ai_response contract.
                 metadata.setdefault("messageId", uuid.uuid4().hex)
-                metadata.setdefault("aiModel", settings.gemini_model)
+                metadata.setdefault("aiModel", primary_model(usage))
                 self._warn_unknown_metadata_keys(feature_type, metadata)
         except Exception as exc:
             logger.warning(
@@ -712,7 +713,7 @@ class ChatMixin:
             "draftDocument": turn.get("draftDocument"),
             "metadata": {
                 "messageId": chat_id,
-                "aiModel": settings.gemini_model,
+                "aiModel": primary_model(current_usage()),
                 # Per-response token/price + incremented workspace totals for
                 # this drafting turn (scope opened in on_user_message_request).
                 **self._token_usage_metadata(workspace_id, current_usage()),
@@ -1079,7 +1080,7 @@ class ChatMixin:
                                 ),
                                 metadata=AIResponseMetadata(
                                     messageId=chat_id,
-                                    aiModel=settings.gemini_model,
+                                    aiModel=primary_model(current_usage()),
                                     **self._token_usage_metadata(
                                         workspace_id, current_usage()
                                     ),
@@ -2935,7 +2936,7 @@ class ChatMixin:
                 content=response_text_to_emit,
                 metadata=AIResponseMetadata(
                     messageId=response.message_id,
-                    aiModel=settings.gemini_model,
+                    aiModel=primary_model(current_usage()),
                     responseTime=processing_time,
                     confidence=(
                         response.confidence.value
@@ -3031,7 +3032,7 @@ class ChatMixin:
                 if self._socket_client and chat_id:
                     error_meta = AIResponseMetadata(
                         messageId=chat_id,
-                        aiModel=settings.gemini_model,
+                        aiModel=primary_model(current_usage()),
                         error=str(e),
                         **self._token_usage_metadata(workspace_id, current_usage()),
                     )

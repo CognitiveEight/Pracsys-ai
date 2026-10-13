@@ -11,15 +11,15 @@ SimplerToday is a Python asyncio **Socket.IO client** (not a server). It connect
 ```bash
 make setup        # create venv, install deps, copy env.example → .env, mkdir logs/ data/
 make run          # python -m app.main  (the only entry point)
-make test         # pytest tests/  — the knowledge-plane suite
+make test         # pytest tests + tests/offline/verify_*.py (fails on any failure)
 make eval         # run the evaluation harness over the golden set
 make ontology-ddl # regenerate data/ontology/schema.{enterprise,community}.cypher
 make smoke-graph  # end-to-end check against a real Neo4j (needs NEO4J_URL)
 make statute-report  # statutory register coverage summary
 make docker-up    # bring up Qdrant + Redis from docker-compose.yml
 make docker-down
-make lint         # pylint app/  (only if pylint is installed)
-make format       # black app/   (only if black is installed)
+make lint         # ruff check .  (rules in pyproject.toml; fails on findings)
+make format       # black app/   (only if black is installed; not enforced)
 ./dev.sh start    # interactive helper around the same actions
 ```
 
@@ -434,7 +434,7 @@ It came from `feature/data_ingestion`, ported onto this branch's own RAG.
   retries and escalates. On a single-document delete it is logged CRITICAL and
   audited instead.
 
-Tests: `pytest tests` (254 unit tests) plus the `[knowledge graph]` group in
+Tests: `pytest tests` plus the `[knowledge graph]` group in
 `tests/offline/verify_rag.py`.
 
 ### The quality score explanation is objective-relative

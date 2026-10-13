@@ -5,7 +5,7 @@ help:
 	@echo "=================================="
 	@echo "make install      - Install dependencies"
 	@echo "make setup        - Complete setup (venv + deps + services)"
-	@echo "make test         - Run setup tests"
+	@echo "make test         - Run pytest + offline verify suites"
 	@echo "make run          - Run the application"
 	@echo "make clean        - Clean temporary files"
 	@echo "make docker-up    - Start Docker services (Qdrant, Redis)"

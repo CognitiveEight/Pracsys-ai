@@ -12,7 +12,7 @@ Use the `Makefile` first:
 - `make run` starts the service with `python -m app.main`.
 - `make docker-up` starts local services such as Qdrant and Redis.
 - `make docker-down` stops those containers.
-- `make lint` runs `pylint app/` when installed.
+- `make lint` runs `ruff check .` (rules in `pyproject.toml`); `pre-commit install` adds the commit gates.
 - `make format` runs `black app/` when installed.
 
 For manual setup, use `python3 -m venv venv`, `source venv/bin/activate`, and `pip install -r requirements.txt`.

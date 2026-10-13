@@ -167,6 +167,30 @@ def pricing_overrides() -> Dict[str, Any]:
 
 
 @lru_cache(maxsize=1)
+def selectable_models() -> Dict[str, Profile]:
+    """Models a user may choose per case: id -> profile. Always includes the
+    LLM_DEFAULT head, under its model name."""
+    raw = getattr(settings, "llm_selectable_models", None)
+    out: Dict[str, Profile] = {}
+    if raw not in (None, ""):
+        try:
+            value = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError as exc:
+            raise RoutingConfigError(f"LLM_SELECTABLE_MODELS is not valid JSON: {exc}") from exc
+        if isinstance(value, dict):
+            items = [(str(k), str(v)) for k, v in value.items()]
+        elif isinstance(value, list):
+            items = [(parse_profile(str(v)).model, str(v)) for v in value]
+        else:
+            raise RoutingConfigError("LLM_SELECTABLE_MODELS must be a JSON object or list")
+        for model_id, spec in items:
+            out[model_id] = parse_profile(spec)
+    default = load_routing().default[0]
+    out.setdefault(default.model, default)
+    return out
+
+
+@lru_cache(maxsize=1)
 def model_options_table() -> Dict[str, Dict[str, Any]]:
     return _json_setting("llm_model_options", dict)
 
@@ -220,13 +244,18 @@ def clear_caches() -> None:
         azure_deployments,
         pricing_overrides,
         model_options_table,
+        selectable_models,
     ):
         fn.cache_clear()
 
 
 #: The embedding space the evidence collection was built in before
-#: portability. It keeps the unsuffixed collection name.
-_LEGACY_EMBEDDING_SPACE = ("gemini", "gemini-embedding-001", 768)
+#: portability. It keeps the unsuffixed collection name. gemini-embedding-001
+#: through gate0 is the SAME space (the gateway calls the same model with the
+#: same task type and requested size — verified identical, cosine 1.0), so
+#: routing embeddings through gate0 needs no re-index.
+_LEGACY_EMBEDDING_SPACE = ("gemini-embedding-001", 768)
+_LEGACY_EMBEDDING_PROVIDERS = ("gemini", "gate0")
 
 
 def embedding_space_suffix() -> str:
@@ -239,7 +268,7 @@ def embedding_space_suffix() -> str:
     if model.startswith("models/"):
         model = model[len("models/"):]
     dims = int(settings.embedding_dimensions or 768)
-    if (provider, model, dims) == _LEGACY_EMBEDDING_SPACE:
+    if provider in _LEGACY_EMBEDDING_PROVIDERS and (model, dims) == _LEGACY_EMBEDDING_SPACE:
         return ""
     slug = re.sub(r"[^a-z0-9]+", "-", f"{provider}-{model}-{dims}".lower()).strip("-")
     return f"__{slug[:80]}"

@@ -7,7 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Per-case cost was missing background work.** A case's cost total now
+  matches gate0/LiteLLM's spend for that workspace. Before, a case showed
+  $0.24 while gate0 had charged $0.30: knowledge-graph ingestion and other
+  background steps with no emit of their own spent money that never reached
+  the case.
+  - **How costs reach a case now.** Every model call and paid unit is charged
+    to its workspace when it is recorded (the workspace ledger in
+    `app/ai/usage.py`). Each emit reports, and adds to the total, the case's
+    spend since its previous emit.
+  - **No double reporting.** A second emit in the same turn no longer repeats
+    the per-response `price`, so the sum of per-response prices equals
+    `totalPrice`.
+  - **Payload.** The socket payload shape is unchanged. The per-response
+    `price` now means "spend since the case's last emit".
+  - **New script:** `scripts/reconcile_gate0_spend.py` compares each case with
+    gate0's spend logs.
+  - **Tests and purge.** `tests/test_office_extraction.py` no longer makes
+    real, billed classifier calls on every run. A workspace purge also clears
+    the case's unreported spend.
+
 ### Added
+
+- **The user chooses the model per case** (`aiModel`).
+  - **Socket payload change:** a new optional `aiModel` field.
+    - On `workspace_created` / `workspace_sync` / `workspace_version_restore`
+      it sets the case's model for every model call. Absent = unchanged;
+      `null` / `""` = default.
+    - On `user_message_request` it overrides the model for that turn only.
+  - **Allowed models.** Only ids in `LLM_SELECTABLE_MODELS` are honoured. The
+    default (`LLM_DEFAULT`, `gemini-3.8-flash`) stays behind the choice as the
+    fallback.
+  - **Not affected by the choice.** Tasks pinned in `LLM_ROUTES`, case-law
+    grounding (Gemini) and embeddings never follow it.
+  - **Storage.** The choice is persisted per case
+    (`CacheKinds.MODEL_SELECTION`), rehydrated on a cold workspace and purged
+    with the workspace.
+  - **Embeddings through gate0** (`gemini-embedding-001`, 768) are the same
+    vector space as direct Gemini (verified identical), so they keep the
+    existing collection with no re-index.
 
 - **Model portability: one provider-neutral model layer**
   (`app/llm/`, `docs/MODEL_PORTABILITY.md`). Every model call can now be served

@@ -103,3 +103,7 @@ google-application-credentials.json
 /docs/SYSTEM_ARCHITECTURE.drawio
 /docs/TARGET_ARCHITECTURE.drawio
 /pracsys2.0/
+
+
+application-service-*.json
+Central Creds.txt

@@ -22,7 +22,6 @@ from typing import Dict, List, Optional, Tuple
 
 from loguru import logger
 
-from app.ai.usage import record_usage
 from app.core.config import settings
 from app.llm.base import Provider
 from app.llm.config import (
@@ -92,8 +91,14 @@ class ModelRouter:
 
     def problems(self) -> List[Tuple[str, str]]:
         """(profile, reason) for every configured profile that cannot serve calls."""
+        from app.llm.config import selectable_models
+
         out, seen = [], set()
-        profiles = self.routing.all_profiles() + [self.embedding_profile()]
+        profiles = (
+            self.routing.all_profiles()
+            + list(selectable_models().values())
+            + [self.embedding_profile()]
+        )
         for profile in profiles:
             if str(profile) in seen:
                 continue
@@ -112,6 +117,20 @@ class ModelRouter:
             return "GATE0_ENFORCE is on: direct provider calls are not allowed (use gate0:<model>)"
         return None
 
+    def chain_for(self, task: Optional[str]) -> List[Profile]:
+        """The task's chain, headed by the model the user chose for this case
+        (or this chat turn), unless LLM_ROUTES pins the task. The configured
+        chain stays behind it as the fallback."""
+        chain = self.routing.chain(task)
+        if task and task in self.routing.routes:
+            return chain
+        from app.workspace.model_selection import selected_profile
+
+        chosen = selected_profile()
+        if chosen is None:
+            return chain
+        return [chosen] + [p for p in chain if str(p) != str(chosen)]
+
     def default_available(self) -> bool:
         return any(
             self.blocked_by_governance(p) is None
@@ -126,7 +145,7 @@ class ModelRouter:
     async def complete(self, request: LLMRequest, *, task: str, kind: str) -> LLMResult:
         """Run ``request`` down the task's chain. Never raises except
         ``asyncio.CancelledError``; failure is ``finish`` error/timeout."""
-        chain = self.routing.grounding if request.grounding else self.routing.chain(task)
+        chain = self.routing.grounding if request.grounding else self.chain_for(task)
         needs = request.needs()
         retries = max(0, int(getattr(settings, "llm_transient_retries", 1) or 0))
         last_finish, last_error, attempted = "error", "", False
@@ -196,6 +215,10 @@ class ModelRouter:
 
     @staticmethod
     def _record(result: LLMResult) -> None:
+        # Imported here: app.ai imports this module (via gemini_client), so a
+        # module-level import would be circular when app.llm is imported first.
+        from app.ai.usage import record_usage
+
         try:
             record_usage(
                 result.input_tokens,

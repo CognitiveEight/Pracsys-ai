@@ -110,6 +110,14 @@ class Settings(BaseSettings):
     llm_routes: Optional[str] = None
     # JSON [profile, ...] tried after a task's own chain on error/timeout.
     llm_fallbacks: Optional[str] = None
+    # Models the user may choose per case (the `aiModel` field on workspace /
+    # chat events). JSON {"<id>": "<profile>"} — the id is what the frontend
+    # sends, e.g. {"gemini-3.8-flash": "gate0:gemini-3.8-flash",
+    # "gpt-4o": "gate0:gpt-4o"} — or a JSON list of profiles (id = model part).
+    # The LLM_DEFAULT model is always selectable. An unknown id is ignored and
+    # the case keeps its model. Tasks listed in LLM_ROUTES are pinned to their
+    # route and ignore the selection; grounding and embeddings never follow it.
+    llm_selectable_models: Optional[str] = None
     # Profiles allowed to serve Google-Search-grounded calls (only Gemini can).
     llm_grounding_profiles: Optional[str] = None
     # Extra attempts on the SAME profile for a transient error (429/5xx/network)

@@ -62,6 +62,9 @@ class CacheKinds:
     # arriving after a restart can still be resolved to a permission.
     # Shape: [{"userId","name","permission"}, ...]
     PARTICIPANTS = "participants"
+    # The model the user chose for this case (`aiModel` on workspace events),
+    # so background work after a restart keeps running on it. Shape: {"model": id}
+    MODEL_SELECTION = "model_selection"
     LIST_OF_DATES = "list_of_dates"
     WORKSPACE_METADATA_PAYLOAD = "workspace_metadata_payload"
     DOCUMENT_ASSESSMENTS = "document_assessments"
@@ -130,6 +133,7 @@ WORKSPACE_HYDRATION_KINDS = (
     CacheKinds.PROCEDURAL_TIMELINE,
     CacheKinds.CUSTOM_INSTRUCTIONS,
     CacheKinds.PARTICIPANTS,
+    CacheKinds.MODEL_SELECTION,
     CacheKinds.LIST_OF_DATES,
     CacheKinds.WORKSPACE_METADATA_PAYLOAD,
     CacheKinds.DOCUMENT_ASSESSMENTS,

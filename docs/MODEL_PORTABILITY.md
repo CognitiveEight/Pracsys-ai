@@ -145,6 +145,41 @@ There are three ways to reach open-weight models:
    enabled in your Bedrock account and region.
 3. **Azure AI Foundry**, via `azure_foundry:<deployment>`.
 
+## User-selected model per case (`aiModel`)
+
+The lawyer chooses the model in the frontend, and the backend sends it as
+`aiModel`:
+
+| Event | Effect |
+|---|---|
+| `workspace_created` / `workspace_sync` / `workspace_version_restore` | Sets the **case's** model. Every model call for the case runs on it, including background panels and work resumed after a restart. Absent = no change; `null` / `""` = back to the default. |
+| `user_message_request` | Overrides the model for **that chat turn only**. |
+
+```bash
+LLM_DEFAULT=gate0:gemini-3.8-flash                     # default + fallback
+LLM_SELECTABLE_MODELS={"gemini-3.8-flash":"gate0:gemini-3.8-flash",
+                       "gemini-2.5-pro":"gate0:gemini-2.5-pro",
+                       "gpt-4o":"gate0:gpt-4o"}         # id the frontend sends -> profile
+```
+
+**Rules** (`app/workspace/model_selection.py`, `ModelRouter.chain_for`):
+- **Only ids in `LLM_SELECTABLE_MODELS` are honoured.** Anything else is
+  logged and ignored, and the case keeps its model. The frontend dropdown
+  should list exactly these ids.
+- **Fallback.** The chosen model heads the chain, with the default behind it,
+  so a failing provider falls back to Gemini.
+- **Pinned tasks.** Tasks listed in `LLM_ROUTES` keep their own route.
+- **Never affected by the choice:**
+  - Google-Search-grounded case-law search, which stays on
+    `LLM_GROUNDING_PROFILES` (Gemini);
+  - embeddings. A case's documents are embedded once, and a chat model change
+    must never change its vector space. Any LLM can read text found by any
+    embedding model.
+- **Labels.** `metadata.aiModel` on every emit is the model that actually
+  answered.
+- **Storage.** The choice persists per case (`CacheKinds.MODEL_SELECTION`). It
+  is rehydrated on a cold workspace and cleared by the workspace purge.
+
 ## Gate0 (governed gateway)
 
 Gate0 is ViitorCloud's AI gateway, built on the LiteLLM proxy. It holds the
@@ -197,6 +232,26 @@ EMBEDDING_MODEL=gemini-embedding-001
   - the same 16K output floor as direct Gemini.
 - **Budgets.** A 429 that says "budget" is final: no retry, no fallback, and
   the caller reports the failure. A plain rate-limit 429 is retried once.
+
+**Embeddings through gate0 need no re-index.** Use the named group
+`gemini-embedding-001` at 768 dimensions (`EMBEDDING_PROVIDER=gate0`). The
+gateway calls the same model with the same task type and size: the vectors
+were verified identical to a direct call (cosine 1.0), so the evidence
+collection keeps its name.
+
+**`drop_params`.** LiteLLM's global `drop_params: true` cannot be overridden
+per model, and gate0 keeps it on for its other callers. That is safe for
+SimplerToday: it sends Gemini-only parameters (thinking, safety, search) only
+to Gemini models, and every approved model supports `response_format`.
+
+**Done in gate0's config:**
+- **Named model groups** (`gemini-3.8-flash`, `gemini-2.5-flash`,
+  `gemini-2.5-pro`, `gpt-4o`, `gpt-4o-mini`, `gemini-embedding-001`), each
+  with `timeout: 300` and no cross-model fallback.
+- **Approval.** Each group is approved under `named_models` in
+  `approved-models.stack0.yaml`. `check_approved_models.py` now fails on an
+  unapproved named group, so the governance check covers them.
+- **Templates** for Azure, Bedrock, DeepSeek and Qwen are left commented out.
 
 **Gate0-side configuration SimplerToday needs** (in gate0's `litellm` config):
 1. **Model groups named by model**, so SimplerToday chooses the model per
@@ -282,9 +337,41 @@ Supported models:
 
 ## Cost
 
+**Per case (workspace).**
+- Every paid unit is charged to its workspace the moment it is recorded:
+  model tokens, OCR pages, Speech-to-Text seconds, search queries, grounding
+  and embeddings. This is the workspace ledger in `app/ai/usage.py`.
+- The workspace comes from the running event's logging context. That is the
+  same `workspace_id` gate0 tags the request with, so SimplerToday's per-case
+  model cost equals LiteLLM's spend for that tag.
+- Each emit reports and adds to the case total whatever the ledger holds
+  since the previous emit (`drain_for_emit`), so every cost is reported
+  exactly once. That includes background work with no emit of its own, such as
+  knowledge-graph ingestion and re-evaluations, which before this change never
+  reached the case.
+- A cost recorded with no workspace in context stays with its scope and is
+  reported by that scope's own emit.
+
+**Checking against gate0.**
+`GATE0_ADMIN_KEY=<key that can read spend logs> python scripts/reconcile_gate0_spend.py --by-feature`
+lists, per workspace, gate0's model spend next to SimplerToday's model-cost
+total and flags any difference. It is read-only.
+- Only model cost is compared. OCR, Speech-to-Text, Vertex Search and non-gate0
+  embeddings never pass through gate0, so SimplerToday's `totalPrice` is that
+  model cost plus `totalServicePrice`.
+- Workspaces whose totals started before gate0 also include direct-Gemini
+  spend that gate0 never saw.
+
+**LiteLLM's Usage page is the global view**: all apps, keys and test calls. For
+one case, filter its spend logs on the `workspace_id:<id>` tag, which is what
+the reconciliation script does.
+
+**Pricing.**
 - Each call is priced by the model that served it, at record time
   (`UsageAccumulator.add(..., model)`). A turn that mixes providers is therefore
   billed correctly.
+- Calls through gate0 are billed at gate0's own figure (the
+  `x-litellm-response-cost` header) instead of the local table.
 - `metadata.aiModel` reports the model that did most of the work.
 - Non-Gemini rates are **not** hard-coded. They change, and must come from the
   provider's price page, or from your serving cost for self-hosted models. Set

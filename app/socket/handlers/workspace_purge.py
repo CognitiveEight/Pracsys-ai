@@ -553,6 +553,33 @@ class WorkspacePurgeMixin:
                 participants_error,
             )
 
+        # The case's chosen model (module-level, app/workspace/model_selection.py).
+        try:
+            from app.workspace.model_selection import clear_model_selection
+
+            clear_model_selection(workspace_id)
+            removed += 1
+        except Exception as selection_error:  # pragma: no cover - best effort
+            logger.debug(
+                "Clearing workspace model selection failed (workspace={}): {}",
+                workspace_id,
+                selection_error,
+            )
+
+        # Unreported spend in the module-level usage ledger (app/ai/usage.py):
+        # keyed by workspace id and not reached by the self.__dict__ sweep.
+        try:
+            from app.ai.usage import forget_workspace_usage
+
+            forget_workspace_usage(workspace_id)
+            removed += 1
+        except Exception as ledger_error:  # pragma: no cover - best effort
+            logger.debug(
+                "Clearing workspace usage ledger failed (workspace={}): {}",
+                workspace_id,
+                ledger_error,
+            )
+
         # Scalars pointing at this workspace: leaving them set would make the
         # reconnect re-emit path try to republish a purged workspace's panels.
         if getattr(self, "_pending_reemit_workspace_id", None) == workspace_id:

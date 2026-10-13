@@ -34,6 +34,7 @@ _LLM_SETTINGS = (
     "embedding_dimensions",
     "embedding_max_attempts",
     "gemini_request_timeout_seconds",
+    "llm_selectable_models",
 )
 
 
@@ -102,6 +103,9 @@ def client(monkeypatch):
     settings.llm_model_options = None
     settings.llm_transient_retries = 1
     settings.gemini_request_timeout_seconds = 300.0
+    # Independent of the developer's .env (which may route through gate0).
+    settings.llm_selectable_models = None
+    settings.embedding_provider = "gemini"
     c = ModelClient()
     c.router.reload()
     yield c
@@ -354,9 +358,13 @@ def test_no_provider_sdk_is_imported_outside_the_adapters():
     assert offenders == []
 
 
-def test_default_routing_is_unchanged_gemini():
+def test_default_routing_is_unchanged_gemini(monkeypatch):
+    """With no LLM_* settings (whatever the local .env holds), every call and
+    the embeddings go to Gemini — the pre-portability behaviour."""
     for k in ("llm_default", "llm_routes", "llm_fallbacks", "llm_grounding_profiles"):
-        assert getattr(settings, k) in (None, ""), f"{k} set in the test environment"
+        monkeypatch.setattr(settings, k, None)
+    monkeypatch.setattr(settings, "embedding_provider", "gemini")
     c = ModelClient()
+    c.router.reload()
     assert [str(p) for p in c.router.routing.chain("anything")] == [f"gemini:{settings.gemini_model}"]
     assert str(c.router.embedding_profile()).startswith("gemini:")

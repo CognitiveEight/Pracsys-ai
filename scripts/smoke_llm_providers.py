@@ -49,12 +49,16 @@ async def _one(router, profile) -> bool:
         return False
     ms = round((time.perf_counter() - started) * 1000)
     valid = coerce_valid_json_text(result.text) is not None
-    price = price_for(profile.model, result.input_tokens, result.output_tokens)["price"]
+    # A gateway's own cost (gate0) is what the service bills; else the local table.
+    price = round(result.cost_usd, 6) if result.cost_usd is not None else price_for(
+        profile.model, result.input_tokens, result.output_tokens
+    )["price"]
+    source = "gateway" if result.cost_usd is not None else "table"
     ok = result.finish == "ok" and valid
     print(
         f"  {profile}: {'ok' if ok else 'PROBLEM'} finish={result.finish}({result.raw_finish}) "
         f"json={'valid' if valid else 'INVALID'} ms={ms} in={result.input_tokens} "
-        f"out={result.output_tokens} price=${price}"
+        f"out={result.output_tokens} price=${price} ({source})"
     )
     return ok
 

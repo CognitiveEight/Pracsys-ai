@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Python 3.10: every failed model call crashed its panel.**
+  `reraise_if_cancelled` (`app/llm/errors.py`) called `Task.cancelling()`,
+  which exists only from Python 3.11; the staging VM runs 3.10, so a model
+  error (e.g. gateway unreachable) raised `AttributeError` instead of failing
+  cleanly. It now falls back to the task's pending-cancel flag on 3.10. The
+  full suite passes on 3.10.18 and 3.12. Note: `requirements.lock.txt` needs
+  Python 3.11+ (`bidict==0.24.1`); a 3.10 host can only install `requirements.txt`.
 - **SIM-29: every case-scoped model call through gate0 was rejected (401).**
   The gate0 adapter sent the workspace id as a `workspace_id` metadata key,
   which LiteLLM bans (an Anthropic/Bedrock workspace selector), so any call

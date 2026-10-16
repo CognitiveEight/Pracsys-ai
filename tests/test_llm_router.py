@@ -368,3 +368,30 @@ def test_default_routing_is_unchanged_gemini(monkeypatch):
     c.router.reload()
     assert [str(p) for p in c.router.routing.chain("anything")] == [f"gemini:{settings.gemini_model}"]
     assert str(c.router.embedding_profile()).startswith("gemini:")
+
+
+# -- Python 3.10 compatibility: Task.cancelling() is 3.11+ ------------------------------
+
+
+def test_reraise_if_cancelled_works_without_task_cancelling(monkeypatch):
+    """The staging VM runs Python 3.10, where tasks have no cancelling(); every
+    failed model call used to raise AttributeError from this guard instead."""
+    import asyncio
+
+    from app.llm import errors
+
+    class _Py310Task:  # no cancelling() attribute, like asyncio.Task on 3.10
+        _must_cancel = False
+
+    task = _Py310Task()
+    monkeypatch.setattr(errors.asyncio, "current_task", lambda: task)
+    errors.reraise_if_cancelled()  # no pending cancel: must not raise anything
+    task._must_cancel = True
+    with pytest.raises(asyncio.CancelledError):
+        errors.reraise_if_cancelled()
+
+
+async def test_reraise_if_cancelled_on_a_real_task():
+    from app.llm import errors
+
+    errors.reraise_if_cancelled()  # running task, not cancelled: no-op

@@ -5,12 +5,12 @@ One Jira ticket = one spec folder entry in each of the three directories, named
 after the ticket key:
 
 ```
-specs/requirements/ST-123-short-name.md        what and why (product view)
-specs/technical-design/ST-123-short-name.md    how (files, payloads, risks)
-specs/acceptance-criteria/ST-123-short-name.md how we prove it works
+specs/requirements/SIM-123-short-name.md        what and why (product view)
+specs/technical-design/SIM-123-short-name.md    how (files, payloads, risks)
+specs/acceptance-criteria/SIM-123-short-name.md how we prove it works
 ```
 
-`ST` is a placeholder for the Jira project key. Start each file from the
+The Jira project key is `SIM`. Start each file from the
 `_TEMPLATE.md` in its directory.
 
 ## Who writes what

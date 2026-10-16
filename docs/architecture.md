@@ -53,6 +53,11 @@ Backend
 
 | Topic | Document |
 |---|---|
+| New to the repo: reading order, vocabulary, setup, first week | `docs/onboarding.md` |
+| Claude Code set-up: shared vs personal config, guardrails, new accounts | `docs/claude-code-setup.md` |
+| Moving the service: dependencies, where state lives, migration steps | `docs/migration-guide.md` |
+| Layered architecture, one page (draw.io: presentation, application, domain agents and tools, retrieval, persistence, infrastructure, socket edge, security, DevOps, logging, testing) | `docs/system-architecture-layered.drawio` |
+| Architecture diagrams (draw.io, 12 pages: C4 context / containers / components, events, ingestion, panels, chat, model routing, data and erasure, deployment, security, delivery) | `docs/system-architecture.drawio` |
 | Full event flow and multi-agent design | `docs/SYSTEM_ARCHITECTURE.md` |
 | Handler module map and conventions | `docs/SOCKET_EVENTS_ARCHITECTURE.md` |
 | Reconnects and socket stability | `docs/socket-reconnection-and-stability.md` |
@@ -60,7 +65,6 @@ Backend
 | Version restore contract | `docs/BACKEND_VERSION_RESTORE_SPEC.md` |
 | Model providers and routing | `docs/MODEL_PORTABILITY.md` |
 | Knowledge graph / ontology RAG | `docs/AGENTIC_ONTOLOGY_RAG_FOUNDATIONS.md` |
-| Vendored Keel copy | `docs/KEEL_VENDORED.md` |
 | How work flows from Jira to release | `docs/development-workflow.md` |
 | Specs for individual changes | `specs/` |
 | Feature history | `CHANGELOG.md` |

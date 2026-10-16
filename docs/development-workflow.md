@@ -1,18 +1,18 @@
 # Development workflow
 
-How a change goes from a Jira ticket to production. `ST` stands for the Jira
-project key.
+How a change goes from a Jira ticket to production. The Jira project key is
+**SIM**.
 
 ## Branches
 
 ```
-feature/ST-123-short-name ──PR──► development ──PR──► staging ──PR──► main
-fix/ST-124-short-name     ──PR──┘
+feature/SIM-123-short-name ──PR──► development ──PR──► staging ──PR──► main
+fix/SIM-124-short-name     ──PR──┘
 ```
 
 - Branch from `development`. Name it with the ticket key so Jira links the
   branch, commits and PR automatically (GitHub for Jira).
-- Commits: `feat(ST-123): …`, `fix(ST-123): …`, `chore: …`.
+- Commits: `feat(SIM-123): …`, `fix(SIM-123): …`, `chore: …`.
 - Nobody, human or agent, commits directly to `development`, `staging` or
   `main`.
 

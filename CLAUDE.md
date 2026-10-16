@@ -9,19 +9,33 @@ SimplerToday is a Python asyncio **Socket.IO client** (not a server). It connect
 ## Common commands
 
 ```bash
-make setup        # create venv, install deps, copy env.example → .env, mkdir logs/ data/
+make setup        # create venv/, install deps, copy env.example → .env, mkdir logs/audit data/workspaces
 make run          # python -m app.main  (the only entry point)
 make test         # pytest tests + tests/offline/verify_*.py (fails on any failure)
-make eval         # run the evaluation harness over the golden set
 make ontology-ddl # regenerate data/ontology/schema.{enterprise,community}.cypher
-make smoke-graph  # end-to-end check against a real Neo4j (needs NEO4J_URL)
-make statute-report  # statutory register coverage summary
+make graph-up     # start Neo4j via the docker-compose "graph" profile (needs NEO4J_PASSWORD)
 make docker-up    # bring up Qdrant + Redis from docker-compose.yml
 make docker-down
 make lint         # ruff check .  (rules in pyproject.toml; fails on findings)
 make format       # black app/   (only if black is installed; not enforced)
 ./dev.sh start    # interactive helper around the same actions
+
+# Single tests (pytest.ini sets asyncio_mode=auto, testpaths=tests)
+python -m pytest -q tests/test_ocr.py              # one file
+python -m pytest -q tests/test_ocr.py -k <name>    # one test
+python tests/offline/verify_rag.py                 # one offline suite (plain script, not pytest)
+
+# Retrieval eval (golden set is JSON Lines; see app/rag/eval/metrics.py)
+python scripts/eval_rag.py <golden.jsonl> [--answers] [--graph] [--out report.json]
+
+# Commit gates (gitleaks, ruff, …): install once per clone
+pip install -r requirements-dev.txt && pre-commit install
 ```
+
+The existing local virtualenv in this checkout is `env/` (not the `venv/` that
+`make setup` would create). `make eval`, `make smoke-graph` and
+`make statute-report` are referenced in `docs/AGENTIC_ONTOLOGY_RAG_FOUNDATIONS.md`
+but **do not exist in this Makefile**.
 
 `make test` runs `pytest tests` (ontology, graph, retrieval, statute layers) and
 the offline `tests/offline/verify_*.py` suites. **Before a deploy, also run `make e2e`**
@@ -393,7 +407,9 @@ Neo4j (`app/graph/store.py`) and planned and assembled by
 `app/retrieval/` (planner, critic, graph queries).
 
 It came from `feature/data_ingestion`, ported onto this branch's own RAG.
-**It does not use Keel.** Vector and exact-term sub-questions run on
+**It does not use Keel** (the separate knowledge-plane platform that is the
+planned long-term home for the graph write path; no Keel code is in this
+repo). Vector and exact-term sub-questions run on
 `app/rag/retriever` (hybrid search), and graph sub-questions run on Neo4j.
 
 **Configuration**
@@ -614,17 +630,6 @@ check of the sinks.
 
 `bns-ai-*.json` and `gcp-vision.json` are GCP service-account credential files that exist in the working tree. Do not read, log, or include their contents in commits, diffs, or chat output. Treat `.env` the same way.
 
-## Keel (`keel/`)
-
-`keel/` is a **vendored plain copy** of the Keel knowledge-plane platform
-(`github.com/keel-vc/keel-ai` @ `418cfb6`), copied 2026-08-24 so the Keel-side
-tasks of the Agentic Ontology RAG programme can be done in this tree. It is
-**not** part of the AI service and does not run in `env/` — its dependency pins
-conflict with this repo's on fastapi, uvicorn, qdrant-client, redis and
-python-multipart, so it needs its own venv or container. There is no git link to
-upstream; refreshing is a manual rsync. See `docs/KEEL_VENDORED.md` before
-touching it, and note the `.gitignore` `*.md` trap documented there.
-
 ## Where to look first
 
 - Handshake authentication → `app/socket/auth.py` (scheme `v1`: HMAC over `v1:AI_Maverick:<unix_seconds>:<nonce>`, sent as `x-signature` / `x-signature-timestamp` / `x-signature-nonce`). Headers are **single-use** — `SocketClient.connect` passes the builder as a *callable* so python-socketio re-signs on every reconnect; passing a dict breaks every reconnect with `replayed_nonce`. Spec and failure-code table: `docs/AI_SERVICE_AUTH_MIGRATION.md`. `SOCKET_AUTH_SCHEME=legacy` is a rollback-only escape hatch.
@@ -635,9 +640,11 @@ touching it, and note the `.gitignore` `*.md` trap documented there.
 - Vector retrieval → `app/vectorstore/qdrant.py` (storage) + `app/rag/` (chunking, hybrid retrieval, evidence, citations).
 - Model providers, routing, per-task model choice → `app/llm/` (router + `providers/`) behind `app/ai/gemini_client.py`; `docs/MODEL_PORTABILITY.md`.
 - Prompt edits (legal framing, guardrails) → `app/prompts/`.
-- Knowledge plane / Keel → `keel/` + `docs/KEEL_VENDORED.md`. Ontology, statutory register and eval harness → `app/ontology/`, `app/statutes/`, `app/eval/` + `docs/AGENTIC_ONTOLOGY_RAG_FOUNDATIONS.md`.
+- Ontology, statutory register and eval harness → `app/ontology/`, `app/statutes/`, `app/eval/` + `docs/AGENTIC_ONTOLOGY_RAG_FOUNDATIONS.md`.
 - Full event-flow narrative → `docs/SYSTEM_ARCHITECTURE.md`. Recent feature-level history → `CHANGELOG.md`.
 - Architecture map (start here) → `docs/architecture.md`.
+- Onboarding a person, a new Claude account, or migrating the service →
+  `docs/onboarding.md`, `docs/claude-code-setup.md`, `docs/migration-guide.md`.
 
 ## How work is done here
 

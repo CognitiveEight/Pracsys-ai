@@ -4,6 +4,11 @@ Status of the work plan (`Agentic_Ontology_RAG_Workplan_v1.0.docx`) inside this
 repository. This document covers what exists in code, what it does, and what is
 deliberately not built yet.
 
+> **Note.** The Keel parts below (`keel/backend/…`, `app/keel/client.py`,
+> `KEEL_*` settings) were written on `feature/data_ingestion` and are **not in
+> this branch**. Here the graph runs on this repo's own RAG (`app/rag/`) and
+> Neo4j; see CLAUDE.md "Knowledge graph".
+
 ## What is implemented
 
 Three pieces, chosen because they are the plan's own week-one items and none of

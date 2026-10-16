@@ -311,6 +311,16 @@ class Settings(BaseSettings):
     )
     audio_min_speakers: int = 2
     audio_max_speakers: int = 6
+    # Chirp 3 BatchRecognize rejects files over 20 minutes. Longer recordings
+    # are cut at pauses into windows of at most this many seconds (overlap
+    # included), transcribed in parallel and stitched back together.
+    audio_batch_window_seconds: float = 1140.0
+    # Audio shared by neighbouring windows; used to match speakers across them.
+    audio_window_overlap_seconds: float = 15.0
+    # BatchRecognize jobs in flight at once for one recording.
+    audio_batch_concurrency: int = 4
+    # Recordings longer than this are rejected before any paid call. 0 = no cap.
+    audio_max_duration_minutes: float = 1440.0
     huggingface_token: Optional[str] = None  # Optional, for pyannote fallback
     pyannote_model: str = "pyannote/speaker-diarization-3.1"
 

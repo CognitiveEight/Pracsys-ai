@@ -174,6 +174,17 @@ class Settings(BaseSettings):
     # Send Gemini safety_settings BLOCK_NONE for Gemini-backed gate0 models
     # (legal evidence trips the default filters; same policy as direct Gemini).
     gate0_gemini_block_none: bool = True
+    # Gate0 usage meter: report the non-model paid units (Vision OCR pages,
+    # Speech-to-Text seconds, Vertex AI Search queries, Google Search grounding
+    # requests gate0 did not price) to gate0, so gate0 holds the whole bill of
+    # every case. Needs gate0's usage-record endpoint (usage-record schema
+    # 1.1.0); off until that is deployed. Records carry ids and quantities only.
+    gate0_meter_enabled: bool = False
+    gate0_meter_path: str = "/usage-records"  # relative to GATE0_BASE_URL
+    gate0_meter_flush_seconds: float = 10.0
+    # Records gate0 could not take are kept here and re-sent on the next start
+    # (gate0 dedupes by call id). Billing records only — no case content.
+    gate0_meter_outbox_dir: str = "data/gate0_meter_outbox"
     # Embeddings: EMBEDDING_MODEL / EMBEDDING_DIMENSIONS above name the model.
     # gemini | openai | azure_openai | azure_foundry | bedrock | openai_compat:<account>
     embedding_provider: str = "gemini"

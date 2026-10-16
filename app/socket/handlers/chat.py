@@ -160,6 +160,9 @@ class ChatMixin:
                 search_queries=service_units["searchQueries"],
                 grounding_requests=service_units["groundingRequests"],
                 embed_tokens=service_units["embedTokens"],
+                # Embeddings gate0 priced itself are billed at its figure.
+                embed_gateway_tokens=int(getattr(usage, "embed_gateway_tokens", 0) or 0),
+                embed_gateway_cost=float(getattr(usage, "embed_gateway_cost", 0.0) or 0.0),
             )
 
             fields: Dict[str, Any] = {

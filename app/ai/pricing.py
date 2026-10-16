@@ -234,6 +234,8 @@ def service_price_for(
     search_queries: int = 0,
     grounding_requests: int = 0,
     embed_tokens: int = 0,
+    embed_gateway_tokens: int = 0,
+    embed_gateway_cost: float = 0.0,
 ) -> Dict[str, float]:
     """Return the USD cost of the paid non-LLM work in one scope.
 
@@ -241,6 +243,9 @@ def service_price_for(
     ``embedPrice`` and their sum ``servicePrice`` — each rounded to 6 decimal
     places (sub-cent precision), matching :func:`price_for`. Negative/None
     quantities are treated as 0. Never raises.
+
+    ``embed_gateway_tokens`` of the ``embed_tokens`` were priced by a gateway at
+    ``embed_gateway_cost``; only the rest are priced at the local rate.
     """
     ocr_units = max(int(ocr_units or 0), 0)
     stt_seconds = max(float(stt_seconds or 0.0), 0.0)
@@ -272,10 +277,13 @@ def service_price_for(
         ),
         6,
     )
+    gateway_tokens = min(max(int(embed_gateway_tokens or 0), 0), embed_tokens)
+    gateway_cost = max(float(embed_gateway_cost or 0.0), 0.0)
     embed_price = round(
-        embed_tokens / _PER_MILLION * _service_rate(
+        (embed_tokens - gateway_tokens) / _PER_MILLION * _service_rate(
             "embed_price_per_million_tokens", EMBED_PRICE_PER_MILLION_TOKENS
-        ),
+        )
+        + gateway_cost,
         6,
     )
 

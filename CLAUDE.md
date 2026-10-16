@@ -594,8 +594,9 @@ check of the sinks.
 **One line per model call**
 - `gemini_client` writes a single `llm_call` line with the kind, the feature
   (taken from the `@meter_usage` function name), model, status
-  (`ok`/`error`/`timeout`/`blocked`/`truncated`), finish reason, duration and
-  tokens.
+  (`ok`/`error`/`timeout`/`blocked`/`truncated`), finish reason, duration,
+  tokens, `cost=` and `gateway_call_id=` (gate0's call id: one line per gate0
+  usage record). Embeddings get one `llm_call embed` line per batch.
 - A failed call that returns the error sentinel is logged as `error`. Do not
   add per-call "generating…/generated" lines.
 

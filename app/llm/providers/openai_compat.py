@@ -28,6 +28,7 @@ from app.llm.types import (
     AudioPart,
     Capabilities,
     DocumentPart,
+    EmbeddingBatch,
     EmbedTask,
     ImagePart,
     LLMRequest,
@@ -300,16 +301,31 @@ class OpenAIChatProvider(Provider):
         if extra_body:
             kwargs["extra_body"] = extra_body
         try:
-            response = await self._client.get().embeddings.create(**kwargs)
+            response, headers = await self._embed_create(self._client.get(), kwargs)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             raise self._to_error(exc) from exc
         usage = getattr(response, "usage", None)
-        tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
-        record_embed_tokens(tokens or sum(len(t or "") for t in texts) // 4)
+        tokens = int(getattr(usage, "prompt_tokens", 0) or 0) or sum(len(t or "") for t in texts) // 4
+        cost, call_id = self._gateway_fields(headers)
+        record_embed_tokens(tokens, cost)
         data = sorted(response.data or [], key=lambda d: getattr(d, "index", 0))
-        return [list(d.embedding or []) for d in data]
+        return EmbeddingBatch(
+            [list(d.embedding or []) for d in data],
+            input_tokens=tokens,
+            cost_usd=cost,
+            gateway_call_id=call_id,
+        )
+
+    async def _embed_create(self, client: Any, kwargs: Dict[str, Any]) -> Any:
+        """One embeddings call: ``(response, response_headers or None)``."""
+        return await client.embeddings.create(**kwargs), None
+
+    @staticmethod
+    def _gateway_fields(headers: Any) -> "tuple[Optional[float], Optional[str]]":
+        """(cost, call id) a gateway reported in ``headers``; none for direct APIs."""
+        return None, None
 
 
 class OpenAICompatProvider(OpenAIChatProvider):

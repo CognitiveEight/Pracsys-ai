@@ -8,7 +8,6 @@ from app.ontology.contradictions import (
     CONFLICT_DATE,
     CONFLICT_PARTY,
     CONFLICT_QUANTUM,
-    CONFLICT_STATUS,
     detect_contradictions,
     detect_date_conflicts,
     detect_party_role_conflicts,

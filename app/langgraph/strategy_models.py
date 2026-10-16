@@ -8,7 +8,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from app.agents.role_models import Role, RoleEnum
+from app.agents.role_models import RoleEnum
 
 # Strategy Types (aligned with legal reasoning)
 StrategyType = Literal[

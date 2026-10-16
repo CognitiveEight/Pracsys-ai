@@ -7,7 +7,6 @@ sensible pingInterval so the connection is not closed while the AI service is ge
 """
 
 import asyncio
-import json
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional

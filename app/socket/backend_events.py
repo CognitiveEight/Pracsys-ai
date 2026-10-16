@@ -5,7 +5,6 @@ Based on official backend Socket.IO events documentation (2026-01-21)
 This module contains schemas for ALL events documented by the backend team.
 """
 
-from datetime import datetime
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field

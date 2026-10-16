@@ -8,7 +8,7 @@ from typing import Any, Dict
 from langgraph.graph import END, StateGraph
 from loguru import logger
 
-from app.langgraph.chat_models import ChatContext, ChatMessage, ChatResponse
+from app.langgraph.chat_models import ChatContext, ChatResponse
 from app.langgraph.chat_nodes import (action_dispatcher_node,
                                       chat_context_builder_node,
                                       explain_why_node,

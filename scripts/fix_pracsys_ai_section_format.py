@@ -33,7 +33,7 @@ import re
 import sys
 from copy import deepcopy
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Sequence
 
 from docx import Document
 from docx.oxml import OxmlElement

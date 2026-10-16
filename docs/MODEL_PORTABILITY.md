@@ -87,8 +87,8 @@ Some tasks are named explicitly:
 |---|---|
 | `audio_diarization` | Transcript speaker diarization and roles |
 | `audio_transliteration` | Hinglish transliteration |
-| `text_filter` | Forbidden-word filter in `agent.py` |
-| `law_strip` | Law-citation strip in `agent.py` |
+| `text_filter` | Forbidden-word filter in `app/langgraph/output_filters.py` |
+| `law_strip` | Law-citation strip in `app/langgraph/output_filters.py` |
 
 **Startup validation.** `lifecycle.startup` → `gemini_client.initialize()`
 checks every configured profile.
@@ -212,24 +212,61 @@ EMBEDDING_MODEL=gemini-embedding-001
     (`generate_grounded` returns `("", [])`) rather than sent around the
     gateway.
 - **Attribution.** Every request carries LiteLLM `metadata` and `tags`:
-  - fields: `app`, `feature` (the route key), `kind`, `workspace_id`,
-    `request_id`, `event`;
+  - fields: `app`, `feature` (the route key), `kind`, `case_id` (the
+    workspace id), `request_id`, `event`;
   - tags: `app:…`, `feature:…`, `workspace_id:…`.
 
   These are ids only, never names or prompt text. Turn them off with
-  `GATE0_TAG_REQUESTS=false`.
+  `GATE0_TAG_REQUESTS=false`. The metadata key is `case_id`, **not**
+  `workspace_id`: LiteLLM rejects (401) any request whose body or metadata has
+  a `workspace_id` key, an Anthropic/Bedrock workspace selector on its
+  client-credential ban list. `tests/test_llm_gate0.py` guards it.
 - **One bill.** The cost gate0 computed (the `x-litellm-response-cost` header)
-  is what SimplerToday bills, instead of its local price table. Both systems
-  report the same figure.
+  is what SimplerToday bills, instead of its local price table, for chat
+  **and embeddings** (`embedPrice` = gate0's figure for gateway-priced tokens,
+  the local rate only for the rest). Both systems report the same figure; the
+  cost is kept unrounded until the emit.
+- **One log key.** gate0's `x-litellm-call-id` is on every `llm_call` line as
+  `gateway_call_id=`, with `cost=`, for generations and for embeddings (one
+  `llm_call embed feature=embeddings` line per batch). That id is the
+  `call_id` of gate0's usage record and the `request_id` of its spend log, so
+  every call joins one-to-one.
+- **Model features come from configuration.** Any model gate0 serves
+  (Gemini, Claude, GPT, Azure deployments, or open-source models such as
+  Llama, Qwen, DeepSeek or Mistral) is described in
+  `LLM_MODEL_OPTIONS[model]`, never inferred from its name:
+
+  | Key | Effect |
+  |---|---|
+  | `max_output_tokens` | output ceiling (set it for every non-Gemini model) |
+  | `supports_documents`, `supports_images` | PDF / image input |
+  | `thinking: true` | sends `reasoning_effort` (LiteLLM maps it per backend) |
+  | `grounding: true` | sends `web_search_options` (LiteLLM's web search) |
+  | `extra_body` | backend-specific parameters, passed through unchanged |
+  | `family: "anthropic"` | Claude rules: no `temperature` with thinking, no thinking in JSON mode (LiteLLM forces a tool call for JSON on Claude) |
+  | `family: "gemini"` / `gemini: true` | Gemini features for a group whose name hides it |
+  | `cohere_input_type: true` | Cohere query/document embedding type (automatic for names containing `cohere`) |
+
+  An unconfigured non-Gemini model gets a plain OpenAI request.
 - **Gemini features through the gateway.** These apply to models whose name
-  contains `gemini`, or to a task class marked
-  `LLM_MODEL_OPTIONS={"gate0/lite": {"gemini": true}}`:
+  contains `gemini`, or to a group marked `"family": "gemini"` / `"gemini": true`:
   - `reasoning_effort` (LiteLLM turns it into the thinking level);
   - `safety_settings` BLOCK_NONE (`GATE0_GEMINI_BLOCK_NONE`);
   - Google Search grounding through `web_search_options`, with sources read
     from the `url_citation` annotations;
   - embedding `task_type`;
   - the same 16K output floor as direct Gemini.
+- **Startup check.** Under `GATE0_ENFORCE=true`, startup lists gate0's models
+  and logs an ERROR for each configured model gate0 does not serve, and a
+  WARNING for a selectable non-Gemini model without `max_output_tokens`. It
+  never blocks startup.
+- **Usage meter (`GATE0_METER_ENABLED`, off by default).** OCR pages,
+  Speech-to-Text seconds, Vertex AI Search queries and grounding requests gate0
+  did not price never pass through gate0. With the meter on, each is also sent
+  to gate0 as a usage record (`app/ai/gate0_meter.py`; schema 1.1.0 with
+  `usage_kind`, `units`, `attribution`), batched to `GATE0_METER_PATH`, with an
+  on-disk outbox while gate0 is unreachable. Ids and quantities only. Needs
+  gate0's usage-record endpoint, which is not deployed yet.
 - **Budgets.** A 429 that says "budget" is final: no retry, no fallback, and
   the caller reports the failure. A plain rate-limit 429 is retried once.
 

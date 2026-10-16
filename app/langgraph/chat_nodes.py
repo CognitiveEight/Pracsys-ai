@@ -4,18 +4,15 @@ Implements governed, role-aware chat reasoning.
 """
 
 import re
-import time
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from app.agents.role_models import RoleEnum
 from app.ai.gemini_client import gemini_client
 from app.core.config import settings
 from app.rag.citations import verify_and_number
 from app.rag.evidence import EvidencePack
 from app.langgraph.chat_models import (
-    ChatIntent,
     ChatIntentEnum,
     ConfidenceLevel,
     GovernanceValidationResult,
@@ -228,7 +225,6 @@ def chat_context_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # Extract inputs
     chat_context = state.get("chat_context", {})
-    user_message = state.get("user_message", "")
 
     # Validate critical inputs
     role_context = chat_context.get("role_context")
@@ -1122,9 +1118,6 @@ def action_dispatcher_node(state: Dict[str, Any]) -> Dict[str, Any]:
     logger.info("Dispatching action...")
 
     intent = state.get("intent", "EXPLAIN")
-    intent_classification = state.get("intent_classification", {})
-    requires_agent = intent_classification.get("requires_agent", False)
-    target_agent = intent_classification.get("target_agent")
 
     routed_to_agent = None
     dispatch_message = None
@@ -1250,9 +1243,7 @@ def governance_validator_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     logger.info("Validating governance compliance...")
 
-    role = state.get("role")
     chat_context = state.get("chat_context", {})
-    response_text = state.get("response_text", "")
     intent = state.get("intent")
 
     violations = []

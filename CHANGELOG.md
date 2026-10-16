@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SIM-29: every case-scoped model call through gate0 was rejected (401).**
+  The gate0 adapter sent the workspace id as a `workspace_id` metadata key,
+  which LiteLLM bans (an Anthropic/Bedrock workspace selector), so any call
+  made inside a workspace event failed once gate0 was in use. The key is now
+  `case_id`; the `workspace_id:<id>` tag that reconciliation reads is unchanged.
+- **SIM-29: embedding cost through gate0 is gate0's own figure**, read from
+  `x-litellm-response-cost`, instead of a token estimate × a configured rate.
+  Gateway costs are also no longer rounded per call (a $0.00000975 call was
+  billed as $0.00001). **Value change, not a shape change:** `embedPrice`,
+  `servicePrice` and `price` in every emit's `metadata` move to gate0's figures.
 - **Audio recordings over 20 minutes (hotfix).** Chirp 3 BatchRecognize rejects
   files longer than 20 minutes, so every long call paid for a doomed upload and
   then fell back to ~40 s Recognize chunks, whose speaker tags drift across
@@ -50,6 +60,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the case's unreported spend.
 
 ### Added
+
+- **SIM-29: gate0 as the single model, cost and log layer.**
+  - Every `llm_call` line has `cost=` and `gateway_call_id=` (gate0's call id),
+    and embeddings get their own `llm_call embed` line, so each call matches
+    one gate0 usage record.
+  - Model features through gate0 come from `LLM_MODEL_OPTIONS` (`thinking`,
+    `grounding`, `supports_documents`, `extra_body`, `family`), never from the
+    model name, so any model gate0 serves, open-source ones included, can be
+    configured. Gemini behaviour is unchanged.
+  - Cohere embeddings get the query/document `input_type` through gate0.
+  - Under `GATE0_ENFORCE`, startup reports configured models gate0 does not
+    serve, without blocking.
+  - `GATE0_METER_ENABLED` (off by default) reports OCR, Speech-to-Text, search
+    and unpriced grounding units to gate0's meter with an on-disk outbox.
+    Needs gate0's usage-record endpoint (schema 1.1.0), not yet deployed.
 
 - **The user chooses the model per case** (`aiModel`).
   - **Socket payload change:** a new optional `aiModel` field.

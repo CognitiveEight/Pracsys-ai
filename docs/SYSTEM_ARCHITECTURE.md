@@ -142,7 +142,7 @@ Four rules:
 Scoped to the one document: drift between `evidenceFiles` and the live vector
 store is logged, never acted on — reconciling the whole workspace is
 `workspace_sync`'s job and would spend the user's money on work they did not
-ask for. Offline coverage: `verify_document_reload.py`.
+ask for. Offline coverage: `tests/offline/verify_document_reload.py`.
 
 **Outbound (AI → Backend):**
 
@@ -347,7 +347,7 @@ Four mechanisms now make that recoverable, and they are ordered deliberately —
 
 Supporting changes: Gemini calls are bounded by `gemini_request_timeout_seconds` (default 300 s — the legitimate regeneration takes ~2 minutes); `is_generation_error()` stops a returned failure sentinel from masquerading as content (a 429 used to surface as "model returned no JSON"); and every give-up path logs a reason code plus an `objective_change_failed` audit event.
 
-**When you add a path that arms `workspace:refresh`,** pair it with a `_release_refresh_loaders` call on every branch that can exit without emitting — including the cancellation branch. Offline coverage: `verify_objective_change.py` group 12.
+**When you add a path that arms `workspace:refresh`,** pair it with a `_release_refresh_loaders` call on every branch that can exit without emitting — including the cancellation branch. Offline coverage: `tests/offline/verify_objective_change.py` group 12.
 
 So a name correction stays surgical and consistent everywhere, while an objective change re-derives the objective-dependent intelligence (objective, summaries' framing, analysis, score, laws) and leaves the document-derived panels stable.
 

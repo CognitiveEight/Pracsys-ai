@@ -134,3 +134,36 @@ def test_emit_metadata_reports_and_totals_the_drained_spend(monkeypatch):
     assert again["price"] == 0 and again["totalPrice"] == pytest.approx(0.2989)
     assert added == [pytest.approx(0.2989)]  # cumulative incremented once
     assert ingest is not None
+
+
+# -- SIM-29: embeddings billed at gate0's own figure -----------------------------------
+
+
+def test_embed_price_mixes_gateway_cost_and_estimate(monkeypatch):
+    from app.ai.pricing import service_price_for
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "embed_price_per_million_tokens", 1.0)
+    # 3,000 tokens: 1,000 gate0-priced at $0.5, 2,000 estimated at $1/1M.
+    price = service_price_for(embed_tokens=3000, embed_gateway_tokens=1000, embed_gateway_cost=0.5)
+    assert price["embedPrice"] == pytest.approx(0.5 + 2000 / 1_000_000)
+    # Gateway tokens can never exceed the total (no negative estimate).
+    assert service_price_for(embed_tokens=10, embed_gateway_tokens=50, embed_gateway_cost=0.1)[
+        "embedPrice"] == pytest.approx(0.1)
+
+
+def test_gateway_embed_cost_survives_merge_and_drain():
+    from app.ai.usage import record_embed_tokens
+
+    with logger.contextualize(workspace_id="ws-embed"):
+        with capture_usage():
+            record_embed_tokens(100, 0.002)
+            record_embed_tokens(40)  # estimate, no gateway cost
+        with capture_usage():
+            record_embed_tokens(60, 0.003)
+    drained = drain_for_emit("ws-embed")
+    assert drained.embed_tokens == 200
+    assert drained.embed_gateway_tokens == 160
+    assert drained.embed_gateway_cost == pytest.approx(0.005)
+    # Drained exactly once.
+    assert drain_for_emit("ws-embed").embed_tokens == 0

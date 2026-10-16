@@ -2,7 +2,6 @@
 File handlers for processing different file types using GCP Vision OCR.
 """
 
-import base64
 import os
 import re
 import subprocess
@@ -155,9 +154,8 @@ def _strip_repeated_pdf_boilerplate(
     return cleaned
 
 try:
-    from google.auth.exceptions import DefaultCredentialsError
-    from google.cloud import vision
-
+    from google.auth.exceptions import DefaultCredentialsError  # noqa: F401  (availability probe)
+    from google.cloud import vision  # noqa: F401  (availability probe)
     GCP_OCR_AVAILABLE = True
 except ImportError:
     GCP_OCR_AVAILABLE = False
@@ -180,8 +178,7 @@ except ImportError:
     logger.warning("pdf2image not available")
 
 try:
-    from PIL import Image
-
+    from PIL import Image  # noqa: F401  (availability probe)
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -208,8 +205,7 @@ except ImportError:
     logger.warning("docx2txt not available")
 
 try:
-    import openpyxl
-
+    import openpyxl  # noqa: F401  (availability probe)
     XLSX_AVAILABLE = True
 except ImportError:
     XLSX_AVAILABLE = False

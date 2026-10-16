@@ -249,7 +249,7 @@ Development Tools:
 make setup          - Complete setup (venv, deps, .env, folders)
 make run            - Start application
 make docker-up      - Start services (Qdrant, Redis)
-make lint / format  - pylint / black (if installed)
+make lint / format  - ruff (enforced) / black (if installed)
 make clean          - Clean temp files
 (No working test target: make test expects a test_setup.py that does not
 exist — validate via make run against a connected backend.)

@@ -147,7 +147,7 @@ Do not rely on these being in Git — they appear after the first runs.
 | Install deps only | `make install` |
 | First-time setup (venv, deps, `.env` from template, folders) | `make setup` |
 | Run the AI service | `make run` or `python -m app.main` |
-| Smoke test | `make test` *(currently expects `test_setup.py`; add tests before relying on this target)* |
+| Tests | `make test` (pytest + `tests/offline/verify_*.py`), `make lint` (ruff) |
 | Start Docker services (e.g. Qdrant) | `make docker-up` |
 | Stop Docker services | `make docker-down` |
 

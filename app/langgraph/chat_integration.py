@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 
 from loguru import logger
 
-from app.langgraph.chat_models import ChatContext, ChatMessage, ChatResponse
+from app.langgraph.chat_models import ChatContext, ChatMessage
 from app.langgraph.intelligence_chat_agent import intelligence_chat_agent
 from app.workspace.custom_instructions import build_custom_instruction_suffix
 from app.workspace.manager import workspace_manager

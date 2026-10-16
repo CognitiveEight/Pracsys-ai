@@ -13,7 +13,7 @@ from app.agents.role_models import Role, RoleEnum
 from app.langgraph.role_agent import role_agent
 from app.langgraph.state import WorkspaceState, create_initial_workspace_state
 from app.observability.audit import audit_logger
-from app.workspace.context import WorkspaceContext, context_manager
+from app.workspace.context import WorkspaceContext
 
 
 class WorkspaceRoleIntegration:

@@ -106,6 +106,30 @@ class LLMResult:
     #: Authoritative USD cost reported by a gateway (gate0/LiteLLM), when known.
     #: Used instead of the local price table so both sides bill the same figure.
     cost_usd: Optional[float] = None
+    #: The gateway's own id for this call (gate0's ``x-litellm-call-id``), so the
+    #: service's ``llm_call`` line joins one-to-one with gate0's spend record.
+    gateway_call_id: Optional[str] = None
+
+
+class EmbeddingBatch(list):
+    """The vectors of one embedding call, plus what a gateway reported about it.
+
+    A plain ``list`` to every caller; providers that know more (gate0) fill the
+    attributes so the router can log and bill the call like a generation.
+    """
+
+    def __init__(
+        self,
+        vectors: Any = (),
+        *,
+        input_tokens: int = 0,
+        cost_usd: Optional[float] = None,
+        gateway_call_id: Optional[str] = None,
+    ) -> None:
+        super().__init__(vectors)
+        self.input_tokens = input_tokens
+        self.cost_usd = cost_usd
+        self.gateway_call_id = gateway_call_id
 
 
 @dataclass(frozen=True)

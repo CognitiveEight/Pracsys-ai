@@ -28,6 +28,8 @@ from typing import Any, Dict, List, Optional, Tuple, TypedDict
 from langgraph.graph import END, StateGraph
 from loguru import logger
 
+from app.utils.redact import chars
+
 
 class TemplateMatchState(TypedDict, total=False):
     """State threaded through the template-match graph.

@@ -40,7 +40,7 @@ class RoleBasedAgent:
         """Initialize the role-based agent with LangGraph."""
         self.graph = self._build_graph()
         self.compiled_graph = None
-        logger.info("🎭 Role-Based Agent initialized")
+        logger.info("Role-Based Agent initialized")
 
     def _build_graph(self) -> StateGraph:
         """
@@ -82,7 +82,7 @@ class RoleBasedAgent:
             Returns:
                 Configured StateGraph
         """
-        logger.info("🏗️ Building Role-Based Agent graph...")
+        logger.info("Building Role-Based Agent graph...")
 
         # Create graph
         workflow = StateGraph(WorkspaceState)
@@ -116,7 +116,7 @@ class RoleBasedAgent:
         # Add edge from validation to end (ready for downstream)
         workflow.add_edge("role_validation", END)
 
-        logger.success("✅ Role-Based Agent graph built")
+        logger.success("Role-Based Agent graph built")
         return workflow
 
     def _route_from_role_gate(
@@ -138,16 +138,16 @@ class RoleBasedAgent:
         """
         # Check if role gate blocked
         if state["metadata"].get("role_gate_blocked"):
-            logger.debug("🚧 Routing: role_gate → role_selection (blocked)")
+            logger.debug("Routing: role_gate  role_selection (blocked)")
             return "role_selection"
 
         # Check if role is validated
         if validate_role_state(state):
-            logger.debug("✅ Routing: role_gate → role_context_builder (passed)")
+            logger.debug("Routing: role_gate  role_context_builder (passed)")
             return "role_context_builder"
 
         # Error case
-        logger.error("❌ Routing: role_gate → end (error)")
+        logger.error("Routing: role_gate  end (error)")
         return "end"
 
     @tracer.trace("role_agent_compile")
@@ -158,9 +158,9 @@ class RoleBasedAgent:
         Returns:
             Self for chaining
         """
-        logger.info("⚙️ Compiling Role-Based Agent graph...")
+        logger.info("Compiling Role-Based Agent graph...")
         self.compiled_graph = self.graph.compile()
-        logger.success("✅ Role-Based Agent graph compiled")
+        logger.success("Role-Based Agent graph compiled")
         return self
 
     @tracer.trace("role_agent_invoke")
@@ -187,7 +187,7 @@ class RoleBasedAgent:
             RoleSelectionError: If role enforcement fails
         """
         logger.info(
-            "🚀 Invoking Role-Based Agent for workspace {} with input: {}",
+            "Invoking Role-Based Agent for workspace {} with input: {}",
             workspace_id,
             user_input[:50] + "..." if len(user_input) > 50 else user_input,
         )
@@ -209,7 +209,7 @@ class RoleBasedAgent:
             result = await self.compiled_graph.ainvoke(state)
 
             logger.success(
-                "✅ Role-Based Agent completed for workspace {}", workspace_id
+                "Role-Based Agent completed for workspace {}", workspace_id
             )
 
             # Log audit event
@@ -228,7 +228,7 @@ class RoleBasedAgent:
             return result
 
         except RoleSelectionError as e:
-            logger.error("❌ Role enforcement error: {}", str(e))
+            logger.error("Role enforcement error: {}", str(e))
 
             # Log audit event
             await audit_logger.log_error(
@@ -244,7 +244,7 @@ class RoleBasedAgent:
             raise
 
         except Exception as e:
-            logger.error("❌ Role-Based Agent error: {}", str(e))
+            logger.error("Role-Based Agent error: {}", str(e))
 
             # Log audit event
             await audit_logger.log_error(
@@ -328,10 +328,10 @@ class RoleBasedAgent:
             with open(output_path, "wb") as f:
                 f.write(mermaid_png)
 
-            logger.success("✅ Graph visualization saved to {}", output_path)
+            logger.success("Graph visualization saved to {}", output_path)
 
         except Exception as e:
-            logger.error("❌ Failed to visualize graph: {}", str(e))
+            logger.error("Failed to visualize graph: {}", str(e))
 
 
 # ============================================================================
@@ -370,7 +370,7 @@ async def enforce_role_gate(
     """
     if not validate_role_state(state):
         logger.error(
-            "🚨 Role Gate: Blocking {} operation for workspace {} - No role selected",
+            "Role Gate: Blocking {} operation for workspace {} - No role selected",
             operation,
             workspace_id,
         )
@@ -396,7 +396,7 @@ async def enforce_role_gate(
         )
 
     logger.debug(
-        "✅ Role Gate: Allowing {} operation for workspace {}", operation, workspace_id
+        "Role Gate: Allowing {} operation for workspace {}", operation, workspace_id
     )
 
     return True

@@ -1,212 +1,111 @@
 """
-Distributed tracing and performance monitoring.
+Operation timing.
+
+``@tracer.trace("name")`` times a function and writes one structured record
+(``trace=True``) to ``logs/structured.log``: operation, duration, status, a
+unique ``trace_id`` and the parent operation's id, plus the request context
+(request_id / event / workspace_id) bound for the inbound event. Text logs get
+a DEBUG line only, so timings never drown the readable log.
+
+The current trace id lives in a contextvar, so nested traced calls record their
+parent and child tasks inherit it.
 """
 
+import asyncio
+import contextvars
 import functools
 import time
-from contextlib import asynccontextmanager
-from datetime import datetime
-from typing import Any, Callable, Dict, Optional
+import uuid
+from typing import Any, Callable, Optional
 
 from loguru import logger
 
 from app.core.config import settings
 
+_current_trace: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "simplertoday_trace_id", default=None
+)
+
+
+def current_trace_id() -> Optional[str]:
+    return _current_trace.get()
+
 
 class Tracer:
-    """
-    Simple tracer for monitoring function execution and performance.
-    """
+    """Times decorated functions; no-op when ENABLE_TRACE is false."""
 
     def __init__(self):
         self.enabled = settings.enable_trace
-        self._active_traces: Dict[str, Dict[str, Any]] = {}
 
     def trace(self, operation_name: str):
-        """
-        Decorator to trace function execution.
-
-        Args:
-            operation_name: Name of the operation being traced
-        """
-
         def decorator(func: Callable) -> Callable:
-            @functools.wraps(func)
-            async def async_wrapper(*args, **kwargs):
-                if not self.enabled:
-                    return await func(*args, **kwargs)
+            if asyncio.iscoroutinefunction(func):
 
-                trace_id = f"{operation_name}_{int(time.time() * 1000)}"
-                start_time = time.time()
-
-                logger.debug("Starting trace: {} ({})", operation_name, trace_id)
-
-                try:
-                    result = await func(*args, **kwargs)
-                    duration = time.time() - start_time
-
-                    self._log_trace(
-                        trace_id=trace_id,
-                        operation_name=operation_name,
-                        duration=duration,
-                        status="success",
-                    )
-
+                @functools.wraps(func)
+                async def async_wrapper(*args, **kwargs):
+                    if not self.enabled:
+                        return await func(*args, **kwargs)
+                    trace_id, parent, token = self._start()
+                    start = time.perf_counter()
+                    try:
+                        result = await func(*args, **kwargs)
+                    except BaseException as exc:
+                        self._finish(operation_name, trace_id, parent, start, exc)
+                        raise
+                    finally:
+                        _current_trace.reset(token)
+                    self._finish(operation_name, trace_id, parent, start, None)
                     return result
 
-                except Exception as e:
-                    duration = time.time() - start_time
-
-                    self._log_trace(
-                        trace_id=trace_id,
-                        operation_name=operation_name,
-                        duration=duration,
-                        status="error",
-                        error=str(e),
-                    )
-
-                    raise
+                return async_wrapper
 
             @functools.wraps(func)
             def sync_wrapper(*args, **kwargs):
                 if not self.enabled:
                     return func(*args, **kwargs)
-
-                trace_id = f"{operation_name}_{int(time.time() * 1000)}"
-                start_time = time.time()
-
-                logger.debug("Starting trace: {} ({})", operation_name, trace_id)
-
+                trace_id, parent, token = self._start()
+                start = time.perf_counter()
                 try:
                     result = func(*args, **kwargs)
-                    duration = time.time() - start_time
-
-                    self._log_trace(
-                        trace_id=trace_id,
-                        operation_name=operation_name,
-                        duration=duration,
-                        status="success",
-                    )
-
-                    return result
-
-                except Exception as e:
-                    duration = time.time() - start_time
-
-                    self._log_trace(
-                        trace_id=trace_id,
-                        operation_name=operation_name,
-                        duration=duration,
-                        status="error",
-                        error=str(e),
-                    )
-
+                except BaseException as exc:
+                    self._finish(operation_name, trace_id, parent, start, exc)
                     raise
+                finally:
+                    _current_trace.reset(token)
+                self._finish(operation_name, trace_id, parent, start, None)
+                return result
 
-            # Return appropriate wrapper based on function type
-            if asyncio.iscoroutinefunction(func):
-                return async_wrapper
-            else:
-                return sync_wrapper
+            return sync_wrapper
 
         return decorator
 
-    @asynccontextmanager
-    async def span(self, operation_name: str, **attributes):
-        """
-        Context manager for creating trace spans.
+    @staticmethod
+    def _start():
+        trace_id = uuid.uuid4().hex[:16]
+        parent = _current_trace.get()
+        token = _current_trace.set(trace_id)
+        return trace_id, parent, token
 
-        Args:
-            operation_name: Name of the operation
-            **attributes: Additional span attributes
-        """
-        if not self.enabled:
-            yield
-            return
-
-        trace_id = f"{operation_name}_{int(time.time() * 1000)}"
-        start_time = time.time()
-
-        logger.debug("Starting span: {} ({})", operation_name, trace_id)
-
-        try:
-            yield trace_id
-            duration = time.time() - start_time
-
-            self._log_trace(
-                trace_id=trace_id,
-                operation_name=operation_name,
-                duration=duration,
-                status="success",
-                attributes=attributes,
-            )
-
-        except Exception as e:
-            duration = time.time() - start_time
-
-            self._log_trace(
-                trace_id=trace_id,
-                operation_name=operation_name,
-                duration=duration,
-                status="error",
-                error=str(e),
-                attributes=attributes,
-            )
-
-            raise
-
-    def _log_trace(
-        self,
-        trace_id: str,
-        operation_name: str,
-        duration: float,
-        status: str,
-        error: Optional[str] = None,
-        attributes: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """
-        Log trace information.
-
-        Args:
-            trace_id: Trace identifier
-            operation_name: Name of the operation
-            duration: Duration in seconds
-            status: Trace status (success, error)
-            error: Optional error message
-            attributes: Optional trace attributes
-        """
-        trace_data = {
-            "trace_id": trace_id,
-            "operation": operation_name,
-            "duration_ms": round(duration * 1000, 2),
-            "status": status,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-
-        if error:
-            trace_data["error"] = error
-
-        if attributes:
-            trace_data["attributes"] = attributes
-
-        if status == "success":
-            logger.info(
-                "Trace completed: {} ({:.2f}ms)", operation_name, duration * 1000
-            )
+    @staticmethod
+    def _finish(operation, trace_id, parent, start, exc: Optional[BaseException]) -> None:
+        duration_ms = round((time.perf_counter() - start) * 1000, 1)
+        if exc is None:
+            status = "ok"
+        elif isinstance(exc, asyncio.CancelledError):
+            status = "cancelled"
         else:
-            logger.error(
-                "Trace failed: {} ({:.2f}ms) - {}",
-                operation_name,
-                duration * 1000,
-                error,
-            )
+            status = "error"
+        record: dict[str, Any] = {
+            "trace_id": trace_id,
+            "parent_trace_id": parent,
+            "operation": operation,
+            "duration_ms": duration_ms,
+            "status": status,
+        }
+        if exc is not None and status == "error":
+            record["error"] = type(exc).__name__
+        logger.bind(trace=True, **record).info("trace {}", operation)
+        logger.debug("{} {} in {}ms", operation, status, duration_ms)
 
-        # Log structured trace data
-        logger.bind(trace=True).debug(trace_data)
 
-
-# Import asyncio for checking coroutine functions
-import asyncio
-
-# Global tracer instance
 tracer = Tracer()

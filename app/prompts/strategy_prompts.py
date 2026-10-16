@@ -9,7 +9,7 @@ __all__ = [
     "generate_strategies_from_documents_prompt4",
     "generate_strategies_from_documents_prompt5",
     "generate_strategies_from_documents_prompt6",
-    "regenerate_strategy_objective_preserving_case_summary_prompt",
+    "regenerate_strategy_for_new_objective_prompt",
     "reground_strategy_objective_prompt",
     "regenerate_case_summary_with_feedback_prompt",
     "regenerate_next_steps_with_feedback_prompt",
@@ -322,18 +322,64 @@ def generate_strategies_from_documents_prompt6(*, workspace_role):
     )
 
 
-def regenerate_strategy_objective_preserving_case_summary_prompt(*, SPEAKER_LABEL_GUARDRAIL, case_summary, combined_document_content, current_strategy, report_case_summary, role, user_objective_instruction, entities_block="{}", confirmed_party=None):
-    return (
-f"""You are a legal strategy analyst for Indian law.
+def regenerate_strategy_for_new_objective_prompt(*, SPEAKER_LABEL_GUARDRAIL, case_summary, combined_document_content, current_strategy, report_case_summary, role, user_objective_instruction, entities_block="{}", confirmed_party=None, refresh_case_summary=True):
+    """Regenerate the strategy panel for a NEWLY DECLARED objective.
 
-The following case summaries are FIXED. Do NOT change, paraphrase, or contradict them.
+    ``refresh_case_summary`` decides what happens to the two case summaries:
+
+    * ``True`` (the objective-change default) — they are RE-FRAMED to lead with
+      the facts the new objective makes decisive. Re-framing is emphasis and
+      ordering only: the facts themselves are fixed, and the caller enforces
+      that with a deterministic dropped-figure check.
+    * ``False`` — they are locked verbatim, the pre-existing behaviour, used
+      where the trigger changes who is advocated for rather than what is being
+      argued (role reassignment).
+    """
+    if refresh_case_summary:
+        summary_block = f"""The two case summaries below are the CURRENT text. You will RE-FRAME them for the new
+objective (see the RE-FRAME RULES) — you will NOT re-state the facts in them.
+
+CURRENT caseSummary (re-frame this; every fact in it must survive):
+{case_summary}
+
+CURRENT reportCaseSummary (apply the SAME re-frame; keep it neutral):
+{report_case_summary or "(same facts as case summary; neutral report narrative)"}
+"""
+    else:
+        summary_block = f"""The following case summaries are FIXED. Do NOT change, paraphrase, or contradict them.
 
 LOCKED caseSummary (verbatim context):
 {case_summary}
 
 LOCKED reportCaseSummary (verbatim context):
 {report_case_summary or "(same facts as case summary; neutral report narrative)"}
+"""
 
+    if refresh_case_summary:
+        summary_keys = """  "caseSummary": "the CURRENT caseSummary re-framed for the new objective; MUST start EXACTLY with 'This case is about...'; 10-20 sentences; EVERY named party, amount, date, suit/FIR number, property/document identifier and statute from the current text must still be present",
+  "reportCaseSummary": "the same re-frame applied to reportCaseSummary; MUST start EXACTLY with 'This matter is about...'; neutral expanded narrative; do NOT use the words Petitioner/Respondent/Client/Case/Adjudicator/Mediator",
+"""
+        summary_rules = """- RE-FRAME RULES for caseSummary / reportCaseSummary (CRITICAL — read as a whole):
+   (a) RE-FRAME MEANS EMPHASIS, NOT FACTS. Lead with the facts the new objective makes decisive, give them the detail the objective demands, and move what is now secondary later. That is the ONLY licence you have over these two fields.
+   (b) EVERY FACT SURVIVES. Every named party, exact amount (in the same notation), every date, every suit/FIR/case number, every property or document identifier, every named statute and every Annexure reference present in the CURRENT text MUST appear in your re-framed text. Dropping one is a failure, not a summary. If a fact no longer seems relevant, keep it anyway and simply place it later.
+   (c) NOTHING IS ADDED. Do not introduce a fact, party, figure, date or body that is not already in the CURRENT summaries or the document content. The new objective is a direction, not evidence.
+   (d) THE SUMMARY IS NOT THE OBJECTIVE. caseSummary states what happened; strategicObjective states what is now sought. Do not turn the summary into advocacy, do not write the objective's aims into it, and do not predict outcomes in it.
+   (e) IF NOTHING GENUINELY NEEDS RE-FRAMING for this objective, return the CURRENT text unchanged. An unnecessary rewrite is worse than no rewrite.
+"""
+    else:
+        summary_keys = ""
+        summary_rules = "- Do not restate or replace caseSummary/reportCaseSummary in the output.\n"
+
+    document_content_note = (
+        "ground truth for every fact; the case summaries above may be re-framed but never contradicted"
+        if refresh_case_summary
+        else "for fact consistency only; do not rewrite the case summaries"
+    )
+
+    return (
+f"""You are a legal strategy analyst for Indian law.
+
+{summary_block}
 **User's new strategic priority / instruction** (follow this as the primary constraint):
 {user_objective_instruction.strip()}
 
@@ -358,19 +404,18 @@ Current possible next steps (to replace):
 EXTRACTED FACTS (authoritative entities pulled from the documents — the ONLY organisations, authorities, bodies, parties, and places you may name):
 {entities_block}
 
-**Document content** (for fact consistency only; do not rewrite the case summaries):
+**Document content** ({document_content_note}):
 {combined_document_content}
 
 Return JSON ONLY with these keys:
 {{
-  "strategicObjective": "10-20 sentences, role-tailored for {role}, advocacy anchored to the specific named party who holds the role in the live/dominant proceeding (per ROLE -> NAMED-PARTY RESOLUTION above), aligned with the user's instruction and the case facts",
+{summary_keys}  "strategicObjective": "10-20 sentences, role-tailored for {role}, advocacy anchored to the specific named party who holds the role in the live/dominant proceeding (per ROLE -> NAMED-PARTY RESOLUTION above), aligned with the user's instruction and the case facts",
   "possibleNextSteps": ["3-5 concrete immediate actions; use Annexure N for uploads, never Document N"],
   "suggestionChips": ["15-16 short labels, 2-5 words each, actionable"]
 }}
 
 Rules:
-- Do not restate or replace caseSummary/reportCaseSummary in the output.
-- The new strategicObjective and possibleNextSteps MUST reflect the new user instruction and MUST NOT just repeat the CURRENT objective/steps shown above. (This does not conflict with the VERBATIM RULE: reproducing the user's OWN drafted objective is required; repeating the previous objective is not.)
+{summary_rules}- The new strategicObjective and possibleNextSteps MUST reflect the new user instruction and MUST NOT just repeat the CURRENT objective/steps shown above. (This does not conflict with the VERBATIM RULE: reproducing the user's OWN drafted objective is required; repeating the previous objective is not.)
 - BNS/BNSS/BSA naming (not IPC/CrPC/IEA where replaced).
 - GROUNDING (MANDATORY): Do NOT name any organisation, authority, board, association, committee, party, or place that does not appear in EXTRACTED FACTS or the document content above. Use only the real entities from this case — never introduce a new body or location to fit the instruction.
 - FORUM/VENUE instructions: when the user's instruction only names a place, court, or body (e.g. "file in Patna", "file to ICC"), treat it STRICTLY as a forum preference. Do NOT invent local organisations, offices, tournaments, or a local "leg"/branch of an event to match that place. Keep the actual parties and bodies named in the documents (e.g. a national board or a specific state association) — do NOT rename or relocate them.

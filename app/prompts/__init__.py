@@ -5,6 +5,9 @@ from app.prompts.applicable_acts import (
     format_targeted_acts_for_prompt,
 )
 from app.prompts.drafting import (
+    DOC_CLASS_CORRESPONDENCE,
+    DOC_CLASS_FILING,
+    DOC_CLASS_UNKNOWN,
     DRAFT_RENDER_INSTRUCTION,
     DRAFTING_SYSTEM_INSTRUCTION,
     SUGGESTED_DRAFTS_INSTRUCTION,
@@ -14,6 +17,7 @@ from app.prompts.drafting import (
     build_suggested_drafts_prompt,
     build_template_kickoff_prompt,
     build_template_match_prompt,
+    infer_document_class,
 )
 from app.prompts.legal_intelligence_system import (
     LEGAL_INTELLIGENCE_SYSTEM_PROMPT,
@@ -36,4 +40,8 @@ __all__ = [
     "build_template_kickoff_prompt",
     "build_template_match_prompt",
     "build_draft_render_prompt",
+    "infer_document_class",
+    "DOC_CLASS_CORRESPONDENCE",
+    "DOC_CLASS_FILING",
+    "DOC_CLASS_UNKNOWN",
 ]

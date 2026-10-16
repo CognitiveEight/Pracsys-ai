@@ -11,6 +11,8 @@ import aiofiles
 import httpx
 from loguru import logger
 
+from app.utils.redact import safe_url
+
 from app.core.config import settings
 from app.observability.trace import tracer
 from app.socket.schemas import EvidenceFile, WorkspaceData
@@ -272,13 +274,13 @@ class WorkspaceManager:
             # Remove the trailing quote if present (from the example data)
             clean_url = url.rstrip('"')
 
-            logger.debug("Downloading file from: {}", clean_url)
+            logger.debug("Downloading file from {}", safe_url(clean_url))
             response = await self._http_client.get(clean_url)
             response.raise_for_status()
             return response.content
 
         except Exception as e:
-            logger.error("Failed to download file from {}: {}", url, str(e))
+            logger.error("Failed to download file from {}: {}", safe_url(url), str(e))
             raise FileProcessingError(
                 "Failed to download file", details={"url": url, "error": str(e)}
             )

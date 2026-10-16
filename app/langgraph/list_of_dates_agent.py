@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from loguru import logger
+from app.rag.packing import fit_to_budget
 
 from app.prompts.legal_intelligence_system import ENGLISH_ONLY_OUTPUT_DIRECTIVE
 
@@ -113,7 +114,7 @@ def snap_hallucinated_year(
 
     snapped = f"{snapped_year}-{date_iso[5:]}"
     logger.info(
-        "{}: snapping hallucinated year {} → {} for date {} "
+        "{}: snapping hallucinated year {}  {} for date {} "
         "(no anchor, year not in source text)",
         log_prefix, year, snapped_year, date_iso,
     )
@@ -230,6 +231,9 @@ class TemporalInferenceState(TypedDict, total=False):
     source_doc_name: str
     anchor_year: Optional[int]
     today_str: Optional[str]  # YYYY-MM-DD; pinned to call time, used for year resolution
+    # YYYY-MM-DD from the file name (app/utils/document_dates.py), if any.
+    # Declared here because LangGraph drops undeclared state keys.
+    document_date: Optional[str]
     raw_response: str
     events: List[Dict[str, Any]]
 
@@ -316,7 +320,7 @@ class ListOfDatesTemporalAgent:
             "- Use [] for any bucket with no matches.\n"
             "- Return ONLY valid JSON. No commentary, no markdown fences.\n\n"
             "DOCUMENT:\n"
-            f"{document_text[:20000]}"
+            f"{fit_to_budget(document_text, 60000, 'dates')}"
         )
 
         try:
@@ -385,7 +389,7 @@ class ListOfDatesTemporalAgent:
         _ents_suit_count = len(doc_entities.get("suit_numbers") or [])
         _ents_prop_count = len(doc_entities.get("properties") or [])
         logger.info(
-            "🧠 list_of_dates pre-extraction for doc '{}': parties={} amounts={} suits={} properties={}",
+            "list_of_dates pre-extraction for doc '{}': parties={} amounts={} suits={} properties={}",
             (state.get("source_doc_name") or state.get("source_doc_id") or "?")[:60],
             _ents_party_count,
             _ents_amount_count,
@@ -409,6 +413,14 @@ class ListOfDatesTemporalAgent:
         except ValueError:
             previous_year = current_year
 
+        document_date = state.get("document_date")
+        document_date_block = (
+            f"Document date (from its file name): {document_date}. If the text does not state "
+            "when this document itself was written or sent, record the document itself on "
+            "this date — e.g. a letter, representation or notice: who wrote it, to whom, and "
+            "what it raises or demands — unless the text gives a different date for it.\n"
+            if document_date else ""
+        )
         prompt = f"""You are a legal timeline extractor. Extract only factual, case-relevant dates from the legal text below.
 
 {ENGLISH_ONLY_OUTPUT_DIRECTIVE}
@@ -501,9 +513,9 @@ Rules:
 ]
 
 Anchor year hint (if available): {anchor_txt}
-
+{document_date_block}
 Legal text:
-{document_text[:20000]}
+{fit_to_budget(document_text, 60000, 'dates')}
 """
         try:
             raw = await gemini_client.generate(
@@ -697,7 +709,10 @@ Legal text:
                 anchor_year=anchor_year if isinstance(anchor_year, int) else None,
                 log_prefix="List of dates agent",
             )
-            if snapped != date_val:
+            # The panel is past-only and the future check already ran: a snap
+            # that lands in the future made the date worse, not better (a
+            # 2025 letter "corrected" to 2026), so it is not applied.
+            if snapped != date_val and snapped <= today_str_for_check:
                 date_val = snapped
                 try:
                     year = int(date_val[:4])
@@ -782,8 +797,12 @@ Legal text:
         source_doc_name: str,
         anchor_year: Optional[int],
         today_str: Optional[str] = None,
+        document_date: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        if anchor_year is None and document_date:
+            anchor_year = int(document_date[:4])
         state: TemporalInferenceState = {
+            "document_date": document_date,
             "document_text": document_text,
             "source_doc_id": source_doc_id,
             "source_doc_name": source_doc_name,

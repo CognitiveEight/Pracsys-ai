@@ -7,6 +7,8 @@ from typing import Optional
 
 from loguru import logger
 
+from app.utils.redact import chars
+
 from app.agents.role_models import Role, RoleEnum
 from app.langgraph.role_agent import role_agent
 from app.langgraph.state import WorkspaceState, create_initial_workspace_state
@@ -35,7 +37,7 @@ class WorkspaceRoleIntegration:
             Initialized WorkspaceState
         """
         logger.info(
-            "🏗️ Initializing workspace {} for user {} with role: {}",
+            "Initializing workspace {} for user {} with role: {}",
             workspace_id,
             user_id,
             initial_role or "None",
@@ -47,7 +49,7 @@ class WorkspaceRoleIntegration:
         # If initial role provided, set it
         if initial_role:
             if not RoleEnum.validate(initial_role):
-                logger.error("❌ Invalid initial role: {}", initial_role)
+                logger.error("Invalid initial role: {}", initial_role)
                 raise ValueError(f"Invalid role: {initial_role}")
 
             # Invoke role agent with role selection
@@ -59,11 +61,11 @@ class WorkspaceRoleIntegration:
             )
 
             logger.success(
-                "✅ Workspace {} initialized with role {}", workspace_id, initial_role
+                "Workspace {} initialized with role {}", workspace_id, initial_role
             )
         else:
             logger.info(
-                "ℹ️ Workspace {} initialized without role (will require selection)",
+                "ℹ Workspace {} initialized without role (will require selection)",
                 workspace_id,
             )
 
@@ -107,7 +109,7 @@ class WorkspaceRoleIntegration:
             )
 
             logger.debug(
-                "✅ Synced role {} to workspace context for workspace {}",
+                "Synced role {} to workspace context for workspace {}",
                 role,
                 workspace_context.workspace_id,
             )
@@ -153,7 +155,7 @@ class WorkspaceRoleIntegration:
         current_role = state["role_state"].get("role")
 
         logger.warning(
-            "⚠️ Role change requested for workspace {}: {} → {}",
+            "Role change requested for workspace {}: {}  {}",
             workspace_id,
             current_role,
             new_role,
@@ -183,7 +185,7 @@ class WorkspaceRoleIntegration:
         )
 
         logger.success(
-            "✅ Role changed for workspace {}: {} → {}",
+            "Role changed for workspace {}: {}  {}",
             workspace_id,
             current_role,
             new_role,
@@ -213,9 +215,9 @@ class WorkspaceRoleIntegration:
             Updated workspace state
         """
         logger.info(
-            "💬 Processing message for workspace {}: {}",
+            "Processing message for workspace {}: {}",
             workspace_id,
-            message[:50] + "..." if len(message) > 50 else message,
+            chars(message),
         )
 
         # Invoke role agent

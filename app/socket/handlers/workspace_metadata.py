@@ -17,6 +17,8 @@ from urllib.parse import quote_plus
 import httpx
 from loguru import logger
 
+from app.utils.redact import chars
+
 from app.agents.role_models import RoleEnum
 from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
@@ -125,7 +127,161 @@ from app.prompts.workspace_metadata_prompts import (
 class WorkspaceMetadataMixin:
     """Workspace title/summary/category/description generation."""
 
-    def _normalize_case_title(self, title: str) -> str:
+    # Role labels that unambiguously mark a side in Indian filings. Used only
+    # to detect a title whose two sides were emitted in the wrong order.
+    _CASE_TITLE_SIDE_LABELS: Dict[str, str] = {
+        "petitioner": "petitioner",
+        "petitioners": "petitioner",
+        "complainant": "petitioner",
+        "complainants": "petitioner",
+        "appellant": "petitioner",
+        "appellants": "petitioner",
+        "plaintiff": "petitioner",
+        "plaintiffs": "petitioner",
+        "applicant": "petitioner",
+        "applicants": "petitioner",
+        "informant": "petitioner",
+        "claimant": "petitioner",
+        "claimants": "petitioner",
+        "respondent": "respondent",
+        "respondents": "respondent",
+        "accused": "respondent",
+        "defendant": "respondent",
+        "defendants": "respondent",
+        "opposite party": "respondent",
+        "opposite parties": "respondent",
+        "opponent": "respondent",
+        "opponents": "respondent",
+        "non-applicant": "respondent",
+        "non applicant": "respondent",
+    }
+
+    # Placeholder sides produced by the fallback paths ("Petitioner vs
+    # Respondent", "<Party> vs Matter"): never treated as real party names.
+    _CASE_TITLE_PLACEHOLDER_SIDES = {
+        "petitioner",
+        "respondent",
+        "matter",
+        "issue",
+        "party",
+        "party1",
+        "party2",
+        "unknown",
+    }
+
+    # How far (characters) from a party name a role label may sit, on the same
+    # line, and still be taken as labelling that party.
+    _CASE_TITLE_LABEL_WINDOW = 200
+
+    def _case_title_bare_party(self, side: str) -> str:
+        """Strip "& Anr"/"& Ors" shorthand and punctuation off one title side."""
+        s = (side or "").strip().strip('"').strip("'")
+        s = re.sub(
+            r"\s*&\s*(anr|ors|another|others)\.?$", "", s, flags=re.IGNORECASE
+        )
+        return s.strip(" .,:;-").strip()
+
+    def _case_title_party_side(self, doc_text: str, party: str) -> Optional[str]:
+        """
+        Decide whether `party` reads as the petitioner-side or respondent-side
+        party in `doc_text`, by looking at the role label nearest to each
+        mention of the name (e.g. a cause title "ABC ...Petitioner / Versus /
+        XYZ ...Respondent", or "Complainant: ABC", "Accused: XYZ").
+
+        Returns "petitioner", "respondent", or None when the documents give no
+        clear signal - callers must treat None as "leave the title alone".
+        """
+        name = self._case_title_bare_party(party)
+        if not doc_text or len(name) < 3:
+            return None
+        if name.lower() in self._CASE_TITLE_PLACEHOLDER_SIDES:
+            return None
+
+        text = doc_text[:20000]
+        label_re = re.compile(
+            r"\b("
+            + "|".join(
+                re.escape(lbl)
+                for lbl in sorted(self._CASE_TITLE_SIDE_LABELS, key=len, reverse=True)
+            )
+            + r")\b",
+            flags=re.IGNORECASE,
+        )
+        name_re = re.compile(re.escape(name), flags=re.IGNORECASE)
+
+        # Scoped to a single line on purpose. Cause titles put the label on the
+        # same line as the party ("ABC ... ...Petitioner"), as do labelled
+        # complaints ("Complainant: ABC"), while the label of the *other* side
+        # is often physically closer across a line break ("Versus" lines).
+        scores = {"petitioner": 0, "respondent": 0}
+        for line in text.splitlines():
+            if len(line) > 2000:
+                line = line[:2000]
+            occurrences = list(name_re.finditer(line))
+            if not occurrences:
+                continue
+            labels = [
+                (m.start(), m.end(), self._CASE_TITLE_SIDE_LABELS[m.group(1).lower()])
+                for m in label_re.finditer(line)
+            ]
+            if not labels:
+                continue
+            for occurrence in occurrences[:5]:
+                nearest_side = None
+                nearest_dist = None
+                for label_start, label_end, side in labels:
+                    if label_start >= occurrence.end():
+                        dist = label_start - occurrence.end()
+                    elif label_end <= occurrence.start():
+                        dist = occurrence.start() - label_end
+                    else:
+                        continue  # the label is inside the name itself
+                    if nearest_dist is None or dist < nearest_dist:
+                        nearest_dist, nearest_side = dist, side
+                if (
+                    nearest_side
+                    and nearest_dist is not None
+                    and nearest_dist <= self._CASE_TITLE_LABEL_WINDOW
+                ):
+                    scores[nearest_side] += 1
+
+        if scores["petitioner"] > scores["respondent"]:
+            return "petitioner"
+        if scores["respondent"] > scores["petitioner"]:
+            return "respondent"
+        return None
+
+    def _orient_case_title_sides(
+        self, left: str, right: str, doc_text: str
+    ) -> Tuple[str, str]:
+        """
+        Put the petitioner-side party first when the documents clearly say the
+        model emitted the two sides the wrong way round.
+
+        Deliberately conservative: the sides are swapped only when the left
+        party is clearly respondent-side AND the right party is clearly
+        petitioner-side. Any ambiguity leaves the model's order untouched.
+        """
+        if not doc_text:
+            return left, right
+        try:
+            if self._case_title_party_side(doc_text, left) != "respondent":
+                return left, right
+            if self._case_title_party_side(doc_text, right) != "petitioner":
+                return left, right
+        except Exception as e:  # never let title cleanup break metadata
+            logger.warning("Case title orientation check failed: {}", str(e))
+            return left, right
+        logger.info(
+            "Case title orientation corrected (sides were swapped): '{} vs {}' -> '{} vs {}'",
+            left,
+            right,
+            right,
+            left,
+        )
+        return right, left
+
+    def _normalize_case_title(self, title: str, doc_text: str = "") -> str:
         """
         Normalize a case title to "Petitioner vs Respondent" style with
         Indian-court multi-party shorthand:
@@ -135,6 +291,9 @@ class WorkspaceMetadataMixin:
         - Single-party sides and sides already ending in "& Anr" / "& Ors" are
           left untouched.
         - Also rewrites " v ", " v. ", " versus " (case-insensitive) to " vs ".
+        - When `doc_text` (the document content the title was derived from) is
+          supplied, a reversed "<respondent> vs <petitioner>" title is flipped
+          back into petitioner-first order.
 
         Only " & " is treated as a multi-party separator. We deliberately do
         NOT split on commas or the word "and" because those frequently appear
@@ -176,7 +335,10 @@ class WorkspaceMetadataMixin:
                 return f"{first} & Anr"
             return f"{first} & Ors"
 
-        normalized = f"{_reduce_side(left)} vs {_reduce_side(right)}"
+        left, right = self._orient_case_title_sides(
+            _reduce_side(left), _reduce_side(right), doc_text
+        )
+        normalized = f"{left} vs {right}"
         normalized = re.sub(r"\s{2,}", " ", normalized).strip()
         return normalized
 
@@ -201,7 +363,7 @@ class WorkspaceMetadataMixin:
         if title_match:
             val = title_match.group(1).strip()
             if val:
-                result["caseTitle"] = self._normalize_case_title(val)
+                result["caseTitle"] = self._normalize_case_title(val, combined)
         # Salvage caseCategory
         if "caseCategory" in raw:
             cat_match = re.search(r'"caseCategory"\s*:\s*"([^"]*)"', raw)
@@ -320,7 +482,7 @@ class WorkspaceMetadataMixin:
                 if len(lines) < 3 and lines:
                     combined_text = " ".join(lines)
                     logger.debug(
-                        "Attempting sentence split on: {}", combined_text[:100]
+                        "Attempting sentence split on: {}", chars(combined_text)
                     )
                     # Split on sentence endings: period, exclamation, or question mark followed by space or end
                     # Use lookahead to keep the punctuation
@@ -380,14 +542,14 @@ class WorkspaceMetadataMixin:
                     logger.warning(
                         "AI summary failed validation (attempt {}): {}",
                         attempt + 1,
-                        summary[:100],
+                        chars(summary),
                     )
                     continue
                 if self._is_generic_description(summary):
                     logger.warning(
                         "AI returned generic description (attempt {}): {}",
                         attempt + 1,
-                        summary[:100],
+                        chars(summary),
                     )
                     if attempt == 0:
                         logger.info("Retrying with stricter prompt")
@@ -609,7 +771,9 @@ class WorkspaceMetadataMixin:
             result["caseTitle"] = title
         # Final pass: collapse multi-party sides to "<first> & Anr"/"& Ors"
         # so titles never appear as "A vs B & C" or "A & B vs C".
-        result["caseTitle"] = self._normalize_case_title(result["caseTitle"])
+        result["caseTitle"] = self._normalize_case_title(
+            result["caseTitle"], combined
+        )
         return result
 
     async def _generate_fallback_metadata(
@@ -715,7 +879,7 @@ class WorkspaceMetadataMixin:
                             elif len(desc_lines) > 4:
                                 desc = "\n".join(desc_lines[:4])
                         return {
-                            "caseTitle": self._normalize_case_title(title),
+                            "caseTitle": self._normalize_case_title(title, combined),
                             "caseCategory": category,
                             "subcategories": subs[:3],
                             "description": desc[:500],
@@ -847,7 +1011,7 @@ class WorkspaceMetadataMixin:
                     return salvaged
                 return await self._generate_fallback_metadata(combined, workspace_id)
             case_title = self._normalize_case_title(
-                (data.get("caseTitle") or "").strip()
+                (data.get("caseTitle") or "").strip(), combined
             )
             case_category = (data.get("caseCategory") or "").strip().upper()
             subcategories = data.get("subcategories") or data.get("subcategory") or []
@@ -915,7 +1079,7 @@ class WorkspaceMetadataMixin:
                     if ai_summary:
                         result["description"] = ai_summary
                         logger.info(
-                            "✅ Generated case-specific description from documents (AI): {}",
+                            "Generated case-specific description from documents (AI): {}",
                             ai_summary[:80],
                         )
                     elif not result.get("description"):
@@ -931,12 +1095,12 @@ class WorkspaceMetadataMixin:
                         if ai_summary:
                             result["description"] = ai_summary
                             logger.info(
-                                "✅ Generated case-specific description (retry): {}",
+                                "Generated case-specific description (retry): {}",
                                 ai_summary[:80],
                             )
                         else:
                             logger.error(
-                                "❌ Failed to generate case-specific description after retries - description will be empty"
+                                "Failed to generate case-specific description after retries - description will be empty"
                             )
                             result["description"] = (
                                 ""  # Leave empty rather than use generic
@@ -963,12 +1127,13 @@ class WorkspaceMetadataMixin:
             # Ensure all fields are complete (fills any missing values)
             result = self._ensure_metadata_complete(result, combined)
 
+            # The case title and description name the parties: log sizes only.
             logger.info(
                 "Workspace metadata: caseTitle={}, caseCategory={}, subcategories={}, description={}",
-                result["caseTitle"][:50] if result["caseTitle"] else "",
+                chars(result.get("caseTitle")),
                 result["caseCategory"],
                 result["subcategories"],
-                result["description"][:50] if result["description"] else "",
+                chars(result.get("description")),
             )
             return result
         except Exception as e:
@@ -1073,7 +1238,7 @@ class WorkspaceMetadataMixin:
         # mirrors it to Qdrant — subsequent process restarts won't re-heal.
         self._workspace_document_assessments_payload[workspace_id] = cached
         logger.success(
-            "✅ Devanagari heal: workspace {} — healed {} cached transcript(s) "
+            "Devanagari heal: workspace {} — healed {} cached transcript(s) "
             "to Hinglish; cache updated.",
             workspace_id[:12] if workspace_id else "",
             healed_count,

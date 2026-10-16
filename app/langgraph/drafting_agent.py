@@ -35,8 +35,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
+from app.utils.redact import chars, safe_url
+
 from app.ai.gemini_client import gemini_client
 from app.prompts.drafting import (
+    DOC_CLASS_CORRESPONDENCE,
     DRAFT_RENDER_INSTRUCTION,
     DRAFT_TRANSLATE_INSTRUCTION,
     DRAFTING_CHAT_INSTRUCTION,
@@ -69,6 +72,7 @@ from app.prompts.drafting import (
     build_template_kickoff_prompt,
     build_template_match_prompt,
     build_template_profile_prompt,
+    infer_document_class,
 )
 
 
@@ -206,6 +210,54 @@ _RESIDUAL_PLACEHOLDER_PATTERNS = (
     re.compile(r"\[(?:[^\[\]\n]*?(?:address|name|number|date|amount|insert|"
                r"to be filled|tbd|xxxx|placeholder)[^\[\]\n]*?)\]", re.IGNORECASE),
 )
+
+
+# Statutory citations in a rendered draft. Deliberately NARROW — the broad
+# `agent.has_potential_law_citation` prefilter matches "pursuant to" and any
+# capitalised "...Act", so it fires on every notice that mentions an Agreement.
+_DRAFT_CITATION_RE = re.compile(
+    r"(?:\bSections?\s+\d+[A-Za-z()\d/\s,and]*?\s+of\s+the\s+[A-Z][\w.,'\- ]{3,60}?"
+    r"(?:Act|Sanhita|Adhiniyam|Code|Rules|Regulations)"
+    r"(?:,\s*\d{4})?"
+    r"|\bunder\s+(?:the\s+)?(?:BNS|BNSS|BSA|IPC|CrPC|CPC)\b[\s\w.,()/]{0,40}"
+    r"|\bSections?\s+\d+[A-Za-z()\d/]*\s+(?:of\s+)?(?:the\s+)?(?:BNS|BNSS|BSA|IPC|CrPC|CPC)\b)",
+    re.IGNORECASE,
+)
+
+# A citation is load-bearing when it is a fact of the record (an FIR that was
+# actually registered), a regulator's direction actually breached, or the
+# provision that makes the notice itself statutory. Those are expected in
+# correspondence and must not be counted against the draft.
+_LOAD_BEARING_CITATION_RE = re.compile(
+    r"(?:F\.?I\.?R\.?|Crime\s+No|Charge\s*-?sheet|First\s+Information\s+Report"
+    r"|Negotiable\s+Instruments|Section\s+138|Section\s+142"
+    r"|Arbitration\s+and\s+Conciliation|Section\s+21\b|Section\s+80\b"
+    r"|Reserve\s+Bank|RBI|TRAI|SEBI|IRDAI)",
+    re.IGNORECASE,
+)
+
+_CORRESPONDENCE_CITATION_BUDGET = 3
+
+
+def _unsupported_draft_citations(markdown: str) -> List[str]:
+    """Statutory citations in a correspondence draft that look decorative.
+
+    Diagnostic only — nothing is stripped. A citation is ignored when a
+    load-bearing marker (FIR / regulator / statutory-notice provision) sits
+    within 200 characters of it, which is where the reference notices put
+    theirs ("FIR No. 150/2025 ... under Sections 318(4) ... BNS").
+    """
+    if not markdown:
+        return []
+    flagged: List[str] = []
+    for m in _DRAFT_CITATION_RE.finditer(markdown):
+        window = markdown[max(0, m.start() - 200): m.end() + 200]
+        if _LOAD_BEARING_CITATION_RE.search(window):
+            continue
+        text = " ".join(m.group(0).split())
+        if text not in flagged:
+            flagged.append(text)
+    return flagged
 
 
 def _residual_placeholders(markdown: str) -> List[str]:
@@ -444,11 +496,9 @@ def _looks_like_forbidden_act(text: str) -> bool:
 
 def _filename_for_extraction(name: Optional[str], extension: Optional[str]) -> str:
     """Produce a filename with extension so FileProcessor can route extraction."""
-    name = (name or "template").strip()
-    ext = (extension or "").strip().lstrip(".").lower()
-    if ext and not name.lower().endswith("." + ext):
-        return f"{name}.{ext}"
-    return name
+    from app.processing.file_handlers import filename_for_extraction
+
+    return filename_for_extraction((name or "").strip() or "template", extension)
 
 
 def _word_count(text: str) -> int:
@@ -615,7 +665,7 @@ class DraftingAgent:
             logger.debug(
                 "Prematch lock held: title={!r} stays bound to {} "
                 "(ignored re-point to {})",
-                (title or "")[:60],
+                chars(title),
                 existing,
                 template_id,
             )
@@ -792,7 +842,7 @@ class DraftingAgent:
         if not suggestions:
             logger.info(
                 "Drafting suggestions produced no items (raw preview: {})",
-                (raw or "")[:200],
+                chars(raw),
             )
             return suggestions
 
@@ -1312,7 +1362,7 @@ class DraftingAgent:
         except Exception as exc:
             logger.warning(
                 "Template match-score call failed for {!r} (non-fatal): {}",
-                (suggestion_title or "")[:60],
+                chars(suggestion_title),
                 exc,
             )
             return None, None
@@ -1710,7 +1760,7 @@ class DraftingAgent:
                     "Template download failed (user={}, template={}, url={}): {}",
                     user_id,
                     template_id,
-                    (file_url or "")[:80],
+                    chars(file_url),
                     e,
                 )
                 return None
@@ -1783,21 +1833,21 @@ class DraftingAgent:
                         downloaded_bytes = converted
                         ext_lower = "docx"
                         logger.info(
-                            "Template PDF→DOCX conversion succeeded "
+                            "Template PDFDOCX conversion succeeded "
                             "(user={}, template={}, in_bytes={}, out_bytes={})",
                             user_id, template_id,
                             pdf_bytes_len, len(converted),
                         )
                     else:
                         logger.warning(
-                            "Template PDF→DOCX conversion produced no usable "
+                            "Template PDFDOCX conversion produced no usable "
                             "output (user={}, template={}) — llm_diff path will "
                             "fall back to skeleton_clone for this template",
                             user_id, template_id,
                         )
                 except Exception as exc:
                     logger.warning(
-                        "Template PDF→DOCX conversion raised (user={}, "
+                        "Template PDFDOCX conversion raised (user={}, "
                         "template={}): {} — continuing without skeleton",
                         user_id, template_id, exc,
                     )
@@ -2155,13 +2205,25 @@ class DraftingAgent:
         self,
         variables: List[Dict[str, Any]],
         case_context: Dict[str, Any],
+        document_class: str = "",
     ) -> Dict[str, str]:
         """Extract a value for every registry variable the CASE CONTEXT clearly
         supports → ``{variable_id: value}``. One focused Gemini call so auto-fill
         is reliable (the kickoff LLM recites facts in prose but under-populates
         gatheredFacts). Omits variables the context does not clearly provide;
-        never guesses/fabricates. Returns ``{}`` on failure."""
+        never guesses/fabricates. Returns ``{}`` on failure.
+
+        For pre-litigation correspondence, statute-kind variables are left for
+        the lawyer: pre-seeding them from the applicable-laws panel is how the
+        panel's "Act §Section" rows end up cited in a notice that should be
+        argued from the contract and the record."""
         vars_ = [v for v in (variables or []) if isinstance(v, dict) and v.get("id")]
+        is_correspondence = document_class == DOC_CLASS_CORRESPONDENCE
+        if is_correspondence:
+            vars_ = [
+                v for v in vars_
+                if (v.get("kind") or "").strip().lower() != "statute"
+            ]
         if not vars_:
             return {}
         listing = "\n".join(
@@ -2172,7 +2234,8 @@ class DraftingAgent:
         ctx_parts = [
             ("CASE SUMMARY", case_context.get("case_summary")),
             ("CASE FACTS / EVIDENCE", case_context.get("case_facts_brief")),
-            ("APPLICABLE LAWS", case_context.get("applicable_laws_brief")),
+            ("APPLICABLE LAWS", None if is_correspondence
+             else case_context.get("applicable_laws_brief")),
             ("STRATEGY", case_context.get("strategy_brief")),
         ]
         context_block = "\n\n".join(
@@ -2602,7 +2665,7 @@ class DraftingAgent:
         )
         if ok:
             logger.info(
-                "Template renamed (user={}, template={}): {!r} → {!r}",
+                "Template renamed (user={}, template={}): {!r}  {!r}",
                 user_id,
                 template_id,
                 previous_name,
@@ -3054,7 +3117,7 @@ class DraftingAgent:
             logger.info(
                 "Template cleanup ({} chunk) (template={!r}): {} -> {} chars",
                 "1",
-                (name or "")[:60],
+                chars(name),
                 len(body),
                 len(result),
             )
@@ -3084,13 +3147,13 @@ class DraftingAgent:
                 "Chunked template cleanup rejected at merge ({} chunks, "
                 "template={!r}); keeping normalised text",
                 len(chunks),
-                (name or "")[:60],
+                chars(name),
             )
             return body
         logger.info(
             "Template cleanup ({} chunks) (template={!r}): {} -> {} chars",
             len(chunks),
-            (name or "")[:60],
+            chars(name),
             len(body),
             len(merged),
         )
@@ -3557,7 +3620,7 @@ class DraftingAgent:
         result = [deduped[k] for k in order]
         if len(result) < len(ready):
             logger.info(
-                "Template matcher deduped {} → {} entries "
+                "Template matcher deduped {}  {} entries "
                 "(collapsed {} duplicate/same-content template(s))",
                 len(ready),
                 len(result),
@@ -4289,8 +4352,8 @@ class DraftingAgent:
                 # assistant just offered. Treat as a fresh kickoff for
                 # that document type and clear the menu.
                 logger.info(
-                    "Drafting menu pick: '{}' → '{}'",
-                    user_message[:60],
+                    "Drafting menu pick: '{}'  '{}'",
+                    chars(user_message),
                     _picked,
                 )
                 (session_state or {}).pop("last_offered_options", None)
@@ -4874,7 +4937,7 @@ class DraftingAgent:
                     "Suggested-draft click without templateId — reusing "
                     "pre-matched template {} (title={!r}, user={})",
                     recalled_template_id,
-                    (suggestion_title or "")[:60],
+                    chars(suggestion_title),
                     (user_id or "")[:12],
                 )
                 request_fields = {
@@ -5049,7 +5112,12 @@ class DraftingAgent:
             if registry_vars:
                 try:
                     prefilled_facts = await self._autofill_variables_from_context(
-                        registry_vars, case_context
+                        registry_vars,
+                        case_context,
+                        document_class=infer_document_class(
+                            suggestion_title or template_payload.get("name"),
+                            template_payload.get("document_type"),
+                        ),
                     )
                 except Exception as exc:
                     logger.warning("Kickoff auto-fill pass raised: {}", exc)
@@ -5160,6 +5228,7 @@ class DraftingAgent:
                 "source": "template",
                 "template_id": template_payload.get("template_id"),
                 "template_name": template_payload.get("name"),
+                "template_document_type": template_payload.get("document_type") or "",
                 # Carry the template's tone / filing context + approved drafting
                 # controls forward so the later render turn drafts in the
                 # template's voice, depth, and structure.
@@ -5236,9 +5305,18 @@ class DraftingAgent:
                 "facts under the first header and AT LEAST THREE numbered "
                 "titled scoping questions under the second header. The "
                 "document type to draft is the DRAFT TITLE HINT above; "
-                "infer the standard Indian-advocate skeleton for that "
-                "document type — court heading, party array, grounds, "
-                "prayer, verification — and produce the open questions "
+                "infer the standard Indian-advocate skeleton for THAT "
+                "document type from the DOCUMENT-TYPE REGISTRY — for a "
+                "court filing that means court heading, party array, "
+                "grounds, prayer and verification; for an advocate's "
+                "letter (legal notice, reply notice, demand notice, "
+                "cease-and-desist, employer letter) it means letterhead, "
+                "reference and date, WITHOUT PREJUDICE, addressee block, "
+                "SUBJECT line, numbered factual narrative, quoted "
+                "contract clauses, itemised demand, deadline, "
+                "consequences, reservation of rights and signature, and "
+                "NEVER a court heading, prayer or verification — and "
+                "produce the open questions "
                 "needed to fill its case-variable slots. Do NOT reply "
                 "with a single open-ended question or a chat-style "
                 "paragraph; the structured layout is mandatory even "
@@ -6560,7 +6638,7 @@ class DraftingAgent:
             logger.warning(
                 "Drafting router JSON parse failed: {} (raw first 300 chars: {!r})",
                 exc,
-                cleaned[:300],
+                chars(cleaned),
             )
             return {
                 "action": "chat_reply",
@@ -7745,7 +7823,7 @@ OUTPUT FORMAT:
                 actionable_id or "-",
                 version,
                 path_used,
-                url,
+                safe_url(url),
             )
             return url
         except Exception as e:
@@ -7815,7 +7893,7 @@ OUTPUT FORMAT:
                 )
                 if not converted:
                     logger.warning(
-                        "Lazy PDF→DOCX conversion produced no usable output "
+                        "Lazy PDFDOCX conversion produced no usable output "
                         "(template={}) — skipping backfill",
                         template_id,
                     )
@@ -7823,7 +7901,7 @@ OUTPUT FORMAT:
                 content = converted
             except Exception as exc:
                 logger.warning(
-                    "Lazy PDF→DOCX conversion raised (template={}): {}",
+                    "Lazy PDFDOCX conversion raised (template={}): {}",
                     template_id, exc,
                 )
                 return None
@@ -7935,7 +8013,7 @@ OUTPUT FORMAT:
         # issue is upstream (no templateId on the click / template not in the
         # store), not the render prompt.
         logger.info(
-            "🖋️ Draft render: mode={} template_id={} template_name={!r} "
+            "Draft render: mode={} template_id={} template_name={!r} "
             "template_chars={} gathered_facts={}",
             mode,
             template_id or "(none)",
@@ -7965,6 +8043,14 @@ OUTPUT FORMAT:
             draft_depth=draft_depth or None,
             structure_style=draft_structure or None,
             guardrail_level=guardrail_level or None,
+            # Decides the document CLASS (correspondence vs court filing).
+            # session_state is the fallback: after a reconnect the template
+            # fetch above can come back empty, and the class must not flip.
+            template_document_type=(
+                (tpl or {}).get("document_type")
+                or session_state.get("template_document_type")
+                or ""
+            ),
         )
         try:
             # LOW thinking preserves the full 64k output budget for draft text;
@@ -8111,6 +8197,27 @@ OUTPUT FORMAT:
                 template_id or "(none)",
                 residual[:12],
             )
+
+        # Correspondence should be argued from the instrument and the record;
+        # a notice stacked with sections is the regression this class exists to
+        # prevent. Log-only — the draft ships either way and the lawyer stays
+        # in control of the document's content.
+        if infer_document_class(
+            draft_title,
+            (tpl or {}).get("document_type")
+            or session_state.get("template_document_type")
+            or "",
+        ) == DOC_CLASS_CORRESPONDENCE:
+            stray = _unsupported_draft_citations(markdown)
+            if len(stray) > _CORRESPONDENCE_CITATION_BUDGET:
+                logger.warning(
+                    "Correspondence draft carries {} non-load-bearing "
+                    "citation(s) (title={!r}, template={}): {}",
+                    len(stray),
+                    draft_title,
+                    template_id or "(none)",
+                    stray[:8],
+                )
 
         session_state["draft_status"] = "ready"
         session_state["current_draft_version"] = new_version

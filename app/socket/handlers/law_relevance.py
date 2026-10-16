@@ -192,7 +192,7 @@ class LawRelevanceMixin:
         for q in queries:
             if not q or len(q.strip()) < 5:
                 continue
-            logger.info("law_relevance: Indian Kanoon query={}", q[:200])
+            logger.debug("law_relevance: Indian Kanoon query ({} chars)", len(q))
             batch = await self._search_indiankanoon(q)
             for row in batch:
                 u = row.get("url") or ""
@@ -422,14 +422,6 @@ class LawRelevanceMixin:
             "userId": user_id,
             "payload": payload_inner,
         }
-        try:
-            doc_log = json.dumps(doc_feature_body, default=str)
-        except Exception:
-            doc_log = str(doc_feature_body)
-        logger.info(
-            "applicable_law_relevance → backend document_feature_response (preview): {}",
-            doc_log[:2000] + ("..." if len(doc_log) > 2000 else ""),
-        )
         await self._emit_document_feature(
             feature_type="applicable_law_relevance",
             workspace_id=workspace_id,
@@ -446,17 +438,9 @@ class LawRelevanceMixin:
         }
         if request_id:
             standalone["requestId"] = request_id
-        try:
-            solo_log = json.dumps(standalone, default=str)
-        except Exception:
-            solo_log = str(standalone)
-        logger.info(
-            "applicable_law_relevance → backend applicable_law_relevance_response (preview): {}",
-            solo_log[:2000] + ("..." if len(solo_log) > 2000 else ""),
-        )
         await self._socket_client.emit("applicable_law_relevance_response", standalone)
-        logger.success(
-            "✅ applicable law relevance delivered to backend (document_feature_response + applicable_law_relevance_response) requestId={} relevance={}",
+        logger.info(
+            "applicable law relevance delivered requestId={} relevance={}",
             request_id,
             law_dict.get("relevance"),
         )
@@ -470,7 +454,7 @@ class LawRelevanceMixin:
         """
         payload_in = data if isinstance(data, dict) else {}
         logger.info(
-            "applicable_law_relevance_request ← backend (received): keys={}",
+            "applicable_law_relevance_request  backend (received): keys={}",
             list(payload_in.keys()) if isinstance(payload_in, dict) else type(payload_in),
         )
         try:
@@ -508,7 +492,7 @@ class LawRelevanceMixin:
         section = (law.section or "").strip()
 
         logger.info(
-            "applicable_law_relevance_request ← backend (parsed): workspaceId={} userId={} requestId={} act={} section={}",
+            "applicable_law_relevance_request  backend (parsed): workspaceId={} userId={} requestId={} act={} section={}",
             workspace_id[:24] if workspace_id else "",
             user_id[:24] if user_id else "",
             request_id,

@@ -640,7 +640,7 @@ class RelevantPartiesMixin:
             usage=current_usage(),
         )
         logger.success(
-            "✅ Relevant parties sent to backend ({} parties)",
+            "Relevant parties sent to backend ({} parties)",
             len(payload.get("parties", [])),
         )
         await asyncio.sleep(0.1)

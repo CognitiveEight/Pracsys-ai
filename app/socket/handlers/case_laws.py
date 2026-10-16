@@ -122,6 +122,20 @@ from app.prompts.case_laws_prompts import (
 )
 
 
+def _citation_in_text(citation: str, judgment_text: str) -> Optional[bool]:
+    """Whether a reporter citation such as "(2014) 9 SCC 129" appears in the
+    judgment text, compared on its year, volume, reporter and page. None when
+    there is no citation to check."""
+    # Reporters are printed with or without dots ("SCC" / "S.C.C."): compare
+    # without them.
+    parts = re.findall(r"[A-Za-z]+|\d+", (citation or "").replace(".", ""))
+    if len(parts) < 3:
+        return None
+    haystack = re.sub(r"\s+", " ", (judgment_text or "").replace(".", "")).lower()
+    pattern = r"\W*".join(re.escape(p.lower()) for p in parts)
+    return bool(re.search(pattern, haystack))
+
+
 class CaseLawsMixin:
     """Case Laws (precedent) retrieval, ranking, enrichment."""
 
@@ -509,6 +523,12 @@ class CaseLawsMixin:
                 if v in (None, "", []):
                     continue
                 merged[k] = v
+            # "verified" only ever meant "the URL came from retrieval". Check the
+            # citation string itself against the fetched judgment, so a card
+            # whose citation the model mis-remembered says so.
+            merged["citationVerified"] = _citation_in_text(
+                str(merged.get("citation") or ""), text
+            )
             return merged
 
         return await asyncio.gather(*[_enrich_one(c) for c in selected])
@@ -661,7 +681,7 @@ class CaseLawsMixin:
             usage=current_usage(),
         )
         logger.success(
-            "✅ Case laws sent to backend ({} cases)",
+            "Case laws sent to backend ({} cases)",
             n,
         )
         await asyncio.sleep(0.1)
@@ -693,7 +713,7 @@ class CaseLawsMixin:
             )
         await self._socket_client.emit("case_law_document_response", body)
         logger.success(
-            "✅ case_law_document_response emitted (accepted={}) requestId={}",
+            "case_law_document_response emitted (accepted={}) requestId={}",
             accepted,
             request_id,
         )
@@ -738,7 +758,7 @@ class CaseLawsMixin:
         role = (req.workspaceRole or "ADJUDICATOR").strip().upper()
 
         logger.info(
-            "📄 case_law_document_request: workspace={} doc={} requestId={}",
+            "case_law_document_request: workspace={} doc={} requestId={}",
             workspace_id[:12] if workspace_id else "",
             document_name,
             request_id,
@@ -888,7 +908,7 @@ class CaseLawsMixin:
                     usage=current_usage(),
                 )
                 logger.success(
-                    "✅ case_law_document_request: appended 1 case; panel now has "
+                    "case_law_document_request: appended 1 case; panel now has "
                     "{} (workspace={})",
                     len(merged.get("caseLaws", [])),
                     workspace_id[:12] if workspace_id else "",
@@ -910,8 +930,7 @@ class CaseLawsMixin:
                 },
             )
         except Exception as e:
-            logger.warning("case_law_document_request failed: {}", e)
-            logger.exception(e)
+            logger.opt(exception=e).warning("case_law_document_request failed: {}", e)
             await self._emit_case_law_document_response(
                 request_id=request_id,
                 workspace_id=workspace_id,

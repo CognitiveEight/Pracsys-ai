@@ -32,6 +32,483 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Excel (`.xlsx`/`.xlsm`) and PowerPoint (`.pptx`) evidence.** Both now go
+  through `process_document` like any other file. Spreadsheets are read sheet
+  by sheet (openpyxl, cached formula values), in blocks sized to one chunk.
+  Each block opens with the sheet name, its row range and the header row, so
+  any chunk retrieved from a long sheet keeps its column names. Hidden sheets
+  are included and labelled. Spreadsheets are capped at 200K cells, and the
+  text says so when the cap is hit. Decks are read slide by slide: title, text,
+  tables, chart data and speaker notes. Each slide is marked
+  `--- Page N ---` with N = the slide number, so citations name the slide.
+  Slides that are only a pasted picture are OCR'd, up to 50 images per deck. Legacy `.xls`/`.ppt` now fail with an explicit
+  "unsupported format" message, where they used to come out of the DOC
+  extractor as byte noise. New deps: `openpyxl`, `python-pptx`.
+  Workbooks are parsed once into typed tables (`app/processing/tables.py`):
+  - the header is found below any title rows;
+  - numbers and day-first dates typed as text are read as values;
+  - percentages are shown as the sheet shows them;
+  - formulas with no saved value are kept as formula text, counted, and
+    excluded from every figure.
+  The text opens with a workbook summary computed from every row.
+
+- **`missing_information_edited` (Server → AI).** A lawyer can re-word a
+  Missing Information item. `on_missing_information_edited` replaces the item's
+  text by `itemId` in the cached analysis report and keeps its id and
+  `isMatched`. Score, explanations and the other lists are left alone, and no
+  model call is made. The report is then re-emitted as `analysis_report`. The
+  edit is recorded in a per-workspace ledger (`CacheKinds.EDITED_MISSING_INFO`)
+  that `_tag_analysis_report_against_current_state` re-applies. Without it, the
+  next upload, sync or objective change would regenerate the model's original
+  wording from the documents. A re-sent `requestId` is swallowed. An edit whose
+  `editedAt` is older than the one already applied is dropped as stale. A
+  `view` collaborator's edit (`editedBy`) is not applied. Offline coverage:
+  `verify_missing_info_edit.py`.
+
+- **Exact spreadsheet calculations in chat (`[T#]`).** A question asking for a
+  count, total, average, minimum, maximum, percentage or list of rows is now
+  computed in code over every row (`app/rag/table_query.py`). The model only
+  turns the question into a JSON spec. Code validates it against the real
+  columns and refuses anything it cannot run, then computes with exact
+  decimals. Each result joins the evidence pack as `[T#]`, and the citation
+  checker verifies every figure the answer quotes against it. The sheet's own
+  Total rows are excluded so nothing is counted twice; blank and non-numeric
+  cells are counted and stated. When nothing could be computed, the prompt
+  says so and forbids totals from partial rows. Rows are stored in a new
+  vector-less collection, `<collection>_tables_v1`, cleared by
+  `delete_documents` and `delete_workspace` (the compliance purge). New
+  settings: `QDRANT_TABLES_COLLECTION`, `TABLE_QUERY_ENABLED`.
+- **Spreadsheet citations name the sheet and row.** `ai_response.citations`
+  and panel citations gain optional `sheet`, `rowStart`, `rowEnd` and
+  `computed`, and a cell quote is prefixed with its column header. **Socket
+  payload change (additive):** the `Citation` schema has these four optional
+  fields.
+
+### Fixed
+
+- **Scanned PDFs: a failed OCR page was dropped silently.** One transient
+  Vision `503` lost a page of a 19-page judgment, with nothing in the text to
+  say so. Transient failures now retry once. A page that still cannot be read
+  keeps its `--- Page N ---` marker with an `[OCR note: this page could not be
+  read ...]`, and so does a page read with low word confidence.
+- **Scanned PDFs: OCR quality and speed.** `app/processing/ocr.py`:
+  - The scan's own JPEG is sent instead of a 150-DPI re-render, which threw
+    away 30-50% of a phone scan's pixels.
+  - `document_text_detection` runs first (Vision's mode for dense pages and
+    handwriting); the original `text_detection` is the fallback.
+  - Reading order is rebuilt from word boxes on single-column pages. Vision
+    had put "renewed from 02-05-2006 to 02-05-2012" out of order on widely
+    spaced typed text.
+  - Pages run 4 at a time on one shared client: a 15-page scan went from
+    118 s to 5 s.
+  Every step falls back to the previous behaviour. Over 147 real PDFs, the
+  old and new code agree with 0 regressions: text-layer PDFs are
+  byte-identical, and no scanned PDF has a new error, a lost page or a
+  lower-resolution image. Guarded by `tests/test_ocr.py`.
+- **Evidence was routed on a filename with no extension.** The backend's
+  `filename` ("annexure-3-...-results") has no suffix. `extension` is the only
+  type signal, and `process_batch` never passed it, so every file was routed by
+  content sniffing and any ZIP went to the DOCX parser. `process_document` now
+  takes `extension` and routes on `filename_for_extraction(filename,
+  extension)`. The stored and displayed `filename` is unchanged. This also
+  fixes audio sent with an extension-less `filename`, which was never sent for
+  transcription. Guarded by `tests/test_office_extraction.py`.
+- **PII redaction masked whole spreadsheet columns that are not
+  identifiers.** The prose redactor decides from an 80-char window, and in a
+  table that window reaches the "Account No" header from the next rows. On a
+  500-row ledger it masked all 500 mobile numbers as bank accounts, plus 52 of
+  500 transaction refs, about 10% of which pass the Aadhaar checksum alone.
+  Spreadsheets are now redacted by column: each cell is judged with its own
+  header as context (`scan_text(strict_context=True)`). The same ledger now
+  has 0 mobiles and 0 refs masked, and all 500 account numbers masked.
+- **Spreadsheet chunks repeated rows.** Chunk overlap duplicated 71 rows of a
+  500-row sheet across chunks, so anything reading adjacent chunks counted
+  them twice. Sheets are chunked without overlap; prose is unchanged.
+- **Citation figures matched inside longer numbers and ISO dates were checked
+  by year only.** "15.5" was supported by "115.5", and "2026-09-02" by any 2026
+  date. Figures now match as whole numbers and equal by value across trailing
+  zeros ("₹1,05,47,271.00" matches 10547271). ISO dates are checked whole.
+  `_date_forms` now includes the ISO form, without which no chronology entry
+  taken from a spreadsheet could be cited.
+- **Entity resolution merged numbered parties.** "Player 1" vs "Player 10"
+  scored 94 against a merge threshold of 92, so 40 players became 9 entities;
+  "Accused No. 1" / "No. 10" had the same risk. Names whose numbers (or roman
+  ordinals) differ are never merged.
+- **Spreadsheets in the knowledge graph.** Graph ingest now skips spreadsheet
+  chunks. The prose extractor has no node for a measurement and checks nothing
+  against the row.
+- **A debug log line could include a document quote.** Dropped citations are
+  logged by keys only.
+- **Chat replies carried no citations.** `ChatState` did not declare
+  `evidence_index` / `citations` / `citation_report`, and LangGraph drops
+  undeclared keys between nodes, so every `ai_response` went out with an empty
+  `citations` list. Guarded by `tests/test_chat_state.py`.
+- **Stop did not stop in-flight Gemini work.** google-genai 2.25 needs
+  `aiohttp.ClientConnectorDNSError`, which aiohttp 3.9.5 lacks. A cancelled or
+  failed request therefore surfaced as `AttributeError`, the client retried on
+  the legacy SDK, and a stopped pipeline kept running, which also delayed a
+  following resume. aiohttp is now 3.14.3, which also clears the 3.9-line
+  security advisories. The Gemini client re-raises a cancellation instead of
+  falling back (`_reraise_if_cancelled`).
+- **Legal notices and past filings appeared on no panel.** The list-of-dates
+  classifier dropped them as procedural, and the procedural timeline excludes
+  them by design. They are now kept on the list of dates.
+- **List of dates empty for undated letters.** Letters and representations
+  often carry their date only in the file name ("25 11 29 Letter KCA.pdf",
+  "30 Nov BCCI Letter.pdf"). The date is now read from the name, including the
+  "annexure-N-" upload prefix (`app/utils/document_dates.py`), and used as the
+  document's date and year anchor. The year backstop no longer moves a date
+  into the future (it had turned a 2025 letter into 2026, which was then
+  dropped as future-dated). The procedural timeline uses the same parser.
+- **"Verification" deleted from ingested PDFs.** With one word per line in the
+  PDF text layer, a 12-character word repeated on 3+ pages counted as a
+  running header. "BCCI Age Verification Committee" became "BCCI Age
+  Committee" in every panel. A single word is no longer a header.
+- **"documents" rewritten to "annexures" everywhere.** Analysis-report text
+  read "Annexure 1 annexures an official representation" and "identity
+  annexures". Only references to uploads are rewritten now
+  (`_upload_wording`).
+- **Party names in logs.** Three log lines carried them: the metadata case
+  title, the analysis-report party list and the applicable-laws payload dump.
+  Two strategy retry warnings and the role-reassignment line did too.
+  `verify_logging.py` now has a personal-data rule.
+
+### Changed
+
+- **Statute check uses India Code.** `check_provision` validates against
+  `app/statutes/data/sections.json`: 165 acts and 12,530 sections fetched from
+  India Code. It flags 16 repealed acts, never reads an Order/Rule as a
+  section, and marks IPC-numbered BNS sections `invalid`.
+- **Exact dependency versions.**
+  - `requirements.lock.txt` is regenerated on Python 3.12 and verified by every
+    suite on a clean venv.
+  - `pytest` moved to `requirements-dev.txt`.
+  - The Dockerfile is on Python 3.12 and installs the lock; it adds ffmpeg,
+    poppler and antiword and runs as a non-root user.
+  - `.dockerignore` excludes the credential files.
+
+### Added
+
+- **`sectionTitle` on applicable-laws rows (socket payload, additive).** This
+  is the official section heading from India Code, e.g. Copyright Act s.19 →
+  "Mode of assignment". `section` is unchanged. The frontend and the backend
+  PDF need to render it (e.g. "Section 19 – Mode of assignment").
+- **Production-readable logs.**
+  - `event … received/finished` per inbound event.
+  - `result <panel> delivered=yes|no items=… price=…` per emit.
+  - The 5-second probing-prompts poll is at DEBUG.
+  - `llm_call` lines name the calling feature instead of `-`.
+- `scripts/e2e_local_backend.py` (`make e2e`): the pre-deploy end-to-end run.
+  `--evidence FILE…` runs real case files.
+- `scripts/fetch_laws_indiacode.py`, `scripts/build_statute_index.py`,
+  `scripts/clean_master_laws.py`: the statute data pipeline.
+
+- **Knowledge-graph retrieval (ontology agentic RAG), behind flags.**
+  - **What it is:** the ontology, Neo4j graph store, fact extraction, entity
+    resolution, contradiction detection and retrieval planner/critic from
+    `feature/data_ingestion`, ported onto this branch's own hybrid RAG. No
+    Keel server.
+  - **Provenance:** facts carry evidence-store chunk ids and the page their
+    text is on.
+  - **Where it is used:** chat gets graph facts tied to citable passages;
+    four panels can take a graph evidence block (augment only).
+  - **Deletion:** every delete or purge withdraws graph facts, and a failed
+    purge clear raises.
+  - **Off by default:** `NEO4J_URL`, `ONTOLOGY_INGEST_ENABLED` and
+    `RETRIEVAL_PANELS` control it. Neo4j 5 Community starts with
+    `make graph-up` (compose profile `graph`).
+  - **Statute register:** the branch's validated register replaces the
+    previous loader, with the same `check_provision` behaviour.
+  - **Tests:** `make test` now runs the 254 ported unit tests plus the
+    offline suites. It used to point at a missing `test_setup.py`.
+
+### Changed
+
+- **Logging rebuilt for tracing and data safety.**
+  - **Correlation:** every log line carries `request_id` / `event` /
+    `workspace_id` from the inbound event, including lines from the tasks it
+    spawns.
+  - **Model calls:** one `llm_call` line per model call, with feature,
+    status, duration and tokens. Failed calls are no longer traced as
+    success.
+  - **Audit log restored.** `logs/audit/audit.log` had stopped receiving
+    events on 2026-04-02 because a second logging setup removed its sink.
+  - **Removed from logs:**
+    - raw socket payloads (dumped up to three times per event);
+    - full model responses and document text;
+    - signed URLs (one valid about 25 years);
+    - a client mobile number, party names, chat and objective text, and
+      fact values.
+  - **Reconnect storm throttled:** one ERROR per refused handshake, with the
+    diagnosis hint once per outage. It had been about 40% of `app.log`.
+  - **Clean-up:**
+    - 99 f-string log calls converted to placeholders;
+    - emoji removed from 303 messages;
+    - 13 duplicate error-then-exception pairs merged;
+    - per-item dumps (about 30 lines per analysis report) replaced by count
+      lines;
+    - three unused example modules deleted.
+  - **Sinks:** `app.log` follows `LOG_LEVEL`; file writes are queued off the
+    event loop; tracebacks no longer include local variables unless
+    `LOG_DIAGNOSE=true`.
+  - **Regression guard:** `verify_logging.py`.
+
+
+### Added
+
+- **Accurate retrieval with verified citations** (`app/rag/`). Socket payloads
+  gain only additive, optional fields, and the frontend should render them:
+  - `ai_response.citations[]`: one entry per inline `[n]` marker, with
+    `type` (document / case_law / statute), `documentId`, `annexure`,
+    `fileName`, `page`, `quote`, or `url` for case laws and statutes;
+  - `list_of_dates` / `procedural_timeline` entries: `evidenceSnippet`,
+    `citation`, plus a corrected `pageNumber` and `sourceDocId`;
+  - `analysis_report` item objects: `citations[]`;
+  - `strategy_objective.caseSummaryCitations[]`;
+  - `applicable_laws` rows: `sourceUrl`, `registerStatus`, `citations[]`;
+  - `case_laws` cards: `citationVerified`.
+- **Hybrid search.** Dense and sparse (legal-aware tokens such as `s.302`,
+  `498A`, case numbers, amounts) with RRF fusion, query rewriting, LLM
+  reranking, per-document diversity, and a rewrite-and-retry when nothing
+  relevant is found.
+- **Page-aware, structure-aware chunking** with overlap, in a new evidence
+  collection. Legacy workspaces are re-indexed on first use or with
+  `scripts/reindex_chunks.py`.
+- **Evaluation:** `scripts/eval_rag.py` plus a golden-set format.
+
+### Changed
+
+- **Model** defaults to `gemini-3.8-flash`. `MINIMAL` thinking maps to `LOW`,
+  because 3.8 Flash rejects `MINIMAL` and long-form continuations would
+  otherwise fail. Pricing is $0.75 / $3.75 per 1M tokens until 2026-12-31.
+- **Embeddings** use the correct task type for queries versus documents, an
+  explicit dimensionality, batching and retries. They are never zero-vector
+  substitutes.
+- **Panels** get relevance-aware excerpts instead of a front cut, with a 200K
+  budget (`PANEL_CONTEXT_CHARS`).
+- **Law signals** are drawn from every document, and cited provisions lead the
+  search query.
+- **`qdrant-client`** 1.7.3 → 1.18.0.
+
+### Fixed
+
+- **Long documents were reassembled in alphabetical chunk order** for every
+  feature.
+- **`get_all_documents` dropped document metadata**, so prompt headers were
+  always empty.
+- **Page numbers were guessed or defaulted to 1.** No page markers were ever
+  written.
+- **Re-ingesting a document duplicated its chunks.**
+- **`CHAT_MIN_SCORE_THRESHOLD` was never applied.**
+- **Deleting a document or workspace now clears both collections.**
+
+
+### Added
+
+- **Stop and "Finish update" for a running workspace update**
+  (`workspace_stop_request`, `workspace_resume_request`; new
+  `app/socket/handlers/run_control.py`, schemas `WorkspaceStopRequestPayload` /
+  `WorkspaceResumeRequestPayload`). Socket contract: two new inbound events;
+  the only outbound change is that a resume's `workspace:refresh` carries
+  `reason: "ai_resume_started"`.
+  - **Stop** cancels the running update's tasks (never a chat turn), drops
+    buffered deliveries in memory *and* in the persisted
+    `PENDING_FEATURE_DELIVERY` copy, disarms recovery markers, and never
+    replies. It is backed by a **run fence**: every workspace-scoped event runs
+    in a `(workspace_id, epoch)` context scope, a stop bumps the epoch, and the
+    socket proxy suppresses any `document_feature_response` or
+    `workspace:refresh` from an older scope. So a stale refresh from the stopped
+    run cannot re-arm the frontend's spinners, and a new run started after the
+    stop is untouched. Re-sends under the same `requestId` are swallowed; a stop
+    whose `stoppedAt` predates newer work is ignored as a stale re-send.
+  - An **objective change interrupted by a stop is held**, not dropped (the
+    resume payload does not carry the new objective): never auto-resumed on
+    reconnect or restart, replayed only by a resume that includes
+    `strategy_objective`, dropped by a new full run.
+  - **Resume** declares exactly `reEmitFeatures` (unknown types dropped) in
+    `workspace:refresh`, reconciles `evidenceFiles` against the vector store,
+    produces one `document_feature_response` per feature in product order with
+    `currentState` honoured, and releases any declared loader it could not
+    satisfy. Idempotent on `requestId` (a failed attempt re-runs).
+  - `_release_refresh_loaders` can now settle `document_assessments` and
+    `workspace_metadata` from their cached envelopes.
+  - Offline coverage: `verify_run_control.py`.
+
+### Fixed
+
+- **An objective change no longer hangs the workspace on "refreshing" when the
+  socket drops mid-regeneration.** Confirmed root cause of the 2026-09-17
+  incident: the objective change was accepted at 11:59:56 IST, the socket
+  disconnected 25 s into a ~2-minute regeneration, and the work died leaving no
+  log line and no emit — so all six panel loaders armed by `workspace:refresh`
+  span for the rest of the session. `asyncio.CancelledError` derives from
+  `BaseException`, so every `except Exception` on that path missed it.
+
+  Six changes, in the order that matters:
+
+  - **Cancellation is caught, reported and recoverable.**
+    `_regenerate_strategy_for_new_objective` and the objective-change cascade
+    runner now handle `asyncio.CancelledError` explicitly: they log the stage
+    reached, record the instruction for resume, release any loader they armed,
+    and re-raise. Detached tasks are held in `_background_tasks` with a
+    done-callback (`_track_background_task`) — asyncio keeps only a weak
+    reference to a task, so a fire-and-forget `create_task` could be collected
+    mid-flight and reported nothing when it died.
+  - **Emits now report delivery.** `SocketClient.emit` / `emit_ai_response`
+    return `bool` instead of `None` (still never raising), and
+    `_emit_document_feature` propagates it. An undelivered payload is buffered
+    per `(workspace_id, featureType)` and re-sent on reconnect
+    (`_flush_pending_feature_deliveries`), **before** the cached-feature replay,
+    so the frontend receives the genuinely-generated objective rather than the
+    pre-change snapshot. The buffer is persisted
+    (`CacheKinds.PENDING_FEATURE_DELIVERY`) because the disconnect that loses an
+    emit is often what restarted the process.
+  - **Work that produced nothing is re-run.** An interrupted change is recorded
+    as `CacheKinds.PENDING_OBJECTIVE_CHANGE` and resumed once on reconnect
+    (`_resume_pending_objective_changes`), capped at one attempt and dropped
+    after 15 minutes. A change whose payload was merely undelivered is *not*
+    re-run — the cascade is scheduled instead.
+  - **Gemini calls are bounded.** New `gemini_request_timeout_seconds`
+    (default 300 s, env-overridable) applied in `generate`, `generate_longform`
+    and `generate_grounded`; nothing in the service had a timeout before. A
+    timeout on the new-SDK path does not fall back to the legacy SDK, which
+    would have doubled the stall.
+  - **LLM failures are no longer success-shaped.** `generate` reports failure by
+    *returning* a sentinel string, so a 429 / 5xx / safety block used to surface
+    as the far more misleading "model returned no JSON". New
+    `is_generation_error()` is checked before parsing; the objective
+    regeneration logs the real reason and retries once. Every give-up path now
+    emits one structured line plus an `objective_change_failed` audit event with
+    a reason code (`llm_error`, `no_json`, `no_objective`, `emit_dropped`,
+    `cancelled`, …).
+  - **A lit loader can no longer outlive its work.** New shared
+    `_release_refresh_loaders` emits each panel's terminal state for any
+    featureType that was armed but never emitted, and is called from all four
+    objective-change failure branches and from a `finally` in the cascade
+    runner. The chat reply now says plainly that the objective was not updated
+    (`OBJECTIVE_CHANGE_FAILED_MESSAGE`) instead of falling through to the
+    general chat agent.
+
+  Also fixed in the same class: the analysis-report chat-update path armed its
+  loader and skipped the emit when no cached report existed; cascade step 1
+  (the analysis regeneration) was unwrapped, so a raise there aborted the
+  remaining six panels; `_regenerate_strategy_for_new_objective` returned `True`
+  without emitting when there was no socket client; and the dead
+  `_suppress_analysis_emit_until_ts` guard (never assigned, and a no-emit
+  `return False` if it ever had been) was removed.
+
+  `workspace:refresh` now carries a `refreshId` so an arm/release pair can be
+  read end to end in the log — the 2026-09-17 cause had to be reconstructed from
+  the *absence* of lines. The frontend may ignore the field; echoing it back on
+  `document_feature_response` is a follow-up that needs backend agreement.
+
+  A vague request ("just revise the strategic objective as per proper
+  documents") is no longer passed through *as* the new objective: it is
+  reframed as a document re-derivation
+  (`_document_grounded_objective_instruction`), and `revise` / `rework` /
+  `reframe` / `redefine` / `regenerate` were added to the panel-edit verb gate.
+
+  Offline coverage: `verify_objective_change.py` group 12.
+
+### Changed
+
+- **The quality score explanation is now objective-relative and always
+  refreshed by an objective change.** `_ensure_quality_score_explanation` takes
+  the current strategic objective and passes it to all three producers (the LLM
+  pass, the deterministic fallback, and the main analysis-report prompt), each of
+  which must state how the objective bears on the score. The objective-change
+  cascade forces the refresh when the regenerated report's explanation comes back
+  empty or unchanged — the case that used to leave stale text on screen, since
+  `qualityScoreExplanation` is among the first fields lost to JSON truncation and
+  the generic refill is objective-blind. `reportQualityScoreExplanation` is
+  re-derived alongside it. The objective is also threaded through the
+  `analysis_report_feedback`, `added_missing_information` and `workspace_sync`
+  merge regenerations.
+- **An objective change now updates the Case Summary as well.** Declaring a new
+  strategic objective re-frames `caseSummary` and `reportCaseSummary` alongside
+  the objective, next steps and chips, in one call and one coalesced
+  `strategy_objective` emit (`_regenerate_strategy_for_new_objective`, renamed
+  from `_regenerate_strategy_objective_preserving_case_summary`).
+
+  Re-framing is emphasis and ordering, **never facts** — the summary is the
+  fact-of-record narrative every other panel's prompt is built on. Three
+  deterministic checks enforce it: every figure in the previous summary must
+  survive (new `find_dropped_case_figures`), no new organisation/party/place may
+  appear (`find_ungrounded_proper_nouns`), and the mandated opening must be
+  intact. A candidate failing any check is discarded and the previous text
+  stands; the new objective lands either way, and the chat acknowledgement names
+  the case summary only when it actually moved.
+
+  Unchanged: **role reassignment** still locks both summaries
+  (`refresh_case_summary=False`), and a **surgical** objective edit
+  (`_regenerate_strategic_objective_with_feedback`) still preserves them
+  byte-for-byte.
+
+### Added
+
+- **New inbound event `document_reload_request`** (`app/socket/schemas.py`,
+  `app/socket/client.py`, `app/socket/events.py`,
+  `app/socket/handlers/document_reload.py`). The lawyer hits "reload" on one
+  document in Supporting Material — or the backend does, because the document
+  scored 0 — and the AI purges everything it holds for that file, re-fetches the
+  freshly-signed URL, re-extracts it, and re-runs the workspace feature suite
+  over the full evidence set. Until now the only recovery for an unreadable
+  upload (a scan whose OCR produced nothing, a failed transcription) was to
+  delete the document and upload it again, which threw away its id and every
+  curated item tied to it. **Socket payload change** —
+  `DocumentReloadRequestPayload` carries `requestId`, `targetFile` (an evidence
+  file plus an advisory `previousQualityScore`), the full active `evidenceFiles`,
+  a MANDATORY `currentState`, and optional `participants`. Steps 6–7 of the flow
+  are the emits a `workspace_sync` re-run already produces
+  (`workspace:refresh`, then `document_feature_response` per feature), so the
+  whole output path is reused. Four rules shape the handler: the document's
+  vectors and its entry in the cached `document_assessments` manifest are purged
+  **before** the re-fetch, so no prompt is built on the copy the reload exists to
+  replace; the document's backend id is **resolved, never invented** (`_id` →
+  matching `fileHash` → `storeFileName`/`path` → a unique filename match in the
+  manifest), and an unresolvable reload is abandoned rather than ingested under a
+  second identity no later delete could reach; the removed-evidence ledger is
+  written **only when the re-read fails** and cleared when it succeeds, so a good
+  reload never reports its own document as a `missingInfo` gap; and re-sends
+  under the same `requestId` are swallowed while in flight or just completed but
+  **re-run after a failure**, since the backend eventually stops retrying. The
+  re-ingestion runs under its own `capture_usage()` scope, and the reload
+  revokes a pending compliance purge like every other live-workspace event.
+  Scoped to the one document: drift between `evidenceFiles` and the live vector
+  store is logged, never acted on.
+
+- `verify_document_reload.py` — offline verification of the reload: schema,
+  id resolution (including the ambiguous cases it must refuse), purge-before-read
+  ordering, manifest merge, ledger behaviour on success and failure, curation
+  survival, the `requestId` de-dupe, and purge revocation. 69 checks, no API key,
+  no backend, no Qdrant.
+
+- `verify_objective_change.py` — offline verification of the re-frame and
+  of every case in which it must be refused.
+
+- **Workspace sharing.** Two new optional inbound fields, neither of which
+  changes `userId` (it stays the case OWNER on both, so owner-scoped caches keep
+  their key):
+  - `workspace_sync.participants` — `[{userId, name, permission}]`, permission
+    `edit` or `view`. Absent entirely (not `[]`) when the case is not shared, so
+    an absent field on `workspace_sync` is read as *un-shared* and drops the
+    roster. `workspace_version_restore` inherits the field but is not
+    authoritative over it.
+  - `user_message_request.askedBy` — `{userId, name}`, present only when someone
+    other than the owner typed the message.
+
+  The roster lives in `app/workspace/participants.py` (`CacheKinds.PARTICIPANTS`,
+  hydrated on a cold workspace, cleared by the `workspace_deleted` purge).
+  `resolve_asker(...)` turns the pair into a permission: a `view` collaborator
+  gets the same analysis for any question, but chat-driven **writes** are
+  skipped — panel edits, fact corrections, the objective-change cascade,
+  AI-marker panel updates and role selection — and the reply says so instead of
+  implying the change landed. The asker also reaches the chat prompt as a short
+  attribution block; participants are app users, not parties to the dispute, so
+  they are kept out of every other prompt.
+- `verify_workspace_share.py` — offline verification of the sharing path
+  (schemas, roster lifecycle, permission resolution, and end-to-end viewer /
+  editor / owner chat behaviour).
 - **User-asserted fact ledger.** A fact the lawyer corrects in chat ("the disputed
   amount is 6 lakh USD, not 16 lakh") is now pinned per workspace
   (`CacheKinds.USER_ASSERTED_FACTS`, `app/socket/handlers/user_facts.py`). Every

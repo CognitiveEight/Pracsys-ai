@@ -218,28 +218,38 @@ Classify each entry as ONE of:
                     document handed over, transaction, communication exchanged,
                     medical examination, FIR registered as an event, site
                     inspection, possession delay, fraud transaction, etc.).
+                    ALSO factual: a legal / demand / statutory notice sent,
+                    received or replied to between the parties, and a
+                    complaint, suit, petition or FIR that WAS filed on a past
+                    date. These are the backbone of an Indian "List of Dates
+                    and Events" (e.g. the s.138 NI Act notice and its receipt
+                    start the limitation clock), and the Procedural Timeline
+                    panel does NOT show them — dropping them here would leave
+                    them on no panel at all.
                     Anything a lawyer would mention when narrating "the story
                     of what happened" to a colleague.
-  - "procedural"  : a lawyer-side / court-side / system-side milestone
-                    (court filing, hearing, adjournment, judgment, summons,
-                    legal / demand / statutory notice issuance, response
-                    deadline, filing deadline, evidence deadline, compliance
-                    deadline, limitation period, lawyer or client consultation,
-                    mediation session, scheduled meeting, "case initiation",
-                    report due, period of judicial inactivity, judge absent,
-                    document expiry as a deadline). Anything that belongs on
-                    a separate Procedural Timeline panel rather than the
-                    factual narrative.
+  - "procedural"  : ONLY what the separate Procedural Timeline panel shows —
+                    a date set BY A COURT / TRIBUNAL / FORUM or BY LAW that
+                    controls how the case moves: a hearing or listing date,
+                    an adjournment / next date, a court-directed filing,
+                    evidence or compliance deadline, a computed limitation or
+                    response deadline, a scheduled future meeting or mediation
+                    session. Also lawyer-side bookkeeping: lawyer or client
+                    consultation, "case initiation", report due, period of
+                    judicial inactivity, judge absent, document expiry as a
+                    deadline.
 
 Apply general semantic judgment — do NOT rely on specific keywords. The same
 entry may be procedural in one case and factual in another:
   - "Visa Expiry" is FACTUAL only when the dispute is itself about visa
     overstay / immigration; otherwise it's procedural / metadata.
-  - "Notice Sent" is procedural; "Letter from employer demanding meeting"
-    is factual communication.
+  - "Legal Notice Sent" and "Notice Received by Accused" are factual (an
+    exchange between the parties); "Last Date to Pay Under the Notice" is
+    procedural (a deadline computed by law).
+  - "Complaint Filed Before the Magistrate" is factual (it happened);
+    "Next Hearing Date" and "Written Statement Due" are procedural.
   - "Marriage" is factual; "Marriage Certificate Filed in Court" is
     procedural.
-  - "Application Submitted" is procedural (a filing).
 
 If the entry's title is a vague placeholder ("Date Mentioned", "Event",
 "Case Date") with no concrete event content, classify as "procedural" so it

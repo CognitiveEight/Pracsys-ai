@@ -38,6 +38,8 @@ from typing import Any, Optional
 
 from loguru import logger
 
+from app.utils.redact import chars
+
 from app.ai.usage import record_stt_seconds, record_usage
 from app.core.config import settings
 
@@ -330,7 +332,7 @@ def _generate_gemini_json(prompt: str, *, max_output_tokens: int = 2048) -> Opti
     valid = _coerce_valid_json_text(text)
     if not valid:
         logger.warning(
-            "Audio Gemini JSON response not valid JSON (preview={!r})", text[:200]
+            "Audio Gemini JSON response not valid JSON (preview={!r})", chars(text)
         )
         return None
     obj = _extract_json_object(valid)
@@ -584,7 +586,7 @@ def _prepare_audio_for_recognition(audio_file: str) -> PreparedAudio:
             needs_conversion = True
 
     if needs_conversion:
-        logger.info("Audio: normalising input with ffmpeg → PCM16 mono 16kHz")
+        logger.info("Audio: normalising input with ffmpeg  PCM16 mono 16kHz")
         prepared_path = _convert_audio_to_pcm_wav(audio_file)
         cleanup_path = prepared_path
 
@@ -3047,7 +3049,7 @@ def transliterate_formatted_transcript_to_hinglish(formatted: str) -> str:
     residual = sum(1 for i in needs_translit_idx if _has_devanagari(texts[i]))
     logger.info(
         "Audio: cached transcript healed — {}/{} lines converted "
-        "({} still Devanagari after plain-text backstop) ({} chars → {} chars)",
+        "({} still Devanagari after plain-text backstop) ({} chars  {} chars)",
         healed_count, total_to_translit, residual, len(formatted), len(rebuilt),
     )
     return rebuilt

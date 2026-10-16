@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Audio recordings over 20 minutes (hotfix).** Chirp 3 BatchRecognize rejects
+  files longer than 20 minutes, so every long call paid for a doomed upload and
+  then fell back to ~40 s Recognize chunks, whose speaker tags drift across
+  dozens of joins. Recordings longer than `AUDIO_BATCH_WINDOW_SECONDS` (1140 s)
+  are now cut at pauses into overlapping windows straight from the source file,
+  run as parallel BatchRecognize jobs (`AUDIO_BATCH_CONCURRENCY`), and stitched
+  with speakers matched on the shared overlap audio. A window whose job fails
+  falls back to chunked Recognize for that window only; a window that cannot be
+  transcribed fails the transcription explicitly rather than leaving a silent gap.
+- Gemini re-diarization no longer drops every utterance after the 5,000th: long
+  transcripts are assigned in overlapping blocks, reconciled for 1/2 label swaps.
+- STT cost is recorded only for batch jobs that processed the audio; a rejected
+  job was charged at its full duration.
+- A cancelled transcription (Stop, purge, disconnect) now stops its worker thread
+  at the next window/batch instead of running on.
+- `AUDIO_MAX_DURATION_MINUTES` (default 1440, 0 = off) rejects a recording before
+  any paid call with `transcriptStatus: failed`.
+- Logs: the chunked-fallback line states its real reason (it always said "no GCS
+  bucket configured"), and document/audio log lines no longer carry file names,
+  which often contain party names.
+
 ### Added
 
 - **Excel (`.xlsx`/`.xlsm`) and PowerPoint (`.pptx`) evidence.** Both now go

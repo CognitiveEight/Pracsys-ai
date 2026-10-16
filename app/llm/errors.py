@@ -89,7 +89,18 @@ def reraise_if_cancelled() -> None:
     and a stopped pipeline kept running on the fallback path.
     """
     task = asyncio.current_task()
-    if task is not None and task.cancelling():
+    if task is None:
+        return
+    cancelling = getattr(task, "cancelling", None)  # Task.cancelling() is Python 3.11+
+    if cancelling is not None:
+        pending = bool(cancelling())
+    else:
+        # Python 3.10 (the staging VM's runtime): no public API, so read the flag
+        # Task.cancel() sets until the cancellation is delivered. Without this
+        # guard every failed model call raised AttributeError here and took the
+        # whole panel down with it.
+        pending = bool(getattr(task, "_must_cancel", False))
+    if pending:
         raise asyncio.CancelledError()
 
 

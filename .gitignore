@@ -96,14 +96,16 @@ google-application-credentials.json
 !**/RELEASE.md
 !**/CHANGELOG.md
 !docs/MODEL_PORTABILITY.md
+# Cloud credentials (same rules as main / SIM-9)
+application-service-*.json
+Central Creds.txt
+*creds*.txt
+*Creds*.txt
 # Statute pipeline inputs/outputs (large, regenerable; see scripts/fetch_laws_indiacode.py)
 /masterLaws*.json
 # Local reference material, not part of the service
 /SimplerToday_Cloud_Services_Migration-1.pdf
+/docs/archive/
 /docs/SYSTEM_ARCHITECTURE.drawio
 /docs/TARGET_ARCHITECTURE.drawio
 /pracsys2.0/
-
-
-application-service-*.json
-Central Creds.txt

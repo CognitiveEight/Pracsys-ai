@@ -91,3 +91,15 @@ google-application-credentials.json
 !**/SYSTEM_ARCHITECTURE.md
 !**/RELEASE.md
 !**/CHANGELOG.md
+# Cloud credentials (same rules as development / SIM-9)
+application-service-*.json
+Central Creds.txt
+*creds*.txt
+*Creds*.txt
+# Statute pipeline inputs/outputs (large, regenerable; see scripts/fetch_laws_indiacode.py)
+/masterLaws*.json
+# Local reference material, not part of the service
+/docs/archive/
+/docs/SYSTEM_ARCHITECTURE.drawio
+/docs/TARGET_ARCHITECTURE.drawio
+/pracsys2.0/

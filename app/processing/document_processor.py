@@ -226,9 +226,10 @@ Document excerpt:
         Returns:
             Processing result with readability score
         """
+        # File names often carry party/client names, so log the id only.
         logger.info(
-            "Processing document: {} for user {} in workspace {}",
-            filename,
+            "Processing document {} for user {} in workspace {}",
+            document_id,
             user_id,
             workspace_id,
         )
@@ -511,24 +512,23 @@ Document excerpt:
             ) as fh:
                 fh.write(file_content)
                 tmp_path = fh.name
-            logger.info("Audio transcription starting: {}", filename)
+            # File names often carry party/client names: log type and size only.
+            logger.info(
+                "Audio transcription starting ({}, {} bytes)", suffix, len(file_content)
+            )
             result = await transcribe_audio(tmp_path)
             if result.success:
                 logger.success(
-                    "Audio transcription succeeded: {} (source={}, segs={})",
-                    filename,
+                    "Audio transcription succeeded (source={}, segs={}, duration={}s)",
                     result.speaker_source,
                     len(result.segments),
+                    round(result.duration_seconds or 0),
                 )
             else:
-                logger.warning(
-                    "Audio transcription failed: {} ({})",
-                    filename,
-                    result.error,
-                )
+                logger.warning("Audio transcription failed ({})", result.error)
             return result
         except Exception as exc:  # pragma: no cover - defensive
-            logger.error("Audio transcription crashed for {}: {}", filename, exc)
+            logger.opt(exception=exc).error("Audio transcription crashed")
             return AudioTranscriptionResult(
                 success=False, error=f"transcription_crashed: {exc}"
             )

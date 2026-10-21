@@ -9,6 +9,7 @@ from loguru import logger
 
 from app.workspace.custom_instructions import (hydrate_custom_instructions_from_cache)
 from app.workspace.participants import hydrate_participants_from_cache
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
                                        hydrate_workspace_state)
 
@@ -284,12 +285,12 @@ class StateRolesMixin:
         Priority:
         1) Explicit role from current payload
         2) Persisted role cache (authoritative: in-memory role cache, then Qdrant)
-        3) In-memory workspace context (may be a fabricated ADJUDICATOR default)
-        4) ADJUDICATOR fallback
+        3) In-memory workspace context (may be a fabricated default)
+        4) DEFAULT_WORKSPACE_ROLE (PETITIONER, the lawyer app's own default)
 
         The persisted role cache MUST win over the in-memory workspace context:
         `upsert_workspace` and `hydrate_context_from_cache` (app/workspace/context.py)
-        default a role-less context to ADJUDICATOR, and that fabricated default
+        default a role-less context to DEFAULT_WORKSPACE_ROLE, and that fabricated default
         would otherwise shadow the user's real selection on paths that carry no
         explicit role (e.g. a document-upload workspace_sync).
         """
@@ -347,10 +348,13 @@ class StateRolesMixin:
         except Exception:
             pass
 
-        logger.info(
-            "Workspace role unresolved; defaulting to ADJUDICATOR (source=fallback, "
+        # The role is mandatory in the lawyer app, so reaching here means the role
+        # was lost upstream or never persisted: warn, so it shows up in production.
+        logger.warning(
+            "Workspace role unresolved; defaulting to {} (source=fallback, "
             "workspace={}, user={})",
+            DEFAULT_WORKSPACE_ROLE,
             str(workspace_id)[:12],
             str(user_id)[:12],
         )
-        return "ADJUDICATOR"
+        return DEFAULT_WORKSPACE_ROLE

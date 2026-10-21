@@ -34,6 +34,7 @@ from app.prompts.case_laws_prompts import (
     extract_judgment_digest_prompt,
     classify_and_extract_uploaded_case_law_prompt,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 def _citation_in_text(citation: str, judgment_text: str) -> Optional[bool]:
@@ -543,7 +544,7 @@ class CaseLawsMixin:
         merge_with_previous: bool = True,
     ) -> None:
         """Generate and emit document_feature_response with featureType case_laws."""
-        role = (workspace_role or "ADJUDICATOR").strip().upper()
+        role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
         logger.info(
             "Case laws: generation started for workspace {}",
             workspace_id[:12] if workspace_id else "",
@@ -669,7 +670,7 @@ class CaseLawsMixin:
         user_id = (req.userId or "").strip()
         document_url = (req.documentUrl or "").strip()
         document_name = (req.documentName or "").strip() or "case-law-document"
-        role = (req.workspaceRole or "ADJUDICATOR").strip().upper()
+        role = (req.workspaceRole or DEFAULT_WORKSPACE_ROLE).strip().upper()
 
         logger.info(
             "case_law_document_request: workspace={} doc={} requestId={}",

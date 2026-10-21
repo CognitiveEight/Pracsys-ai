@@ -60,6 +60,7 @@ from app.prompts.strategy_prompts import (
     llm_classify_panel_edit_intent_prompt2,
     panel_edit_ack_prompt,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 def _noop_key(value: Any) -> Any:
@@ -1328,9 +1329,9 @@ class StrategyMixin:
                     + "\n[... content truncated ...]"
                 )
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
             confirmed_party = self._resolve_confirmed_role_party(
                 workspace_id, role, explicit=confirmed_party
             )
@@ -1809,9 +1810,9 @@ class StrategyMixin:
                     + "\n[... content truncated ...]"
                 )
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             prompt = regenerate_case_summary_with_feedback_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, combined_document_content=combined_document_content, current_case_summary=current_case_summary, current_report_case_summary=current_report_case_summary, current_strategy=current_strategy, role=role, user_feedback=user_feedback)
 
@@ -1939,9 +1940,9 @@ class StrategyMixin:
             if not current_case_summary:
                 return False
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             prompt = regenerate_next_steps_with_feedback_prompt(current_case_summary=current_case_summary, current_strategic_objective=current_strategic_objective, current_strategy=current_strategy, role=role, user_feedback=user_feedback)
 
@@ -2099,9 +2100,9 @@ class StrategyMixin:
             if not current_strategic_objective:
                 return False
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             prompt = regenerate_strategic_objective_with_feedback_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, current_case_summary=current_case_summary, current_strategic_objective=current_strategic_objective, current_strategy=current_strategy, role=role, user_feedback=user_feedback)
 
@@ -2228,7 +2229,7 @@ class StrategyMixin:
         try:
             from app.ai.gemini_client import gemini_client
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             prompt = summarize_objective_instruction_from_thread_prompt(role=role, thread=thread)
             raw = await gemini_client.generate(
                 prompt=prompt,
@@ -2815,7 +2816,7 @@ class StrategyMixin:
         return {
             "workspaceId": workspace_id,
             "userId": user_id,
-            "role": (workspace_role or "ADJUDICATOR").strip().upper(),
+            "role": (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper(),
             "isUpdate": is_update,
             "isEmpty": True,
             "caseSummary": "",

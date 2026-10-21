@@ -64,6 +64,7 @@ from app.socket.schemas import (
 )
 from app.workspace.participants import set_participants
 from app.workspace.persistence import CacheKinds, restore_state
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 # ---------------------------------------------------------------------------
 # Context
@@ -748,7 +749,7 @@ class RunControlMixin:
             self._mark_resume_request(workspace_id, request_id, "done")
             return
 
-        workspace_role = "ADJUDICATOR"
+        workspace_role = DEFAULT_WORKSPACE_ROLE
         refreshed = False
         emitted: Set[str] = set()
         try:
@@ -1241,7 +1242,7 @@ class RunControlMixin:
                 )
             if not isinstance(analysis_report, dict) or not analysis_report:
                 analysis_report = self._analysis_report_fallback(
-                    (workspace_role or "ADJUDICATOR").strip().upper()
+                    (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
                 )
             try:
                 analysis_report = await self._tag_analysis_report_against_current_state(

@@ -23,6 +23,7 @@ from app.prompts.suggestion_chips_prompts import (
     generate_drafting_chips_prompt,
     generate_analysis_report_suggestion_chips_prompt,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 class SuggestionChipsMixin:
@@ -30,7 +31,7 @@ class SuggestionChipsMixin:
 
     def _fallback_chips_for_role(self, role: str, needed: int) -> List[str]:
         """Return generic role-appropriate chips to pad when the model returns fewer than 10. Need 12+ for rotation."""
-        role_upper = (role or "ADJUDICATOR").upper()
+        role_upper = (role or DEFAULT_WORKSPACE_ROLE).upper()
         pools = {
             "ADJUDICATOR": [
                 "Summarise key issues",
@@ -92,7 +93,7 @@ class SuggestionChipsMixin:
                 "Suggest cooling-off period",
             ],
         }
-        generic = pools.get(role_upper, pools["ADJUDICATOR"])
+        generic = pools.get(role_upper, pools[DEFAULT_WORKSPACE_ROLE])
         return list(generic)[:needed]
 
     async def _generate_contextual_suggestion_chips(
@@ -113,7 +114,7 @@ class SuggestionChipsMixin:
             from app.ai.gemini_client import gemini_client
 
             gemini_client.initialize()
-            role_upper = (role or "ADJUDICATOR").upper()
+            role_upper = (role or DEFAULT_WORKSPACE_ROLE).upper()
             user_preview = (user_message or "")[:300]
             ai_preview = (ai_response_text or "")[:400]
             prompt = generate_contextual_suggestion_chips_prompt(ai_preview=ai_preview, conversation_summary=conversation_summary, role_upper=role_upper, user_preview=user_preview)
@@ -351,7 +352,7 @@ class SuggestionChipsMixin:
             from app.ai.gemini_client import gemini_client
 
             gemini_client.initialize()
-            role_upper = (role or "ADJUDICATOR").upper()
+            role_upper = (role or DEFAULT_WORKSPACE_ROLE).upper()
             # Build short context from report for the prompt
             # missingInfo / weaknesses / risks are now {id,text,isMatched} dicts
             # (were plain strings) — coerce to text so chips never embed dict reprs.

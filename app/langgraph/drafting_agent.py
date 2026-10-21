@@ -74,6 +74,7 @@ from app.prompts.drafting import (
     build_template_profile_prompt,
     infer_document_class,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 # ---------------------------------------------------------------------------
@@ -1556,7 +1557,7 @@ class DraftingAgent:
         *,
         user_id: str,
         suggestions: List[Dict[str, Any]],
-        role: str = "ADJUDICATOR",
+        role: str = DEFAULT_WORKSPACE_ROLE,
         case_summary: str = "",
         applicable_laws_brief: str = "",
         strategy_brief: str = "",
@@ -4886,7 +4887,7 @@ class DraftingAgent:
     ) -> Dict[str, Any]:
         source = (request_fields.get("source") or "").strip()
         user_id = (request_fields.get("userId") or "").strip()
-        role = (case_context.get("role") or "ADJUDICATOR").upper()
+        role = (case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
         case_summary = case_context.get("case_summary") or ""
         case_facts = case_context.get("case_facts_brief") or ""
         lawyer_instructions = (user_message or "").strip() or None
@@ -5533,7 +5534,7 @@ class DraftingAgent:
             inferred_doc_type = (classifier_result.get("document_type") or "").strip()
 
         if intent == "proceed_from_scratch":
-            role = (case_context.get("role") or "ADJUDICATOR").upper()
+            role = (case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
             case_summary = case_context.get("case_summary") or ""
             case_facts = case_context.get("case_facts_brief") or ""
             # If the lawyer named a specific document type (e.g. "draft
@@ -5817,7 +5818,7 @@ class DraftingAgent:
 
         if intent == "from_scratch":
             _clear_choice(session_state)
-            role = (case_context.get("role") or "ADJUDICATOR").upper()
+            role = (case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
             new_state = await self._scope_blank_draft(
                 role=role,
                 case_summary=case_context.get("case_summary") or "",
@@ -5862,7 +5863,7 @@ class DraftingAgent:
         — drafting still requires the lawyer to pick (a)/(b)/(c) on a
         later turn.
         """
-        role = (case_context.get("role") or "ADJUDICATOR").upper()
+        role = (case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
         case_summary = case_context.get("case_summary") or ""
         case_facts = case_context.get("case_facts_brief") or ""
         template_name = (session_state.get("template_name") or "(uploaded template)").strip()
@@ -6570,7 +6571,7 @@ class DraftingAgent:
         Failure mode: any LLM / JSON error returns a safe ``chat_reply``
         fallback so the turn never crashes the caller.
         """
-        role = (case_context.get("role") or "ADJUDICATOR").upper()
+        role = (case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
         case_summary = (case_context.get("case_summary") or "")
         case_facts = (case_context.get("case_facts_brief") or "")
 
@@ -6717,7 +6718,7 @@ class DraftingAgent:
             open_questions as before — there is no scoping progress to
             preserve.
         """
-        role = (case_context.get("role") or "ADJUDICATOR").upper()
+        role = (case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
         case_summary = case_context.get("case_summary") or ""
         case_facts = case_context.get("case_facts_brief") or ""
         prior_status = (session_state.get("draft_status") or "").strip()
@@ -7005,7 +7006,7 @@ OUTPUT FORMAT:
             )
             return session_state
 
-        role = (case_context.get("role") or "ADJUDICATOR").upper()
+        role = (case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
         case_summary = case_context.get("case_summary") or ""
         prompt = build_draft_translate_prompt(
             role=role,
@@ -7273,7 +7274,7 @@ OUTPUT FORMAT:
                     )
                     values = await self._extract_template_placeholder_values(
                         placeholders=placeholders,
-                        role=role or "ADJUDICATOR",
+                        role=role or DEFAULT_WORKSPACE_ROLE,
                         case_summary=case_summary or "",
                         case_facts_brief=case_facts_brief or "",
                         gathered_facts=gathered_facts or {},
@@ -7304,7 +7305,7 @@ OUTPUT FORMAT:
                 return None
             values = await self._extract_template_placeholder_values(
                 placeholders=placeholders,
-                role=role or "ADJUDICATOR",
+                role=role or DEFAULT_WORKSPACE_ROLE,
                 case_summary=case_summary or "",
                 case_facts_brief=case_facts_brief or "",
                 gathered_facts=gathered_facts or {},
@@ -7722,7 +7723,7 @@ OUTPUT FORMAT:
                     diff = await self._extract_template_diff(
                         template_docx_bytes=template_docx_bytes,
                         markdown=markdown,
-                        role=role or "ADJUDICATOR",
+                        role=role or DEFAULT_WORKSPACE_ROLE,
                         case_summary=case_summary or "",
                         case_facts_brief=case_facts_brief or "",
                         gathered_facts=gathered_facts or {},
@@ -7962,7 +7963,7 @@ OUTPUT FORMAT:
         mode_override: Optional[str],
         revision_instruction: Optional[str] = None,
     ) -> Dict[str, Any]:
-        role = (case_context.get("role") or "ADJUDICATOR").upper()
+        role = (case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
         case_summary = case_context.get("case_summary") or ""
         case_facts = case_context.get("case_facts_brief") or ""
         draft_title = session_state.get("draft_title") or "New Draft"
@@ -8304,7 +8305,7 @@ OUTPUT FORMAT:
             workspace_id=workspace_id,
             actionable_id=actionable_id,
             version=new_version,
-            role=(case_context.get("role") or "ADJUDICATOR").upper(),
+            role=(case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper(),
             case_summary=case_context.get("case_summary") or "",
             case_facts_brief=case_context.get("case_facts_brief") or "",
             gathered_facts=session_state.get("gathered_facts") or {},

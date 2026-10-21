@@ -27,6 +27,7 @@ from app.workspace.manager import workspace_manager
 from app.prompts.law_relevance_prompts import (
     assess_law_relevance_with_kanoon_and_llm_prompt,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 class LawRelevanceMixin:
@@ -427,7 +428,7 @@ class LawRelevanceMixin:
             return
 
         doc_context = await self._document_snippet_for_law_relevance(workspace_id)
-        role = "ADJUDICATOR"
+        role = DEFAULT_WORKSPACE_ROLE
         try:
             ctx = workspace_manager.get_workspace(workspace_id)
             if ctx and getattr(ctx, "workspace_role", None):

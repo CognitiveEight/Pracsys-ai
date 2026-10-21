@@ -50,6 +50,7 @@ from app.prompts.analysis_report_prompts import (
     compute_rejection_score_delta_prompt,
     compute_added_missing_info_score_delta_prompt,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 class AnalysisReportMixin:
@@ -89,9 +90,9 @@ class AnalysisReportMixin:
             if not instruction:
                 return False
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             # The cached report's text sections are now {id,text,isMatched}
             # dicts. The edit prompt expects plain strings ("the other lists
@@ -241,9 +242,9 @@ class AnalysisReportMixin:
                 workspace_role,
             )
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             all_docs = []
             try:
@@ -1405,7 +1406,7 @@ Rules:
         except Exception as e:
             logger.opt(exception=e).error("Analysis report generation failed: {}", e)
             return self._analysis_report_fallback(
-                (workspace_role or "ADJUDICATOR").strip().upper()
+                (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             )
 
     async def _ensure_structured_relevant_jurisdiction(
@@ -2159,7 +2160,7 @@ Rules:
                         self._emit_analysis_report(
                             workspace_id=workspace_id,
                             user_id=user_id,
-                            workspace_role=(role or "ADJUDICATOR"),
+                            workspace_role=(role or DEFAULT_WORKSPACE_ROLE),
                             batch_result=None,
                             is_update=True,
                             log_context=log_context or " (marker miss refresh)",

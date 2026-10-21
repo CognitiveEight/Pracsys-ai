@@ -18,6 +18,7 @@ from app.socket.event_utils import (
     _format_document_for_prompt,
     drafting_payload_to_wire,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 class DraftingMixin:
@@ -203,7 +204,7 @@ class DraftingMixin:
         try:
             from app.langgraph.drafting_agent import drafting_agent
 
-            role_upper = (workspace_role or "ADJUDICATOR").strip().upper() or "ADJUDICATOR"
+            role_upper = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper() or DEFAULT_WORKSPACE_ROLE
             # Make sure the lawyer's template library is loaded into the
             # in-memory store BEFORE pre-matching. The backend only pushes
             # template_sync on upload/rename/delete, so after an AI restart
@@ -360,7 +361,7 @@ class DraftingMixin:
             prev_count = int((meta or {}).get("lib_count") or 0)
             if current_count == prev_count:
                 continue  # library unchanged — no-op snapshot, nothing to do
-            role = (meta or {}).get("role") or "ADJUDICATOR"
+            role = (meta or {}).get("role") or DEFAULT_WORKSPACE_ROLE
             logger.info(
                 "Template library changed ({}{}) — refreshing drafting "
                 "suggestions for workspace={} (user={}) — matched cards whose "
@@ -424,7 +425,7 @@ class DraftingMixin:
         try:
             from app.langgraph.drafting_agent import drafting_agent
 
-            role_upper = (workspace_role or "ADJUDICATOR").strip().upper() or "ADJUDICATOR"
+            role_upper = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper() or DEFAULT_WORKSPACE_ROLE
             brief = self._build_case_brief_for_drafting(workspace_id)
             refreshed = await drafting_agent.rematch_unmatched_suggestions(
                 user_id=user_id,

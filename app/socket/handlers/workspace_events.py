@@ -28,6 +28,7 @@ from app.workspace.participants import set_participants
 from app.socket.event_utils import (
     drafting_payload_to_wire,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 class WorkspaceEventsMixin:
@@ -393,17 +394,16 @@ class WorkspaceEventsMixin:
             self._pending_reemit_user_id = str(payload.userId)
 
             # STEP 1: Validate role (convert to uppercase for validation)
-            workspace_role = (
-                payload.workspaceRole.upper()
-                if payload.workspaceRole
-                else "ADJUDICATOR"
-            )
+            workspace_role = (payload.workspaceRole or "").strip().upper()
             if not RoleEnum.validate(workspace_role):
+                # Mandatory in the lawyer app, so a missing or unknown role here is
+                # an upstream bug; use the app's own default rather than stopping.
                 logger.warning(
-                    "Invalid workspace role '{}', defaulting to ADJUDICATOR",
-                    payload.workspaceRole,
+                    "Workspace created with missing or invalid role '{}'; defaulting to {}",
+                    payload.workspaceRole or "",
+                    DEFAULT_WORKSPACE_ROLE,
                 )
-                workspace_role = "ADJUDICATOR"
+                workspace_role = DEFAULT_WORKSPACE_ROLE
             await self._remember_workspace_role(
                 str(payload.workspaceId), str(payload.userId), workspace_role
             )
@@ -640,7 +640,7 @@ class WorkspaceEventsMixin:
                             if self._socket_client and batch_result is not None:
                                 try:
                                     fallback = self._analysis_report_fallback(
-                                        (workspace_role or "ADJUDICATOR")
+                                        (workspace_role or DEFAULT_WORKSPACE_ROLE)
                                         .strip()
                                         .upper()
                                     )
@@ -718,7 +718,7 @@ class WorkspaceEventsMixin:
             if not payload.evidenceFiles and self._socket_client:
                 try:
                     workspace_role = (
-                        (payload.workspaceRole or "ADJUDICATOR").strip().upper()
+                        (payload.workspaceRole or DEFAULT_WORKSPACE_ROLE).strip().upper()
                     )
                     fallback = self._analysis_report_fallback(workspace_role)
                     await self._emit_document_feature(
@@ -1102,7 +1102,7 @@ class WorkspaceEventsMixin:
                 )
             # Resolve the role BEFORE upserting the context: a doc-upload sync
             # carries no workspaceRole, and upserting first on cold memory
-            # would fabricate an ADJUDICATOR context that shadows the
+            # would fabricate a default-role context that shadows the
             # Qdrant-persisted role during resolution.
             resolved_workspace_role = await self._resolve_workspace_role(
                 workspace_id=str(payload.workspaceId),
@@ -1300,7 +1300,7 @@ class WorkspaceEventsMixin:
                         )
                     if not analysis_report or not isinstance(analysis_report, dict):
                         analysis_report = self._analysis_report_fallback(
-                            (workspace_role or "ADJUDICATOR").strip().upper()
+                            (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
                         )
                     # Document deletion REPLACES the analysis report with the
                     # freshly-regenerated one (derived from the remaining docs).
@@ -2048,7 +2048,7 @@ class WorkspaceEventsMixin:
                     )
                 if not analysis_report or not isinstance(analysis_report, dict):
                     analysis_report = self._analysis_report_fallback(
-                        (workspace_role or "ADJUDICATOR").strip().upper()
+                        (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
                     )
                 if isinstance(analysis_report, dict):
                     try:
@@ -2786,7 +2786,7 @@ class WorkspaceEventsMixin:
                 )
             if not analysis_report or not isinstance(analysis_report, dict):
                 analysis_report = self._analysis_report_fallback(
-                    (workspace_role or "ADJUDICATOR").strip().upper()
+                    (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
                 )
             # Replace, don't merge: the restored document set is authoritative,
             # so items tied to a document that is no longer here must drop.

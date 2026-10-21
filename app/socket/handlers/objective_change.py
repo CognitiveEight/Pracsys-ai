@@ -432,8 +432,7 @@ class ObjectiveChangeMixin:
             if ok:
                 resumed += 1
                 self._clear_pending_objective_change(workspace_id)
-                self._pending_reemit_workspace_id = workspace_id
-                self._pending_reemit_user_id = user_id
+                self._arm_reconnect_reemit(workspace_id, user_id)
                 self._schedule_objective_change_reanalysis(
                     workspace_id=workspace_id,
                     user_id=user_id,
@@ -2701,8 +2700,7 @@ class ObjectiveChangeMixin:
         # pipeline lock, which is what actually prevents the interleaving.
         # Cache and set pending re-emit before emit so re-emit on reconnect has data if emit fails
         self._workspace_analysis_payload[workspace_id] = analysis_report
-        self._pending_reemit_workspace_id = workspace_id
-        self._pending_reemit_user_id = user_id
+        self._arm_reconnect_reemit(workspace_id, user_id)
         await self._emit_document_feature(
             feature_type="analysis_report",
             workspace_id=workspace_id,

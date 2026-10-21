@@ -273,8 +273,10 @@ class SocketEventHandler(
         self._background_tasks: Set[asyncio.Task] = set()
         # Re-emit after reconnect when socket dropped right after analysis report (so backend gets the update)
         self._had_disconnect: bool = False
-        self._pending_reemit_workspace_id: Optional[str] = None
-        self._pending_reemit_user_id: Optional[str] = None
+        # workspace_id -> (user_id, armed_at): every case whose cached panels
+        # are replayed after a reconnect (was a single slot: only the most
+        # recently active case was ever replayed).
+        self._pending_reemits: Dict[str, Tuple[str, float]] = {}
         # Per-workspace coalescing for analysis_report_feedback. Bulk-reject sends
         # N events in ~2ms; processing them sequentially under a lock is correct
         # but takes ~19s × N (Gemini scoring + explanation regeneration). We
@@ -307,8 +309,10 @@ class SocketEventHandler(
         # - per user/workspace: f"{workspace_id}:{user_id}" -> role
         self._role_cache_by_chat: Dict[str, str] = {}
         self._role_cache_by_user_workspace: Dict[str, str] = {}
-        # Last ai_response payload; re-emit after reconnect when socket dropped right after emit so backend receives it
-        self._pending_ai_response: Optional[Dict[str, Any]] = None
+        # chat_id -> ai_response payload whose delivery failed; all re-sent on the
+        # next connect (was a single slot shared by every chat, so a second
+        # undelivered reply silently replaced the first).
+        self._pending_ai_responses: Dict[str, Dict[str, Any]] = {}
         # De-dup guard for replayed workspace_sync events (e.g., reconnect replay).
         # workspace_id -> {"fingerprint": str, "ts": float}
         self._last_workspace_sync_fingerprint: Dict[str, Dict[str, Any]] = {}

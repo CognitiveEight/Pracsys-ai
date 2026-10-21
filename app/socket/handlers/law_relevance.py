@@ -28,6 +28,7 @@ from app.prompts.law_relevance_prompts import (
     assess_law_relevance_with_kanoon_and_llm_prompt,
 )
 from app.core.roles import DEFAULT_WORKSPACE_ROLE
+from app.utils.redact import validation_fields
 
 
 class LawRelevanceMixin:
@@ -366,7 +367,11 @@ class LawRelevanceMixin:
         try:
             req = ApplicableLawRelevanceRequestPayload(**payload_in)
         except Exception as e:
-            logger.warning("applicable_law_relevance_request: invalid payload {}: {}", e, payload_in)
+            logger.warning(
+                "applicable_law_relevance_request: invalid payload (keys={}): {}",
+                sorted(payload_in.keys()),
+                validation_fields(e),
+            )
             workspace_id = str(payload_in.get("workspaceId") or payload_in.get("workspace_id") or "")
             user_id = str(payload_in.get("userId") or payload_in.get("user_id") or "")
             request_id_raw = payload_in.get("requestId") or payload_in.get("request_id")

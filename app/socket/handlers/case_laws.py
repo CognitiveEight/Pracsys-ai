@@ -35,6 +35,7 @@ from app.prompts.case_laws_prompts import (
     classify_and_extract_uploaded_case_law_prompt,
 )
 from app.core.roles import DEFAULT_WORKSPACE_ROLE
+from app.utils.redact import chars, validation_fields
 
 
 def _citation_in_text(citation: str, judgment_text: str) -> Optional[bool]:
@@ -647,7 +648,9 @@ class CaseLawsMixin:
         try:
             req = CaseLawDocumentRequest(**payload_in)
         except Exception as e:
-            logger.warning("case_law_document_request: invalid payload: {}", e)
+            logger.warning(
+                "case_law_document_request: invalid payload: {}", validation_fields(e)
+            )
             await self._emit_case_law_document_response(
                 request_id=(
                     payload_in.get("requestId") or payload_in.get("request_id")
@@ -675,7 +678,7 @@ class CaseLawsMixin:
         logger.info(
             "case_law_document_request: workspace={} doc={} requestId={}",
             workspace_id[:12] if workspace_id else "",
-            document_name,
+            chars(document_name),
             request_id,
         )
 

@@ -29,40 +29,59 @@ from app.socket.event_utils import (
     drafting_payload_to_wire,
 )
 from app.core.roles import DEFAULT_WORKSPACE_ROLE
+from app.utils.redact import validation_fields
+
+#: Only workspaces armed this recently are replayed from cache after a reconnect.
+#: Undelivered panels have their own buffer (PENDING_FEATURE_DELIVERY); this
+#: replay is a safety net for work in progress, not a history of every case.
+_REEMIT_WINDOW_SECONDS = 1800
 
 
 class WorkspaceEventsMixin:
     """Connection lifecycle, reconnect re-emit, workspace_created/sync."""
 
+    def _arm_reconnect_reemit(self, workspace_id: str, user_id: str) -> None:
+        """Mark a workspace's cached panels for replay after the next reconnect."""
+        if workspace_id:
+            self._pending_reemits[str(workspace_id)] = (str(user_id or ""), time.time())
+
     async def _do_reemit_after_reconnect(self) -> None:
-        """Schedule a re-emit of cached document_feature_response payloads for the pending workspace after reconnect.
-        Covers all ten feature panels in product order (see _reemit_cached_features).
-        Clears pending state synchronously so it only runs once per disconnect/reconnect
-        cycle; the emits themselves run in a detached task under the workspace
-        pipeline lock so they never interleave a live generation chain."""
-        if (
-            not self._had_disconnect
-            or not self._pending_reemit_workspace_id
-            or not self._socket_client
-        ):
+        """Schedule a re-emit of cached document_feature_response payloads after reconnect.
+        Covers all ten feature panels in product order (see _reemit_cached_features),
+        for every workspace armed within _REEMIT_WINDOW_SECONDS (not only the most
+        recent one). Clears pending state synchronously so it only runs once per
+        disconnect/reconnect cycle; each replay runs in a detached task, in its
+        workspace's run scope (so a stop or purge can cancel it), under the
+        workspace pipeline lock so it never interleaves a live generation chain."""
+        if not self._had_disconnect or not self._pending_reemits or not self._socket_client:
             return
-        workspace_id = self._pending_reemit_workspace_id
-        user_id = self._pending_reemit_user_id or ""
+        pending = dict(self._pending_reemits)
         self._had_disconnect = False
-        self._pending_reemit_workspace_id = None
-        self._pending_reemit_user_id = None
+        self._pending_reemits.clear()
+        cutoff = time.time() - _REEMIT_WINDOW_SECONDS
+        recent = {ws: uid for ws, (uid, armed_at) in pending.items() if armed_at >= cutoff}
+        if len(recent) < len(pending):
+            logger.info(
+                "Reconnect replay skipped {} workspace(s) armed more than {}s ago",
+                len(pending) - len(recent),
+                _REEMIT_WINDOW_SECONDS,
+            )
 
-        async def _locked_reemit() -> None:
-            # Queue behind any in-flight generation chain so cached snapshots
-            # never interleave a live pipeline's emits. Runs detached so
-            # on_connect/on_connected return immediately.
-            async with self._workspace_pipeline_lock(workspace_id):
-                await self._reemit_cached_features(workspace_id, user_id)
+        for workspace_id, user_id in recent.items():
 
-        try:
-            asyncio.create_task(_locked_reemit())
-        except RuntimeError as rt_err:
-            logger.error("Could not schedule reconnect re-emit: {}", rt_err)
+            async def _locked_reemit(ws: str = workspace_id, uid: str = user_id) -> None:
+                # Queue behind any in-flight generation chain so cached snapshots
+                # never interleave a live pipeline's emits. Runs detached so
+                # on_connect/on_connected return immediately.
+                async with self._workspace_pipeline_lock(ws):
+                    await self._reemit_cached_features(ws, uid)
+
+            try:
+                self._spawn_in_run_scope(
+                    workspace_id, _locked_reemit(), label="reconnect re-emit"
+                )
+            except RuntimeError as rt_err:
+                logger.error("Could not schedule reconnect re-emit: {}", rt_err)
 
     async def _reemit_cached_features(self, workspace_id: str, user_id: str) -> None:
         """Replay cached feature payloads for one workspace in product order.
@@ -251,7 +270,7 @@ class WorkspaceEventsMixin:
                 # id was recorded when the change was accepted.
                 marker_user = (
                     (self._pending_objective_changes.get(ws_id) or {}).get("userId")
-                    or self._pending_reemit_user_id
+                    or (self._pending_reemits.get(ws_id) or ("", 0.0))[0]
                     or ""
                 )
                 self._clear_pending_objective_change(ws_id)
@@ -296,20 +315,32 @@ class WorkspaceEventsMixin:
         )
         await self._recover_interrupted_work()
         await self._do_reemit_after_reconnect()
-        # Re-emit last ai_response if we disconnected right after sending (so backend receives the chat response)
-        if self._had_disconnect and self._pending_ai_response and self._socket_client:
-            try:
-                await self._socket_client.emit_ai_response(self._pending_ai_response)
-                logger.success(
-                    "AI chat response re-emitted to backend after reconnect (chat: {})",
-                    self._pending_ai_response.get("chatId"),
-                )
-            except Exception as e:
-                logger.warning("Failed to re-emit ai_response after reconnect: {}", e)
-            finally:
-                self._pending_ai_response = None
+        await self._resend_pending_ai_responses()
         if self._had_disconnect:
             self._had_disconnect = False
+
+    async def _resend_pending_ai_responses(self) -> None:
+        """Re-send every chat reply whose delivery failed, one per chat.
+
+        Not conditioned on ``_had_disconnect``: a reply is only buffered when its
+        emit was not confirmed, and ``_do_reemit_after_reconnect`` clears that flag
+        first, which used to skip this re-send whenever a panel replay was pending.
+        A reply that fails again stays buffered for the next connect.
+        """
+        if not self._pending_ai_responses or not self._socket_client:
+            return
+        for chat_key, payload in list(self._pending_ai_responses.items()):
+            delivered = False
+            try:
+                delivered = bool(await self._socket_client.emit_ai_response(payload))
+            except Exception as e:
+                logger.warning("Failed to re-emit ai_response after reconnect: {}", e)
+            if delivered:
+                self._pending_ai_responses.pop(chat_key, None)
+                logger.success(
+                    "AI chat response re-emitted to backend after reconnect (chat: {})",
+                    chat_key,
+                )
 
     async def on_disconnect(self, data: Any) -> None:
         """Handle disconnection event. Mark that we disconnected (so on_connected can re-emit if needed)."""
@@ -390,8 +421,7 @@ class WorkspaceEventsMixin:
                 payload.workspaceRole,
             )
             # Set early so re-emit on reconnect works even if socket drops during document_assessments/metadata/strategy/analysis/list_of_dates
-            self._pending_reemit_workspace_id = str(payload.workspaceId)
-            self._pending_reemit_user_id = str(payload.userId)
+            self._arm_reconnect_reemit(str(payload.workspaceId), str(payload.userId))
 
             # STEP 1: Validate role (convert to uppercase for validation)
             workspace_role = (payload.workspaceRole or "").strip().upper()
@@ -2873,7 +2903,7 @@ class WorkspaceEventsMixin:
             logger.error(
                 "workspace_transferred: invalid payload (keys={}): {}",
                 list((data or {}).keys()) if isinstance(data, dict) else type(data).__name__,
-                e,
+                validation_fields(e),
             )
             return
 
@@ -2938,8 +2968,7 @@ class WorkspaceEventsMixin:
 
         # Reconnect safety: from now on any post-disconnect re-emit for this
         # workspace must carry the NEW owner (mirrors on_workspace_created).
-        self._pending_reemit_workspace_id = workspace_id
-        self._pending_reemit_user_id = new_user_id
+        self._arm_reconnect_reemit(workspace_id, new_user_id)
 
         # Resolve role for the new owner: payload → context → Qdrant → ADJUDICATOR.
         workspace_role = await self._resolve_workspace_role(
@@ -3138,8 +3167,11 @@ class WorkspaceEventsMixin:
                     )
 
         # Never block the socket loop — the forced template sync awaits a full
-        # snapshot ingest and suggestion generation is an LLM call.
-        asyncio.create_task(_runner())
+        # snapshot ingest and suggestion generation is an LLM call. Tracked, so
+        # a stop or a purge of this workspace can cancel it.
+        self._track_background_task(
+            asyncio.create_task(_runner()), label="workspace_transferred re-emit"
+        )
         logger.success(
             "workspace_transferred processed for {} — {} feature re-emit(s) scheduled",
             workspace_id,

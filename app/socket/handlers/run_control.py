@@ -65,6 +65,7 @@ from app.socket.schemas import (
 from app.workspace.participants import set_participants
 from app.workspace.persistence import CacheKinds, restore_state
 from app.core.roles import DEFAULT_WORKSPACE_ROLE
+from app.utils.redact import validation_fields
 
 # ---------------------------------------------------------------------------
 # Context
@@ -362,6 +363,24 @@ class RunControlMixin:
             return
         self._register_run_task(workspace_id, task)
 
+    def _spawn_in_run_scope(
+        self, workspace_id: str, coro: Any, *, label: str = ""
+    ) -> "asyncio.Task":
+        """Start detached work for a workspace from outside an inbound event.
+
+        Work spawned from an event already inherits that event's run scope. Work
+        started elsewhere (the reconnect replay) has none, so a stop could not
+        find it to cancel it and its emits were never fenced. This gives it the
+        workspace's current scope first. Uses ``Context.run`` rather than
+        ``create_task(context=...)`` so it also runs on Python 3.10.
+        """
+
+        def _spawn() -> "asyncio.Task":
+            _RUN_SCOPE.set((workspace_id, self._run_epoch(workspace_id)))
+            return self._track_background_task(asyncio.create_task(coro), label=label)
+
+        return contextvars.copy_context().run(_spawn)
+
     def _cancel_workspace_run_tasks(self, workspace_id: str) -> List["asyncio.Task"]:
         """Cancel every registered task for a workspace; return them to await."""
         current = asyncio.current_task()
@@ -485,7 +504,8 @@ class RunControlMixin:
             workspace_id = str(raw.get("workspaceId") or "").strip()
             if not workspace_id:
                 logger.error(
-                    "workspace_stop_request rejected — no workspaceId ({})", parse_err
+                    "workspace_stop_request rejected — no workspaceId ({})",
+                    validation_fields(parse_err),
                 )
                 return
             # A malformed stop still stops: this is the moment something is
@@ -494,7 +514,7 @@ class RunControlMixin:
                 "workspace_stop_request for {} failed validation ({}); applying it "
                 "with defaults",
                 workspace_id[:12],
-                parse_err,
+                validation_fields(parse_err),
             )
             payload = WorkspaceStopRequestPayload(
                 workspaceId=workspace_id, requestId=str(raw.get("requestId") or "")
@@ -559,10 +579,8 @@ class RunControlMixin:
 
         # 3. Cancel and settle.
         cancelled = self._cancel_workspace_run_tasks(workspace_id)
-        if self._pending_reemit_workspace_id == workspace_id:
-            # Otherwise the next reconnect replays this workspace's panels.
-            self._pending_reemit_workspace_id = None
-            self._pending_reemit_user_id = None
+        # Otherwise the next reconnect replays this workspace's panels.
+        self._pending_reemits.pop(workspace_id, None)
         unsettled = 0
         if cancelled:
             _, still_running = await asyncio.wait(

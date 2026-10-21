@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from app.utils.redact import validation_fields
+
 from app.socket.schemas import (
     TemplateSyncPayload,
     TemplateSyncResponsePayload,
@@ -59,7 +61,7 @@ class TemplateSyncMixin:
                 "template_sync: invalid payload (action={}, keys={}): {}",
                 (payload_in or {}).get("action"),
                 list((payload_in or {}).keys()),
-                e,
+                validation_fields(e),
             )
             return
 
@@ -312,7 +314,7 @@ class TemplateSyncMixin:
             logger.warning(
                 "template_sync_response: invalid payload (keys={}): {}",
                 list((payload_in or {}).keys()),
-                e,
+                validation_fields(e),
             )
             return
 

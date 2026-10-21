@@ -69,6 +69,10 @@ from app.vectorstore.qdrant import vector_store
 #: revoked purge and quietly stop retrying — leaving the data in place with
 #: nothing left to trigger another attempt. `_pending_purges` is instead
 #: cleared explicitly, only once the erase has actually succeeded.
+#:
+#: `_run_epochs` is the stop fence (an integer per workspace, no case data). The
+#: purge raises it before cancelling the case's running work; sweeping it would
+#: reset the case to epoch 0 and let a task that outlived the cancel emit again.
 _SWEEP_EXEMPT = frozenset(
     {
         "_handlers",
@@ -77,8 +81,14 @@ _SWEEP_EXEMPT = frozenset(
         "_pending_purges",
         "_purged_workspaces",
         "_seen_purge_requests",
+        "_run_epochs",
     }
 )
+
+#: How long the purge waits for the case's cancelled tasks to unwind before it
+#: deletes the data they read. They are fenced either way; this only keeps a
+#: task mid-await from touching storage after the delete.
+_PURGE_SETTLE_SECONDS = 10.0
 
 #: Backoff between purge attempts, in seconds. A purge that fails every one of
 #: these is escalated as a compliance incident rather than dropped.
@@ -386,6 +396,20 @@ class WorkspacePurgeMixin:
 
     # ---------------------------------------------------------------- erasure
 
+    async def _halt_workspace_work(self, workspace_id: str) -> None:
+        """Fence and cancel every task of the workspace's running update."""
+        self._run_epochs[workspace_id] = self._run_epoch(workspace_id) + 1
+        cancelled = self._cancel_workspace_run_tasks(workspace_id)
+        if not cancelled:
+            return
+        _, still_running = await asyncio.wait(cancelled, timeout=_PURGE_SETTLE_SECONDS)
+        logger.info(
+            "Purge cancelled {} running task(s) for workspace {} ({} still unwinding, fenced)",
+            len(cancelled),
+            workspace_id,
+            len(still_running),
+        )
+
     async def _purge_workspace(
         self,
         *,
@@ -410,16 +434,22 @@ class WorkspacePurgeMixin:
         # 1. Stop new state from being written for this workspace.
         block_workspace_persistence(workspace_id)
 
-        # 2. Drop in-memory caches and cancel per-workspace background work
+        # 2. Stop the case's running update the way a stop does: raise the
+        #    fence so nothing it started can emit a panel for an erased case,
+        #    then cancel its tasks. The memory sweep below only drops the task
+        #    registry; without this the tasks kept running on the client's data.
+        await self._halt_workspace_work(workspace_id)
+
+        # 3. Drop in-memory caches and cancel per-workspace background work
         #    before the durable delete, so nothing in flight rewrites Qdrant.
         cleared = self._clear_workspace_memory(workspace_id)
 
-        # 3. Qdrant + workspace context + local files. delete_workspace filters
+        # 4. Qdrant + workspace context + local files. delete_workspace filters
         #    on workspace_id alone, so it takes document chunks and every
         #    state-cache kind in one pass.
         await workspace_manager.delete_workspace(workspace_id)
 
-        # 4. Belt and braces: delete_workspace goes through the workspace
+        # 5. Belt and braces: delete_workspace goes through the workspace
         #    manager, which also clears context and disk. Re-running the vector
         #    delete directly costs one filtered call and closes the case where
         #    the manager short-circuits on a workspace it never loaded.
@@ -582,20 +612,19 @@ class WorkspacePurgeMixin:
 
         # Scalars pointing at this workspace: leaving them set would make the
         # reconnect re-emit path try to republish a purged workspace's panels.
-        if getattr(self, "_pending_reemit_workspace_id", None) == workspace_id:
-            self._pending_reemit_workspace_id = None
-            self._pending_reemit_user_id = None
+        if getattr(self, "_pending_reemits", {}).pop(workspace_id, None) is not None:
             removed += 1
         if getattr(self, "_last_workspace_id_with_chips", None) == workspace_id:
             self._last_workspace_id_with_chips = None
             removed += 1
-        pending_response = getattr(self, "_pending_ai_response", None)
-        if isinstance(pending_response, dict) and workspace_id in {
-            str(pending_response.get("workspaceId") or ""),
-            str(pending_response.get("workspace_id") or ""),
-        }:
-            self._pending_ai_response = None
-            removed += 1
+        pending_responses = getattr(self, "_pending_ai_responses", {})
+        for chat_key, pending_response in list(pending_responses.items()):
+            if isinstance(pending_response, dict) and workspace_id in {
+                str(pending_response.get("workspaceId") or ""),
+                str(pending_response.get("workspace_id") or ""),
+            }:
+                pending_responses.pop(chat_key, None)
+                removed += 1
 
         logger.debug(
             "Cleared {} in-memory entr(ies) for workspace {}", removed, workspace_id

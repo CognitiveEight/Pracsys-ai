@@ -690,7 +690,7 @@ class ChatMixin:
             self._intelligence_last_ai_by_chat[chat_id] = ai_response_payload[
                 "content"
             ]
-        # _pending_ai_response represents an emit that did NOT make it to BE
+        # _pending_ai_responses holds emits that did NOT make it to BE
         # and must be retried on the next reconnect. If we buffer the payload
         # unconditionally (the old behaviour) every disconnect/reconnect cycle
         # re-emits the last delivered message, producing duplicate drafts in
@@ -709,7 +709,7 @@ class ChatMixin:
         if emit_succeeded:
             # Drop any stale pending payload from a previous failed emit so
             # reconnect doesn't re-emit it after we just delivered fresh content.
-            self._pending_ai_response = None
+            self._pending_ai_responses.pop(str(chat_id), None)
             logger.success(
                 "Drafting ai_response emitted (status={}, version={})",
                 ai_response_payload.get("draftStatus"),
@@ -718,7 +718,7 @@ class ChatMixin:
         else:
             # Emit raised or socket was silently disconnected — keep the
             # payload buffered so on_connected can retry once we reconnect.
-            self._pending_ai_response = ai_response_payload
+            self._pending_ai_responses[str(chat_id)] = ai_response_payload
             logger.warning(
                 "Drafting ai_response not confirmed delivered — will retry on reconnect"
             )
@@ -1019,7 +1019,7 @@ class ChatMixin:
                             )
                             payload_dict = ai_response.dict(by_alias=True)
                             await self._socket_client.emit_ai_response(payload_dict)
-                            # Do NOT populate _pending_ai_response here — the
+                            # Do NOT populate _pending_ai_responses here — the
                             # role-confirmation ack does not need reconnect
                             # retry, and leaving a stale buffer here caused
                             # this acknowledgement to be re-emitted on the
@@ -2426,10 +2426,9 @@ class ChatMixin:
                             objective_ack_kind = "direct"
                             self._clear_pending_objective_change(workspace_id)
                             # Reconnect replay was unreachable for a chat-driven
-                            # change: _pending_reemit_workspace_id is armed only
+                            # change: the reconnect replay is armed only
                             # by workspace_created / transfer / analysis emit.
-                            self._pending_reemit_workspace_id = workspace_id
-                            self._pending_reemit_user_id = user_id
+                            self._arm_reconnect_reemit(workspace_id, user_id)
                             self._schedule_objective_change_reanalysis(
                                 workspace_id=workspace_id,
                                 user_id=user_id,
@@ -2696,8 +2695,7 @@ class ChatMixin:
                             )
                         if regen_ok:
                             self._clear_pending_objective_change(workspace_id)
-                            self._pending_reemit_workspace_id = workspace_id
-                            self._pending_reemit_user_id = user_id
+                            self._arm_reconnect_reemit(workspace_id, user_id)
                             self._schedule_objective_change_reanalysis(
                                 workspace_id=workspace_id,
                                 user_id=user_id,
@@ -2889,7 +2887,7 @@ class ChatMixin:
                 ),
             )
 
-            # STEP 6: Emit ai_response back to server. _pending_ai_response is
+            # STEP 6: Emit ai_response back to server. _pending_ai_responses is
             # the buffer that on_connected re-emits after a reconnect — we
             # populate it ONLY when the emit was not confirmed delivered, so a
             # successful emit does not get duplicated on the next disconnect
@@ -2905,11 +2903,12 @@ class ChatMixin:
                     )
                 except Exception as emit_err:
                     logger.error("Failed to emit ai_response: {}", emit_err)
+                pending_key = str(payload_dict.get("chatId") or chat_id or "")
                 if emit_succeeded:
-                    self._pending_ai_response = None
+                    self._pending_ai_responses.pop(pending_key, None)
                     logger.success("AI response sent successfully")
                 else:
-                    self._pending_ai_response = payload_dict
+                    self._pending_ai_responses[pending_key] = payload_dict
                     logger.warning(
                         "ai_response not confirmed delivered — will retry on reconnect"
                     )

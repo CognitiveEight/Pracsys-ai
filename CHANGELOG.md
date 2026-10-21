@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Long audio whose speakers collapsed was discarded (hotfix).** When
+  diarization collapsed a recording to one speaker, the whole call became one
+  segment, split into ~134 pieces that all went into one 8000-token
+  transliteration call, which the model could not answer (finish_reason
+  MAX_TOKENS); the failure threw away the finished transcript ("Audio
+  transcription crashed", readability 0%). Now pieces are sent 10 per call,
+  pieces already in Roman script are not re-sent, and a transliteration failure
+  keeps the Devanagari transcript instead of failing the document. On `main` the
+  crash itself was `response.text` raising outside a `try`; here the router
+  already returns an error sentinel for that. No payload change.
+- **Every audio transcription failed with `NameError` (SIM-29 regression).**
+  The model-portability refactor dropped the module-level
+  `_RESOLVED_CREDENTIALS_PATH` / `_CREDENTIALS_RESOLVED` declarations that
+  `_resolve_credentials_path` reads, so its first call raised before any
+  recognition ran. Restored. Offline coverage:
+  `tests/test_audio_transliteration.py`.
 - **Python 3.10: every failed model call crashed its panel.**
   `reraise_if_cancelled` (`app/llm/errors.py`) called `Task.cancelling()`,
   which exists only from Python 3.11; the staging VM runs 3.10, so a model

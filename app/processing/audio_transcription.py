@@ -343,6 +343,12 @@ def _generate_gemini_text(prompt: str, *, max_output_tokens: int = 128) -> Optio
     )
 
 
+# ── Project + credentials resolution ──────────────────────────────────────────
+# Cached so we resolve only once per process.
+_RESOLVED_CREDENTIALS_PATH: Optional[str] = None
+_CREDENTIALS_RESOLVED: bool = False
+
+
 def _candidate_base_dirs() -> list[str]:
     bases: list[str] = []
     cwd = os.getcwd()
@@ -2409,43 +2415,14 @@ def _split_long_utterance_for_translit(text: str, max_chars: int = _HINGLISH_MAX
     return [s]
 
 
-def _transliterate_one_batch_to_hinglish(
-    batch_texts: list[str],
+def _transliterate_piece_group(
+    expanded_texts: list[str],
     *,
     batch_label: str = "",
 ) -> Optional[list[Optional[str]]]:
-    """Single Gemini call that converts a batch of utterances from Devanagari
-    to Hinglish. Returns a list of strings the same length as ``batch_texts``
-    (may contain ``None`` for items where the model didn't emit a useful
-    string). Returns ``None`` on total failure (no data from Gemini AND no
-    salvage from JSON repair).
-
-    Long single utterances (multi-paragraph monologues) are split on sentence
-    boundaries before the Gemini call and re-joined after, so a single very
-    long turn never has to fit into one streaming response.
-    """
-    if not batch_texts:
-        return []
-
-    # Expand any over-long utterance into smaller sentence chunks. Keep a
-    # mapping from original index → range of expanded indices so we can
-    # rejoin the Hinglish parts after the call returns.
-    expanded_texts: list[str] = []
-    expansion_map: list[tuple[int, int]] = []  # (start_in_expanded, count)
-    for t in batch_texts:
-        parts = _split_long_utterance_for_translit(t or "")
-        if not parts:
-            parts = [(t or "").strip()]
-        expansion_map.append((len(expanded_texts), len(parts)))
-        expanded_texts.extend(parts)
-    expanded_was_split = len(expanded_texts) != len(batch_texts)
-    if expanded_was_split:
-        logger.info(
-            "Audio: Hinglish batch{} — expanded {} utterance(s) into {} "
-            "sentence-chunks (long-turn split)",
-            batch_label, len(batch_texts), len(expanded_texts),
-        )
-
+    """One model call (plus the terse retry) over at most
+    ``_HINGLISH_BATCH_SIZE`` pieces. Returns one entry per piece (``None``
+    where the model gave nothing), or ``None`` when nothing came back."""
     numbered = "\n".join(
         f"{i+1}. {(t or '').strip()}" for i, t in enumerate(expanded_texts)
     )
@@ -2535,15 +2512,81 @@ Utterances:
 
     if arr is None:
         return None
-
-    # Build the per-expanded-utterance result list, then collapse it back to
-    # one entry per original utterance by joining the consecutive parts of
-    # any utterance we split earlier.
-    expanded_out: list[Optional[str]] = [None] * len(expanded_texts)
+    out: list[Optional[str]] = [None] * len(expanded_texts)
     for i in range(min(len(arr), len(expanded_texts))):
         v = arr[i]
         if isinstance(v, str) and v.strip():
-            expanded_out[i] = v.strip()
+            out[i] = v.strip()
+    return out
+
+
+def _transliterate_one_batch_to_hinglish(
+    batch_texts: list[str],
+    *,
+    batch_label: str = "",
+) -> Optional[list[Optional[str]]]:
+    """Convert a batch of utterances from Devanagari to Hinglish, one Gemini
+    call per ``_HINGLISH_BATCH_SIZE`` pieces. Returns a list of strings the
+    same length as ``batch_texts`` (may contain ``None`` for items where the model didn't emit a useful
+    string). Returns ``None`` on total failure (no data from Gemini AND no
+    salvage from JSON repair).
+
+    Long single utterances (multi-paragraph monologues) are split on sentence
+    boundaries before the Gemini call and re-joined after, so a single very
+    long turn never has to fit into one streaming response.
+    """
+    if not batch_texts:
+        return []
+
+    # Expand any over-long utterance into smaller sentence chunks. Keep a
+    # mapping from original index → range of expanded indices so we can
+    # rejoin the Hinglish parts after the call returns.
+    expanded_texts: list[str] = []
+    expansion_map: list[tuple[int, int]] = []  # (start_in_expanded, count)
+    for t in batch_texts:
+        parts = _split_long_utterance_for_translit(t or "")
+        if not parts:
+            parts = [(t or "").strip()]
+        expansion_map.append((len(expanded_texts), len(parts)))
+        expanded_texts.extend(parts)
+    expanded_was_split = len(expanded_texts) != len(batch_texts)
+    if expanded_was_split:
+        logger.info(
+            "Audio: Hinglish batch{} — expanded {} utterance(s) into {} "
+            "sentence-chunks (long-turn split)",
+            batch_label, len(batch_texts), len(expanded_texts),
+        )
+
+    # Send the pieces in groups of _HINGLISH_BATCH_SIZE. The retry passes
+    # shrink the batch by SEGMENT, which cannot help when diarization collapsed
+    # a whole recording into one segment: all 134 pieces of an 87-minute call
+    # went into a single 8000-token call, which returned nothing every time.
+    # Pieces already in Roman script are kept as they are and not re-sent.
+    expanded_out: list[Optional[str]] = [
+        None if _has_devanagari(t) else ((t or "").strip() or None)
+        for t in expanded_texts
+    ]
+    todo = [i for i, t in enumerate(expanded_texts) if _has_devanagari(t)]
+    groups = [
+        todo[g:g + _HINGLISH_BATCH_SIZE]
+        for g in range(0, len(todo), _HINGLISH_BATCH_SIZE)
+    ]
+    any_group_ok = False
+    for gi, group in enumerate(groups, 1):
+        if gi > 1:
+            _raise_if_cancelled()
+        label = batch_label if len(groups) == 1 else f"{batch_label} group {gi}/{len(groups)}"
+        got = _transliterate_piece_group(
+            [expanded_texts[i] for i in group], batch_label=label
+        )
+        if got is None:
+            continue
+        any_group_ok = True
+        for i, v in zip(group, got):
+            if v is not None:
+                expanded_out[i] = v
+    if groups and not any_group_ok:
+        return None
 
     out: list[Optional[str]] = [None] * len(batch_texts)
     for orig_idx, (start, count) in enumerate(expansion_map):
@@ -3185,7 +3228,16 @@ def _sync_transcribe(
     original_had_devanagari = _has_devanagari(raw_transcript) or any(
         _has_devanagari(s.text or "") for s in segments
     )
-    segments = _transliterate_segments_to_hinglish(segments)
+    try:
+        segments = _transliterate_segments_to_hinglish(segments)
+    except TranscriptionCancelled:
+        raise
+    except Exception as exc:
+        # Cosmetic step over a finished, already-billed transcript: a failure
+        # keeps the Devanagari text instead of discarding the whole recording.
+        logger.opt(exception=exc).error(
+            "Audio: Hinglish transliteration failed; keeping the original script"
+        )
 
     formatted = _format_transcript_with_speakers(segments)
 

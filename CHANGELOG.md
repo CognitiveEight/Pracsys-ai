@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **SIM-113: AI service docs in the layered format (DR-0015).** `docs/features`,
+  `flows`, `architecture`, `contracts`, `runbooks`, `decisions` and `policies`,
+  written from the code, with `docs/README.md` as the index. They are published
+  read-only to PracSys Engineering as "… — AI service" pages;
+  `docs/.publish-map.json` maps each file to its page. No code or payload change.
+
 ### Fixed
 
 - **Long audio whose speakers collapsed was discarded (hotfix).** When

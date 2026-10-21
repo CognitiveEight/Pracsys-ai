@@ -9,13 +9,29 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from app.utils.redact import validation_fields
+from app.utils.redact import chars, validation_fields
 
 from app.socket.schemas import (
     TemplateSyncPayload,
     TemplateSyncResponsePayload,
 )
 
+
+
+#: The actions TemplateSyncPayload accepts; anything else is logged as its size.
+_KNOWN_ACTIONS = frozenset(
+    {"uploaded", "deleted", "renamed", "preset_created", "formatting_updated"}
+)
+
+
+def _safe_action(value: Any) -> str:
+    """An inbound ``action`` for a log line: the value if known, else its size."""
+    return value if value in _KNOWN_ACTIONS else chars(value)
+
+
+def _safe_count(value: Any) -> Any:
+    """An inbound ``count`` for a log line: an int as-is, anything else its size."""
+    return value if isinstance(value, int) else chars(value)
 
 
 class TemplateSyncMixin:
@@ -47,7 +63,7 @@ class TemplateSyncMixin:
         # so a malformed/unexpected payload is still visible in the logs.
         logger.info(
             "template_sync received: action={} userId={} templates={} keys={}",
-            (payload_in or {}).get("action"),
+            _safe_action((payload_in or {}).get("action")),
             str((payload_in or {}).get("userId") or "")[:12],
             len((payload_in or {}).get("templates") or [])
             if isinstance((payload_in or {}).get("templates"), list)
@@ -59,7 +75,7 @@ class TemplateSyncMixin:
         except Exception as e:
             logger.warning(
                 "template_sync: invalid payload (action={}, keys={}): {}",
-                (payload_in or {}).get("action"),
+                _safe_action((payload_in or {}).get("action")),
                 list((payload_in or {}).keys()),
                 validation_fields(e),
             )
@@ -305,7 +321,7 @@ class TemplateSyncMixin:
             "template_sync_response received: userId={} requestId={} count={} keys={}",
             str((payload_in or {}).get("userId") or "")[:12],
             (payload_in or {}).get("requestId"),
-            (payload_in or {}).get("count"),
+            _safe_count((payload_in or {}).get("count")),
             list((payload_in or {}).keys()),
         )
         try:

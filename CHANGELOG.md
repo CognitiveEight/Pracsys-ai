@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Long audio whose speakers collapsed was discarded (hotfix).** When
+  diarization collapsed a recording to one speaker, the whole call became one
+  segment, split into ~134 pieces that all went into one 8000-token
+  transliteration call. The model returned no Part (finish_reason MAX_TOKENS),
+  `response.text` raised `ValueError` outside the `try`, and the finished
+  transcript was thrown away ("Audio transcription crashed", readability 0%).
+  Now: the audio helpers read the text safely (`_response_text`), pieces are
+  sent 10 per call and pieces already in Roman script are not re-sent, and a
+  transliteration failure keeps the Devanagari transcript instead of failing
+  the document. No payload change. Offline coverage:
+  `tests/test_audio_transliteration.py`.
 - **Audio recordings over 20 minutes (hotfix).** Chirp 3 BatchRecognize rejects
   files longer than 20 minutes, so every long call paid for a doomed upload and
   then fell back to ~40 s Recognize chunks, whose speaker tags drift across

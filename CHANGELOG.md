@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A missing workspace role defaulted to ADJUDICATOR.** The lawyer app makes the
+  role mandatory and pre-selects PETITIONER, but 114 inline fallbacks turned a
+  missing or invalid role into a neutral judge's view. One constant
+  (`app/core/roles.py`, PETITIONER) now backs every fallback, with a warning.
+- **Deleting a case did not stop its running work.** The purge dropped the task
+  registry without cancelling the tasks, so panel generation kept running on an
+  erased case and could still emit. It now raises the stop fence and cancels
+  them first; the fence is no longer swept back to 0.
+- **Two background tasks escaped Stop and the purge**: the transfer re-emit and
+  the reconnect replay. Both are tracked and scoped to their workspace now.
+- **Payload values in logs.** Invalid-payload log lines printed the payload or a
+  pydantic error containing input values, and case-law uploads logged the file
+  name. `validation_fields()` (`app/utils/redact.py`) logs field paths only.
+- **Lost chat replies after a disconnect.** Undelivered replies were held in one
+  slot for the whole service and the re-send was skipped whenever a panel replay
+  was pending. They are now buffered per chat and always re-sent; cached panels
+  are replayed for every case active in the last 30 minutes, not only the last.
+  No socket payload change.
+
 - **Long audio whose speakers collapsed was discarded (hotfix).** When
   diarization collapsed a recording to one speaker, the whole call became one
   segment, split into ~134 pieces that all went into one 8000-token

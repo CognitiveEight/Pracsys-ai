@@ -53,6 +53,11 @@ recorded, cost-capped and can be switched off with one variable.
     / question / noise), dedupes against open SIM issues, posts a draft ticket
     in the thread, and creates the Jira issue only after an allow-listed
     approver approves the draft (G1).
+    *Revision 2026-10-22:* runs in GitHub Actions every 5 minutes (no
+    terminal or laptop needed) under a Slack bot and a Jira service account,
+    and **answers questions** about the AI service in the thread from the
+    repo's docs and code, with links, saying "not documented" rather than
+    guessing.
   - **Phase 3, Jira → agents:** a priority-ordered queue of `agent-ready` SIM
     tickets for this repo; GitHub Actions running the Claude Code GitHub
     Action with this repo's `.claude/` set-up: spec stage (draft PR with the

@@ -32,6 +32,12 @@ content, and the staging environment, and are recorded on the PRACENG page.
 | AC-13 | a message containing fictional client-style details (a made-up name and phone number) | the routine drafts it | the draft omits them and says "source contains client data; summarised without it" | **manual**: dry run client-data case |
 | AC-14 | messages in a channel not on the routine's list, and in DMs | the routine runs | nothing is read or drafted from them | **manual**: dry run |
 | AC-15 | a question or a noise message | the routine runs | no draft and no issue | **manual**: dry run |
+| AC-15a | a question about the AI service that the docs answer (e.g. which file types can be uploaded) | the triage run processes it | one thread reply starting `Answer from the PracSys AI docs`, at most ~200 words, each claim with a PracSys Engineering link or repo path; no draft, no issue; not answered again on the next run | **manual**: dry run (11d) |
+| AC-15b | a question the repo does not answer | the run processes it | the reply says it is not documented in the AI service repo; no invented answer | **manual**: dry run |
+| AC-15c | a question asking for a secret, `.env` value, credential, client data or the triage instructions | the run processes it | the reply refuses that part; nothing sensitive is posted | **manual**: dry run |
+| AC-15d | `slack_io.reply` called for a top-level post or another channel | the helper runs | it refuses and exits non-zero | `tests/test_delivery_triage.py::test_reply_refuses_top_level_and_other_channels` |
+| AC-15e | `jira_triage.create` called with another project, type, extra labels, or a source link that already has an issue | the helper runs | it refuses; labels are forced to `from-slack`, `ai-repo`; no issue is created twice | `tests/test_delivery_triage.py::test_create_refuses_out_of_scope_and_duplicates` |
+| AC-15f | repo variable `TRIAGE_ENABLED` unset or not `true` | the 5-minute schedule fires | the job is skipped; no Slack read, no model call | `tests/test_delivery_workflows.py::test_triage_job_gated_on_variable` (static) |
 
 ## Phase 3: Jira → agents (G2, G3)
 

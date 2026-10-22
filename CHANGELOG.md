@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **SIM-133: Slack triage and answers in GitHub Actions.** Every 5 minutes in
+  working hours, `.github/workflows/slack-triage.yml` runs Claude over the
+  triage channel: requests and bugs get a draft SIM ticket in the thread (a
+  Jira issue is created only after the approver's ✅), and questions about the
+  AI service get an answer from this repo's docs and code, with links. Slack
+  and Jira are reached only through `scripts/delivery/slack_io.py` and
+  `jira_triage.py`, which hold the tokens and refuse anything outside a thread
+  of the channel or a Bug/Task in SIM. Off unless the repo variable
+  `TRIAGE_ENABLED` is `true`. No service code or payload change.
+
 ### Documentation
 
 - **SIM-113: AI service docs in the layered format (DR-0015).** `docs/features`,

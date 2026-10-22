@@ -3,7 +3,8 @@
 - **Requirements:** `specs/requirements/SIM-71-automated-delivery-pipeline.md`
 - **Status:** draft (Phases 1, 3, 4); **Phase 2 approved** by the product
   owner on 2026-10-22, built under SIM-133; **Phase 2 revision (GitHub
-  Actions every 5 minutes, answers questions) awaiting approval**
+  Actions every 5 minutes, answers questions) approved** by the product owner
+  on 2026-10-22
 - **Approver:** tech lead (SimplerToday); admin for the identity, ruleset and
   GCP parts; product owner for the gate placement (already decided)
 

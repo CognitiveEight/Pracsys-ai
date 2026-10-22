@@ -1,7 +1,8 @@
 # SIM-71: Automated delivery pipeline — technical design
 
 - **Requirements:** `specs/requirements/SIM-71-automated-delivery-pipeline.md`
-- **Status:** draft
+- **Status:** draft (Phases 1, 3, 4); **Phase 2 approved** by the product
+  owner on 2026-10-22, built under SIM-133
 - **Approver:** tech lead (SimplerToday); admin for the identity, ruleset and
   GCP parts; product owner for the gate placement (already decided)
 
@@ -156,8 +157,10 @@ agent):
   links automatically.
 
 ### Phase 2: Slack → Jira triage routine
-Runs in Claude's cloud on a schedule (proposed: every 30 minutes, working
-hours), not on git events. Instructions live in
+Runs in Claude's cloud on a schedule: hourly, Mon–Sat 09:00–20:00 IST
+(cron `30 3-14 * * 1-6` UTC; one hour is the platform's shortest interval),
+not on git events. All state lives in the Slack threads (marker lines), since
+every run starts with no memory. Instructions live in
 `docs/delivery/slack-triage-routine.md`, so changes are reviewed. Each run:
 
 1. **Read**: new top-level messages and thread replies since the last run, in

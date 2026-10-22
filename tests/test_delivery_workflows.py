@@ -56,3 +56,11 @@ def test_checkout_does_not_keep_credentials():
     doc, _ = _load()
     checkout = doc["jobs"]["triage"]["steps"][0]
     assert checkout["with"]["persist-credentials"] is False
+
+
+def test_action_uses_the_read_only_job_token_not_oidc():
+    doc, _ = _load()
+    step = next(s for s in doc["jobs"]["triage"]["steps"] if "claude-code-action" in s["uses"])
+    assert step["with"]["github_token"] == "${{ github.token }}"
+    assert "id-token" not in doc["permissions"]
+    assert doc["permissions"] == {"contents": "read"}

@@ -44,6 +44,7 @@ from app.socket.event_utils import (
     _ANNEXURE_REF_RE,
     _roman_or_int,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 # Edit verbs recognised by the cheap panel-edit precheck in
@@ -508,13 +509,13 @@ class ChatMixin:
 
         # Resolve role from workspace context (same logic as the main chat
         # path, but minimised because drafting is role-aware not gated).
-        role = "ADJUDICATOR"
+        role = DEFAULT_WORKSPACE_ROLE
         try:
             from app.workspace.manager import workspace_manager
 
             ctx = workspace_manager.get_workspace(workspace_id)
             if ctx and getattr(ctx, "workspace_role", None):
-                role = (ctx.workspace_role or "ADJUDICATOR").upper()
+                role = (ctx.workspace_role or DEFAULT_WORKSPACE_ROLE).upper()
         except Exception:
             pass
         cached_role = await self._restore_workspace_role(
@@ -689,7 +690,7 @@ class ChatMixin:
             self._intelligence_last_ai_by_chat[chat_id] = ai_response_payload[
                 "content"
             ]
-        # _pending_ai_response represents an emit that did NOT make it to BE
+        # _pending_ai_responses holds emits that did NOT make it to BE
         # and must be retried on the next reconnect. If we buffer the payload
         # unconditionally (the old behaviour) every disconnect/reconnect cycle
         # re-emits the last delivered message, producing duplicate drafts in
@@ -708,7 +709,7 @@ class ChatMixin:
         if emit_succeeded:
             # Drop any stale pending payload from a previous failed emit so
             # reconnect doesn't re-emit it after we just delivered fresh content.
-            self._pending_ai_response = None
+            self._pending_ai_responses.pop(str(chat_id), None)
             logger.success(
                 "Drafting ai_response emitted (status={}, version={})",
                 ai_response_payload.get("draftStatus"),
@@ -717,7 +718,7 @@ class ChatMixin:
         else:
             # Emit raised or socket was silently disconnected — keep the
             # payload buffered so on_connected can retry once we reconnect.
-            self._pending_ai_response = ai_response_payload
+            self._pending_ai_responses[str(chat_id)] = ai_response_payload
             logger.warning(
                 "Drafting ai_response not confirmed delivered — will retry on reconnect"
             )
@@ -836,7 +837,7 @@ class ChatMixin:
                 return
 
             role_context = {
-                "role": "ADJUDICATOR",
+                "role": DEFAULT_WORKSPACE_ROLE,
                 "workspace_id": workspace_id,
                 "user_id": user_id,
             }
@@ -861,14 +862,14 @@ class ChatMixin:
 
                 ctx = workspace_manager.get_workspace(workspace_id)
                 if ctx:
-                    workspace_role = (ctx.workspace_role or "ADJUDICATOR").upper()
+                    workspace_role = (ctx.workspace_role or DEFAULT_WORKSPACE_ROLE).upper()
                     if workspace_role not in (
                         "ADJUDICATOR",
                         "PETITIONER",
                         "RESPONDENT",
                         "MEDIATOR",
                     ):
-                        workspace_role = "ADJUDICATOR"
+                        workspace_role = DEFAULT_WORKSPACE_ROLE
                     role_context["role"] = workspace_role
                     await self._remember_workspace_role(
                         workspace_id, user_id, workspace_role, chat_id=chat_id
@@ -936,7 +937,7 @@ class ChatMixin:
             ):
                 workspace_state["role_selected"] = True
                 role_context["role"] = (
-                    (role_context.get("role") or "ADJUDICATOR").strip().upper()
+                    (role_context.get("role") or DEFAULT_WORKSPACE_ROLE).strip().upper()
                 )
                 logger.warning(
                     "Role not found for workspace {} with existing documents; bypassing gate with role={}",
@@ -1018,7 +1019,7 @@ class ChatMixin:
                             )
                             payload_dict = ai_response.dict(by_alias=True)
                             await self._socket_client.emit_ai_response(payload_dict)
-                            # Do NOT populate _pending_ai_response here — the
+                            # Do NOT populate _pending_ai_responses here — the
                             # role-confirmation ack does not need reconnect
                             # retry, and leaving a stale buffer here caused
                             # this acknowledgement to be re-emitted on the
@@ -1524,7 +1525,7 @@ class ChatMixin:
                             and (classification.get("reassignParty") or "").strip()
                         ):
                             _ws_role = (
-                                role_context.get("role") or "ADJUDICATOR"
+                                role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                             ).strip().upper()
                             _reassign_role = (
                                 classification.get("reassignRole") or ""
@@ -1845,7 +1846,7 @@ class ChatMixin:
                                 workspace_id=workspace_id,
                                 user_id=user_id,
                                 workspace_role=(
-                                    role_context.get("role") or "ADJUDICATOR"
+                                    role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                 ),
                                 user_feedback=so_slot["instruction"],
                                 current_strategy=cur_strat_for_edit,
@@ -1899,7 +1900,7 @@ class ChatMixin:
                                     workspace_id=workspace_id,
                                     user_id=user_id,
                                     workspace_role=(
-                                        role_context.get("role") or "ADJUDICATOR"
+                                        role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                     ),
                                     user_feedback=_combined_instr,
                                     current_strategy=cur_strat_for_edit,
@@ -1933,7 +1934,7 @@ class ChatMixin:
                                 workspace_id=workspace_id,
                                 user_id=user_id,
                                 workspace_role=(
-                                    role_context.get("role") or "ADJUDICATOR"
+                                    role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                 ),
                                 user_feedback=ns_slot["instruction"],
                                 current_strategy=cur_strat_for_edit,
@@ -1971,7 +1972,7 @@ class ChatMixin:
                                     workspace_id=workspace_id,
                                     user_id=user_id,
                                     workspace_role=(
-                                        role_context.get("role") or "ADJUDICATOR"
+                                        role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                     ),
                                     user_feedback=ar_slot["instruction"],
                                     current_report=cur_report_for_edit,
@@ -2005,7 +2006,7 @@ class ChatMixin:
                                 workspace_id=workspace_id,
                                 user_id=user_id,
                                 workspace_role=(
-                                    role_context.get("role") or "ADJUDICATOR"
+                                    role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                 ),
                                 user_feedback=lod_slot["instruction"],
                                 outcome=_o,
@@ -2037,7 +2038,7 @@ class ChatMixin:
                                 workspace_id=workspace_id,
                                 user_id=user_id,
                                 workspace_role=(
-                                    role_context.get("role") or "ADJUDICATOR"
+                                    role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                 ),
                                 user_feedback=_rename_instr,
                                 outcome=_o,
@@ -2055,7 +2056,7 @@ class ChatMixin:
                                 workspace_id=workspace_id,
                                 user_id=user_id,
                                 workspace_role=(
-                                    role_context.get("role") or "ADJUDICATOR"
+                                    role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                 ),
                                 user_feedback=_rename_instr,
                                 outcome=_o,
@@ -2259,7 +2260,7 @@ class ChatMixin:
                         )
                         instr = await self._summarize_objective_instruction_from_thread(
                             thread_txt,
-                            (role_context.get("role") or "ADJUDICATOR"),
+                            (role_context.get("role") or DEFAULT_WORKSPACE_ROLE),
                         )
                         cur_strat = self._workspace_strategy_payload.get(workspace_id)
                         if (
@@ -2279,7 +2280,7 @@ class ChatMixin:
                                     workspace_id=workspace_id,
                                     user_id=user_id,
                                     workspace_role=(
-                                        role_context.get("role") or "ADJUDICATOR"
+                                        role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                     ),
                                     user_objective_instruction=instr,
                                     current_strategy=cur_strat,
@@ -2307,7 +2308,7 @@ class ChatMixin:
                                     list(OBJECTIVE_CHANGE_REFRESH_FEATURES),
                                     reason="objective_followup_regen_failed",
                                     workspace_role=(
-                                        role_context.get("role") or "ADJUDICATOR"
+                                        role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                     ),
                                 )
                                 objective_regen_ok = True
@@ -2398,7 +2399,7 @@ class ChatMixin:
                     if isinstance(cur_strat, dict) and (
                         cur_strat.get("caseSummary") or ""
                     ).strip():
-                        _obj_role = role_context.get("role") or "ADJUDICATOR"
+                        _obj_role = role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                         await self._emit_workspace_refresh(
                             workspace_id=workspace_id,
                             user_id=user_id,
@@ -2425,10 +2426,9 @@ class ChatMixin:
                             objective_ack_kind = "direct"
                             self._clear_pending_objective_change(workspace_id)
                             # Reconnect replay was unreachable for a chat-driven
-                            # change: _pending_reemit_workspace_id is armed only
+                            # change: the reconnect replay is armed only
                             # by workspace_created / transfer / analysis emit.
-                            self._pending_reemit_workspace_id = workspace_id
-                            self._pending_reemit_user_id = user_id
+                            self._arm_reconnect_reemit(workspace_id, user_id)
                             self._schedule_objective_change_reanalysis(
                                 workspace_id=workspace_id,
                                 user_id=user_id,
@@ -2666,7 +2666,7 @@ class ChatMixin:
                     if isinstance(cur_strat, dict) and (
                         cur_strat.get("caseSummary") or ""
                     ).strip():
-                        _promoted_role = role_context.get("role") or "ADJUDICATOR"
+                        _promoted_role = role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                         await self._emit_workspace_refresh(
                             workspace_id=workspace_id,
                             user_id=user_id,
@@ -2695,8 +2695,7 @@ class ChatMixin:
                             )
                         if regen_ok:
                             self._clear_pending_objective_change(workspace_id)
-                            self._pending_reemit_workspace_id = workspace_id
-                            self._pending_reemit_user_id = user_id
+                            self._arm_reconnect_reemit(workspace_id, user_id)
                             self._schedule_objective_change_reanalysis(
                                 workspace_id=workspace_id,
                                 user_id=user_id,
@@ -2825,7 +2824,7 @@ class ChatMixin:
                     # Generate 10-12 contextual chips, store for this workspace; send random 4 in response (backend polls every few sec and we return random 4 each time)
                     suggestion_chips_for_payload = []
                     try:
-                        role_for_chips = (role_context.get("role") or "ADJUDICATOR").upper()
+                        role_for_chips = (role_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
                         generated = await self._generate_contextual_suggestion_chips(
                             workspace_id=workspace_id,
                             role=role_for_chips,
@@ -2888,7 +2887,7 @@ class ChatMixin:
                 ),
             )
 
-            # STEP 6: Emit ai_response back to server. _pending_ai_response is
+            # STEP 6: Emit ai_response back to server. _pending_ai_responses is
             # the buffer that on_connected re-emits after a reconnect — we
             # populate it ONLY when the emit was not confirmed delivered, so a
             # successful emit does not get duplicated on the next disconnect
@@ -2904,18 +2903,19 @@ class ChatMixin:
                     )
                 except Exception as emit_err:
                     logger.error("Failed to emit ai_response: {}", emit_err)
+                pending_key = str(payload_dict.get("chatId") or chat_id or "")
                 if emit_succeeded:
-                    self._pending_ai_response = None
+                    self._pending_ai_responses.pop(pending_key, None)
                     logger.success("AI response sent successfully")
                 else:
-                    self._pending_ai_response = payload_dict
+                    self._pending_ai_responses[pending_key] = payload_dict
                     logger.warning(
                         "ai_response not confirmed delivered — will retry on reconnect"
                     )
                 await self._remember_workspace_role(
                     workspace_id,
                     user_id,
-                    (role_context.get("role") or "ADJUDICATOR"),
+                    (role_context.get("role") or DEFAULT_WORKSPACE_ROLE),
                     chat_id=chat_id,
                 )
                 # Cache assistant text for follow-ups like "yes" when conversation_history is incomplete
@@ -3125,11 +3125,11 @@ class ChatMixin:
                         or last_ai
                         or (conv_history and len(conv_history) >= 2)
                     ):
-                        role = "ADJUDICATOR"
+                        role = DEFAULT_WORKSPACE_ROLE
                         try:
                             ctx = workspace_manager.get_workspace(workspace_id)
                             if ctx and ctx.workspace_role:
-                                role = (ctx.workspace_role or "ADJUDICATOR").upper()
+                                role = (ctx.workspace_role or DEFAULT_WORKSPACE_ROLE).upper()
                         except Exception:
                             pass
                         if last_user or last_ai:
@@ -3188,11 +3188,11 @@ class ChatMixin:
                                 or []
                             )
                         if not chips:
-                            role = "ADJUDICATOR"
+                            role = DEFAULT_WORKSPACE_ROLE
                             try:
                                 ctx = workspace_manager.get_workspace(workspace_id)
                                 if ctx and ctx.workspace_role:
-                                    role = (ctx.workspace_role or "ADJUDICATOR").upper()
+                                    role = (ctx.workspace_role or DEFAULT_WORKSPACE_ROLE).upper()
                             except Exception:
                                 pass
                             chips = self._fallback_chips_for_role(role, 16)

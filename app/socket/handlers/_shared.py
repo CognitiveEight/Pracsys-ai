@@ -16,6 +16,7 @@ from app.socket.event_utils import (
     _normalize_match_text,
     drafting_payload_to_wire,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 class JsonHelpersMixin:
@@ -298,7 +299,7 @@ class JsonHelpersMixin:
             return []
         already = {str(f) for f in (skip or set())}
         released: List[str] = []
-        role = (workspace_role or "ADJUDICATOR").strip().upper() or "ADJUDICATOR"
+        role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper() or DEFAULT_WORKSPACE_ROLE
 
         for feature in feature_types:
             if not feature or feature in already:

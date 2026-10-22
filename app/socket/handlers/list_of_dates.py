@@ -39,6 +39,7 @@ from app.prompts.list_of_dates_prompts import (
     reeval_list_of_dates_relevance_prompt,
     generate_list_of_dates_from_documents_prompt,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 class ListOfDatesMixin:
@@ -77,9 +78,9 @@ class ListOfDatesMixin:
             if not instruction:
                 return False
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             current_json = json.dumps(current, ensure_ascii=True)
             prompt = regenerate_list_of_dates_with_feedback_prompt(current_json=current_json, instruction=instruction)
@@ -178,9 +179,9 @@ class ListOfDatesMixin:
             if not obj:
                 return False
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             current_json = json.dumps(current, ensure_ascii=True)
             prompt = reeval_list_of_dates_relevance_prompt(current_json=current_json, obj=obj)

@@ -35,6 +35,7 @@ from app.prompts.applicable_laws_prompts import (
     regenerate_applicable_laws_with_feedback_prompt,
     generate_applicable_laws_from_sources_prompt,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 class ApplicableLawsMixin:
@@ -72,9 +73,9 @@ class ApplicableLawsMixin:
             if not instruction:
                 return False
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             current_json = json.dumps(current, ensure_ascii=True)
             prompt = regenerate_applicable_laws_with_feedback_prompt(current_json=current_json, instruction=instruction)
@@ -660,7 +661,7 @@ class ApplicableLawsMixin:
         them — used on an objective change so stale laws from the old perspective
         are dropped.
         """
-        role = (workspace_role or "ADJUDICATOR").strip().upper()
+        role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
         logger.info(
             "Applicable laws: generation started for workspace {}",
             workspace_id[:12] if workspace_id else "",

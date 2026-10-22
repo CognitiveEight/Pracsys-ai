@@ -11,7 +11,9 @@ paired with a terminal emit", "Stop is a fence", "Workspace sharing".
 - New event or payload: a mixin in `app/socket/handlers/` plus a schema in
   `app/socket/schemas.py`. Payload changes are additive; anything else needs
   a CHANGELOG entry and a linked backend/frontend ticket.
-- Nothing downstream runs without a validated role (role gate).
+- Every panel runs for a validated role; resolve it with `_resolve_workspace_role`
+  and fall back only to `DEFAULT_WORKSPACE_ROLE` (`app/core/roles.py`), never a
+  literal role.
 - Long work: `_track_background_task`, never a bare `asyncio.create_task`.
   Cache the result and re-emit it on reconnect.
 - Catch `asyncio.CancelledError` before `except Exception`, log, re-raise.

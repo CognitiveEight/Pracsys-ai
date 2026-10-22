@@ -11,6 +11,7 @@ from app.ai.usage import current_usage, meter_usage
 from app.search.case_law_finder import (
     find_case_law_sources,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 
@@ -73,7 +74,7 @@ class PanelEditsMixin:
         except Exception as e:  # pragma: no cover - best-effort
             logger.debug("add_case_law: hydration failed (workspace={}): {}", workspace_id, e)
 
-        role = (workspace_role or "ADJUDICATOR").strip().upper()
+        role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
 
         # Resolve candidate source rows.
         research_notes = ""

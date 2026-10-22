@@ -33,6 +33,7 @@ from app.prompts.objective_change_prompts import (
     merge_applicable_laws_with_previous_prompt,
     llm_resolve_answered_missing_info_prompt,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 class ObjectiveChangeMixin:
@@ -177,7 +178,7 @@ class ObjectiveChangeMixin:
             attempts = int(existing.get("attempts") or 0)
             marker: Dict[str, Any] = {
                 "userId": user_id,
-                "workspaceRole": (workspace_role or "ADJUDICATOR").strip().upper(),
+                "workspaceRole": (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper(),
                 "instruction": instruction,
                 "featureTypes": list(OBJECTIVE_CHANGE_REFRESH_FEATURES),
                 "attempts": attempts,
@@ -344,7 +345,7 @@ class ObjectiveChangeMixin:
                 OBJECTIVE_CHANGE_REFRESH_FEATURES
             )
             user_id = str(marker.get("userId") or "")
-            role = str(marker.get("workspaceRole") or "ADJUDICATOR")
+            role = str(marker.get("workspaceRole") or DEFAULT_WORKSPACE_ROLE)
 
             if attempts >= 1 or age > self._OBJECTIVE_RESUME_MAX_AGE_SECONDS:
                 logger.warning(
@@ -431,8 +432,7 @@ class ObjectiveChangeMixin:
             if ok:
                 resumed += 1
                 self._clear_pending_objective_change(workspace_id)
-                self._pending_reemit_workspace_id = workspace_id
-                self._pending_reemit_user_id = user_id
+                self._arm_reconnect_reemit(workspace_id, user_id)
                 self._schedule_objective_change_reanalysis(
                     workspace_id=workspace_id,
                     user_id=user_id,
@@ -2057,7 +2057,7 @@ class ObjectiveChangeMixin:
             _u_obj_analysis = None
         if not (isinstance(new_analysis, dict) and new_analysis):
             new_analysis = self._analysis_report_fallback(
-                (workspace_role or "ADJUDICATOR").strip().upper()
+                (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             )
 
         # The quality score measures readiness FOR AN OBJECTIVE, so when the
@@ -2379,7 +2379,7 @@ class ObjectiveChangeMixin:
         ctx = log_context or " (objective change)"
 
         # Resolve role with safe fallbacks so regeneration is always attempted.
-        role = "ADJUDICATOR"
+        role = DEFAULT_WORKSPACE_ROLE
         try:
             strategy_payload = self._workspace_strategy_payload.get(workspace_id) or {}
             candidate_role = (strategy_payload.get("role") or "").strip().upper()
@@ -2661,7 +2661,7 @@ class ObjectiveChangeMixin:
             )
             if not analysis_report:
                 analysis_report = self._analysis_report_fallback(
-                    (workspace_role or "ADJUDICATOR").strip().upper()
+                    (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
                 )
         except Exception as e:
             logger.warning(
@@ -2670,7 +2670,7 @@ class ObjectiveChangeMixin:
                 e,
             )
             analysis_report = self._analysis_report_fallback(
-                (workspace_role or "ADJUDICATOR").strip().upper()
+                (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             )
         # Tag the fresh report's text sections against the frontend's
         # currentState so each item carries {id, text, isMatched}: items that
@@ -2700,8 +2700,7 @@ class ObjectiveChangeMixin:
         # pipeline lock, which is what actually prevents the interleaving.
         # Cache and set pending re-emit before emit so re-emit on reconnect has data if emit fails
         self._workspace_analysis_payload[workspace_id] = analysis_report
-        self._pending_reemit_workspace_id = workspace_id
-        self._pending_reemit_user_id = user_id
+        self._arm_reconnect_reemit(workspace_id, user_id)
         await self._emit_document_feature(
             feature_type="analysis_report",
             workspace_id=workspace_id,
@@ -2714,7 +2713,7 @@ class ObjectiveChangeMixin:
         await asyncio.sleep(0.15)
         # Generate and cache 15-16 suggestion chips for Analysis Report (probing_prompts_request with chatType ANALYSIS_REPORT)
         try:
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             analysis_chips = await self._generate_analysis_report_suggestion_chips(
                 workspace_id=workspace_id,
                 report=analysis_report,
@@ -2776,7 +2775,7 @@ class ObjectiveChangeMixin:
             )
             if not analysis_report:
                 analysis_report = self._analysis_report_fallback(
-                    (workspace_role or "ADJUDICATOR").strip().upper()
+                    (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
                 )
             # Tag the fresh report against the frontend's currentState so items
             # carry {id, text, isMatched} (matched → prior id; new → minted id;
@@ -2813,7 +2812,7 @@ class ObjectiveChangeMixin:
             )
             try:
                 fallback = self._analysis_report_fallback(
-                    (workspace_role or "ADJUDICATOR").strip().upper()
+                    (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
                 )
                 if self._socket_client:
                     await self._emit_document_feature(

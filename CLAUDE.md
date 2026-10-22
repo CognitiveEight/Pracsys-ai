@@ -76,7 +76,9 @@ The system is a multi-agent pipeline gated by a role agent and triggered by sock
 
 ### The role gate is non-bypassable
 
-`app/langgraph/role_agent.py` is the root agent. **Without a validated role (ADJUDICATOR / PETITIONER / RESPONDENT / MEDIATOR), no downstream agent runs** — workspace init calls `workspace_role_integration.initialize_workspace_with_role(...)` first, and role changes invalidate all derived intelligence. When adding a new agent or feature, gate it through this state and don't smuggle role-dependent logic past it.
+`app/langgraph/role_agent.py` is the root agent. Every panel and chat turn is produced for one validated role (ADJUDICATOR / PETITIONER / RESPONDENT / MEDIATOR) — workspace init calls `workspace_role_integration.initialize_workspace_with_role(...)` first, and role changes invalidate all derived intelligence. When adding a new agent or feature, gate it through this state and don't smuggle role-dependent logic past it.
+
+The role is a **mandatory field in the lawyer app, pre-selected as PETITIONER**, so the service does not block on a missing role. A missing or invalid role falls back to `DEFAULT_WORKSPACE_ROLE` (`app/core/roles.py`, PETITIONER, the app's own default) and logs a warning, because it means the role was lost upstream. Resolve a role with `_resolve_workspace_role` (payload → persisted cache → context → default); never type a literal role as a fallback — use the constant.
 
 ### Two strategy paths exist — know which one runs
 

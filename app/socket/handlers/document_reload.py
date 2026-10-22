@@ -52,6 +52,7 @@ from app.observability.audit import audit_logger
 from app.processing.document_processor import document_processor
 from app.socket.schemas import DocumentReloadRequestPayload
 from app.workspace.participants import set_participants
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 #: How long a COMPLETED reload request stays de-duplicated. A re-send inside
 #: this window is the backend's reconnect cover for a request it already got an
@@ -731,7 +732,7 @@ class DocumentReloadMixin:
                 )
             if not analysis_report or not isinstance(analysis_report, dict):
                 analysis_report = self._analysis_report_fallback(
-                    (workspace_role or "ADJUDICATOR").strip().upper()
+                    (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
                 )
             # Tag against the echoed currentState: items the lawyer approved or
             # rejected keep their ids (isMatched=True) and only genuinely new

@@ -25,6 +25,7 @@ from app.socket.event_utils import (
 from app.prompts.procedural_timeline_prompts import (
     regenerate_procedural_timeline_with_feedback_prompt,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 class ProceduralTimelineMixin:
@@ -60,9 +61,9 @@ class ProceduralTimelineMixin:
             if not instruction:
                 return False
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             current_json = json.dumps(current, ensure_ascii=True)
             prompt = regenerate_procedural_timeline_with_feedback_prompt(current_json=current_json, instruction=instruction)

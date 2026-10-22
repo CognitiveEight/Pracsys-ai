@@ -11,6 +11,7 @@ from loguru import logger
 
 from app.socket.schemas import EvidenceFile, WorkspaceData
 from app.workspace.persistence import CacheKinds, persist_state
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 class _DictAttrShim:
@@ -514,7 +515,7 @@ class ContextManager:
                 context.status = status
             if workspace_role is not None:
                 context.workspace_role = (
-                    (workspace_role or "ADJUDICATOR").strip().upper()
+                    (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
                 )
                 if context.workspace_role not in (
                     "ADJUDICATOR",
@@ -522,7 +523,7 @@ class ContextManager:
                     "RESPONDENT",
                     "MEDIATOR",
                 ):
-                    context.workspace_role = "ADJUDICATOR"
+                    context.workspace_role = DEFAULT_WORKSPACE_ROLE
             if evidence_files is not None:
                 context.evidence_files = list(evidence_files)
             if updated_at is not None:
@@ -534,9 +535,9 @@ class ContextManager:
             )
             context._persist_meta()
             return context
-        role = (workspace_role or "ADJUDICATOR").strip().upper()
+        role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
         if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-            role = "ADJUDICATOR"
+            role = DEFAULT_WORKSPACE_ROLE
         context = WorkspaceContext(
             workspace_id=workspace_id,
             user_id=user_id,
@@ -603,10 +604,10 @@ class ContextManager:
             return existing
 
         cached_role = (
-            (cached.get("workspace_role") or "ADJUDICATOR").strip().upper()
+            (cached.get("workspace_role") or DEFAULT_WORKSPACE_ROLE).strip().upper()
         )
         if cached_role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-            cached_role = "ADJUDICATOR"
+            cached_role = DEFAULT_WORKSPACE_ROLE
         try:
             created_at = datetime.fromisoformat(str(cached.get("created_at")))
         except Exception:

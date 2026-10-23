@@ -70,6 +70,7 @@ def slack(monkeypatch):
 @pytest.fixture
 def jira(monkeypatch):
     mod = _load("jira_triage")
+    monkeypatch.setenv("JIRA_COMPONENT_FIELD", "customfield_10075")
     monkeypatch.setenv("JIRA_EMAIL", "bot@example.test")
     monkeypatch.setenv("JIRA_API_TOKEN", "token-test")
     state = {"existing": [], "calls": []}
@@ -151,23 +152,23 @@ def test_create_refuses_out_of_scope_and_duplicates(jira):
     mod, state = jira
     link = "https://example-team.slack.com/archives/C0TEST0001/p1792600200000002"
     with pytest.raises(mod.TriageRefused):
-        mod.create(issue_type="Epic", summary="x", priority="P2", source_link=link, description="d")
+        mod.create(component="AI", issue_type="Epic", summary="x", priority="P2", source_link=link, description="d")
     with pytest.raises(mod.TriageRefused):
-        mod.create(issue_type="Bug", summary="x", priority="P9", source_link=link, description="d")
+        mod.create(component="AI", issue_type="Bug", summary="x", priority="P9", source_link=link, description="d")
     with pytest.raises(mod.TriageRefused):
-        mod.create(issue_type="Bug", summary="x", priority="P2", source_link="https://elsewhere.test/x", description="d")
+        mod.create(component="AI", issue_type="Bug", summary="x", priority="P2", source_link="https://elsewhere.test/x", description="d")
     with pytest.raises(mod.TriageRefused):
-        mod.create(issue_type="Bug", summary=" ", priority="P2", source_link=link, description="d")
+        mod.create(component="AI", issue_type="Bug", summary=" ", priority="P2", source_link=link, description="d")
 
     state["existing"] = [{"key": "SIM-5", "fields": {"summary": "already there"}}]
-    assert mod.create(issue_type="Bug", summary="x", priority="P2", source_link=link, description="d") == {
+    assert mod.create(component="AI", issue_type="Bug", summary="x", priority="P2", source_link=link, description="d") == {
         "key": "SIM-5",
         "created": False,
     }
     assert not [c for c in state["calls"] if c[1] == "/rest/api/2/issue"]
 
     state["existing"] = []
-    out = mod.create(issue_type="Task", summary="Export case laws", priority="P3", source_link=link, description="Problem")
+    out = mod.create(component="AI", issue_type="Task", summary="Export case laws", priority="P3", source_link=link, description="Problem")
     assert out == {"key": "SIM-999", "created": True}
     _, _, body = state["calls"][-1]
     fields = body["fields"]
@@ -175,6 +176,7 @@ def test_create_refuses_out_of_scope_and_duplicates(jira):
     assert fields["issuetype"] == {"name": "Task"}
     assert fields["priority"] == {"name": "Medium"}
     assert sorted(fields["labels"]) == ["ai-repo", "from-slack"]
+    assert fields["customfield_10075"] == {"value": "AI"}
     assert fields["description"].rstrip().endswith(f"Source: {link}")
 
 
@@ -189,8 +191,67 @@ def test_jira_cli_create_reads_description_from_stdin(jira, monkeypatch, capsys)
     mod, state = jira
     monkeypatch.setattr("sys.stdin", io.StringIO("Problem: dates missing"))
     rc = mod.main([
-        "create", "--type", "Bug", "--summary", "Dates missing", "--priority", "P2",
+        "create", "--component", "FE", "--type", "Bug", "--summary", "Dates missing", "--priority", "P2",
         "--source-link", "https://example-team.slack.com/archives/C0TEST0001/p1792600200000002",
     ])
     assert rc == 0
     assert json.loads(capsys.readouterr().out)["key"] == "SIM-999"
+
+
+def test_create_component_and_labels(jira):
+    mod, state = jira
+    link = "https://example-team.slack.com/archives/C0TEST0001/p1792600200000002"
+    with pytest.raises(mod.TriageRefused):
+        mod.create(component="Marketing", issue_type="Bug", summary="x", priority="P2", source_link=link, description="d")
+    expected = {"AI": "ai-repo", "BE": "be-repo", "FE": "fe-repo", "Admin": "admin-repo", "DevOps": "devops", "QA": "qa"}
+    for component, label in expected.items():
+        mod.create(component=component, issue_type="Task", summary="x", priority="P3", source_link=link, description="d")
+        fields = state["calls"][-1][2]["fields"]
+        assert fields["customfield_10075"] == {"value": component}
+        assert sorted(fields["labels"]) == sorted(["from-slack", label])
+
+
+# ---------------------------------------------------------------- Confluence
+
+
+@pytest.fixture
+def confluence(monkeypatch):
+    mod = _load("confluence_docs")
+    monkeypatch.setenv("JIRA_EMAIL", "bot@example.test")
+    monkeypatch.setenv("JIRA_API_TOKEN", "token-test")
+    calls = []
+
+    def fake_request(path, params):
+        calls.append((path, params))
+        if path == "/wiki/rest/api/search":
+            return {"results": [{
+                "content": {"id": "4489221", "title": "Sharing, transfer and revoking access"},
+                "excerpt": "Lawyers can share a case",
+                "resultGlobalContainer": {"title": "PracSys Engineering"},
+            }]}
+        if path == "/wiki/rest/api/content/5390000":
+            return {"id": "5390000", "title": "Other", "space": {"key": "OTHER"},
+                    "body": {"storage": {"value": "<p>secret</p>"}}}
+        if path == "/wiki/rest/api/content/4489221":
+            return {"id": "4489221", "title": "Sharing", "space": {"key": "PRACENG"},
+                    "body": {"storage": {"value": "<h2>In plain words</h2><p>Share &amp; revoke.</p>"}}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(mod, "_request", fake_request)
+    return mod, calls
+
+
+def test_confluence_scoped_to_praceng(confluence):
+    mod, calls = confluence
+    hits = mod.search('sharing" OR space = "OTHER')
+    cql = calls[-1][1]["cql"]
+    assert cql.startswith('space = "PRACENG" AND type = page AND text ~ ')
+    assert 'OR space = "OTHER"' not in cql.replace('\\"', "")  # quotes in the query are escaped
+    assert hits[0]["id"] == "4489221"
+    assert hits[0]["url"].endswith("/wiki/spaces/PRACENG/pages/4489221")
+    with pytest.raises(mod.TriageRefused):
+        mod.read("5390000")
+    with pytest.raises(mod.TriageRefused):
+        mod.read("not-an-id")
+    page = mod.read("4489221")
+    assert page["text"] == "In plain words\nShare & revoke."

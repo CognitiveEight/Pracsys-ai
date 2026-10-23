@@ -1,12 +1,13 @@
 """Jira access for the triage agent (SIM-133). The only way it reads or writes SIM.
 
     python scripts/delivery/jira_triage.py search --jql '<jql>'
-    python scripts/delivery/jira_triage.py create --type Bug|Task \\
-        --summary '<one line>' --priority P1|P2|P3|P4 \\
+    python scripts/delivery/jira_triage.py create --component AI|BE|FE|Admin|DevOps|QA \\
+        --type Bug|Task --summary '<one line>' --priority P1|P2|P3|P4 \\
         --source-link '<Slack message link>'          # description on stdin
 
 ``search`` is always scoped to project SIM. ``create`` makes one Bug or Task
-in SIM with labels forced to ``from-slack`` and ``ai-repo`` and component AI,
+in SIM for one PracSys component, with labels forced to ``from-slack`` and
+the component's label,
 and refuses if an issue already exists for the same Slack message. There is no
 edit, comment, transition or delete command. Credentials come from
 ``JIRA_EMAIL`` / ``JIRA_API_TOKEN`` and are never shown to the model.
@@ -26,7 +27,16 @@ from typing import Any, Dict, List, Optional
 _PROJECT = "SIM"
 _TYPES = {"Bug", "Task"}
 _PRIORITIES = {"P1": "Highest", "P2": "High", "P3": "Medium", "P4": "Low"}
-_LABELS = ["from-slack", "ai-repo"]
+#: SIM "Components" values and the label each one forces (one requests
+#: channel serves every PracSys app).
+_COMPONENT_LABELS = {
+    "AI": "ai-repo",
+    "BE": "be-repo",
+    "FE": "fe-repo",
+    "Admin": "admin-repo",
+    "DevOps": "devops",
+    "QA": "qa",
+}
 _SLACK_LINK = re.compile(r"^https://[a-z0-9-]+\.slack\.com/archives/C[A-Z0-9]+/p(\d{16})$")
 
 
@@ -78,9 +88,17 @@ def search(jql: str, max_results: int = 20) -> List[Dict[str, Any]]:
 
 
 def create(
-    *, issue_type: str, summary: str, priority: str, source_link: str, description: str
+    *,
+    component: str,
+    issue_type: str,
+    summary: str,
+    priority: str,
+    source_link: str,
+    description: str,
 ) -> Dict[str, Any]:
     """Create one SIM issue for a Slack message, or return the one that exists."""
+    if component not in _COMPONENT_LABELS:
+        raise TriageRefused(f"component must be one of {sorted(_COMPONENT_LABELS)}")
     if issue_type not in _TYPES:
         raise TriageRefused(f"issue type must be one of {sorted(_TYPES)}")
     if priority not in _PRIORITIES:
@@ -100,12 +118,12 @@ def create(
         "issuetype": {"name": issue_type},
         "summary": summary.strip()[:250],
         "priority": {"name": _PRIORITIES[priority]},
-        "labels": list(_LABELS),
+        "labels": ["from-slack", _COMPONENT_LABELS[component]],
         "description": f"{(description or '').strip()}\n\nSource: {source_link}",
     }
     component_field = os.environ.get("JIRA_COMPONENT_FIELD", "").strip()
     if component_field:
-        fields[component_field] = {"value": "AI"}
+        fields[component_field] = {"value": component}
     created = _request("POST", "/rest/api/2/issue", {"fields": fields})
     return {"key": created.get("key", ""), "created": True}
 
@@ -116,6 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
     search_p = sub.add_parser("search", help="read-only JQL search inside SIM")
     search_p.add_argument("--jql", required=True)
     create_p = sub.add_parser("create", help="create one Bug or Task; description on stdin")
+    create_p.add_argument("--component", required=True)
     create_p.add_argument("--type", dest="issue_type", required=True)
     create_p.add_argument("--summary", required=True)
     create_p.add_argument("--priority", required=True)
@@ -130,6 +149,7 @@ def main(argv: List[str] | None = None) -> int:
             result: Any = search(args.jql)
         else:
             result = create(
+                component=args.component,
                 issue_type=args.issue_type,
                 summary=args.summary,
                 priority=args.priority,

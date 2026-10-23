@@ -1,7 +1,7 @@
 ---
 title: Logging and personal data (AI service)
 type: policy
-repo: law-firm-simplertoday-ai
+repo: Pracsys-ai
 owner: AI team
 status: current
 audience: everyone; engineers from "The rules"

@@ -1,7 +1,7 @@
 ---
 title: Reconcile case cost with gate0
 type: runbook
-repo: law-firm-simplertoday-ai
+repo: Pracsys-ai
 owner: AI team
 status: current
 audience: everyone; engineers below "Before you start"

@@ -1,7 +1,7 @@
 ---
 title: Deleting a workspace erases every copy the AI service holds
 type: decision
-repo: law-firm-simplertoday-ai
+repo: Pracsys-ai
 owner: AI team
 status: accepted
 audience: everyone; engineers below "What this means"

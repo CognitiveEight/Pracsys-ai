@@ -1,7 +1,7 @@
 ---
 title: AI service docs – start here
 type: index
-repo: law-firm-simplertoday-ai
+repo: Pracsys-ai
 owner: AI team
 status: current
 audience: everyone

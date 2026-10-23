@@ -418,6 +418,7 @@ def test_comments_and_notices_carry_no_ticket_text(monkeypatch, tmp_path):
     # Every reason category is a fixed token.
     assert set(notify.REASON_CATEGORIES) == {
         "dor-gap", "tests-red", "review-changes", "injection", "workflow-failed", "budget", "already-ran",
+        "protected-path",
     }
     with pytest.raises(ops.DeliveryRefused):
         ops.comment("SIM-12", stage="spec", outcome="blocked", reason_category=INJECTED_SUMMARY)

@@ -1,6 +1,7 @@
 """Branch guard for the agent publish steps (SIM-153, SIM-71 AC-21/23/27).
 
     python scripts/delivery/guard_branch.py check --branch <name> --issue SIM-<n>
+    python scripts/delivery/guard_branch.py key --issue SIM-<n>
     python scripts/delivery/guard_branch.py already-ran --issue SIM-<n>
         # stdin: {"branches": [...remote branch names], "prs": [...open PR heads or titles]}
 
@@ -8,7 +9,7 @@
 ``feature/SIM-<n>-<slug>`` or ``fix/SIM-<n>-<slug>``, and never to
 ``development``, ``staging`` or ``main``. ``already-ran`` tells the spec stage
 whether a branch or open PR for the key exists, so a second run changes
-nothing. No network and no credentials. Standard library only.
+nothing. ``key`` only checks an issue key (a workflow input) and echoes it. No network and no credentials. Standard library only.
 """
 
 from __future__ import annotations
@@ -77,6 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
     check_p = sub.add_parser("check", help="refuse anything but the issue's own ticket branch")
     check_p.add_argument("--branch", required=True)
     check_p.add_argument("--issue", required=True)
+    key_p = sub.add_parser("key", help="check an issue key and echo it")
+    key_p.add_argument("--issue", required=True)
     ran_p = sub.add_parser("already-ran", help="branches and PRs as JSON on stdin")
     ran_p.add_argument("--issue", required=True)
     return parser
@@ -87,6 +90,8 @@ def main(argv: List[str] | None = None) -> int:
     try:
         if args.command == "check":
             result: Dict[str, Any] = {"ok": True, "branch": check(args.branch, args.issue)}
+        elif args.command == "key":
+            result = {"issue": validate_key(args.issue)}
         else:
             validate_key(args.issue)
             data = json.loads(sys.stdin.read() or "{}")

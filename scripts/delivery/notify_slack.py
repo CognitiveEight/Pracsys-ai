@@ -43,6 +43,7 @@ REASON_CATEGORIES = (
     "workflow-failed",
     "budget",
     "already-ran",
+    "protected-path",
 )
 
 

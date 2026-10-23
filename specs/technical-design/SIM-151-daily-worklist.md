@@ -34,8 +34,8 @@ besides checkout (pinned by SHA).
 **Queries** (all through Jira REST `POST /rest/api/3/search/jql`, fields
 `summary, status, priority, assignee, updated, duedate, customfield_10075,
 customfield_10021`):
-1. In progress: `project = SIM AND status in ("In Progress", "In Review") AND issuetype != Epic ORDER BY updated ASC` (epics are umbrellas, not daily work)
-2. Next up: `project = SIM AND statusCategory = "To Do" AND issuetype != Epic ORDER BY priority DESC, created ASC` (first 10)
+1. In progress: `project = SIM AND status in ("Spec", "In Progress", "In Review", "QA") AND issuetype != Epic ORDER BY updated ASC` (epics are umbrellas, not daily work; Spec and QA count as active work although Jira files them under the "To Do" category)
+2. Next up: `project = SIM AND status = "To Do" AND issuetype != Epic ORDER BY priority DESC, created ASC` (first 10)
 3. Blocked and overdue: `project = SIM AND statusCategory != Done AND (Flagged is not EMPTY OR duedate < startOfDay())`
 
 **Message** (Slack markdown). Nothing is ever cut: when the worklist is longer

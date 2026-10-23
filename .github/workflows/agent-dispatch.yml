@@ -10,7 +10,10 @@
 #   * no model, no Anthropic key, no push token: this job only reads Jira and
 #     starts agent-spec.yml with its own token (`actions: write`);
 #   * the started run's input is a key agent_queue.py printed, re-checked
-#     here and again by agent-spec.yml before any use.
+#     here and again by agent-spec.yml before any use;
+#   * a key that already has a feature/SIM-<n>-* or fix/SIM-<n>-* branch is
+#     skipped (EXISTING_TICKET_BRANCH_KEYS), so an already-ran ticket is not
+#     re-dispatched every 15 minutes.
 #
 # Scheduled and workflow_dispatch workflows run from the default branch
 # (`main`); a human copies this file there. Code and scripts come from
@@ -63,8 +66,16 @@ jobs:
           done
           keys="$(gh pr list --label agent-pr --state open --limit 200 --json headRefName,title \
             --jq '[.[] | (.headRefName + " " + .title) | scan("SIM-[0-9]+")] | unique | join(",")')"
+          # Keys that already have a ticket branch: the spec stage would only
+          # report already-ran for them, so the queue skips them.
+          # A failed lookup stops the job like the counts above; no branch at all is fine.
+          for refs in matching-refs/heads/feature/SIM- matching-refs/heads/fix/SIM-; do
+            gh api --paginate "repos/${GH_REPO}/git/${refs}" --jq '.[].ref'
+          done > "$RUNNER_TEMP/ticket-refs.txt"
+          branch_keys="$( (grep -oE 'SIM-[0-9]+' "$RUNNER_TEMP/ticket-refs.txt" || true) | sort -u | paste -sd, -)"
           echo "running=${running}" >> "$GITHUB_OUTPUT"
           echo "open_keys=${keys}" >> "$GITHUB_OUTPUT"
+          echo "branch_keys=${branch_keys}" >> "$GITHUB_OUTPUT"
           echo "running=${running}"
 
       - name: Pick the next tickets
@@ -73,6 +84,7 @@ jobs:
           AGENT_MAX_CONCURRENT: ${{ vars.AGENT_MAX_CONCURRENT || '1' }}
           AGENT_RUNNING: ${{ steps.count.outputs.running }}
           OPEN_SPEC_PR_KEYS: ${{ steps.count.outputs.open_keys }}
+          EXISTING_TICKET_BRANCH_KEYS: ${{ steps.count.outputs.branch_keys }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
         run: |

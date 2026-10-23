@@ -5,26 +5,33 @@
 # (gate G2). Claude then runs /implement, /verify and /review in CI mode; a
 # person still reviews and merges the PR (gate G3).
 #
-# Same four-job split as agent-spec.yml, so the agent and the push token never
-# share a runner:
-#   prepare  The G2 check (scripts/delivery/stage_io.py design-gate): the
-#            design flipped to approved in this push, not by an agent commit,
-#            on a branch that does not change .claude/ or .github/. Anything
+# Five jobs, so the agent, the code it writes and the credentials never share
+# a runner:
+#   prepare  Jira + Slack. Checks out `development` and runs only its
+#            scripts; the pushed commits are read as git data. The G2 check
+#            (stage_io.py design-gate): the design flipped to approved in
+#            this push, no commit in the pushed range by the agent, on a
+#            branch that does not change the pipeline or the gates. Anything
 #            else exits quietly (the spec stage's own push lands here too).
 #            Then Jira → In Progress, label agent-running, ticket to a file.
-#   agent    Anthropic key only. Qdrant service for `make test`. After
-#            Claude, `make lint` and `make test` run again on the committed
-#            tree; the codes, the outcome and a git bundle are handed back.
-#   publish  Fresh runner, no agent code run. Re-checks the hand-off, forces
-#            needs-human-review for sensitive paths (review_labels.py),
-#            pushes with AGENT_PUSH_TOKEN, comments the AC table on the PR,
-#            and marks it ready for review ONLY when lint and tests are
-#            green, the review approves and every AC passes. Otherwise the PR
-#            stays a draft and Jira is flagged Blocked with the reason.
+#   agent    Anthropic key only, egress allow-listed (harden-runner). Hands
+#            back the normalised outcome, a result summary and a git bundle.
+#   gates    No secrets. Fresh runner: development + its dependencies, then
+#            the agent's bundle on the approved commit; `make lint` and
+#            `make test`, counts only in the log.
+#   publish  Fresh runner, no agent code run, scripts from development.
+#            Re-checks the hand-off, refuses (nothing pushed) an agent change
+#            to the pipeline, the gates or any spec (`protected-path`) or one
+#            gitleaks flags (`secret-found`), forces needs-human-review for
+#            sensitive paths, pushes with AGENT_PUSH_TOKEN, comments the AC
+#            table and marks the PR ready ONLY when the gates job is green on
+#            exactly that tree, the review approves and every AC passes.
+#            Otherwise the PR stays a draft and Jira is flagged Blocked.
 #   cleanup  On failure or cancellation: Blocked, `workflow-failed`.
 #
 # A push-triggered workflow runs from the pushed branch, which is cut from
-# `development` and so carries this file. Nothing here merges.
+# `development` and so carries this file; the design gate refuses a branch
+# whose .github/ differs from development's. Nothing here merges.
 
 name: Agent implement stage
 
@@ -64,10 +71,33 @@ jobs:
       go: ${{ steps.ticket.outputs.go }}
       started: ${{ steps.ticket.outputs.started }}
     steps:
+      # This job holds Jira and Slack credentials, so it runs only scripts from
+      # `development`. The pushed branch is read as git data (ls-tree, show,
+      # log, diff); nothing from it is executed here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: development
           fetch-depth: 0
           persist-credentials: false
+
+      # fetch-depth 0 already brings every branch; this covers a commit no
+      # longer at a branch head. The job token (contents: read) is passed as a
+      # header for this one fetch and not stored.
+      - name: Fetch the pushed commits as git data
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          for sha in "$AFTER" "$BEFORE"; do
+            if [ "$sha" = "0000000000000000000000000000000000000000" ]; then continue; fi
+            if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+              git -c "http.https://github.com/.extraheader=${auth}" fetch -q --no-tags origin "$sha" \
+                || echo "a pushed commit is not available"
+            fi
+          done
 
       - name: Check this push is the design approval (G2)
         id: gate
@@ -123,6 +153,8 @@ jobs:
           python3 scripts/delivery/jira_ops.py label --issue "$ISSUE" --add agent-running
           echo "go=true" >> "$GITHUB_OUTPUT"
 
+      # 1-day retention. Deleting it at the end of the run would need
+      # `actions: write` on a job holding credentials, which is not granted.
       - name: Hand the ticket to the agent job
         if: steps.ticket.outputs.go == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -140,10 +172,11 @@ jobs:
     permissions:
       contents: read
 
-    # As in ci.yml: a real Qdrant so `make test` runs its store checks.
+    # As in ci.yml (same tag, pinned by digest): a real Qdrant so Claude's
+    # own `make test` runs its store checks.
     services:
       qdrant:
-        image: qdrant/qdrant:v1.18.3
+        image: qdrant/qdrant:v1.18.3@sha256:0bd98fa7977f1e75694779359ca4e212822e5a71334e28421182f72f209d5286
         ports:
           - 6333:6333
 
@@ -154,10 +187,37 @@ jobs:
       TEST_QDRANT_URL: http://localhost:6333
 
     steps:
+      # Egress allow-list: the Anthropic API, the action's own install hosts
+      # (its .github/egress-firewall.yaml at the pinned SHA), GitHub and PyPI.
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >-
+            api.anthropic.com:443
+            claude.ai:443
+            downloads.claude.ai:443
+            registry.npmjs.org:443
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            *.githubusercontent.com:443
+            pypi.org:443
+            files.pythonhosted.org:443
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      # The outcome is normalised in this job with these scripts, taken from
+      # `development` before Claude runs, so only validated fields are
+      # uploaded. The publish job validates it again with its own copy.
+      - name: Keep a copy of the delivery scripts from development
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/trusted"
+          git archive origin/development scripts/delivery | tar -x -C "$RUNNER_TEMP/trusted"
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -167,6 +227,7 @@ jobs:
             requirements.lock.txt
             requirements-dev.txt
 
+      # pre-commit comes from requirements-dev.txt, an exact pin.
       - name: Install dependencies and the commit gates
         env:
           BRANCH: ${{ needs.prepare.outputs.branch }}
@@ -217,31 +278,18 @@ jobs:
             Outcome file to write: ${{ runner.temp }}/agent/outcome.json
           claude_args: >-
             --model ${{ vars.AGENT_MODEL || 'claude-sonnet-5-5' }}
-            --max-turns ${{ vars.AGENT_MAX_TURNS || 60 }}
+            --max-turns ${{ vars.AGENT_MAX_TURNS_IMPLEMENT || 120 }}
             --add-dir ${{ runner.temp }}/agent
             --allowedTools "Read,Grep,Glob,Write,Edit,Task,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git branch:*),Bash(git switch:*),Bash(git add:*),Bash(git commit:*),Bash(make lint:*),Bash(make test:*),Bash(python -m pytest:*),Bash(env/bin/python -m pytest:*),Bash(ruff check:*)"
 
-      # The gates the publish job decides on, run on what Claude committed
-      # (uncommitted leftovers are set aside first). No secret in this step.
-      - name: Run make lint and make test on the committed tree
-        id: gates
-        if: ${{ !cancelled() }}
-        env:
-          BRANCH: ${{ needs.prepare.outputs.branch }}
-        run: |
-          set -uo pipefail
-          git stash push -q --include-untracked || true
-          git switch -q "$BRANCH" || exit 1
-          make lint > "$RUNNER_TEMP/lint.log" 2>&1; lint=$?
-          make test > "$RUNNER_TEMP/test.log" 2>&1; test=$?
-          echo "make lint exit ${lint}"; tail -3 "$RUNNER_TEMP/lint.log"
-          echo "make test exit ${test}"; tail -15 "$RUNNER_TEMP/test.log"
-          mkdir -p "$RUNNER_TEMP/handoff"
-          printf '{"lint": %d, "test": %d}\n' "$lint" "$test" > "$RUNNER_TEMP/handoff/gates.json"
-
+      # No secret in this step. Handed back: the result summary (no text,
+      # only a bool for a spend/limit error), the NORMALISED outcome and a
+      # bundle of the commits on top of the approved one. Never the
+      # execution log or the agent's raw outcome file.
       - name: Collect the agent's work
         if: ${{ !cancelled() }}
         env:
+          ISSUE: ${{ needs.prepare.outputs.issue }}
           BRANCH: ${{ needs.prepare.outputs.branch }}
           AFTER: ${{ github.sha }}
           EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
@@ -252,12 +300,13 @@ jobs:
           log="${EXECUTION_FILE:-$RUNNER_TEMP/claude-execution-output.json}"
           if [ -f "$log" ]; then
             jq '[.[] | select(type == "object" and .type == "result")] | last
-                | [{type, subtype, is_error, num_turns, total_cost_usd}]' "$log" > "$out/result.json" || true
+                | [{type, subtype, is_error, num_turns, total_cost_usd,
+                    limit: ((.result // "") | tostring
+                      | test("credit balance|spend limit|usage limit|budget|invalid api key|authentication"; "i"))}]' \
+              "$log" > "$out/result.json" || true
           fi
-          outcome="$RUNNER_TEMP/agent/outcome.json"
-          if [ -f "$outcome" ] && [ "$(stat -c %s "$outcome")" -le 64000 ]; then
-            cp "$outcome" "$out/outcome.json"
-          fi
+          python3 "$RUNNER_TEMP/trusted/scripts/delivery/stage_io.py" outcome --stage implement --issue "$ISSUE" \
+            --file "$RUNNER_TEMP/agent/outcome.json" > "$out/outcome.json"
           if [ "$(git rev-list --count "${AFTER}..refs/heads/${BRANCH}")" -gt 0 ]; then
             git bundle create "$out/branch.bundle" "refs/heads/${BRANCH}" "^${AFTER}"
           fi
@@ -272,13 +321,130 @@ jobs:
           retention-days: 1
           if-no-files-found: warn
 
-  publish:
+  # `make lint` and `make test` on a fresh runner that never held a secret or
+  # ran the agent: development is checked out and its dependencies installed
+  # first, then the agent's bundle is applied on the approved commit. Code
+  # the agent wrote runs here, and nothing here can publish.
+  gates:
     needs: [prepare, agent]
     if: vars.AGENTS_ENABLED == 'true' && needs.prepare.outputs.go == 'true' && needs.agent.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      lint: ${{ steps.run.outputs.lint }}
+      test: ${{ steps.run.outputs.test }}
+      head: ${{ steps.tree.outputs.head }}
+
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.18.3@sha256:0bd98fa7977f1e75694779359ca4e212822e5a71334e28421182f72f209d5286
+        ports:
+          - 6333:6333
+
+    env:
+      SOCKET_URL: http://127.0.0.1:9
+      SECRET_KEY: ci-placeholder
+      TEST_QDRANT_URL: http://localhost:6333
+
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >-
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            *.githubusercontent.com:443
+            pypi.org:443
+            files.pythonhosted.org:443
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: development
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: handoff-${{ github.run_id }}
+          path: ${{ runner.temp }}/handoff
+
+      - name: Apply the agent's commits to the approved commit
+        id: tree
+        env:
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          h="$RUNNER_TEMP/handoff"
+          git cat-file -e "${AFTER}^{commit}"
+          head="$AFTER"
+          if [ -f "$h/branch.bundle" ]; then
+            git bundle verify -q "$h/branch.bundle"
+            git fetch -q --no-tags "$h/branch.bundle" "refs/heads/${BRANCH}:refs/heads/agent-result"
+            git merge-base --is-ancestor "$AFTER" refs/heads/agent-result
+            head="$(git rev-parse refs/heads/agent-result)"
+          fi
+          echo "head=${head}" >> "$GITHUB_OUTPUT"
+
+      # From development's files, before the agent's tree is checked out. The
+      # design gate refuses a branch that changes them, and publish refuses an
+      # agent change to them.
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install -r requirements.lock.txt -r requirements-dev.txt
+          python -m pip check
+
+      - name: Wait for Qdrant
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -sf -m 2 http://localhost:6333/readyz >/dev/null; then
+              echo "Qdrant ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Qdrant did not become ready"; exit 1
+
+      # Only exit codes and counts are printed: test names and output may
+      # carry ticket text.
+      - name: Run make lint and make test
+        id: run
+        env:
+          HEAD_SHA: ${{ steps.tree.outputs.head }}
+        run: |
+          set -uo pipefail
+          git switch -q --detach "$HEAD_SHA" || exit 1
+          make lint > "$RUNNER_TEMP/lint.log" 2>&1; lint=$?
+          make test > "$RUNNER_TEMP/test.log" 2>&1; test=$?
+          counts() {
+            grep -oE '\b[0-9]+ (passed|failed|errors?|skipped|xfailed|xpassed)\b' "$1" \
+              | awk '{n[$2] += $1} END {for (k in n) printf "%s=%d ", k, n[k]}'
+          }
+          echo "make lint exit ${lint}"
+          echo "make test exit ${test}: $(counts "$RUNNER_TEMP/test.log")"
+          echo "lint=${lint}" >> "$GITHUB_OUTPUT"
+          echo "test=${test}" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: [prepare, agent, gates]
+    if: >-
+      vars.AGENTS_ENABLED == 'true' && needs.prepare.outputs.go == 'true'
+      && needs.agent.result == 'success' && needs.gates.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
+    env:
+      # As ci.yml's secrets-scan job; update the two together.
+      GITLEAKS_VERSION: "8.30.1"
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
       # Scripts from development, not from the branch the agent wrote.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -292,12 +458,28 @@ jobs:
           name: handoff-${{ github.run_id }}
           path: ${{ runner.temp }}/handoff
 
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          (cd "$RUNNER_TEMP" && echo "${GITLEAKS_SHA256}  ${tarball}" | sha256sum --check --strict)
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/gitleaks" gitleaks
+          rm -f "$RUNNER_TEMP/$tarball"
+          echo "$RUNNER_TEMP/gitleaks" >> "$GITHUB_PATH"
+
       - name: Check the agent's work
         id: check
         env:
           ISSUE: ${{ needs.prepare.outputs.issue }}
           BRANCH: ${{ needs.prepare.outputs.branch }}
           AFTER: ${{ github.sha }}
+          GATES_RESULT: ${{ needs.gates.result }}
+          GATES_LINT: ${{ needs.gates.outputs.lint }}
+          GATES_TEST: ${{ needs.gates.outputs.test }}
+          GATES_HEAD: ${{ needs.gates.outputs.head }}
         run: |
           set -euo pipefail
           h="$RUNNER_TEMP/handoff"
@@ -305,8 +487,6 @@ jobs:
           python3 scripts/delivery/stage_io.py outcome --stage implement --issue "$ISSUE" \
             --file "$h/outcome.json" > "$RUNNER_TEMP/outcome.json"
           python3 scripts/delivery/stage_io.py cost --file "$h/result.json" > "$RUNNER_TEMP/cost.json"
-          lint_rc="$(jq -r '.lint // ""' "$h/gates.json" 2>/dev/null || true)"
-          test_rc="$(jq -r '.test // ""' "$h/gates.json" 2>/dev/null || true)"
 
           # The agent's commits, on top of the approved commit and nothing else.
           commits=0
@@ -318,14 +498,38 @@ jobs:
             head="refs/heads/agent-result"
           fi
 
+          # Gate codes count only from the gates job, and only for exactly this tree.
+          lint_rc=""
+          test_rc=""
+          if [ "$GATES_RESULT" = "success" ] && [ "$GATES_HEAD" = "$(git rev-parse "$head")" ]; then
+            lint_rc="$GATES_LINT"
+            test_rc="$GATES_TEST"
+          fi
+          budget=()
+          if [ "$(jq -r '.budget' "$RUNNER_TEMP/cost.json")" = "true" ]; then budget=(--budget); fi
           python3 scripts/delivery/stage_io.py decide --outcome "$RUNNER_TEMP/outcome.json" \
-            --lint-rc "$lint_rc" --test-rc "$test_rc" --commits "$commits" > "$RUNNER_TEMP/decision.json"
+            --lint-rc "$lint_rc" --test-rc "$test_rc" --commits "$commits" "${budget[@]}" \
+            > "$RUNNER_TEMP/decision.json"
           ready="$(jq -r '.ready' "$RUNNER_TEMP/decision.json")"
           reason="$(jq -r '.reasonCategory // ""' "$RUNNER_TEMP/decision.json")"
-          # Workflows stay human-written (the push token cannot change them either).
-          git diff --name-only "$AFTER" "$head" > "$RUNNER_TEMP/agent-changed.txt"
-          if [ "$commits" -gt 0 ] && grep -q '^\.github/workflows/' "$RUNNER_TEMP/agent-changed.txt"; then
-            ready=false; reason=protected-path; commits=0; head="$AFTER"
+
+          if [ "$commits" -gt 0 ]; then
+            # Every file any agent commit touched: never the pipeline, the gates or a spec.
+            git log --no-renames --name-only --format= "${AFTER}..refs/heads/agent-result" \
+              | python3 scripts/delivery/stage_io.py agent-paths --stage implement --issue "$ISSUE" \
+              > "$RUNNER_TEMP/paths.json"
+            if [ "$(jq -r '.ok' "$RUNNER_TEMP/paths.json")" != "true" ]; then
+              ready=false; reason=protected-path; commits=0; head="$AFTER"
+            fi
+          fi
+          if [ "$commits" -gt 0 ]; then
+            # Pinned gitleaks over exactly the commits to be pushed. Findings
+            # stay in a file on this runner; only the verdict is printed.
+            if ! gitleaks git --no-banner --redact --log-opts="${AFTER}..refs/heads/agent-result" . \
+              > "$RUNNER_TEMP/gitleaks.log" 2>&1; then
+              echo "gitleaks reported findings in the agent's commits; nothing is pushed"
+              ready=false; reason=secret-found; commits=0; head="$AFTER"
+            fi
           fi
 
           flag=()
@@ -381,6 +585,8 @@ jobs:
             pr="$(gh pr create --draft --base development --head "$BRANCH" \
               --title "${ISSUE}: implementation" --label agent-pr --body-file "$RUNNER_TEMP/pr-body.md")"
           fi
+          # The spec stage opened it as "<KEY>: specs".
+          gh pr edit "$pr" --title "${ISSUE}: implementation"
           if [ "$NHR" = "true" ]; then
             gh pr edit "$pr" --add-label needs-human-review
           fi
@@ -418,6 +624,7 @@ jobs:
           if [ -n "$cost" ]; then common+=(--cost "$cost"); fi
           if [ "$READY" = "true" ]; then
             python3 scripts/delivery/jira_ops.py transition --issue "$ISSUE" --to "In Review"
+            python3 scripts/delivery/jira_ops.py unblock --issue "$ISSUE"
             python3 scripts/delivery/jira_ops.py comment "${common[@]}" --outcome ready
             python3 scripts/delivery/jira_ops.py label --issue "$ISSUE" --remove agent-running
             python3 scripts/delivery/notify_slack.py post "${common[@]}" --outcome ready
@@ -429,7 +636,7 @@ jobs:
           fi
 
   cleanup:
-    needs: [prepare, agent, publish]
+    needs: [prepare, agent, gates, publish]
     if: (failure() || cancelled()) && vars.AGENTS_ENABLED == 'true' && needs.prepare.outputs.started == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10

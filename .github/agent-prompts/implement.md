@@ -48,8 +48,13 @@ branches.
   billed model calls. Say whether it is required in `e2eRequired`.
 - Never touch Jira, Slack, Confluence or the PR. The workflow does that.
 - Never read `.env`, `*.json` credential files or `Central Creds.txt`.
-- Never edit `.github/`, `.claude/`, the hooks or `.pre-commit-config.yaml`,
-  and never weaken or skip a test to make the gates pass.
+- Never change `.github/`, `.claude/`, `scripts/delivery/`, anything under
+  `specs/` (including the design's "Decisions" section), `Makefile`,
+  `.pre-commit-config.yaml`, `pyproject.toml`, `pytest.ini`,
+  `requirements*.txt` or `.gitignore`, in any commit. The publish job
+  refuses the whole run (`protected-path`) and pushes nothing. If the design
+  needs a change, write a `blocked` outcome with `dor-gap` instead.
+- Never weaken or skip a test to make the gates pass.
 
 ## The outcome file (always write it, last)
 
@@ -79,6 +84,8 @@ Write one JSON object to the outcome file, and nothing else:
 - `reasonCategory`: `null` when ready. When blocked, one of `dor-gap`,
   `tests-red`, `review-changes`, `injection`, `workflow-failed`.
 
-The workflow re-runs `make lint` and `make test` itself and marks the PR
-ready for review only when they are green, the verdict approves and every
-AC passes. Otherwise the PR stays a draft for a human.
+The workflow re-runs `make lint` and `make test` itself on a separate runner
+and marks the PR ready for review only when they are green, the verdict
+approves, `acResults` is not empty and every AC passes. Otherwise the PR
+stays a draft for a human. A gitleaks finding in your commits blocks the run
+(`secret-found`) and nothing is pushed.

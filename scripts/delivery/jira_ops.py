@@ -1,17 +1,23 @@
 """Jira access for the agent pipeline workflows (SIM-153, SIM-71 AC-21/36/37).
 
+    python scripts/delivery/jira_ops.py check-scope --issue SIM-<n>
     python scripts/delivery/jira_ops.py fetch --issue SIM-<n> --out <file>
     python scripts/delivery/jira_ops.py transition --issue SIM-<n> \\
         --to Spec|"In Progress"|"In Review"|QA|Blocked
+    python scripts/delivery/jira_ops.py unblock --issue SIM-<n>
     python scripts/delivery/jira_ops.py label --issue SIM-<n> [--add agent-x ...] [--remove agent-y ...]
     python scripts/delivery/jira_ops.py comment --issue SIM-<n> --stage S --outcome O \\
         [--pr-url U] [--run-url U] [--cost C] [--count name=<int> ...] [--reason-category CAT]
 
-Every command checks the key before any API call. ``fetch`` writes the ticket
+Every command checks the key before any API call. ``check-scope`` is
+read-only: whether the issue is one the agents may work on (labels
+``agent-ready`` and ``ai-repo``, neither ``agent-running`` nor
+``agent-blocked``, status To Do or Spec), printed as a bool, so the spec stage
+can refuse before fetching anything. ``fetch`` writes the ticket
 to a file as data for the agent and prints only the path. ``transition`` never
 moves an issue to Done (QA does that by hand); ``Blocked`` sets the Flagged
 field and the ``agent-blocked`` label, because the board has no Blocked
-status. ``label`` touches only ``agent-*`` labels. ``comment`` is built from
+status; ``unblock`` clears both on a successful run. ``label`` touches only ``agent-*`` labels. ``comment`` is built from
 structured fields only (validated as in ``notify_slack.py``), never from
 ticket text. Credentials come from ``JIRA_EMAIL`` / ``JIRA_API_TOKEN`` and are
 never printed. Standard library only.
@@ -42,6 +48,10 @@ _AGENT_LABEL = re.compile(r"^agent-[a-z0-9][a-z0-9-]*$")
 _COMPONENT_FIELD = "customfield_10075"
 _FLAGGED_FIELD = "customfield_10021"
 _FETCH_FIELDS = ["summary", "description", "priority", _COMPONENT_FIELD, "labels", "issuelinks"]
+#: The agents' scope; the same rule as agent_queue.py's JQL.
+SCOPE_LABELS = frozenset({"agent-ready", "ai-repo"})
+SCOPE_EXCLUDED_LABELS = frozenset({"agent-running", "agent-blocked"})
+SCOPE_STATUSES = frozenset({"To Do", "Spec"})
 #: Statuses the pipeline may move an issue to. Done is not, and never will be.
 _TARGETS = {
     "spec": "Spec",
@@ -86,6 +96,22 @@ def _key(issue: Any) -> str:
     if not isinstance(issue, str) or not _KEY.fullmatch(issue):
         raise DeliveryRefused("issue key must match ^SIM-[0-9]+$")
     return issue
+
+
+# ------------------------------------------------------------ check-scope
+
+
+def check_scope(issue: str) -> Dict[str, Any]:
+    """Whether ``issue`` is in the agents' scope. One GET of labels and status; prints no text."""
+    key = _key(issue)
+    data = _request("GET", f"/rest/api/2/issue/{key}?fields=labels,status")
+    fields = data.get("fields") or {}
+    labels = {name for name in (fields.get("labels") or []) if isinstance(name, str)}
+    status = ((fields.get("status") or {}).get("name")) or ""
+    in_scope = (
+        SCOPE_LABELS <= labels and not labels & SCOPE_EXCLUDED_LABELS and status in SCOPE_STATUSES
+    )
+    return {"issue": key, "inScope": bool(in_scope)}
 
 
 # ------------------------------------------------------------------ fetch
@@ -191,6 +217,17 @@ def transition(issue: str, to: str) -> Dict[str, Any]:
     return {"issue": key, "status": target, "transitioned": True}
 
 
+def unblock(issue: str) -> Dict[str, Any]:
+    """Clear the Flagged field and remove ``agent-blocked`` (a later run succeeded)."""
+    key = _key(issue)
+    _request(
+        "PUT",
+        f"/rest/api/2/issue/{key}",
+        {"fields": {_FLAGGED_FIELD: None}, "update": {"labels": [{"remove": "agent-blocked"}]}},
+    )
+    return {"issue": key, "flagged": False, "removed": "agent-blocked"}
+
+
 # ------------------------------------------------------------------ label
 
 
@@ -255,6 +292,10 @@ def comment(issue: str, **fields: Any) -> Dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
+    scope_p = sub.add_parser("check-scope", help="read-only: is the issue in the agents' scope")
+    scope_p.add_argument("--issue", required=True)
+    unblock_p = sub.add_parser("unblock", help="clear Flagged and agent-blocked")
+    unblock_p.add_argument("--issue", required=True)
     fetch_p = sub.add_parser("fetch", help="write the issue to a file as data")
     fetch_p.add_argument("--issue", required=True)
     fetch_p.add_argument("--out", required=True)
@@ -281,7 +322,11 @@ def main(argv: List[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         _key(args.issue)
-        if args.command == "fetch":
+        if args.command == "check-scope":
+            result = check_scope(args.issue)
+        elif args.command == "unblock":
+            result = unblock(args.issue)
+        elif args.command == "fetch":
             result = fetch(args.issue, args.out)
         elif args.command == "transition":
             result = transition(args.issue, args.to)

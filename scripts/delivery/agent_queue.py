@@ -1,13 +1,17 @@
 """Pick the next SIM tickets for the agent pipeline (SIM-153, SIM-71 AC-16/17/18).
 
     AGENTS_ENABLED=true AGENT_MAX_CONCURRENT=1 AGENT_RUNNING=<n> \\
-    OPEN_SPEC_PR_KEYS=SIM-1,SIM-2 python scripts/delivery/agent_queue.py next
+    OPEN_SPEC_PR_KEYS=SIM-1,SIM-2 EXISTING_TICKET_BRANCH_KEYS=SIM-3 \\
+    python scripts/delivery/agent_queue.py next
 
 Prints ``{"start": ["SIM-<n>", ...]}``: the tickets labelled ``agent-ready``
 and ``ai-repo`` to start the spec stage for, P1 → P4 then oldest first, at
 most ``AGENT_MAX_CONCURRENT - AGENT_RUNNING`` of them. Nothing when
 ``AGENTS_ENABLED`` is not exactly ``true`` (Jira is not even queried). An
-issue in Spec with an open spec PR is waiting for G2 and is skipped. It starts
+issue in Spec with an open spec PR is waiting for G2 and is skipped, and so is
+any issue that already has a ``feature/SIM-<n>-*`` / ``fix/SIM-<n>-*`` branch
+(``EXISTING_TICKET_BRANCH_KEYS``): the spec stage would only report
+``already-ran`` for it. It starts
 no workflow itself; ``agent-dispatch.yml`` does. Credentials:
 ``JIRA_EMAIL`` / ``JIRA_API_TOKEN``. Standard library only.
 """
@@ -22,7 +26,7 @@ import re
 import sys
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 JQL = (
     "project = SIM AND labels = agent-ready AND labels = ai-repo AND labels not in "
@@ -100,6 +104,7 @@ def select(
     max_concurrent: int,
     enabled: bool,
     open_spec_pr_keys: Iterable[str],
+    branch_keys: Iterable[str] = (),
 ) -> List[str]:
     """Keys to start now, in queue order; empty when disabled or at the limit."""
     if enabled is not True:
@@ -108,7 +113,10 @@ def select(
     if room <= 0:
         return []
     waiting = set(open_spec_pr_keys)
-    ready = sorted((i for i in issues if _eligible(i, waiting)), key=_order)
+    has_branch = set(branch_keys)
+    ready = sorted(
+        (i for i in issues if _eligible(i, waiting) and i.get("key") not in has_branch), key=_order
+    )
     return [i["key"] for i in ready[:room]]
 
 
@@ -123,6 +131,10 @@ def _env_int(name: str, default: Optional[int]) -> int:
     return int(raw)
 
 
+def _env_keys(name: str) -> Set[str]:
+    return {k.strip() for k in os.environ.get(name, "").split(",") if _KEY.fullmatch(k.strip())}
+
+
 def next_keys() -> List[str]:
     """Read the settings from the environment, query Jira, and select."""
     if os.environ.get("AGENTS_ENABLED") != "true":
@@ -131,13 +143,13 @@ def next_keys() -> List[str]:
     running = _env_int("AGENT_RUNNING", None)
     if running >= max_concurrent:
         return []
-    open_keys = {
-        k.strip() for k in os.environ.get("OPEN_SPEC_PR_KEYS", "").split(",") if _KEY.fullmatch(k.strip())
-    }
+    open_keys = _env_keys("OPEN_SPEC_PR_KEYS")
+    branch_keys = _env_keys("EXISTING_TICKET_BRANCH_KEYS")
     body = {"jql": JQL, "fields": _FIELDS, "maxResults": 50}
     issues = _request("POST", "/rest/api/3/search/jql", body).get("issues", [])
     return select(
-        issues, running=running, max_concurrent=max_concurrent, enabled=True, open_spec_pr_keys=open_keys
+        issues, running=running, max_concurrent=max_concurrent, enabled=True, open_spec_pr_keys=open_keys,
+        branch_keys=branch_keys,
     )
 
 

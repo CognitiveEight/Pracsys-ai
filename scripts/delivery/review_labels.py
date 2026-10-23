@@ -28,8 +28,20 @@ SENSITIVE_FILES = (
     "app/ai/usage.py",
     "app/ai/pricing.py",
 )
-#: Whole trees (``<dir>/**``).
-SENSITIVE_DIRS = ("app/llm/", ".claude/", ".github/", "scripts/deploy/")
+#: Path prefixes: whole trees (``<dir>/**``) and the gate files (``requirements``
+#: covers every ``requirements*.txt``).
+SENSITIVE_DIRS = (
+    "app/llm/",
+    ".claude/",
+    ".github/",
+    "scripts/deploy/",
+    "scripts/delivery/",
+    "Makefile",
+    ".pre-commit-config.yaml",
+    "pyproject.toml",
+    "pytest.ini",
+    "requirements",
+)
 
 
 def _normalise(path: str) -> str:

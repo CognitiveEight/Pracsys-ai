@@ -164,6 +164,14 @@ SENSITIVE = [
     ".claude/hooks/protect-branch.sh",
     ".github/workflows/agent-spec.yml",
     "scripts/deploy/remote_deploy.sh",
+    "scripts/delivery/stage_io.py",
+    "Makefile",
+    ".pre-commit-config.yaml",
+    "pyproject.toml",
+    "pytest.ini",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "requirements.lock.txt",
 ]
 
 
@@ -418,7 +426,7 @@ def test_comments_and_notices_carry_no_ticket_text(monkeypatch, tmp_path):
     # Every reason category is a fixed token.
     assert set(notify.REASON_CATEGORIES) == {
         "dor-gap", "tests-red", "review-changes", "injection", "workflow-failed", "budget", "already-ran",
-        "protected-path",
+        "protected-path", "secret-found",
     }
     with pytest.raises(ops.DeliveryRefused):
         ops.comment("SIM-12", stage="spec", outcome="blocked", reason_category=INJECTED_SUMMARY)
@@ -556,3 +564,75 @@ def test_queue_cli_next(monkeypatch, capsys):
     monkeypatch.setenv("AGENT_RUNNING", "0")
     monkeypatch.setenv("AGENT_MAX_CONCURRENT", "many")
     assert queue.main(["next"]) == 2
+
+
+# --------------------------------------- review and audit fixes (SIM-153)
+
+
+def _scope_jira(monkeypatch, labels, status):
+    ops = _load("jira_ops")
+    monkeypatch.setenv("JIRA_EMAIL", "bot@example.test")
+    monkeypatch.setenv("JIRA_API_TOKEN", "token-test")
+    calls = []
+
+    def fake_request(method, path, body=None):
+        calls.append((method, path, body))
+        assert method == "GET", "check-scope must be read-only"
+        return {"key": "SIM-12", "fields": {"labels": labels, "status": {"name": status},
+                                            "summary": INJECTED_SUMMARY, "description": INJECTED_DESCRIPTION}}
+
+    monkeypatch.setattr(ops, "_request", fake_request)
+    return ops, calls
+
+
+@pytest.mark.parametrize("labels,status,expected", [
+    (["agent-ready", "ai-repo"], "To Do", True),
+    (["agent-ready", "ai-repo", "from-slack"], "Spec", True),
+    (["agent-ready"], "To Do", False),
+    (["ai-repo"], "To Do", False),
+    (["agent-ready", "ai-repo"], "In Progress", False),
+    (["agent-ready", "ai-repo"], "Done", False),
+    (["agent-ready", "ai-repo", "agent-blocked"], "To Do", False),
+    (["agent-ready", "ai-repo", "agent-running"], "To Do", False),
+    ([], "To Do", False),
+])
+def test_check_scope_is_read_only_and_prints_no_ticket_text(monkeypatch, capsys, labels, status, expected):
+    ops, calls = _scope_jira(monkeypatch, labels, status)
+    assert ops.main(["check-scope", "--issue", "SIM-12"]) == 0
+    out = capsys.readouterr().out
+    assert json.loads(out) == {"issue": "SIM-12", "inScope": expected}
+    assert INJECTED_SUMMARY not in out and "Ignore" not in out
+    assert calls == [("GET", "/rest/api/2/issue/SIM-12?fields=labels,status", None)]
+
+
+def test_check_scope_checks_the_key_first(monkeypatch):
+    ops, calls = _scope_jira(monkeypatch, ["agent-ready", "ai-repo"], "To Do")
+    assert ops.main(["check-scope", "--issue", "SIM-12 OR 1=1"]) == 2
+    assert calls == []
+
+
+def test_unblock_clears_the_flag_and_the_blocked_label(monkeypatch, capsys):
+    ops, state = _fake_jira(monkeypatch)
+    assert ops.main(["unblock", "--issue", "SIM-12"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"issue": "SIM-12", "flagged": False, "removed": "agent-blocked"}
+    (method, path, body), = state["calls"]
+    assert (method, path) == ("PUT", "/rest/api/2/issue/SIM-12")
+    assert body == {"fields": {"customfield_10021": None}, "update": {"labels": [{"remove": "agent-blocked"}]}}
+
+
+def test_queue_skips_keys_with_a_ticket_branch(monkeypatch, capsys):
+    queue = _load("agent_queue")
+    issues = [_q("SIM-31", "Highest"), _q("SIM-32", "High"), _q("SIM-33", "Low")]
+    picked = queue.select(issues, running=0, max_concurrent=5, enabled=True, open_spec_pr_keys=set(),
+                          branch_keys={"SIM-31"})
+    assert picked == ["SIM-32", "SIM-33"]
+
+    monkeypatch.setattr(queue, "_request", lambda *a, **k: {"issues": issues})
+    monkeypatch.setenv("JIRA_EMAIL", "bot@example.test")
+    monkeypatch.setenv("JIRA_API_TOKEN", "token-test")
+    monkeypatch.setenv("AGENTS_ENABLED", "true")
+    monkeypatch.setenv("AGENT_MAX_CONCURRENT", "5")
+    monkeypatch.setenv("AGENT_RUNNING", "0")
+    monkeypatch.setenv("EXISTING_TICKET_BRANCH_KEYS", "SIM-31,SIM-33,not-a-key")
+    assert queue.main(["next"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"start": ["SIM-32"]}

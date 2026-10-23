@@ -1,14 +1,16 @@
 """What the agent stages hand back, checked before anything is published (SIM-153, SIM-71 tasks 17-18).
 
     python scripts/delivery/stage_io.py outcome --stage spec|implement --issue SIM-<n> --file <outcome.json>
-    python scripts/delivery/stage_io.py cost --file <claude-execution-output.json>
+    python scripts/delivery/stage_io.py cost --file <result-summary.json>
     git diff --name-only origin/development...<branch> | \\
         python scripts/delivery/stage_io.py spec-paths --issue SIM-<n>
     git show <branch>:<design.md> | python scripts/delivery/stage_io.py design-status
     python scripts/delivery/stage_io.py design-gate --branch <ref name> --before <sha> --after <sha> \\
         --base origin/development [--repo .]
+    git log --no-renames --name-only --format= <range> | \\
+        python scripts/delivery/stage_io.py agent-paths --stage spec|implement --issue SIM-<n>
     python scripts/delivery/stage_io.py decide --outcome <normalised.json> \\
-        --lint-rc <n> --test-rc <n> --commits <n>
+        --lint-rc <n> --test-rc <n> --commits <n> [--budget]
     git diff --name-only origin/development...<branch> | \\
         python scripts/delivery/stage_io.py pr-comment --issue SIM-<n> --outcome <normalised.json> \\
         --lint-rc <n> --test-rc <n> --commits <n> [--agent-flag] [--cost <usd>]
@@ -16,12 +18,15 @@
 The agent's outcome file is untrusted: ``outcome`` keeps only the fields the
 design names, each checked, and turns anything unexpected into
 ``blocked`` / ``workflow-failed``. ``cost`` reads only the result message's
-cost from the action's execution log (which also holds everything the agent
-read, so the log itself is never published). ``spec-paths`` confines the spec
-stage to its own three spec files. ``design-gate`` decides whether a push is
-the G2 approval: the ticket's technical design flipped to ``Status: approved``
-in this push, by a commit the agent did not author, on a branch that does not
-change ``.claude/`` or ``.github/``. ``decide`` and ``pr-comment`` give the
+cost, and whether the run hit a spend limit, from the action's result summary
+(the execution log holds everything the agent read, so it is never
+published). ``spec-paths`` confines the spec stage to its own three spec
+files; ``agent-paths`` is the publish jobs' refusal list (the implement stage
+may not change the pipeline, the gates or any spec). ``design-gate`` decides
+whether a push is the G2 approval: the ticket's technical design flipped to
+``Status: approved`` in this push, with no commit in the pushed range authored
+or committed by the agent, on a branch that does not change the pipeline or
+the gates (``PROTECTED_PREFIXES``). ``decide`` and ``pr-comment`` give the
 implement stage's verdict and PR comment from those fields only. Standard
 library only; prints JSON (``pr-comment`` prints markdown).
 """
@@ -52,6 +57,7 @@ _SHA = re.compile(r"^[0-9a-f]{40}$")
 _ZERO_SHA = "0" * 40
 _SPEC_PATH = r"^specs/(requirements|technical-design|acceptance-criteria)/{key}-[a-z0-9][a-z0-9-]*\.md$"
 _STATUS_LINE = re.compile(r"^\s*(?:[-*]\s+)?Status\s*:\s*(.*)$")
+_LIMIT_SUBTYPES = ("error_max_budget_usd",)
 #: Identities the agent commits under: the workflow's git identity, and the
 #: action's default bot identity in case the environment override is lost.
 AGENT_IDENTITIES = (
@@ -59,8 +65,30 @@ AGENT_IDENTITIES = (
     "41898282+claude[bot]@users.noreply.github.com",
 )
 #: A ticket branch touching these is not run by the agent: they hold the
-#: instructions, hooks and workflows the next agent run would execute under.
-PROTECTED_PREFIXES = (".claude/", ".github/")
+#: instructions, hooks and workflows the next agent run would execute under,
+#: the delivery scripts the jobs holding secrets run, and the gates
+#: (``make lint`` / ``make test`` and what they read). Prefixes, so
+#: ``requirements`` covers every ``requirements*.txt``.
+PROTECTED_PREFIXES = (
+    ".claude/",
+    ".github/",
+    "scripts/delivery/",
+    "Makefile",
+    ".pre-commit-config.yaml",
+    "pyproject.toml",
+    "pytest.ini",
+    "requirements",
+)
+#: What an implement-stage agent may never change (publish refuses, nothing is
+#: pushed). The specs are the human-approved input; keeping
+#: ``specs/technical-design/`` here also means an implement push can never
+#: start the implement workflow (its trigger path).
+IMPLEMENT_PROTECTED_PREFIXES = PROTECTED_PREFIXES + (
+    "specs/technical-design/",
+    "specs/requirements/",
+    "specs/acceptance-criteria/",
+    ".gitignore",
+)
 VERDICTS = ("approve", "approve-with-follow-ups", "request-changes")
 STATUSES = ("ready", "blocked")
 STAGES = ("spec", "implement")
@@ -176,6 +204,27 @@ def run_cost(path: str) -> Optional[float]:
     return None
 
 
+def run_budget(path: str) -> bool:
+    """True if the action's result summary shows the run stopped on a spend limit.
+
+    The summary is a list holding the last result message reduced to ``type``, ``subtype``,
+    ``is_error``, ``num_turns``, ``total_cost_usd`` and ``limit`` (a bool the agent job
+    derives from the result text: credit balance, spend or usage limit). The turn limit
+    (``error_max_turns``) is not a budget stop; it ends in the gates' verdict."""
+    try:
+        messages = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(messages, list):
+        return False
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("type") == "result":
+            if message.get("subtype") in _LIMIT_SUBTYPES:
+                return True
+            return message.get("is_error") is True and message.get("limit") is True
+    return False
+
+
 # --------------------------------------------------------------- spec paths
 
 
@@ -191,12 +240,45 @@ def check_spec_paths(issue: str, paths: Iterable[str]) -> Tuple[bool, List[str],
     return True, clean, None
 
 
+# -------------------------------------------------------------- agent paths
+
+
+def _clean_path(path: str) -> str:
+    path = (path or "").strip().replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path
+
+
+def check_agent_paths(stage: str, issue: str, paths: Iterable[str]) -> Tuple[bool, List[str], Optional[str]]:
+    """Whether a publish job may push an agent change touching ``paths``.
+
+    Returns ``(ok, matched, reason)``; ``reason`` is ``protected-path`` when refused. The spec
+    stage may change only its own three spec files; the implement stage anything except
+    ``IMPLEMENT_PROTECTED_PREFIXES``. An empty list is allowed (nothing to push)."""
+    if stage not in STAGES:
+        raise StageRefused("stage must be spec or implement")
+    key = guard_branch.validate_key(issue)
+    clean = sorted({_clean_path(p) for p in paths if p and p.strip()})
+    if stage == "spec":
+        pattern = re.compile(_SPEC_PATH.format(key=re.escape(key)))
+        matched = [p for p in clean if not pattern.fullmatch(p) or ".." in p]
+    else:
+        matched = [p for p in clean if p.startswith(IMPLEMENT_PROTECTED_PREFIXES) or ".." in p]
+    if matched:
+        return False, matched, "protected-path"
+    return True, [], None
+
+
 # ----------------------------------------------------------- design status
 
 
 def design_approved(text: str) -> bool:
-    """True if the design's first ``Status:`` line (in its header) starts with ``approved``."""
-    for line in text.splitlines()[:30]:
+    """True if the first ``Status:`` line in the design's header block (everything before
+    the first ``## `` heading) starts with ``approved``."""
+    for line in text.splitlines():
+        if line.startswith("## "):
+            return False
         match = _STATUS_LINE.match(line.replace("*", "").replace("_", ""))
         if match:
             return match.group(1).strip().lower().startswith("approved")
@@ -239,8 +321,11 @@ def design_gate(branch: str, before: str, after: str, base: str, repo: str = "."
             return {**result, "reason": "before-unavailable"}
         if _exists(repo, f"{before}:{design}") and design_approved(_git(repo, "show", f"{before}:{design}")):
             return {**result, "reason": "already-approved"}
-    author = _git(repo, "log", "-1", "--format=%ae%n%ce", after).split()
-    if any(identity in AGENT_IDENTITIES for identity in author):
+    # Every commit this push adds (a new branch: everything not on the base), by author and
+    # committer: an agent commit anywhere in the range refuses the whole push.
+    span = f"{base}..{after}" if before == _ZERO_SHA else f"{before}..{after}"
+    identities = _git(repo, "log", "--format=%ae%n%ce", span).split()
+    if any(identity.lower() in AGENT_IDENTITIES for identity in identities):
         return {**result, "reason": "agent-commit"}
     changed = _git(repo, "diff", "--name-only", f"{base}...{after}").splitlines()
     if any(p.startswith(PROTECTED_PREFIXES) for p in changed):
@@ -252,14 +337,21 @@ def design_gate(branch: str, before: str, after: str, base: str, repo: str = "."
 
 
 def implement_decision(outcome: Dict[str, Any], lint_rc: Optional[int], test_rc: Optional[int],
-                       commits: int) -> Dict[str, Any]:
-    """Ready for review only with green gates, an approving verdict and every AC passing."""
+                       commits: int, run_budget: bool = False) -> Dict[str, Any]:
+    """Ready for review only with green gates, an approving verdict, at least one AC result
+    and every AC passing."""
+    green = lint_rc == 0 and test_rc == 0
     if not outcome.get("valid"):
-        return {"ready": False, "reasonCategory": "workflow-failed"}
+        if run_budget:
+            return {"ready": False, "reasonCategory": "budget"}
+        return {"ready": False, "reasonCategory": "workflow-failed" if green else "tests-red"}
     if outcome.get("status") != "ready":
         return {"ready": False, "reasonCategory": outcome.get("reasonCategory") or "dor-gap"}
-    if lint_rc != 0 or test_rc != 0 or not all(r["pass"] for r in outcome.get("acResults", [])):
+    results = outcome.get("acResults") or []
+    if not green or not all(r["pass"] for r in results):
         return {"ready": False, "reasonCategory": "tests-red"}
+    if not results:
+        return {"ready": False, "reasonCategory": "dor-gap"}
     if outcome.get("verdict") not in ("approve", "approve-with-follow-ups"):
         return {"ready": False, "reasonCategory": "review-changes"}
     if commits <= 0:
@@ -333,6 +425,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--file", required=True)
     p = sub.add_parser("spec-paths")
     p.add_argument("--issue", required=True)
+    p = sub.add_parser("agent-paths")
+    p.add_argument("--stage", required=True, choices=STAGES)
+    p.add_argument("--issue", required=True)
     sub.add_parser("design-status")
     p = sub.add_parser("design-gate")
     p.add_argument("--branch", required=True)
@@ -346,6 +441,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--lint-rc", default="")
         p.add_argument("--test-rc", default="")
         p.add_argument("--commits", default="0")
+        p.add_argument("--budget", action="store_true", help="the run stopped on a spend limit")
         if name == "pr-comment":
             p.add_argument("--issue", required=True)
             p.add_argument("--agent-flag", action="store_true")
@@ -359,10 +455,13 @@ def main(argv: List[str] | None = None) -> int:
         if args.command == "outcome":
             result: Any = read_outcome(args.stage, args.file, args.issue)
         elif args.command == "cost":
-            result = {"cost": run_cost(args.file)}
+            result = {"cost": run_cost(args.file), "budget": run_budget(args.file)}
         elif args.command == "spec-paths":
             ok, paths, reason = check_spec_paths(args.issue, sys.stdin.read().splitlines())
             result = {"ok": ok, "paths": paths, "reason": reason}
+        elif args.command == "agent-paths":
+            ok, matched, reason = check_agent_paths(args.stage, args.issue, sys.stdin.read().splitlines())
+            result = {"ok": ok, "matched": matched, "reason": reason}
         elif args.command == "design-status":
             result = {"approved": design_approved(sys.stdin.read())}
         elif args.command == "design-gate":
@@ -370,7 +469,8 @@ def main(argv: List[str] | None = None) -> int:
         else:
             outcome = _load_outcome(args.outcome)
             commits = int(args.commits) if re.fullmatch(r"[0-9]{1,6}", args.commits) else 0
-            decision = implement_decision(outcome, _rc(args.lint_rc), _rc(args.test_rc), commits)
+            decision = implement_decision(outcome, _rc(args.lint_rc), _rc(args.test_rc), commits,
+                                          run_budget=args.budget)
             if args.command == "decide":
                 result = decision
             else:

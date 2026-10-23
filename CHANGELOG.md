@@ -38,6 +38,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.github/agent-prompts/`, "In CI" sections in `.claude/commands/`.
   Static rules: `tests/test_delivery_workflows.py`,
   `tests/test_delivery_stage_io.py`.
+  **Review and security-audit fixes:** the implement `prepare` job now
+  checks out `development` and reads the pushed commits only as git data;
+  both publish jobs refuse (nothing pushed) an agent change to the pipeline,
+  the gates or any spec (`protected-path`) and run pinned gitleaks over the
+  commits first (new reason category `secret-found`); the G2 gate checks
+  every commit in the push for the agent's identity; `make lint` /
+  `make test` move to a secret-free `gates` job on a fresh runner;
+  harden-runner (`egress-policy: block`) on the agent and gates jobs; Qdrant
+  pinned by digest; only the normalised outcome is uploaded and no test-log
+  text is printed; new `jira_ops.py check-scope` (read-only, before any
+  fetch) and `unblock`; the queue skips keys that already have a ticket
+  branch; `AGENT_MAX_TURNS_IMPLEMENT` (default 120). No socket payload or
+  `app/` change.
 
 - **SIM-152: instant replies in #pracsys-requests.** A small GCP Cloud
   Function (`relay/slack_events/`) receives Slack events, checks Slack's

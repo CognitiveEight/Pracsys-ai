@@ -44,6 +44,7 @@ REASON_CATEGORIES = (
     "budget",
     "already-ran",
     "protected-path",
+    "secret-found",
 )
 
 

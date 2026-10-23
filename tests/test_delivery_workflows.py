@@ -358,7 +358,10 @@ def test_agent_step_runs_bounded(path):
     doc, _ = _wf(path)
     (_, job, step), = _agent_steps(doc)
     args = step["with"]["claude_args"]
-    assert "--max-turns ${{ vars.AGENT_MAX_TURNS || 60 }}" in args
+    if path.name == "agent-implement.yml":
+        assert "--max-turns ${{ vars.AGENT_MAX_TURNS_IMPLEMENT || 120 }}" in args
+    else:
+        assert "--max-turns ${{ vars.AGENT_MAX_TURNS || 60 }}" in args
     assert "--model ${{ vars.AGENT_MODEL || 'claude-sonnet-5-5' }}" in args
     assert job["timeout-minutes"] <= 90
     # the prompt carries no expression an outsider controls
@@ -375,3 +378,201 @@ def test_prompts_treat_the_ticket_as_data():
     for command in ("spec", "implement", "verify", "review"):
         body = (Path(__file__).resolve().parents[1] / ".claude" / "commands" / f"{command}.md").read_text()
         assert "## In CI (GitHub Actions)" in body
+
+
+# ------------------------------------------- review and audit fixes (SIM-153)
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+STAGE_FILES = [WORKFLOWS / "agent-spec.yml", WORKFLOWS / "agent-implement.yml"]
+HARDEN = "step-security/harden-runner@"
+QDRANT_PINNED = re.compile(r"^qdrant/qdrant:v1\.18\.3@sha256:[0-9a-f]{64}$")
+
+
+def _job_text(job):
+    return yaml.safe_dump(job)
+
+
+def _run(job):
+    return "\n".join(s.get("run", "") for s in job.get("steps", []))
+
+
+def _ci_gitleaks():
+    ci, _ = _wf(WORKFLOWS / "ci.yml")
+    env = ci["jobs"]["secrets-scan"]["env"]
+    return env["GITLEAKS_VERSION"], env["GITLEAKS_SHA256"]
+
+
+@pytest.mark.parametrize("path", STAGE_FILES, ids=lambda p: p.name)
+def test_jobs_holding_secrets_run_only_development_scripts(path):
+    """Blocker: no job that holds a Jira, Slack or push credential checks out (or switches to)
+    anything but `development`; ticket-branch commits are read only as git data."""
+    doc, _ = _wf(path)
+    for job_id, job in doc["jobs"].items():
+        if job_id == "agent":
+            continue
+        if "secrets." not in _job_text(job):
+            continue
+        checkouts = [s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@")]
+        assert checkouts, job_id
+        for step in checkouts:
+            assert step["with"].get("ref") == "development", f"{path.name}:{job_id}"
+        body = _run(job)
+        assert not re.search(r"git (switch|checkout)\b", body), f"{path.name}:{job_id}"
+        assert "make " not in body and "pip install" not in body and "pre-commit" not in body, job_id
+
+
+def test_implement_prepare_reads_the_push_as_git_data():
+    doc, _ = _wf(WORKFLOWS / "agent-implement.yml")
+    prepare = doc["jobs"]["prepare"]
+    checkout = prepare["steps"][0]
+    assert checkout["with"] == {"ref": "development", "fetch-depth": 0, "persist-credentials": False}
+    body = _run(prepare)
+    assert "fetch -q --no-tags origin" in body
+    assert "stage_io.py design-gate" in body and "--base origin/development" in body
+
+
+@pytest.mark.parametrize("path", STAGE_FILES, ids=lambda p: p.name)
+def test_publish_refuses_protected_paths_and_secrets_before_pushing(path):
+    doc, _ = _wf(path)
+    publish = doc["jobs"]["publish"]
+    stage = "implement" if "implement" in path.name else "spec"
+    steps = publish["steps"]
+    names = [s.get("name", "") for s in steps]
+    check = next(i for i, s in enumerate(steps) if f"stage_io.py agent-paths --stage {stage}" in s.get("run", ""))
+    scan = next(i for i, s in enumerate(steps) if "gitleaks git" in s.get("run", ""))
+    push = next(i for i, s in enumerate(steps) if "git push" in s.get("run", ""))
+    assert check < push and scan < push, names
+    body = steps[scan]["run"]
+    assert "--redact" in body and "secret-found" in body
+    assert "--no-renames --name-only" in steps[check]["run"]
+    install = next(s for s in steps if "sha256sum --check --strict" in s.get("run", ""))
+    version, digest = _ci_gitleaks()
+    assert publish["env"]["GITLEAKS_VERSION"] == version
+    assert publish["env"]["GITLEAKS_SHA256"] == digest
+    assert "secrets." not in yaml.safe_dump(install)
+
+
+def test_gates_run_on_a_fresh_runner_without_secrets():
+    doc, _ = _wf(WORKFLOWS / "agent-implement.yml")
+    gates = doc["jobs"]["gates"]
+    assert set(gates["needs"]) == {"prepare", "agent"}
+    assert "secrets." not in _job_text(gates)
+    assert gates["permissions"] == {"contents": "read"}
+    assert QDRANT_PINNED.fullmatch(gates["services"]["qdrant"]["image"])
+    checkout = next(s for s in gates["steps"] if s.get("uses", "").startswith("actions/checkout@"))
+    assert checkout["with"]["ref"] == "development"
+    body = _run(gates)
+    assert "make lint" in body and "make test" in body
+    assert "git bundle verify" in body and "merge-base --is-ancestor" in body
+    # deps are installed from development before the agent's tree is checked out
+    assert body.index("pip install") < body.index("git switch -q --detach")
+    assert {"lint", "test", "head"} <= set(gates["outputs"])
+    # the agent job no longer runs the gates itself
+    agent_body = _run(doc["jobs"]["agent"])
+    assert "make test" not in agent_body and "make lint" not in agent_body
+    publish = doc["jobs"]["publish"]
+    assert "gates" in publish["needs"]
+    text = _job_text(publish)
+    for needed in ("needs.gates.result", "needs.gates.outputs.lint", "needs.gates.outputs.test",
+                   "needs.gates.outputs.head"):
+        assert needed in text, needed
+
+
+@pytest.mark.parametrize("path", STAGE_FILES, ids=lambda p: p.name)
+def test_no_log_tails_and_only_normalised_outcomes_leave_the_agent_job(path):
+    doc, _ = _wf(path)
+    text = path.read_text()
+    assert "tail -" not in text and "cat \"$RUNNER_TEMP/test.log\"" not in text
+    agent = doc["jobs"]["agent"]
+    collect = next(s for s in agent["steps"] if s.get("name") == "Collect the agent's work")
+    assert "stage_io.py\" outcome --stage" in collect["run"]
+    assert 'cp "$outcome"' not in collect["run"]
+    # the trusted copy of the scripts is taken before the agent runs
+    steps = agent["steps"]
+    snapshot = next(i for i, s in enumerate(steps) if "git archive" in s.get("run", ""))
+    claude = next(i for i, s in enumerate(steps) if AGENT_ACTION in s.get("uses", ""))
+    assert snapshot < claude
+    for step in steps:
+        if step.get("uses", "").startswith("actions/upload-artifact@"):
+            assert step["with"]["retention-days"] == 1
+
+
+@pytest.mark.parametrize("path,jobs", [
+    (WORKFLOWS / "agent-spec.yml", ("agent",)),
+    (WORKFLOWS / "agent-implement.yml", ("agent", "gates")),
+], ids=["spec", "implement"])
+def test_harden_runner_is_the_first_step(path, jobs):
+    doc, _ = _wf(path)
+    for job_id in jobs:
+        first = doc["jobs"][job_id]["steps"][0]
+        assert first["uses"].startswith(HARDEN) and SHA_PIN.fullmatch(first["uses"].split()[0]), job_id
+        assert first["with"]["egress-policy"] == "block", job_id
+        allowed = first["with"]["allowed-endpoints"].split()
+        assert "pypi.org:443" in allowed and "files.pythonhosted.org:443" in allowed
+        if job_id == "agent":
+            assert "api.anthropic.com:443" in allowed
+        else:
+            assert "api.anthropic.com:443" not in allowed
+
+
+@pytest.mark.parametrize("path", STAGE_FILES, ids=lambda p: p.name)
+def test_qdrant_pinned_by_digest_and_pre_commit_exact(path):
+    doc, _ = _wf(path)
+    for job_id, job in doc["jobs"].items():
+        for service in (job.get("services") or {}).values():
+            assert QDRANT_PINNED.fullmatch(service["image"]), job_id
+    text = path.read_text()
+    assert "|| echo pre-commit" not in text
+    if "pre-commit install" in text and "requirements-dev.txt" in text:
+        assert re.search(r"pre-commit==", (ROOT_DIR / "requirements-dev.txt").read_text())
+
+
+def test_implement_publish_titles_unblocks_and_maps_budget():
+    path = WORKFLOWS / "agent-implement.yml"
+    doc, _ = _wf(path)
+    body = _run(doc["jobs"]["publish"])
+    assert 'gh pr edit "$pr" --title "${ISSUE}: implementation"' in body
+    assert "jira_ops.py unblock" in body
+    assert "--budget" in body
+
+
+def test_spec_stage_scope_check_comes_before_the_fetch():
+    path = WORKFLOWS / "agent-spec.yml"
+    doc, _ = _wf(path)
+    steps = doc["jobs"]["prepare"]["steps"]
+    scope = next(i for i, s in enumerate(steps) if "jira_ops.py check-scope" in s.get("run", ""))
+    fetch = next(i for i, s in enumerate(steps) if "jira_ops.py fetch" in s.get("run", ""))
+    ran = next(i for i, s in enumerate(steps) if "guard_branch.py already-ran" in s.get("run", ""))
+    assert scope < ran < fetch
+    assert "steps.scope.outputs.inscope=='true'" in _flat(steps[fetch]["if"])
+    upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact@"))
+    assert "steps.ticket.outputs.go=='true'" in _flat(upload["if"])
+    # already ran: flagged and labelled so the queue stops re-dispatching it
+    report = next(s for s in steps if "--reason-category already-ran" in s.get("run", ""))
+    assert "--to Blocked" in report["run"]
+    publish = _run(doc["jobs"]["publish"])
+    assert "needs-human-review" in publish and "jira_ops.py unblock" in publish
+    assert "budget" in publish
+
+
+def test_dispatch_skips_keys_with_a_ticket_branch():
+    doc, _ = _wf(WORKFLOWS / "agent-dispatch.yml")
+    job = doc["jobs"]["dispatch"]
+    pick = next(s for s in job["steps"] if "agent_queue.py" in s.get("run", ""))
+    assert pick["env"]["EXISTING_TICKET_BRANCH_KEYS"] == "${{ steps.count.outputs.branch_keys }}"
+    body = _run(job)
+    assert "matching-refs/heads/feature/SIM-" in body and "matching-refs/heads/fix/SIM-" in body
+
+
+def test_push_token_owner_is_never_trusted_as_an_approver_by_default():
+    """The push token belongs to an approver (until a machine user exists), so an agent push
+    arrives with an approver as sender. The gate must not rely on the sender: there is no
+    built-in approver fallback, and design-gate (not the job `if:`) refuses agent commits.
+    The design records the machine user as REQUIRED before AGENTS_ENABLED goes beyond the pilot."""
+    path = WORKFLOWS / "agent-implement.yml"
+    doc, _ = _wf(path)
+    cond = _flat(doc["jobs"]["prepare"]["if"])
+    assert "vars.DESIGN_APPROVERS" in cond and "||" not in cond
+    assert "st-heyabhishek" not in path.read_text()
+    design = (ROOT_DIR / "specs" / "technical-design" / "SIM-71-automated-delivery-pipeline.md").read_text()
+    assert "REQUIRED before `AGENTS_ENABLED=true` beyond the pilot" in design

@@ -344,3 +344,167 @@ def test_guard_branch_key_command(capsys):
     assert json.loads(capsys.readouterr().out) == {"issue": "SIM-13"}
     assert guard.main(["key", "--issue", "SIM-13\nrm -rf /"]) == 2
     assert guard.main(["key", "--issue", "sim-13"]) == 2
+
+
+# ------------------------------------------- review and audit fixes (SIM-153)
+
+
+def test_design_status_reads_the_whole_header_block(sio):
+    # A long header (many metadata lines) still counts, up to the first `## `.
+    padding = "".join(f"- **Field {i}:** value\n" for i in range(40))
+    assert sio.design_approved("# T\n" + padding + "- **Status:** approved\n\n## Summary\n") is True
+    # A Status line after the first `## ` heading is body text, not the header.
+    assert sio.design_approved("# T\n- Requirements: x\n\n## Summary\n- Status: approved\n") is False
+    assert sio.design_approved("# T\n" + padding + "\n## Summary\n" + padding + "- Status: approved\n") is False
+
+
+def test_gate_refuses_an_agent_commit_anywhere_in_the_pushed_range(sio, repo):
+    draft = _commit(repo, DESIGN, "# D\n- **Status:** draft\n")
+    _commit(repo, "app/x.py", "x = 1\n", author="pracsys-agent <pracsys-agent@users.noreply.github.com>")
+    approved = _commit(repo, DESIGN, "# D\n- **Status:** approved\n")  # tip by the approver
+    out = sio.design_gate("feature/SIM-13-export", draft, approved, "base-ref", str(repo))
+    assert out["go"] is False and out["reason"] == "agent-commit"
+
+
+def test_gate_refuses_an_agent_committer_even_with_a_human_author(sio, repo):
+    draft = _commit(repo, DESIGN, "# D\n- **Status:** draft\n")
+    target = repo / DESIGN
+    target.write_text("# D\n- **Status:** approved\n")
+    _git(repo, "add", DESIGN)
+    env = {**__import__("os").environ, "GIT_COMMITTER_NAME": "claude[bot]",
+           "GIT_COMMITTER_EMAIL": "41898282+claude[bot]@users.noreply.github.com"}
+    _git(repo, "-c", "commit.gpgsign=false", "commit", "-q", "--author",
+         "Test Approver <approver@example.com>", "-m", "c", env=env)
+    approved = _git(repo, "rev-parse", "HEAD")
+    out = sio.design_gate("feature/SIM-13-export", draft, approved, "base-ref", str(repo))
+    assert out["go"] is False and out["reason"] == "agent-commit"
+
+
+def test_gate_new_branch_checks_every_commit_since_the_base(sio, repo):
+    _commit(repo, "app/x.py", "x = 1\n", author="pracsys-agent <pracsys-agent@users.noreply.github.com>")
+    approved = _commit(repo, DESIGN, "# D\n- **Status:** approved\n")
+    out = sio.design_gate("feature/SIM-13-export", "0" * 40, approved, "base-ref", str(repo))
+    assert out["go"] is False and out["reason"] == "agent-commit"
+
+
+@pytest.mark.parametrize("path", [
+    "scripts/delivery/stage_io.py", "Makefile", ".pre-commit-config.yaml", "pyproject.toml",
+    "pytest.ini", "requirements.txt", "requirements-dev.txt", "requirements.lock.txt",
+])
+def test_gate_refuses_a_branch_that_changes_the_gates(sio, repo, path):
+    draft = _commit(repo, DESIGN, "# D\n- **Status:** draft\n")
+    _commit(repo, path, "changed\n")
+    approved = _commit(repo, DESIGN, "# D\n- **Status:** approved\n")
+    out = sio.design_gate("feature/SIM-13-export", draft, approved, "base-ref", str(repo))
+    assert out["go"] is False and out["reason"] == "protected-path"
+
+
+IMPLEMENT_PROTECTED = [
+    ".claude/settings.json", ".claude/hooks/protect-branch.sh", ".github/workflows/agent-implement.yml",
+    ".github/agent-prompts/implement.md", "scripts/delivery/stage_io.py",
+    "specs/technical-design/SIM-13-export.md", "specs/requirements/SIM-13-export.md",
+    "specs/acceptance-criteria/SIM-13-export.md", "specs/technical-design/SIM-99-other.md",
+    "Makefile", ".pre-commit-config.yaml", "pyproject.toml", "pytest.ini", "requirements.txt",
+    "requirements-dev.txt", "requirements.lock.txt", ".gitignore", "./.github/x.yml",
+]
+
+
+@pytest.mark.parametrize("path", IMPLEMENT_PROTECTED)
+def test_implement_publish_refuses_protected_agent_changes(sio, path):
+    ok, matched, reason = sio.check_agent_paths("implement", "SIM-13", ["app/main.py", path])
+    assert ok is False and reason == "protected-path" and matched
+
+
+def test_implement_publish_allows_code_and_tests(sio):
+    paths = ["app/main.py", "tests/test_x.py", "tests/offline/verify_x.py", "CHANGELOG.md",
+             "scripts/eval_rag.py", "docs/x.md"]
+    assert sio.check_agent_paths("implement", "SIM-13", paths) == (True, [], None)
+    assert sio.check_agent_paths("implement", "SIM-13", []) == (True, [], None)
+
+
+def test_spec_publish_allows_only_its_own_spec_files(sio):
+    own = ["specs/requirements/SIM-13-export.md", "specs/technical-design/SIM-13-export.md"]
+    assert sio.check_agent_paths("spec", "SIM-13", own)[0] is True
+    for bad in ("Makefile", "app/main.py", ".github/x.yml", "specs/technical-design/SIM-14-x.md"):
+        ok, _, reason = sio.check_agent_paths("spec", "SIM-13", own + [bad])
+        assert ok is False and reason == "protected-path"
+
+
+def test_agent_paths_cli(sio, monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", io.StringIO("app/main.py\nMakefile\n"))
+    assert sio.main(["agent-paths", "--stage", "implement", "--issue", "SIM-13"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"ok": False, "matched": ["Makefile"], "reason": "protected-path"}
+
+
+def test_an_agent_push_can_never_satisfy_g2(sio, repo):
+    """The implement trigger is `specs/technical-design/**`. An agent push can reach it only
+    through a publish job; each publish refuses what would make the gate fire, and the gate
+    refuses agent commits anywhere in the pushed range."""
+    implement = _load("stage_io")
+    # 1. Implement publish: no agent change under specs/technical-design/ is ever pushed, so an
+    #    implement publish cannot trigger the implement workflow at all.
+    assert implement.check_agent_paths("implement", "SIM-13", [DESIGN])[0] is False
+    # 2. Spec publish: may write its own design, but never one that reads approved.
+    approved_text = "# D\n- **Status:** approved\n"
+    assert sio.check_agent_paths("spec", "SIM-13", [DESIGN])[0] is True
+    assert sio.design_approved(approved_text) is True  # the spec publish refuses this (workflow)
+    # 3. Even if an approved design were pushed with agent commits, the gate refuses it,
+    #    although the push token owner (an approver) is the sender.
+    draft = _commit(repo, DESIGN, "# D\n- **Status:** draft\n")
+    agent = "pracsys-agent <pracsys-agent@users.noreply.github.com>"
+    by_agent = _commit(repo, DESIGN, approved_text, author=agent)
+    assert sio.design_gate("feature/SIM-13-export", draft, by_agent, "base-ref", str(repo))["go"] is False
+    _commit(repo, "app/y.py", "y = 1\n", author=agent)
+    later = _commit(repo, "app/z.py", "z = 1\n")
+    for before in (draft, "0" * 40):
+        assert sio.design_gate("feature/SIM-13-export", before, later, "base-ref", str(repo))["go"] is False
+
+
+def test_ready_needs_at_least_one_ac_result(sio):
+    assert sio.implement_decision(_impl(acResults=[]), 0, 0, 2) == {"ready": False, "reasonCategory": "dor-gap"}
+
+
+def test_invalid_outcome_with_red_gates_is_tests_red(sio):
+    bad = _impl(valid=False, status="blocked", reasonCategory="workflow-failed", acResults=[])
+    assert sio.implement_decision(bad, 0, 1, 2)["reasonCategory"] == "tests-red"
+    assert sio.implement_decision(bad, 1, 0, 0)["reasonCategory"] == "tests-red"
+    assert sio.implement_decision(bad, None, None, 0)["reasonCategory"] == "tests-red"
+    assert sio.implement_decision(bad, 0, 0, 2)["reasonCategory"] == "workflow-failed"
+    # a run stopped by the spend limit is budget, whatever the gates say
+    assert sio.implement_decision(bad, 0, 1, 2, run_budget=True)["reasonCategory"] == "budget"
+
+
+def test_budget_is_read_from_the_result_summary(sio, tmp_path):
+    def summary(**kw):
+        return _write(tmp_path, "r.json", [{"type": "result", "subtype": "success", "is_error": False, **kw}])
+
+    assert sio.run_budget(summary()) is False
+    assert sio.run_budget(summary(subtype="error_max_budget_usd", is_error=True)) is True
+    assert sio.run_budget(summary(is_error=True, limit=True)) is True
+    assert sio.run_budget(summary(is_error=False, limit=True)) is False
+    assert sio.run_budget(summary(subtype="error_max_turns", is_error=True)) is False
+    assert sio.run_budget(summary(is_error=True, limit="yes")) is False
+    assert sio.run_budget(str(tmp_path / "absent.json")) is False
+    assert sio.run_budget(_write(tmp_path, "g.json", "garbage")) is False
+
+
+def test_cost_cli_reports_budget(sio, tmp_path, capsys):
+    f = _write(tmp_path, "r.json", [{"type": "result", "subtype": "error_max_budget_usd", "is_error": True,
+                                     "total_cost_usd": 4.5}])
+    assert sio.main(["cost", "--file", f]) == 0
+    assert json.loads(capsys.readouterr().out) == {"cost": 4.5, "budget": True}
+
+
+def test_decide_cli_reads_budget_and_gates(sio, tmp_path, capsys):
+    f = _write(tmp_path, "o.json", _impl(valid=False, status="blocked", acResults=[]))
+    assert sio.main(["decide", "--outcome", f, "--lint-rc", "0", "--test-rc", "2", "--commits", "1"]) == 0
+    assert json.loads(capsys.readouterr().out)["reasonCategory"] == "tests-red"
+    assert sio.main(["decide", "--outcome", f, "--lint-rc", "0", "--test-rc", "2", "--commits", "1",
+                     "--budget"]) == 0
+    assert json.loads(capsys.readouterr().out)["reasonCategory"] == "budget"
+
+
+def test_secret_found_is_a_reason_category():
+    notify = _load("notify_slack")
+    assert "secret-found" in notify.REASON_CATEGORIES

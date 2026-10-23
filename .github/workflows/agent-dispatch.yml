@@ -1,16 +1,25 @@
 # Agent pipeline queue (SIM-153; SIM-71 Phase 3, task 17).
 #
-# Every 15 minutes in working hours, starts the spec stage for the next
-# `agent-ready` + `ai-repo` SIM tickets (scripts/delivery/agent_queue.py:
-# priority, then oldest), keeping at most AGENT_MAX_CONCURRENT (default 1)
-# agent-spec / agent-implement runs going at once.
+# Every 15 minutes in working hours:
+#   1. starts the implement stage for open `agent-pr` spec PRs that carry the
+#      G2 approval (label `design-approved` by a DESIGN_APPROVERS login, on
+#      the current head: scripts/delivery/g2_gate.py, the same check the
+#      implement stage repeats), not yet labelled `agent-implemented`, whose
+#      issue is in scope (no `agent-running` / `agent-blocked`); a refusal
+#      other than "not approved yet" is also started, so the implement stage
+#      reports it once and flags the issue;
+#   2. with the room left, starts the spec stage for the next `agent-ready` +
+#      `ai-repo` SIM tickets (scripts/delivery/agent_queue.py: priority, then
+#      oldest).
+# At most AGENT_MAX_CONCURRENT (default 1) agent-spec / agent-implement runs
+# go at once.
 #
 # Guardrails:
 #   * off unless repo variable AGENTS_ENABLED is exactly "true" (kill switch);
 #   * no model, no Anthropic key, no push token: this job only reads Jira and
 #     starts agent-spec.yml with its own token (`actions: write`);
-#   * the started run's input is a key agent_queue.py printed, re-checked
-#     here and again by agent-spec.yml before any use;
+#   * the started run's inputs are values g2_gate.py / agent_queue.py printed,
+#     re-checked here and again by the stage workflow before any use;
 #   * a key that already has a feature/SIM-<n>-* or fix/SIM-<n>-* branch is
 #     skipped (EXISTING_TICKET_BRANCH_KEYS), so an already-ran ticket is not
 #     re-dispatched every 15 minutes.
@@ -42,6 +51,7 @@ jobs:
       actions: write
       contents: read
       pull-requests: read
+      issues: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -78,10 +88,71 @@ jobs:
           echo "branch_keys=${branch_keys}" >> "$GITHUB_OUTPUT"
           echo "running=${running}"
 
+      # GitHub only, read-only job token: the same G2 check the implement
+      # stage repeats. Any failed call stops the job, so nothing starts.
+      - name: Find spec PRs carrying the design approval (G2)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DESIGN_APPROVERS: ${{ vars.DESIGN_APPROVERS }}
+        run: |
+          set -euo pipefail
+          g="$RUNNER_TEMP/g2"
+          mkdir -p "$g"
+          gh pr list --state open --label agent-pr --label design-approved --limit 100 \
+            --json number,headRefName,headRefOid,baseRefName,labels,isCrossRepository > "$g/listed.json"
+          python3 scripts/delivery/g2_gate.py candidates < "$g/listed.json" > "$g/candidates.json"
+          echo '[]' > "$RUNNER_TEMP/g2-start.json"
+          while IFS=$'\t' read -r issue pr sha branch; do
+            [ -n "$issue" ] || continue
+            gh api "repos/${GH_REPO}/pulls/${pr}" > "$g/pr.json"
+            gh api "repos/${GH_REPO}/issues/${pr}/timeline" --paginate --jq '.[]' | jq -s . > "$g/timeline.json"
+            gh api "repos/${GH_REPO}/activity?ref=refs/heads/${branch}&per_page=100" > "$g/activity.json"
+            python3 scripts/delivery/g2_gate.py check --issue "$issue" --pr "$pr" --sha "$sha" \
+              --pr-file "$g/pr.json" --timeline-file "$g/timeline.json" --activity-file "$g/activity.json" \
+              --approvers "$DESIGN_APPROVERS" --repo "$GH_REPO" > "$g/verdict.json"
+            echo "G2 ${issue} (PR #${pr}): $(jq -r '.reason' "$g/verdict.json")" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$(jq -r '.go or .notify' "$g/verdict.json")" = "true" ]; then
+              jq --slurpfile v "$g/verdict.json" '. + [{issue: $v[0].issue, pr: $v[0].pr, sha: $v[0].sha}]' \
+                "$RUNNER_TEMP/g2-start.json" > "$g/next.json"
+              mv "$g/next.json" "$RUNNER_TEMP/g2-start.json"
+            fi
+          done < <(jq -r '.[] | [.issue, (.pr | tostring), .sha, .branch] | @tsv' "$g/candidates.json")
+
+      # Jira only (no GitHub token here): keep the approved issues that are in
+      # the agents' scope, up to the room AGENT_MAX_CONCURRENT leaves.
+      - name: Check the approved issues are in scope
+        id: scope
+        env:
+          AGENT_MAX_CONCURRENT: ${{ vars.AGENT_MAX_CONCURRENT || '1' }}
+          AGENT_RUNNING: ${{ steps.count.outputs.running }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$AGENT_MAX_CONCURRENT" =~ ^[0-9]{1,4}$ ]] || ! [[ "$AGENT_RUNNING" =~ ^[0-9]{1,6}$ ]]; then
+            echo "AGENT_MAX_CONCURRENT or the running count is not a number"; exit 1
+          fi
+          room=$((AGENT_MAX_CONCURRENT - AGENT_RUNNING))
+          echo '[]' > "$RUNNER_TEMP/implement-start.json"
+          started=0
+          while IFS=$'\t' read -r issue row; do
+            [ -n "$issue" ] || continue
+            [ "$started" -lt "$room" ] || break
+            if [ "$(python3 scripts/delivery/jira_ops.py check-scope --issue "$issue" | jq -r '.inScope')" = "true" ]; then
+              jq --argjson r "$row" '. + [$r]' "$RUNNER_TEMP/implement-start.json" > "$RUNNER_TEMP/next.json"
+              mv "$RUNNER_TEMP/next.json" "$RUNNER_TEMP/implement-start.json"
+              started=$((started + 1))
+            fi
+          done < <(jq -r '.[] | [.issue, (. | tojson)] | @tsv' "$RUNNER_TEMP/g2-start.json")
+          echo "implement_started=${started}" >> "$GITHUB_OUTPUT"
+
       - name: Pick the next tickets
         env:
           AGENTS_ENABLED: ${{ vars.AGENTS_ENABLED }}
           AGENT_MAX_CONCURRENT: ${{ vars.AGENT_MAX_CONCURRENT || '1' }}
+          # Implement runs started this tick count against the limit.
+          IMPLEMENT_STARTED: ${{ steps.scope.outputs.implement_started }}
           AGENT_RUNNING: ${{ steps.count.outputs.running }}
           OPEN_SPEC_PR_KEYS: ${{ steps.count.outputs.open_keys }}
           EXISTING_TICKET_BRANCH_KEYS: ${{ steps.count.outputs.branch_keys }}
@@ -89,8 +160,24 @@ jobs:
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
         run: |
           set -euo pipefail
-          python3 scripts/delivery/agent_queue.py next > "$RUNNER_TEMP/queue.json"
+          AGENT_RUNNING=$((AGENT_RUNNING + ${IMPLEMENT_STARTED:-0})) \
+            python3 scripts/delivery/agent_queue.py next > "$RUNNER_TEMP/queue.json"
           cat "$RUNNER_TEMP/queue.json"
+
+      - name: Start the implement stage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r issue pr sha; do
+            [ -n "$issue" ] || continue
+            if ! [[ "$issue" =~ ^SIM-[0-9]+$ && "$pr" =~ ^[0-9]{1,7}$ && "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "skipping malformed implement inputs"; continue
+            fi
+            gh workflow run agent-implement.yml --ref main -f issue="$issue" -f pr="$pr" -f sha="$sha"
+            echo "started the implement stage for ${issue}"
+          done < <(jq -r '.[] | [.issue, (.pr | tostring), .sha] | @tsv' "$RUNNER_TEMP/implement-start.json")
 
       - name: Start the spec stage
         env:

@@ -82,13 +82,14 @@ Every path below is **new** unless marked otherwise.
 | `.github/workflows/ci.yml` | Phase 1: the SIM-23 workflow, merged as is (from `feature/SIM-23-ci`) |
 | `.github/workflows/agent-dispatch.yml` | Phase 3: cron + `workflow_dispatch`; reads the Jira queue, starts stage runs |
 | `.github/workflows/agent-spec.yml` | Phase 3: spec stage for one issue key (`workflow_dispatch` input `issue`) |
-| `.github/workflows/agent-implement.yml` | Phase 3: implement + verify + review stage, triggered by the G2 approval push |
+| `.github/workflows/agent-implement.yml` | Phase 3: implement + verify + review stage; `workflow_dispatch` only (inputs `issue`, `pr`, `sha`), started by the dispatcher for a spec PR carrying the G2 label (revised 2026-10-23, see "Second fix round") |
 | `.github/workflows/deploy.yml` | Phase 4: staging on push to `development`, production on push to `main`, rollback by `workflow_dispatch` with a `ref` |
 | `.github/workflows/release-pr.yml` | Phase 4: `workflow_dispatch` that opens a release PR with the `/release-check` checklist; never merges |
 | `.github/agent-prompts/README.md` | Phase 3: how the stage prompts map to the commands; prompts kept short and versioned |
 | `scripts/delivery/jira_ops.py` | Phase 3: Jira REST client for the workflows: fetch an issue to a file, run the queue JQL, comment, add/remove labels, transition. Refuses a transition to Done |
 | `scripts/delivery/agent_queue.py` | Phase 3: picks the next issue(s): priority order, skips running/blocked, honours `AGENT_MAX_CONCURRENT` and `AGENTS_ENABLED` |
 | `scripts/delivery/guard_branch.py` | Phase 3: validates a branch name (`^(feature\|fix)/SIM-[0-9]+-[a-z0-9-]+$`) and that its key matches the run's issue; refuses protected branches |
+| `scripts/delivery/g2_gate.py` | Phase 3 (added 2026-10-23): decides G2 from the PR, its timeline and the repository activity; lists the dispatcher's candidates; git defence-in-depth on `development..sha` |
 | `scripts/delivery/review_labels.py` | Phase 3: decides `needs-human-review` from the changed paths (the deterministic list in the implement stage) OR'd with the agent's outcome |
 | `scripts/delivery/notify_slack.py` | Phase 3/4: posts a fixed-format notice (key, stage, outcome, link) to the delivery channel webhook; no free text from Jira or Slack |
 | `scripts/deploy/remote_deploy.sh` | Phase 4: runs on the VM: fetch, check out an exact SHA, install `requirements.lock.txt`, restart, wait for the connect log line; prints the previous SHA for rollback |
@@ -114,7 +115,7 @@ Outside the repo (admin, recorded here so nothing is invented later):
 | Anthropic workspace for CI (**new**) | Anthropic console | Separate key with a monthly spend limit: the hard cost cap |
 | Jira service account (**new**) | Atlassian | SIM only: browse, comment, edit labels, transition. Cannot transition to Done (workflow condition: QA group only) |
 | Jira statuses Spec, In QA, Blocked; labels `agent-ready`, `agent-running`, `agent-blocked`, `from-slack`, `ai-repo` | Jira | Statuses and the Done condition need the Jira admin; all labels except `ai-repo` are **new** |
-| GitHub labels `needs-human-review` (in use per `.claude/rules/pr.md`), `agent-pr` (**new**) | GitHub | `agent-pr` marks bot-opened PRs |
+| GitHub labels `needs-human-review` (in use per `.claude/rules/pr.md`), `agent-pr`, `design-approved`, `agent-implemented` (**new**) | GitHub | Must exist before the pilot. `agent-pr` marks bot-opened PRs; `design-approved` is G2, added only by a `DESIGN_APPROVERS` login (the pipeline never adds it); `agent-implemented` is set by the implement publish so an approval is implemented at most once |
 | Slack channels `#ai-requests`, `#ai-delivery` (**new**) | Slack | Triage reads only `#ai-requests` (plus a test channel during the dry run); notices go to `#ai-delivery` |
 | GCP workload identity pool + deploy service account (**new**) | GCP | No JSON key. Roles limited to IAP tunnel and OS Login on the named VM(s) |
 | Claude cloud routine "slack-triage" (**new**) | claude.ai | Slack and Atlassian connectors, schedule, approver allow-list |
@@ -130,7 +131,7 @@ service runtime is untouched; only how changes reach it.
 | Gate | Who | Mechanism (deterministic where possible) | After it |
 |---|---|---|---|
 | G1 ticket | allow-listed approver | ✅ reaction on the routine's draft reply in the Slack thread | routine creates the SIM issue (To Do, `from-slack`, `ai-repo`, `agent-ready`) |
-| G2 design | allow-listed approver (`DESIGN_APPROVERS`) | changes `Status: draft` → `Status: approved` in the ticket's technical design on the ticket branch and pushes (web edit or local) | `agent-implement.yml` starts |
+| G2 design | allow-listed approver (`DESIGN_APPROVERS`) | adds the label `design-approved` to the agent's spec PR (revised 2026-10-23; the design stays `Status: draft`). Valid only if the LAST `labeled design-approved` event's actor is an approver (a User), nothing was pushed, force-pushed, deleted or unlabelled after it, and the PR head is the commit being built (`g2_gate.py`) | `agent-dispatch.yml` starts `agent-implement.yml` from `main` for that PR and head SHA |
 | G3 merge | human reviewer (tech lead for `needs-human-review`) | GitHub PR approval + merge; rulesets require green CI | `deploy.yml` deploys to staging |
 | G4 production | required reviewer on Environment `production` | GitHub Environment approval | production deploy runs |
 
@@ -141,7 +142,8 @@ agent):
 |---|---|
 | spec stage starts | → Spec; label `agent-running` |
 | spec draft PR opened | stays Spec; comment: PR link, spec paths, open questions count, cost; remove `agent-running` |
-| G2 push detected, implement stage starts | → In Progress; `agent-running` |
+| G2 label verified, implement stage starts | → In Progress; `agent-running` |
+| G2 refused for any reason other than "not approved yet" | → Blocked (Flagged + `agent-blocked`); comment and notice with category `g2-refused` |
 | PR marked ready for review | → In Review; comment: PR link, checks run, `needs-human-review` yes/no, `make e2e` required yes/no, cost |
 | merge to `development` + staging deploy succeeded | → In QA |
 | QA passes on staging | → Done, **by the QA engineer by hand** (the service account cannot) |
@@ -314,8 +316,9 @@ design below stands, with five changes to match the set-up as it now is:
    run from `main`, so `agent-dispatch.yml`, `agent-spec.yml` and
    `agent-implement.yml` get a workflow-only copy on `main` (as
    `slack-triage.yml` has). They check out `development` for code, scripts
-   and instructions. `agent-implement.yml` (push-triggered) runs from the
-   ticket branch, which is cut from `development` and contains it.
+   and instructions. `agent-implement.yml` is `workflow_dispatch` only too
+   (revised 2026-10-23: it was push-triggered and ran from the ticket
+   branch), so every credentialed job runs YAML from `main`.
 3. **Jira statuses.** The board has Spec and **QA** (not "In QA") and no
    Blocked status. Blocked work is marked with the Flagged field plus label
    `agent-blocked`; "In QA" in the tables below means QA.
@@ -378,13 +381,17 @@ design below stands, with five changes to match the set-up as it now is:
   `workflow-failed`.
 
 **Implement stage (`agent-implement.yml`)**
-- Trigger: `push` to `feature/SIM-*` and `fix/SIM-*` touching
-  `specs/technical-design/**`. Job `if:` kill switch **and**
-  `github.event.sender.login` in `DESIGN_APPROVERS` **and** not the bot. A
-  first step checks that the ticket's technical design now reads
-  `Status: approved` and that this commit changed it; otherwise exit quietly.
-  This keeps the repo's rule "only a human sets `approved`", and
-  `/implement`'s own check still runs.
+- Trigger (revised 2026-10-23, product owner): `workflow_dispatch` only, from
+  `main`, inputs `issue` (`^SIM-[0-9]+$`), `pr` (number) and `sha` (40 hex),
+  checked before any API call. `agent-dispatch.yml` starts it for each open
+  `agent-pr` PR labelled `design-approved` (and not `agent-implemented`)
+  whose G2 check passes and whose issue is in scope, within
+  `AGENT_MAX_CONCURRENT`. Job `if:` kill switch only: the approver is the
+  label event's actor, not the run's sender. `prepare` repeats the G2 check
+  (`g2_gate.py check`, then `git-check` on `development..sha`); "not approved
+  yet" exits quietly, any other refusal is reported (`g2-refused`) and flags
+  the issue. It writes the verified approval record (`g2.json`) for the
+  agent, which `/implement` in CI mode accepts instead of the status line.
 - Same isolation as the spec stage. Services: the pinned Qdrant container
   from `ci.yml`, so `make test` runs its store checks.
 - Jira → In Progress, `agent-running`. Agent prompt equivalent to
@@ -396,7 +403,8 @@ design below stands, with five changes to match the set-up as it now is:
   Allowed Bash adds `make test`, `python -m pytest *`, `ruff check *`.
   `make e2e` stays denied by `.claude/settings.json` and is not in the allowed
   list.
-- Publish step: `guard_branch.py`; push; mark the PR ready for review; add
+- Publish step: `guard_branch.py`; push; label the PR `agent-implemented`;
+  mark the PR ready for review (advisory: PR CI and G3 are the gate); add
   `needs-human-review` when the agent says so **or** the diff touches a
   path the rules name (deterministic list: `app/socket/schemas.py`,
   `app/langgraph/role_agent.py`, `app/socket/handlers/workspace_purge.py`,
@@ -422,7 +430,8 @@ design below stands, with five changes to match the set-up as it now is:
 - A diff touching `.github/**`, `.claude/**` or `scripts/deploy/**` is always
   `needs-human-review`.
 - No `pull_request_target`; no workflow checks out untrusted refs with write
-  tokens.
+  tokens; no workflow that references a secret has a `push` or
+  `pull_request` trigger (added 2026-10-23, static test).
 
 **Cost**
 - Per run: `--max-turns`, `timeout-minutes`, the model from `AGENT_MODEL`.
@@ -509,8 +518,12 @@ through G1.
 | Bad staging/production deploy | Exact-SHA checkout; health check on the connect line; automatic restore of the previous SHA; manual rollback by `workflow_dispatch`; production waits for G4 |
 | Deploy credentials leaked | Workload identity (no key file), environment-scoped, IAP + OS Login on named VMs only |
 | Client data in tickets, PRs or logs | Routine and prompts forbid it; `security-auditor` checks specs and logs; gitleaks in pre-commit and CI; reviewers |
-| Agent push token belongs to an approver | Agent pushes arrive with an approver as sender. Controls: every commit in the push checked for agent identity, publish refuses agent changes under `specs/`, the pipeline and the gates. REQUIRED before going beyond the pilot: a separate machine-user push identity outside `DESIGN_APPROVERS`, and secrets in a `main`-only Environment with branch rulesets (org admin) |
-| A push-triggered workflow runs the ticket branch's own copy of `agent-implement.yml` | Only approvers' pushes pass the job `if:`; the design gate refuses a branch whose `.github/` differs from `development`; agent pushes cannot change `.github/`. Residual: an approver's own branch edit to the workflow runs with the secrets. Rulesets/Environment (above) close it |
+| Agent push token belongs to an approver | Agent pushes and the pipeline's own PR edits arrive as an approver. G2 no longer reads the sender: it is the `design-approved` label event's actor, and no workflow ever adds that label (static test). `git-check` refuses an agent commit outside the issue's own spec files on `development..sha`; publish refuses agent changes under `specs/`, the pipeline and the gates. Residual: anything that can act with the token (only the publish steps hold it, after the agent has exited) could add the label as the approver. REQUIRED before going beyond the pilot: a separate machine-user push identity outside `DESIGN_APPROVERS` (org admin) |
+| ~~A push-triggered workflow runs the ticket branch's own copy of `agent-implement.yml`~~ | **Closed** 2026-10-23 (security re-audit #1, product owner decision): `agent-implement.yml` is `workflow_dispatch` only and runs from `main`; static test: no workflow that references a secret has a `push` or `pull_request` trigger (`ci.yml`, which has them, references none). The earlier mitigation text ("only approvers' pushes pass the job `if:`") was wrong: the push token's owner is an approver, so every pipeline push passed it |
+| Agent-written code runs next to the Anthropic key | The agent job holds `ANTHROPIC_API_KEY` while Claude runs `make test` over code it wrote. `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` scrubs it from subprocess environments (best effort, per the action's docs), harden-runner removes sudo and container access and blocks egress except the allow-list. **Accepted residual:** a scrub is not isolation (the key is still in the action's own process), and an allowed host can carry data out (for example `api.anthropic.com` itself, or a GitHub endpoint reachable with the read-only job token). The key is a separate CI-workspace key with a monthly spend limit; rotate it on any suspicion; harden-runner insights are reviewed after the pilot |
+| G2 label read from the timeline | `committed` events sort by the commit's own date, which a pusher controls, so the gate also requires the branch's latest push in the repository activity API to be the dispatched SHA and to predate the label. Pilot check: that the activity API answers with the read-only job token; if not, the gate refuses (`push-unverified`, fail closed) |
+| A G2 refusal flags the issue | Refusals other than "not approved yet" set Flagged + `agent-blocked` so the dispatcher does not re-start a refused run every 15 minutes; a person re-labels (or fixes the branch) and unflags the issue |
+| Pilot checks not verifiable offline (2026-10-23) | (1) harden-runner `disable-sudo-and-containers` with the Qdrant service container: the service is reached by port, but the runner's container teardown may warn; fallback `disable-sudo: "true"` (deprecated at the pinned SHA). (2) `allowed_bots: github-actions` on `workflow_dispatch` runs started by the dispatcher: the action's `checkHumanActor` (agent mode) resolves `github-actions[bot]` as a non-User and consults `allowed_bots`; confirm on the first dispatched run. (3) The `claude-code-action` pin `cb4685f8…` is the annotated tag object of v1.0.258, not its commit (`6b6870e649b5ff408753befeaee5fc7989d4e6a9`); confirm the runner resolves it, or re-pin to the commit in every workflow (including `slack-triage.yml`) together |
 | harden-runner allow-list incomplete (pilot) | `egress-policy: block` with an explicit list; wildcard (`*.githubusercontent.com`) support and the implicit artifact/cache endpoints are not verifiable offline. A blocked call fails the job, which ends Blocked `workflow-failed` (fail closed). Check the first pilot run's harden-runner insights and widen the list by name, never with a broad wildcard such as `*.blob.core.windows.net` |
 | Ticket artifact readable for up to a day | `retention-days: 1`; no deletion, because that needs `actions: write` on a credentialed job. Hand-off artifacts carry no ticket text |
 | A trusted-copy outcome is normalised on the agent's runner | Publish re-normalises with its own `development` checkout; the agent-job copy only limits what is uploaded |
@@ -525,7 +538,10 @@ through G1.
     `vars.AGENTS_ENABLED == 'true'`;
   - `ci.yml` has `permissions: contents: read` and references no
     `secrets.`;
-  - no workflow uses `pull_request_target`;
+  - no workflow uses `pull_request_target`, and no workflow referencing a
+    secret has a `push` or `pull_request` trigger (`ci.yml` has them and
+    references no secret);
+  - no workflow adds the `design-approved` label (G2 is a person's act);
   - every third-party `uses:` is pinned to a 40-character SHA;
   - no `run:` interpolates `github.event.*` text fields (issue/PR body or
     title, comment body, head ref) directly;
@@ -535,6 +551,9 @@ through G1.
     only on `main` or `workflow_dispatch`;
   - the allowed-tools string for the agent excludes `git push`, `gh`,
     `curl`, `WebFetch` and `make e2e`.
+- `tests/test_delivery_g2_gate.py` (added 2026-10-23, fixture JSON and a
+  throwaway git repository): who labelled, nothing after the label, the push
+  record, the PR shape, inputs, candidates, git defence in depth.
 - `tests/test_delivery_scripts.py` (**new**, fake HTTP):
   - `jira_ops`: queue JQL ordering; comment text has no ticket body; a
     transition to Done raises; issue key validation;
@@ -747,18 +766,124 @@ Review and security-audit fixes (SIM-153, 2026-10-23), as built:
 - **Implement PR title** is set to `<KEY>: implementation` on the existing
   spec PR.
 
+Second fix round (SIM-153, 2026-10-23), as built. These supersede the
+"G2 hardening" and "G2 checks every commit in the push" bullets above and the
+`paths: specs/technical-design/**` trigger reasoning in "Publish refuses
+protected agent changes":
+- **G2 is a PR label; implement runs only from `main`** (product owner
+  decision 2026-10-23, security re-audit #1: a push-triggered workflow runs
+  the pushed branch's YAML, so any writer could read the secrets).
+  `agent-implement.yml` is `workflow_dispatch` with inputs `issue`, `pr`,
+  `sha`, checked first (`g2_gate.py inputs`); every job checks out
+  `development` and fetches `sha` as git data with the read-only job token.
+  The push-based `stage_io.py design-gate` and its tests are removed.
+- **`scripts/delivery/g2_gate.py` (new)** decides G2 from three GitHub
+  replies, tested with fixture JSON (`tests/test_delivery_g2_gate.py`): the
+  pull (open, base `development`, head the issue's own ticket branch in this
+  repository, labels `agent-pr` and `design-approved`, not
+  `agent-implemented`, head SHA = input `sha`), the issue timeline
+  (`gh api repos/{repo}/issues/{pr}/timeline --paginate`: the LAST
+  `labeled design-approved` event's `actor.login` must be in
+  `DESIGN_APPROVERS` (comma list, trimmed, case-insensitive) and of type
+  User; no later `unlabeled design-approved`, `committed`,
+  `head_ref_force_pushed` or `head_ref_deleted`, by position or by
+  `created_at`) and, **added beyond the decision**, the repository activity
+  (`repos/{repo}/activity?ref=refs/heads/<branch>`): the branch's latest
+  push must be `sha` and must predate the label, because a `committed`
+  event sorts by the commit's own forgeable date. Quiet reasons (job summary
+  only): `not-approved`, `already-implemented`, `bad-input`, `bad-data`;
+  any other refusal is reported in Jira and Slack with the new reason
+  category `g2-refused` and flags the issue (so the dispatcher does not
+  repeat it).
+- **Defence in depth on `development..sha` (`g2_gate.py git-check`), changed
+  from the request:** the request kept "every commit in range not
+  agent-authored", but the spec stage's own commit (`docs(<KEY>): specs`,
+  by `pracsys-agent`) is always in that range, so the literal rule would
+  refuse every run. As built: an agent-authored or agent-committed commit
+  may touch only the issue's own three spec files; anything else is
+  `agent-commit`. The branch may not change `PROTECTED_PREFIXES`
+  (`protected-path`).
+- **Dispatcher.** `agent-dispatch.yml` (runs from `main`) lists open PRs
+  labelled `agent-pr` + `design-approved` (`g2_gate.py candidates`: base
+  `development`, not cross-repository, ticket branch head, not
+  `agent-implemented`), runs the same check with the read-only token, keeps
+  issues in scope (`jira_ops.py check-scope`, in a step without a GitHub
+  token: no `agent-running` / `agent-blocked`), and starts
+  `gh workflow run agent-implement.yml --ref main -f issue= -f pr= -f sha=`
+  within `AGENT_MAX_CONCURRENT`; implement runs started this tick count
+  against the spec queue's room. A refusal that must be reported is started
+  too, so the implement stage reports it once. Kill switch unchanged.
+- **`agent-implemented` label.** Implement publish adds it to the PR on
+  every outcome, and the gate refuses (quietly) a PR that carries it, so an
+  approval is implemented at most once; a re-label after a new push needs a
+  person to remove it.
+- **Approval record for the agent.** `prepare` writes
+  `$RUNNER_TEMP/ticket/g2.json` (`gate`, `label`, `issue`, `pr`, `sha`,
+  `approver`, `labelledAt`) only when G2 passes; it reaches the agent as
+  `$RUNNER_TEMP/agent/g2.json`. In CI mode `/implement` and
+  `.github/agent-prompts/implement.md` accept that file (gate G2, this
+  issue, the checked-out SHA) instead of `Status: approved`; the spec stage
+  still writes `Status: draft`, and the interactive rule is unchanged.
+- **harden-runner** on both agent jobs and the gates job adds
+  `disable-sudo-and-containers: "true"` (input read from `action.yml` at
+  `ccd8616d…`; `disable-sudo` alone is deprecated there). Pilot check in
+  "Risks and rollback".
+- **Subprocess env scrub.** Both agent steps set
+  `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"`. Verified in the action source at
+  the commit the pinned tag points to (`6b6870e6…`): `action.yml` forwards
+  `env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` to the CLI, and `docs/security.md`
+  describes a best-effort scrub of Anthropic, cloud and GitHub Actions
+  secrets from subprocess environments. Residual risk recorded.
+- **`allowed_bots: github-actions`** is now set on the implement agent step
+  too: dispatched runs have `github-actions[bot]` as actor. Push mode no
+  longer applies; behaviour on `workflow_dispatch` is a pilot check.
+- **`gitleaks:allow` is refused.** Both publish jobs run
+  `stage_io.py allow-markers` over `git log -p` of exactly the commits to be
+  pushed; any agent-ADDED line carrying `gitleaks:allow` (any case or
+  spacing) is `secret-found`, nothing pushed.
+- **More protected files.** `.gitleaks.toml`, `.gitleaksignore`,
+  `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.mcp.json`, root
+  `conftest.py` and `tests/conftest.py` join `PROTECTED_PREFIXES` (G2
+  git-check and implement publish), are refused explicitly by the spec
+  publish, and join `review_labels.SENSITIVE_DIRS`.
+- **No pip cache on the agent job** (`cache: pip` dropped).
+- **Comments** in both stage workflows say plainly that the agent job's
+  normalisation is a shape filter, not a control; publish's re-validation is.
+- **Final verdict in one place.** `stage_io.py decide` takes the publish
+  refusals (`--protected`, `--secret`), `--budget` and `--gates-mismatch`
+  and returns `{ready, reasonCategory, push}`. Nothing is pushed on
+  `protected-path`, `secret-found` or `budget` (AC-39); a red run still
+  pushes a draft (AC-34). `pr-comment` takes `--ready` and `--reason` and
+  renders them, never recomputing. When the gates job tested another tree
+  than the one publish would push, the reason is the new category
+  `gates-mismatch` (not `tests-red`), and the comment shows the gate codes
+  as "no result for this tree".
+- **Already ran with concurrency > 1.** `guard_branch.py already-ran` also
+  reports `openAgentPr`; the spec stage flags the issue Blocked only when no
+  open `agent-pr` PR for the key exists, and otherwise only comments.
+- **"Ready for review" is advisory.** It is the pipeline's opinion; the
+  required PR CI checks and the human review and merge (G3) are the gate.
+- **Labels prerequisite.** `design-approved`, `agent-pr`,
+  `needs-human-review` and `agent-implemented` must exist in the repository
+  before the pilot (admin table above).
+
 REQUIRED before `AGENTS_ENABLED=true` beyond the pilot (org admin; not in
 code):
 - **A separate push identity** (a machine user or GitHub App) that is NOT
   in `DESIGN_APPROVERS`. Today `AGENT_PUSH_TOKEN` belongs to an approver, so
-  every agent push arrives with an approver as `sender` and passes the
-  implement job's `if:`. The pipeline's assumption is therefore that the
-  sender proves nothing: `design-gate` refuses agent commits anywhere in the
-  push, and publish refuses any agent change under `specs/` (static test
-  `test_push_token_owner_is_never_trusted_as_an_approver_by_default`).
-- **Secrets in a GitHub Environment** limited to the `main` branch, plus
-  branch rulesets on `development` / `staging` / `main` with no bypass for
-  the push identity.
+  every pipeline push and PR edit is made as an approver. G2 does not read
+  the run's sender (it is the label event's actor, and no workflow adds
+  `design-approved`), `git-check` refuses agent commits outside the spec
+  files, and publish refuses any agent change under `specs/` (static test
+  `test_push_token_owner_is_never_trusted_as_an_approver_by_default`). But
+  anything acting with that token could add the label as the approver;
+  only a separate identity closes that.
+- **Secrets in a GitHub Environment** limited to `main`, plus branch
+  rulesets on `development` / `staging` / `main` with no bypass for the push
+  identity. Since every credentialed job now runs from `main`
+  (`workflow_dispatch` / `schedule`), a `main`-only Environment IS usable
+  for the agent workflows' secrets; before this change the push-triggered
+  implement stage ran from ticket branches and could not have used one.
 
 Design decisions needing tech-lead approval:
 - **Push rights, narrowest form.** PRACENG lets Claude push and merge to

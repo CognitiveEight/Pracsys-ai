@@ -35,8 +35,8 @@ says:
    `specs/technical-design/<KEY>-<short-name>.md` and
    `specs/acceptance-criteria/<KEY>-<short-name>.md`. Touch nothing else. The
    technical design's status line must read `- **Status:** draft`. Only a
-   human sets `approved`, and the workflow refuses to publish a design that
-   reads `approved`.
+   human approves (gate G2: the `design-approved` label on the PR), and the
+   workflow refuses to publish a design that reads `approved`.
 5. Use fictional data only: no names, phone numbers, case text or objective
    text from the ticket.
 6. Run `make lint`, then commit with

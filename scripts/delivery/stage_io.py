@@ -5,15 +5,14 @@
     git diff --name-only origin/development...<branch> | \\
         python scripts/delivery/stage_io.py spec-paths --issue SIM-<n>
     git show <branch>:<design.md> | python scripts/delivery/stage_io.py design-status
-    python scripts/delivery/stage_io.py design-gate --branch <ref name> --before <sha> --after <sha> \\
-        --base origin/development [--repo .]
     git log --no-renames --name-only --format= <range> | \\
         python scripts/delivery/stage_io.py agent-paths --stage spec|implement --issue SIM-<n>
+    git log -p --no-renames --format= <range> | python scripts/delivery/stage_io.py allow-markers
     python scripts/delivery/stage_io.py decide --outcome <normalised.json> \\
-        --lint-rc <n> --test-rc <n> --commits <n> [--budget]
+        --lint-rc <n> --test-rc <n> --commits <n> [--budget] [--protected] [--secret] [--gates-mismatch]
     git diff --name-only origin/development...<branch> | \\
         python scripts/delivery/stage_io.py pr-comment --issue SIM-<n> --outcome <normalised.json> \\
-        --lint-rc <n> --test-rc <n> --commits <n> [--agent-flag] [--cost <usd>]
+        --ready true|false --reason <category> --lint-rc <n> --test-rc <n> [--agent-flag] [--cost <usd>]
 
 The agent's outcome file is untrusted: ``outcome`` keeps only the fields the
 design names, each checked, and turns anything unexpected into
@@ -22,13 +21,13 @@ cost, and whether the run hit a spend limit, from the action's result summary
 (the execution log holds everything the agent read, so it is never
 published). ``spec-paths`` confines the spec stage to its own three spec
 files; ``agent-paths`` is the publish jobs' refusal list (the implement stage
-may not change the pipeline, the gates or any spec). ``design-gate`` decides
-whether a push is the G2 approval: the ticket's technical design flipped to
-``Status: approved`` in this push, with no commit in the pushed range authored
-or committed by the agent, on a branch that does not change the pipeline or
-the gates (``PROTECTED_PREFIXES``). ``decide`` and ``pr-comment`` give the
-implement stage's verdict and PR comment from those fields only. Standard
-library only; prints JSON (``pr-comment`` prints markdown).
+may not change the pipeline, the gates or any spec); ``allow-markers`` refuses
+any agent-added ``gitleaks:allow``. ``design-status`` reads a design's header
+``Status:`` line (the spec publish refuses a design the agent marked
+approved). ``decide`` gives the implement stage's final verdict, reason and
+whether to push; ``pr-comment`` renders that verdict (it never recomputes it).
+G2 itself is ``g2_gate.py``. Standard library only; prints JSON
+(``pr-comment`` prints markdown).
 """
 
 from __future__ import annotations
@@ -37,7 +36,6 @@ import argparse
 import json
 import math
 import re
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -54,20 +52,24 @@ _MAX_OUTCOME_BYTES = 64_000
 _MAX_AC = 100
 _AC_ID = re.compile(r"^AC-[0-9]{1,4}[a-z]?$")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
-_ZERO_SHA = "0" * 40
 _SPEC_PATH = r"^specs/(requirements|technical-design|acceptance-criteria)/{key}-[a-z0-9][a-z0-9-]*\.md$"
 _STATUS_LINE = re.compile(r"^\s*(?:[-*]\s+)?Status\s*:\s*(.*)$")
 _LIMIT_SUBTYPES = ("error_max_budget_usd",)
+_ALLOW_MARKER = re.compile(r"gitleaks\s*:\s*allow", re.IGNORECASE)
+#: Reasons on which publish pushes nothing (AC-39 for ``budget``).
+NO_PUSH_REASONS = ("protected-path", "secret-found", "budget")
 #: Identities the agent commits under: the workflow's git identity, and the
 #: action's default bot identity in case the environment override is lost.
 AGENT_IDENTITIES = (
     "pracsys-agent@users.noreply.github.com",
     "41898282+claude[bot]@users.noreply.github.com",
 )
-#: A ticket branch touching these is not run by the agent: they hold the
-#: instructions, hooks and workflows the next agent run would execute under,
-#: the delivery scripts the jobs holding secrets run, and the gates
-#: (``make lint`` / ``make test`` and what they read). Prefixes, so
+#: A ticket branch touching these is not run by the agent, and no agent commit
+#: may touch them: they hold the instructions, hooks and workflows the next
+#: agent run would execute under (``CLAUDE.md``, ``AGENTS.md``, ``.mcp.json``),
+#: the delivery scripts the jobs holding secrets run, the secret scan's own
+#: configuration, and the gates (``make lint`` / ``make test`` and what they
+#: read, including the conftest files pytest loads first). Prefixes, so
 #: ``requirements`` covers every ``requirements*.txt``.
 PROTECTED_PREFIXES = (
     ".claude/",
@@ -78,11 +80,17 @@ PROTECTED_PREFIXES = (
     "pyproject.toml",
     "pytest.ini",
     "requirements",
+    ".gitleaks.toml",
+    ".gitleaksignore",
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    "AGENTS.md",
+    ".mcp.json",
+    "conftest.py",
+    "tests/conftest.py",
 )
 #: What an implement-stage agent may never change (publish refuses, nothing is
-#: pushed). The specs are the human-approved input; keeping
-#: ``specs/technical-design/`` here also means an implement push can never
-#: start the implement workflow (its trigger path).
+#: pushed). The specs are the human-approved input.
 IMPLEMENT_PROTECTED_PREFIXES = PROTECTED_PREFIXES + (
     "specs/technical-design/",
     "specs/requirements/",
@@ -250,6 +258,11 @@ def _clean_path(path: str) -> str:
     return path
 
 
+def is_protected(path: str) -> bool:
+    """Whether ``path`` is on the pipeline/gates list (``PROTECTED_PREFIXES``)."""
+    return _clean_path(path).startswith(PROTECTED_PREFIXES)
+
+
 def check_agent_paths(stage: str, issue: str, paths: Iterable[str]) -> Tuple[bool, List[str], Optional[str]]:
     """Whether a publish job may push an agent change touching ``paths``.
 
@@ -262,7 +275,7 @@ def check_agent_paths(stage: str, issue: str, paths: Iterable[str]) -> Tuple[boo
     clean = sorted({_clean_path(p) for p in paths if p and p.strip()})
     if stage == "spec":
         pattern = re.compile(_SPEC_PATH.format(key=re.escape(key)))
-        matched = [p for p in clean if not pattern.fullmatch(p) or ".." in p]
+        matched = [p for p in clean if not pattern.fullmatch(p) or ".." in p or is_protected(p)]
     else:
         matched = [p for p in clean if p.startswith(IMPLEMENT_PROTECTED_PREFIXES) or ".." in p]
     if matched:
@@ -285,88 +298,74 @@ def design_approved(text: str) -> bool:
     return False
 
 
-def _git(repo: str, *args: str) -> str:
-    return subprocess.run(
-        ["git", "-C", repo, *args], check=True, capture_output=True, text=True
-    ).stdout
+# ---------------------------------------------------------- allow markers
 
 
-def _exists(repo: str, rev: str) -> bool:
-    return subprocess.run(
-        ["git", "-C", repo, "cat-file", "-e", rev], capture_output=True
-    ).returncode == 0
-
-
-def design_gate(branch: str, before: str, after: str, base: str, repo: str = ".") -> Dict[str, Any]:
-    """Whether the push ``before``..``after`` to ``branch`` is the G2 approval."""
-    match = re.fullmatch(r"(?:feature|fix)/(SIM-[0-9]+)-[a-z0-9][a-z0-9-]*", branch or "")
-    if not match:
-        return {"go": False, "reason": "not-ticket-branch", "issue": None, "branch": None}
-    issue = match.group(1)
-    for sha in (before, after):
-        if not _SHA.fullmatch(sha or ""):
-            raise StageRefused("before and after must be 40-hex commit ids")
-    result = {"go": False, "issue": issue, "branch": guard_branch.check(branch, issue)}
-
-    prefix = f"specs/technical-design/{issue}-"
-    listing = _git(repo, "ls-tree", "--name-only", after, "specs/technical-design/").splitlines()
-    designs = [p for p in listing if p.startswith(prefix) and p.endswith(".md")]
-    if len(designs) != 1:
-        return {**result, "reason": "no-design"}
-    design = designs[0]
-    if not design_approved(_git(repo, "show", f"{after}:{design}")):
-        return {**result, "reason": "not-approved"}
-    if before != _ZERO_SHA:
-        if not _exists(repo, before):
-            return {**result, "reason": "before-unavailable"}
-        if _exists(repo, f"{before}:{design}") and design_approved(_git(repo, "show", f"{before}:{design}")):
-            return {**result, "reason": "already-approved"}
-    # Every commit this push adds (a new branch: everything not on the base), by author and
-    # committer: an agent commit anywhere in the range refuses the whole push.
-    span = f"{base}..{after}" if before == _ZERO_SHA else f"{before}..{after}"
-    identities = _git(repo, "log", "--format=%ae%n%ce", span).split()
-    if any(identity.lower() in AGENT_IDENTITIES for identity in identities):
-        return {**result, "reason": "agent-commit"}
-    changed = _git(repo, "diff", "--name-only", f"{base}...{after}").splitlines()
-    if any(p.startswith(PROTECTED_PREFIXES) for p in changed):
-        return {**result, "reason": "protected-path"}
-    return {**result, "go": True, "reason": "approved", "design": design}
+def allow_markers(patch_lines: Iterable[str]) -> int:
+    """How many lines a patch ADDS that carry a ``gitleaks:allow`` marker (any spacing or case).
+    An agent may never add one: it would silence the secret scan for that line."""
+    count = 0
+    for line in patch_lines:
+        if line.startswith("+") and not line.startswith("+++") and _ALLOW_MARKER.search(line):
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------- decision
 
 
 def implement_decision(outcome: Dict[str, Any], lint_rc: Optional[int], test_rc: Optional[int],
-                       commits: int, run_budget: bool = False) -> Dict[str, Any]:
-    """Ready for review only with green gates, an approving verdict, at least one AC result
-    and every AC passing."""
+                       commits: int, run_budget: bool = False, *, protected: bool = False,
+                       secret: bool = False, gates_mismatch: bool = False) -> Dict[str, Any]:
+    """The implement stage's final verdict: ``{ready, reasonCategory, push}``.
+
+    Ready for review only with green gates on exactly the tree to be pushed, an approving
+    verdict, at least one AC result and every AC passing. Publish refusals come first
+    (``protected-path``, ``secret-found``: nothing pushed), then a run stopped by a spend
+    limit (``budget``: nothing pushed, AC-39), then gate codes from another tree
+    (``gates-mismatch``). Any other blocked run is pushed as a draft for a human (AC-34)."""
+    def verdict(ready: bool, reason: Optional[str]) -> Dict[str, Any]:
+        push = commits > 0 and reason not in NO_PUSH_REASONS
+        return {"ready": ready and push, "reasonCategory": reason, "push": push}
+
+    if protected:
+        return verdict(False, "protected-path")
+    if secret:
+        return verdict(False, "secret-found")
     green = lint_rc == 0 and test_rc == 0
     if not outcome.get("valid"):
         if run_budget:
-            return {"ready": False, "reasonCategory": "budget"}
-        return {"ready": False, "reasonCategory": "workflow-failed" if green else "tests-red"}
+            return verdict(False, "budget")
+        if gates_mismatch:
+            return verdict(False, "gates-mismatch")
+        return verdict(False, "workflow-failed" if green else "tests-red")
     if outcome.get("status") != "ready":
-        return {"ready": False, "reasonCategory": outcome.get("reasonCategory") or "dor-gap"}
+        return verdict(False, outcome.get("reasonCategory") or "dor-gap")
+    if gates_mismatch:
+        return verdict(False, "gates-mismatch")
     results = outcome.get("acResults") or []
     if not green or not all(r["pass"] for r in results):
-        return {"ready": False, "reasonCategory": "tests-red"}
+        return verdict(False, "tests-red")
     if not results:
-        return {"ready": False, "reasonCategory": "dor-gap"}
+        return verdict(False, "dor-gap")
     if outcome.get("verdict") not in ("approve", "approve-with-follow-ups"):
-        return {"ready": False, "reasonCategory": "review-changes"}
+        return verdict(False, "review-changes")
     if commits <= 0:
-        return {"ready": False, "reasonCategory": "workflow-failed"}
-    return {"ready": True, "reasonCategory": None}
+        return verdict(False, "workflow-failed")
+    return verdict(True, None)
 
 
 def _gate(rc: Optional[int]) -> str:
+    if rc is None:
+        return "no result for this tree"
     return "green" if rc == 0 else "red"
 
 
 def pr_comment(*, issue: str, outcome: Dict[str, Any], decision: Dict[str, Any],
                lint_rc: Optional[int], test_rc: Optional[int], needs_human_review: bool,
                matched: List[str], cost: Optional[float]) -> str:
-    """The implement stage's one PR comment, from validated fields only."""
+    """The implement stage's one PR comment, from validated fields only. ``decision`` is the
+    final verdict publish already settled (``decide``); it is rendered, never recomputed."""
     guard_branch.validate_key(issue)
     for path in matched:
         if path not in review_labels.SENSITIVE_FILES and not path.startswith(review_labels.SENSITIVE_DIRS):
@@ -376,6 +375,8 @@ def pr_comment(*, issue: str, outcome: Dict[str, Any], decision: Dict[str, Any],
     category = decision.get("reasonCategory")
     if category is not None and category not in notify_slack.REASON_CATEGORIES:
         raise StageRefused("unknown reason category")
+    if not isinstance(decision.get("ready"), bool) or (decision["ready"] and category is not None):
+        raise StageRefused("ready must be a bool, with no reason when ready")
     yes = {True: "yes", False: "no"}
     lines = [
         f"### Agent pipeline: {issue} implement stage",
@@ -429,23 +430,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stage", required=True, choices=STAGES)
     p.add_argument("--issue", required=True)
     sub.add_parser("design-status")
-    p = sub.add_parser("design-gate")
-    p.add_argument("--branch", required=True)
-    p.add_argument("--before", required=True)
-    p.add_argument("--after", required=True)
-    p.add_argument("--base", required=True)
-    p.add_argument("--repo", default=".")
+    sub.add_parser("allow-markers", help="a patch on stdin")
     for name in ("decide", "pr-comment"):
         p = sub.add_parser(name)
         p.add_argument("--outcome", required=True)
         p.add_argument("--lint-rc", default="")
         p.add_argument("--test-rc", default="")
-        p.add_argument("--commits", default="0")
-        p.add_argument("--budget", action="store_true", help="the run stopped on a spend limit")
-        if name == "pr-comment":
-            p.add_argument("--issue", required=True)
-            p.add_argument("--agent-flag", action="store_true")
-            p.add_argument("--cost", type=float)
+    p = sub.choices["decide"]
+    p.add_argument("--commits", default="0")
+    p.add_argument("--budget", action="store_true", help="the run stopped on a spend limit")
+    p.add_argument("--protected", action="store_true", help="publish refused a protected path")
+    p.add_argument("--secret", action="store_true", help="gitleaks or an allow marker refused it")
+    p.add_argument("--gates-mismatch", action="store_true",
+                   help="the gates job tested another tree than the one to be pushed")
+    p = sub.choices["pr-comment"]
+    p.add_argument("--issue", required=True)
+    p.add_argument("--ready", required=True, choices=("true", "false"))
+    p.add_argument("--reason", default="")
+    p.add_argument("--agent-flag", action="store_true")
+    p.add_argument("--cost", type=float)
     return parser
 
 
@@ -464,26 +467,27 @@ def main(argv: List[str] | None = None) -> int:
             result = {"ok": ok, "matched": matched, "reason": reason}
         elif args.command == "design-status":
             result = {"approved": design_approved(sys.stdin.read())}
-        elif args.command == "design-gate":
-            result = design_gate(args.branch, args.before, args.after, args.base, args.repo)
-        else:
+        elif args.command == "allow-markers":
+            count = allow_markers(sys.stdin.read().splitlines())
+            result = {"ok": count == 0, "count": count}
+        elif args.command == "decide":
             outcome = _load_outcome(args.outcome)
             commits = int(args.commits) if re.fullmatch(r"[0-9]{1,6}", args.commits) else 0
-            decision = implement_decision(outcome, _rc(args.lint_rc), _rc(args.test_rc), commits,
-                                          run_budget=args.budget)
-            if args.command == "decide":
-                result = decision
-            else:
-                needed, matched = review_labels.needs_human_review(
-                    sys.stdin.read().splitlines(),
-                    agent_flag=args.agent_flag or bool(outcome.get("needsHumanReview")),
-                )
-                print(pr_comment(issue=args.issue, outcome=outcome, decision=decision,
-                                 lint_rc=_rc(args.lint_rc), test_rc=_rc(args.test_rc),
-                                 needs_human_review=needed, matched=matched, cost=args.cost), end="")
-                return 0
-    except (StageRefused, guard_branch.GuardRefused, subprocess.CalledProcessError, OSError,
-            ValueError) as refused:
+            result = implement_decision(outcome, _rc(args.lint_rc), _rc(args.test_rc), commits,
+                                        run_budget=args.budget, protected=args.protected,
+                                        secret=args.secret, gates_mismatch=args.gates_mismatch)
+        else:
+            outcome = _load_outcome(args.outcome)
+            decision = {"ready": args.ready == "true", "reasonCategory": args.reason or None}
+            needed, matched = review_labels.needs_human_review(
+                sys.stdin.read().splitlines(),
+                agent_flag=args.agent_flag or bool(outcome.get("needsHumanReview")),
+            )
+            print(pr_comment(issue=args.issue, outcome=outcome, decision=decision,
+                             lint_rc=_rc(args.lint_rc), test_rc=_rc(args.test_rc),
+                             needs_human_review=needed, matched=matched, cost=args.cost), end="")
+            return 0
+    except (StageRefused, guard_branch.GuardRefused, OSError, ValueError) as refused:
         print(f"refused: {type(refused).__name__}", file=sys.stderr)
         return 2
     print(json.dumps(result))

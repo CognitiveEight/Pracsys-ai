@@ -272,7 +272,8 @@ def test_dispatch_schedule_queue_and_start():
     assert set(triggers) == {"schedule", "workflow_dispatch"}
     assert triggers["schedule"] == [{"cron": "*/15 3-15 * * 1-6"}]
     job = doc["jobs"]["dispatch"]
-    assert job["permissions"] == {"actions": "write", "contents": "read", "pull-requests": "read"}
+    assert job["permissions"] == {"actions": "write", "contents": "read", "pull-requests": "read",
+                                  "issues": "read"}
     text = (WORKFLOWS / "agent-dispatch.yml").read_text()
     assert "ANTHROPIC_API_KEY" not in text and "AGENT_PUSH_TOKEN" not in text
     assert "scripts/delivery/agent_queue.py next" in text
@@ -324,22 +325,24 @@ def test_spec_stage_shape():
 def test_implement_stage_shape():
     path = WORKFLOWS / "agent-implement.yml"
     doc, triggers = _wf(path)
-    assert set(triggers) == {"push"}
-    assert triggers["push"]["branches"] == ["feature/SIM-*", "fix/SIM-*"]
-    assert triggers["push"]["paths"] == ["specs/technical-design/**"]
-    gate = doc["jobs"]["prepare"]
-    cond = _flat(gate["if"])
-    assert "contains(format(',{0},',vars.DESIGN_APPROVERS),format(',{0},',github.event.sender.login))" in cond
-    assert "github.event.sender.type!='Bot'" in cond
+    # Runs from `main` only: workflow_dispatch, never a push (any writer could push a modified
+    # copy of this file and read the secrets).
+    assert set(triggers) == {"workflow_dispatch"}
+    inputs = triggers["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {"issue", "pr", "sha"}
+    assert all(i["required"] is True for i in inputs.values())
+    assert doc["concurrency"] == {"group": "agent-${{ inputs.issue }}", "cancel-in-progress": False}
     text = path.read_text()
-    for needed in ("stage_io.py design-gate", "--to \"In Progress\"", "--add agent-running",
+    for needed in ("g2_gate.py check", "g2_gate.py git-check", "--to \"In Progress\"", "--add agent-running",
                    "qdrant/qdrant:v1.18.3", "requirements.lock.txt", "make lint", "make test",
                    "stage_io.py outcome --stage implement", "stage_io.py decide", "review_labels.py",
                    "gh pr ready", "needs-human-review", "gh pr comment", "--to \"In Review\"",
-                   "--to Blocked", "guard_branch.py check", "notify_slack.py post"):
+                   "--to Blocked", "guard_branch.py check", "notify_slack.py post",
+                   "--add-label agent-implemented", "--reason-category g2-refused"):
         assert needed in text, needed
     (_, _, step), = _agent_steps(doc)
     assert ".github/agent-prompts/implement.md" in step["with"]["prompt"]
+    assert "g2.json" in step["with"]["prompt"]
     args, tools = _allowed_tools(step)
     for tool in ("Bash(make test:*)", "Bash(python -m pytest:*)", "Bash(ruff check:*)"):
         assert tool in tools
@@ -350,6 +353,43 @@ def test_implement_stage_shape():
     assert "failure()||cancelled()" in _flat(cleanup["if"])
     body = "\n".join(step.get("run", "") for step in cleanup["steps"])
     assert "workflow-failed" in body and "--remove agent-running" in body and "--to Blocked" in body
+
+
+def test_implement_inputs_are_checked_before_any_api_call_and_reach_scripts_via_env():
+    doc, _ = _wf(WORKFLOWS / "agent-implement.yml")
+    steps = doc["jobs"]["prepare"]["steps"]
+    validate = next(i for i, s in enumerate(steps) if "g2_gate.py inputs" in s.get("run", ""))
+    first_api = min(i for i, s in enumerate(steps) if re.search(r"gh api|jira_ops\.py", s.get("run", "")))
+    assert validate < first_api
+    env = steps[validate]["env"]
+    assert env == {"ISSUE": "${{ inputs.issue }}", "PR": "${{ inputs.pr }}", "SHA": "${{ inputs.sha }}"}
+    # every later step uses the checked outputs, never the raw inputs
+    for step in steps[validate + 1:]:
+        assert "inputs." not in yaml.safe_dump(step), step.get("name")
+    for job_id, job in doc["jobs"].items():
+        if job_id != "prepare":
+            assert "inputs." not in _job_text(job), job_id
+
+
+def test_implement_prepare_decides_g2_from_the_pr_label():
+    doc, _ = _wf(WORKFLOWS / "agent-implement.yml")
+    prepare = doc["jobs"]["prepare"]
+    assert _flat(prepare["if"]) == KILL_SWITCH  # no sender check: G2 is the label, read from the timeline
+    assert prepare["permissions"] == {"contents": "read", "pull-requests": "read", "issues": "read"}
+    body = _run(prepare)
+    for needed in ("issues/${PR}/timeline", "--paginate", "pulls/${PR}", "activity?ref=refs/heads/",
+                   '--approvers "$DESIGN_APPROVERS"', "--record", "g2.json"):
+        assert needed in body, needed
+    gate = next(s for s in prepare["steps"] if "g2_gate.py check" in s.get("run", ""))
+    assert gate["env"]["DESIGN_APPROVERS"] == "${{ vars.DESIGN_APPROVERS }}"
+    assert "secrets." not in yaml.safe_dump(gate)
+    # the approval record travels with the ticket, so the agent can read it
+    assert "$RUNNER_TEMP/ticket/g2.json" in body
+    # refusals other than "not approved yet" are reported and flag the issue
+    report = next(s for s in prepare["steps"] if "--reason-category g2-refused" in s.get("run", ""))
+    assert "steps.gate.outputs.notify=='true'" in _flat(report["if"])
+    assert "--to Blocked" in report["run"] and "notify_slack.py post" in report["run"]
+    assert "GITHUB_STEP_SUMMARY" in body
 
 
 @pytest.mark.parametrize("path", [p for p in AGENT_FILES if p.name != "agent-dispatch.yml"],
@@ -421,14 +461,15 @@ def test_jobs_holding_secrets_run_only_development_scripts(path):
         assert "make " not in body and "pip install" not in body and "pre-commit" not in body, job_id
 
 
-def test_implement_prepare_reads_the_push_as_git_data():
+def test_implement_reads_the_approved_commit_only_as_git_data():
     doc, _ = _wf(WORKFLOWS / "agent-implement.yml")
-    prepare = doc["jobs"]["prepare"]
-    checkout = prepare["steps"][0]
-    assert checkout["with"] == {"ref": "development", "fetch-depth": 0, "persist-credentials": False}
-    body = _run(prepare)
-    assert "fetch -q --no-tags origin" in body
-    assert "stage_io.py design-gate" in body and "--base origin/development" in body
+    for job_id in ("prepare", "agent", "gates", "publish"):
+        job = doc["jobs"][job_id]
+        checkout = next(s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@"))
+        assert checkout["with"] == {"ref": "development", "fetch-depth": 0, "persist-credentials": False}, job_id
+        assert "fetch -q --no-tags origin" in _run(job), job_id
+    body = _run(doc["jobs"]["prepare"])
+    assert "g2_gate.py git-check" in body and "--base origin/development" in body
 
 
 @pytest.mark.parametrize("path", STAGE_FILES, ids=lambda p: p.name)
@@ -513,6 +554,9 @@ def test_harden_runner_is_the_first_step(path, jobs):
             assert "api.anthropic.com:443" in allowed
         else:
             assert "api.anthropic.com:443" not in allowed
+        # no sudo and no container access for code the agent wrote (input name read from
+        # action.yml at the pinned SHA; `disable-sudo` alone is deprecated there)
+        assert first["with"]["disable-sudo-and-containers"] == "true", job_id
 
 
 @pytest.mark.parametrize("path", STAGE_FILES, ids=lambda p: p.name)
@@ -531,7 +575,7 @@ def test_implement_publish_titles_unblocks_and_maps_budget():
     path = WORKFLOWS / "agent-implement.yml"
     doc, _ = _wf(path)
     body = _run(doc["jobs"]["publish"])
-    assert 'gh pr edit "$pr" --title "${ISSUE}: implementation"' in body
+    assert 'gh pr edit "$PR" --title "${ISSUE}: implementation"' in body
     assert "jira_ops.py unblock" in body
     assert "--budget" in body
 
@@ -547,9 +591,15 @@ def test_spec_stage_scope_check_comes_before_the_fetch():
     assert "steps.scope.outputs.inscope=='true'" in _flat(steps[fetch]["if"])
     upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact@"))
     assert "steps.ticket.outputs.go=='true'" in _flat(upload["if"])
-    # already ran: flagged and labelled so the queue stops re-dispatching it
+    # already ran: flagged and labelled so the queue stops re-dispatching it, unless an open
+    # agent PR for the key shows the earlier run is in hand (concurrency > 1)
     report = next(s for s in steps if "--reason-category already-ran" in s.get("run", ""))
     assert "--to Blocked" in report["run"]
+    assert re.search(r'if \[ "\$OPEN_AGENT_PR" != "true" \]; then\s+python3 scripts/delivery/jira_ops.py '
+                     r'transition --issue "\$ISSUE" --to Blocked', report["run"])
+    assert report["env"]["OPEN_AGENT_PR"] == "${{ steps.ran.outputs.open_agent_pr }}"
+    ran_step = steps[ran]["run"]
+    assert "agentPrs" in ran_step and "labels" in ran_step
     publish = _run(doc["jobs"]["publish"])
     assert "needs-human-review" in publish and "jira_ops.py unblock" in publish
     assert "budget" in publish
@@ -565,14 +615,99 @@ def test_dispatch_skips_keys_with_a_ticket_branch():
 
 
 def test_push_token_owner_is_never_trusted_as_an_approver_by_default():
-    """The push token belongs to an approver (until a machine user exists), so an agent push
-    arrives with an approver as sender. The gate must not rely on the sender: there is no
-    built-in approver fallback, and design-gate (not the job `if:`) refuses agent commits.
+    """The push token belongs to an approver (until a machine user exists). G2 is the label
+    event's actor, so the pipeline must never add `design-approved` itself, there is no
+    built-in approver fallback, and git-check refuses agent commits outside the spec files.
     The design records the machine user as REQUIRED before AGENTS_ENABLED goes beyond the pilot."""
-    path = WORKFLOWS / "agent-implement.yml"
-    doc, _ = _wf(path)
-    cond = _flat(doc["jobs"]["prepare"]["if"])
-    assert "vars.DESIGN_APPROVERS" in cond and "||" not in cond
-    assert "st-heyabhishek" not in path.read_text()
+    for path in ALL_FILES:
+        text = path.read_text()
+        assert "st-heyabhishek" not in text, path.name
+        assert not re.search(r"(add-label|--label)[ =]+\"?design-approved", text.replace(
+            "gh pr list --state open --label agent-pr --label design-approved", "")), path.name
+        assert "labels/design-approved" not in text and '"design-approved"' not in text, path.name
     design = (ROOT_DIR / "specs" / "technical-design" / "SIM-71-automated-delivery-pipeline.md").read_text()
     assert "REQUIRED before `AGENTS_ENABLED=true` beyond the pilot" in design
+
+
+# ------------------------------------------------ second fix round (SIM-153)
+
+
+@pytest.mark.parametrize("path", ALL_FILES, ids=lambda p: p.name)
+def test_no_workflow_holding_a_secret_runs_on_push_or_pull_request(path):
+    """A push- or pull_request-triggered workflow runs the YAML from the pushed branch, so any
+    writer could change it and read whatever secrets it references."""
+    _, triggers = _wf(path)
+    text = path.read_text()
+    if "secrets." in text:
+        assert not ({"push", "pull_request"} & set(triggers)), path.name
+    if path.name == "ci.yml":
+        assert {"push", "pull_request"} & set(triggers)
+        assert "secrets." not in text
+
+
+def test_dispatch_starts_implement_runs_for_g2_approved_prs():
+    doc, _ = _wf(WORKFLOWS / "agent-dispatch.yml")
+    job = doc["jobs"]["dispatch"]
+    body = _run(job)
+    assert "gh pr list --state open --label agent-pr --label design-approved" in body
+    assert "g2_gate.py candidates" in body and "g2_gate.py check" in body
+    assert ('gh workflow run agent-implement.yml --ref main -f issue="$issue" -f pr="$pr" -f sha="$sha"'
+            in body)
+    # the G2 step reads GitHub only; Jira is checked in a separate step with no GitHub write token
+    g2_step = next(s for s in job["steps"] if "g2_gate.py check" in s.get("run", ""))
+    assert "secrets." not in yaml.safe_dump(g2_step)
+    assert g2_step["env"]["DESIGN_APPROVERS"] == "${{ vars.DESIGN_APPROVERS }}"
+    scope = next(s for s in job["steps"] if "jira_ops.py check-scope" in s.get("run", ""))
+    assert "GH_TOKEN" not in scope["env"]
+    # implement runs count against AGENT_MAX_CONCURRENT before any spec run is picked
+    pick = next(s for s in job["steps"] if "agent_queue.py" in s.get("run", ""))
+    assert "implement_started" in yaml.safe_dump(pick) or "implement_started" in pick["run"]
+    start = next(s for s in job["steps"] if "gh workflow run agent-implement.yml" in s.get("run", ""))
+    assert "secrets." not in yaml.safe_dump(start)
+
+
+@pytest.mark.parametrize("path", STAGE_FILES, ids=lambda p: p.name)
+def test_agent_step_scrubs_subprocess_env_and_allows_the_dispatch_bot(path):
+    doc, _ = _wf(path)
+    (_, job, step), = _agent_steps(doc)
+    assert step["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
+    assert step["with"]["allowed_bots"] == "github-actions"
+    # no pip cache on the agent job: a cache the agent's runner restores is shared state
+    for s in job["steps"]:
+        if s.get("uses", "").startswith("actions/setup-python@"):
+            assert "cache" not in (s.get("with") or {}), path.name
+
+
+@pytest.mark.parametrize("path", STAGE_FILES, ids=lambda p: p.name)
+def test_publish_refuses_agent_added_gitleaks_allow_before_pushing(path):
+    doc, _ = _wf(path)
+    steps = doc["jobs"]["publish"]["steps"]
+    check = next(i for i, s in enumerate(steps) if "stage_io.py allow-markers" in s.get("run", ""))
+    push = next(i for i, s in enumerate(steps) if "git push" in s.get("run", ""))
+    assert check < push
+    assert "git log -p --no-renames --format=" in steps[check]["run"]
+    assert "secret" in steps[check]["run"]
+
+
+@pytest.mark.parametrize("path", STAGE_FILES, ids=lambda p: p.name)
+def test_comments_say_agent_side_normalisation_is_not_a_control(path):
+    assert "not a control" in path.read_text()
+
+
+def test_implement_publish_pushes_only_on_the_decided_verdict():
+    doc, _ = _wf(WORKFLOWS / "agent-implement.yml")
+    publish = doc["jobs"]["publish"]
+    check = next(s for s in publish["steps"] if "stage_io.py decide" in s.get("run", ""))
+    body = check["run"]
+    for flag in ("--protected", "--secret", "--gates-mismatch", "--budget"):
+        assert flag in body, flag
+    # pr-comment renders the final verdict; it does not get the inputs to recompute it
+    comment = body[body.index("stage_io.py pr-comment"):]
+    assert '--ready "$ready"' in comment and '--reason "$reason"' in comment
+    assert "--commits" not in comment.split("\n\n")[0]
+    push = next(s for s in publish["steps"] if "git push" in s.get("run", ""))
+    assert push["env"]["PUSH"] == "${{ steps.check.outputs.push }}"
+    assert re.search(r'if \[ "\$PUSH" = "true" \]; then\s+git push', push["run"])
+    # the PR is the dispatched one, re-checked against the branch before any edit
+    assert 'gh pr view "$PR" --json headRefName' in push["run"]
+    assert "gh pr create" not in push["run"]

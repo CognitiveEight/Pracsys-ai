@@ -51,6 +51,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetch) and `unblock`; the queue skips keys that already have a ticket
   branch; `AGENT_MAX_TURNS_IMPLEMENT` (default 120). No socket payload or
   `app/` change.
+  **Second fix round (G2 is a PR label):** `agent-implement.yml` is no
+  longer `push`-triggered (a push ran the pushed branch's YAML with the
+  secrets); it is `workflow_dispatch` only (inputs `issue`, `pr`, `sha`),
+  runs from `main`, and is started by `agent-dispatch.yml` for spec PRs
+  carrying the label `design-approved` added by a `DESIGN_APPROVERS` login
+  on the current head (new `scripts/delivery/g2_gate.py`: PR, timeline and
+  push-record checks; the design now stays `Status: draft`, and `/implement`
+  in CI reads the verified `g2.json` instead). New PR label
+  `agent-implemented`; new reason categories `g2-refused` and
+  `gates-mismatch`; nothing is pushed on `budget` (AC-39); agent-added
+  `gitleaks:allow` lines are refused (`secret-found`); `CLAUDE.md`,
+  `AGENTS.md`, `.mcp.json`, gitleaks config and the conftest files are
+  protected; harden-runner disables sudo and containers; the agent step
+  scrubs secrets from subprocess environments; the spec stage no longer
+  flags an issue for "already ran" while its agent PR is open. Admin:
+  create the GitHub labels `design-approved` and `agent-implemented`. No
+  socket payload or `app/` change.
 
 - **SIM-152: instant replies in #pracsys-requests.** A small GCP Cloud
   Function (`relay/slack_events/`) receives Slack events, checks Slack's

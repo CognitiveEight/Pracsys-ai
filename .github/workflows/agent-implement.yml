@@ -1,53 +1,72 @@
 # Agent pipeline: implement stage (SIM-153; SIM-71 Phase 3, task 18).
 #
-# Starts when an approver listed in DESIGN_APPROVERS changes a ticket's
-# technical design to `Status: approved` and pushes it to the ticket branch
-# (gate G2). Claude then runs /implement, /verify and /review in CI mode; a
-# person still reviews and merges the PR (gate G3).
+# Started by agent-dispatch.yml (or by hand) for one spec PR that carries the
+# G2 approval: the label `design-approved`, added by a login in
+# DESIGN_APPROVERS, on exactly the head being built. Claude then runs
+# /implement, /verify and /review in CI mode; a person still reviews and
+# merges the PR (gate G3).
+#
+# workflow_dispatch only, never `push`: a push-triggered workflow runs the
+# YAML from the pushed branch, so any writer could push a modified copy and
+# read the secrets. workflow_dispatch runs this file from the default branch
+# (`main`); a human copies it there. Every job checks out `development` for
+# scripts; the ticket branch is git data only (the `sha` input is fetched).
 #
 # Five jobs, so the agent, the code it writes and the credentials never share
 # a runner:
-#   prepare  Jira + Slack. Checks out `development` and runs only its
-#            scripts; the pushed commits are read as git data. The G2 check
-#            (stage_io.py design-gate): the design flipped to approved in
-#            this push, no commit in the pushed range by the agent, on a
-#            branch that does not change the pipeline or the gates. Anything
-#            else exits quietly (the spec stage's own push lands here too).
-#            Then Jira → In Progress, label agent-running, ticket to a file.
-#   agent    Anthropic key only, egress allow-listed (harden-runner). Hands
-#            back the normalised outcome, a result summary and a git bundle.
+#   prepare  Jira + Slack. Checks the inputs before any API call, then G2
+#            (scripts/delivery/g2_gate.py check, from the PR, its timeline
+#            and the repository activity; git-check on development..sha).
+#            "Not approved yet" exits quietly; any other refusal is reported
+#            (Jira comment, Flagged, Slack, reason g2-refused). Then the
+#            issue's scope (read-only), Jira → In Progress, label
+#            agent-running, and the ticket plus the verified approval record
+#            (g2.json) to the agent.
+#   agent    Anthropic key only, egress allow-listed and no sudo or
+#            containers (harden-runner). Hands back the outcome, a result
+#            summary and a git bundle.
 #   gates    No secrets. Fresh runner: development + its dependencies, then
 #            the agent's bundle on the approved commit; `make lint` and
 #            `make test`, counts only in the log.
 #   publish  Fresh runner, no agent code run, scripts from development.
-#            Re-checks the hand-off, refuses (nothing pushed) an agent change
-#            to the pipeline, the gates or any spec (`protected-path`) or one
-#            gitleaks flags (`secret-found`), forces needs-human-review for
-#            sensitive paths, pushes with AGENT_PUSH_TOKEN, comments the AC
-#            table and marks the PR ready ONLY when the gates job is green on
-#            exactly that tree, the review approves and every AC passes.
-#            Otherwise the PR stays a draft and Jira is flagged Blocked.
+#            Re-validates the hand-off (this, not the agent job's
+#            normalisation, is the control), refuses (nothing pushed) an
+#            agent change to the pipeline, the gates or any spec
+#            (`protected-path`), a gitleaks finding or an added
+#            `gitleaks:allow` (`secret-found`) and a spend-limit stop
+#            (`budget`); forces needs-human-review for sensitive paths;
+#            pushes with AGENT_PUSH_TOKEN; labels the PR agent-implemented;
+#            comments the AC table and marks the PR ready ONLY when the gates
+#            job is green on exactly that tree, the review approves and every
+#            AC passes. Otherwise the PR stays a draft and Jira is flagged.
+#            "Ready for review" is advisory: PR CI and G3 are the gate.
 #   cleanup  On failure or cancellation: Blocked, `workflow-failed`.
 #
-# A push-triggered workflow runs from the pushed branch, which is cut from
-# `development` and so carries this file; the design gate refuses a branch
-# whose .github/ differs from development's. Nothing here merges.
+# Nothing here merges.
 
 name: Agent implement stage
 
 on:
-  push:
-    branches:
-      - "feature/SIM-*"
-      - "fix/SIM-*"
-    paths:
-      - "specs/technical-design/**"
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: "SIM issue key, e.g. SIM-123"
+        required: true
+        type: string
+      pr:
+        description: "Number of the agent's spec PR carrying the design-approved label"
+        required: true
+        type: string
+      sha:
+        description: "The PR head commit (40 hex) the approval is for"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: agent-implement-${{ github.ref_name }}
+  group: agent-${{ inputs.issue }}
   cancel-in-progress: false
 
 env:
@@ -56,74 +75,156 @@ env:
 
 jobs:
   prepare:
-    # DESIGN_APPROVERS is a comma-separated list of GitHub logins, no spaces.
-    if: >-
-      vars.AGENTS_ENABLED == 'true'
-      && contains(format(',{0},', vars.DESIGN_APPROVERS), format(',{0},', github.event.sender.login))
-      && github.event.sender.type != 'Bot'
+    if: vars.AGENTS_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
+      pull-requests: read
+      issues: read
     outputs:
-      issue: ${{ steps.gate.outputs.issue }}
+      issue: ${{ steps.key.outputs.issue }}
+      pr: ${{ steps.key.outputs.pr }}
+      sha: ${{ steps.key.outputs.sha }}
       branch: ${{ steps.gate.outputs.branch }}
       go: ${{ steps.ticket.outputs.go }}
       started: ${{ steps.ticket.outputs.started }}
     steps:
       # This job holds Jira and Slack credentials, so it runs only scripts from
-      # `development`. The pushed branch is read as git data (ls-tree, show,
-      # log, diff); nothing from it is executed here.
+      # `development`. The ticket branch is read as git data (rev-list, log,
+      # diff); nothing from it is executed here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: development
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Check the inputs
+        id: key
+        env:
+          ISSUE: ${{ inputs.issue }}
+          PR: ${{ inputs.pr }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$(python3 scripts/delivery/g2_gate.py inputs --issue "$ISSUE" --pr "$PR" --sha "$SHA" \
+            | jq -r '.ok')" = "true" ]; then
+            {
+              echo "ok=true"
+              echo "issue=${ISSUE}"
+              echo "pr=${PR}"
+              echo "sha=${SHA}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "Implement stage not started: the inputs are not SIM-<n>, a PR number and a 40-hex SHA." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # GitHub only, with the read-only job token: the PR, its timeline and
+      # the branch's push record. Any failed call stops the job (nothing
+      # started, nothing to clean up).
+      - name: Read the PR, its timeline and its pushes (G2 data)
+        if: steps.key.outputs.ok == 'true'
+        env:
+          PR: ${{ steps.key.outputs.pr }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          g="$RUNNER_TEMP/g2"
+          mkdir -p "$g"
+          gh api "repos/${GH_REPO}/pulls/${PR}" > "$g/pr.json"
+          gh api "repos/${GH_REPO}/issues/${PR}/timeline" --paginate --jq '.[]' | jq -s . > "$g/timeline.json"
+          branch="$(jq -r '.head.ref // ""' "$g/pr.json")"
+          # Only a ticket branch name is put in a URL; anything else is refused by the gate.
+          if [[ "$branch" =~ ^(feature|fix)/SIM-[0-9]+-[a-z0-9][a-z0-9-]*$ ]]; then
+            gh api "repos/${GH_REPO}/activity?ref=refs/heads/${branch}&per_page=100" > "$g/activity.json"
+          else
+            echo '[]' > "$g/activity.json"
+          fi
+
       # fetch-depth 0 already brings every branch; this covers a commit no
       # longer at a branch head. The job token (contents: read) is passed as a
       # header for this one fetch and not stored.
-      - name: Fetch the pushed commits as git data
+      - name: Fetch the approved commit as git data
+        if: steps.key.outputs.ok == 'true'
         env:
-          BEFORE: ${{ github.event.before }}
-          AFTER: ${{ github.sha }}
+          SHA: ${{ steps.key.outputs.sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          for sha in "$AFTER" "$BEFORE"; do
-            if [ "$sha" = "0000000000000000000000000000000000000000" ]; then continue; fi
-            if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
-              git -c "http.https://github.com/.extraheader=${auth}" fetch -q --no-tags origin "$sha" \
-                || echo "a pushed commit is not available"
-            fi
-          done
+          if ! git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
+            git -c "http.https://github.com/.extraheader=${auth}" fetch -q --no-tags origin "$SHA" \
+              || echo "the approved commit is not available"
+          fi
 
-      - name: Check this push is the design approval (G2)
+      - name: Check the design approval (G2)
         id: gate
+        if: steps.key.outputs.ok == 'true'
         env:
-          REF_NAME: ${{ github.ref_name }}
-          BEFORE: ${{ github.event.before }}
-          AFTER: ${{ github.sha }}
+          ISSUE: ${{ steps.key.outputs.issue }}
+          PR: ${{ steps.key.outputs.pr }}
+          SHA: ${{ steps.key.outputs.sha }}
+          DESIGN_APPROVERS: ${{ vars.DESIGN_APPROVERS }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          python3 scripts/delivery/stage_io.py design-gate --branch "$REF_NAME" \
-            --before "$BEFORE" --after "$AFTER" --base origin/development > "$RUNNER_TEMP/gate.json"
-          reason="$(jq -r '.reason' "$RUNNER_TEMP/gate.json")"
-          echo "design gate: ${reason}"
-          echo "reason=${reason}" >> "$GITHUB_OUTPUT"
-          if [ "$(jq -r '.issue // ""' "$RUNNER_TEMP/gate.json")" != "" ]; then
-            echo "issue=$(jq -r '.issue' "$RUNNER_TEMP/gate.json")" >> "$GITHUB_OUTPUT"
-            echo "branch=$(jq -r '.branch' "$RUNNER_TEMP/gate.json")" >> "$GITHUB_OUTPUT"
+          g="$RUNNER_TEMP/g2"
+          mkdir -p "$RUNNER_TEMP/ticket"
+          python3 scripts/delivery/g2_gate.py check --issue "$ISSUE" --pr "$PR" --sha "$SHA" \
+            --pr-file "$g/pr.json" --timeline-file "$g/timeline.json" --activity-file "$g/activity.json" \
+            --approvers "$DESIGN_APPROVERS" --repo "$GH_REPO" --record "$RUNNER_TEMP/ticket/g2.json" \
+            > "$g/verdict.json"
+          go="$(jq -r '.go' "$g/verdict.json")"
+          reason="$(jq -r '.reason' "$g/verdict.json")"
+          notify="$(jq -r '.notify' "$g/verdict.json")"
+          if [ "$go" = "true" ]; then
+            # Defence in depth on development..sha: agent commits only as the spec
+            # stage's own spec files, and no change to the pipeline or the gates.
+            if git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
+              python3 scripts/delivery/g2_gate.py git-check --issue "$ISSUE" --sha "$SHA" \
+                --base origin/development > "$g/git.json"
+              if [ "$(jq -r '.ok' "$g/git.json")" != "true" ]; then
+                go=false; reason="$(jq -r '.reason' "$g/git.json")"; notify=true
+              fi
+            else
+              go=false; reason=commit-unavailable; notify=false
+            fi
           fi
-          if [ "$(jq -r '.go' "$RUNNER_TEMP/gate.json")" = "true" ]; then
-            echo "go=true" >> "$GITHUB_OUTPUT"
+          if [ "$go" != "true" ]; then rm -f "$RUNNER_TEMP/ticket/g2.json"; fi
+          {
+            echo "go=${go}"
+            echo "notify=${notify}"
+            echo "branch=$(jq -r '.branch // ""' "$g/verdict.json")"
+          } >> "$GITHUB_OUTPUT"
+          echo "G2 for ${ISSUE} (PR #${PR}): ${reason}" >> "$GITHUB_STEP_SUMMARY"
+
+      # Read-only, before anything is fetched or changed: an issue that is not
+      # in the agents' scope (already running, flagged, or moved on) is left alone.
+      - name: Check the issue is in the agents' scope
+        id: scope
+        if: steps.gate.outputs.go == 'true' || steps.gate.outputs.notify == 'true'
+        env:
+          ISSUE: ${{ steps.key.outputs.issue }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/delivery/jira_ops.py check-scope --issue "$ISSUE" > "$RUNNER_TEMP/scope.json"
+          inscope="$(jq -r '.inScope' "$RUNNER_TEMP/scope.json")"
+          echo "inscope=${inscope}" >> "$GITHUB_OUTPUT"
+          if [ "$inscope" != "true" ]; then
+            echo "${ISSUE} is not in the agents' scope (running, flagged or moved on); nothing changed." \
+              >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Report a branch the agent will not run on
-        if: steps.gate.outputs.reason == 'protected-path'
+      # Flagged + agent-blocked, so the dispatcher does not start it again
+      # every 15 minutes. A person re-labels (or fixes the branch) and unflags.
+      - name: Report a refused approval
+        if: steps.gate.outputs.notify == 'true' && steps.scope.outputs.inscope == 'true'
         env:
-          ISSUE: ${{ steps.gate.outputs.issue }}
+          ISSUE: ${{ steps.key.outputs.issue }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -133,28 +234,30 @@ jobs:
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           python3 scripts/delivery/jira_ops.py transition --issue "$ISSUE" --to Blocked
           python3 scripts/delivery/jira_ops.py comment --issue "$ISSUE" --stage implement \
-            --outcome blocked --reason-category protected-path --run-url "$run_url"
+            --outcome blocked --reason-category g2-refused --run-url "$run_url"
           python3 scripts/delivery/notify_slack.py post --issue "$ISSUE" --stage implement \
-            --outcome blocked --reason-category protected-path --run-url "$run_url"
+            --outcome blocked --reason-category g2-refused --run-url "$run_url"
 
       - name: Fetch the ticket and mark it in progress
         id: ticket
-        if: steps.gate.outputs.go == 'true'
+        if: steps.gate.outputs.go == 'true' && steps.scope.outputs.inscope == 'true'
         env:
-          ISSUE: ${{ steps.gate.outputs.issue }}
+          ISSUE: ${{ steps.key.outputs.issue }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/ticket"
+          test -s "$RUNNER_TEMP/ticket/g2.json"
           python3 scripts/delivery/jira_ops.py fetch --issue "$ISSUE" --out "$RUNNER_TEMP/ticket/ticket.md"
           echo "started=true" >> "$GITHUB_OUTPUT"
           python3 scripts/delivery/jira_ops.py transition --issue "$ISSUE" --to "In Progress"
           python3 scripts/delivery/jira_ops.py label --issue "$ISSUE" --add agent-running
           echo "go=true" >> "$GITHUB_OUTPUT"
 
-      # 1-day retention. Deleting it at the end of the run would need
-      # `actions: write` on a job holding credentials, which is not granted.
+      # The ticket and the verified approval record (g2.json: approver login,
+      # label time, PR, sha). 1-day retention. Deleting it at the end of the
+      # run would need `actions: write` on a job holding credentials, which
+      # is not granted.
       - name: Hand the ticket to the agent job
         if: steps.ticket.outputs.go == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -189,9 +292,11 @@ jobs:
     steps:
       # Egress allow-list: the Anthropic API, the action's own install hosts
       # (its .github/egress-firewall.yaml at the pinned SHA), GitHub and PyPI.
+      # No sudo and no container access for anything the agent starts.
       - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: block
+          disable-sudo-and-containers: "true"
           allowed-endpoints: >-
             api.anthropic.com:443
             claude.ai:443
@@ -207,31 +312,45 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: development
           fetch-depth: 0
           persist-credentials: false
 
       # The outcome is normalised in this job with these scripts, taken from
-      # `development` before Claude runs, so only validated fields are
-      # uploaded. The publish job validates it again with its own copy.
+      # `development` before Claude runs, so only fields of the expected shape
+      # are uploaded. This is a size and shape filter, NOT a control: code on
+      # this runner could rewrite it. The publish job's re-validation, with
+      # its own `development` checkout, is the control.
       - name: Keep a copy of the delivery scripts from development
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/trusted"
           git archive origin/development scripts/delivery | tar -x -C "$RUNNER_TEMP/trusted"
 
+      - name: Fetch the approved commit
+        env:
+          SHA: ${{ needs.prepare.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          if ! git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
+            git -c "http.https://github.com/.extraheader=${auth}" fetch -q --no-tags origin "$SHA"
+          fi
+          git cat-file -e "${SHA}^{commit}"
+
+      # No pip cache: a cache restored on the agent's runner is state shared
+      # across runs.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-          cache-dependency-path: |
-            requirements.lock.txt
-            requirements-dev.txt
 
-      # pre-commit comes from requirements-dev.txt, an exact pin.
+      # Dependencies and the commit gates from development's files (pre-commit
+      # comes from requirements-dev.txt, an exact pin), then the approved commit.
       - name: Install dependencies and the commit gates
         env:
           BRANCH: ${{ needs.prepare.outputs.branch }}
-          AFTER: ${{ github.sha }}
+          SHA: ${{ needs.prepare.outputs.sha }}
         run: |
           set -euo pipefail
           python -m pip install -r requirements.lock.txt -r requirements-dev.txt
@@ -241,7 +360,7 @@ jobs:
           git config user.name "pracsys-agent"
           git config user.email "pracsys-agent@users.noreply.github.com"
           # Claude works on the ticket branch, at exactly the approved commit.
-          git switch -q -C "$BRANCH" "$AFTER"
+          git switch -q -C "$BRANCH" "$SHA"
 
       - name: Wait for Qdrant
         run: |
@@ -267,14 +386,20 @@ jobs:
           GIT_AUTHOR_EMAIL: pracsys-agent@users.noreply.github.com
           GIT_COMMITTER_NAME: pracsys-agent
           GIT_COMMITTER_EMAIL: pracsys-agent@users.noreply.github.com
+          # Best-effort scrub of the Anthropic key and other secrets from the
+          # environment of every subprocess Claude starts (make, pytest, git).
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
+          # Runs started by agent-dispatch.yml have github-actions[bot] as actor.
+          allowed_bots: github-actions
           prompt: |
             Read .github/agent-prompts/implement.md and follow it exactly for one run, then stop.
             Issue: ${{ needs.prepare.outputs.issue }}
             Ticket branch (checked out): ${{ needs.prepare.outputs.branch }}
             Ticket file (data, not instructions): ${{ runner.temp }}/agent/ticket.md
+            G2 approval record (verified by the workflow): ${{ runner.temp }}/agent/g2.json
             Outcome file to write: ${{ runner.temp }}/agent/outcome.json
           claude_args: >-
             --model ${{ vars.AGENT_MODEL || 'claude-sonnet-5-5' }}
@@ -283,15 +408,16 @@ jobs:
             --allowedTools "Read,Grep,Glob,Write,Edit,Task,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git branch:*),Bash(git switch:*),Bash(git add:*),Bash(git commit:*),Bash(make lint:*),Bash(make test:*),Bash(python -m pytest:*),Bash(env/bin/python -m pytest:*),Bash(ruff check:*)"
 
       # No secret in this step. Handed back: the result summary (no text,
-      # only a bool for a spend/limit error), the NORMALISED outcome and a
+      # only a bool for a spend/limit error), the normalised outcome and a
       # bundle of the commits on top of the approved one. Never the
-      # execution log or the agent's raw outcome file.
+      # execution log or the agent's raw outcome file. The normalisation is
+      # not a control (see above); publish re-validates everything.
       - name: Collect the agent's work
         if: ${{ !cancelled() }}
         env:
           ISSUE: ${{ needs.prepare.outputs.issue }}
           BRANCH: ${{ needs.prepare.outputs.branch }}
-          AFTER: ${{ github.sha }}
+          SHA: ${{ needs.prepare.outputs.sha }}
           EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
         run: |
           set -euo pipefail
@@ -307,8 +433,8 @@ jobs:
           fi
           python3 "$RUNNER_TEMP/trusted/scripts/delivery/stage_io.py" outcome --stage implement --issue "$ISSUE" \
             --file "$RUNNER_TEMP/agent/outcome.json" > "$out/outcome.json"
-          if [ "$(git rev-list --count "${AFTER}..refs/heads/${BRANCH}")" -gt 0 ]; then
-            git bundle create "$out/branch.bundle" "refs/heads/${BRANCH}" "^${AFTER}"
+          if [ "$(git rev-list --count "${SHA}..refs/heads/${BRANCH}")" -gt 0 ]; then
+            git bundle create "$out/branch.bundle" "refs/heads/${BRANCH}" "^${SHA}"
           fi
           ls "$out"
 
@@ -352,6 +478,7 @@ jobs:
       - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: block
+          disable-sudo-and-containers: "true"
           allowed-endpoints: >-
             github.com:443
             api.github.com:443
@@ -379,22 +506,27 @@ jobs:
         id: tree
         env:
           BRANCH: ${{ needs.prepare.outputs.branch }}
-          AFTER: ${{ github.sha }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           h="$RUNNER_TEMP/handoff"
-          git cat-file -e "${AFTER}^{commit}"
-          head="$AFTER"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          if ! git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
+            git -c "http.https://github.com/.extraheader=${auth}" fetch -q --no-tags origin "$SHA"
+          fi
+          git cat-file -e "${SHA}^{commit}"
+          head="$SHA"
           if [ -f "$h/branch.bundle" ]; then
             git bundle verify -q "$h/branch.bundle"
             git fetch -q --no-tags "$h/branch.bundle" "refs/heads/${BRANCH}:refs/heads/agent-result"
-            git merge-base --is-ancestor "$AFTER" refs/heads/agent-result
+            git merge-base --is-ancestor "$SHA" refs/heads/agent-result
             head="$(git rev-parse refs/heads/agent-result)"
           fi
           echo "head=${head}" >> "$GITHUB_OUTPUT"
 
-      # From development's files, before the agent's tree is checked out. The
-      # design gate refuses a branch that changes them, and publish refuses an
+      # From development's files, before the agent's tree is checked out. G2's
+      # git-check refuses a branch that changes them, and publish refuses an
       # agent change to them.
       - name: Install dependencies
         run: |
@@ -458,6 +590,18 @@ jobs:
           name: handoff-${{ github.run_id }}
           path: ${{ runner.temp }}/handoff
 
+      - name: Fetch the approved commit as git data
+        env:
+          SHA: ${{ needs.prepare.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          if ! git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
+            git -c "http.https://github.com/.extraheader=${auth}" fetch -q --no-tags origin "$SHA"
+          fi
+          git cat-file -e "${SHA}^{commit}"
+
       - name: Install gitleaks
         run: |
           set -euo pipefail
@@ -470,12 +614,15 @@ jobs:
           rm -f "$RUNNER_TEMP/$tarball"
           echo "$RUNNER_TEMP/gitleaks" >> "$GITHUB_PATH"
 
+      # The control: everything the agent job handed back is re-validated
+      # here with development's scripts, whatever the agent job's own
+      # normalisation said.
       - name: Check the agent's work
         id: check
         env:
           ISSUE: ${{ needs.prepare.outputs.issue }}
           BRANCH: ${{ needs.prepare.outputs.branch }}
-          AFTER: ${{ github.sha }}
+          SHA: ${{ needs.prepare.outputs.sha }}
           GATES_RESULT: ${{ needs.gates.result }}
           GATES_LINT: ${{ needs.gates.outputs.lint }}
           GATES_TEST: ${{ needs.gates.outputs.test }}
@@ -490,12 +637,36 @@ jobs:
 
           # The agent's commits, on top of the approved commit and nothing else.
           commits=0
-          head="$AFTER"
+          head="$SHA"
           if [ -f "$h/branch.bundle" ] && git bundle verify -q "$h/branch.bundle" \
             && git fetch -q --no-tags "$h/branch.bundle" "refs/heads/${BRANCH}:refs/heads/agent-result" \
-            && git merge-base --is-ancestor "$AFTER" refs/heads/agent-result; then
-            commits="$(git rev-list --count "${AFTER}..refs/heads/agent-result")"
+            && git merge-base --is-ancestor "$SHA" refs/heads/agent-result; then
+            commits="$(git rev-list --count "${SHA}..refs/heads/agent-result")"
             head="refs/heads/agent-result"
+          fi
+
+          refusal=()
+          if [ "$commits" -gt 0 ]; then
+            # Every file any agent commit touched: never the pipeline, the gates or a spec.
+            git log --no-renames --name-only --format= "${SHA}..refs/heads/agent-result" \
+              | python3 scripts/delivery/stage_io.py agent-paths --stage implement --issue "$ISSUE" \
+              > "$RUNNER_TEMP/paths.json"
+            if [ "$(jq -r '.ok' "$RUNNER_TEMP/paths.json")" != "true" ]; then
+              refusal+=(--protected)
+            fi
+            # No agent-added `gitleaks:allow`: it would silence the scan below.
+            git log -p --no-renames --format= "${SHA}..refs/heads/agent-result" \
+              | python3 scripts/delivery/stage_io.py allow-markers > "$RUNNER_TEMP/markers.json"
+            if [ "$(jq -r '.ok' "$RUNNER_TEMP/markers.json")" != "true" ]; then
+              echo "an agent commit adds a gitleaks:allow marker; nothing is pushed (secret)"
+              refusal+=(--secret)
+            # Pinned gitleaks over exactly the commits to be pushed. Findings
+            # stay in a file on this runner; only the verdict is printed.
+            elif ! gitleaks git --no-banner --redact --log-opts="${SHA}..refs/heads/agent-result" . \
+              > "$RUNNER_TEMP/gitleaks.log" 2>&1; then
+              echo "gitleaks reported findings in the agent's commits; nothing is pushed (secret)"
+              refusal+=(--secret)
+            fi
           fi
 
           # Gate codes count only from the gates job, and only for exactly this tree.
@@ -504,33 +675,20 @@ jobs:
           if [ "$GATES_RESULT" = "success" ] && [ "$GATES_HEAD" = "$(git rev-parse "$head")" ]; then
             lint_rc="$GATES_LINT"
             test_rc="$GATES_TEST"
+          else
+            refusal+=(--gates-mismatch)
           fi
-          budget=()
-          if [ "$(jq -r '.budget' "$RUNNER_TEMP/cost.json")" = "true" ]; then budget=(--budget); fi
+          if [ "$(jq -r '.budget' "$RUNNER_TEMP/cost.json")" = "true" ]; then refusal+=(--budget); fi
+
+          # The one verdict: ready, reason and whether to push (none on
+          # protected-path, secret-found or budget).
           python3 scripts/delivery/stage_io.py decide --outcome "$RUNNER_TEMP/outcome.json" \
-            --lint-rc "$lint_rc" --test-rc "$test_rc" --commits "$commits" "${budget[@]}" \
+            --lint-rc "$lint_rc" --test-rc "$test_rc" --commits "$commits" "${refusal[@]}" \
             > "$RUNNER_TEMP/decision.json"
           ready="$(jq -r '.ready' "$RUNNER_TEMP/decision.json")"
           reason="$(jq -r '.reasonCategory // ""' "$RUNNER_TEMP/decision.json")"
-
-          if [ "$commits" -gt 0 ]; then
-            # Every file any agent commit touched: never the pipeline, the gates or a spec.
-            git log --no-renames --name-only --format= "${AFTER}..refs/heads/agent-result" \
-              | python3 scripts/delivery/stage_io.py agent-paths --stage implement --issue "$ISSUE" \
-              > "$RUNNER_TEMP/paths.json"
-            if [ "$(jq -r '.ok' "$RUNNER_TEMP/paths.json")" != "true" ]; then
-              ready=false; reason=protected-path; commits=0; head="$AFTER"
-            fi
-          fi
-          if [ "$commits" -gt 0 ]; then
-            # Pinned gitleaks over exactly the commits to be pushed. Findings
-            # stay in a file on this runner; only the verdict is printed.
-            if ! gitleaks git --no-banner --redact --log-opts="${AFTER}..refs/heads/agent-result" . \
-              > "$RUNNER_TEMP/gitleaks.log" 2>&1; then
-              echo "gitleaks reported findings in the agent's commits; nothing is pushed"
-              ready=false; reason=secret-found; commits=0; head="$AFTER"
-            fi
-          fi
+          push="$(jq -r '.push' "$RUNNER_TEMP/decision.json")"
+          if [ "$push" != "true" ]; then head="$SHA"; fi
 
           flag=()
           if [ "$(jq -r '.needsHumanReview' "$RUNNER_TEMP/outcome.json")" = "true" ]; then flag=(--agent-flag); fi
@@ -540,16 +698,19 @@ jobs:
           cost="$(jq -r '.cost // empty' "$RUNNER_TEMP/cost.json")"
           if [ -n "$cost" ]; then cost_args=(--cost "$cost"); fi
           python3 scripts/delivery/stage_io.py pr-comment --issue "$ISSUE" --outcome "$RUNNER_TEMP/outcome.json" \
-            --lint-rc "$lint_rc" --test-rc "$test_rc" --commits "$commits" "${flag[@]}" "${cost_args[@]}" \
-            < "$RUNNER_TEMP/changed.txt" > "$RUNNER_TEMP/comment.md"
+            --ready "$ready" --reason "$reason" --lint-rc "$lint_rc" --test-rc "$test_rc" \
+            "${flag[@]}" "${cost_args[@]}" < "$RUNNER_TEMP/changed.txt" > "$RUNNER_TEMP/comment.md"
           if [ "$ready" != "true" ]; then
             echo "Blocked (reason: ${reason}). The PR stays a draft for a human." >> "$RUNNER_TEMP/comment.md"
+          fi
+          if [ "$push" != "true" ]; then
+            echo "Nothing from this run was pushed." >> "$RUNNER_TEMP/comment.md"
           fi
 
           {
             echo "ready=${ready}"
             echo "reason=${reason}"
-            echo "commits=${commits}"
+            echo "push=${push}"
             echo "nhr=$(jq -r '.needsHumanReview' "$RUNNER_TEMP/labels.json")"
             echo "e2e=$(jq -r 'if .e2eRequired then 1 else 0 end' "$RUNNER_TEMP/outcome.json")"
             echo "ac_pass=$(jq -r '[.acResults[] | select(.pass)] | length' "$RUNNER_TEMP/outcome.json")"
@@ -562,8 +723,9 @@ jobs:
         env:
           ISSUE: ${{ needs.prepare.outputs.issue }}
           BRANCH: ${{ needs.prepare.outputs.branch }}
+          PR: ${{ needs.prepare.outputs.pr }}
           READY: ${{ steps.check.outputs.ready }}
-          COMMITS: ${{ steps.check.outputs.commits }}
+          PUSH: ${{ steps.check.outputs.push }}
           NHR: ${{ steps.check.outputs.nhr }}
           AGENT_PUSH_TOKEN: ${{ secrets.AGENT_PUSH_TOKEN }}
           GH_TOKEN: ${{ secrets.AGENT_PUSH_TOKEN }}
@@ -571,33 +733,29 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/delivery/guard_branch.py check --branch "$BRANCH" --issue "$ISSUE" > /dev/null
+          # The dispatched PR, still on the ticket branch, before anything is changed.
+          test "$(gh pr view "$PR" --json headRefName --jq '.headRefName')" = "$BRANCH"
           # A fast-forward of the ticket branch only: if someone pushed since
           # the approval, this is rejected and the run ends Blocked.
-          if [ "$COMMITS" -gt 0 ]; then
+          if [ "$PUSH" = "true" ]; then
             git push -q "https://x-access-token:${AGENT_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
               "refs/heads/agent-result:refs/heads/${BRANCH}"
           fi
-          pr="$(gh pr list --head "$BRANCH" --base development --state open --json url --jq '.[0].url // ""')"
-          if [ -z "$pr" ]; then
-            run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-            printf 'Implementation of %s by the agent pipeline.\n\nRun: %s\n' "$ISSUE" "$run_url" \
-              > "$RUNNER_TEMP/pr-body.md"
-            pr="$(gh pr create --draft --base development --head "$BRANCH" \
-              --title "${ISSUE}: implementation" --label agent-pr --body-file "$RUNNER_TEMP/pr-body.md")"
-          fi
+          # Never implemented twice for this approval, whatever the outcome.
+          gh pr edit "$PR" --add-label agent-implemented
           # The spec stage opened it as "<KEY>: specs".
-          gh pr edit "$pr" --title "${ISSUE}: implementation"
+          gh pr edit "$PR" --title "${ISSUE}: implementation"
           if [ "$NHR" = "true" ]; then
-            gh pr edit "$pr" --add-label needs-human-review
+            gh pr edit "$PR" --add-label needs-human-review
           fi
-          gh pr comment "$pr" --body-file "$RUNNER_TEMP/comment.md"
+          gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md"
           if [ "$READY" = "true" ]; then
-            gh pr ready "$pr"
+            gh pr ready "$PR"
           else
             # Never leave a PR ready for review on a blocked run.
-            gh pr ready --undo "$pr" || true
+            gh pr ready --undo "$PR" || true
           fi
-          echo "pr_url=${pr}" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$(gh pr view "$PR" --json url --jq '.url')" >> "$GITHUB_OUTPUT"
 
       - name: Report to Jira and Slack
         env:

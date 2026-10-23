@@ -28,8 +28,10 @@ SENSITIVE_FILES = (
     "app/ai/usage.py",
     "app/ai/pricing.py",
 )
-#: Path prefixes: whole trees (``<dir>/**``) and the gate files (``requirements``
-#: covers every ``requirements*.txt``).
+#: Path prefixes: whole trees (``<dir>/**``), the gate files (``requirements``
+#: covers every ``requirements*.txt``), the secret-scan configuration and the
+#: files an agent run or pytest reads as instructions (the same additions as
+#: ``stage_io.PROTECTED_PREFIXES``).
 SENSITIVE_DIRS = (
     "app/llm/",
     ".claude/",
@@ -41,6 +43,14 @@ SENSITIVE_DIRS = (
     "pyproject.toml",
     "pytest.ini",
     "requirements",
+    ".gitleaks.toml",
+    ".gitleaksignore",
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    "AGENTS.md",
+    ".mcp.json",
+    "conftest.py",
+    "tests/conftest.py",
 )
 
 

@@ -117,7 +117,7 @@ def test_spec_stage_is_idempotent_per_issue(monkeypatch, capsys):
         "sys.stdin", io.StringIO(json.dumps({"branches": ["feature/SIM-13-x"], "prs": []}))
     )
     assert guard.main(["already-ran", "--issue", "SIM-13"]) == 0
-    assert json.loads(capsys.readouterr().out) == {"alreadyRan": True}
+    assert json.loads(capsys.readouterr().out) == {"alreadyRan": True, "openAgentPr": False}
 
     # the stage's "already ran" comment is a fixed category, not free text
     ops, state = _fake_jira(monkeypatch)
@@ -426,7 +426,7 @@ def test_comments_and_notices_carry_no_ticket_text(monkeypatch, tmp_path):
     # Every reason category is a fixed token.
     assert set(notify.REASON_CATEGORIES) == {
         "dor-gap", "tests-red", "review-changes", "injection", "workflow-failed", "budget", "already-ran",
-        "protected-path", "secret-found",
+        "protected-path", "secret-found", "gates-mismatch", "g2-refused",
     }
     with pytest.raises(ops.DeliveryRefused):
         ops.comment("SIM-12", stage="spec", outcome="blocked", reason_category=INJECTED_SUMMARY)
@@ -636,3 +636,40 @@ def test_queue_skips_keys_with_a_ticket_branch(monkeypatch, capsys):
     monkeypatch.setenv("EXISTING_TICKET_BRANCH_KEYS", "SIM-31,SIM-33,not-a-key")
     assert queue.main(["next"]) == 0
     assert json.loads(capsys.readouterr().out) == {"start": ["SIM-32"]}
+
+
+# ------------------------------------------------ second fix round (SIM-153)
+
+
+def test_already_ran_with_an_open_agent_pr_is_not_flagged(monkeypatch, capsys):
+    """With concurrency > 1 a second spec run can race the first. An open agent PR for the key
+    means the earlier run is in hand: report already-ran, but do not flag the issue Blocked."""
+    guard = _load("guard_branch")
+    data = {"branches": ["feature/SIM-13-x"], "prs": ["feature/SIM-13-x SIM-13: specs"],
+            "agentPrs": ["feature/SIM-13-x SIM-13: specs"]}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(data)))
+    assert guard.main(["already-ran", "--issue", "SIM-13"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"alreadyRan": True, "openAgentPr": True}
+    # an agent PR for another key (SIM-130) does not count
+    data = {"branches": ["feature/SIM-13-x"], "prs": [], "agentPrs": ["feature/SIM-130-x SIM-130: specs"]}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(data)))
+    assert guard.main(["already-ran", "--issue", "SIM-13"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"alreadyRan": True, "openAgentPr": False}
+    assert guard.open_agent_pr("SIM-13", ["fix/SIM-13-y"]) is True
+
+
+@pytest.mark.parametrize("path", [
+    ".gitleaks.toml", ".gitleaksignore", "CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", ".mcp.json",
+    "conftest.py", "tests/conftest.py",
+])
+def test_instruction_and_scan_config_files_force_needs_human_review(path):
+    labels = _load("review_labels")
+    needed, matched = labels.needs_human_review(["app/main.py", path])
+    assert needed is True and matched == [path]
+
+
+def test_new_reason_categories_render():
+    notify = _load("notify_slack")
+    for reason in ("gates-mismatch", "g2-refused"):
+        assert reason in notify.build_notice(issue="SIM-13", stage="implement", outcome="blocked",
+                                             reason_category=reason)

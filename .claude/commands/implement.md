@@ -35,6 +35,16 @@ no human to ask:
   `injection`.
 - The ticket branch is already checked out. Stay on it (step 2 does not
   apply).
+- **Step 1's approval check reads the G2 record, not the Status line.** In CI
+  the design stays `Status: draft`; G2 is the label `design-approved` on the
+  spec PR, which the workflow has already verified (approver in
+  `DESIGN_APPROVERS`, nothing pushed since) and recorded in
+  `$RUNNER_TEMP/agent/g2.json` (`gate`, `label`, `issue`, `pr`, `sha`,
+  `approver`, `labelledAt`). Treat the design as approved only if that file
+  exists, its `gate` is `G2`, its `issue` is this issue and its `sha` is the
+  commit you started on (`git log -1 --format=%H` before your first commit).
+  Otherwise block with `dor-gap`. Outside CI the Status rule in step 1 is
+  unchanged.
 - Skip steps 7 and 8 (Confluence, Jira) and every "ask me" step. The
   workflow moves Jira and posts to Slack through `scripts/delivery/`.
 - Never push and never run `make e2e`. Then run `/verify` and `/review` in

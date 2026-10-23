@@ -45,6 +45,8 @@ REASON_CATEGORIES = (
     "already-ran",
     "protected-path",
     "secret-found",
+    "gates-mismatch",
+    "g2-refused",
 )
 
 

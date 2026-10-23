@@ -2,23 +2,28 @@
 #
 # Started by agent-dispatch.yml (or by hand) for one SIM issue. Claude writes
 # the three spec files on a new ticket branch; a person approves the design
-# (gate G2) before anything is implemented.
+# (gate G2: the label `design-approved` on the spec PR, added by a login in
+# DESIGN_APPROVERS) before anything is implemented. The design stays
+# `Status: draft`.
 #
 # Four jobs, so that no runner ever holds both the agent and a credential
 # that could publish:
 #   prepare  Jira only. Checks the key, re-checks (read-only) that the
 #            ticket is in scope (agent-ready + ai-repo, To Do or Spec) before
 #            fetching anything, stops if the stage already ran (and flags it
-#            so the queue stops re-dispatching), fetches the ticket to a data
+#            so the queue stops re-dispatching, unless an open agent PR for the
+#            key shows the earlier run is in hand), fetches the ticket to a data
 #            file, moves the issue to Spec and labels it agent-running.
 #   agent    Anthropic key only (plus the read-only job token), egress
-#            allow-listed (harden-runner). Claude runs
+#            allow-listed and no sudo or containers (harden-runner). Claude runs
 #            .github/agent-prompts/spec.md and commits locally; the job hands
 #            back the normalised outcome, a result summary and a git bundle.
 #   publish  Fresh runner, no agent code run. Re-checks everything with the
-#            scripts from `development`; refuses (nothing pushed) any change
-#            outside its own three spec files, an approved design
-#            (`protected-path`) or a gitleaks finding (`secret-found`); then
+#            scripts from `development` (this re-validation is the control;
+#            the agent job's own normalisation is not); refuses (nothing
+#            pushed) any change outside its own three spec files, an approved
+#            design (`protected-path`), a gitleaks finding or an added
+#            `gitleaks:allow` (`secret-found`); then
 #            pushes the branch with AGENT_PUSH_TOKEN, opens a DRAFT PR to
 #            development labelled agent-pr, and reports to Jira and Slack.
 #   cleanup  On failure or cancellation: agent-running removed, the issue
@@ -109,24 +114,31 @@ jobs:
         run: |
           set -euo pipefail
           git branch -r --format='%(refname:short)' > "$RUNNER_TEMP/branches.txt"
-          gh pr list --state open --limit 200 --json headRefName,title > "$RUNNER_TEMP/prs.json"
+          gh pr list --state open --limit 200 --json headRefName,title,labels > "$RUNNER_TEMP/prs.json"
           jq -n --rawfile b "$RUNNER_TEMP/branches.txt" --slurpfile p "$RUNNER_TEMP/prs.json" \
             '{branches: ($b | split("\n") | map(select(length > 0))),
-              prs: [$p[0][] | .headRefName, .title]}' \
+              prs: [$p[0][] | .headRefName, .title],
+              agentPrs: [$p[0][] | select(any(.labels[]?; .name == "agent-pr")) | .headRefName, .title]}' \
             | python3 scripts/delivery/guard_branch.py already-ran --issue "$ISSUE" > "$RUNNER_TEMP/ran.json"
           echo "already=$(jq -r '.alreadyRan' "$RUNNER_TEMP/ran.json")" >> "$GITHUB_OUTPUT"
+          echo "open_agent_pr=$(jq -r '.openAgentPr' "$RUNNER_TEMP/ran.json")" >> "$GITHUB_OUTPUT"
 
       - name: Report that the spec stage already ran
         if: steps.ran.outputs.already == 'true'
         env:
           ISSUE: ${{ steps.key.outputs.issue }}
+          OPEN_AGENT_PR: ${{ steps.ran.outputs.open_agent_pr }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
         run: |
           set -euo pipefail
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          # Flagged + agent-blocked, so the queue stops re-dispatching it.
-          python3 scripts/delivery/jira_ops.py transition --issue "$ISSUE" --to Blocked
+          # With no open agent PR for the key, flag it (Flagged + agent-blocked) so
+          # the queue stops re-dispatching it. An open agent PR means an earlier
+          # run is in hand (a race when AGENT_MAX_CONCURRENT > 1): report only.
+          if [ "$OPEN_AGENT_PR" != "true" ]; then
+            python3 scripts/delivery/jira_ops.py transition --issue "$ISSUE" --to Blocked
+          fi
           python3 scripts/delivery/jira_ops.py comment --issue "$ISSUE" --stage spec \
             --outcome blocked --reason-category already-ran --run-url "$run_url"
           echo "Spec stage already ran for ${ISSUE}; nothing changed." >> "$GITHUB_STEP_SUMMARY"
@@ -168,9 +180,11 @@ jobs:
     steps:
       # Egress allow-list: the Anthropic API, the action's own install hosts
       # (its .github/egress-firewall.yaml at the pinned SHA), GitHub and PyPI.
+      # No sudo and no container access for anything the agent starts.
       - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: block
+          disable-sudo-and-containers: "true"
           allowed-endpoints: >-
             api.anthropic.com:443
             claude.ai:443
@@ -191,8 +205,10 @@ jobs:
           persist-credentials: false
 
       # The outcome is normalised in this job with these scripts, copied
-      # before Claude runs, so only validated fields are uploaded. The
-      # publish job validates it again with its own copy.
+      # before Claude runs, so only fields of the expected shape are uploaded.
+      # This is a size and shape filter, NOT a control: code on this runner
+      # could rewrite it. The publish job's re-validation, with its own
+      # `development` checkout, is the control.
       - name: Keep a copy of the delivery scripts from development
         run: |
           set -euo pipefail
@@ -236,6 +252,9 @@ jobs:
           GIT_AUTHOR_EMAIL: pracsys-agent@users.noreply.github.com
           GIT_COMMITTER_NAME: pracsys-agent
           GIT_COMMITTER_EMAIL: pracsys-agent@users.noreply.github.com
+          # Best-effort scrub of the Anthropic key and other secrets from the
+          # environment of every subprocess Claude starts (git, make).
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           # The job's own token (contents: read), so no OIDC token is minted.
@@ -254,7 +273,7 @@ jobs:
             --allowedTools "Read,Grep,Glob,Write,Edit,Task,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git branch:*),Bash(git switch:*),Bash(git add:*),Bash(git commit:*),Bash(make lint:*)"
 
       # No secret in this step. Everything collected here is re-checked by
-      # the publish job. Handed back: the result summary (no text, only a
+      # the publish job (the normalisation here is not a control). Handed back: the result summary (no text, only a
       # bool for a spend/limit error), the NORMALISED outcome and a bundle.
       # Never the execution log or the agent's raw outcome file.
       - name: Collect the agent's work
@@ -370,6 +389,15 @@ jobs:
                 fi
               fi
               if [ "$status" = "ready" ]; then
+                # No agent-added `gitleaks:allow`: it would silence the scan below.
+                git log -p --no-renames --format= "origin/development..refs/heads/${branch}" \
+                  | python3 scripts/delivery/stage_io.py allow-markers > "$RUNNER_TEMP/markers.json"
+                if [ "$(jq -r '.ok' "$RUNNER_TEMP/markers.json")" != "true" ]; then
+                  echo "an agent commit adds a gitleaks:allow marker; nothing is pushed (secret)"
+                  status=blocked; reason=secret-found
+                fi
+              fi
+              if [ "$status" = "ready" ]; then
                 # Pinned gitleaks over exactly the commits to be pushed. Findings
                 # stay in a file on this runner; only the verdict is printed.
                 if ! gitleaks git --no-banner --redact --log-opts="origin/development..refs/heads/${branch}" . \
@@ -424,8 +452,10 @@ jobs:
             echo "Spec files:"
             jq -r '.paths[] | "- `" + . + "`"' "$RUNNER_TEMP/paths.json"
             echo
-            echo "**Gate G2:** an approver listed in DESIGN_APPROVERS reviews the design and changes its"
-            echo "status line to \`Status: approved\` on this branch. That push starts the implement stage."
+            echo "**Gate G2:** an approver listed in DESIGN_APPROVERS reviews the specs and adds the label"
+            echo "\`design-approved\` to this PR. The dispatcher then starts the implement stage on exactly"
+            echo "this head; any later push makes the approval stale (label again). Leave the design's"
+            echo "status line as \`Status: draft\`."
             echo
             echo "Run: ${run_url}"
           } > "$RUNNER_TEMP/pr-body.md"

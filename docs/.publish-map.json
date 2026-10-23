@@ -38,7 +38,8 @@
     "docs/decisions/DR-AI-0002-gate0-as-the-model-cost-and-log-layer.md": "9502721",
     "docs/decisions/DR-AI-0003-nothing-is-cited-unless-checked.md": "9535489",
     "docs/decisions/DR-AI-0004-stop-is-a-fence.md": "9568257",
-    "docs/decisions/DR-AI-0005-workspace-deletion-erases-every-copy.md": "9371665"
+    "docs/decisions/DR-AI-0005-workspace-deletion-erases-every-copy.md": "9371665",
+    "docs/runbooks/deploy-slack-events-relay.md": "11534337"
   },
   "group_pages": {
     "Features/Case laws and applicable laws": "8847361",

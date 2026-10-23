@@ -1,0 +1,41 @@
+# Daily PracSys worklist (SIM-151).
+#
+# At 09:00 IST, Mon–Sat, posts one message to #pracsys-daily from Jira SIM:
+# work in progress by person, the next ten To Do tickets, and what is blocked
+# or overdue, for all PracSys components. No AI model; Jira is read-only.
+#
+# Off unless repo variable DAILY_ENABLED is exactly "true".
+# Scheduled workflows run only from the repository's default branch.
+
+name: Daily worklist
+
+on:
+  schedule:
+    - cron: "30 3 * * 1-6" # 09:00 IST, Mon–Sat
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-worklist
+  cancel-in-progress: false
+
+jobs:
+  worklist:
+    if: vars.DAILY_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: development
+          persist-credentials: false
+
+      - name: Post the worklist
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          DAILY_CHANNEL_ID: ${{ vars.DAILY_CHANNEL_ID }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: python3 scripts/delivery/daily_worklist.py post

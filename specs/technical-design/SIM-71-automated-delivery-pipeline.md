@@ -514,7 +514,7 @@ through G1.
 | harden-runner allow-list incomplete (pilot) | `egress-policy: block` with an explicit list; wildcard (`*.githubusercontent.com`) support and the implicit artifact/cache endpoints are not verifiable offline. A blocked call fails the job, which ends Blocked `workflow-failed` (fail closed). Check the first pilot run's harden-runner insights and widen the list by name, never with a broad wildcard such as `*.blob.core.windows.net` |
 | Ticket artifact readable for up to a day | `retention-days: 1`; no deletion, because that needs `actions: write` on a credentialed job. Hand-off artifacts carry no ticket text |
 | A trusted-copy outcome is normalised on the agent's runner | Publish re-normalises with its own `development` checkout; the agent-job copy only limits what is uploaded |
-| Protect-branch hook misses combined short flags (`git commit -nm`) | Pending: `.claude/hooks/protect-branch.sh` is Claude Code configuration and is changed by a human, not by the agent (patch prepared). gitleaks still runs in both publish jobs and in CI |
+| Protect-branch hook missed combined short flags (`git commit -nm`) | **Fixed** 2026-10-23: the product owner approved the prepared patch; the hook now checks only the `git commit` segment's flags (quoted text removed), blocks any short-flag cluster containing `n` and any prefix of `--no-verify`; `tests/test_protect_branch_flags.py`. gitleaks also runs in every publish job before a push. |
 | Kill switch | Repo variable `AGENTS_ENABLED=false` stops every agent workflow at the job `if:`. Disable the routine in claude.ai. Revoke `ANTHROPIC_API_KEY` as the last resort. CI and deploys are unaffected |
 
 ## Test plan

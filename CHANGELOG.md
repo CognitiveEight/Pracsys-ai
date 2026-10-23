@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SIM-153: Phase 3 delivery helpers for the agent pipeline (SIM-71 tasks
+  12–14).** Five standard-library scripts in `scripts/delivery/`, the
+  deterministic controls the agent workflows will call: `guard_branch.py`
+  (pushes only to the run's own `feature/SIM-<n>-*` / `fix/SIM-<n>-*`
+  branch, never `development`/`staging`/`main`; detects a spec stage that
+  already ran), `review_labels.py` (forces `needs-human-review` for the
+  sensitive paths), `notify_slack.py` (fixed-format notice to
+  `DELIVERY_CHANNEL_ID`), `jira_ops.py` (fetch a ticket to a data file,
+  transition, `agent-*` labels, fixed-format comments; refuses Done; Blocked
+  sets Flagged plus `agent-blocked`) and `agent_queue.py` (priority-ordered
+  pick of `agent-ready` + `ai-repo` tickets, honouring `AGENTS_ENABLED` and
+  `AGENT_MAX_CONCURRENT`). Comments and notices carry only key, stage,
+  outcome, counts, cost, a reason category and GitHub links, never ticket
+  or Slack text. Tests: `tests/test_delivery_scripts.py`. No workflow uses
+  them yet; no socket payload or `app/` change.
+
 - **SIM-152: instant replies in #pracsys-requests.** A small GCP Cloud
   Function (`relay/slack_events/`) receives Slack events, checks Slack's
   signature, and starts the "Slack triage" workflow straight away for a

@@ -94,11 +94,26 @@ def test_escapes_slack_characters(wl):
     assert "Fix &lt;b&gt; &amp; &gt; tags" in text
 
 
-def test_length_cap(wl):
+def test_long_worklist_split_without_dropping(wl):
     many = [_issue(f"SIM-{i}", summary="A long ticket summary " * 4, assignee=f"Person {i % 7}") for i in range(200)]
-    text = wl.build_message(in_progress=many, todo=many[:10], todo_more=True, blocked=many, today=TODAY)
-    assert len(text) <= 3900
-    assert "… and " in text and " more" in text
+    todo = [_issue(f"SIM-{i}", status="To Do") for i in range(300, 310)]
+    blocked = [_issue(f"SIM-{i}", flagged=True) for i in range(400, 440)]
+    messages = wl.build_messages(in_progress=many, todo=todo, todo_more=False, blocked=blocked, today=TODAY)
+    assert len(messages) > 1
+    assert all(len(m) <= 3900 for m in messages)
+    joined = "\n".join(messages)
+    assert "… and " not in joined  # nothing is cut any more
+    for key in [f"SIM-{i}" for i in list(range(200)) + list(range(300, 310)) + list(range(400, 440))]:
+        assert joined.count(f"|{key}>") == 1, key
+    # every message after the first starts at a section or a person, never mid-list
+    for m in messages[1:]:
+        first = m.splitlines()[0]
+        assert first.startswith(("*", "• *")), first
+
+
+def test_short_worklist_is_one_message(wl):
+    messages = wl.build_messages(in_progress=[_issue("SIM-1")], todo=[], todo_more=False, blocked=[], today=TODAY)
+    assert len(messages) == 1 and messages[0].startswith("*PracSys worklist")
 
 
 def test_posts_only_to_daily_channel(wl, monkeypatch):
@@ -107,7 +122,7 @@ def test_posts_only_to_daily_channel(wl, monkeypatch):
     monkeypatch.setattr(wl, "_jira_search", lambda jql, limit: ([], False))
     monkeypatch.setattr(wl, "_slack_post", lambda channel, text: posted.append((channel, text)))
     assert wl.main(["post"]) == 0
-    assert len(posted) == 1 and posted[0][0] == "C0DAILY0001"
+    assert posted and all(channel == "C0DAILY0001" for channel, _ in posted)
 
 
 def test_dry_run_does_not_post(wl, monkeypatch, capsys):

@@ -38,8 +38,10 @@ customfield_10021`):
 2. Next up: `project = SIM AND statusCategory = "To Do" AND issuetype != Epic ORDER BY priority DESC, created ASC` (first 10)
 3. Blocked and overdue: `project = SIM AND statusCategory != Done AND (Flagged is not EMPTY OR duedate < startOfDay())`
 
-**Message** (Slack markdown, one post, ≤ 3,900 characters; if longer, each
-section is cut with "… and N more" and a link to the Jira search):
+**Message** (Slack markdown). Nothing is ever cut: when the worklist is longer
+than 3,900 characters it is posted as several consecutive messages, split
+only between sections or between people (2026-10-23, product owner: the
+"… and N more" cut hid tickets):
 ```
 PracSys worklist — <Weekday, DD Mon YYYY>
 
@@ -81,7 +83,8 @@ must be invited to `#pracsys-daily`.
 ## Test plan
 `tests/test_daily_worklist.py` (no network: `_jira` and `_slack` replaced):
 grouping by assignee and ordering; top-10 cut; blocked and overdue; empty
-sections; priority mapping; length cap with "… and N more"; post goes only to
+sections; priority mapping; long worklists split into several messages with
+nothing dropped; posts go only to
 `DAILY_CHANNEL_ID`; `--dry-run` prints without posting.
 `tests/test_delivery_workflows.py`: gate on `DAILY_ENABLED`, read-only,
 pinned checkout, cron at 03:30 UTC Mon–Sat. `make e2e` not needed.

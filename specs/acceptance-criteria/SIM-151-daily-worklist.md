@@ -9,8 +9,8 @@
 | AC-2 | 14 To Do tickets of mixed priority | the worklist is built | "Next up" shows 10, highest priority first, and "top 10 of 14" | `tests/test_daily_worklist.py::test_next_up_top_ten` |
 | AC-3 | a flagged ticket and an overdue ticket | the worklist is built | both appear under "Blocked and overdue" with "flagged" / "due <date>" | `tests/test_daily_worklist.py::test_blocked_and_overdue` |
 | AC-4 | no tickets in a section | the worklist is built | that section says "None" | `tests/test_daily_worklist.py::test_empty_sections` |
-| AC-5 | very many tickets | the message is built | it stays under 3,900 characters and cut sections end with "… and N more" | `tests/test_daily_worklist.py::test_length_cap` |
-| AC-6 | `DAILY_CHANNEL_ID` set | the script posts | exactly one top-level message goes to that channel and nowhere else | `tests/test_daily_worklist.py::test_posts_only_to_daily_channel` |
+| AC-5 | very many tickets | the worklist is built | it is split into several messages, each under 3,900 characters, split only between sections or people, and every ticket appears exactly once | `tests/test_daily_worklist.py::test_long_worklist_split_without_dropping` |
+| AC-6 | `DAILY_CHANNEL_ID` set | the script posts | each message goes to that channel only, top-level, in order | `tests/test_daily_worklist.py::test_posts_only_to_daily_channel` |
 | AC-7 | `--dry-run` | the script runs | the message is printed and nothing is posted | `tests/test_daily_worklist.py::test_dry_run_does_not_post` |
 | AC-8 | `DAILY_ENABLED` not `true` | the schedule fires | the job is skipped | `tests/test_delivery_workflows.py::test_daily_job_gated_on_variable` |
 | AC-9 | the live set-up | 09:00 IST on a working day | a post appears in `#pracsys-daily` by 09:45 and its counts match the JQL in Jira | **manual**: first live morning |

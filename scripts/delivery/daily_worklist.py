@@ -156,49 +156,82 @@ def _blocked_lines(issues: List[Dict[str, Any]], today: date) -> List[str]:
     return lines
 
 
-def _render(header: str, sections: List[Tuple[str, List[str]]]) -> str:
-    parts = [header]
-    for title, lines in sections:
-        parts.append("")
-        parts.append(title)
-        parts.extend(lines or ["  None"])
-    return "\n".join(parts)
-
-
-def build_message(
+def _blocks(
     *,
     in_progress: List[Dict[str, Any]],
     todo: List[Dict[str, Any]],
     todo_more: bool,
     blocked: List[Dict[str, Any]],
     today: date,
-) -> str:
+) -> List[str]:
+    """The worklist as whole blocks: the header, each section title, and each
+    person's group. A message may be split between blocks, never inside one
+    (unless a single block is itself too long)."""
     header = f"*PracSys worklist — {today.strftime('%A')}, {today.day} {today.strftime('%b %Y')}*"
-    progress_lines: List[str] = []
-    for name, lines in _in_progress_lines(in_progress, today):
-        progress_lines.append(f"• *{_esc(name)}*")
-        progress_lines.extend(lines)
-    todo_total = f"{len(todo)}+" if todo_more else str(len(todo))
-    sections = [
-        [f"*In progress ({len(in_progress)})*", progress_lines],
-        [f"*Next up (top {min(len(todo), _TODO_SHOWN)} of {todo_total})*", _todo_lines(todo)],
-        [f"*Blocked and overdue ({len(blocked)})*", _blocked_lines(blocked, today)],
-    ]
+    blocks = [header]
 
-    text = _render(header, [tuple(s) for s in sections])
-    # Too long for one Slack message: shorten the longest section, a few lines
-    # at a time, and say how many were left out.
-    full = {i: list(s[1]) for i, s in enumerate(sections)}
-    while len(text) > _MAX_TEXT:
-        index = max(full, key=lambda i: len(sections[i][1]))
-        kept = [line for line in sections[index][1] if not line.startswith("  … and ")]
-        if len(kept) <= 1:
-            break
-        kept = kept[: max(1, len(kept) - 5)]
-        hidden = len(full[index]) - len(kept)
-        sections[index][1] = kept + [f"  … and {hidden} more"]
-        text = _render(header, [tuple(s) for s in sections])
-    return text[:_MAX_TEXT]
+    blocks.append(f"\n*In progress ({len(in_progress)})*")
+    groups = _in_progress_lines(in_progress, today)
+    for name, lines in groups:
+        blocks.append("\n".join([f"• *{_esc(name)}*", *lines]))
+    if not groups:
+        blocks.append("  None")
+
+    todo_total = f"{len(todo)}+" if todo_more else str(len(todo))
+    todo_lines = _todo_lines(todo)
+    blocks.append(
+        "\n".join(
+            [f"\n*Next up (top {min(len(todo), _TODO_SHOWN)} of {todo_total})*", *(todo_lines or ["  None"])]
+        )
+    )
+    blocked_lines = _blocked_lines(blocked, today)
+    blocks.append("\n".join([f"\n*Blocked and overdue ({len(blocked)})*", *(blocked_lines or ["  None"])]))
+    return blocks
+
+
+def _pack(blocks: List[str]) -> List[str]:
+    """Pack blocks into as few messages as fit, each at most _MAX_TEXT long."""
+    messages: List[str] = []
+    current = ""
+    for block in blocks:
+        pieces = [block]
+        if len(block) > _MAX_TEXT:  # one person with a very long list: split by line
+            pieces, chunk = [], ""
+            for line in block.split("\n"):
+                if chunk and len(chunk) + 1 + len(line) > _MAX_TEXT:
+                    pieces.append(chunk)
+                    chunk = line if line.startswith(("*", "• *")) else f"• *(continued)*\n{line}"
+                else:
+                    chunk = f"{chunk}\n{line}" if chunk else line
+            pieces.append(chunk)
+        for piece in pieces:
+            if current and len(current) + 1 + len(piece) > _MAX_TEXT:
+                messages.append(current)
+                current = piece.lstrip("\n")
+            else:
+                current = f"{current}\n{piece}" if current else piece
+    if current:
+        messages.append(current)
+    return messages
+
+
+def build_messages(
+    *,
+    in_progress: List[Dict[str, Any]],
+    todo: List[Dict[str, Any]],
+    todo_more: bool,
+    blocked: List[Dict[str, Any]],
+    today: date,
+) -> List[str]:
+    """The whole worklist, split into Slack-sized messages; nothing is dropped."""
+    return _pack(
+        _blocks(in_progress=in_progress, todo=todo, todo_more=todo_more, blocked=blocked, today=today)
+    )
+
+
+def build_message(**kwargs: Any) -> str:
+    """The whole worklist as one text (used for --dry-run and tests)."""
+    return "\n".join(_blocks(**kwargs))
 
 
 # -------------------------------------------------------------------- CLI
@@ -219,7 +252,7 @@ def main(argv: List[str] | None = None) -> int:
     in_progress, _ = _jira_search(JQL_IN_PROGRESS, 100)
     todo, todo_more = _jira_search(JQL_TODO, 100)
     blocked, _ = _jira_search(JQL_BLOCKED, 50)
-    text = build_message(
+    messages = build_messages(
         in_progress=in_progress,
         todo=todo,
         todo_more=todo_more,
@@ -227,10 +260,14 @@ def main(argv: List[str] | None = None) -> int:
         today=datetime.now(_IST).date(),
     )
     if args.dry_run:
-        print(text)
+        print("\n\n---\n\n".join(messages))
         return 0
-    _slack_post(channel, text)
-    print(f"posted worklist: in_progress={len(in_progress)} todo={len(todo)} blocked={len(blocked)}")
+    for text in messages:
+        _slack_post(channel, text)
+    print(
+        f"posted worklist: messages={len(messages)} in_progress={len(in_progress)} "
+        f"todo={len(todo)} blocked={len(blocked)}"
+    )
     return 0
 
 

@@ -1,0 +1,178 @@
+# CI for the SimplerToday AI service (Jira SIM-23).
+#
+# Runs the same gates a developer runs locally (`make lint`, `make test`) plus a
+# secret scan of the commits being proposed. Deliberately offline and free:
+#   * no repository secrets are referenced anywhere in this file;
+#   * no model, GCS, Vision or backend call is made (the suites stub them);
+#   * `make e2e` is never run here — it makes real, billed Gemini calls and is
+#     started by a human before a deploy.
+#
+# Required status checks for branch protection use the job names below:
+#   "lint", "test", "secrets-scan".
+
+name: CI
+
+on:
+  pull_request:
+    branches: [development, staging, main]
+  push:
+    branches: [development, staging, main]
+
+# Least privilege: every job only needs to read the repository.
+permissions:
+  contents: read
+
+# A new push to a PR supersedes the run in progress for it. Pushes to the
+# protected branches are not cancelled, so each merge keeps a complete record.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Production runs Python 3.12 (Dockerfile: python:3.12-slim) and
+  # requirements.lock.txt was resolved and tested on 3.12. pyproject's
+  # `target-version = "py311"` is only ruff's minimum-syntax setting.
+  PYTHON_VERSION: "3.12"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # The enabled rules (F, E9) are static, so ruff needs no project
+      # dependencies. The version is read from requirements-dev.txt so the pin
+      # lives in one place (it must also match .pre-commit-config.yaml).
+      - name: Install ruff
+        run: |
+          ruff_pin="$(grep -oE '^ruff==[0-9.]+' requirements-dev.txt)"
+          test -n "$ruff_pin" || { echo "ruff pin not found in requirements-dev.txt"; exit 1; }
+          python -m pip install "$ruff_pin"
+
+      - name: make lint
+        run: make lint
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    # A real Qdrant so the store checks run instead of skipping:
+    # tests/test_tables.py (row store, skipif no Qdrant) and
+    # tests/offline/verify_rag.py (prints "store checks skipped" and still
+    # exits 0 without one). Both use uniquely named throwaway collections.
+    # Pinned to the server version docker-compose.yml's `latest` currently
+    # resolves to, which matches qdrant-client==1.18.0 in requirements.lock.txt.
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.18.3
+        ports:
+          - 6333:6333
+
+    env:
+      # The only two settings app/core/config.py requires at import time.
+      # Obvious placeholders: no .env exists in CI and none is needed. The
+      # socket URL points at the discard port, so nothing could ever connect.
+      SOCKET_URL: http://127.0.0.1:9
+      SECRET_KEY: ci-placeholder
+      TEST_QDRANT_URL: http://localhost:6333
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock.txt
+            requirements-dev.txt
+
+      # The exact production set (requirements.lock.txt) plus the dev tools.
+      # requirements-dev.txt pulls in requirements.txt too; the lock's exact
+      # pins satisfy those ranges, so pip errors out if the two have drifted.
+      # No apt packages: no test shells out to ffmpeg, poppler or antiword.
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.lock.txt -r requirements-dev.txt
+          python -m pip check
+
+      # The Qdrant image ships neither curl nor wget, so a service health-cmd
+      # is not possible; poll its readiness endpoint from the runner instead.
+      - name: Wait for Qdrant
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -sf -m 2 http://localhost:6333/readyz >/dev/null; then
+              echo "Qdrant ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Qdrant did not become ready"; exit 1
+
+      - name: make test
+        run: make test
+
+  secrets-scan:
+    name: secrets-scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # Same version as the pre-commit hook in .pre-commit-config.yaml.
+      GITLEAKS_VERSION: "8.30.1"
+      # SHA-256 of gitleaks_8.30.1_linux_x64.tar.gz from the release's
+      # published checksums file. Update together with GITLEAKS_VERSION.
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      # Full history so the commit range below can be resolved.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # gitleaks/gitleaks-action needs a paid GITLEAKS_LICENSE secret on
+      # organisation repositories, and the pre-commit hook only scans staged
+      # changes. So the release binary is used directly, checksum-verified.
+      - name: Install gitleaks
+        run: |
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          echo "${GITLEAKS_SHA256}  ${tarball}" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/gitleaks" gitleaks
+          rm -f "$tarball"
+          echo "$RUNNER_TEMP/gitleaks" >> "$GITHUB_PATH"
+
+      # Scan only the commits this PR or push adds, not all history: the
+      # point is to stop new secrets landing. --redact keeps any finding's
+      # value out of the public job log. Event values go through env, never
+      # straight into the script.
+      - name: Scan new commits
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_AFTER_SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            log_opts="${PR_BASE_SHA}..${PR_HEAD_SHA}"
+          elif [ -z "$PUSH_BEFORE_SHA" ] || [ "$PUSH_BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            # Branch created by this push: no "before" to diff against.
+            log_opts="-1 ${PUSH_AFTER_SHA}"
+          else
+            log_opts="${PUSH_BEFORE_SHA}..${PUSH_AFTER_SHA}"
+          fi
+          echo "Scanning: ${log_opts}"
+          gitleaks git --no-banner --redact --verbose --log-opts="${log_opts}" .

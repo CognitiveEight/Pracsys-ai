@@ -29,8 +29,16 @@ _FIELDS = [
 ]
 _PRIORITY = {"Highest": "P1", "High": "P2", "Medium": "P3", "Low": "P4", "Lowest": "P4"}
 
-JQL_IN_PROGRESS = 'project = SIM AND status in ("In Progress", "In Review") AND issuetype != Epic ORDER BY updated ASC'
-JQL_TODO = 'project = SIM AND statusCategory = "To Do" AND issuetype != Epic ORDER BY priority DESC, created ASC'
+#: Active work: the team's workflow is To Do → Spec → In Progress → In Review →
+#: QA → Done. Jira files Spec and QA under the "To Do" category, so the
+#: queries name statuses, not categories.
+ACTIVE_STATUSES = ("Spec", "In Progress", "In Review", "QA")
+JQL_IN_PROGRESS = (
+    "project = SIM AND status in ("
+    + ", ".join(f'"{s}"' for s in ACTIVE_STATUSES)
+    + ") AND issuetype != Epic ORDER BY updated ASC"
+)
+JQL_TODO = 'project = SIM AND status = "To Do" AND issuetype != Epic ORDER BY priority DESC, created ASC'
 JQL_BLOCKED = (
     "project = SIM AND statusCategory != Done "
     "AND (Flagged is not EMPTY OR duedate < startOfDay()) ORDER BY priority DESC"
@@ -170,7 +178,7 @@ def _blocks(
     header = f"*PracSys worklist — {today.strftime('%A')}, {today.day} {today.strftime('%b %Y')}*"
     blocks = [header]
 
-    blocks.append(f"\n*In progress ({len(in_progress)})*")
+    blocks.append(f"\n*In progress: spec, build, review, QA ({len(in_progress)})*")
     groups = _in_progress_lines(in_progress, today)
     for name, lines in groups:
         blocks.append("\n".join([f"• *{_esc(name)}*", *lines]))

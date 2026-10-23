@@ -51,7 +51,7 @@ def test_in_progress_grouped_by_assignee(wl):
         _issue("SIM-4", assignee="Asha Test", updated="2026-10-22T09:00:00.000+0530"),
     ]
     text = wl.build_message(in_progress=issues, todo=[], todo_more=False, blocked=[], today=TODAY)
-    section = text.split("*In progress (4)*")[1].split("*Next up")[0]
+    section = text.split("*In progress: spec, build, review, QA (4)*")[1].split("*Next up")[0]
     assert section.index("Asha Test") < section.index("Ravi Test") < section.index("Unassigned")
     asha = section.split("Asha Test")[1].split("Ravi Test")[0]
     assert asha.index("SIM-2") < asha.index("SIM-4")  # oldest update first
@@ -138,3 +138,10 @@ def test_missing_channel_refused(wl, monkeypatch):
     monkeypatch.setattr(wl, "_jira_search", lambda jql, limit: ([], False))
     monkeypatch.setattr("sys.stderr", io.StringIO())
     assert wl.main(["post"]) != 0
+
+
+def test_queries_cover_spec_and_qa_and_exclude_them_from_next_up(wl):
+    for status in ("Spec", "In Progress", "In Review", "QA"):
+        assert f'"{status}"' in wl.JQL_IN_PROGRESS
+    assert 'status = "To Do"' in wl.JQL_TODO and "statusCategory" not in wl.JQL_TODO
+    assert "issuetype != Epic" in wl.JQL_IN_PROGRESS and "issuetype != Epic" in wl.JQL_TODO

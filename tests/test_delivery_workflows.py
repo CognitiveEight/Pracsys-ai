@@ -65,3 +65,29 @@ def test_action_uses_the_read_only_job_token_not_oidc():
     assert step["with"]["github_token"] == "${{ github.token }}"
     assert "id-token" not in doc["permissions"]
     assert doc["permissions"] == {"contents": "read"}
+
+
+DAILY = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "daily-worklist.yml"
+
+
+def _load_daily():
+    doc = yaml.safe_load(DAILY.read_text())
+    return doc, doc.get("on", doc.get(True))
+
+
+def test_daily_job_gated_on_variable():
+    doc, _ = _load_daily()
+    assert doc["jobs"]["worklist"]["if"].replace(" ", "") == "vars.DAILY_ENABLED=='true'"
+
+
+def test_daily_schedule_read_only_and_no_model():
+    doc, triggers = _load_daily()
+    assert set(triggers) == {"schedule", "workflow_dispatch"}
+    assert triggers["schedule"] == [{"cron": "30 3 * * 1-6"}]  # 09:00 IST, Mon–Sat
+    assert doc["permissions"] == {"contents": "read"}
+    steps = doc["jobs"]["worklist"]["steps"]
+    uses = [s["uses"] for s in steps if "uses" in s]
+    assert len(uses) == 1 and uses[0].startswith("actions/checkout@")
+    assert len(uses[0].split("@", 1)[1]) == 40  # pinned by SHA
+    assert steps[0]["with"]["persist-credentials"] is False
+    assert "ANTHROPIC_API_KEY" not in DAILY.read_text()

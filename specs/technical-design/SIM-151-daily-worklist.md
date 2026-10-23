@@ -1,7 +1,7 @@
 # SIM-151: Daily PracSys worklist — technical design
 
 - **Requirements:** `specs/requirements/SIM-151-daily-worklist.md`
-- **Status:** draft
+- **Status:** approved by the product owner on 2026-10-23
 - **Approver:** product owner
 
 ## Summary
@@ -34,7 +34,7 @@ besides checkout (pinned by SHA).
 **Queries** (all through Jira REST `POST /rest/api/3/search/jql`, fields
 `summary, status, priority, assignee, updated, duedate, customfield_10075,
 customfield_10021`):
-1. In progress: `project = SIM AND status in ("In Progress", "In Review") ORDER BY updated ASC`
+1. In progress: `project = SIM AND status in ("In Progress", "In Review") AND issuetype != Epic ORDER BY updated ASC` (epics are umbrellas, not daily work)
 2. Next up: `project = SIM AND statusCategory = "To Do" AND issuetype != Epic ORDER BY priority DESC, created ASC` (first 10)
 3. Blocked and overdue: `project = SIM AND statusCategory != Done AND (Flagged is not EMPTY OR duedate < startOfDay())`
 

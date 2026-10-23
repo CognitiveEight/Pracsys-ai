@@ -2,7 +2,7 @@
 
 - **Jira:** SIM-151 (epic SIM-71)
 - **Owner:** product owner
-- **Status:** draft
+- **Status:** approved by the product owner on 2026-10-23
 - **Target branch flow:** feature/SIM-151-daily-worklist → development → staging → main
 
 ## Problem

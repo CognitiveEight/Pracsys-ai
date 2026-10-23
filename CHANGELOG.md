@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SIM-151: daily PracSys worklist in Slack.** At 09:00 IST, Mon–Sat,
+  `.github/workflows/daily-worklist.yml` posts one message to `#pracsys-daily`
+  from Jira SIM: work in progress by person, the next ten To Do tickets by
+  priority, and blocked or overdue tickets, for all components. No AI model;
+  Jira read-only (`scripts/delivery/daily_worklist.py`). Off unless the repo
+  variable `DAILY_ENABLED` is `true`.
+
 - **SIM-133: Slack triage and answers in GitHub Actions.** Every 5 minutes in
   working hours, `.github/workflows/slack-triage.yml` runs Claude over the
   triage channel: requests and bugs get a draft SIM ticket in the thread (a

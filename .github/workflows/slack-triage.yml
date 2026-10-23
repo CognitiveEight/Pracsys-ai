@@ -1,16 +1,17 @@
-# Slack → Jira triage and answers (SIM-133; SIM-71 design, "Phase 2 revision").
+# PracSys requests channel: triage and answers (SIM-133; SIM-71 design, Phase 2 revisions).
 #
 # Every 5 minutes in working hours, Claude reads the triage channel and, per
 # docs/delivery/slack-triage-routine.md, drafts tickets for requests and bugs,
-# answers questions about the AI service from this repo, and creates a SIM
-# issue only after the approver's ✅.
+# answers questions about PracSys from PracSys Engineering and this repo, and
+# creates a SIM issue only after the approver's ✅.
 #
 # Guardrails:
 #   * off unless repo variable TRIAGE_ENABLED is exactly "true" (kill switch);
 #   * read-only checkout of development; no git push, no edits;
-#   * Claude may only read files and run the two helper scripts. Slack and Jira
-#     are reached through those scripts, which hold the tokens and refuse
-#     anything outside a thread of TRIAGE_CHANNEL_ID / a Bug or Task in SIM;
+#   * Claude may only read files and run the three helper scripts. Slack,
+#     Jira and Confluence are reached through them; they hold the tokens and
+#     refuse anything outside a thread of TRIAGE_CHANNEL_ID, a Bug or Task in
+#     SIM, or the PracSys Engineering space;
 #   * ANTHROPIC_API_KEY belongs to a separate workspace with a spend limit.
 #
 # Scheduled workflows run only from the repository's default branch.
@@ -60,4 +61,4 @@ jobs:
           claude_args: >-
             --model claude-sonnet-5-5
             --max-turns 40
-            --allowedTools "Read,Grep,Glob,Bash(python3 scripts/delivery/slack_io.py:*),Bash(python3 scripts/delivery/jira_triage.py:*)"
+            --allowedTools "Read,Grep,Glob,Bash(python3 scripts/delivery/slack_io.py:*),Bash(python3 scripts/delivery/jira_triage.py:*),Bash(python3 scripts/delivery/confluence_docs.py:*)"

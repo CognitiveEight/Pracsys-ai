@@ -47,6 +47,7 @@ def test_agent_tools_are_read_only_plus_the_two_helpers():
         "Glob",
         "Bash(python3 scripts/delivery/slack_io.py:*)",
         "Bash(python3 scripts/delivery/jira_triage.py:*)",
+        "Bash(python3 scripts/delivery/confluence_docs.py:*)",
     ]
     for banned in ("Edit", "Write", "WebFetch", "git push", "make e2e", "dangerously"):
         assert banned not in args

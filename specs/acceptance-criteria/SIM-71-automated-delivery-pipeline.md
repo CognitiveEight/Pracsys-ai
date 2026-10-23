@@ -38,6 +38,10 @@ content, and the staging environment, and are recorded on the PRACENG page.
 | AC-15d | `slack_io.reply` called for a top-level post or another channel | the helper runs | it refuses and exits non-zero | `tests/test_delivery_triage.py::test_reply_refuses_top_level_and_other_channels` |
 | AC-15e | `jira_triage.create` called with another project, type, extra labels, or a source link that already has an issue | the helper runs | it refuses; labels are forced to `from-slack`, `ai-repo`; no issue is created twice | `tests/test_delivery_triage.py::test_create_refuses_out_of_scope_and_duplicates` |
 | AC-15f | repo variable `TRIAGE_ENABLED` unset or not `true` | the 5-minute schedule fires | the job is skipped; no Slack read, no model call | `tests/test_delivery_workflows.py::test_triage_job_gated_on_variable` (static) |
+| AC-15g | a bug about the lawyer app, one about the backend and one about the AI service | the run drafts them | each draft names the matching component (FE, BE, AI); after ✅ each issue has that component and labels `from-slack` plus `fe-repo` / `be-repo` / `ai-repo` | **manual**: dry run |
+| AC-15h | `jira_triage.create` called with a component outside AI/BE/FE/Admin/DevOps/QA | the helper runs | it refuses; the component label is forced from the component, never taken from input | `tests/test_delivery_triage.py::test_create_component_and_labels` |
+| AC-15i | a question about how sharing works in the lawyer app | the run answers it | the answer is built from PracSys Engineering pages and links them; no invented detail | **manual**: dry run |
+| AC-15j | `confluence_docs` asked for a page outside space PRACENG, or a CQL that names another space | the helper runs | it refuses the page; search is always scoped to PRACENG | `tests/test_delivery_triage.py::test_confluence_scoped_to_praceng` |
 
 ## Phase 3: Jira → agents (G2, G3)
 

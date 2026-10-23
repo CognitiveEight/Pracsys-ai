@@ -4,7 +4,8 @@
 - **Status:** draft (Phases 1, 3, 4); **Phase 2 approved** by the product
   owner on 2026-10-22, built under SIM-133; **Phase 2 revision (GitHub
   Actions every 5 minutes, answers questions) approved** by the product owner
-  on 2026-10-22
+  on 2026-10-22; **Phase 2 revision 2 (one global channel for all PracSys
+  apps) approved** by the product owner on 2026-10-23
 - **Approver:** tech lead (SimplerToday); admin for the identity, ruleset and
   GCP parts; product owner for the gate placement (already decided)
 
@@ -262,6 +263,39 @@ nothing new; the spend limit on the CI workspace is the hard cap.
 
 **Rollback.** Set `TRIAGE_ENABLED=false` (or unset it). The Claude cloud
 routine stays created and disabled, as a fallback.
+
+### Phase 2 revision 2 (2026-10-23): one global channel for all PracSys apps
+The product owner chose one requests channel for the whole platform instead
+of one per app: people should not have to know which part is broken. The
+runner, gates and guardrails above are unchanged. What changes:
+
+- **Channel.** `#ai-requests` is renamed `#pracsys-requests` (same channel id,
+  `C0CAXK9J7U6`, so `TRIAGE_CHANNEL_ID` does not change).
+- **Component.** The triage step picks the component from the message: `AI`,
+  `BE` (backend), `FE` (lawyer app), `Admin` (admin panel), `DevOps` or `QA`
+  (the SIM "Components" field's own values). The draft shows it; the
+  approver can ask for a change. `jira_triage.py create` takes
+  `--component` (one of those six, anything else refused) and forces the
+  labels `from-slack` plus the component's label: `ai-repo`, `be-repo`,
+  `fe-repo`, `admin-repo`, `devops`, `qa`. When unsure, the draft says
+  "component unclear" under Open questions and suggests one.
+- **Answers for every app.** Questions are answered from **PracSys
+  Engineering** (Confluence space `PRACENG`), which already holds the
+  features, flows, contracts, runbooks, policies and decisions of all four
+  apps, plus this repo's code for the AI service. **new**
+  `scripts/delivery/confluence_docs.py`: `search` (CQL forced to space
+  PRACENG, page titles and excerpts) and `read` (one page as plain text,
+  refused if the page is not in PRACENG). Read-only; it uses the same
+  Atlassian service account and token as Jira (`JIRA_EMAIL`,
+  `JIRA_API_TOKEN`), which must be able to read PRACENG. Reading the backend,
+  lawyer-app and admin **code** is out of scope for now (needs read access
+  to those repos).
+- **Approvers.** Still the product owner only (`U0C8G5235A8`). Per-component
+  approvers are a later change to the allow-list.
+- **Where it lives.** Stays in Pracsys-ai for now; moving it to a neutral
+  delivery repo is an open question.
+
+New acceptance criteria: AC-15g to AC-15j.
 
 ## Phase 3: Jira → agents
 

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SIM-152: instant replies in #pracsys-requests.** A small GCP Cloud
+  Function (`relay/slack_events/`) receives Slack events, checks Slack's
+  signature, and starts the "Slack triage" workflow straight away for a
+  person's message or a ✅/❌ reaction in the channel, so replies arrive in
+  about a minute instead of about half an hour. It never logs message text.
+  Deploy with `docs/runbooks/deploy-slack-events-relay.md`; the 5-minute
+  schedule stays as a safety net.
+
 - **SIM-151: daily PracSys worklist in Slack.** At 09:00 IST, Mon–Sat,
   `.github/workflows/daily-worklist.yml` posts one message to `#pracsys-daily`
   from Jira SIM: work in progress by person, the next ten To Do tickets by

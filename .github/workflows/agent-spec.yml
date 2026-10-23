@@ -61,6 +61,7 @@ jobs:
   prepare:
     if: vars.AGENTS_ENABLED == 'true'
     runs-on: ubuntu-24.04
+    environment: pracsys-agents
     timeout-minutes: 10
     permissions:
       contents: read
@@ -174,6 +175,7 @@ jobs:
     needs: prepare
     if: vars.AGENTS_ENABLED == 'true' && needs.prepare.outputs.go == 'true'
     runs-on: ubuntu-24.04
+    environment: pracsys-agents
     timeout-minutes: 30
     permissions:
       contents: read
@@ -315,6 +317,7 @@ jobs:
     needs: [prepare, agent]
     if: vars.AGENTS_ENABLED == 'true' && needs.prepare.outputs.go == 'true' && needs.agent.result == 'success'
     runs-on: ubuntu-24.04
+    environment: pracsys-agents
     timeout-minutes: 15
     # The job token stays read-only; writes use AGENT_PUSH_TOKEN, in the one
     # step that pushes and opens the PR.
@@ -499,6 +502,7 @@ jobs:
     needs: [prepare, agent, publish]
     if: (failure() || cancelled()) && vars.AGENTS_ENABLED == 'true' && needs.prepare.outputs.started == 'true'
     runs-on: ubuntu-24.04
+    environment: pracsys-agents
     timeout-minutes: 10
     permissions:
       contents: read

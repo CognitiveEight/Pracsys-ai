@@ -578,6 +578,9 @@ def test_implement_publish_titles_unblocks_and_maps_budget():
     assert 'gh pr edit "$PR" --title "${ISSUE}: implementation"' in body
     assert "jira_ops.py unblock" in body
     assert "--budget" in body
+    # Review finding 6: the title says "implementation" only when something was pushed.
+    assert re.search(r'if \[ "\$PUSH" = "true" \]; then\s+git push[^\n]*\n[^\n]*\n'
+                     r'(\s+#[^\n]*\n)*\s+gh pr edit "\$PR" --title "\$\{ISSUE\}: implementation"\s+fi', body)
 
 
 def test_spec_stage_scope_check_comes_before_the_fetch():
@@ -618,7 +621,7 @@ def test_push_token_owner_is_never_trusted_as_an_approver_by_default():
     """The push token belongs to an approver (until a machine user exists). G2 is the label
     event's actor, so the pipeline must never add `design-approved` itself, there is no
     built-in approver fallback, and git-check refuses agent commits outside the spec files.
-    The design records the machine user as REQUIRED before AGENTS_ENABLED goes beyond the pilot."""
+    The design records the machine user as REQUIRED BEFORE THE PILOT (security audit A1)."""
     for path in ALL_FILES:
         text = path.read_text()
         assert "st-heyabhishek" not in text, path.name
@@ -626,7 +629,8 @@ def test_push_token_owner_is_never_trusted_as_an_approver_by_default():
             "gh pr list --state open --label agent-pr --label design-approved", "")), path.name
         assert "labels/design-approved" not in text and '"design-approved"' not in text, path.name
     design = (ROOT_DIR / "specs" / "technical-design" / "SIM-71-automated-delivery-pipeline.md").read_text()
-    assert "REQUIRED before `AGENTS_ENABLED=true` beyond the pilot" in design
+    assert "REQUIRED BEFORE THE PILOT" in design
+    assert "beyond the pilot" not in design.split("## Risks and rollback", 1)[1].split("## Test plan", 1)[0]
 
 
 # ------------------------------------------------ second fix round (SIM-153)
@@ -711,3 +715,126 @@ def test_implement_publish_pushes_only_on_the_decided_verdict():
     # the PR is the dispatched one, re-checked against the branch before any edit
     assert 'gh pr view "$PR" --json headRefName' in push["run"]
     assert "gh pr create" not in push["run"]
+
+
+# ------------------------------------------- final review fixes (SIM-153)
+
+ENVIRONMENT = "pracsys-agents"
+
+
+def _uses_a_secret(job):
+    """Whether a job reads a repository or environment secret. The job token
+    (`github.token`, or its alias `secrets.GITHUB_TOKEN`) is not one."""
+    return bool(re.search(r"secrets\.(?!GITHUB_TOKEN\b)", _job_text(job)))
+
+
+@pytest.mark.parametrize("path", AGENT_FILES, ids=lambda p: p.name)
+def test_every_job_reading_a_secret_runs_in_the_main_only_environment(path):
+    """Security audit A1: `workflow_dispatch` runs whatever ref the dispatcher names, so any
+    writer could start a modified branch copy. The agent secrets live only in the Environment
+    `pracsys-agents`, whose deployment branches are `main` only; every job that reads one must
+    name it, and a job that reads none must not (it would gain nothing and wait on the rules)."""
+    doc, _ = _wf(path)
+    for job_id, job in doc["jobs"].items():
+        if _uses_a_secret(job):
+            assert job.get("environment") == ENVIRONMENT, f"{path.name}:{job_id}"
+        else:
+            assert "environment" not in job, f"{path.name}:{job_id}"
+
+
+def test_the_secret_free_jobs_are_the_expected_ones():
+    implement, _ = _wf(WORKFLOWS / "agent-implement.yml")
+    assert [j for j, job in implement["jobs"].items() if not _uses_a_secret(job)] == ["gates"]
+    spec, _ = _wf(WORKFLOWS / "agent-spec.yml")
+    assert all(_uses_a_secret(job) for job in spec["jobs"].values())
+    dispatch, _ = _wf(WORKFLOWS / "agent-dispatch.yml")
+    assert _uses_a_secret(dispatch["jobs"]["dispatch"])
+
+
+def test_dispatch_survives_a_failed_read_for_one_pr():
+    """Review finding 1: under `set -euo pipefail` a failed activity read used to stop the
+    whole tick. It now reads as `[]` (the gate says `push-unverified` for that PR only), and a
+    failed PR or timeline read as `null` (`bad-data`, quiet, retried next tick)."""
+    doc, _ = _wf(WORKFLOWS / "agent-dispatch.yml")
+    step = next(s for s in doc["jobs"]["dispatch"]["steps"] if "g2_gate.py check" in s.get("run", ""))
+    body = step["run"]
+    assert re.search(r'activity\?ref=refs/heads/\$\{branch\}&per_page=100" > "\$g/activity.json"\s*\\?\s*'
+                     r"\|\| echo '\[\]' > \"\$g/activity.json\"", body), body
+    assert re.search(r'pulls/\$\{pr\}" > "\$g/pr.json"\s*\\?\s*\|\| echo null > "\$g/pr.json"', body)
+    assert "|| echo null > \"$g/timeline.json\"" in body
+
+
+def test_dispatch_fails_once_without_design_approvers():
+    """Review finding 4: an empty DESIGN_APPROVERS fails the dispatcher job with one clear
+    error instead of starting (and flagging) a run for every approved PR. The spec queue still
+    runs first."""
+    doc, _ = _wf(WORKFLOWS / "agent-dispatch.yml")
+    steps = doc["jobs"]["dispatch"]["steps"]
+    g2 = next(i for i, s in enumerate(steps) if "g2_gate.py check" in s.get("run", ""))
+    body = steps[g2]["run"]
+    assert steps[g2]["id"] == "g2"
+    guard = body.index("approvers_missing=true")
+    assert guard < body.index("gh pr list")
+    assert "exit 0" in body[guard:body.index("gh pr list")]
+    fail = next(i for i, s in enumerate(steps) if s.get("name") == "Fail on a missing approver list")
+    spec = next(i for i, s in enumerate(steps) if "gh workflow run agent-spec.yml" in s.get("run", ""))
+    assert fail > spec and fail == len(steps) - 1
+    assert _flat(steps[fail]["if"]) == "steps.g2.outputs.approvers_missing=='true'"
+    assert "::error::" in steps[fail]["run"] and "exit 1" in steps[fail]["run"]
+
+
+def test_implement_git_check_crash_is_refused_and_reported_once():
+    """Review finding 3: a crash in `g2_gate.py git-check` is go=false, reason
+    `git-check-failed`, notify=true (the issue is flagged, so the dispatcher stops), instead of
+    a failed job that the dispatcher restarts every 15 minutes with no signal."""
+    doc, _ = _wf(WORKFLOWS / "agent-implement.yml")
+    gate = next(s for s in doc["jobs"]["prepare"]["steps"] if s.get("id") == "gate")
+    body = gate["run"]
+    assert re.search(r"if ! python3 scripts/delivery/g2_gate.py git-check [^\n]*\\\n[^\n]*"
+                     r'> "\$g/git.json"; then\s+go=false; reason=git-check-failed; notify=true', body), body
+    # the dispatcher's own check never runs git-check, so this is the only place it can fail
+    disp, _ = _wf(WORKFLOWS / "agent-dispatch.yml")
+    assert "git-check" not in _run(disp["jobs"]["dispatch"])
+
+
+def test_implement_prepare_survives_a_failed_activity_read_and_missing_approvers():
+    doc, _ = _wf(WORKFLOWS / "agent-implement.yml")
+    steps = doc["jobs"]["prepare"]["steps"]
+    read = next(s for s in steps if "issues/${PR}/timeline" in s.get("run", ""))
+    assert "|| echo '[]' > \"$g/activity.json\"" in read["run"]
+    gate = next(s for s in steps if s.get("id") == "gate")
+    assert '"$reason" = "no-approvers"' in gate["run"] and "::error::" in gate["run"]
+
+
+def test_implement_notices_name_the_approved_commit():
+    """Security audit A2: the final Jira comment and Slack notice, and the failure notice,
+    say which commit the design approval covered."""
+    doc, _ = _wf(WORKFLOWS / "agent-implement.yml")
+    report = next(s for s in doc["jobs"]["publish"]["steps"] if s.get("name") == "Report to Jira and Slack")
+    assert report["env"]["SHA"] == "${{ needs.prepare.outputs.sha }}"
+    assert '--approved-sha "$SHA"' in report["run"]
+    cleanup = _run(doc["jobs"]["cleanup"])
+    assert cleanup.count('--approved-sha "$SHA"') == 2
+
+
+def test_implement_comment_explains_the_environment_control():
+    text = (WORKFLOWS / "agent-implement.yml").read_text()
+    header = text.split("name: Agent implement stage", 1)[0]
+    assert "pracsys-agents" in header and "REQUIRED BEFORE THE PILOT" in header
+    assert "DESIGN_APPROVERS" in header
+
+
+def test_runbook_covers_the_pilot_prerequisites_and_re_runs():
+    """Review findings 5 and A7, security audit A1: the runbook says what an admin must do
+    before the pilot, how to re-run after a blocked run (matching what the code checks), and
+    not to use "Re-run failed jobs"."""
+    text = (ROOT_DIR / "docs" / "runbooks" / "run-the-agent-pipeline.md").read_text()
+    for needle in ("pracsys-agents", "`main` only", "ANTHROPIC_API_KEY", "AGENT_PUSH_TOKEN",
+                   "DESIGN_APPROVERS", "slack-triage.yml", "agent-implemented", "agent-blocked",
+                   "agent-running", "**Spec**", "Re-run failed jobs", "protected-path-stale",
+                   "git-check-failed", "gh workflow run agent-implement.yml --ref main"):
+        assert needle in text, needle
+    # what the runbook says to undo is what check-scope and the gate actually check
+    ops = (ROOT_DIR / "scripts" / "delivery" / "jira_ops.py").read_text()
+    assert 'SCOPE_EXCLUDED_LABELS = frozenset({"agent-running", "agent-blocked"})' in ops
+    assert 'SCOPE_STATUSES = frozenset({"To Do", "Spec"})' in ops

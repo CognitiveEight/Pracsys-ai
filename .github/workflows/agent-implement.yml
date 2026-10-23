@@ -7,9 +7,19 @@
 # merges the PR (gate G3).
 #
 # workflow_dispatch only, never `push`: a push-triggered workflow runs the
-# YAML from the pushed branch, so any writer could push a modified copy and
-# read the secrets. workflow_dispatch runs this file from the default branch
-# (`main`); a human copies it there. Every job checks out `development` for
+# YAML from the pushed branch. But workflow_dispatch does NOT force the `main`
+# copy either: it runs the YAML at whatever ref the dispatcher names, and any
+# writer can dispatch a modified branch copy (or push a new `on: push`
+# workflow) and read every repository-level secret. The control is the GitHub
+# Environment `pracsys-agents`: every job here that reads a secret declares
+# it, its deployment branches are `main` only, ALL agent secrets
+# (ANTHROPIC_API_KEY, JIRA_EMAIL, JIRA_API_TOKEN, SLACK_BOT_TOKEN,
+# AGENT_PUSH_TOKEN) live only in it, and their repository-level copies are
+# deleted. With it, a push identity for AGENT_PUSH_TOKEN that is NOT in
+# DESIGN_APPROVERS (so nothing acting with that token can add the label as an
+# approver). Both are admin/owner actions, REQUIRED BEFORE THE PILOT
+# (docs/runbooks/run-the-agent-pipeline.md, "Before the pilot"); until then
+# this file is not safe to enable. Every job checks out `development` for
 # scripts; the ticket branch is git data only (the `sha` input is fetched).
 #
 # Five jobs, so the agent, the code it writes and the credentials never share
@@ -41,6 +51,12 @@
 #            AC passes. Otherwise the PR stays a draft and Jira is flagged.
 #            "Ready for review" is advisory: PR CI and G3 are the gate.
 #   cleanup  On failure or cancellation: Blocked, `workflow-failed`.
+#
+# The Jira comment and Slack notice of a started run name the approved commit
+# ("design approved at <sha7>"). The `gates` result and the `budget` flag are
+# advisory (code under test or the agent's runner could forge them); the hard
+# controls are the required PR CI checks, the human review and merge (G3) and
+# the Anthropic workspace spend limit.
 #
 # Nothing here merges.
 
@@ -77,6 +93,7 @@ jobs:
   prepare:
     if: vars.AGENTS_ENABLED == 'true'
     runs-on: ubuntu-24.04
+    environment: pracsys-agents
     timeout-minutes: 10
     permissions:
       contents: read
@@ -121,8 +138,10 @@ jobs:
           fi
 
       # GitHub only, with the read-only job token: the PR, its timeline and
-      # the branch's push record. Any failed call stops the job (nothing
-      # started, nothing to clean up).
+      # the branch's push record. A failed PR or timeline read stops the job
+      # (nothing started, nothing to clean up; the next tick retries). A
+      # failed push-record read is `[]`: the gate refuses `push-unverified`
+      # and reports it once, instead of failing silently every tick.
       - name: Read the PR, its timeline and its pushes (G2 data)
         if: steps.key.outputs.ok == 'true'
         env:
@@ -138,7 +157,8 @@ jobs:
           branch="$(jq -r '.head.ref // ""' "$g/pr.json")"
           # Only a ticket branch name is put in a URL; anything else is refused by the gate.
           if [[ "$branch" =~ ^(feature|fix)/SIM-[0-9]+-[a-z0-9][a-z0-9-]*$ ]]; then
-            gh api "repos/${GH_REPO}/activity?ref=refs/heads/${branch}&per_page=100" > "$g/activity.json"
+            gh api "repos/${GH_REPO}/activity?ref=refs/heads/${branch}&per_page=100" > "$g/activity.json" \
+              || echo '[]' > "$g/activity.json"
           else
             echo '[]' > "$g/activity.json"
           fi
@@ -179,13 +199,22 @@ jobs:
           go="$(jq -r '.go' "$g/verdict.json")"
           reason="$(jq -r '.reason' "$g/verdict.json")"
           notify="$(jq -r '.notify' "$g/verdict.json")"
+          if [ "$reason" = "no-approvers" ]; then
+            # A configuration fault, not this issue's: fail once, flag nothing.
+            echo "::error::DESIGN_APPROVERS is empty or unset; G2 cannot be checked."
+            exit 1
+          fi
           if [ "$go" = "true" ]; then
             # Defence in depth on development..sha: agent commits only as the spec
-            # stage's own spec files, and no change to the pipeline or the gates.
+            # stage's own spec files, no change to the pipeline or the gates, and
+            # those files at sha exactly as on the development tip. A crash here
+            # is a refusal reported once (the issue is flagged, so the dispatcher
+            # stops), never a failed job restarted every tick.
             if git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
-              python3 scripts/delivery/g2_gate.py git-check --issue "$ISSUE" --sha "$SHA" \
-                --base origin/development > "$g/git.json"
-              if [ "$(jq -r '.ok' "$g/git.json")" != "true" ]; then
+              if ! python3 scripts/delivery/g2_gate.py git-check --issue "$ISSUE" --sha "$SHA" \
+                --base origin/development > "$g/git.json"; then
+                go=false; reason=git-check-failed; notify=true
+              elif [ "$(jq -r '.ok' "$g/git.json")" != "true" ]; then
                 go=false; reason="$(jq -r '.reason' "$g/git.json")"; notify=true
               fi
             else
@@ -221,6 +250,9 @@ jobs:
 
       # Flagged + agent-blocked, so the dispatcher does not start it again
       # every 15 minutes. A person re-labels (or fixes the branch) and unflags.
+      # Only for the issue's own PR: g2_gate.py sets notify=false when the
+      # PR's head is not this issue's ticket branch in this repository, so a
+      # hand dispatch naming someone else's PR writes the job summary only.
       - name: Report a refused approval
         if: steps.gate.outputs.notify == 'true' && steps.scope.outputs.inscope == 'true'
         env:
@@ -271,6 +303,7 @@ jobs:
     needs: prepare
     if: vars.AGENTS_ENABLED == 'true' && needs.prepare.outputs.go == 'true'
     runs-on: ubuntu-24.04
+    environment: pracsys-agents
     timeout-minutes: 90
     permissions:
       contents: read
@@ -570,6 +603,7 @@ jobs:
       vars.AGENTS_ENABLED == 'true' && needs.prepare.outputs.go == 'true'
       && needs.agent.result == 'success' && needs.gates.result == 'success'
     runs-on: ubuntu-24.04
+    environment: pracsys-agents
     timeout-minutes: 15
     permissions:
       contents: read
@@ -740,11 +774,11 @@ jobs:
           if [ "$PUSH" = "true" ]; then
             git push -q "https://x-access-token:${AGENT_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
               "refs/heads/agent-result:refs/heads/${BRANCH}"
+            # The spec stage opened it as "<KEY>: specs"; renamed only when code was pushed.
+            gh pr edit "$PR" --title "${ISSUE}: implementation"
           fi
           # Never implemented twice for this approval, whatever the outcome.
           gh pr edit "$PR" --add-label agent-implemented
-          # The spec stage opened it as "<KEY>: specs".
-          gh pr edit "$PR" --title "${ISSUE}: implementation"
           if [ "$NHR" = "true" ]; then
             gh pr edit "$PR" --add-label needs-human-review
           fi
@@ -760,6 +794,7 @@ jobs:
       - name: Report to Jira and Slack
         env:
           ISSUE: ${{ needs.prepare.outputs.issue }}
+          SHA: ${{ needs.prepare.outputs.sha }}
           READY: ${{ steps.check.outputs.ready }}
           REASON: ${{ steps.check.outputs.reason }}
           NHR: ${{ steps.check.outputs.nhr }}
@@ -775,7 +810,7 @@ jobs:
           set -euo pipefail
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           nhr=0; if [ "$NHR" = "true" ]; then nhr=1; fi
-          common=(--issue "$ISSUE" --stage implement --run-url "$run_url" --pr-url "$PR_URL"
+          common=(--issue "$ISSUE" --stage implement --run-url "$run_url" --pr-url "$PR_URL" --approved-sha "$SHA"
                   --count "acPassed=${AC_PASS}" --count "acFailed=${AC_FAIL}"
                   --count "needsHumanReview=${nhr}" --count "e2eRequired=${E2E}")
           cost="$(jq -r '.cost // empty' "$RUNNER_TEMP/cost.json")"
@@ -797,6 +832,7 @@ jobs:
     needs: [prepare, agent, gates, publish]
     if: (failure() || cancelled()) && vars.AGENTS_ENABLED == 'true' && needs.prepare.outputs.started == 'true'
     runs-on: ubuntu-24.04
+    environment: pracsys-agents
     timeout-minutes: 10
     permissions:
       contents: read
@@ -809,6 +845,7 @@ jobs:
       - name: Mark the issue blocked
         env:
           ISSUE: ${{ needs.prepare.outputs.issue }}
+          SHA: ${{ needs.prepare.outputs.sha }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -820,7 +857,7 @@ jobs:
           python3 scripts/delivery/jira_ops.py label --issue "$ISSUE" --remove agent-running || rc=1
           python3 scripts/delivery/jira_ops.py transition --issue "$ISSUE" --to Blocked || rc=1
           python3 scripts/delivery/jira_ops.py comment --issue "$ISSUE" --stage implement --outcome failed \
-            --reason-category workflow-failed --run-url "$run_url" || rc=1
+            --reason-category workflow-failed --run-url "$run_url" --approved-sha "$SHA" || rc=1
           python3 scripts/delivery/notify_slack.py post --issue "$ISSUE" --stage implement --outcome failed \
-            --reason-category workflow-failed --run-url "$run_url" || rc=1
+            --reason-category workflow-failed --run-url "$run_url" --approved-sha "$SHA" || rc=1
           exit "$rc"

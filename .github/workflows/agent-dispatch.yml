@@ -24,9 +24,16 @@
 #     skipped (EXISTING_TICKET_BRANCH_KEYS), so an already-ran ticket is not
 #     re-dispatched every 15 minutes.
 #
-# Scheduled and workflow_dispatch workflows run from the default branch
-# (`main`); a human copies this file there. Code and scripts come from
-# `development`.
+# A scheduled run uses the default branch's copy (`main`); a human copies
+# this file there. A workflow_dispatch run uses whatever ref the dispatcher
+# names, so `--ref main` alone is no control: the Jira secrets this job reads
+# live only in the GitHub Environment `pracsys-agents`, whose deployment
+# branches are `main` only (an admin action REQUIRED BEFORE THE PILOT; see
+# agent-implement.yml and docs/runbooks/run-the-agent-pipeline.md). Code and
+# scripts come from `development`.
+#
+# DESIGN_APPROVERS empty or unset: no implement run is started and the job
+# fails once, at the end (after the spec queue), with one clear error.
 
 name: Agent dispatch
 
@@ -46,6 +53,7 @@ jobs:
   dispatch:
     if: vars.AGENTS_ENABLED == 'true'
     runs-on: ubuntu-24.04
+    environment: pracsys-agents
     timeout-minutes: 10
     permissions:
       actions: write
@@ -89,8 +97,13 @@ jobs:
           echo "running=${running}"
 
       # GitHub only, read-only job token: the same G2 check the implement
-      # stage repeats. Any failed call stops the job, so nothing starts.
+      # stage repeats. A failed read for one PR is that PR's refusal only:
+      # the PR or timeline as `null` (bad-data: quiet, retried next tick),
+      # the push record as `[]` (push-unverified: the implement stage reads
+      # it again and reports a second failure once). The listing itself
+      # failing still stops the job, so nothing starts on a wrong list.
       - name: Find spec PRs carrying the design approval (G2)
+        id: g2
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -99,15 +112,23 @@ jobs:
           set -euo pipefail
           g="$RUNNER_TEMP/g2"
           mkdir -p "$g"
+          echo '[]' > "$RUNNER_TEMP/g2-start.json"
+          if [ -z "$(printf '%s' "$DESIGN_APPROVERS" | tr -d ', \t\n')" ]; then
+            echo "approvers_missing=true" >> "$GITHUB_OUTPUT"
+            echo "G2 not checked: DESIGN_APPROVERS is empty." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           gh pr list --state open --label agent-pr --label design-approved --limit 100 \
             --json number,headRefName,headRefOid,baseRefName,labels,isCrossRepository > "$g/listed.json"
           python3 scripts/delivery/g2_gate.py candidates < "$g/listed.json" > "$g/candidates.json"
-          echo '[]' > "$RUNNER_TEMP/g2-start.json"
           while IFS=$'\t' read -r issue pr sha branch; do
             [ -n "$issue" ] || continue
-            gh api "repos/${GH_REPO}/pulls/${pr}" > "$g/pr.json"
-            gh api "repos/${GH_REPO}/issues/${pr}/timeline" --paginate --jq '.[]' | jq -s . > "$g/timeline.json"
-            gh api "repos/${GH_REPO}/activity?ref=refs/heads/${branch}&per_page=100" > "$g/activity.json"
+            gh api "repos/${GH_REPO}/pulls/${pr}" > "$g/pr.json" \
+              || echo null > "$g/pr.json"
+            gh api "repos/${GH_REPO}/issues/${pr}/timeline" --paginate --jq '.[]' | jq -s . > "$g/timeline.json" \
+              || echo null > "$g/timeline.json"
+            gh api "repos/${GH_REPO}/activity?ref=refs/heads/${branch}&per_page=100" > "$g/activity.json" \
+              || echo '[]' > "$g/activity.json"
             python3 scripts/delivery/g2_gate.py check --issue "$issue" --pr "$pr" --sha "$sha" \
               --pr-file "$g/pr.json" --timeline-file "$g/timeline.json" --activity-file "$g/activity.json" \
               --approvers "$DESIGN_APPROVERS" --repo "$GH_REPO" > "$g/verdict.json"
@@ -192,3 +213,10 @@ jobs:
             gh workflow run agent-spec.yml --ref main -f issue="$key"
             echo "started the spec stage for ${key}"
           done
+
+      # After the spec queue, so a missing approver list does not stop it.
+      - name: Fail on a missing approver list
+        if: steps.g2.outputs.approvers_missing == 'true'
+        run: |
+          echo "::error::DESIGN_APPROVERS is empty or unset: no implement run was started. Set the repository variable to the comma-separated GitHub logins allowed to add design-approved."
+          exit 1

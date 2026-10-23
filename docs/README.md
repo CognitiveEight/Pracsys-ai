@@ -116,6 +116,7 @@ Diagrams (draw.io, open in diagrams.net or the VS Code extension):
 | [Rebuild the statute index](runbooks/rebuild-the-statute-index.md) | Refreshing the section list used to check applicable laws |
 | [Reconcile gate0 spend](runbooks/reconcile-gate0-spend.md) | Comparing each case's model cost with gate0's records |
 | [Roll back the handshake auth](runbooks/roll-back-the-handshake-auth.md) | Returning to the legacy socket handshake in an emergency |
+| [Run the agent pipeline](runbooks/run-the-agent-pipeline.md) | Pilot prerequisites, approving a design (G2), re-running a blocked implement run |
 
 ## Decisions
 

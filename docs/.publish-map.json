@@ -1,7 +1,7 @@
 {
   "space": "PRACENG",
   "base_url": "https://simplertoday.atlassian.net/wiki/spaces/PRACENG/pages/",
-  "source_base": "https://github.com/Simplertoday/law-firm-simplertoday-ai/blob/development/",
+  "source_base": "https://github.com/CognitiveEight/Pracsys-ai/blob/development/",
   "pages": {
     "docs/README.md": "8650755",
     "docs/architecture/ai-service-layered.md": "4292725",

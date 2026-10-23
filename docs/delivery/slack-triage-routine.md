@@ -1,7 +1,7 @@
 ---
 title: PracSys requests channel, triage and answers (instructions)
 type: runbook
-repo: law-firm-simplertoday-ai
+repo: Pracsys-ai
 owner: AI team
 status: current
 last_verified: 2026-10-22

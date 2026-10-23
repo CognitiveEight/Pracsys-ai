@@ -1,7 +1,7 @@
 ---
 title: All model calls go through one provider-neutral router
 type: decision
-repo: law-firm-simplertoday-ai
+repo: Pracsys-ai
 owner: AI team
 status: accepted
 audience: everyone; engineers below "What this means"

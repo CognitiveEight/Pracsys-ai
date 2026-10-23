@@ -1,7 +1,7 @@
 ---
 title: Nothing is cited unless it was checked
 type: decision
-repo: law-firm-simplertoday-ai
+repo: Pracsys-ai
 owner: AI team
 status: accepted
 audience: everyone; engineers below "What this means"

@@ -1,7 +1,7 @@
 ---
 title: Stop fences a run by epoch instead of relying on cancellation
 type: decision
-repo: law-firm-simplertoday-ai
+repo: Pracsys-ai
 owner: AI team
 status: accepted
 audience: everyone; engineers below "What this means"

@@ -1,7 +1,7 @@
 ---
 title: gate0 as the single model, cost and log layer
 type: decision
-repo: law-firm-simplertoday-ai
+repo: Pracsys-ai
 owner: AI team
 status: accepted
 audience: everyone; engineers below "What this means"

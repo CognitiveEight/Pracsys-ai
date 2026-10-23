@@ -1,7 +1,7 @@
 ---
 title: Evidence to analysis panels
 type: flow
-repo: law-firm-simplertoday-ai
+repo: Pracsys-ai
 owner: AI team
 status: current
 audience: everyone; engineers below "For engineers"

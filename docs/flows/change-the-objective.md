@@ -1,7 +1,7 @@
 ---
 title: Change the objective
 type: flow
-repo: law-firm-simplertoday-ai
+repo: Pracsys-ai
 owner: AI team
 status: current
 audience: everyone; engineers below "For engineers"

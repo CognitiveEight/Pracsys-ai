@@ -1,7 +1,7 @@
 ---
 title: Model calls through gate0
 type: contract
-repo: law-firm-simplertoday-ai
+repo: Pracsys-ai
 owner: AI team
 status: current
 audience: everyone; engineers below "Messages"

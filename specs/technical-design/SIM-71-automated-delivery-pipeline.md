@@ -299,6 +299,31 @@ New acceptance criteria: AC-15g to AC-15j.
 
 ## Phase 3: Jira → agents
 
+**Phase 3 revision (2026-10-23), approved by the product owner on 2026-10-23** (scope: tickets labelled `agent-ready` and `ai-repo` only; push token from the product owner's account). The
+design below stands, with five changes to match the set-up as it now is:
+1. **Push identity.** No organisation GitHub App (that needs an org admin).
+   The publish steps use a fine-grained token, secret `AGENT_PUSH_TOKEN`,
+   limited to `CognitiveEight/Pracsys-ai` with Contents and Pull requests
+   read and write and nothing else. Only the publish steps receive it, after
+   the agent step has exited; `guard_branch.py` still allows pushes only to
+   `feature/SIM-<n>-*` / `fix/SIM-<n>-*` for the run's own ticket, and never
+   to `development`, `staging` or `main`. Branch rulesets are not available
+   (no org admin), so the guard and the workflows' own checks are the
+   control; this is recorded as a risk.
+2. **Default branch is `main`.** Scheduled and `workflow_dispatch` workflows
+   run from `main`, so `agent-dispatch.yml`, `agent-spec.yml` and
+   `agent-implement.yml` get a workflow-only copy on `main` (as
+   `slack-triage.yml` has). They check out `development` for code, scripts
+   and instructions. `agent-implement.yml` (push-triggered) runs from the
+   ticket branch, which is cut from `development` and contains it.
+3. **Jira statuses.** The board has Spec and **QA** (not "In QA") and no
+   Blocked status. Blocked work is marked with the Flagged field plus label
+   `agent-blocked`; "In QA" in the tables below means QA.
+4. **Notices** go to `#pracsys-delivery` (renamed from `#ai-delivery`).
+5. **`DESIGN_APPROVERS`** = the product owner's GitHub login
+   (`st-heyabhishek`) until the tech lead names others. Concurrency 1, model
+   `claude-sonnet-5-5`, `AGENTS_ENABLED` off until the pilot (task 19).
+
 **Queue (`agent-dispatch.yml`)**
 - Triggers: `schedule` (proposed every 15 minutes) and `workflow_dispatch`.
 - Job `if: vars.AGENTS_ENABLED == 'true'`. Permissions: `actions: write`

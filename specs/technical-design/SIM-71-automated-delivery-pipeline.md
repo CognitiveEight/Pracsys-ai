@@ -323,6 +323,12 @@ design below stands, with five changes to match the set-up as it now is:
 5. **`DESIGN_APPROVERS`** = the product owner's GitHub login
    (`st-heyabhishek`) until the tech lead names others. Concurrency 1, model
    `claude-sonnet-5-5`, `AGENTS_ENABLED` off until the pilot (task 19).
+6. **Secret names as built** (they replace the names in the tables above):
+   Slack notices use the existing bot (`SLACK_BOT_TOKEN`, posting to repo
+   variable `DELIVERY_CHANNEL_ID` = `#pracsys-delivery`) instead of a
+   `SLACK_DELIVERY_WEBHOOK_URL`; Jira uses the existing `JIRA_EMAIL` +
+   `JIRA_API_TOKEN` (not `JIRA_USER_EMAIL`); `AGENT_PUSH_TOKEN` replaces
+   `DELIVERY_APP_ID` / `DELIVERY_APP_PRIVATE_KEY` (point 1).
 
 **Queue (`agent-dispatch.yml`)**
 - Triggers: `schedule` (proposed every 15 minutes) and `workflow_dispatch`.

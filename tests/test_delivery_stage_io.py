@@ -171,6 +171,12 @@ def test_design_status_reads_the_header_line(sio):
     assert sio.design_approved("# T\nno status here\n") is False
 
 
+def test_design_status_cli(sio, monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", io.StringIO("# T\n- **Status:** approved\n"))
+    assert sio.main(["design-status"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"approved": True}
+
+
 # -------------------------------------------------------------- design gate
 
 

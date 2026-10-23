@@ -1,0 +1,95 @@
+# Agent pipeline queue (SIM-153; SIM-71 Phase 3, task 17).
+#
+# Every 15 minutes in working hours, starts the spec stage for the next
+# `agent-ready` + `ai-repo` SIM tickets (scripts/delivery/agent_queue.py:
+# priority, then oldest), keeping at most AGENT_MAX_CONCURRENT (default 1)
+# agent-spec / agent-implement runs going at once.
+#
+# Guardrails:
+#   * off unless repo variable AGENTS_ENABLED is exactly "true" (kill switch);
+#   * no model, no Anthropic key, no push token: this job only reads Jira and
+#     starts agent-spec.yml with its own token (`actions: write`);
+#   * the started run's input is a key agent_queue.py printed, re-checked
+#     here and again by agent-spec.yml before any use.
+#
+# Scheduled and workflow_dispatch workflows run from the default branch
+# (`main`); a human copies this file there. Code and scripts come from
+# `development`.
+
+name: Agent dispatch
+
+on:
+  schedule:
+    - cron: "*/15 3-15 * * 1-6" # Mon–Sat, 08:30–21:15 IST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-dispatch
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    if: vars.AGENTS_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: development
+          persist-credentials: false
+
+      # Runs that are queued or in progress count against the limit. Any
+      # failure here stops the job, so nothing starts on a wrong count.
+      - name: Count running stages and spec PRs waiting for G2
+        id: count
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          running=0
+          for wf in agent-spec.yml agent-implement.yml; do
+            for status in queued in_progress waiting pending requested; do
+              n="$(gh run list --workflow "$wf" --status "$status" --limit 100 --json databaseId --jq 'length')"
+              running=$((running + n))
+            done
+          done
+          keys="$(gh pr list --label agent-pr --state open --limit 200 --json headRefName,title \
+            --jq '[.[] | (.headRefName + " " + .title) | scan("SIM-[0-9]+")] | unique | join(",")')"
+          echo "running=${running}" >> "$GITHUB_OUTPUT"
+          echo "open_keys=${keys}" >> "$GITHUB_OUTPUT"
+          echo "running=${running}"
+
+      - name: Pick the next tickets
+        env:
+          AGENTS_ENABLED: ${{ vars.AGENTS_ENABLED }}
+          AGENT_MAX_CONCURRENT: ${{ vars.AGENT_MAX_CONCURRENT || '1' }}
+          AGENT_RUNNING: ${{ steps.count.outputs.running }}
+          OPEN_SPEC_PR_KEYS: ${{ steps.count.outputs.open_keys }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/delivery/agent_queue.py next > "$RUNNER_TEMP/queue.json"
+          cat "$RUNNER_TEMP/queue.json"
+
+      - name: Start the spec stage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for key in $(jq -r '.start[]' "$RUNNER_TEMP/queue.json"); do
+            if ! printf '%s' "$key" | grep -Eq '^SIM-[0-9]+$'; then
+              echo "skipping a malformed key"; continue
+            fi
+            gh workflow run agent-spec.yml --ref main -f issue="$key"
+            echo "started the spec stage for ${key}"
+          done

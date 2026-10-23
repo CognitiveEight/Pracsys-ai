@@ -613,6 +613,40 @@ Product owner, 2026-10-21 (not reopened here):
 - **Record the plan** as these specs and as a "How we automate delivery" page
   in PracSys Engineering for the tech lead to approve.
 
+Phase 3 as built (SIM-153, 2026-10-23; developer notes against the approved
+revision, for the tech lead to confirm at G3):
+- **Each stage is four jobs, not one job with ordered steps.** `make lint`
+  and `make test` run code the agent can write, and a process started there
+  could outlive the agent step and read a later step's environment on the
+  same runner. So `prepare` (Jira), `agent` (Anthropic key only), `publish`
+  (fresh runner; the only holder of `AGENT_PUSH_TOKEN`; runs no agent code,
+  scripts from `development`) and `cleanup` (`failure() || cancelled()`).
+  The agent's commits travel as a git bundle artifact (1-day retention)
+  together with the outcome file and a cost summary. The action's execution
+  log, which holds everything the agent read, is never uploaded.
+- **The implement gate (`make lint`, `make test`) runs in the agent job**
+  after the agent step, not in the publish step, because the publish job
+  must not run agent code with the push token present. CI on the PR runs
+  them again before G3.
+- **`scripts/delivery/stage_io.py`** (new) validates the outcome file,
+  reads cost from the result message (`total_cost_usd`, checked against the
+  pinned action's source), confines the spec stage to its own three spec
+  files, and decides the implement verdict and PR comment. The PR comment
+  carries the AC table, verdict and gate results only, not the reviewers'
+  findings text (model output).
+- **G2 hardening.** `AGENT_PUSH_TOKEN` belongs to an approver, so pushes by
+  the pipeline arrive as that approver. The design gate therefore also
+  refuses a push whose head commit is agent-authored, or whose design was
+  already approved before this push. The spec publish refuses a design that
+  reads `approved`, and a ticket branch that changes `.claude/` or
+  `.github/` is not run (reason `protected-path`, a new reason category).
+- **Ticket and outcome files live in `$RUNNER_TEMP/agent/`.** That one
+  directory is passed to Claude with `--add-dir`, so it cannot write the
+  action's own files in `$RUNNER_TEMP`.
+- **Runs started by the dispatcher have `github-actions[bot]` as actor.**
+  The action refuses non-human actors unless listed, so `agent-spec.yml`
+  sets `allowed_bots: github-actions`.
+
 Design decisions needing tech-lead approval:
 - **Push rights, narrowest form.** PRACENG lets Claude push and merge to
   `development`; this repo denies agents any push. Proposal: keep

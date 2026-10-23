@@ -22,8 +22,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pick of `agent-ready` + `ai-repo` tickets, honouring `AGENTS_ENABLED` and
   `AGENT_MAX_CONCURRENT`). Comments and notices carry only key, stage,
   outcome, counts, cost, a reason category and GitHub links, never ticket
-  or Slack text. Tests: `tests/test_delivery_scripts.py`. No workflow uses
-  them yet; no socket payload or `app/` change.
+  or Slack text. Tests: `tests/test_delivery_scripts.py`. No socket payload
+  or `app/` change.
+  **Agent workflows (SIM-71 tasks 15-18):** `agent-dispatch.yml` (every 15
+  minutes, starts the spec stage for the next queued ticket),
+  `agent-spec.yml` (Claude writes the three specs, a draft PR `<KEY>: specs`
+  labelled `agent-pr`) and `agent-implement.yml` (starts when an approver
+  sets the design to `Status: approved`: `/implement`, `/verify`, `/review`,
+  then the PR is marked ready only with green `make lint`/`make test`, an
+  approving review and every AC passing; `needs-human-review` forced for
+  sensitive paths). Each stage runs in separate jobs, so the agent never
+  shares a runner with `AGENT_PUSH_TOKEN`, Jira or Slack credentials;
+  `scripts/delivery/stage_io.py` re-checks what the agent hands back. All
+  off until `AGENTS_ENABLED=true`; nothing merges. CI-mode prompts in
+  `.github/agent-prompts/`, "In CI" sections in `.claude/commands/`.
+  Static rules: `tests/test_delivery_workflows.py`,
+  `tests/test_delivery_stage_io.py`.
 
 - **SIM-152: instant replies in #pracsys-requests.** A small GCP Cloud
   Function (`relay/slack_events/`) receives Slack events, checks Slack's

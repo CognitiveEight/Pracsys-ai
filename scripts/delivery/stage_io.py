@@ -4,6 +4,7 @@
     python scripts/delivery/stage_io.py cost --file <claude-execution-output.json>
     git diff --name-only origin/development...<branch> | \\
         python scripts/delivery/stage_io.py spec-paths --issue SIM-<n>
+    git show <branch>:<design.md> | python scripts/delivery/stage_io.py design-status
     python scripts/delivery/stage_io.py design-gate --branch <ref name> --before <sha> --after <sha> \\
         --base origin/development [--repo .]
     python scripts/delivery/stage_io.py decide --outcome <normalised.json> \\
@@ -332,6 +333,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--file", required=True)
     p = sub.add_parser("spec-paths")
     p.add_argument("--issue", required=True)
+    sub.add_parser("design-status")
     p = sub.add_parser("design-gate")
     p.add_argument("--branch", required=True)
     p.add_argument("--before", required=True)
@@ -361,6 +363,8 @@ def main(argv: List[str] | None = None) -> int:
         elif args.command == "spec-paths":
             ok, paths, reason = check_spec_paths(args.issue, sys.stdin.read().splitlines())
             result = {"ok": ok, "paths": paths, "reason": reason}
+        elif args.command == "design-status":
+            result = {"approved": design_approved(sys.stdin.read())}
         elif args.command == "design-gate":
             result = design_gate(args.branch, args.before, args.after, args.base, args.repo)
         else:

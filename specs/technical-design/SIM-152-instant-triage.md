@@ -1,7 +1,7 @@
 # SIM-152: Instant replies in #pracsys-requests — technical design
 
 - **Requirements:** `specs/requirements/SIM-152-instant-triage.md`
-- **Status:** draft
+- **Status:** approved by the product owner on 2026-10-23 (demo deployment)
 - **Approver:** product owner (demo); tech lead before production GCP
 
 ## Summary
@@ -24,7 +24,6 @@ Anthropic key; it can only start one workflow.
 | `relay/slack_events/requirements.txt` | **new**: `functions-framework` only |
 | `tests/test_slack_events_relay.py` | **new**: tests first, no network |
 | `docs/runbooks/deploy-slack-events-relay.md` | **new**: deploy, configure Slack, roll back |
-| `.github/workflows/slack-triage.yml` | concurrency comment only; behaviour unchanged |
 
 ## Event and payload changes
 None for the AI service. New inbound HTTP endpoint on GCP only.

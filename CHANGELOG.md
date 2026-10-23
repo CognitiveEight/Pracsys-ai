@@ -25,13 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or Slack text. Tests: `tests/test_delivery_scripts.py`. No socket payload
   or `app/` change.
   **Agent workflows (SIM-71 tasks 15-18):** `agent-dispatch.yml` (every 15
-  minutes, starts the spec stage for the next queued ticket),
-  `agent-spec.yml` (Claude writes the three specs, a draft PR `<KEY>: specs`
-  labelled `agent-pr`) and `agent-implement.yml` (starts when an approver
-  sets the design to `Status: approved`: `/implement`, `/verify`, `/review`,
-  then the PR is marked ready only with green `make lint`/`make test`, an
-  approving review and every AC passing; `needs-human-review` forced for
-  sensitive paths). Each stage runs in separate jobs, so the agent never
+  minutes: starts the implement stage for spec PRs carrying the G2 label,
+  then the spec stage for the next queued tickets, within
+  `AGENT_MAX_CONCURRENT`), `agent-spec.yml` (Claude writes the three specs,
+  a draft PR `<KEY>: specs` labelled `agent-pr`, design left
+  `Status: draft`) and `agent-implement.yml` (`workflow_dispatch` only,
+  started by the dispatcher once a `DESIGN_APPROVERS` login adds the PR
+  label `design-approved` on the current head: `/implement`, `/verify`,
+  `/review`, then the PR is marked ready only with green
+  `make lint`/`make test`, an approving review and every AC passing;
+  `needs-human-review` forced for sensitive paths). Each stage runs in separate jobs, so the agent never
   shares a runner with `AGENT_PUSH_TOKEN`, Jira or Slack credentials;
   `scripts/delivery/stage_io.py` re-checks what the agent hands back. All
   off until `AGENTS_ENABLED=true`; nothing merges. CI-mode prompts in
@@ -68,6 +71,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flags an issue for "already ran" while its agent PR is open. Admin:
   create the GitHub labels `design-approved` and `agent-implemented`. No
   socket payload or `app/` change.
+  **Final review and security-audit fixes:** every agent job that reads a
+  secret declares the GitHub Environment `pracsys-agents` (admin, REQUIRED
+  BEFORE THE PILOT: create it with deployment branches `main` only, move
+  the agent secrets into it as separate credentials, delete the repository
+  copies, and give `AGENT_PUSH_TOKEN` to an identity outside
+  `DESIGN_APPROVERS`; `workflow_dispatch` alone does not stop a writer
+  running a modified copy). G2: a push in the same second as the label is
+  stale; a PR that is not the issue's own is refused without a Jira or
+  Slack notice; `git-check` also requires protected paths to match the
+  development tip (new refusal `protected-path-stale`) and protects
+  `conftest.py` at any depth; a `git-check` crash is reported once
+  (`git-check-failed`). The dispatcher survives a failed read for one PR,
+  and an empty `DESIGN_APPROVERS` fails it once with a clear error. Publish
+  judges `budget` before the outcome file and renames the PR to
+  `<KEY>: implementation` only when it pushed; notices say "design approved
+  at <sha7>" (new `--approved-sha` on `notify_slack.py` / `jira_ops.py`).
+  `protect-branch.sh` now parses commands with `shlex`
+  (`.claude/hooks/_git_commit_guard.py`), closing quoted-flag,
+  `-c core.hooksPath`, global-option and `GIT_CONFIG_*` bypasses. New
+  runbook `docs/runbooks/run-the-agent-pipeline.md` (pilot checklist,
+  re-running a blocked run). No socket payload or `app/` change.
 
 - **SIM-152: instant replies in #pracsys-requests.** A small GCP Cloud
   Function (`relay/slack_events/`) receives Slack events, checks Slack's

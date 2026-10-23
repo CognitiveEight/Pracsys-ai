@@ -69,8 +69,9 @@ AGENT_IDENTITIES = (
 #: agent run would execute under (``CLAUDE.md``, ``AGENTS.md``, ``.mcp.json``),
 #: the delivery scripts the jobs holding secrets run, the secret scan's own
 #: configuration, and the gates (``make lint`` / ``make test`` and what they
-#: read, including the conftest files pytest loads first). Prefixes, so
-#: ``requirements`` covers every ``requirements*.txt``.
+#: read, including the conftest files pytest loads first: ``conftest.py`` at
+#: any depth, see ``is_protected``). Prefixes, so ``requirements`` covers every
+#: ``requirements*.txt``.
 PROTECTED_PREFIXES = (
     ".claude/",
     ".github/",
@@ -258,9 +259,15 @@ def _clean_path(path: str) -> str:
     return path
 
 
+def _is_conftest(path: str) -> bool:
+    return path == "conftest.py" or path.endswith("/conftest.py")
+
+
 def is_protected(path: str) -> bool:
-    """Whether ``path`` is on the pipeline/gates list (``PROTECTED_PREFIXES``)."""
-    return _clean_path(path).startswith(PROTECTED_PREFIXES)
+    """Whether ``path`` is on the pipeline/gates list (``PROTECTED_PREFIXES``), or is a
+    ``conftest.py`` anywhere (pytest loads every one on the way to a test)."""
+    path = _clean_path(path)
+    return path.startswith(PROTECTED_PREFIXES) or _is_conftest(path)
 
 
 def check_agent_paths(stage: str, issue: str, paths: Iterable[str]) -> Tuple[bool, List[str], Optional[str]]:
@@ -277,7 +284,8 @@ def check_agent_paths(stage: str, issue: str, paths: Iterable[str]) -> Tuple[boo
         pattern = re.compile(_SPEC_PATH.format(key=re.escape(key)))
         matched = [p for p in clean if not pattern.fullmatch(p) or ".." in p or is_protected(p)]
     else:
-        matched = [p for p in clean if p.startswith(IMPLEMENT_PROTECTED_PREFIXES) or ".." in p]
+        matched = [p for p in clean
+                   if p.startswith(IMPLEMENT_PROTECTED_PREFIXES) or _is_conftest(p) or ".." in p]
     if matched:
         return False, matched, "protected-path"
     return True, [], None
@@ -322,7 +330,8 @@ def implement_decision(outcome: Dict[str, Any], lint_rc: Optional[int], test_rc:
     Ready for review only with green gates on exactly the tree to be pushed, an approving
     verdict, at least one AC result and every AC passing. Publish refusals come first
     (``protected-path``, ``secret-found``: nothing pushed), then a run stopped by a spend
-    limit (``budget``: nothing pushed, AC-39), then gate codes from another tree
+    limit (``budget``: nothing pushed, AC-39; judged before the outcome file, which a run
+    cut short may still have written), then gate codes from another tree
     (``gates-mismatch``). Any other blocked run is pushed as a draft for a human (AC-34)."""
     def verdict(ready: bool, reason: Optional[str]) -> Dict[str, Any]:
         push = commits > 0 and reason not in NO_PUSH_REASONS
@@ -332,10 +341,10 @@ def implement_decision(outcome: Dict[str, Any], lint_rc: Optional[int], test_rc:
         return verdict(False, "protected-path")
     if secret:
         return verdict(False, "secret-found")
+    if run_budget:
+        return verdict(False, "budget")
     green = lint_rc == 0 and test_rc == 0
     if not outcome.get("valid"):
-        if run_budget:
-            return verdict(False, "budget")
         if gates_mismatch:
             return verdict(False, "gates-mismatch")
         return verdict(False, "workflow-failed" if green else "tests-red")
@@ -368,7 +377,7 @@ def pr_comment(*, issue: str, outcome: Dict[str, Any], decision: Dict[str, Any],
     final verdict publish already settled (``decide``); it is rendered, never recomputed."""
     guard_branch.validate_key(issue)
     for path in matched:
-        if path not in review_labels.SENSITIVE_FILES and not path.startswith(review_labels.SENSITIVE_DIRS):
+        if not review_labels.is_sensitive(path):
             raise StageRefused("matched paths must be on the sensitive-path list")
         if not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", path):
             raise StageRefused("unexpected characters in a path")

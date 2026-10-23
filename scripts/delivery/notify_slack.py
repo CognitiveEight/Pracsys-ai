@@ -4,13 +4,15 @@
         --stage spec|implement|review --outcome ready|blocked|failed \\
         [--pr-url https://github.com/CognitiveEight/Pracsys-ai/pull/<n>] \\
         [--run-url https://github.com/CognitiveEight/Pracsys-ai/actions/runs/<id>] \\
-        [--count name=<int> ...] [--cost <usd>] [--reason-category <category>] [--dry-run]
+        [--count name=<int> ...] [--cost <usd>] [--reason-category <category>] \\
+        [--approved-sha <40-hex>] [--dry-run]
 
 A notice is built only from those structured fields, each validated, so no
 text from a ticket, Slack or the model can reach it. It is posted top-level to
 ``DELIVERY_CHANNEL_ID`` with ``SLACK_BOT_TOKEN``; there is no channel or text
-argument. ``jira_ops.py comment`` uses the same field validation. Standard
-library only.
+argument. ``--approved-sha`` (the commit the G2 label covered) is shown as
+"design approved at <first 7>". ``jira_ops.py comment`` uses the same field
+validation. Standard library only.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ _API = "https://slack.com/api/"
 _KEY = re.compile(r"^SIM-[0-9]+$")
 _PR_URL = re.compile(r"^https://github\.com/CognitiveEight/Pracsys-ai/pull/([0-9]+)$")
 _RUN_URL = re.compile(r"^https://github\.com/CognitiveEight/Pracsys-ai/actions/runs/[0-9]+(/job/[0-9]+)?$")
+_SHA = re.compile(r"^[0-9a-f]{40}$")
 _COUNT_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
 _MAX_COUNTS = 10
 _MAX_COST = 10_000.0
@@ -64,6 +67,7 @@ def validate_fields(
     counts: Optional[Mapping[str, Any]] = None,
     cost: Any = None,
     reason_category: Any = None,
+    approved_sha: Any = None,
 ) -> Dict[str, Any]:
     """The fields of a notice or comment, checked; refused if any is not as expected."""
     if not isinstance(issue, str) or not _KEY.fullmatch(issue):
@@ -96,6 +100,8 @@ def validate_fields(
             raise DeliveryRefused("cost out of range")
     if reason_category is not None and reason_category not in REASON_CATEGORIES:
         raise DeliveryRefused(f"reason category must be one of {list(REASON_CATEGORIES)}")
+    if approved_sha is not None and not (isinstance(approved_sha, str) and _SHA.fullmatch(approved_sha)):
+        raise DeliveryRefused("approved SHA must be a 40-hex commit id")
     return {
         "issue": issue,
         "stage": stage,
@@ -106,6 +112,7 @@ def validate_fields(
         "counts": clean_counts,
         "cost": None if cost is None else float(cost),
         "reason_category": reason_category,
+        "approved_sha": approved_sha,
     }
 
 
@@ -130,15 +137,18 @@ def build_notice(
     counts: Optional[Mapping[str, int]] = None,
     cost: Optional[float] = None,
     reason_category: Optional[str] = None,
+    approved_sha: Optional[str] = None,
 ) -> str:
     """One line of Slack text from validated fields only."""
     f = validate_fields(
         issue=issue, stage=stage, outcome=outcome, pr_url=pr_url, run_url=run_url,
-        counts=counts, cost=cost, reason_category=reason_category,
+        counts=counts, cost=cost, reason_category=reason_category, approved_sha=approved_sha,
     )
     parts = [f["issue"], f["stage"], f["outcome"]]
     if f["reason_category"]:
         parts.append(f"reason: {f['reason_category']}")
+    if f["approved_sha"]:
+        parts.append(f"design approved at {f['approved_sha'][:7]}")
     if f["pr_url"]:
         parts.append(f"<{f['pr_url']}|PR #{f['pr_number']}>")
     if f["run_url"]:
@@ -195,6 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
     post_p.add_argument("--count", action="append", default=[], metavar="NAME=INT")
     post_p.add_argument("--cost", type=float)
     post_p.add_argument("--reason-category")
+    post_p.add_argument("--approved-sha")
     post_p.add_argument("--dry-run", action="store_true", help="print instead of posting")
     return parser
 
@@ -205,7 +216,7 @@ def main(argv: List[str] | None = None) -> int:
         fields = dict(
             issue=args.issue, stage=args.stage, outcome=args.outcome, pr_url=args.pr_url,
             run_url=args.run_url, counts=parse_counts(args.count), cost=args.cost,
-            reason_category=args.reason_category,
+            reason_category=args.reason_category, approved_sha=args.approved_sha,
         )
         result = {"text": build_notice(**fields)} if args.dry_run else post(**fields)
     except DeliveryRefused as refused:

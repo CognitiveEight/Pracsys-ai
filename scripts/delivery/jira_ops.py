@@ -7,7 +7,8 @@
     python scripts/delivery/jira_ops.py unblock --issue SIM-<n>
     python scripts/delivery/jira_ops.py label --issue SIM-<n> [--add agent-x ...] [--remove agent-y ...]
     python scripts/delivery/jira_ops.py comment --issue SIM-<n> --stage S --outcome O \\
-        [--pr-url U] [--run-url U] [--cost C] [--count name=<int> ...] [--reason-category CAT]
+        [--pr-url U] [--run-url U] [--cost C] [--count name=<int> ...] [--reason-category CAT] \\
+        [--approved-sha <40-hex>]
 
 Every command checks the key before any API call. ``check-scope`` is
 read-only: whether the issue is one the agents may work on (labels
@@ -258,15 +259,18 @@ def build_comment(
     counts: Optional[Mapping[str, int]] = None,
     cost: Optional[float] = None,
     reason_category: Optional[str] = None,
+    approved_sha: Optional[str] = None,
 ) -> str:
     """Comment text from validated fields only; no ticket text can reach it."""
     f = notify_slack.validate_fields(
         issue=issue, stage=stage, outcome=outcome, pr_url=pr_url, run_url=run_url,
-        counts=counts, cost=cost, reason_category=reason_category,
+        counts=counts, cost=cost, reason_category=reason_category, approved_sha=approved_sha,
     )
     lines = [f"Agent pipeline {f['issue']}: {f['stage']} stage, outcome {f['outcome']}."]
     if f["reason_category"]:
         lines.append(f"Reason: {f['reason_category']}")
+    if f["approved_sha"]:
+        lines.append(f"Design approved at {f['approved_sha'][:7]}.")
     if f["pr_url"]:
         lines.append(f"PR: {f['pr_url']}")
     if f["run_url"]:
@@ -315,6 +319,7 @@ def build_parser() -> argparse.ArgumentParser:
     comment_p.add_argument("--cost", type=float)
     comment_p.add_argument("--count", action="append", default=[], metavar="NAME=INT")
     comment_p.add_argument("--reason-category")
+    comment_p.add_argument("--approved-sha")
     return parser
 
 
@@ -342,6 +347,7 @@ def main(argv: List[str] | None = None) -> int:
                 counts=notify_slack.parse_counts(args.count),
                 cost=args.cost,
                 reason_category=args.reason_category,
+                approved_sha=args.approved_sha,
             )
     except DeliveryRefused as refused:
         print(f"refused: {refused}", file=sys.stderr)

@@ -18,13 +18,19 @@ ticket branch in this repository, label ``agent-pr``, not yet
 LAST ``labeled design-approved`` event, by an approver who is a User, with no
 later ``unlabeled design-approved``, ``committed``, ``head_ref_force_pushed``
 or ``head_ref_deleted``) and the repository activity (the branch's latest push
-is the input SHA and happened before the label: a ``committed`` event sorts by
-the commit's own date, which the pusher controls). It always prints a JSON
-verdict and exits 0; ``notify`` says whether the refusal is reported in Jira
-and Slack (everything except "not approved yet"). ``git-check`` is defence in
-depth on ``base..sha``: an agent-authored or agent-committed commit may only
-touch the issue's own spec files (the spec stage's commit), and the branch may
-not change the pipeline or the gates. ``candidates`` lists the PRs the
+is the input SHA and happened strictly before the label, in an earlier second:
+a ``committed`` event sorts by the commit's own date, which the pusher
+controls). It always prints a JSON verdict and exits 0; ``notify`` says
+whether the refusal is reported in Jira and Slack (everything except "not
+approved yet", and nothing at all when the PR's head is not the issue's own
+ticket branch in this repository, so a hand dispatch cannot flag an unrelated
+issue). ``git-check`` is defence in depth on ``base..sha``: an agent-authored
+or agent-committed commit may only touch the issue's own spec files (the spec
+stage's commit), the branch may not change the pipeline or the gates
+(``protected-path``), and every protected path at ``sha`` must be
+byte-identical to ``base`` itself, the current development tip
+(``protected-path-stale`` when development changed one since the branch was
+cut). ``candidates`` lists the PRs the
 dispatcher should check; ``inputs`` checks the three workflow inputs before any
 API call. Standard library only.
 """
@@ -63,9 +69,9 @@ class G2Refused(Exception):
     """A request the gate will not carry out."""
 
 
-def _verdict(reason: str, **fields: Any) -> Dict[str, Any]:
+def _verdict(reason: str, owned: bool = True, **fields: Any) -> Dict[str, Any]:
     out: Dict[str, Any] = {"go": reason == "approved", "reason": reason,
-                           "notify": reason != "approved" and reason not in QUIET_REASONS}
+                           "notify": owned and reason != "approved" and reason not in QUIET_REASONS}
     out.update(fields)
     return out
 
@@ -109,19 +115,20 @@ def check(*, issue: Any, pr_number: Any, sha: Any, pr: Any, timeline: Any, activ
         return _verdict("bad-data", **fields)
     head = pr.get("head") or {}
     branch = head.get("ref") if isinstance(head.get("ref"), str) else ""
-
+    try:
+        guard_branch.check(branch, issue)
+        owned = ((head.get("repo") or {}).get("full_name")) == repo
+    except guard_branch.GuardRefused:
+        owned = False
+    # A PR that is not the issue's own is refused before anything else, and quietly.
+    if not owned:
+        return _verdict("wrong-branch", owned=False, **fields)
     if pr.get("number") != int(pr_number):
         return _verdict("pr-mismatch", **fields)
     if pr.get("state") != "open":
         return _verdict("pr-not-open", **fields)
     if (pr.get("base") or {}).get("ref") != BASE:
         return _verdict("wrong-base", **fields)
-    try:
-        guard_branch.check(branch, issue)
-    except guard_branch.GuardRefused:
-        return _verdict("wrong-branch", **fields)
-    if ((head.get("repo") or {}).get("full_name")) != repo:
-        return _verdict("wrong-branch", **fields)
     fields["branch"] = branch
     labels = _labels(pr)
     if AGENT_PR not in labels:
@@ -165,7 +172,8 @@ def check(*, issue: Any, pr_number: Any, sha: Any, pr: Any, timeline: Any, activ
     if not pushes:
         return _verdict("push-unverified", **fields)
     pushed_at, last = max(pushes, key=lambda item: item[0])
-    if last.get("after") != sha or pushed_at > label_time:
+    # Same second counts as after: the timestamps cannot show which came first.
+    if last.get("after") != sha or pushed_at >= label_time:
         return _verdict("approval-stale", **fields)
     return _verdict("approved", **fields)
 
@@ -218,7 +226,8 @@ def _git(repo: str, *args: str) -> str:
 
 def git_check(issue: str, sha: str, base: str, repo: str = ".") -> Dict[str, Any]:
     """Defence in depth on ``base..sha``: agent commits only as the spec stage's own spec files,
-    and no change to the pipeline or the gates anywhere on the branch."""
+    no change to the pipeline or the gates anywhere on the branch, and the pipeline and gates
+    at ``sha`` exactly as they are at ``base`` (the development tip) now."""
     key = guard_branch.validate_key(issue)
     if not _SHA.fullmatch(sha or ""):
         raise G2Refused("sha must be a 40-hex commit id")
@@ -231,9 +240,14 @@ def git_check(issue: str, sha: str, base: str, repo: str = ".") -> Dict[str, Any
                      "--root", commit).split()
         if not files or any(not spec_path.fullmatch(p) or ".." in p for p in files):
             return {"ok": False, "reason": "agent-commit"}
-    changed = _git(repo, "diff", "--name-only", f"{base}...{sha}").splitlines()
+    changed = _git(repo, "diff", "--name-only", "--no-renames", f"{base}...{sha}").splitlines()
     if any(stage_io.is_protected(p) for p in changed):
         return {"ok": False, "reason": "protected-path"}
+    # Two-dot: the trees themselves. A branch cut before a protected change landed on
+    # development would otherwise run the gates and pipeline files as they were then.
+    differ = _git(repo, "diff", "--name-only", "--no-renames", base, sha).splitlines()
+    if any(stage_io.is_protected(p) for p in differ):
+        return {"ok": False, "reason": "protected-path-stale"}
     return {"ok": True, "reason": None}
 
 

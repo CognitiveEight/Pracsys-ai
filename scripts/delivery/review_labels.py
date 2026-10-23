@@ -61,15 +61,14 @@ def _normalise(path: str) -> str:
     return path
 
 
+def is_sensitive(path: str) -> bool:
+    """Whether a normalised path is on the list (any ``conftest.py`` at any depth counts)."""
+    return path in SENSITIVE_FILES or path.startswith(SENSITIVE_DIRS) or path.endswith("/conftest.py")
+
+
 def needs_human_review(paths: Iterable[str], agent_flag: bool = False) -> Tuple[bool, List[str]]:
     """Whether the PR needs a human reviewer, and the sensitive paths it touches."""
-    matched = sorted(
-        {
-            p
-            for p in (_normalise(raw) for raw in paths)
-            if p and (p in SENSITIVE_FILES or p.startswith(SENSITIVE_DIRS))
-        }
-    )
+    matched = sorted({p for p in (_normalise(raw) for raw in paths) if p and is_sensitive(p)})
     return bool(agent_flag or matched), matched
 
 

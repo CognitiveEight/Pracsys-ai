@@ -420,7 +420,8 @@ def test_comments_and_notices_carry_no_ticket_text(monkeypatch, tmp_path):
         assert all(u.startswith("https://github.com/CognitiveEight/Pracsys-ai/") for u in urls), urls
 
     # The builders take structured fields only: no parameter can carry prose.
-    allowed = {"issue", "stage", "outcome", "pr_url", "run_url", "counts", "cost", "reason_category"}
+    allowed = {"issue", "stage", "outcome", "pr_url", "run_url", "counts", "cost", "reason_category",
+               "approved_sha"}
     assert set(inspect.signature(notify.build_notice).parameters) <= allowed
     assert set(inspect.signature(ops.build_comment).parameters) <= allowed
     # Every reason category is a fixed token.
@@ -673,3 +674,21 @@ def test_new_reason_categories_render():
     for reason in ("gates-mismatch", "g2-refused"):
         assert reason in notify.build_notice(issue="SIM-13", stage="implement", outcome="blocked",
                                              reason_category=reason)
+
+
+def test_notices_name_the_approved_commit():
+    """Security audit A2: the implement stage's notices say which commit the design approval
+    covered, so a reviewer can see whether the label was on the head they reviewed."""
+    notify = _load("notify_slack")
+    ops = _load("jira_ops")
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    text = notify.build_notice(issue="SIM-13", stage="implement", outcome="ready", approved_sha=sha)
+    assert "design approved at 0123456" in text and sha not in text
+    comment = ops.build_comment(issue="SIM-13", stage="implement", outcome="blocked",
+                                reason_category="tests-red", approved_sha=sha)
+    assert "design approved at 0123456" in comment.lower() and sha not in comment
+    for bad in ("0123456", sha.upper(), sha + "\n", "x" * 40, "<!channel>" + sha[:30]):
+        with pytest.raises(notify.DeliveryRefused):
+            notify.build_notice(issue="SIM-13", stage="implement", outcome="ready", approved_sha=bad)
+    assert notify.main(["post", "--issue", "SIM-13", "--stage", "implement", "--outcome", "ready",
+                        "--approved-sha", sha, "--dry-run"]) == 0

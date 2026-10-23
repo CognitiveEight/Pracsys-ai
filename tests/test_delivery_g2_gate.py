@@ -186,6 +186,14 @@ def test_the_last_push_must_be_the_dispatched_head(g2):
     assert _check(g2, activity=activity)["go"] is True
 
 
+def test_a_push_in_the_same_second_as_the_label_is_stale(g2):
+    """Security audit A2: the timestamps have one-second resolution, so a push in the same
+    second as the label cannot be shown to predate it."""
+    out = _check(g2, activity=_activity(at=LABEL_TIME))
+    assert out["go"] is False and out["reason"] == "approval-stale" and out["notify"] is True
+    assert _check(g2, activity=_activity(at="2026-10-23T09:59:59Z"))["go"] is True
+
+
 def test_no_push_record_for_the_branch_refuses(g2):
     for activity in ([], _activity(ref="refs/heads/feature/SIM-14-other"), [{"ref": f"refs/heads/{BRANCH}"}]):
         out = _check(g2, activity=activity)
@@ -203,15 +211,27 @@ def test_head_must_equal_the_dispatched_sha(g2):
 @pytest.mark.parametrize("over,reason", [
     ({"state": "closed"}, "pr-not-open"),
     ({"base": {"ref": "main"}}, "wrong-base"),
-    ({"head": {"ref": BRANCH, "sha": SHA, "repo": {"full_name": "someone/fork"}}}, "wrong-branch"),
-    ({"head": {"ref": "feature/SIM-14-other", "sha": SHA, "repo": {"full_name": REPO}}}, "wrong-branch"),
-    ({"head": {"ref": "development", "sha": SHA, "repo": {"full_name": REPO}}}, "wrong-branch"),
     ({"labels": [{"name": "design-approved"}]}, "not-agent-pr"),
     ({"number": 8}, "pr-mismatch"),
 ])
 def test_pr_shape_is_checked(g2, over, reason):
     out = _check(g2, pr=_pr(**over))
     assert out["go"] is False and out["reason"] == reason and out["notify"] is True
+
+
+@pytest.mark.parametrize("head", [
+    {"ref": BRANCH, "sha": SHA, "repo": {"full_name": "someone/fork"}},
+    {"ref": "feature/SIM-14-other", "sha": SHA, "repo": {"full_name": REPO}},
+    {"ref": "development", "sha": SHA, "repo": {"full_name": REPO}},
+])
+def test_a_pr_whose_branch_is_not_the_issues_own_is_refused_quietly(g2, head):
+    """Security audit A5: a hand dispatch pairing an issue with someone else's PR must not flag
+    that issue or post to Slack. The refusal goes to the job summary only."""
+    out = _check(g2, pr=_pr(head=head))
+    assert out["go"] is False and out["reason"] == "wrong-branch" and out["notify"] is False
+    # every other refusal on a foreign PR is quiet too
+    out = _check(g2, pr=_pr(head=head, state="closed"))
+    assert out["go"] is False and out["notify"] is False
 
 
 @pytest.mark.parametrize("kw", [
@@ -390,11 +410,35 @@ def test_git_check_refuses_an_agent_spec_commit_for_another_issue(g2, repo):
     ".github/workflows/agent-implement.yml", ".claude/settings.json", "scripts/delivery/g2_gate.py",
     "Makefile", "pyproject.toml", "requirements-dev.txt", ".gitleaks.toml", ".gitleaksignore",
     "CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", ".mcp.json", "conftest.py", "tests/conftest.py",
+    "tests/offline/conftest.py", "app/conftest.py",
 ])
 def test_git_check_refuses_a_branch_that_changes_the_pipeline_or_gates(g2, repo, path):
     _spec_commit(repo)
     head = _commit(repo, path, "changed\n")
     assert g2.git_check("SIM-13", head, "base-ref", str(repo)) == {"ok": False, "reason": "protected-path"}
+
+
+def test_git_check_refuses_a_branch_behind_a_protected_change_on_development(g2, repo):
+    """Security audit A3: protected paths at the approved commit must be byte-identical to the
+    current development tip, not only unchanged since the merge-base. A branch cut before a
+    gate fix landed on development would otherwise run the old gates."""
+    _commit(repo, "Makefile", "lint:\n\truff check .\n")
+    _git(repo, "branch", "-f", "base-ref", "HEAD")
+    _git(repo, "switch", "-q", "-c", "feature/SIM-13-stale", "HEAD")
+    head = _spec_commit(repo)
+    assert g2.git_check("SIM-13", head, "base-ref", str(repo)) == {"ok": True, "reason": None}
+    # development moves on with a protected change; the ticket branch does not have it
+    _git(repo, "switch", "-q", "development")
+    _git(repo, "reset", "-q", "--hard", "base-ref")
+    tip = _commit(repo, "Makefile", "lint:\n\truff check . --no-fix\n")
+    _git(repo, "branch", "-f", "base-ref", tip)
+    assert g2.git_check("SIM-13", head, "base-ref", str(repo)) == {
+        "ok": False, "reason": "protected-path-stale"}
+    # an unprotected change on development is fine
+    _git(repo, "reset", "-q", "--hard", "HEAD~1")
+    tip = _commit(repo, "docs/x.md", "x\n")
+    _git(repo, "branch", "-f", "base-ref", tip)
+    assert g2.git_check("SIM-13", head, "base-ref", str(repo)) == {"ok": True, "reason": None}
 
 
 def test_git_check_cli(g2, repo, capsys):

@@ -441,3 +441,30 @@ def test_both_publish_stages_refuse_instruction_and_scan_config_files(sio, path)
 
 def test_nested_test_files_stay_allowed(sio):
     assert sio.check_agent_paths("implement", "SIM-13", ["tests/offline/verify_x.py", "tests/test_x.py"])[0]
+
+
+# ------------------------------------------- final review fixes (SIM-153)
+
+
+def test_budget_is_judged_before_the_outcome_is(sio):
+    """Review finding 2: a run stopped by the spend limit is `budget` even when the agent left a
+    valid outcome file, ready or blocked; nothing is pushed."""
+    assert sio.implement_decision(_impl(), 0, 0, 2, run_budget=True) == _no("budget", push=False)
+    blocked = _impl(status="blocked", reasonCategory="dor-gap")
+    assert sio.implement_decision(blocked, 0, 1, 2, run_budget=True) == _no("budget", push=False)
+    assert sio.implement_decision(_impl(), 0, 0, 2, gates_mismatch=True,
+                                  run_budget=True) == _no("budget", push=False)
+    # the publish refusals still come first
+    assert sio.implement_decision(_impl(), 0, 0, 2, secret=True,
+                                  run_budget=True)["reasonCategory"] == "secret-found"
+
+
+@pytest.mark.parametrize("path", ["tests/offline/conftest.py", "app/conftest.py", "a/b/c/conftest.py"])
+def test_conftest_at_any_depth_is_protected(sio, path):
+    """Security audit A3: pytest loads every conftest.py on the way to a test, not only the
+    root and tests/ ones."""
+    assert sio.is_protected(path) and sio.is_protected("./" + path)
+    ok, matched, reason = sio.check_agent_paths("implement", "SIM-13", ["app/main.py", path])
+    assert ok is False and reason == "protected-path" and matched == [path]
+    assert not sio.is_protected("tests/test_conftest_helpers.py")
+    assert not sio.is_protected("app/myconftest.py")

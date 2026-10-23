@@ -39,7 +39,9 @@ Secret Manager, as shown below.
 
 ## Steps
 
-Run these from the repository root.
+Run these from the repository root, on an up-to-date `development` branch
+(`ls relay/slack_events` must show `main.py`), from a machine whose `gcloud`
+points at the project where the relay should live.
 
 **1. Choose the project and turn on the APIs**
 
@@ -71,14 +73,18 @@ api.slack.com/apps → **PracSys Triage** → Basic Information → App Credenti
 
 **4. Store both secrets in Secret Manager**
 
-Each command asks you to paste the value, then press Enter and Ctrl+D. Nothing
-is echoed or saved in your shell history.
+Run each line, then paste the value and press Enter once. The value is not
+shown, not saved in your shell history, and stored without a trailing line
+break (a trailing line break makes the signature check or the token fail).
+Type `--data-file=-` exactly as written: the dash means "read the value from
+what I type next"; never put the secret itself in the command.
 
 ```bash
-gcloud secrets create slack-signing-secret --replication-policy=automatic --data-file=-
-gcloud secrets create github-dispatch-token --replication-policy=automatic --data-file=-
+read -rs SECRET && printf '%s' "$SECRET" | gcloud secrets create slack-signing-secret --replication-policy=automatic --data-file=- ; unset SECRET
+read -rs SECRET && printf '%s' "$SECRET" | gcloud secrets create github-dispatch-token --replication-policy=automatic --data-file=- ; unset SECRET
 ```
-Expected: "Created version [1] of the secret".
+Expected: "Created version [1] of the secret". To replace a value later, use the
+same line with `gcloud secrets versions add <name> --data-file=-`.
 
 **5. Let the function read them**
 
@@ -90,6 +96,15 @@ for s in slack-signing-secret github-dispatch-token; do
   gcloud secrets add-iam-policy-binding "$s" \
     --member="serviceAccount:${RUNTIME_SA}" --role=roles/secretmanager.secretAccessor
 done
+```
+
+Also let Cloud Build use that account to build the function (new projects
+often lack this, and the deploy then fails with "missing permission on the
+build service account"):
+
+```bash
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:${RUNTIME_SA}" --role=roles/cloudbuild.builds.builder
 ```
 
 **6. Deploy the function**
@@ -161,3 +176,4 @@ working as before. To remove it entirely:
 | Date | Change | Spec / commit |
 |---|---|---|
 | 2026-10-23 | First version, for the demo deployment | SIM-152 |
+| 2026-10-23 | Secrets stored without a trailing line break; Cloud Build role; deploy from `development` (lessons from the first deployment, in `pracsys-staging`) | SIM-152 |

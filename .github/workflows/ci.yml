@@ -99,10 +99,17 @@ jobs:
             requirements.lock.txt
             requirements-dev.txt
 
+      # tests/test_ocr.py drives the scanned-PDF path, which counts pages with
+      # poppler's pdfinfo (pdf2image). Same package the Dockerfile installs.
+      # No test shells out to ffmpeg or antiword.
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends poppler-utils
+
       # The exact production set (requirements.lock.txt) plus the dev tools.
       # requirements-dev.txt pulls in requirements.txt too; the lock's exact
       # pins satisfy those ranges, so pip errors out if the two have drifted.
-      # No apt packages: no test shells out to ffmpeg, poppler or antiword.
       - name: Install dependencies
         run: |
           python -m pip install -r requirements.lock.txt -r requirements-dev.txt

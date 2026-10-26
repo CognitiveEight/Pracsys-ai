@@ -292,6 +292,10 @@ class SocketEventHandler(
         # New triggers QUEUE behind the in-flight chain (FIFO); cross-workspace
         # runs stay concurrent because locks are keyed by workspace_id.
         self._workspace_pipeline_locks: Dict[str, asyncio.Lock] = {}
+        # Who holds each workspace's pipeline lock, in which stage, since when:
+        # workspace_id -> {"holder", "stage", "acquiredAt", "cap", "warnedAt"}.
+        # Read by the lock watchdog and the run cap (handlers/_shared.py).
+        self._workspace_pipeline_lock_holder: Dict[str, Dict[str, Any]] = {}
         self._pending_feedback_queue: Dict[str, List[Dict[str, Any]]] = {}
         self._pending_feedback_task: Dict[str, asyncio.Task] = {}
         # Window for collecting bulk-reject bursts before flushing.

@@ -79,6 +79,10 @@ class ApplicationLifecycle:
             logger.info("Registering socket client with event handler...")
             event_handler.set_socket_client(self.socket_client)
 
+            # Reports any case whose pipeline lock is held past
+            # PIPELINE_LOCK_WARN_SECONDS, with the holder and its stage.
+            event_handler.start_pipeline_lock_watchdog()
+
             # Connect to socket server
             logger.info("Connecting to socket server: {}", safe_url(settings.socket_url))
             await self.socket_client.connect()
@@ -95,6 +99,11 @@ class ApplicationLifecycle:
         """Cleanup application components on shutdown."""
         logger.info("Shutting down application...")
         self._running = False
+
+        try:
+            await event_handler.stop_pipeline_lock_watchdog()
+        except Exception as e:
+            logger.error("Error stopping the pipeline lock watchdog: {}", e)
 
         # Disconnect socket client
         if self.socket_client:

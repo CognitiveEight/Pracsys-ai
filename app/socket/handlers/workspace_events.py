@@ -28,6 +28,7 @@ from app.workspace.participants import set_participants
 from app.socket.event_utils import (
     drafting_payload_to_wire,
 )
+from app.socket.handlers._shared import UPLOAD_REFRESH_FEATURES
 from app.core.roles import DEFAULT_WORKSPACE_ROLE
 from app.utils.redact import validation_fields
 
@@ -73,7 +74,7 @@ class WorkspaceEventsMixin:
                 # Queue behind any in-flight generation chain so cached snapshots
                 # never interleave a live pipeline's emits. Runs detached so
                 # on_connect/on_connected return immediately.
-                async with self._workspace_pipeline_lock(ws):
+                async with self._hold_pipeline_lock(ws, "reemit"):
                     await self._reemit_cached_features(ws, uid)
 
             try:
@@ -1386,6 +1387,10 @@ class WorkspaceEventsMixin:
 
             # Process new evidence files if any (skip files that are deleted: isDeleted true or in deleted_ids)
             files_to_process = []
+            # The loaders this sync armed with workspace:refresh. Every one is
+            # owed a terminal emit on every branch below (see
+            # _release_refresh_loaders); empty when nothing was armed.
+            armed_features: List[str] = []
             if payload.evidenceFiles:
                 for file in payload.evidenceFiles:
                     is_deleted = getattr(file, "isDeleted", False) or getattr(
@@ -1489,26 +1494,16 @@ class WorkspaceEventsMixin:
                         or self._workspace_procedural_timeline_payload.get(payload.workspaceId)
                     )
                     if has_prior_panels and self._socket_client:
+                        # Re-uploads rebuild the assessments payload below, and
+                        # a new document regenerates every panel (facts
+                        # changed), so every loader is shown.
+                        armed_features = list(UPLOAD_REFRESH_FEATURES)
                         try:
                             await self._emit_workspace_refresh(
                                 workspace_id=str(payload.workspaceId),
                                 user_id=str(payload.userId),
                                 reason="ai_update_started",
-                                feature_types=[
-                                    # Re-uploads rebuild the assessments payload
-                                    # below, so surface its loader too.
-                                    "document_assessments",
-                                    "strategy_objective",
-                                    "analysis_report",
-                                    "list_of_dates",
-                                    "applicable_laws",
-                                    "procedural_timeline",
-                                    # New-document upload regenerates these too
-                                    # (facts changed), so show their loaders as well.
-                                    "relevant_parties",
-                                    "case_laws",
-                                    "drafting_assistant",
-                                ],
+                                feature_types=list(armed_features),
                             )
                         except Exception as refresh_err:
                             logger.warning(
@@ -1557,12 +1552,14 @@ class WorkspaceEventsMixin:
                     # capture_usage bills the re-ingestion spend (OCR units, STT
                     # seconds, embeddings, per-document Gemini calls) — see the
                     # matching scope in on_workspace_created.
+                    ingest_started = self._stage_begin(str(payload.workspaceId), "ingest")
                     with capture_usage() as ingest_usage:
                         batch_result = await document_processor.process_batch(
                             files=files_to_process,
                             workspace_id=payload.workspaceId,
                             user_id=payload.userId,
                         )
+                    self._log_stage("ingest", ingest_started, mode="sequential")
 
                     logger.success(
                         "Document sync complete: {}/{} successful",
@@ -1637,11 +1634,17 @@ class WorkspaceEventsMixin:
                                 try:
                                     # Own scope — see the matching comment in
                                     # on_workspace_created.
+                                    meta_started = self._stage_begin(
+                                        str(payload.workspaceId), "metadata"
+                                    )
                                     with capture_usage() as meta_usage:
                                         meta = await self._get_workspace_category_and_subcategory(
                                             workspace_id=payload.workspaceId,
                                             user_id=payload.userId,
                                         )
+                                    self._log_stage(
+                                        "metadata", meta_started, mode="sequential"
+                                    )
                                     workspace_metadata_payload = {
                                         "featureType": "workspace_metadata",
                                         "workspaceId": payload.workspaceId,
@@ -1701,9 +1704,33 @@ class WorkspaceEventsMixin:
                                     batch_result=batch_result,
                                     is_update=True,
                                     analysis_log_context=" (sync)",
+                                    armed_features=armed_features,
+                                )
+                            elif armed_features:
+                                # An existing case whose new files ALL failed.
+                                # Its panels are unchanged, so they are settled
+                                # from cache as they are: never replaced by a
+                                # fallback report, never emptied, and nothing is
+                                # re-extracted.
+                                settled = await self._release_refresh_loaders(
+                                    str(payload.workspaceId),
+                                    str(payload.userId),
+                                    [
+                                        f
+                                        for f in armed_features
+                                        if f != "document_assessments"
+                                    ],
+                                    reason="sync_all_files_failed",
+                                    workspace_role=resolved_workspace_role,
+                                )
+                                logger.info(
+                                    "sync settled from cache reason={} features={}",
+                                    "all_files_failed",
+                                    len(settled),
                                 )
                             else:
-                                # When no files succeeded on sync, still emit analysis report (fallback)
+                                # First build: when no files succeeded on sync,
+                                # still emit analysis report (fallback)
                                 if self._socket_client:
                                     try:
                                         workspace_role = resolved_workspace_role
@@ -1780,6 +1807,22 @@ class WorkspaceEventsMixin:
                             logger.error(
                                 "Failed to emit sync error notification: {}", emit_error
                             )
+                    if armed_features:
+                        # The crash ended the run before any panel was
+                        # scheduled: settle every armed loader from cache
+                        # (document_assessments got its error emit above).
+                        settled = await self._release_refresh_loaders(
+                            str(payload.workspaceId),
+                            str(payload.userId),
+                            [f for f in armed_features if f != "document_assessments"],
+                            reason="sync_ingest_failed",
+                            workspace_role=resolved_workspace_role,
+                        )
+                        logger.info(
+                            "sync settled from cache reason={} features={}",
+                            "ingest_failed",
+                            len(settled),
+                        )
 
             # When we skipped re-processing (no new/changed/deleted docs), re-emit from cache only.
             # Do NOT regenerate — only when user adds/updates/deletes documents do we regenerate (paths above).

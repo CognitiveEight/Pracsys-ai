@@ -18,6 +18,7 @@ from app.socket.event_utils import (
     _format_document_for_prompt,
     drafting_payload_to_wire,
 )
+from app.core.config import settings
 from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
@@ -192,12 +193,23 @@ class DraftingMixin:
         workspace_id: str,
         user_id: str,
         workspace_role: Optional[str] = None,
+        *,
+        templates_ready: Optional["asyncio.Task"] = None,
     ) -> None:
         """
         Generate the proactive Drafting Assistant panel suggestions and emit
         them as a document_feature_response (featureType="drafting_assistant").
 
         Cached in `_workspace_drafting_payload` for reconnect re-emit.
+
+        ``templates_ready`` is a template prewarm the pipeline runner started
+        before taking the workspace pipeline lock (``_prewarm_templates``).
+        Callers holding the lock pass it so the backend round trip is never
+        awaited under the lock: drafting waits on it for at most
+        ``template_sync_in_lock_wait_seconds`` and then matches against the
+        current store. A library that lands later re-emits the panel through
+        ``_maybe_reemit_drafting_on_templates``. Without it, the bounded
+        ``ensure_templates_synced`` runs inline.
         """
         if not self._socket_client:
             return
@@ -209,7 +221,20 @@ class DraftingMixin:
             # in-memory store BEFORE pre-matching. The backend only pushes
             # template_sync on upload/rename/delete, so after an AI restart
             # the store is cold — request a full snapshot and wait for it.
-            await self.ensure_templates_synced(user_id)
+            if templates_ready is not None:
+                if not templates_ready.done():
+                    await asyncio.wait(
+                        {templates_ready},
+                        timeout=settings.template_sync_in_lock_wait_seconds,
+                    )
+                if not templates_ready.done():
+                    logger.info(
+                        "Drafting: template library not ready after {}s in the "
+                        "pipeline lock — matching against the current store",
+                        settings.template_sync_in_lock_wait_seconds,
+                    )
+            else:
+                await self.ensure_templates_synced(user_id)
             brief = self._build_case_brief_for_drafting(workspace_id)
             suggestions = await drafting_agent.suggest(
                 role=role_upper,

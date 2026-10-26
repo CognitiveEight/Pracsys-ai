@@ -1049,3 +1049,23 @@ Phase 2 (PR 2):
 - Simple process-wide semaphores replace the per-batch `INGEST_CONCURRENCY`.
 - Plan step 10 (replay guard) and the PyPDF2 text-layer swap are dropped.
 - The objective store keeps the objective, not the chat instruction.
+- Phase -1 as implemented (2026-10-26):
+  - The Phase -1 checks live in their own suite,
+    `tests/offline/verify_stuck_loaders.py` (groups named as in the AC table),
+    not in `verify_incremental_update.py`, so the first PR ships independently.
+  - The dates/laws runner has no arming information from its callers
+    (deletion, restore, reload, sync helper), so on a cancel, the cap or a
+    normal exit it releases its own tail features
+    (`PIPELINE_TAIL_FEATURES`) not yet emitted, not an "armed" list. The upload
+    runner releases only the `armed_features` its caller passed.
+  - The cascade runner now also installs the emit observer on its `emitted`
+    set, so the cap settlement and the scheduler's terminal release skip
+    every panel that reached the socket layer (no double emit, AC-117).
+  - Stage names: the upload uses `lock_wait`, `ingest`, `metadata`,
+    `strategy`, `analysis_report`, the six tail stages and `pipeline_total`
+    (`mode=sequential`); the dates/laws runner adds `dates_laws_total`; the
+    cascade logs `objective_cascade_*` lines (lock wait, analysis, quality
+    explanation, tagging, dates relevance, laws, case laws, drafting, total).
+    The chat-turn `objective_*` lines stay in Phase 0.
+  - The `description[:50]` log line in the sync metadata emit is left for
+    Phase 1 step 6, where that code moves.

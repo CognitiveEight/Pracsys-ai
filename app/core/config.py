@@ -200,6 +200,28 @@ class Settings(BaseSettings):
     # handlers turn into a reported failure instead of a permanent loader.
     gemini_request_timeout_seconds: float = 300.0
 
+    # Stuck-loader bounds (SIM-163 Phase -1). A panel loader clears only when its
+    # panel arrives, so nothing that holds the per-workspace pipeline lock may
+    # wait without bound: while it is held, every later upload, objective change,
+    # reconnect replay and resume for the case queues behind it.
+    # Bound on any request_template_sync wait. An undelivered request returns at
+    # once; a late snapshot still refreshes the Drafting Assistant on arrival.
+    template_sync_timeout_seconds: float = 900.0
+    # How long drafting waits on the template prewarm while holding the pipeline
+    # lock. The prewarm itself keeps waiting (up to the bound above) outside it.
+    template_sync_in_lock_wait_seconds: float = 5.0
+    # Hard cap on one upload pipeline / dates-laws run / objective-change cascade
+    # holding the lock, measured from acquisition. At the cap the run is
+    # cancelled, logged CRITICAL with its stage, and its armed panels settle from
+    # cache.
+    pipeline_run_timeout_seconds: float = 900.0
+    # Seconds of cap added per second of audio in the run's batch, and the upper
+    # bound of that extension (also used when an audio duration is unknown).
+    audio_timeout_factor: float = 1.0
+    pipeline_run_timeout_audio_max_seconds: float = 3600.0
+    # Informational WARNING when a case's pipeline lock has been held this long.
+    pipeline_lock_warn_seconds: float = 300.0
+
     # Token pricing overrides (USD per 1,000,000 tokens). When BOTH are set they
     # take precedence over the built-in per-model table in app/ai/pricing.py, so
     # ops can retune costs without a code change. Leave unset to price by model.

@@ -858,8 +858,9 @@ class RunControlMixin:
                     # cumulative so the next emit bills it.
                     self._ingest_usage_metadata(workspace_id, ingest_usage)
 
-                async with self._workspace_pipeline_lock(workspace_id):
+                async with self._hold_pipeline_lock(workspace_id, "resume"):
                     for feature in features:
+                        self._set_pipeline_stage(workspace_id, feature)
                         try:
                             await self._produce_resumed_feature(
                                 feature,

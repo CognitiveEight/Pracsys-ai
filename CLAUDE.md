@@ -244,7 +244,7 @@ change whose 2-minute regeneration was cancelled by a socket disconnect, dying
 without a log line or an emit because `asyncio.CancelledError` is a
 `BaseException` that every `except Exception` on the path missed.
 
-Four rules follow, and a new feature has to honour all of them:
+These rules follow, and a new feature has to honour all of them:
 
 - **Catch `asyncio.CancelledError` explicitly** (before `except Exception`) in
   any long-running generation a socket turn awaits — log it, mark the work, then
@@ -268,8 +268,33 @@ Four rules follow, and a new feature has to honour all of them:
   safety block surfaces as the far more misleading "model returned no JSON".
   All calls are bounded by `gemini_request_timeout_seconds` (default 300s; the
   legitimate strategy regeneration takes ~2 minutes).
+- **Never hold `_workspace_pipeline_lock` across an unbounded external round
+  trip.** While one run holds it, every later upload, objective change,
+  reconnect replay and resume of the case queues behind it. Take it through
+  `_hold_pipeline_lock(workspace_id, holder)`, which records the holder and
+  its stage (`_set_pipeline_stage` / `_stage_begin`). Template sync is bounded
+  (`TEMPLATE_SYNC_TIMEOUT_SECONDS`, 900 s; an undelivered request returns at
+  once) and runners start it **before** the lock (`_prewarm_templates`);
+  drafting under the lock waits on it only `TEMPLATE_SYNC_IN_LOCK_WAIT_SECONDS`
+  (`templates_ready=`), and a late library re-emits drafting by itself.
+- **A run's lock hold is capped.** The upload pipeline, the dates/laws runner
+  and the objective-change cascade run under `asyncio.timeout(cap)`:
+  `PIPELINE_RUN_TIMEOUT_SECONDS` (900 s), extended for audio up to
+  `PIPELINE_RUN_TIMEOUT_AUDIO_MAX_SECONDS` (`_pipeline_run_cap`). At the cap
+  the run logs CRITICAL `pipeline run exceeded cap=… stage=…`, audits
+  `pipeline_run_timeout` and settles its unemitted panels from cache
+  (`_settle_pipeline_run_cap`). A watchdog warns at
+  `PIPELINE_LOCK_WARN_SECONDS` (300 s) and releases nothing. Every step in a
+  long run must re-raise `CancelledError`, or the cap cannot cut it.
+- **A failed step settles its own panel.** Runners set the emit observer
+  (`_EMIT_OBSERVER`, `run_control.py`), so a release skips what already went
+  out. Each failing tail step, a strategy that returns nothing, a cancelled
+  runner, a `process_batch` crash and an upload whose files all fail release
+  their armed panels from cache — an existing case's panels are never replaced
+  by a fallback or emptied because an upload failed.
 
-Offline coverage: `tests/offline/verify_objective_change.py` group 12.
+Offline coverage: `tests/offline/verify_objective_change.py` group 12,
+`tests/offline/verify_stuck_loaders.py`.
 
 ### Stop is a fence, not a cancellation
 

@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **SIM-163 (Phase -1): panels no longer stick after an upload or an
+  objective change; a failed upload no longer replaces existing panels.**
+  - Template sync for the Drafting Assistant is bounded
+    (`TEMPLATE_SYNC_TIMEOUT_SECONDS`, 900 s). An undelivered
+    `request_template_sync` returns at once, an invalid reply releases its
+    waiter, and the round trip now runs outside the per-workspace pipeline lock
+    (drafting waits on it at most `TEMPLATE_SYNC_IN_LOCK_WAIT_SECONDS`, 5 s; a
+    library that arrives later re-emits drafting). Before, one unanswered
+    request held the lock forever and every later panel of the case span until
+    a restart.
+  - One upload pipeline, dates/laws run or objective-change cascade may hold
+    the lock for at most `PIPELINE_RUN_TIMEOUT_SECONDS` (900 s), extended for
+    audio by `AUDIO_TIMEOUT_FACTOR` per second of audio up to
+    `PIPELINE_RUN_TIMEOUT_AUDIO_MAX_SECONDS` (3600 s). At the cap the run is
+    cut, logged CRITICAL with its stage, audited (`pipeline_run_timeout`), and
+    its unemitted panels are settled from cache. A watchdog logs a WARNING
+    when a lock is held past `PIPELINE_LOCK_WARN_SECONDS` (300 s), with the
+    holder and stage.
+  - Every upload-tail step that fails, a cancelled upload or dates/laws run, a
+    strategy step that fails or returns nothing, and a `process_batch` crash
+    now emit the panel's cached (or empty/fallback) state as its terminal
+    emit, exactly once.
+  - An upload to an existing case whose files all fail re-emits the case's
+    panels unchanged. It no longer replaces the Analysis Report with a generic
+    fallback, empties the List of Dates, or schedules a full re-extract. A
+    first build keeps today's fallback behaviour.
+  - Stage timing lines (`stage <name> took Xs`) for the upload pipeline and
+    the objective-change cascade, so a slow step can be told from a hang.
+  - **Socket payload change (wire-visible):** a failed strategy step used to
+    emit `{"featureType": "strategy_objective", "error": "<exception text>"}`
+    with no panel payload. It now emits the cached `strategy_objective`
+    payload (the fallback on a first build) through the normal envelope; the
+    `error` field is gone. Backend owners to confirm nothing reads it. No
+    other shape changes; emits may arrive earlier.
+  - New settings (all in `env.example`): `TEMPLATE_SYNC_TIMEOUT_SECONDS`,
+    `TEMPLATE_SYNC_IN_LOCK_WAIT_SECONDS`, `PIPELINE_RUN_TIMEOUT_SECONDS`,
+    `AUDIO_TIMEOUT_FACTOR`, `PIPELINE_RUN_TIMEOUT_AUDIO_MAX_SECONDS`,
+    `PIPELINE_LOCK_WARN_SECONDS`.
+  - Offline coverage: `tests/offline/verify_stuck_loaders.py`. `make e2e`
+    (AC-113, AC-114) still to be run by a human.
+
 ### Added
 
 - **SIM-152: instant replies in #pracsys-requests.** A small GCP Cloud

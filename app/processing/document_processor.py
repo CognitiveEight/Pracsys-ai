@@ -292,6 +292,9 @@ Document excerpt:
                         "audio_segments": audio_result.segments,
                         "audio_speaker_source": audio_result.speaker_source,
                         "audio_languages": audio_result.detected_languages,
+                        # Internal only (the assessment envelope copies named
+                        # keys): extends the pipeline run cap for long audio.
+                        "audio_duration_seconds": audio_result.duration_seconds,
                     }
                 else:
                     extracted_text = ""
@@ -300,6 +303,7 @@ Document excerpt:
                         "transcript": "",
                         "transcript_status": "failed",
                         "audio_error": audio_result.error or "transcription_failed",
+                        "audio_duration_seconds": audio_result.duration_seconds,
                     }
             else:
                 # Extract text using GCP-powered file processor.

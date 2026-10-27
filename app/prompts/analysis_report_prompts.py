@@ -203,6 +203,10 @@ riskOrWeakness (user says this risk/weakness does not apply):
 
 Output ONLY valid JSON, no markdown, no code block:
 {{"isValidRejection": <true|false>, "scoreIncrease": <integer 0-5>, "reason": "<one short sentence>"}}
+
+The reason is shown to the lawyer next to the score. Write it to them, in plain words: why this item
+does or does not change the case's readiness (for an INVALID rejection, what the gap still affects).
+Do not mention scores, percentages, validity, "the user" or this assessment.
 """
     )
 

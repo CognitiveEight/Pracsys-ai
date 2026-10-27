@@ -61,6 +61,10 @@ sharing them. Fictional items; no model, socket or Qdrant calls.
 | AC-136 | one item was rejected | a later rebuild checks every item against the rejection memory | only the rejected item is suppressed | fakes | `tests/test_reject_matching.py::test_rejection_memory_suppresses_only_the_rejected_gap` |
 | AC-137 | the reject path runs | it logs | no log line carries the item text (sizes only, via `chars`) | review | `analysis_report.py` reject log lines; `tests/offline/verify_logging.py` static scan |
 | AC-140 | a rebuild re-worded an item the frontend already had (same id, different text) | the lawyer rejects the frontend's wording | our item with that id is removed and both wordings are remembered as rejected; with no currentState the text rules apply | fakes | `tests/test_reject_matching.py::test_reworded_item_is_resolved_by_id`, `::test_no_current_state_falls_back_to_text` |
+| AC-141 | a reject the model judges valid (+3) | the batch is applied | the report sent carries `rejectionFeedback` with `scoreChange` 3 and the item's `isValidRejection`, `scoreIncrease` and `reason`, matching `RejectionFeedback` | fakes | `tests/test_reject_matching.py::test_valid_reject_reports_its_reason_and_increase` |
+| AC-142 | a reject the model judges invalid | the batch is applied | the item is removed, the score is unchanged, and `reason` says why | fakes | `tests/test_reject_matching.py::test_invalid_reject_explains_why_the_score_stays` |
+| AC-143 | a reject re-sent for an item already removed | the batch is applied | `reason` says it was already removed; `scoreChange` 0 | fakes | `tests/test_reject_matching.py::test_stale_reject_says_already_removed` |
+| AC-144 | any reject | the report is sent | `rejectionFeedback` is on that emit only, never in the cached report (no replay) | fakes | `tests/test_reject_matching.py::test_valid_reject_reports_its_reason_and_increase`, `::test_stale_reject_says_already_removed` |
 
 ## (a) Follow-up upload: pipeline, ordering, supersede
 

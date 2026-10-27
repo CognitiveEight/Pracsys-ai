@@ -32,6 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Coverage: `tests/test_parallel_panels.py`. Two `verify_stuck_loaders.py`
     groups now run in the sequential mode they assume.
 
+- **SIM-163: the lawyer can see why a reject did or did not raise the score.**
+  The analysis report sent after a reject now carries `rejectionFeedback`:
+  `scoreChange` (what was applied) and one entry per reject with `section`,
+  `rejectedValue` (echoed), `isValidRejection`, `scoreIncrease` and a
+  one-sentence `reason` written for the lawyer. The score rule is unchanged:
+  a reject raises the score only when the item is judged not relevant to the
+  case. **Socket payload change (additive):** `RejectionFeedback` in
+  `app/socket/schemas.py`. It is on that emit only, never cached or replayed.
+  The backend must pass it through and the frontend show `reason` beside the
+  score. Coverage: `tests/test_reject_matching.py`.
+
 ### Fixed
 
 - **SIM-163: rejecting one Analysis Report item no longer removes the others.**

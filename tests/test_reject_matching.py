@@ -7,10 +7,12 @@ later gap sharing those words. Fictional data only; no model or socket calls.
 """
 
 import asyncio
+import copy
 import uuid
 
 import pytest
 
+from app.socket.schemas import RejectionFeedback
 from app.socket.handlers.analysis_report import (
     _indexes_of_rejected_item,
     _same_item_score,
@@ -82,8 +84,10 @@ def handler(monkeypatch):
     async def _noop(*_a, **_kw):
         return None
 
+    verdict = {"value": (True, 1, "")}
+
     async def _delta(**_kw):
-        return (True, 1, "")
+        return verdict["value"]
 
     async def _explanation(**_kw):
         return "Fictional explanation."
@@ -92,7 +96,8 @@ def handler(monkeypatch):
         return report
 
     async def _emit(*, feature_type, workspace_id, user_id, payload, usage):
-        emitted.append((feature_type, workspace_id, payload))
+        # A snapshot: rejectionFeedback is removed from the report after the emit.
+        emitted.append((feature_type, workspace_id, copy.deepcopy(payload)))
         return True
 
     monkeypatch.setattr(h, "_hydrate_workspace_caches", _noop)
@@ -102,8 +107,10 @@ def handler(monkeypatch):
     monkeypatch.setattr(h, "_emit_document_feature", _emit)
     monkeypatch.setattr(h, "_socket_client", _Socket())
     h.emitted = emitted
+    h.verdict = verdict
     yield h
     del h.emitted
+    del h.verdict
 
 
 def _seed(h, ws):
@@ -205,3 +212,66 @@ def test_no_current_state_falls_back_to_text(handler):
         handler._workspace_analysis_payload.pop(ws, None)
         handler._workspace_rejected_analysis_items.pop(ws, None)
 
+
+# -- why the score did or did not move (rejectionFeedback) -----------------------
+
+
+def _last_report(h, ws):
+    return [p for f, w, p in h.emitted if f == "analysis_report" and w == ws][-1]
+
+
+def test_valid_reject_reports_its_reason_and_increase(handler):
+    ws = f"ws-why-valid-{uuid.uuid4().hex[:8]}"
+    _seed(handler, ws)
+    handler.verdict["value"] = (True, 3, "This copy is not needed for the refund claim.")
+    try:
+        _reject(handler, ws, GAPS[0])
+        sent = _last_report(handler, ws)
+        assert sent["caseResolutionScore"] == 43
+        assert sent["rejectionFeedback"] == {
+            "scoreChange": 3,
+            "items": [{
+                "section": "missingInfo", "rejectedValue": GAPS[0],
+                "isValidRejection": True, "scoreIncrease": 3,
+                "reason": "This copy is not needed for the refund claim.",
+            }],
+        }
+        RejectionFeedback.model_validate(sent["rejectionFeedback"])
+        # On this emit only: the cache (and so any replay) never carries it.
+        assert "rejectionFeedback" not in handler._workspace_analysis_payload[ws]
+    finally:
+        handler._workspace_analysis_payload.pop(ws, None)
+        handler._workspace_rejected_analysis_items.pop(ws, None)
+
+
+def test_invalid_reject_explains_why_the_score_stays(handler):
+    ws = f"ws-why-invalid-{uuid.uuid4().hex[:8]}"
+    _seed(handler, ws)
+    handler.verdict["value"] = (False, 0, "Proof of payment still decides the refund amount.")
+    try:
+        _reject(handler, ws, GAPS[1])
+        sent = _last_report(handler, ws)
+        assert sent["caseResolutionScore"] == 40
+        assert sent["missingInfo"] == [GAPS[0], GAPS[2], GAPS[3]]
+        item = sent["rejectionFeedback"]["items"][0]
+        assert sent["rejectionFeedback"]["scoreChange"] == 0
+        assert item["isValidRejection"] is False and item["scoreIncrease"] == 0
+        assert item["reason"] == "Proof of payment still decides the refund amount."
+    finally:
+        handler._workspace_analysis_payload.pop(ws, None)
+        handler._workspace_rejected_analysis_items.pop(ws, None)
+
+
+def test_stale_reject_says_already_removed(handler):
+    ws = f"ws-why-stale-{uuid.uuid4().hex[:8]}"
+    _seed(handler, ws)
+    try:
+        _reject(handler, ws, GAPS[0])
+        _reject(handler, ws, GAPS[0])  # the frontend re-sent it
+        sent = _last_report(handler, ws)
+        assert sent["rejectionFeedback"]["scoreChange"] == 0
+        assert sent["rejectionFeedback"]["items"][0]["reason"].startswith("This item was already removed")
+        assert "rejectionFeedback" not in handler._workspace_analysis_payload[ws]
+    finally:
+        handler._workspace_analysis_payload.pop(ws, None)
+        handler._workspace_rejected_analysis_items.pop(ws, None)

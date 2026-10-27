@@ -124,6 +124,30 @@ def _indexes_of_rejected_item(items: List[Any], value: str) -> List[int]:
     return [best] if best is not None and scores[best] > 0 else []
 
 
+_STALE_REJECTION_REASON = "This item was already removed, so the score is unchanged."
+
+
+def _rejection_feedback_item(
+    event: Dict[str, Any], *, is_valid: bool, increase: int, reason: str
+) -> Dict[str, Any]:
+    """One entry of ``rejectionFeedback.items``: why this reject did or did
+    not move the readiness score. ``rejectedValue`` echoes what the frontend
+    sent, so it can pair the reason with the item."""
+    return {
+        "section": event.get("section"),
+        "rejectedValue": event.get("rejected_value"),
+        "isValidRejection": bool(is_valid),
+        "scoreIncrease": max(0, int(increase or 0)),
+        "reason": (reason or "").strip(),
+    }
+
+
+def _stale_rejection_feedback(event: Dict[str, Any]) -> Dict[str, Any]:
+    return _rejection_feedback_item(
+        event, is_valid=False, increase=0, reason=_STALE_REJECTION_REASON
+    )
+
+
 class AnalysisReportMixin:
     """Analysis report generation, scoring, feedback, and rejection memory."""
 
@@ -2629,7 +2653,7 @@ Rules:
                     delta,
                     chars(reason),
                 )
-                return (is_valid, delta, reason[:200])
+                return (is_valid, delta, reason[:300])
             # Regex fallback: extract scoreIncrease from raw text (e.g. malformed or truncated JSON)
             num_match = re.search(
                 r'"scoreIncrease"\s*:\s*(\d+)|scoreIncrease"\s*:\s*(\d+)|\bscoreIncrease\s*:\s*(\d+)',
@@ -2804,6 +2828,37 @@ Rules:
                     exc,
                 )
 
+    async def _emit_analysis_report_with_feedback(
+        self,
+        workspace_id: str,
+        user_id: str,
+        report: Dict[str, Any],
+        items: List[Dict[str, Any]],
+        *,
+        score_change: int,
+    ) -> None:
+        """Emit the cached ``report`` with ``rejectionFeedback`` added.
+
+        The field is additive and rides this emit only: it is removed from the
+        cached report afterwards, so a reconnect replay or a later rebuild
+        never shows an old reason again. The report object itself is emitted
+        (not a copy) because the emit chokepoint's in-place fixes are meant to
+        reach the cache. ``scoreChange`` is what was applied; it can be lower
+        than the sum of ``scoreIncrease`` when the score is capped (95% while
+        items remain, and the per-batch cap).
+        """
+        report["rejectionFeedback"] = {"scoreChange": int(score_change), "items": items}
+        try:
+            await self._emit_document_feature(
+                feature_type="analysis_report",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=report,
+                usage=current_usage(),
+            )
+        finally:
+            report.pop("rejectionFeedback", None)
+
     def _rejected_item_aliases(
         self,
         workspace_id: str,
@@ -2968,12 +3023,12 @@ Rules:
             report = await self._retag_analysis_report_safe(workspace_id, report)
             self._workspace_analysis_payload[workspace_id] = report
             if self._socket_client:
-                await self._emit_document_feature(
-                    feature_type="analysis_report",
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    payload=report,
-                    usage=current_usage(),
+                await self._emit_analysis_report_with_feedback(
+                    workspace_id,
+                    user_id,
+                    report,
+                    [_stale_rejection_feedback(ev) for ev in events],
+                    score_change=0,
                 )
             return
 
@@ -2991,6 +3046,7 @@ Rules:
         delta_results = await asyncio.gather(*delta_tasks, return_exceptions=True)
 
         total_delta = 0
+        feedback = [_stale_rejection_feedback(ev) for ev in events if ev not in removed_events]
         for ev, result in zip(removed_events, delta_results):
             if isinstance(result, BaseException):
                 logger.warning(
@@ -2998,8 +3054,16 @@ Rules:
                     chars(ev["rejected_value"]),
                     result,
                 )
+                feedback.append(_rejection_feedback_item(
+                    ev, is_valid=False, increase=0,
+                    reason="The readiness score could not be re-assessed for this item.",
+                ))
                 continue
-            is_valid, delta, _reason = result
+            is_valid, delta, reason = result
+            feedback.append(_rejection_feedback_item(
+                ev, is_valid=is_valid, increase=int(delta or 0) if is_valid else 0,
+                reason=reason,
+            ))
             if not is_valid:
                 logger.info(
                     "analysis_report_feedback batch: rejection judged INVALID — no score bump for {}",
@@ -3065,12 +3129,12 @@ Rules:
         self._workspace_analysis_payload[workspace_id] = report
 
         if self._socket_client:
-            await self._emit_document_feature(
-                feature_type="analysis_report",
-                workspace_id=workspace_id,
-                user_id=user_id,
-                payload=report,
-                usage=current_usage(),
+            await self._emit_analysis_report_with_feedback(
+                workspace_id,
+                user_id,
+                report,
+                feedback,
+                score_change=new_score - old_score,
             )
             logger.success(
                 "analysis_report_feedback batch applied: {} rejections, score {}%  {}% (delta +{})",

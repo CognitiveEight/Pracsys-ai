@@ -409,6 +409,23 @@ def _install_stubs():
     settings.audio_timeout_factor = 1.0
     settings.pipeline_run_timeout_audio_max_seconds = 3600.0
     settings.pipeline_lock_warn_seconds = 300.0
+    settings.pipeline_concurrent_panels = True
+
+
+def _sequential(group):
+    """Run a group with PIPELINE_CONCURRENT_PANELS=false (the rollback mode).
+
+    The group names one stuck step as the run's stage and expects the steps
+    after it, drafting included, to be unsent. Both hold only when the steps
+    run one at a time; the concurrent pipeline is covered by
+    tests/test_parallel_panels.py."""
+    async def run():
+        settings.pipeline_concurrent_panels = False
+        try:
+            await group()
+        finally:
+            settings.pipeline_concurrent_panels = True
+    return run
 
 
 def _reset(ws, *, seed=True):
@@ -1166,7 +1183,7 @@ CHECKS = [
     ("stuck_template_sync_invalid_reply", stuck_template_sync_invalid_reply),  # AC-102
     ("stuck_template_sync_late", stuck_template_sync_late),                 # AC-103
     ("stuck_template_sync_other_callers", stuck_template_sync_other_callers),  # AC-104
-    ("stuck_lock_watchdog", stuck_lock_watchdog),                           # AC-105
+    ("stuck_lock_watchdog", _sequential(stuck_lock_watchdog)),                           # AC-105
     ("stuck_tail_step_failure", stuck_tail_step_failure),                   # AC-106
     ("stuck_no_double_emit", stuck_no_double_emit),                         # AC-107
     ("stuck_runner_cancelled", stuck_runner_cancelled),                     # AC-108
@@ -1175,7 +1192,7 @@ CHECKS = [
     ("stuck_ingest_crash", stuck_ingest_crash),                             # AC-111
     ("stuck_all_files_failed", stuck_all_files_failed),                     # AC-112
     ("stuck_slow_step_visible", stuck_slow_step_visible),                   # AC-115
-    ("stuck_run_cap", stuck_run_cap),                                       # AC-116
+    ("stuck_run_cap", _sequential(stuck_run_cap)),                                       # AC-116
     ("stuck_cascade_cap", stuck_cascade_cap),                               # AC-117
     ("stuck_audio_cap", stuck_audio_cap),                                   # AC-118
     ("stuck_audio_cap_unknown", stuck_audio_cap_unknown),                   # AC-119

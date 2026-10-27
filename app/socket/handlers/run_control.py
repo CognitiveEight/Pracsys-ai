@@ -84,6 +84,13 @@ _EMIT_OBSERVER: contextvars.ContextVar[Optional[Set[str]]] = (
     contextvars.ContextVar("simplertoday_emit_observer", default=None)
 )
 
+#: Set in the context of an upload pipeline's tail panels: their emits wait on
+#: this event until the priority panels (strategy, analysis, drafting) are
+#: sent. The runner sets it in ``finally``, so nothing can wait on it forever.
+_HOLD_EMITS_UNTIL: contextvars.ContextVar[Optional[asyncio.Event]] = (
+    contextvars.ContextVar("simplertoday_hold_emits_until", default=None)
+)
+
 # ---------------------------------------------------------------------------
 # Event classes
 # ---------------------------------------------------------------------------

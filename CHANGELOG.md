@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **SIM-163 (Phase 1): an upload's panels are generated in parallel; Strategy,
+  Analysis Report and Drafting Assistant are sent first.**
+  - List of Dates, Applicable Laws, Upcoming Dates, Relevant Parties and Case
+    Laws start with Strategy instead of after Analysis. They are sent once
+    Strategy, Analysis and Drafting are out, in the order they finish.
+  - Drafting runs right after Analysis. On a first build it runs once more at
+    the end, when laws and dates exist.
+  - `PIPELINE_CONCURRENT_PANELS=false` restores the old sequential run.
+  - Analysis no longer repeats Strategy's entity extraction (about 23 s per
+    update): the cache is keyed by the document set, not by each panel's
+    packed prompt text.
+  - List of Dates runs its per-document pass and its per-date duplicate check
+    4 calls at a time (`LIST_OF_DATES_CONCURRENCY`, 1 = old behaviour). The
+    result is the same; on a 27-file local case those two passes took 346 s
+    one call at a time.
+  - **Billing:** an emit reports the case's spend since its previous emit.
+    With panels overlapping, one panel's `price` can include another panel's
+    calls. `totalPrice` and gate0 reconciliation are unchanged.
+  - No payload or schema change. The order of `document_feature_response`
+    events changes as above.
+  - Coverage: `tests/test_parallel_panels.py`. Two `verify_stuck_loaders.py`
+    groups now run in the sequential mode they assume.
+
 ### Fixed
 
 - **SIM-163: rejecting one Analysis Report item no longer removes the others.**

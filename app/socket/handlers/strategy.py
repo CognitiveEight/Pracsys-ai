@@ -27,6 +27,7 @@ from app.langgraph.list_of_dates_agent import (
 from app.workspace.custom_instructions import (build_custom_instruction_suffix)
 
 from app.rag.packing import fit_to_budget, panel_context_budget
+from app.socket.handlers.extraction import document_set_key
 from app.socket.event_utils import (
     OBJECTIVE_UPDATE_OFFER_QUESTION,
     SPEAKER_LABEL_GUARDRAIL,
@@ -222,6 +223,7 @@ class StrategyMixin:
             case_entities: Dict[str, Any] = await self._extract_case_entities(
                 workspace_id=workspace_id,
                 combined_document_content=combined_document_content,
+                cache_key=document_set_key(all_docs),
             )
             _extracted_party_names = [
                 (p.get("name") or "").strip()
@@ -1343,6 +1345,7 @@ class StrategyMixin:
                 case_entities = await self._extract_case_entities(
                     workspace_id=workspace_id,
                     combined_document_content=combined_document_content,
+                    cache_key=document_set_key(all_docs),
                 )
             except Exception as ent_err:
                 logger.debug("Objective regen: entity extraction failed: {}", ent_err)

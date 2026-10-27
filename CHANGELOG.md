@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SIM-163: rejecting one Analysis Report item no longer removes the others.**
+  A reject removed every item sharing two informative words with the rejected
+  text, so on a case whose gaps all mention the same documents one reject
+  could empty Missing Information. The rejected text was then remembered with
+  the same loose rule, so later rebuilds dropped every new gap sharing those
+  words too. A reject now removes the item with the same text (ignoring case
+  and punctuation), or failing that the single closest near-identical
+  rewording, never more. The rejection memory and the duplicate check for a
+  lawyer-added Missing Information item use the same strict rule (a new gap
+  sharing a couple of words with an existing one was silently not added). The
+  chat "remove this item" path keeps the loose match, because there the lawyer
+  paraphrases. Reject log lines no longer carry the item text. No payload
+  change. Offline coverage: `tests/test_reject_matching.py`.
+
 - **SIM-163 (Phase -1): panels no longer stick after an upload or an
   objective change; a failed upload no longer replaces existing panels.**
   - Template sync for the Drafting Assistant is bounded

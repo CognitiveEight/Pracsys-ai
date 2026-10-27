@@ -53,6 +53,75 @@ from app.prompts.analysis_report_prompts import (
 from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
+_MATCH_STOP_WORDS = frozenset({
+    "the", "a", "an", "and", "or", "for", "of", "to", "in", "on", "with", "by",
+    "from", "is", "are", "was", "were", "be", "been", "being", "that", "this",
+    "these", "those", "it", "its", "their", "his", "her", "our", "your", "at",
+    "as", "can", "could", "should", "would", "about", "into", "also", "than",
+    "then", "over", "under",
+})
+
+#: A rejected or added item matches a different-worded one only when this share
+#: of their informative words is common (Jaccard) and at least
+#: ``_SAME_ITEM_MIN_SHARED`` words are shared. Sharing a couple of words is
+#: normal between distinct gaps on one case ("copy", "booking", "email").
+_SAME_ITEM_MIN_JACCARD = 0.8
+_SAME_ITEM_MIN_SHARED = 3
+
+
+def _analysis_item_text(item: Any) -> str:
+    if isinstance(item, str):
+        return item.strip()
+    if isinstance(item, dict) and "point" in item:
+        return (item.get("point") or "").strip()
+    return ""
+
+
+def _match_norm(text: str) -> str:
+    text = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _match_tokens(text: str) -> Set[str]:
+    return {
+        tok
+        for tok in _match_norm(text).split()
+        if len(tok) > 2 and tok not in _MATCH_STOP_WORDS
+    }
+
+
+def _same_item_score(item: Any, value: str) -> float:
+    """How surely ``item`` is the item ``value`` names: 2.0 for the same text
+    (ignoring case and punctuation), else the Jaccard share of informative
+    words when it clears the same-item bar, else 0."""
+    item_text = _analysis_item_text(item)
+    if not item_text or not (value or "").strip():
+        return 0.0
+    if _match_norm(item_text) == _match_norm(value):
+        return 2.0
+    a, b = _match_tokens(item_text), _match_tokens(value)
+    shared = len(a & b)
+    if shared < _SAME_ITEM_MIN_SHARED:
+        return 0.0
+    jaccard = shared / len(a | b)
+    return jaccard if jaccard >= _SAME_ITEM_MIN_JACCARD else 0.0
+
+
+def _indexes_of_rejected_item(items: List[Any], value: str) -> List[int]:
+    """The positions a rejection of ``value`` removes from ``items``.
+
+    Every same-text copy, else the one closest same-item match, else nothing.
+    Never a family of items that merely share words: one reject must remove
+    one gap.
+    """
+    scores = [_same_item_score(x, value) for x in items]
+    exact = [i for i, sc in enumerate(scores) if sc >= 2.0]
+    if exact:
+        return exact
+    best = max(range(len(scores)), key=lambda i: scores[i], default=None)
+    return [best] if best is not None and scores[best] > 0 else []
+
+
 class AnalysisReportMixin:
     """Analysis report generation, scoring, feedback, and rejection memory."""
 
@@ -1874,9 +1943,7 @@ Rules:
             for existing in bucket:
                 if not isinstance(existing, str):
                     continue
-                if self._match_rejected_value(existing, rv) or self._match_rejected_value(
-                    rv, existing
-                ):
+                if self._same_analysis_item(existing, rv):
                     return
             bucket.append(rv)
             current[section] = bucket[-50:]
@@ -1911,23 +1978,25 @@ Rules:
             for prev_rv in bucket:
                 if not isinstance(prev_rv, str) or not prev_rv.strip():
                     continue
-                if self._match_rejected_value(candidate, prev_rv):
+                if self._same_analysis_item(candidate, prev_rv):
                     return True
         except Exception:
             return False
         return False
 
     def _match_rejected_value(self, item: Any, rejected_value: str) -> bool:
-        """Return True if item matches/addresses rejectedValue using robust text overlap."""
+        """Loose topical match: True when ``item`` is ABOUT ``rejected_value``.
+
+        Two shared informative words are enough, so distinct gaps on one case
+        often match each other. Use it only where the lawyer paraphrases (the
+        chat "remove this item" path, protecting user-added items). Anything
+        that removes or suppresses items uses ``_same_analysis_item`` /
+        ``_indexes_of_rejected_item`` instead.
+        """
         rv = (rejected_value or "").strip()
         if not rv:
             return False
-
-        item_text = ""
-        if isinstance(item, str):
-            item_text = item.strip()
-        elif isinstance(item, dict) and "point" in item:
-            item_text = (item.get("point") or "").strip()
+        item_text = _analysis_item_text(item)
         if not item_text:
             return False
 
@@ -1935,69 +2004,8 @@ Rules:
         if item_text == rv or rv in item_text or item_text in rv:
             return True
 
-        def _norm(s: str) -> str:
-            s = s.lower().strip()
-            s = re.sub(r"[^a-z0-9\s]", " ", s)
-            s = re.sub(r"\s+", " ", s).strip()
-            return s
-
-        stop_words = {
-            "the",
-            "a",
-            "an",
-            "and",
-            "or",
-            "for",
-            "of",
-            "to",
-            "in",
-            "on",
-            "with",
-            "by",
-            "from",
-            "is",
-            "are",
-            "was",
-            "were",
-            "be",
-            "been",
-            "being",
-            "that",
-            "this",
-            "these",
-            "those",
-            "it",
-            "its",
-            "their",
-            "his",
-            "her",
-            "our",
-            "your",
-            "at",
-            "as",
-            "can",
-            "could",
-            "should",
-            "would",
-            "about",
-            "into",
-            "also",
-            "than",
-            "then",
-            "over",
-            "under",
-        }
-
-        def _tokens(s: str) -> Set[str]:
-            out: Set[str] = set()
-            for tok in _norm(s).split():
-                if len(tok) <= 2 or tok in stop_words:
-                    continue
-                out.add(tok)
-            return out
-
-        item_tokens = _tokens(item_text)
-        rv_tokens = _tokens(rv)
+        item_tokens = _match_tokens(item_text)
+        rv_tokens = _match_tokens(rv)
         if not item_tokens or not rv_tokens:
             return False
 
@@ -2009,7 +2017,11 @@ Rules:
         if len(overlap) >= 2:
             return True
         return len(overlap) / max(1, len(item_tokens)) >= 0.6
-        return False
+
+    def _same_analysis_item(self, item: Any, value: str) -> bool:
+        """Strict match: ``item`` IS the item ``value`` names (same text, or a
+        near-identical rewording). See ``_same_item_score``."""
+        return _same_item_score(item, value) > 0
 
     def _parse_bullets_from_block(self, block: str) -> List[str]:
         """Parse a text block into a list of bullet items."""
@@ -2751,11 +2763,11 @@ Rules:
                 self._debounce_and_flush_feedback(workspace_id)
             )
         logger.info(
-            "analysis_report_feedback queued ({} pending) for workspace {} (section={}, value={!r})",
+            "analysis_report_feedback queued ({} pending) for workspace {} (section={}, value={})",
             len(self._pending_feedback_queue[workspace_id]),
             workspace_id,
             section,
-            rejected_value[:80],
+            chars(rejected_value),
         )
 
     async def _debounce_and_flush_feedback(self, workspace_id: str) -> None:
@@ -2858,32 +2870,23 @@ Rules:
                     report.get("missingInfo") or report.get("missing_info") or []
                 )
                 if isinstance(missing, list):
-                    new_missing = [
-                        x
-                        for x in missing
-                        if not self._match_rejected_value(x, rejected_value)
-                    ]
+                    drop = set(_indexes_of_rejected_item(missing, rejected_value))
+                    new_missing = [x for i, x in enumerate(missing) if i not in drop]
                     if len(new_missing) < len(missing):
                         report["missingInfo"] = new_missing
                         removed_here = True
             else:
                 weaknesses = report.get("weaknesses") or []
                 if isinstance(weaknesses, list):
-                    new_weak = [
-                        x
-                        for x in weaknesses
-                        if not self._match_rejected_value(x, rejected_value)
-                    ]
+                    drop = set(_indexes_of_rejected_item(weaknesses, rejected_value))
+                    new_weak = [x for i, x in enumerate(weaknesses) if i not in drop]
                     if len(new_weak) < len(weaknesses):
                         report["weaknesses"] = new_weak
                         removed_here = True
                 risks = report.get("risks") or []
                 if isinstance(risks, list):
-                    new_risks = [
-                        x
-                        for x in risks
-                        if not self._match_rejected_value(x, rejected_value)
-                    ]
+                    drop = set(_indexes_of_rejected_item(risks, rejected_value))
+                    new_risks = [x for i, x in enumerate(risks) if i not in drop]
                     if len(new_risks) < len(risks):
                         report["risks"] = new_risks
                         removed_here = True
@@ -2934,16 +2937,16 @@ Rules:
         for ev, result in zip(removed_events, delta_results):
             if isinstance(result, BaseException):
                 logger.warning(
-                    "analysis_report_feedback batch: score-delta call failed for {!r}: {}",
-                    ev["rejected_value"][:80],
+                    "analysis_report_feedback batch: score-delta call failed for {}: {}",
+                    chars(ev["rejected_value"]),
                     result,
                 )
                 continue
             is_valid, delta, _reason = result
             if not is_valid:
                 logger.info(
-                    "analysis_report_feedback batch: rejection judged INVALID — no score bump for {!r}",
-                    ev["rejected_value"][:80],
+                    "analysis_report_feedback batch: rejection judged INVALID — no score bump for {}",
+                    chars(ev["rejected_value"]),
                 )
                 continue
             total_delta += int(delta or 0)
@@ -3340,7 +3343,7 @@ Rules:
             current_missing = [current_missing] if current_missing else []
 
         already_present = any(
-            self._match_rejected_value(x, new_entry) for x in current_missing
+            self._same_analysis_item(x, new_entry) for x in current_missing
         )
         if not already_present and new_entry:
             current_missing = list(current_missing) + [new_entry]

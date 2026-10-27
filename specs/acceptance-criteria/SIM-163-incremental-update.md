@@ -45,6 +45,22 @@ human-run `make e2e` / a live backend.
 | AC-119 | a batch with one audio result whose duration is unknown (`None`) | the cap is computed | cap = `PIPELINE_RUN_TIMEOUT_AUDIO_MAX_SECONDS` (3,600 s); the cap never exceeds that maximum for any durations | fakes | `tests/offline/verify_stuck_loaders.py` group `stuck_audio_cap_unknown` |
 | AC-120 | a fake socket that accepts `request_template_sync` but never answers; fake clock | `ensure_templates_synced` runs with no explicit timeout | it returns after exactly `TEMPLATE_SYNC_TIMEOUT_SECONDS` (900 s), not before; logs a timeout warning; the pending future is removed. With a `False` emit it returns at once (AC-101) | fakes | `tests/offline/verify_stuck_loaders.py` group `stuck_template_wait_900` |
 
+## Reject one Analysis Report item (ships on its own)
+A reject used to remove every item sharing two informative words with the
+rejected text, and the rejection memory then suppressed every later item
+sharing them. Fictional items; no model, socket or Qdrant calls.
+
+| ID | Given | When | Then | Kind | Verified by |
+|---|---|---|---|---|---|
+| AC-130 | four distinct Missing Information items, several sharing words ("copy", "booking", "email") | the lawyer rejects one | only that item is removed; the emitted `analysis_report` and the cache keep the other three | fakes | `tests/test_reject_matching.py::test_rejecting_one_gap_keeps_the_other_three`, `::test_one_reject_removes_one_item_not_its_word_neighbours` |
+| AC-131 | the rejected text differs from the item only in case, spacing or punctuation | the reject is applied | the item is removed | unit | `tests/test_reject_matching.py::test_same_text_ignoring_case_and_punctuation_is_removed` |
+| AC-132 | the same item text appears twice | it is rejected | both copies are removed, nothing else | unit | `tests/test_reject_matching.py::test_every_same_text_copy_is_removed` |
+| AC-133 | items carried as `{"point": …}` objects | one is rejected | only that object is removed | unit | `tests/test_reject_matching.py::test_dict_items_match_on_point` |
+| AC-134 | the report was regenerated and the item slightly re-worded since the lawyer saw it | the old wording is rejected | only the single closest item is removed | unit | `tests/test_reject_matching.py::test_a_near_identical_rewording_removes_only_the_closest_item` |
+| AC-135 | a rejected value that is unrelated, or only a fragment of an item | the reject is applied | nothing is removed | unit | `tests/test_reject_matching.py::test_an_unrelated_or_partial_value_removes_nothing`, `::test_word_neighbours_score_zero` |
+| AC-136 | one item was rejected | a later rebuild checks every item against the rejection memory | only the rejected item is suppressed | fakes | `tests/test_reject_matching.py::test_rejection_memory_suppresses_only_the_rejected_gap` |
+| AC-137 | the reject path runs | it logs | no log line carries the item text (sizes only, via `chars`) | review | `analysis_report.py` reject log lines; `tests/offline/verify_logging.py` static scan |
+
 ## (a) Follow-up upload: pipeline, ordering, supersede
 
 | ID | Given | When | Then | Verified by |
@@ -177,6 +193,7 @@ Earlier AC-64 (process-wide Vision limit) and AC-65 (per-workspace fairness)
 are replaced by the new AC-64 and AC-65 above.
 
 ## Definition of done
+- [ ] Reject fix PR: AC-130 to AC-137 pass offline
 - [ ] Phase -1 PR: AC-100 to AC-112 and AC-115 to AC-120 pass offline; AC-113 and AC-114 signed off from a `make e2e` run; backend confirms nothing reads the removed strategy `error` field
 - [ ] Every AC above has a passing check, or a signed-off manual result (AC-27, AC-79, AC-95, AC-98, AC-113, AC-114, `make e2e`)
 - [ ] `make lint` and `make test` pass

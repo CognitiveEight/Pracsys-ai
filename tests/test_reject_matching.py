@@ -156,3 +156,52 @@ def test_rejection_memory_suppresses_only_the_rejected_gap(handler):
     finally:
         handler._workspace_analysis_payload.pop(ws, None)
         handler._workspace_rejected_analysis_items.pop(ws, None)
+
+
+def test_reworded_item_is_resolved_by_id(handler):
+    # A rebuild re-worded our copy of an item the frontend already had; the
+    # frontend still shows (and rejects) its own wording under the same id.
+    ws = f"ws-alias-{uuid.uuid4().hex[:8]}"
+    ours = "Signed copy of the supplier contract governing the holiday booking and refunds"
+    handler._workspace_analysis_payload[ws] = {
+        "missingInfo": [
+            {"id": "missingInfo_aaa", "text": ours, "isMatched": True},
+            {"id": "missingInfo_bbb", "text": GAPS[1], "isMatched": True},
+        ],
+        "weaknesses": [], "risks": [], "strengths": [], "caseResolutionScore": 40,
+    }
+    handler._workspace_current_state_payload[ws] = {
+        "missingInfo": [
+            {"id": "missingInfo_aaa", "text": GAPS[3], "status": "pending"},
+            {"id": "missingInfo_bbb", "text": GAPS[1], "status": "pending"},
+        ],
+    }
+    try:
+        _reject(handler, ws, GAPS[3])
+        sent = [p for f, w, p in handler.emitted if f == "analysis_report" and w == ws]
+        assert len(sent) == 1
+        assert [i if isinstance(i, str) else i.get("text") for i in sent[0]["missingInfo"]] == [GAPS[1]]
+        # Both wordings are remembered, so a rebuild cannot bring either back.
+        for wording in (ours, GAPS[3]):
+            assert handler._is_previously_rejected_analysis_item(
+                workspace_id=ws, section="missingInfo", candidate=wording)
+        assert not handler._is_previously_rejected_analysis_item(
+            workspace_id=ws, section="missingInfo", candidate=GAPS[1])
+    finally:
+        handler._workspace_analysis_payload.pop(ws, None)
+        handler._workspace_current_state_payload.pop(ws, None)
+        handler._workspace_rejected_analysis_items.pop(ws, None)
+
+
+def test_no_current_state_falls_back_to_text(handler):
+    ws = f"ws-nocs-{uuid.uuid4().hex[:8]}"
+    _seed(handler, ws)
+    try:
+        assert handler._rejected_item_aliases(ws, "missingInfo", GAPS[0],
+                                              handler._workspace_analysis_payload[ws]) == []
+        _reject(handler, ws, GAPS[0])
+        assert handler._workspace_analysis_payload[ws]["missingInfo"] == GAPS[1:]
+    finally:
+        handler._workspace_analysis_payload.pop(ws, None)
+        handler._workspace_rejected_analysis_items.pop(ws, None)
+

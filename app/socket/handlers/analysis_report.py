@@ -73,8 +73,9 @@ _SAME_ITEM_MIN_SHARED = 3
 def _analysis_item_text(item: Any) -> str:
     if isinstance(item, str):
         return item.strip()
-    if isinstance(item, dict) and "point" in item:
-        return (item.get("point") or "").strip()
+    if isinstance(item, dict):
+        # Generated items carry "point"; tagged ones {id, text, isMatched}.
+        return str(item.get("point") or item.get("text") or "").strip()
     return ""
 
 
@@ -2803,6 +2804,44 @@ Rules:
                     exc,
                 )
 
+    def _rejected_item_aliases(
+        self,
+        workspace_id: str,
+        section: str,
+        rejected_value: str,
+        report: Any,
+    ) -> List[str]:
+        """Our wording of the item the lawyer rejected, found through its id.
+
+        For an item it already had (``isMatched``), the frontend keeps showing
+        its own wording, while a rebuild may have re-worded our cached copy:
+        then no text rule links the two. The rejected text is matched exactly
+        against ``currentState`` to get the item id, and the cached item with
+        that id gives the wording to remove. Empty when nothing links them.
+        """
+        fields = ("missingInfo",) if section == "missingInfo" else ("weaknesses", "risks")
+        current_state = self._workspace_current_state_payload.get(workspace_id) or {}
+        if not isinstance(current_state, dict) or not isinstance(report, dict):
+            return []
+        ids = {
+            str(item.get("id"))
+            for field in fields
+            for item in (current_state.get(field) or [])
+            if isinstance(item, dict)
+            and item.get("id")
+            and _same_item_score(item.get("text") or "", rejected_value) >= 2.0
+        }
+        if not ids:
+            return []
+        aliases = []
+        for field in fields:
+            for item in report.get(field) or []:
+                if isinstance(item, dict) and str(item.get("id") or "") in ids:
+                    text = _analysis_item_text(item)
+                    if text and _same_item_score(text, rejected_value) < 2.0:
+                        aliases.append(text)
+        return aliases
+
     @meter_usage
     async def _apply_batched_feedback(
         self, workspace_id: str, events: List[Dict[str, Any]]
@@ -2866,13 +2905,22 @@ Rules:
         for ev in events:
             section = ev["section"]
             rejected_value = ev["rejected_value"]
+            # The same item in our wording, when a rebuild re-worded it.
+            aliases = self._rejected_item_aliases(
+                workspace_id, section, rejected_value, current
+            )
+            values = [rejected_value, *aliases]
+
+            def _drop(items: List[Any]) -> Set[int]:
+                return {i for v in values for i in _indexes_of_rejected_item(items, v)}
+
             removed_here = False
             if section == "missingInfo":
                 missing = (
                     report.get("missingInfo") or report.get("missing_info") or []
                 )
                 if isinstance(missing, list):
-                    drop = set(_indexes_of_rejected_item(missing, rejected_value))
+                    drop = _drop(missing)
                     new_missing = [x for i, x in enumerate(missing) if i not in drop]
                     if len(new_missing) < len(missing):
                         report["missingInfo"] = new_missing
@@ -2880,25 +2928,32 @@ Rules:
             else:
                 weaknesses = report.get("weaknesses") or []
                 if isinstance(weaknesses, list):
-                    drop = set(_indexes_of_rejected_item(weaknesses, rejected_value))
+                    drop = _drop(weaknesses)
                     new_weak = [x for i, x in enumerate(weaknesses) if i not in drop]
                     if len(new_weak) < len(weaknesses):
                         report["weaknesses"] = new_weak
                         removed_here = True
                 risks = report.get("risks") or []
                 if isinstance(risks, list):
-                    drop = set(_indexes_of_rejected_item(risks, rejected_value))
+                    drop = _drop(risks)
                     new_risks = [x for i, x in enumerate(risks) if i not in drop]
                     if len(new_risks) < len(risks):
                         report["risks"] = new_risks
                         removed_here = True
 
             if removed_here:
-                self._record_rejected_analysis_item(
-                    workspace_id=workspace_id,
-                    section=section,
-                    rejected_value=rejected_value,
-                )
+                for value in values:
+                    self._record_rejected_analysis_item(
+                        workspace_id=workspace_id,
+                        section=section,
+                        rejected_value=value,
+                    )
+                if aliases:
+                    logger.info(
+                        "analysis_report_feedback: rejected item resolved by id "
+                        "({} re-worded cached item(s))",
+                        len(aliases),
+                    )
                 removed_events.append(ev)
 
         if not removed_events:

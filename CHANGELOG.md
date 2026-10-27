@@ -47,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chat "remove this item" path keeps the loose match, because there the lawyer
   paraphrases. Reject log lines no longer carry the item text. No payload
   change. Offline coverage: `tests/test_reject_matching.py`.
+  - An item a rebuild re-worded is still found: for an item it already had,
+    the frontend keeps its own wording under the same id, so the rejected text
+    is matched exactly against `currentState`, and our item with that id is
+    removed. Both wordings go into the rejection memory. (Found in local
+    testing: the second reject on an updated case removed nothing.)
 
 - **SIM-163 (Phase -1): panels no longer stick after an upload or an
   objective change; a failed upload no longer replaces existing panels.**

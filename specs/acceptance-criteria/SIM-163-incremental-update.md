@@ -60,6 +60,7 @@ sharing them. Fictional items; no model, socket or Qdrant calls.
 | AC-135 | a rejected value that is unrelated, or only a fragment of an item | the reject is applied | nothing is removed | unit | `tests/test_reject_matching.py::test_an_unrelated_or_partial_value_removes_nothing`, `::test_word_neighbours_score_zero` |
 | AC-136 | one item was rejected | a later rebuild checks every item against the rejection memory | only the rejected item is suppressed | fakes | `tests/test_reject_matching.py::test_rejection_memory_suppresses_only_the_rejected_gap` |
 | AC-137 | the reject path runs | it logs | no log line carries the item text (sizes only, via `chars`) | review | `analysis_report.py` reject log lines; `tests/offline/verify_logging.py` static scan |
+| AC-140 | a rebuild re-worded an item the frontend already had (same id, different text) | the lawyer rejects the frontend's wording | our item with that id is removed and both wordings are remembered as rejected; with no currentState the text rules apply | fakes | `tests/test_reject_matching.py::test_reworded_item_is_resolved_by_id`, `::test_no_current_state_falls_back_to_text` |
 
 ## (a) Follow-up upload: pipeline, ordering, supersede
 

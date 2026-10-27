@@ -589,32 +589,71 @@ minutes, longer with audio).**
   - superseded: log, release nothing, re-raise;
   - otherwise: release the run's unemitted armed loaders, re-raise.
 
-### Phase 1, step 2: concurrent upload panels, ordered emits
-- **Dependencies:**
+### Phase 1, step 2: concurrent upload panels, priority three first
+Replaces the earlier strict `PIPELINE_EMIT_ORDER` gate. The case owner chose on
+2026-10-27: "Only after the priority 3" and "Run early, refresh later".
+
+- **Measured before** (local, gate0, 27 files, 2026-10-27):
+  - first build: 650.9 s from lock to drafting. Strategy 64 s, Analysis 67 s,
+    List of Dates 409 s, Laws 10 s, Timeline 5 s, Parties 53 s, Case laws
+    37 s, Drafting 6 s;
+  - one-file update: 216 s. Strategy 60 s, Analysis 64 s, Dates 23 s, Laws
+    13 s, Timeline 2 s, Parties 12 s, Case laws 36 s, Drafting 6 s.
+- **Dependencies** (re-verified 2026-10-27):
   - list_of_dates, applicable_laws, procedural_timeline, relevant_parties and
-    case_laws do not read the strategy, analysis or entity caches on the upload
-    path;
-  - drafting reads strategy, analysis, laws and dates (`drafting.py:85-166`),
-    so it runs last.
-- **Shape:** inside the one pipeline task (`_track_background_task`),
-  `asyncio.gather` of chain A (metadata → strategy → analysis), and B-F (dates,
-  laws, timeline, parties, case laws); then drafting. The children inherit the
-  run scope and are cancelled with the parent.
-- **`_OrderedEmitGate`** (per run, local): `await gate.turn(f)` waits until
-  every earlier feature in `PIPELINE_EMIT_ORDER` is `done`.
-  - `done` runs in `finally`, on every exit.
-  - Features absent from the run are marked done at start.
-  - Strategy and analysis use the gate too.
-- After `gather`, `_release_refresh_loaders(UPLOAD_REFRESH_FEATURES,
-  skip=emitted)` runs in gate order. This fixes the strategy-`None` lit loader.
+    case_laws read only their own caches on the upload path. The objective
+    is passed to laws and case laws only by the objective-change cascade;
+  - analysis reads strategy (the objective);
+  - drafting reads strategy, analysis, laws and dates (`drafting.py:85-166`).
+- **Shape:** inside the one pipeline task, under the same lock and cap:
+  - an `asyncio.TaskGroup` starts the five tail panels at t=0. Each runs
+    through `_run_tail_step`, so a failure settles its own panel;
+  - the **priority lane** runs in the runner itself: strategy → analysis →
+    drafting. Analysis report chips (one model call, about 20 s) run as a
+    sibling task, so drafting does not wait for them;
+  - **emit hold:** each tail task sets `_HOLD_EMITS_UNTIL` (a per-run
+    `asyncio.Event`, `run_control.py`) in its own context.
+    `_emit_document_feature` awaits it before emitting. The lane sets it in
+    `finally`, also when the lane raises, so a held panel can never wait
+    forever. The tail panels then emit in completion order;
+  - **first build only** (`is_update=False`): once the tail is done, drafting
+    runs once more, because laws and dates now exist. An update's drafting
+    reads the previous laws and dates and is not repeated.
+- The children inherit the run scope, the emit observer set and the logging
+  context. Cancelling the runner (stop, run cap, shutdown) cancels them
+  through the TaskGroup. Every child re-raises `CancelledError`, and
+  `_run_tail_step` catches only `Exception`, so one failed panel never cancels
+  its siblings.
+- Stage lines for the tail say `mode=parallel`. The stage recorded for the
+  run-cap CRITICAL is the last one started, so it can name any of the
+  overlapping steps.
+- **Billing note:** an emit reports the case's spend since the previous emit
+  (`drain_for_emit`). When panels overlap, one panel's `price` can include
+  calls another panel made. The case total (`totalPrice`) and gate0
+  reconciliation are unchanged. The PR is labelled `needs-human-review`.
+- **Rollback:** `PIPELINE_CONCURRENT_PANELS=false` restores the sequential run
+  exactly.
+- Other callers of the tail (dates/laws runner, deletion, restore, reload, the
+  objective-change cascade) stay sequential in this step.
 
 ### Phase 1, step 3: entity cache keyed by document set
-- `_extract_case_entities(..., cache_key=sha1(sorted live document ids +
-  evidence_version))` is passed by strategy, analysis and
-  `_regenerate_strategy_for_new_objective`.
+- `_extract_case_entities(..., cache_key=document_set_key(all_docs))`, where
+  the key is a sha1 over each document's id and a hash of its stored content,
+  in order. Strategy, analysis and `_regenerate_strategy_for_new_objective`
+  pass it.
 - Same documents means a cache hit, however the caller packed its prompt.
-- This saves up to six sub-agent calls on an objective change (chat turn +
-  cascade analysis) and three on every upload's analysis.
+  Measured: each panel's graph block changes its per-document budget, so the
+  packed text never matched and the update paid about 23 s twice.
+- A re-read changes the content hash, so it misses.
+
+### Phase 1, step 14: List of Dates per-document pass, bounded
+- The temporal agent pass (`list_of_dates.py`, one or two calls per document)
+  and the per-date semantic dedupe (`_dedupe_dated_entries_semantically`) ran
+  one call at a time: 276 s and 70 s of the 409 s first build above.
+- Both now run with `asyncio.gather` under a semaphore of
+  `LIST_OF_DATES_CONCURRENCY` (default 4). Results are merged in the original
+  document and date order, so the output is identical to the sequential run.
+- `LIST_OF_DATES_CONCURRENCY=1` restores the sequential behaviour.
 
 ### Phase 1, step 4: one document scroll
 - `QdrantStore.get_all_documents` memoises per workspace on
@@ -1039,6 +1078,12 @@ Phase 2 (PR 2):
 17. Docs: CHANGELOG, CLAUDE.md objective-change section, comment at `:2032`.
 
 ## Decisions
+- 2026-10-27, case owner: the priority three (strategy, analysis, drafting)
+  are sent first; the other five generate in parallel from t=0 and are held
+  until the three are sent. Drafting runs right after analysis and, on a first
+  build only, once more at the end. This replaces the strict emit order of
+  step 2. Ingest concurrency, a knowledge-graph limit and the log-privacy fix
+  for names in chronology titles and file names follow separately.
 - Re-prioritised by the user: (a) 1-5 PDF uploads and (b) objective changes
   first; large first builds may stay slow.
 - Moved to a follow-up ticket: progressive assessments, quota-aware limiters

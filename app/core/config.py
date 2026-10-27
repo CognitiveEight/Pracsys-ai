@@ -221,6 +221,13 @@ class Settings(BaseSettings):
     pipeline_run_timeout_audio_max_seconds: float = 3600.0
     # Informational WARNING when a case's pipeline lock has been held this long.
     pipeline_lock_warn_seconds: float = 300.0
+    # Upload pipeline: generate dates, laws, timeline, parties and case laws
+    # while strategy -> analysis -> drafting run, holding their emits until
+    # those three are sent. false restores the sequential run.
+    pipeline_concurrent_panels: bool = True
+    # List of Dates: per-document temporal calls and per-date dedupe calls
+    # running at once. 1 restores the sequential behaviour.
+    list_of_dates_concurrency: int = 4
 
     # Token pricing overrides (USD per 1,000,000 tokens). When BOTH are set they
     # take precedence over the built-in per-model table in app/ai/pricing.py, so

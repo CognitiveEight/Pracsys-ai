@@ -45,23 +45,44 @@ human-run `make e2e` / a live backend.
 | AC-119 | a batch with one audio result whose duration is unknown (`None`) | the cap is computed | cap = `PIPELINE_RUN_TIMEOUT_AUDIO_MAX_SECONDS` (3,600 s); the cap never exceeds that maximum for any durations | fakes | `tests/offline/verify_stuck_loaders.py` group `stuck_audio_cap_unknown` |
 | AC-120 | a fake socket that accepts `request_template_sync` but never answers; fake clock | `ensure_templates_synced` runs with no explicit timeout | it returns after exactly `TEMPLATE_SYNC_TIMEOUT_SECONDS` (900 s), not before; logs a timeout warning; the pending future is removed. With a `False` emit it returns at once (AC-101) | fakes | `tests/offline/verify_stuck_loaders.py` group `stuck_template_wait_900` |
 
+## Reject one Analysis Report item (ships on its own)
+A reject used to remove every item sharing two informative words with the
+rejected text, and the rejection memory then suppressed every later item
+sharing them. Fictional items; no model, socket or Qdrant calls.
+
+| ID | Given | When | Then | Kind | Verified by |
+|---|---|---|---|---|---|
+| AC-130 | four distinct Missing Information items, several sharing words ("copy", "booking", "email") | the lawyer rejects one | only that item is removed; the emitted `analysis_report` and the cache keep the other three | fakes | `tests/test_reject_matching.py::test_rejecting_one_gap_keeps_the_other_three`, `::test_one_reject_removes_one_item_not_its_word_neighbours` |
+| AC-131 | the rejected text differs from the item only in case, spacing or punctuation | the reject is applied | the item is removed | unit | `tests/test_reject_matching.py::test_same_text_ignoring_case_and_punctuation_is_removed` |
+| AC-132 | the same item text appears twice | it is rejected | both copies are removed, nothing else | unit | `tests/test_reject_matching.py::test_every_same_text_copy_is_removed` |
+| AC-133 | items carried as `{"point": …}` objects | one is rejected | only that object is removed | unit | `tests/test_reject_matching.py::test_dict_items_match_on_point` |
+| AC-134 | the report was regenerated and the item slightly re-worded since the lawyer saw it | the old wording is rejected | only the single closest item is removed | unit | `tests/test_reject_matching.py::test_a_near_identical_rewording_removes_only_the_closest_item` |
+| AC-135 | a rejected value that is unrelated, or only a fragment of an item | the reject is applied | nothing is removed | unit | `tests/test_reject_matching.py::test_an_unrelated_or_partial_value_removes_nothing`, `::test_word_neighbours_score_zero` |
+| AC-136 | one item was rejected | a later rebuild checks every item against the rejection memory | only the rejected item is suppressed | fakes | `tests/test_reject_matching.py::test_rejection_memory_suppresses_only_the_rejected_gap` |
+| AC-137 | the reject path runs | it logs | no log line carries the item text (sizes only, via `chars`) | review | `analysis_report.py` reject log lines; `tests/offline/verify_logging.py` static scan |
+| AC-140 | a rebuild re-worded an item the frontend already had (same id, different text) | the lawyer rejects the frontend's wording | our item with that id is removed and both wordings are remembered as rejected; with no currentState the text rules apply | fakes | `tests/test_reject_matching.py::test_reworded_item_is_resolved_by_id`, `::test_no_current_state_falls_back_to_text` |
+| AC-141 | a reject the model judges valid (+3) | the batch is applied | the report sent carries `rejectionFeedback` with `scoreChange` 3 and the item's `isValidRejection`, `scoreIncrease` and `reason`, matching `RejectionFeedback` | fakes | `tests/test_reject_matching.py::test_valid_reject_reports_its_reason_and_increase` |
+| AC-142 | a reject the model judges invalid | the batch is applied | the item is removed, the score is unchanged, and `reason` says why | fakes | `tests/test_reject_matching.py::test_invalid_reject_explains_why_the_score_stays` |
+| AC-143 | a reject re-sent for an item already removed | the batch is applied | `reason` says it was already removed; `scoreChange` 0 | fakes | `tests/test_reject_matching.py::test_stale_reject_says_already_removed` |
+| AC-144 | any reject | the report is sent | `rejectionFeedback` is on that emit only, never in the cached report (no replay) | fakes | `tests/test_reject_matching.py::test_valid_reject_reports_its_reason_and_increase`, `::test_stale_reject_says_already_removed` |
+
 ## (a) Follow-up upload: pipeline, ordering, supersede
 
 | ID | Given | When | Then | Verified by |
 |---|---|---|---|---|
 | AC-1 | a workspace with cached panels | a `workspace_sync` upload runs | one `stage <name> took` line per stage plus `pipeline_total`, each with the run's `request_id`, none containing document or objective text | `VIU` group `stage_timing` |
-| AC-2 | concurrent panels on; list_of_dates scripted to finish before strategy | the upload pipeline runs | `document_feature_response` emits arrive in `PIPELINE_EMIT_ORDER` | `VIU` group `emit_order` |
-| AC-3 | concurrent panels on | the upload pipeline runs | dates, laws, timeline, parties and case laws generation overlap strategy generation | `VIU` group `concurrency` |
-| AC-4 | `PIPELINE_CONCURRENT_PANELS=false` | the upload pipeline runs | sequential generation; same emit order as AC-2 | `VIU` group `sequential_flag` |
-| AC-5 | drafting reads other caches | the upload pipeline runs | drafting starts only after strategy, analysis, dates and laws caches are written | `VIU` group `drafting_last` |
-| AC-6 | applicable_laws raises | the pipeline runs | later panels still emit in order; applicable_laws gets a terminal emit | `VIU` group `failed_panel_passes_turn` |
+| AC-2 | concurrent panels on; list_of_dates scripted to finish before strategy | the upload pipeline runs | strategy, analysis and drafting are emitted first; every other panel is emitted only after drafting | `tests/test_parallel_panels.py::test_priority_three_emit_first` |
+| AC-3 | concurrent panels on | the upload pipeline runs | dates, laws, timeline, parties and case laws generation overlap strategy generation | `tests/test_parallel_panels.py::test_tail_overlaps_strategy` |
+| AC-4 | `PIPELINE_CONCURRENT_PANELS=false` | the upload pipeline runs | sequential generation in product order, drafting once | `tests/test_parallel_panels.py::test_sequential_flag` |
+| AC-5 | a first build (`is_update=False`) | the upload pipeline runs | drafting runs after analysis and once more after the tail; on an update it runs once | `tests/test_parallel_panels.py::test_first_build_refreshes_drafting`, `::test_update_drafts_once` |
+| AC-6 | applicable_laws raises, or strategy raises | the pipeline runs | the other panels still emit; the failed panel gets a terminal emit; nothing waits forever | `tests/test_parallel_panels.py::test_failed_tail_panel_settles`, `::test_lane_failure_opens_hold`; strategy raising in parallel mode: `tests/offline/verify_stuck_loaders.py` group `stuck_strategy_failure` |
 | AC-7 | `_generate_strategies_from_documents` returns `None` | the upload pipeline runs | `strategy_objective` gets a terminal emit; later panels emit; no armed loader left lit | `VIU` group `strategy_none_releases` |
 | AC-8 | pipeline A (documents X) running | an upload (documents Y) schedules pipeline B | A is cancelled; B covers X and Y in dates, timeline and (Phase 2) strategy/analysis | `VIU` group `supersede_absorbs_batch` |
 | AC-9 | pipeline A superseded mid-run | A handles its cancellation | A emits no `document_feature_response`; B emits every armed feature once | `VIU` group `supersede_no_release` |
 | AC-10 | an objective-change cascade holds or waits on the lock | an upload schedules a document pipeline | the cascade is not cancelled and completes | `VIU` group `cascade_not_superseded` |
 | AC-11 | a document pipeline running | cancelled for a non-supersede reason | logs, releases its unemitted armed loaders, re-raises | `VIU` group `cancel_releases` |
 | AC-12 | `PIPELINE_SUPERSEDE_ENABLED=false` | a second upload arrives | it waits on the lock; nothing cancelled | `VIU` group `supersede_flag` |
-| AC-13 | unchanged documents, graph on or off | strategy, analysis and the objective regeneration each request entities | the three entity sub-extractors run once in total (document-set key) | `VIU` group `entity_cache_document_set` |
+| AC-13 | unchanged documents, graph on or off | strategy and analysis each request entities | the three entity sub-extractors run once in total (document-set key) | `tests/test_parallel_panels.py::test_entity_cache_document_set` |
 | AC-14 | an upload pipeline | it runs end to end | the store is scrolled once per `evidence_version`; later calls get equal copies; the memo is released at run end | `VIU` group `single_scroll` |
 | AC-15 | a memoised scroll | `add_document_chunks`, `add_document`, `delete_documents` or `delete_workspace` runs | the next call reads the store again | `VIU` group `scroll_invalidation` |
 | AC-16 | a caller mutates a returned document dict | the next caller reads the memo | it sees unmodified content | `VIU` group `scroll_copy` |
@@ -77,6 +98,9 @@ human-run `make e2e` / a live backend.
 | AC-35 | full, partial and unparseable dates; ±1-day, month and year edges; cross-document groups | `dated_entry_day` and grouping run | collisions as designed | `tests/test_dated_merge.py` |
 | AC-36 | a case with four documents | a fifth is uploaded | its prompt header is `Annexure 5` and the reference maps back to its id | `VIU` group `annexure_numbering` |
 | AC-79 | a fictional 15-document case on an e2-highmem-2 | uploads of 1 text PDF, 5 text PDFs and 5 scanned PDFs via `make run`, before and after each phase | stage lines recorded; the targets in the requirements met (1 PDF ≤ 90 s, 5 PDFs ≤ 150 s after Phase 2; `document_assessments` ≤ 30 s for one text PDF) | **manual**: real backend, billed calls, production-sized VM |
+
+| AC-138 | 6 documents, `LIST_OF_DATES_CONCURRENCY=4` | the temporal pass and the per-date dedupe run | at most 4 calls run at once, and the merged result equals the sequential result | `tests/test_parallel_panels.py::test_dates_pass_bounded_same_result`, `::test_dedupe_bounded_same_result` |
+| AC-139 | concurrent panels on | the run is cancelled (stop or cap) while tail panels wait on the hold | every child is cancelled and nothing held reaches the wire; the runner releases unemitted armed loaders | `tests/test_parallel_panels.py::test_cancel_cancels_children`; `tests/offline/verify_stuck_loaders.py` group `stuck_runner_cancelled` (runs in parallel mode) |
 
 ## (b) Objective change from chat
 
@@ -177,6 +201,7 @@ Earlier AC-64 (process-wide Vision limit) and AC-65 (per-workspace fairness)
 are replaced by the new AC-64 and AC-65 above.
 
 ## Definition of done
+- [ ] Reject fix PR: AC-130 to AC-137 pass offline
 - [ ] Phase -1 PR: AC-100 to AC-112 and AC-115 to AC-120 pass offline; AC-113 and AC-114 signed off from a `make e2e` run; backend confirms nothing reads the removed strategy `error` field
 - [ ] Every AC above has a passing check, or a signed-off manual result (AC-27, AC-79, AC-95, AC-98, AC-113, AC-114, `make e2e`)
 - [ ] `make lint` and `make test` pass

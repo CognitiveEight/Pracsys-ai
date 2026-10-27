@@ -25,6 +25,7 @@ from app.langgraph.list_of_dates_agent import (
 from app.workspace.custom_instructions import (build_custom_instruction_suffix)
 
 from app.rag.packing import fit_to_budget, panel_context_budget
+from app.socket.handlers.extraction import document_set_key
 from app.socket.event_utils import (
     SPEAKER_LABEL_GUARDRAIL,
     _coerce_analysis_text_item,
@@ -51,6 +52,100 @@ from app.prompts.analysis_report_prompts import (
     compute_added_missing_info_score_delta_prompt,
 )
 from app.core.roles import DEFAULT_WORKSPACE_ROLE
+
+
+_MATCH_STOP_WORDS = frozenset({
+    "the", "a", "an", "and", "or", "for", "of", "to", "in", "on", "with", "by",
+    "from", "is", "are", "was", "were", "be", "been", "being", "that", "this",
+    "these", "those", "it", "its", "their", "his", "her", "our", "your", "at",
+    "as", "can", "could", "should", "would", "about", "into", "also", "than",
+    "then", "over", "under",
+})
+
+#: A rejected or added item matches a different-worded one only when this share
+#: of their informative words is common (Jaccard) and at least
+#: ``_SAME_ITEM_MIN_SHARED`` words are shared. Sharing a couple of words is
+#: normal between distinct gaps on one case ("copy", "booking", "email").
+_SAME_ITEM_MIN_JACCARD = 0.8
+_SAME_ITEM_MIN_SHARED = 3
+
+
+def _analysis_item_text(item: Any) -> str:
+    if isinstance(item, str):
+        return item.strip()
+    if isinstance(item, dict):
+        # Generated items carry "point"; tagged ones {id, text, isMatched}.
+        return str(item.get("point") or item.get("text") or "").strip()
+    return ""
+
+
+def _match_norm(text: str) -> str:
+    text = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _match_tokens(text: str) -> Set[str]:
+    return {
+        tok
+        for tok in _match_norm(text).split()
+        if len(tok) > 2 and tok not in _MATCH_STOP_WORDS
+    }
+
+
+def _same_item_score(item: Any, value: str) -> float:
+    """How surely ``item`` is the item ``value`` names: 2.0 for the same text
+    (ignoring case and punctuation), else the Jaccard share of informative
+    words when it clears the same-item bar, else 0."""
+    item_text = _analysis_item_text(item)
+    if not item_text or not (value or "").strip():
+        return 0.0
+    if _match_norm(item_text) == _match_norm(value):
+        return 2.0
+    a, b = _match_tokens(item_text), _match_tokens(value)
+    shared = len(a & b)
+    if shared < _SAME_ITEM_MIN_SHARED:
+        return 0.0
+    jaccard = shared / len(a | b)
+    return jaccard if jaccard >= _SAME_ITEM_MIN_JACCARD else 0.0
+
+
+def _indexes_of_rejected_item(items: List[Any], value: str) -> List[int]:
+    """The positions a rejection of ``value`` removes from ``items``.
+
+    Every same-text copy, else the one closest same-item match, else nothing.
+    Never a family of items that merely share words: one reject must remove
+    one gap.
+    """
+    scores = [_same_item_score(x, value) for x in items]
+    exact = [i for i, sc in enumerate(scores) if sc >= 2.0]
+    if exact:
+        return exact
+    best = max(range(len(scores)), key=lambda i: scores[i], default=None)
+    return [best] if best is not None and scores[best] > 0 else []
+
+
+_STALE_REJECTION_REASON = "This item was already removed, so the score is unchanged."
+
+
+def _rejection_feedback_item(
+    event: Dict[str, Any], *, is_valid: bool, increase: int, reason: str
+) -> Dict[str, Any]:
+    """One entry of ``rejectionFeedback.items``: why this reject did or did
+    not move the readiness score. ``rejectedValue`` echoes what the frontend
+    sent, so it can pair the reason with the item."""
+    return {
+        "section": event.get("section"),
+        "rejectedValue": event.get("rejected_value"),
+        "isValidRejection": bool(is_valid),
+        "scoreIncrease": max(0, int(increase or 0)),
+        "reason": (reason or "").strip(),
+    }
+
+
+def _stale_rejection_feedback(event: Dict[str, Any]) -> Dict[str, Any]:
+    return _rejection_feedback_item(
+        event, is_valid=False, increase=0, reason=_STALE_REJECTION_REASON
+    )
 
 
 class AnalysisReportMixin:
@@ -412,6 +507,7 @@ class AnalysisReportMixin:
             case_entities = await self._extract_case_entities(
                 workspace_id=workspace_id,
                 combined_document_content=combined_document_content,
+                cache_key=document_set_key(all_docs),
             )
             _ar_party_names = [
                 (p.get("name") or "").strip()
@@ -1874,9 +1970,7 @@ Rules:
             for existing in bucket:
                 if not isinstance(existing, str):
                     continue
-                if self._match_rejected_value(existing, rv) or self._match_rejected_value(
-                    rv, existing
-                ):
+                if self._same_analysis_item(existing, rv):
                     return
             bucket.append(rv)
             current[section] = bucket[-50:]
@@ -1911,23 +2005,25 @@ Rules:
             for prev_rv in bucket:
                 if not isinstance(prev_rv, str) or not prev_rv.strip():
                     continue
-                if self._match_rejected_value(candidate, prev_rv):
+                if self._same_analysis_item(candidate, prev_rv):
                     return True
         except Exception:
             return False
         return False
 
     def _match_rejected_value(self, item: Any, rejected_value: str) -> bool:
-        """Return True if item matches/addresses rejectedValue using robust text overlap."""
+        """Loose topical match: True when ``item`` is ABOUT ``rejected_value``.
+
+        Two shared informative words are enough, so distinct gaps on one case
+        often match each other. Use it only where the lawyer paraphrases (the
+        chat "remove this item" path, protecting user-added items). Anything
+        that removes or suppresses items uses ``_same_analysis_item`` /
+        ``_indexes_of_rejected_item`` instead.
+        """
         rv = (rejected_value or "").strip()
         if not rv:
             return False
-
-        item_text = ""
-        if isinstance(item, str):
-            item_text = item.strip()
-        elif isinstance(item, dict) and "point" in item:
-            item_text = (item.get("point") or "").strip()
+        item_text = _analysis_item_text(item)
         if not item_text:
             return False
 
@@ -1935,69 +2031,8 @@ Rules:
         if item_text == rv or rv in item_text or item_text in rv:
             return True
 
-        def _norm(s: str) -> str:
-            s = s.lower().strip()
-            s = re.sub(r"[^a-z0-9\s]", " ", s)
-            s = re.sub(r"\s+", " ", s).strip()
-            return s
-
-        stop_words = {
-            "the",
-            "a",
-            "an",
-            "and",
-            "or",
-            "for",
-            "of",
-            "to",
-            "in",
-            "on",
-            "with",
-            "by",
-            "from",
-            "is",
-            "are",
-            "was",
-            "were",
-            "be",
-            "been",
-            "being",
-            "that",
-            "this",
-            "these",
-            "those",
-            "it",
-            "its",
-            "their",
-            "his",
-            "her",
-            "our",
-            "your",
-            "at",
-            "as",
-            "can",
-            "could",
-            "should",
-            "would",
-            "about",
-            "into",
-            "also",
-            "than",
-            "then",
-            "over",
-            "under",
-        }
-
-        def _tokens(s: str) -> Set[str]:
-            out: Set[str] = set()
-            for tok in _norm(s).split():
-                if len(tok) <= 2 or tok in stop_words:
-                    continue
-                out.add(tok)
-            return out
-
-        item_tokens = _tokens(item_text)
-        rv_tokens = _tokens(rv)
+        item_tokens = _match_tokens(item_text)
+        rv_tokens = _match_tokens(rv)
         if not item_tokens or not rv_tokens:
             return False
 
@@ -2009,7 +2044,11 @@ Rules:
         if len(overlap) >= 2:
             return True
         return len(overlap) / max(1, len(item_tokens)) >= 0.6
-        return False
+
+    def _same_analysis_item(self, item: Any, value: str) -> bool:
+        """Strict match: ``item`` IS the item ``value`` names (same text, or a
+        near-identical rewording). See ``_same_item_score``."""
+        return _same_item_score(item, value) > 0
 
     def _parse_bullets_from_block(self, block: str) -> List[str]:
         """Parse a text block into a list of bullet items."""
@@ -2614,7 +2653,7 @@ Rules:
                     delta,
                     chars(reason),
                 )
-                return (is_valid, delta, reason[:200])
+                return (is_valid, delta, reason[:300])
             # Regex fallback: extract scoreIncrease from raw text (e.g. malformed or truncated JSON)
             num_match = re.search(
                 r'"scoreIncrease"\s*:\s*(\d+)|scoreIncrease"\s*:\s*(\d+)|\bscoreIncrease\s*:\s*(\d+)',
@@ -2751,11 +2790,11 @@ Rules:
                 self._debounce_and_flush_feedback(workspace_id)
             )
         logger.info(
-            "analysis_report_feedback queued ({} pending) for workspace {} (section={}, value={!r})",
+            "analysis_report_feedback queued ({} pending) for workspace {} (section={}, value={})",
             len(self._pending_feedback_queue[workspace_id]),
             workspace_id,
             section,
-            rejected_value[:80],
+            chars(rejected_value),
         )
 
     async def _debounce_and_flush_feedback(self, workspace_id: str) -> None:
@@ -2788,6 +2827,75 @@ Rules:
                     workspace_id,
                     exc,
                 )
+
+    async def _emit_analysis_report_with_feedback(
+        self,
+        workspace_id: str,
+        user_id: str,
+        report: Dict[str, Any],
+        items: List[Dict[str, Any]],
+        *,
+        score_change: int,
+    ) -> None:
+        """Emit the cached ``report`` with ``rejectionFeedback`` added.
+
+        The field is additive and rides this emit only: it is removed from the
+        cached report afterwards, so a reconnect replay or a later rebuild
+        never shows an old reason again. The report object itself is emitted
+        (not a copy) because the emit chokepoint's in-place fixes are meant to
+        reach the cache. ``scoreChange`` is what was applied; it can be lower
+        than the sum of ``scoreIncrease`` when the score is capped (95% while
+        items remain, and the per-batch cap).
+        """
+        report["rejectionFeedback"] = {"scoreChange": int(score_change), "items": items}
+        try:
+            await self._emit_document_feature(
+                feature_type="analysis_report",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=report,
+                usage=current_usage(),
+            )
+        finally:
+            report.pop("rejectionFeedback", None)
+
+    def _rejected_item_aliases(
+        self,
+        workspace_id: str,
+        section: str,
+        rejected_value: str,
+        report: Any,
+    ) -> List[str]:
+        """Our wording of the item the lawyer rejected, found through its id.
+
+        For an item it already had (``isMatched``), the frontend keeps showing
+        its own wording, while a rebuild may have re-worded our cached copy:
+        then no text rule links the two. The rejected text is matched exactly
+        against ``currentState`` to get the item id, and the cached item with
+        that id gives the wording to remove. Empty when nothing links them.
+        """
+        fields = ("missingInfo",) if section == "missingInfo" else ("weaknesses", "risks")
+        current_state = self._workspace_current_state_payload.get(workspace_id) or {}
+        if not isinstance(current_state, dict) or not isinstance(report, dict):
+            return []
+        ids = {
+            str(item.get("id"))
+            for field in fields
+            for item in (current_state.get(field) or [])
+            if isinstance(item, dict)
+            and item.get("id")
+            and _same_item_score(item.get("text") or "", rejected_value) >= 2.0
+        }
+        if not ids:
+            return []
+        aliases = []
+        for field in fields:
+            for item in report.get(field) or []:
+                if isinstance(item, dict) and str(item.get("id") or "") in ids:
+                    text = _analysis_item_text(item)
+                    if text and _same_item_score(text, rejected_value) < 2.0:
+                        aliases.append(text)
+        return aliases
 
     @meter_usage
     async def _apply_batched_feedback(
@@ -2852,48 +2960,55 @@ Rules:
         for ev in events:
             section = ev["section"]
             rejected_value = ev["rejected_value"]
+            # The same item in our wording, when a rebuild re-worded it.
+            aliases = self._rejected_item_aliases(
+                workspace_id, section, rejected_value, current
+            )
+            values = [rejected_value, *aliases]
+
+            def _drop(items: List[Any]) -> Set[int]:
+                return {i for v in values for i in _indexes_of_rejected_item(items, v)}
+
             removed_here = False
             if section == "missingInfo":
                 missing = (
                     report.get("missingInfo") or report.get("missing_info") or []
                 )
                 if isinstance(missing, list):
-                    new_missing = [
-                        x
-                        for x in missing
-                        if not self._match_rejected_value(x, rejected_value)
-                    ]
+                    drop = _drop(missing)
+                    new_missing = [x for i, x in enumerate(missing) if i not in drop]
                     if len(new_missing) < len(missing):
                         report["missingInfo"] = new_missing
                         removed_here = True
             else:
                 weaknesses = report.get("weaknesses") or []
                 if isinstance(weaknesses, list):
-                    new_weak = [
-                        x
-                        for x in weaknesses
-                        if not self._match_rejected_value(x, rejected_value)
-                    ]
+                    drop = _drop(weaknesses)
+                    new_weak = [x for i, x in enumerate(weaknesses) if i not in drop]
                     if len(new_weak) < len(weaknesses):
                         report["weaknesses"] = new_weak
                         removed_here = True
                 risks = report.get("risks") or []
                 if isinstance(risks, list):
-                    new_risks = [
-                        x
-                        for x in risks
-                        if not self._match_rejected_value(x, rejected_value)
-                    ]
+                    drop = _drop(risks)
+                    new_risks = [x for i, x in enumerate(risks) if i not in drop]
                     if len(new_risks) < len(risks):
                         report["risks"] = new_risks
                         removed_here = True
 
             if removed_here:
-                self._record_rejected_analysis_item(
-                    workspace_id=workspace_id,
-                    section=section,
-                    rejected_value=rejected_value,
-                )
+                for value in values:
+                    self._record_rejected_analysis_item(
+                        workspace_id=workspace_id,
+                        section=section,
+                        rejected_value=value,
+                    )
+                if aliases:
+                    logger.info(
+                        "analysis_report_feedback: rejected item resolved by id "
+                        "({} re-worded cached item(s))",
+                        len(aliases),
+                    )
                 removed_events.append(ev)
 
         if not removed_events:
@@ -2908,12 +3023,12 @@ Rules:
             report = await self._retag_analysis_report_safe(workspace_id, report)
             self._workspace_analysis_payload[workspace_id] = report
             if self._socket_client:
-                await self._emit_document_feature(
-                    feature_type="analysis_report",
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    payload=report,
-                    usage=current_usage(),
+                await self._emit_analysis_report_with_feedback(
+                    workspace_id,
+                    user_id,
+                    report,
+                    [_stale_rejection_feedback(ev) for ev in events],
+                    score_change=0,
                 )
             return
 
@@ -2931,19 +3046,28 @@ Rules:
         delta_results = await asyncio.gather(*delta_tasks, return_exceptions=True)
 
         total_delta = 0
+        feedback = [_stale_rejection_feedback(ev) for ev in events if ev not in removed_events]
         for ev, result in zip(removed_events, delta_results):
             if isinstance(result, BaseException):
                 logger.warning(
-                    "analysis_report_feedback batch: score-delta call failed for {!r}: {}",
-                    ev["rejected_value"][:80],
+                    "analysis_report_feedback batch: score-delta call failed for {}: {}",
+                    chars(ev["rejected_value"]),
                     result,
                 )
+                feedback.append(_rejection_feedback_item(
+                    ev, is_valid=False, increase=0,
+                    reason="The readiness score could not be re-assessed for this item.",
+                ))
                 continue
-            is_valid, delta, _reason = result
+            is_valid, delta, reason = result
+            feedback.append(_rejection_feedback_item(
+                ev, is_valid=is_valid, increase=int(delta or 0) if is_valid else 0,
+                reason=reason,
+            ))
             if not is_valid:
                 logger.info(
-                    "analysis_report_feedback batch: rejection judged INVALID — no score bump for {!r}",
-                    ev["rejected_value"][:80],
+                    "analysis_report_feedback batch: rejection judged INVALID — no score bump for {}",
+                    chars(ev["rejected_value"]),
                 )
                 continue
             total_delta += int(delta or 0)
@@ -3005,12 +3129,12 @@ Rules:
         self._workspace_analysis_payload[workspace_id] = report
 
         if self._socket_client:
-            await self._emit_document_feature(
-                feature_type="analysis_report",
-                workspace_id=workspace_id,
-                user_id=user_id,
-                payload=report,
-                usage=current_usage(),
+            await self._emit_analysis_report_with_feedback(
+                workspace_id,
+                user_id,
+                report,
+                feedback,
+                score_change=new_score - old_score,
             )
             logger.success(
                 "analysis_report_feedback batch applied: {} rejections, score {}%  {}% (delta +{})",
@@ -3340,7 +3464,7 @@ Rules:
             current_missing = [current_missing] if current_missing else []
 
         already_present = any(
-            self._match_rejected_value(x, new_entry) for x in current_missing
+            self._same_analysis_item(x, new_entry) for x in current_missing
         )
         if not already_present and new_entry:
             current_missing = list(current_missing) + [new_entry]

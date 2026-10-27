@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from loguru import logger
 
@@ -20,6 +20,7 @@ from app.workspace.manager import workspace_manager
 from app.rag.packing import fit_to_budget
 from app.socket.event_utils import (
     OBJECTIVE_CHANGE_REFRESH_FEATURES,
+    gather_bounded,
     _coerce_analysis_text_list,
 )
 from app.socket.handlers._shared import (
@@ -27,7 +28,7 @@ from app.socket.handlers._shared import (
     UPLOAD_REFRESH_FEATURES,
     _loop_now,
 )
-from app.socket.handlers.run_control import _EMIT_OBSERVER
+from app.socket.handlers.run_control import _EMIT_OBSERVER, _HOLD_EMITS_UNTIL
 
 
 from app.prompts.objective_change_prompts import (
@@ -539,6 +540,7 @@ class ObjectiveChangeMixin:
         user_id: str,
         workspace_role: str,
         log_context: str = "",
+        mode: str = "sequential",
     ) -> None:
         """Run one tail step; if it raises, settle its panel from cache.
 
@@ -569,7 +571,7 @@ class ObjectiveChangeMixin:
                 workspace_role=workspace_role,
             )
         finally:
-            self._log_stage(stage, started, mode="sequential")
+            self._log_stage(stage, started, mode=mode)
 
     async def _run_list_of_dates_and_applicable_laws(
         self,
@@ -618,6 +620,36 @@ class ObjectiveChangeMixin:
         templates_ready: Optional["asyncio.Task"] = None,
     ) -> None:
         """Body of :meth:`_run_list_of_dates_and_applicable_laws`."""
+        common = {
+            "workspace_id": workspace_id,
+            "user_id": user_id,
+            "workspace_role": workspace_role,
+            "log_context": log_context,
+        }
+        # Order (per product): list_of_dates → applicable_laws → upcoming dates
+        # (procedural_timeline) → relevant_parties → case_laws → drafting.
+        for spec in self._tail_step_specs(
+            workspace_id,
+            user_id,
+            workspace_role,
+            batch_result,
+            deleted_doc_ids=deleted_doc_ids,
+            templates_ready=templates_ready,
+        ):
+            await self._run_tail_step(**spec, **common)
+
+    def _tail_step_specs(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        batch_result: Optional[Dict[str, Any]],
+        *,
+        deleted_doc_ids: Optional[List[str]] = None,
+        templates_ready: Optional["asyncio.Task"] = None,
+    ) -> List[Dict[str, Any]]:
+        """The tail steps in product order, as ``_run_tail_step`` keyword sets
+        (``feature``, ``stage``, ``label``, ``step``)."""
         # On a document DELETION (deleted_doc_ids present) the web-search-derived
         # panels must REFLECT the reduced document set, not accumulate on top of
         # it. Case laws / applicable laws have no per-document linkage, so they
@@ -626,12 +658,6 @@ class ObjectiveChangeMixin:
         # keep the merge/accumulate behaviour ("keep what the user has seen +
         # fold in new").
         replace_derived = bool(deleted_doc_ids)
-        common = {
-            "workspace_id": workspace_id,
-            "user_id": user_id,
-            "workspace_role": workspace_role,
-            "log_context": log_context,
-        }
 
         async def _dates() -> None:
             await self._generate_and_emit_list_of_dates(
@@ -682,32 +708,20 @@ class ObjectiveChangeMixin:
                 templates_ready=templates_ready,
             )
 
-        # Order (per product): list_of_dates → applicable_laws → upcoming dates
-        # (procedural_timeline) → relevant_parties → case_laws → drafting.
-        await self._run_tail_step(
-            feature="list_of_dates", stage="list_of_dates",
-            label="List of dates", step=_dates, **common,
-        )
-        await self._run_tail_step(
-            feature="applicable_laws", stage="applicable_laws",
-            label="Applicable laws", step=_laws, **common,
-        )
-        await self._run_tail_step(
-            feature="procedural_timeline", stage="procedural_timeline",
-            label="Procedural timeline", step=_timeline, **common,
-        )
-        await self._run_tail_step(
-            feature="relevant_parties", stage="relevant_parties",
-            label="Relevant parties", step=_parties, **common,
-        )
-        await self._run_tail_step(
-            feature="case_laws", stage="case_laws",
-            label="Case laws", step=_case_laws, **common,
-        )
-        await self._run_tail_step(
-            feature="drafting_assistant", stage="drafting",
-            label="Drafting suggestions", step=_drafting, **common,
-        )
+        return [
+            {"feature": "list_of_dates", "stage": "list_of_dates",
+             "label": "List of dates", "step": _dates},
+            {"feature": "applicable_laws", "stage": "applicable_laws",
+             "label": "Applicable laws", "step": _laws},
+            {"feature": "procedural_timeline", "stage": "procedural_timeline",
+             "label": "Procedural timeline", "step": _timeline},
+            {"feature": "relevant_parties", "stage": "relevant_parties",
+             "label": "Relevant parties", "step": _parties},
+            {"feature": "case_laws", "stage": "case_laws",
+             "label": "Case laws", "step": _case_laws},
+            {"feature": "drafting_assistant", "stage": "drafting",
+             "label": "Drafting suggestions", "step": _drafting},
+        ]
 
     def _schedule_applicable_laws_only(
         self,
@@ -1601,24 +1615,30 @@ class ObjectiveChangeMixin:
         # within each duplicate group.
         kept_indexes: set[int] = set(range(len(entries)))
 
-        for date_value, idxs in grouped.items():
-            if len(idxs) < 2:
-                continue
+        def _label_for(entry: Dict[str, Any]) -> str:
+            title = str(entry.get(title_field) or "").strip()
+            desc = str(entry.get(description_field) or "").strip()
+            return f"{title} — {desc}" if title and desc else (title or desc)
 
-            def _label_for(entry: Dict[str, Any]) -> str:
-                title = str(entry.get(title_field) or "").strip()
-                desc = str(entry.get(description_field) or "").strip()
-                return f"{title} — {desc}" if title and desc else (title or desc)
-
+        # One call per date with 2+ entries, LIST_OF_DATES_CONCURRENCY at a
+        # time. Dates never interact, so the result is the same as a
+        # one-at-a-time run.
+        async def _keep_for_date(group: Tuple[str, List[int]]) -> Optional[List[int]]:
+            date_value, idxs = group
             labels = [_label_for(entries[i]) for i in idxs]
-            if not all(labels):
-                continue
-
-            kept_label_indexes = await self._llm_semantic_keep_indexes(
+            if len(idxs) < 2 or not all(labels):
+                return None
+            return await self._llm_semantic_keep_indexes(
                 labels, item_type=f"{item_type} on {date_value}", max_keep=len(idxs)
             )
+
+        groups = list(grouped.items())
+        kept_per_date = await gather_bounded(
+            settings.list_of_dates_concurrency, groups, _keep_for_date
+        )
+        for (_date_value, idxs), kept_label_indexes in zip(groups, kept_per_date):
             if not kept_label_indexes:
-                continue  # Dedupe failed; keep all on this date.
+                continue  # Dedupe failed or nothing to compare; keep all on this date.
 
             keep_set_for_date = {idxs[i - 1] for i in kept_label_indexes if 1 <= i <= len(idxs)}
             for original_idx in idxs:
@@ -2643,8 +2663,13 @@ class ObjectiveChangeMixin:
         templates_ready: Optional["asyncio.Task"] = None,
     ) -> None:
         """
-        Strategy → analysis report → scheduled list_of_dates + applicable_laws.
+        Strategy → analysis report → the six tail panels.
         Runs inside asyncio.create_task so workspace_sync / workspace_created return quickly.
+
+        With ``PIPELINE_CONCURRENT_PANELS`` (default) the five panels that read
+        neither strategy nor analysis generate alongside them; see
+        :meth:`_run_upload_panels_concurrently`. Otherwise every step runs in
+        product order.
         """
         role = await self._resolve_workspace_role(
             workspace_id=workspace_id,
@@ -2653,6 +2678,127 @@ class ObjectiveChangeMixin:
         )
 
         logger.info("Using workspace role for background AI pipeline: {}", role)
+        if settings.pipeline_concurrent_panels:
+            await self._run_upload_panels_concurrently(
+                workspace_id,
+                user_id,
+                role,
+                batch_result,
+                is_update=is_update,
+                analysis_log_context=analysis_log_context,
+                templates_ready=templates_ready,
+            )
+            return
+
+        await self._run_pipeline_strategy_step(
+            workspace_id, user_id, role, batch_result, is_update=is_update
+        )
+        await self._emit_analysis_report(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            workspace_role=role,
+            batch_result=batch_result,
+            is_update=is_update,
+            log_context=analysis_log_context,
+            tail_inline=True,
+            templates_ready=templates_ready,
+        )
+
+    async def _run_upload_panels_concurrently(
+        self,
+        workspace_id: str,
+        user_id: str,
+        role: str,
+        batch_result: Dict[str, Any],
+        *,
+        is_update: bool,
+        analysis_log_context: str,
+        templates_ready: Optional["asyncio.Task"] = None,
+    ) -> None:
+        """Priority lane strategy → analysis → drafting, with the other five
+        panels generating from the start and sent only after the lane.
+
+        Dates, laws, timeline, parties and case laws read only their own caches
+        on this path, so they start at once. Their emits wait on ``hold``
+        (``_HOLD_EMITS_UNTIL``), which the lane sets in ``finally``, so the
+        lawyer's three priority panels always arrive first. On a first build
+        drafting runs once more at the end, when laws and dates exist (an
+        update's drafting reads the previous ones).
+
+        The children run in a TaskGroup inside the caller's run: they share its
+        scope, emit observer and lock, and are cancelled with it. A failing
+        child settles its own panel (``_run_tail_step``) and never cancels its
+        siblings.
+        """
+        hold = asyncio.Event()
+        common = {
+            "workspace_id": workspace_id,
+            "user_id": user_id,
+            "workspace_role": role,
+            "log_context": analysis_log_context or " (parallel)",
+            "mode": "parallel",
+        }
+        specs = self._tail_step_specs(
+            workspace_id, user_id, role, batch_result, templates_ready=templates_ready
+        )
+        drafting = next(sp for sp in specs if sp["feature"] == "drafting_assistant")
+
+        async def _held(spec: Dict[str, Any]) -> None:
+            _HOLD_EMITS_UNTIL.set(hold)  # this task's own context only
+            await self._run_tail_step(**spec, **common)
+
+        async with asyncio.TaskGroup() as group:
+            for spec in specs:
+                if spec is not drafting:
+                    group.create_task(_held(spec))
+            try:
+                await self._run_pipeline_strategy_step(
+                    workspace_id, user_id, role, batch_result,
+                    is_update=is_update, mode="parallel",
+                )
+                await self._emit_analysis_report(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=role,
+                    batch_result=batch_result,
+                    is_update=is_update,
+                    log_context=analysis_log_context,
+                    run_tail=False,
+                    defer_chips=True,
+                )
+                group.create_task(self._store_analysis_report_chips(workspace_id, role))
+                await self._run_tail_step(**drafting, **common)
+            except asyncio.CancelledError:
+                raise
+            except Exception as lane_err:
+                # The runner's terminal release settles whatever the lane did
+                # not emit; the held panels still go out.
+                logger.opt(exception=lane_err).error(
+                    "Priority panels failed for workspace {}: {}",
+                    workspace_id[:12] if workspace_id else "",
+                    lane_err,
+                )
+            finally:
+                hold.set()
+
+        if not is_update:
+            await self._run_tail_step(
+                **{**drafting, "stage": "drafting_refresh",
+                   "label": "Drafting suggestions (refresh)"},
+                **common,
+            )
+
+    async def _run_pipeline_strategy_step(
+        self,
+        workspace_id: str,
+        user_id: str,
+        role: str,
+        batch_result: Dict[str, Any],
+        *,
+        is_update: bool,
+        mode: str = "sequential",
+    ) -> None:
+        """Generate and emit strategy; settle its panel from cache on failure."""
         strategy_started = self._stage_begin(workspace_id, "strategy")
         strategy_settled = False
         try:
@@ -2694,7 +2840,7 @@ class ObjectiveChangeMixin:
                 "Background strategy generation failed: {}", strategy_error
             )
         finally:
-            self._log_stage("strategy", strategy_started, mode="sequential")
+            self._log_stage("strategy", strategy_started, mode=mode)
 
         if not strategy_settled:
             # _generate_strategies_from_documents returns None on failure, and
@@ -2709,17 +2855,6 @@ class ObjectiveChangeMixin:
                 reason="strategy_failed",
                 workspace_role=role,
             )
-
-        await self._emit_analysis_report(
-            workspace_id=workspace_id,
-            user_id=user_id,
-            workspace_role=role,
-            batch_result=batch_result,
-            is_update=is_update,
-            log_context=analysis_log_context,
-            tail_inline=True,
-            templates_ready=templates_ready,
-        )
 
     def _schedule_strategy_analysis_pipeline(
         self,
@@ -2764,7 +2899,10 @@ class ObjectiveChangeMixin:
                 # section, so overlapping triggers cannot interleave emits.
                 async with self._hold_pipeline_lock(
                     workspace_id, "upload_pipeline", cap_seconds=cap,
-                    wait_stage="lock_wait", stage_mode="sequential",
+                    wait_stage="lock_wait",
+                    stage_mode=(
+                        "parallel" if settings.pipeline_concurrent_panels else "sequential"
+                    ),
                 ):
                     logger.debug(
                         "pipeline lock: acquired (strategy pipeline) for workspace {}",
@@ -2861,6 +2999,8 @@ class ObjectiveChangeMixin:
         *,
         tail_inline: bool = False,
         templates_ready: Optional["asyncio.Task"] = None,
+        run_tail: bool = True,
+        defer_chips: bool = False,
     ) -> bool:
         """
         Generate analysis report (or use fallback on error), then emit to backend and cache.
@@ -2872,6 +3012,11 @@ class ObjectiveChangeMixin:
         whole strategy→drafting sequence is one critical section. Callers under
         a timeout (e.g. the 35s chat refresh in analysis_report.py) must keep
         the default False.
+
+        ``run_tail=False`` runs no tail at all and ``defer_chips=True`` leaves
+        the suggestion chips to the caller (:meth:`_store_analysis_report_chips`):
+        the concurrent upload pipeline runs the tail itself and the chips beside
+        drafting.
         """
         if not self._socket_client:
             return False
@@ -2936,26 +3081,15 @@ class ObjectiveChangeMixin:
         logger.success("Analysis report sent to backend{}", log_context)
         # Brief yield so the socket can flush before caller continues (reduces risk of disconnect before delivery)
         await asyncio.sleep(0.15)
-        # Generate and cache 15-16 suggestion chips for Analysis Report (probing_prompts_request with chatType ANALYSIS_REPORT)
-        try:
-            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
-            analysis_chips = await self._generate_analysis_report_suggestion_chips(
-                workspace_id=workspace_id,
-                report=analysis_report,
-                role=role,
+        if defer_chips:
+            self._log_stage("analysis_report", analysis_started, mode="parallel")
+        else:
+            await self._store_analysis_report_chips(
+                workspace_id, workspace_role, report=analysis_report
             )
-            if analysis_chips:
-                self._workspace_analysis_suggestion_chips[workspace_id] = list(
-                    analysis_chips
-                )
-                logger.info(
-                    "Analysis report suggestion chips stored: {} for workspace {}",
-                    len(analysis_chips),
-                    workspace_id[:12] if workspace_id else "",
-                )
-        except Exception as chip_err:
-            logger.warning("Analysis report chips generation failed: {}", chip_err)
-        self._log_stage("analysis_report", analysis_started, mode="sequential")
+            self._log_stage("analysis_report", analysis_started, mode="sequential")
+        if not run_tail:
+            return True
         if tail_inline:
             # Caller (pipeline runner) already holds the workspace pipeline
             # lock; run the tail inline so strategy→drafting emits as one
@@ -2978,6 +3112,41 @@ class ObjectiveChangeMixin:
                 log_context=log_context or " (after analysis)",
             )
         return True
+
+    async def _store_analysis_report_chips(
+        self,
+        workspace_id: str,
+        workspace_role: str,
+        *,
+        report: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Generate and cache 15-16 suggestion chips for the Analysis Report
+        (probing_prompts_request with chatType ANALYSIS_REPORT). ``report``
+        defaults to the cached report. Never raises."""
+        try:
+            if report is None:
+                report = self._workspace_analysis_payload.get(workspace_id)
+            if not isinstance(report, dict):
+                return
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
+            analysis_chips = await self._generate_analysis_report_suggestion_chips(
+                workspace_id=workspace_id,
+                report=report,
+                role=role,
+            )
+            if analysis_chips:
+                self._workspace_analysis_suggestion_chips[workspace_id] = list(
+                    analysis_chips
+                )
+                logger.info(
+                    "Analysis report suggestion chips stored: {} for workspace {}",
+                    len(analysis_chips),
+                    workspace_id[:12] if workspace_id else "",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as chip_err:
+            logger.warning("Analysis report chips generation failed: {}", chip_err)
 
     @meter_usage
     async def _generate_and_emit_analysis_report_for_sync(

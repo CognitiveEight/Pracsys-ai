@@ -480,6 +480,25 @@ class AnalysisReportFeedbackPayload(BaseModel):
         populate_by_name = True
 
 
+class RejectionFeedbackItem(BaseModel):
+    """Why one reject did or did not move the readiness score (AI → backend)."""
+
+    section: Literal["missingInfo", "riskOrWeakness"]
+    rejectedValue: str  # echoes AnalysisReportFeedbackPayload.rejectedValue
+    isValidRejection: bool  # False: the item is still a real gap or risk
+    scoreIncrease: int  # 0-5, as judged for this item
+    reason: str  # one sentence for the lawyer; empty when none was produced
+
+
+class RejectionFeedback(BaseModel):
+    """``rejectionFeedback`` on the ``analysis_report`` payload, present only on
+    the emit that answers ``analysis_report_feedback``. Additive and optional;
+    never cached or replayed."""
+
+    scoreChange: int  # applied; may be below the sum of scoreIncrease (caps)
+    items: List[RejectionFeedbackItem]
+
+
 class AddedMissingInformationPayload(BaseModel):
     """
     Payload for added_missing_information event (App → Backend → AI service).

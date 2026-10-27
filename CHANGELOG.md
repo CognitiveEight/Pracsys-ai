@@ -7,7 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **SIM-163 (Phase 1): an upload's panels are generated in parallel; Strategy,
+  Analysis Report and Drafting Assistant are sent first.**
+  - List of Dates, Applicable Laws, Upcoming Dates, Relevant Parties and Case
+    Laws start with Strategy instead of after Analysis. They are sent once
+    Strategy, Analysis and Drafting are out, in the order they finish.
+  - Drafting runs right after Analysis. On a first build it runs once more at
+    the end, when laws and dates exist.
+  - `PIPELINE_CONCURRENT_PANELS=false` restores the old sequential run.
+  - Analysis no longer repeats Strategy's entity extraction (about 23 s per
+    update): the cache is keyed by the document set, not by each panel's
+    packed prompt text.
+  - List of Dates runs its per-document pass and its per-date duplicate check
+    4 calls at a time (`LIST_OF_DATES_CONCURRENCY`, 1 = old behaviour). The
+    result is the same; on a 27-file local case those two passes took 346 s
+    one call at a time.
+  - **Billing:** an emit reports the case's spend since its previous emit.
+    With panels overlapping, one panel's `price` can include another panel's
+    calls. `totalPrice` and gate0 reconciliation are unchanged.
+  - No payload or schema change. The order of `document_feature_response`
+    events changes as above.
+  - Coverage: `tests/test_parallel_panels.py`. Two `verify_stuck_loaders.py`
+    groups now run in the sequential mode they assume.
+
+- **SIM-163: the lawyer can see why a reject did or did not raise the score.**
+  The analysis report sent after a reject now carries `rejectionFeedback`:
+  `scoreChange` (what was applied) and one entry per reject with `section`,
+  `rejectedValue` (echoed), `isValidRejection`, `scoreIncrease` and a
+  one-sentence `reason` written for the lawyer. The score rule is unchanged:
+  a reject raises the score only when the item is judged not relevant to the
+  case. **Socket payload change (additive):** `RejectionFeedback` in
+  `app/socket/schemas.py`. It is on that emit only, never cached or replayed.
+  The backend must pass it through and the frontend show `reason` beside the
+  score. Coverage: `tests/test_reject_matching.py`.
+
 ### Fixed
+
+- **SIM-163: rejecting one Analysis Report item no longer removes the others.**
+  A reject removed every item sharing two informative words with the rejected
+  text, so on a case whose gaps all mention the same documents one reject
+  could empty Missing Information. The rejected text was then remembered with
+  the same loose rule, so later rebuilds dropped every new gap sharing those
+  words too. A reject now removes the item with the same text (ignoring case
+  and punctuation), or failing that the single closest near-identical
+  rewording, never more. The rejection memory and the duplicate check for a
+  lawyer-added Missing Information item use the same strict rule (a new gap
+  sharing a couple of words with an existing one was silently not added). The
+  chat "remove this item" path keeps the loose match, because there the lawyer
+  paraphrases. Reject log lines no longer carry the item text. No payload
+  change. Offline coverage: `tests/test_reject_matching.py`.
+  - An item a rebuild re-worded is still found: for an item it already had,
+    the frontend keeps its own wording under the same id, so the rejected text
+    is matched exactly against `currentState`, and our item with that id is
+    removed. Both wordings go into the rejection memory. (Found in local
+    testing: the second reject on an updated case removed nothing.)
 
 - **SIM-163 (Phase -1): panels no longer stick after an upload or an
   objective change; a failed upload no longer replaces existing panels.**

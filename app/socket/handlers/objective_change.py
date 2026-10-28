@@ -28,7 +28,7 @@ from app.socket.handlers._shared import (
     UPLOAD_REFRESH_FEATURES,
     _loop_now,
 )
-from app.socket.handlers.run_control import _EMIT_OBSERVER, _HOLD_EMITS_UNTIL
+from app.socket.handlers.run_control import _EMIT_OBSERVER
 
 
 from app.prompts.objective_change_prompts import (
@@ -1815,38 +1815,16 @@ class ObjectiveChangeMixin:
         current_state = self._workspace_current_state_payload.get(workspace_id) or {}
         if not isinstance(current_state, dict):
             current_state = {}
-        # Gaps created by a document the user deleted are exempt from
-        # rejected-item memory. A user often dismisses a missingInfo item
-        # *because* a document answered it; once that document is withdrawn the
-        # gap is real again, and the permanent suppression below would hide it
-        # forever. Derived from the same ledger as the deterministic append in
-        # _apply_removed_evidence_missing_info, so the texts match exactly.
-        try:
-            removed_evidence_texts = {
-                item["text"]
-                for item in self._removed_evidence_missing_info_items(workspace_id)
-            }
-        except Exception as ledger_err:
-            logger.debug(
-                "Removed-evidence exemption unavailable (workspace={}): {}",
-                workspace_id,
-                ledger_err,
-            )
-            removed_evidence_texts = set()
         for report_field, cs_key, reject_section in self._ANALYSIS_TAGGED_SECTIONS:
             fresh = _coerce_analysis_text_list(analysis_report.get(report_field))
             # Honour rejected-item memory: never re-surface a dismissed item.
+            # Gaps created by a document the user deleted are exempt: a user
+            # often dismisses a missingInfo item *because* a document answered
+            # it, and once that document is withdrawn the gap is real again.
             if reject_section:
-                fresh = [
-                    s
-                    for s in fresh
-                    if s in removed_evidence_texts
-                    or not self._is_previously_rejected_analysis_item(
-                        workspace_id=workspace_id,
-                        section=reject_section,
-                        candidate=s,
-                    )
-                ]
+                fresh, _ = self._drop_rejected_analysis_items(
+                    workspace_id, reject_section, fresh
+                )
             prev_items = current_state.get(cs_key) if current_state else None
             analysis_report[report_field] = await self._reconcile_against_current_state(
                 fresh=fresh,
@@ -2716,12 +2694,12 @@ class ObjectiveChangeMixin:
         templates_ready: Optional["asyncio.Task"] = None,
     ) -> None:
         """Priority lane strategy → analysis → drafting, with the other five
-        panels generating from the start and sent only after the lane.
+        panels generating from the start.
 
         Dates, laws, timeline, parties and case laws read only their own caches
-        on this path, so they start at once. Their emits wait on ``hold``
-        (``_HOLD_EMITS_UNTIL``), which the lane sets in ``finally``, so the
-        lawyer's three priority panels always arrive first. On a first build
+        on this path, so they start at once. Every panel is sent the moment it
+        is ready, so the lawyer sees each one as it lands rather than a burst
+        once the priority lane finishes. On a first build
         drafting runs once more at the end, when laws and dates exist (an
         update's drafting reads the previous ones).
 
@@ -2730,7 +2708,6 @@ class ObjectiveChangeMixin:
         child settles its own panel (``_run_tail_step``) and never cancels its
         siblings.
         """
-        hold = asyncio.Event()
         common = {
             "workspace_id": workspace_id,
             "user_id": user_id,
@@ -2743,14 +2720,10 @@ class ObjectiveChangeMixin:
         )
         drafting = next(sp for sp in specs if sp["feature"] == "drafting_assistant")
 
-        async def _held(spec: Dict[str, Any]) -> None:
-            _HOLD_EMITS_UNTIL.set(hold)  # this task's own context only
-            await self._run_tail_step(**spec, **common)
-
         async with asyncio.TaskGroup() as group:
             for spec in specs:
                 if spec is not drafting:
-                    group.create_task(_held(spec))
+                    group.create_task(self._run_tail_step(**spec, **common))
             try:
                 await self._run_pipeline_strategy_step(
                     workspace_id, user_id, role, batch_result,
@@ -2772,14 +2745,12 @@ class ObjectiveChangeMixin:
                 raise
             except Exception as lane_err:
                 # The runner's terminal release settles whatever the lane did
-                # not emit; the held panels still go out.
+                # not emit; the other panels are unaffected.
                 logger.opt(exception=lane_err).error(
                     "Priority panels failed for workspace {}: {}",
                     workspace_id[:12] if workspace_id else "",
                     lane_err,
                 )
-            finally:
-                hold.set()
 
         if not is_update:
             await self._run_tail_step(

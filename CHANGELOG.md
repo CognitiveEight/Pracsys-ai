@@ -12,8 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SIM-163 (Phase 1): an upload's panels are generated in parallel; Strategy,
   Analysis Report and Drafting Assistant are sent first.**
   - List of Dates, Applicable Laws, Upcoming Dates, Relevant Parties and Case
-    Laws start with Strategy instead of after Analysis. They are sent once
-    Strategy, Analysis and Drafting are out, in the order they finish.
+    Laws start with Strategy instead of after Analysis. Every panel is sent
+    the moment it is ready (an earlier hold until Strategy, Analysis and
+    Drafting were out made them all arrive in one burst; it is removed).
   - Drafting runs right after Analysis. On a first build it runs once more at
     the end, when laws and dates exist.
   - `PIPELINE_CONCURRENT_PANELS=false` restores the old sequential run.
@@ -44,6 +45,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   score. Coverage: `tests/test_reject_matching.py`.
 
 ### Fixed
+
+- **Chat replies keep their bullet points and headings.** The citation checker
+  splits a reply into sentences and joins them back, and a line break straight
+  after a full stop was never part of any sentence, so it was dropped: every
+  `* Row N` bullet and `####` heading ran into the line before it. The split
+  now covers the reply exactly (`_sentences` in `app/rag/citations.py`).
+  Panel and chat text built through the checker are otherwise unchanged.
+- **Spreadsheet figures read as the sheet shows them.** A float formula cell
+  was rendered with binary noise (`4532.849999999999`), which the model then
+  quoted. A cell's display text now follows its number format's decimal
+  places, or 12 significant digits for General; the exact value used by
+  `table_query` is unchanged. Existing workbooks show the new text after a
+  re-read (reload) of the document. Coverage: `tests/test_chat_formatting.py`.
+
+- **SIM-163: rejecting every analysis item and then uploading no longer leaves
+  Missing Information, Weaknesses and Risks empty.** The model was never told
+  what the lawyer dismissed, so it re-created the same items and the rejection
+  filter removed all of them. The analysis prompt now lists the dismissed
+  items, and a section the filter empties is refilled once with new items (the
+  refill is told what was dismissed too). No payload change. Coverage:
+  `tests/test_rejected_items_regeneration.py`.
+
+- **SIM-163: every upload panel is sent as soon as it is ready.** The tail
+  panels (List of Dates, Applicable Laws, Upcoming Dates, Relevant Parties,
+  Case Laws) were held until Strategy, Analysis and Drafting were sent, so they
+  arrived together. The hold is removed. The order of
+  `document_feature_response` events now follows completion; no payload
+  change. Coverage: `tests/test_parallel_panels.py`,
+  `tests/offline/verify_stuck_loaders.py`.
 
 - **SIM-163: rejecting a Missing Information or Risk/Weakness item now always
   raises the quality score.** The model used to decide whether a reject was

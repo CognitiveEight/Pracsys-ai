@@ -611,11 +611,10 @@ Replaces the earlier strict `PIPELINE_EMIT_ORDER` gate. The case owner chose on
   - the **priority lane** runs in the runner itself: strategy → analysis →
     drafting. Analysis report chips (one model call, about 20 s) run as a
     sibling task, so drafting does not wait for them;
-  - **emit hold:** each tail task sets `_HOLD_EMITS_UNTIL` (a per-run
-    `asyncio.Event`, `run_control.py`) in its own context.
-    `_emit_document_feature` awaits it before emitting. The lane sets it in
-    `finally`, also when the lane raises, so a held panel can never wait
-    forever. The tail panels then emit in completion order;
+  - **no emit hold:** every panel is sent the moment it is ready, in
+    completion order. (An earlier version held the tail panels until the
+    lane had emitted; testing showed the panels then arrived as one burst,
+    so the hold was removed.) A lane failure never blocks the tail;
   - **first build only** (`is_update=False`): once the tail is done, drafting
     runs once more, because laws and dates now exist. An update's drafting
     reads the previous laws and dates and is not repeated.

@@ -475,6 +475,8 @@ class AnalysisReportMixin:
                     + "\n"
                 )
 
+            rejected_items_block = self._build_rejected_items_block(workspace_id)
+
             # Tell the model exactly how many annexures exist so it cannot
             # invent "Annexure 2", "Annexure 3", ... when only one upload
             # is present. The post-processing clamp in
@@ -678,7 +680,7 @@ Carefully read the documents and identify key facts such as:
 
 Only treat something as "present" if it is explicitly stated in the documents.
 
-{removed_evidence_block}
+{removed_evidence_block}{rejected_items_block}
 --------------------------------------------------
 STEP 2 — MISSING INFORMATION VERIFICATION
 --------------------------------------------------
@@ -872,6 +874,7 @@ ENTITY-GROUNDING RULE (CRITICAL):
                 annexure_limit_block=annexure_limit_block,
                 current_year_ar=current_year_ar,
                 removed_evidence_block=removed_evidence_block,
+                rejected_items_block=rejected_items_block,
             )
 
             # Authoritative user corrections lead the prompt so they
@@ -1091,6 +1094,15 @@ Rules:
                 _upload_wording(x)
                 for x in missing_info
             ]
+            # Items the lawyer dismissed never come back. Filtering here (the
+            # emit-time tagging filters again) lets the refill below replace a
+            # section the filter emptied instead of emitting it blank.
+            emptied_by_rejection: List[str] = []
+            missing_info, _dropped = self._drop_rejected_analysis_items(
+                workspace_id, "missingInfo", missing_info
+            )
+            if _dropped and not missing_info:
+                emptied_by_rejection.append("missingInfo")
 
             strengths_raw = data.get("strengths") or []
             if not isinstance(strengths_raw, list):
@@ -1215,6 +1227,16 @@ Rules:
                 _upload_wording(x)
                 for x in risks
             ]
+            weaknesses, _dropped = self._drop_rejected_analysis_items(
+                workspace_id, "riskOrWeakness", weaknesses
+            )
+            if _dropped and not weaknesses:
+                emptied_by_rejection.append("weaknesses")
+            risks, _dropped = self._drop_rejected_analysis_items(
+                workspace_id, "riskOrWeakness", risks
+            )
+            if _dropped and not risks:
+                emptied_by_rejection.append("risks")
 
             relevant_jurisdiction = (
                 data.get("relevantJurisdiction")
@@ -1236,6 +1258,8 @@ Rules:
             # Final guardrail for repeatedly-empty critical sections:
             # force a focused regeneration and, if still empty, apply deterministic defaults.
             must_fill = []
+            if "missingInfo" in emptied_by_rejection:
+                must_fill.append("missingInfo")
             if len(weaknesses) == 0:
                 must_fill.append("weaknesses")
             if len(risks) == 0:
@@ -1246,7 +1270,7 @@ Rules:
                 try:
                     force_tail_prompt = (
                         """Return ONLY one valid JSON object with keys:
-weaknesses, risks, relevantJurisdiction
+missingInfo, weaknesses, risks, relevantJurisdiction
 
 Context:
 - Role: {}
@@ -1258,6 +1282,8 @@ Documents:
 
 Rules:
 - Use only annexure facts; do not invent.
+- missingInfo: provide 1-3 specific evidence or information gaps that are NOT
+  present in the documents (return [] if the documents genuinely leave none).
 - weaknesses: provide 1-3 specific vulnerability points.
 - risks: provide 1-3 concrete procedural/legal risks.
 - relevantJurisdiction: provide 1-3 likely forums/courts/authorities.
@@ -1269,7 +1295,7 @@ Rules:
                         current_case_summary,
                         current_strategic_objective,
                         combined_document_content,
-                    )
+                    ) + rejected_items_block
                     force_raw = await gemini_client.generate(
                         prompt=force_tail_prompt,
                         system_instruction=get_structured_document_feature_system_instruction(
@@ -1281,14 +1307,29 @@ Rules:
                     )
                     force_obj = json.loads((force_raw or "").strip())
                     if isinstance(force_obj, dict):
+                        if not missing_info and isinstance(force_obj.get("missingInfo"), list):
+                            missing_info, _ = self._drop_rejected_analysis_items(
+                                workspace_id,
+                                "missingInfo",
+                                [
+                                    _upload_wording(x)
+                                    for x in _coerce_analysis_text_list(
+                                        force_obj.get("missingInfo")
+                                    )[:10]
+                                ],
+                            )
                         if not weaknesses and isinstance(force_obj.get("weaknesses"), list):
-                            weaknesses = _coerce_analysis_text_list(
-                                force_obj.get("weaknesses")
-                            )[:8]
+                            weaknesses, _ = self._drop_rejected_analysis_items(
+                                workspace_id,
+                                "riskOrWeakness",
+                                _coerce_analysis_text_list(force_obj.get("weaknesses"))[:8],
+                            )
                         if not risks and isinstance(force_obj.get("risks"), list):
-                            risks = _coerce_analysis_text_list(
-                                force_obj.get("risks")
-                            )[:8]
+                            risks, _ = self._drop_rejected_analysis_items(
+                                workspace_id,
+                                "riskOrWeakness",
+                                _coerce_analysis_text_list(force_obj.get("risks"))[:8],
+                            )
                         if (not relevant_jurisdiction) and isinstance(
                             force_obj.get("relevantJurisdiction"), list
                         ):
@@ -2013,6 +2054,76 @@ Rules:
         except Exception:
             return False
         return False
+
+    def _drop_rejected_analysis_items(
+        self, workspace_id: str, section: str, items: List[str]
+    ) -> Tuple[List[str], int]:
+        """``items`` without the ones the lawyer rejected, and how many went.
+
+        A gap re-created by a document the lawyer deleted is kept: the same
+        exemption ``_tag_analysis_report_against_current_state`` applies.
+        """
+        if not items:
+            return items, 0
+        try:
+            exempt = {
+                item["text"]
+                for item in self._removed_evidence_missing_info_items(workspace_id)
+            }
+        except Exception:
+            exempt = set()
+        kept = [
+            s
+            for s in items
+            if s in exempt
+            or not self._is_previously_rejected_analysis_item(
+                workspace_id=workspace_id, section=section, candidate=s
+            )
+        ]
+        return kept, len(items) - len(kept)
+
+    _REJECTED_ITEMS_PROMPT_LIMIT = 30
+
+    def _build_rejected_items_block(self, workspace_id: str) -> str:
+        """The items the lawyer dismissed, for the analysis prompts.
+
+        Without it the model spends its missingInfo / weakness / risk slots
+        re-creating the dismissed items, the rejection filter removes them
+        all, and the gaps a new document raises are never generated: rejecting
+        everything and then uploading left the three sections empty.
+        """
+        current = self._workspace_rejected_analysis_items.get(workspace_id) or {}
+        if not isinstance(current, dict):
+            return ""
+        limit = self._REJECTED_ITEMS_PROMPT_LIMIT
+
+        def _lines(section: str) -> List[str]:
+            bucket = current.get(section)
+            if not isinstance(bucket, list):
+                return []
+            return [
+                f"- {str(v).strip()[:200]}"
+                for v in bucket[-limit:]
+                if isinstance(v, str) and v.strip()
+            ]
+
+        missing = _lines("missingInfo")
+        risk_weak = _lines("riskOrWeakness")
+        if not missing and not risk_weak:
+            return ""
+        parts = [
+            "--------------------------------------------------",
+            "DISMISSED BY THE LAWYER (do not output these, or any rewording of them)",
+            "--------------------------------------------------",
+            "The lawyer has reviewed and removed the items below. Never list them "
+            "again. Use the slots for OTHER gaps, weaknesses and risks that the "
+            "documents support, especially ones raised by recently added documents.",
+        ]
+        if missing:
+            parts += ["Dismissed missingInfo:", *missing]
+        if risk_weak:
+            parts += ["Dismissed weaknesses / risks:", *risk_weak]
+        return "\n".join(parts) + "\n"
 
     def _match_rejected_value(self, item: Any, rejected_value: str) -> bool:
         """Loose topical match: True when ``item`` is ABOUT ``rejected_value``.

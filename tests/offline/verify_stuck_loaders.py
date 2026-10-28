@@ -531,9 +531,14 @@ async def stuck_template_sync_no_answer():
     TEMPLATES["count"] = 0
     real_drafting = H.__dict__.pop("_generate_and_emit_drafting_suggestions")
     mark = len(EMITS)
+    lmark = len(LOGS)
     try:
         task = _schedule_upload(ws)
-        await _until(lambda: _template_requests() and _logged("stage case_laws took"))
+        # Drafting starts its in-lock wait right after the analysis stage ends
+        # (the tail panels are sent as they finish, so they are no cue).
+        await _until(lambda: _template_requests()
+                     and _logged("stage analysis_report took", lmark)
+                     and _logged("stage case_laws took", lmark))
         await _settle()
         check("the template request went out before the lock was needed",
               bool(_template_requests()))
@@ -550,8 +555,9 @@ async def stuck_template_sync_no_answer():
               len(H._pending_template_sync) >= 1)
 
         mark2 = len(EMITS)
+        lmark2 = len(LOGS)
         task2 = _schedule_upload(ws)
-        await _until(lambda: _logged("stage case_laws took") and
+        await _until(lambda: _logged("stage analysis_report took", lmark2) and
                      _count(ws, "case_laws", mark2) == 1)
         await _settle()
         _advance(5.1)
@@ -820,8 +826,13 @@ async def stuck_runner_cancelled():
     counts = {f: _count(ws, f, mark) for f in RELEASABLE}
     check("every armed feature gets exactly one terminal emit",
           all(c == 1 for c in counts.values()), detail=str(counts))
+    # Panels finished before the cancel were sent fresh (nothing holds them);
+    # the blocked one and the lane's unsent drafting are settled from cache.
     check("the unemitted ones come from cache",
-          all(_origin(_emits(ws, f, mark)[0]) == "cached" for f in RELEASABLE[2:]))
+          all(_origin(_emits(ws, f, mark)[0]) == "cached"
+              for f in ("list_of_dates", "drafting_assistant"))
+          and all(_origin(_emits(ws, f, mark)[0]) in ("cached", "fresh")
+                  for f in RELEASABLE[2:]))
     check("the blocked step was itself cancelled", "list_of_dates" in CANCELLED)
     check("the lock is free", not H._workspace_pipeline_lock(ws).locked())
 

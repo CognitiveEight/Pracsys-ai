@@ -51,11 +51,17 @@ _HOLD = "\u2024"  # one-dot leader: stands in for a protected full stop
 
 
 def _sentences(text: str):
-    """(start, sentence) pairs; full stops after legal abbreviations and inside
-    numbers (6.5, 2.1) do not end a sentence."""
+    """(start, sentence) pairs covering ``text`` exactly; full stops after legal
+    abbreviations and inside numbers (6.5, 2.1) do not end a sentence.
+
+    Every character lands in some sentence, so joining them rebuilds the
+    text: a line break straight after a full stop ("... [E2].\n* Row 3") is a
+    sentence of its own. Requiring one non-break character dropped those
+    breaks, which ran bullet lists and headings into one paragraph.
+    """
     protected = _ABBREV_RE.sub(lambda m: m.group(0)[:-1] + _HOLD, text)
     protected = re.sub(r"(?<=\d)\.(?=\d)", _HOLD, protected)
-    for m in re.finditer(r"[^.!?\n]+(?:[.!?]+|\n|$)", protected):
+    for m in re.finditer(r"[^.!?\n]*(?:[.!?]+|\n|$)", protected):
         if m.group(0):
             yield m.start(), text[m.start() : m.end()]
 _WORD_RE = re.compile(r"[a-z0-9]+")

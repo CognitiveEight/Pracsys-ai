@@ -485,8 +485,8 @@ class RejectionFeedbackItem(BaseModel):
 
     section: Literal["missingInfo", "riskOrWeakness"]
     rejectedValue: str  # echoes AnalysisReportFeedbackPayload.rejectedValue
-    isValidRejection: bool  # False: the item is still a real gap or risk
-    scoreIncrease: int  # 0-5, as judged for this item
+    isValidRejection: bool  # True when the reject removed an item; False if already removed
+    scoreIncrease: int  # section weight (missingInfo 5, weakness 5, risk 3); 0 when stale
     reason: str  # one sentence for the lawyer; empty when none was produced
 
 

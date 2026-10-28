@@ -48,7 +48,7 @@ from app.prompts.analysis_report_prompts import (
     generate_analysis_report_from_documents_prompt2,
     ensure_structured_relevant_jurisdiction_prompt,
     ensure_quality_score_explanation_prompt,
-    compute_rejection_score_delta_prompt,
+    rejection_reason_prompt,
     compute_added_missing_info_score_delta_prompt,
 )
 from app.core.roles import DEFAULT_WORKSPACE_ROLE
@@ -125,6 +125,9 @@ def _indexes_of_rejected_item(items: List[Any], value: str) -> List[int]:
 
 
 _STALE_REJECTION_REASON = "This item was already removed, so the score is unchanged."
+_APPLIED_REJECTION_REASON = (
+    "Removed from the report; the readiness score reflects one fewer open item."
+)
 
 
 def _rejection_feedback_item(
@@ -2403,11 +2406,12 @@ Rules:
                         or current_report.get("case_resolution_score")
                         or 0
                     )
-                    delta = min(
-                        5, max(0, removed_missing * 2 + removed_weak + removed_risk)
+                    weights = self._REJECTION_SCORE_INCREASE
+                    delta = (
+                        removed_missing * weights["missingInfo"]
+                        + removed_weak * weights["weaknesses"]
+                        + removed_risk * weights["risks"]
                     )
-                    if delta < 1:
-                        delta = 1
 
                     # Cap based on pending items
                     new_max_allowed = self._analysis_report_max_allowed_score(
@@ -2482,52 +2486,32 @@ Rules:
             ),
         }
 
-    async def _compute_rejection_score_delta(
+    async def _rejection_reason(
         self,
-        current_score: int,
         section: str,
         rejected_value: str,
         report: Dict[str, Any],
         workspace_id: str = "",
-    ) -> Tuple[bool, int, str]:
-        """
-        Ask AI to (a) decide if the user's rejection is VALID — i.e. the rejected
-        item is genuinely not relevant to this specific case — and (b) compute a
-        score INCREASE (1-5) when valid. The system will ADD the returned delta
-        to the current case resolution score.
+    ) -> str:
+        """The one-sentence reason shown beside the score after a reject.
 
-        - Valid rejection (item truly not relevant) → isValidRejection=true,
-          scoreIncrease 1-5.
-        - Invalid rejection (item IS relevant; user is dismissing a real gap) →
-          isValidRejection=false, scoreIncrease=0.
-
-        Returns (is_valid_rejection, delta, reason). On AI failure returns
-        (True, default_bump, generic reason) so the legacy "always bump" behaviour
-        is preserved when Gemini is unavailable.
+        The score itself is not the model's call: every reject that removes an
+        item raises it by the section weight (``_REJECTION_SCORE_INCREASE``).
+        The model only says, for the lawyer, what removing the item means.
+        Falls back to a fixed sentence when the model is unavailable or its
+        output cannot be parsed.
         """
         try:
             from app.ai.gemini_client import gemini_client
 
             gemini_client.initialize()
             if not gemini_client.is_available():
-                return (
-                    True,
-                    self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT,
-                    "Score adjusted to reflect user rejection.",
-                )
-            remaining_missing = len(
-                report.get("missingInfo") or report.get("missing_info") or []
-            )
-            remaining_weak = len(report.get("weaknesses") or [])
-            remaining_risks = len(report.get("risks") or [])
+                return _APPLIED_REJECTION_REASON
 
             # The case description lives in the STRATEGY payload, not in the
             # analysis report: _generate_analysis_report_from_documents never
-            # writes caseSummary / reportCaseSummary / strategicObjective, so
-            # reading them off `report` always yielded "" and the prompt below
-            # rendered the literal "(not available)" — i.e. this scoring call
-            # judged relevance with no case description at all. Fall back to
-            # `report` so a caller that does pass an enriched dict still works.
+            # writes caseSummary / reportCaseSummary / strategicObjective. Fall
+            # back to `report` so a caller that passes an enriched dict works.
             _strategy_src = (
                 self._workspace_strategy_payload.get(workspace_id) or {}
                 if workspace_id
@@ -2554,154 +2538,71 @@ Rules:
                 or ""
             ).strip()
 
-            # Build short context: other items in the same section so the model can judge relative impact
+            # Other items in the same section, so the sentence can say what remains.
             section_items: List[str] = []
             if section == "missingInfo":
-                for x in report.get("missingInfo") or report.get("missing_info") or []:
-                    t = x.get("point", x) if isinstance(x, dict) else x
-                    if isinstance(t, str) and t.strip():
-                        section_items.append(t.strip()[:120])
+                pool = report.get("missingInfo") or report.get("missing_info") or []
             else:
-                for x in (report.get("weaknesses") or []) + (report.get("risks") or []):
-                    t = x.get("point", x) if isinstance(x, dict) else x
-                    if isinstance(t, str) and t.strip():
-                        section_items.append(t.strip()[:120])
+                pool = (report.get("weaknesses") or []) + (report.get("risks") or [])
+            for x in pool:
+                t = _analysis_item_text(x)
+                if t:
+                    section_items.append(t[:120])
             section_context = (
                 "Other items in this section (for context): "
                 + "; ".join(section_items[:8])
                 if section_items
                 else ""
             )
-            # When this rejection leaves no items in any category, score can reach 100%; otherwise capped at 95%
-            can_reach_100 = (
-                remaining_missing == 0 and remaining_weak == 0 and remaining_risks == 0
+            prompt = rejection_reason_prompt(
+                case_summary=case_summary,
+                rejected_value=rejected_value,
+                report_summary=report_summary,
+                section=section,
+                section_context=section_context,
+                strategic_objective=strategic_objective,
             )
-            prompt = compute_rejection_score_delta_prompt(can_reach_100=can_reach_100, case_summary=case_summary, current_score=current_score, rejected_value=rejected_value, remaining_missing=remaining_missing, remaining_risks=remaining_risks, remaining_weak=remaining_weak, report_summary=report_summary, section=section, section_context=section_context, strategic_objective=strategic_objective)
             raw = await gemini_client.generate(
                 prompt=prompt,
                 system_instruction=get_structured_document_feature_system_instruction(
                     None
                 ),
                 temperature=0.3,
-                max_tokens=12000,
+                max_tokens=2000,
                 response_mime_type="application/json",
             )
             raw = (raw or "").strip()
             if not raw or is_generation_error(raw):
                 logger.warning(
-                    "Rejection score delta: Gemini error or empty; using default. raw={}",
+                    "Rejection reason: model error or empty; using default. raw={}",
                     chars(raw),
                 )
-                return (
-                    True,
-                    self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT,
-                    "Score adjusted to reflect user rejection.",
+                return _APPLIED_REJECTION_REASON
+            reason = ""
+            json_str = self._prepare_json_candidate(raw, prefer="object")
+            if json_str:
+                try:
+                    obj = json.loads(json_str)
+                    if isinstance(obj, dict):
+                        reason = str(obj.get("reason") or "").strip()
+                except json.JSONDecodeError:
+                    reason = ""
+            if not reason:
+                match = re.search(r'"reason"\s*:\s*"([^"]*)"', raw)
+                reason = match.group(1).strip() if match else ""
+            if not reason:
+                logger.warning(
+                    "Rejection reason: could not parse response; using default. raw={}",
+                    chars(raw),
                 )
-            # Strip markdown code blocks if present
-            if "```" in raw:
-                match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
-                if match:
-                    raw = match.group(1).strip()
-                else:
-                    raw = re.sub(r"^```\w*\s*", "", raw)
-                    raw = re.sub(r"\s*```\s*$", "", raw)
-            obj: Optional[Dict[str, Any]] = None
-            start = raw.find("{")
-            if start >= 0:
-                depth = 0
-                for i in range(start, len(raw)):
-                    if raw[i] == "{":
-                        depth += 1
-                    elif raw[i] == "}":
-                        depth -= 1
-                        if depth == 0:
-                            try:
-                                obj = json.loads(raw[start : i + 1])
-                            except json.JSONDecodeError:
-                                obj = None
-                            break
-
-            def _coerce_bool(value: Any, default: bool) -> bool:
-                if isinstance(value, bool):
-                    return value
-                if isinstance(value, (int, float)):
-                    return bool(value)
-                if isinstance(value, str):
-                    return value.strip().lower() in ("true", "yes", "1")
-                return default
-
-            if obj and isinstance(obj, dict) and "scoreIncrease" in obj:
-                is_valid = _coerce_bool(
-                    obj.get("isValidRejection", obj.get("is_valid_rejection")),
-                    default=True,
-                )
-                delta = int(
-                    obj.get("scoreIncrease", self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT)
-                )
-                if not is_valid:
-                    delta = 0
-                else:
-                    delta = max(1, min(5, delta))  # Rejection bump 1-5 as per prompt
-                    if current_score + delta > 100:
-                        delta = max(0, 100 - current_score)
-                reason = (
-                    obj.get("reason") or "Score adjusted based on rejection priority."
-                ).strip()
-                logger.info(
-                    "Rejection score delta: AI isValid={} delta={}, reason={}",
-                    is_valid,
-                    delta,
-                    chars(reason),
-                )
-                return (is_valid, delta, reason[:300])
-            # Regex fallback: extract scoreIncrease from raw text (e.g. malformed or truncated JSON)
-            num_match = re.search(
-                r'"scoreIncrease"\s*:\s*(\d+)|scoreIncrease"\s*:\s*(\d+)|\bscoreIncrease\s*:\s*(\d+)',
-                raw,
-            )
-            if num_match:
-                valid_match = re.search(
-                    r'"isValidRejection"\s*:\s*(true|false)',
-                    raw,
-                    flags=re.IGNORECASE,
-                )
-                is_valid = (
-                    valid_match.group(1).strip().lower() == "true"
-                    if valid_match
-                    else True
-                )
-                delta = int(
-                    num_match.group(1) or num_match.group(2) or num_match.group(3) or 0
-                )
-                if not is_valid:
-                    delta = 0
-                else:
-                    delta = max(1, min(5, delta))  # Rejection bump 1-5 as per prompt
-                    if current_score + delta > 100:
-                        delta = max(0, 100 - current_score)
-                reason_match = re.search(r'"reason"\s*:\s*"([^"]*)"', raw)
-                reason = (
-                    reason_match.group(1).strip()
-                    if reason_match
-                    else "Score adjusted based on rejection priority."
-                )[:200]
-                logger.info(
-                    "Rejection score delta: parsed via regex isValid={} delta={}",
-                    is_valid,
-                    delta,
-                )
-                return (is_valid, delta, reason)
-            logger.warning(
-                "Rejection score delta: could not parse response; using default. raw={}",
-                chars(raw),
-            )
+                return _APPLIED_REJECTION_REASON
+            return reason[:300]
+        except asyncio.CancelledError:
+            logger.info("Rejection reason: cancelled")
+            raise
         except Exception as e:
-            logger.warning("Rejection score delta failed: {}; using default bump", e)
-        return (
-            True,
-            self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT,
-            "Score adjusted to reflect user rejection.",
-        )
+            logger.warning("Rejection reason failed: {}; using default", e)
+        return _APPLIED_REJECTION_REASON
 
     async def _retag_analysis_report_safe(
         self, workspace_id: str, report: Dict[str, Any]
@@ -2729,11 +2630,11 @@ Rules:
 
         - The matching item is always removed from the list (the user explicitly
           rejected it).
-        - The AI then judges whether the rejection itself is VALID — i.e. the
-          rejected item is genuinely not relevant to this case.
-            - VALID rejection → caseResolutionScore is bumped 1–5.
-            - INVALID rejection (item IS relevant; user dismissed a real gap) →
-              score is unchanged.
+        - caseResolutionScore rises by the weight of each list the item left
+          (``_REJECTION_SCORE_INCREASE``: missing info 5, weakness 5, risk 3),
+          capped at 95% while any item remains. The model only writes the
+          reason shown beside the score; it does not decide the increase.
+        - A reject that matches nothing (already removed) adds nothing.
         - qualityScoreExplanation and reportQualityScoreExplanation are
           regenerated either way, and the analysis report is always re-emitted
           so the FE loader clears.
@@ -2954,10 +2855,10 @@ Rules:
         )
 
         # Pass 1: remove every matching item up front. We collect the events
-        # that actually removed something so the score-delta calls only run for
-        # real removals, not stale duplicates.
+        # that actually removed something, with the score each one adds, so
+        # stale duplicates add nothing.
         removed_events: list[dict] = []
-        for ev in events:
+        for position, ev in enumerate(events):
             section = ev["section"]
             rejected_value = ev["rejected_value"]
             # The same item in our wording, when a rebuild re-worded it.
@@ -2969,7 +2870,8 @@ Rules:
             def _drop(items: List[Any]) -> Set[int]:
                 return {i for v in values for i in _indexes_of_rejected_item(items, v)}
 
-            removed_here = False
+            # The score rises by the weight of each list the item left.
+            increase = 0
             if section == "missingInfo":
                 missing = (
                     report.get("missingInfo") or report.get("missing_info") or []
@@ -2979,7 +2881,7 @@ Rules:
                     new_missing = [x for i, x in enumerate(missing) if i not in drop]
                     if len(new_missing) < len(missing):
                         report["missingInfo"] = new_missing
-                        removed_here = True
+                        increase += self._REJECTION_SCORE_INCREASE["missingInfo"]
             else:
                 weaknesses = report.get("weaknesses") or []
                 if isinstance(weaknesses, list):
@@ -2987,16 +2889,16 @@ Rules:
                     new_weak = [x for i, x in enumerate(weaknesses) if i not in drop]
                     if len(new_weak) < len(weaknesses):
                         report["weaknesses"] = new_weak
-                        removed_here = True
+                        increase += self._REJECTION_SCORE_INCREASE["weaknesses"]
                 risks = report.get("risks") or []
                 if isinstance(risks, list):
                     drop = _drop(risks)
                     new_risks = [x for i, x in enumerate(risks) if i not in drop]
                     if len(new_risks) < len(risks):
                         report["risks"] = new_risks
-                        removed_here = True
+                        increase += self._REJECTION_SCORE_INCREASE["risks"]
 
-            if removed_here:
+            if increase:
                 for value in values:
                     self._record_rejected_analysis_item(
                         workspace_id=workspace_id,
@@ -3009,7 +2911,7 @@ Rules:
                         "({} re-worded cached item(s))",
                         len(aliases),
                     )
-                removed_events.append(ev)
+                removed_events.append({**ev, "score_increase": increase, "position": position})
 
         if not removed_events:
             # Every rejection was stale (already removed). Just refresh the
@@ -3032,54 +2934,43 @@ Rules:
                 )
             return
 
-        # Pass 2: validity check + score delta for each real removal, in parallel.
-        delta_tasks = [
-            self._compute_rejection_score_delta(
-                current_score=old_score,
-                section=ev["section"],
-                rejected_value=ev["rejected_value"],
-                report=report,
-                workspace_id=workspace_id,
-            )
-            for ev in removed_events
-        ]
-        delta_results = await asyncio.gather(*delta_tasks, return_exceptions=True)
+        # Pass 2: every real removal raises the score by its section weight;
+        # the model only writes the reason shown beside the score.
+        reason_results = await asyncio.gather(
+            *(
+                self._rejection_reason(
+                    section=ev["section"],
+                    rejected_value=ev["rejected_value"],
+                    report=report,
+                    workspace_id=workspace_id,
+                )
+                for ev in removed_events
+            ),
+            return_exceptions=True,
+        )
 
         total_delta = 0
-        feedback = [_stale_rejection_feedback(ev) for ev in events if ev not in removed_events]
-        for ev, result in zip(removed_events, delta_results):
-            if isinstance(result, BaseException):
+        removed_positions = {ev["position"] for ev in removed_events}
+        feedback = [
+            _stale_rejection_feedback(ev)
+            for position, ev in enumerate(events)
+            if position not in removed_positions
+        ]
+        for ev, reason in zip(removed_events, reason_results):
+            if isinstance(reason, asyncio.CancelledError):
+                raise reason
+            if isinstance(reason, BaseException):
                 logger.warning(
-                    "analysis_report_feedback batch: score-delta call failed for {}: {}",
+                    "analysis_report_feedback batch: reason call failed for {}: {}",
                     chars(ev["rejected_value"]),
-                    result,
+                    reason,
                 )
-                feedback.append(_rejection_feedback_item(
-                    ev, is_valid=False, increase=0,
-                    reason="The readiness score could not be re-assessed for this item.",
-                ))
-                continue
-            is_valid, delta, reason = result
+                reason = _APPLIED_REJECTION_REASON
+            increase = int(ev["score_increase"])
             feedback.append(_rejection_feedback_item(
-                ev, is_valid=is_valid, increase=int(delta or 0) if is_valid else 0,
-                reason=reason,
+                ev, is_valid=True, increase=increase, reason=reason,
             ))
-            if not is_valid:
-                logger.info(
-                    "analysis_report_feedback batch: rejection judged INVALID — no score bump for {}",
-                    chars(ev["rejected_value"]),
-                )
-                continue
-            total_delta += int(delta or 0)
-
-        # Cap the batch's combined score bump.
-        if total_delta > self._feedback_batch_max_score_delta:
-            logger.info(
-                "analysis_report_feedback batch: capping combined score delta {}  {}",
-                total_delta,
-                self._feedback_batch_max_score_delta,
-            )
-            total_delta = self._feedback_batch_max_score_delta
+            total_delta += increase
 
         new_score = min(100, old_score + total_delta)
         max_allowed = self._analysis_report_max_allowed_score(report=report)

@@ -45,6 +45,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SIM-163: rejecting a Missing Information or Risk/Weakness item now always
+  raises the quality score.** The model used to decide whether a reject was
+  "valid", and since every item comes from the case's own documents it nearly
+  always said no, so the score stayed put. A reject that removes an item now
+  adds a fixed amount: 5 for missing information, 5 for a weakness, 3 for a
+  risk (the same weights the score deducts per open item). The score is still
+  capped at 95% while any item remains, and reaches 100% only when none do. A
+  bulk reject counts every item (the old 15-point batch cap is gone). The model
+  now writes only the `reason` sentence. A reject of an item already removed
+  adds nothing. The chat "lawyer-provided updates" path uses the same weights.
+  No schema change: `rejectionFeedback.items[].isValidRejection` is `true` for
+  every applied reject and `scoreIncrease` is the section weight. Coverage:
+  `tests/test_reject_matching.py`.
+
 - **SIM-163: rejecting one Analysis Report item no longer removes the others.**
   A reject removed every item sharing two informative words with the rejected
   text, so on a case whose gaps all mention the same documents one reject

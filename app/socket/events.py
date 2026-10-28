@@ -300,10 +300,6 @@ class SocketEventHandler(
         self._pending_feedback_task: Dict[str, asyncio.Task] = {}
         # Window for collecting bulk-reject bursts before flushing.
         self._feedback_debounce_seconds: float = 0.5
-        # Max total score bump from a single batch (each valid rejection
-        # contributes 1–5; capping the sum prevents huge scores when the user
-        # rejects many items at once).
-        self._feedback_batch_max_score_delta: int = 15
         # Chat attachment cache: chat_id -> list of {fileName, content} so follow-up questions in same chat see the document
         self._chat_attachment_by_chat: Dict[str, List[Dict[str, Any]]] = {}
         # Intelligence chat: last assistant text per chat_id (client may omit conversation_history)
@@ -598,7 +594,9 @@ class SocketEventHandler(
         """Map any role wording to a canonical Title-Case role; default 'Other'."""
         return cls._PARTY_ROLE_MAP.get(str(raw or "").strip().upper(), "Other")
 
-    _ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT = 4
+    # What a reject that removes an item adds to caseResolutionScore: the same
+    # weights _derive_case_resolution_score deducts per open item.
+    _REJECTION_SCORE_INCREASE = {"missingInfo": 5, "weaknesses": 5, "risks": 3}
 
     _ADDED_MISSING_INFO_SCORE_DROP_DEFAULT = 3
 

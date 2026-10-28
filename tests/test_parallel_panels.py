@@ -197,7 +197,11 @@ def test_cancel_cancels_children(run):
 
     async def _go():
         task = asyncio.create_task(_pipeline(run, is_update=True))
-        while "case_laws" not in run.started or "strategy_objective" not in run.started:
+        # Cancel only once the other tail panels are on the wire, so the test
+        # does not depend on how fast the machine runs their 0.01 s of work.
+        finished = [f for f in TAIL if f != "case_laws"]
+        while ("case_laws" not in run.started or "strategy_objective" not in run.started
+               or not all(f in run.sent for f in finished)):
             await asyncio.sleep(0.01)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):

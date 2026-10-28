@@ -1,8 +1,8 @@
 """Upload pipeline with concurrent panels (SIM-163 Phase 1, steps 2, 3, 14).
 
 Strategy -> analysis -> drafting is the priority lane; dates, laws, timeline,
-parties and case laws generate alongside it and are sent only after it. The
-real emit chokepoint runs (the hold lives there); generators, the socket and
+parties and case laws generate alongside it, and every panel is sent the moment
+it is ready. The real emit chokepoint runs; generators, the socket and
 persistence are fakes. Fictional data only; no model, Qdrant or socket calls.
 """
 
@@ -126,11 +126,22 @@ def _pipeline(r, *, is_update):
     )
 
 
-def test_priority_three_emit_first(run):
+def test_ready_panels_are_sent_at_once(run):
     run.delay["strategy_objective"] = 0.2  # every tail panel is ready long before
     asyncio.run(_pipeline(run, is_update=True))
-    assert run.sent[:3] == PRIORITY
-    assert sorted(run.sent[3:]) == sorted(TAIL)
+    # Nothing waits for the priority lane: the tail panels go out first, then
+    # the lane in its own order.
+    assert sorted(run.sent[:5]) == sorted(TAIL)
+    assert run.sent[5:] == PRIORITY
+
+
+def test_each_panel_is_sent_when_it_finishes(run):
+    # Staggered finish times: the wire order follows them, not a batch.
+    for i, feature in enumerate(TAIL):
+        run.delay[feature] = 0.05 * (len(TAIL) - i)
+    run.delay["strategy_objective"] = 0.5
+    asyncio.run(_pipeline(run, is_update=True))
+    assert run.sent[:5] == list(reversed(TAIL))
 
 
 def test_tail_overlaps_strategy(run):
@@ -149,10 +160,11 @@ def test_sequential_flag(run, monkeypatch):
 
 def test_first_build_refreshes_drafting(run):
     asyncio.run(_pipeline(run, is_update=False))
-    assert run.sent[:3] == PRIORITY
     assert run.sent[-1] == "drafting_assistant"
     assert run.sent.count("drafting_assistant") == 2
-    assert set(run.sent[3:-1]) == set(TAIL)
+    assert sorted(f for f in run.sent if f in TAIL) == sorted(TAIL)
+    lane = [f for f in run.sent if f in PRIORITY]
+    assert lane[:3] == PRIORITY
 
 
 def test_update_drafts_once(run):
@@ -163,21 +175,20 @@ def test_update_drafts_once(run):
 def test_failed_tail_panel_settles(run):
     run.fail.add("applicable_laws")
     asyncio.run(_pipeline(run, is_update=True))
-    assert run.sent[:3] == PRIORITY
+    assert [f for f in run.sent if f in PRIORITY] == PRIORITY
     # The failed panel still gets its one terminal emit (from cache, or empty),
     # and no other panel is cancelled by the failure.
-    assert sorted(run.sent[3:]) == sorted(TAIL)
+    assert sorted(f for f in run.sent if f in TAIL) == sorted(TAIL)
     assert run.cancelled == []
 
 
-def test_lane_failure_opens_hold(run, monkeypatch):
+def test_lane_failure_does_not_block_other_panels(run, monkeypatch):
     async def _broken(**_kw):
         raise RuntimeError("analysis emit failed (fictional)")
 
     monkeypatch.setattr(run.h, "_emit_analysis_report", _broken)
     asyncio.run(asyncio.wait_for(_pipeline(run, is_update=True), timeout=5))
-    assert run.sent[0] == "strategy_objective"
-    assert sorted(run.sent[1:]) == sorted(TAIL)
+    assert sorted(run.sent) == sorted(["strategy_objective", *TAIL])
 
 
 def test_cancel_cancels_children(run):
@@ -195,8 +206,9 @@ def test_cancel_cancels_children(run):
     asyncio.run(asyncio.wait_for(_go(), timeout=5))
     assert "strategy_objective" in run.cancelled
     assert "case_laws" in run.cancelled
-    # Panels that finished generating were still held: nothing reached the wire.
-    assert run.sent == []
+    # Panels that finished before the cancel were sent; the cancelled ones were not.
+    assert "strategy_objective" not in run.sent and "case_laws" not in run.sent
+    assert sorted(run.sent) == sorted(f for f in TAIL if f != "case_laws")
 
 
 # -- entity cache keyed by the document set -------------------------------------

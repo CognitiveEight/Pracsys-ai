@@ -45,7 +45,6 @@ from app.socket.event_utils import (
     _roman_or_int,
 )
 from app.core.roles import DEFAULT_WORKSPACE_ROLE
-from app.socket.handlers.run_control import _HOLD_EMITS_UNTIL
 
 
 # Edit verbs recognised by the cheap panel-edit precheck in
@@ -427,13 +426,6 @@ class ChatMixin:
             from app.rag.attribution import attach_panel_citations
 
             await attach_panel_citations(workspace_id, feature_type, payload)
-
-        # An upload's tail panel generated while the priority panels were still
-        # running is held here until they are sent. Waiting before the usage
-        # drain below keeps each emit's spend measured at the time it is sent.
-        hold = _HOLD_EMITS_UNTIL.get()
-        if hold is not None and not hold.is_set():
-            await hold.wait()
 
         try:
             if usage is not None:

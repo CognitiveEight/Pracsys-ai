@@ -46,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SIM-163: rejecting every analysis item and then uploading no longer leaves
+  Missing Information, Weaknesses and Risks empty.** The model was never told
+  what the lawyer dismissed, so it re-created the same items and the rejection
+  filter removed all of them. The analysis prompt now lists the dismissed
+  items, and a section the filter empties is refilled once with new items (the
+  refill is told what was dismissed too). No payload change. Coverage:
+  `tests/test_rejected_items_regeneration.py`.
+
 - **SIM-163: every upload panel is sent as soon as it is ready.** The tail
   panels (List of Dates, Applicable Laws, Upcoming Dates, Relevant Parties,
   Case Laws) were held until Strategy, Analysis and Drafting were sent, so they

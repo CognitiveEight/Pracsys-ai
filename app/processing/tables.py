@@ -37,7 +37,7 @@ from __future__ import annotations
 import datetime as _dt
 import re
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from io import BytesIO
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -214,6 +214,47 @@ def format_number(value: Any) -> str:
     return text
 
 
+#: Significant digits a float cell is shown with when its format names no
+#: decimal places. Excel's General format shows about as many; it removes
+#: binary noise from formula results (4532.849999999999 -> 4532.85).
+_DISPLAY_SIGNIFICANT_DIGITS = 12
+
+_FORMAT_PLACES_RE = re.compile(r"\.([0#?]+)")
+
+
+def _format_places(number_format: Optional[str]) -> Optional[int]:
+    """Decimal places a cell's number format shows, or None when it does not
+    say (General, empty, or no digit placeholders)."""
+    section = (number_format or "").split(";", 1)[0]
+    section = re.sub(r'"[^"]*"|\[[^\]]*\]', "", section)  # literals, colours
+    if not re.search(r"[0#?]", section):
+        return None
+    m = _FORMAT_PLACES_RE.search(section)
+    return len(m.group(1)) if m else 0
+
+
+def _display_number(value: Any, number_format: Optional[str] = None) -> str:
+    """How a number cell reads, the way the spreadsheet shows it.
+
+    Only the display text is rounded: ``Cell.value`` keeps the exact number,
+    so computed totals are unchanged. Integers are never touched.
+    """
+    if not isinstance(value, float):
+        return format_number(value)
+    d = _decimal(value)
+    if d is None:
+        return ""
+    places = _format_places(number_format)
+    if places is not None:
+        # Spreadsheets round half away from zero (2.5 -> 3), not half-even.
+        d = d.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+    elif d != 0:
+        exponent = d.adjusted() - _DISPLAY_SIGNIFICANT_DIGITS + 1
+        if exponent < 0:
+            d = d.quantize(Decimal(1).scaleb(exponent), rounding=ROUND_HALF_UP)
+    return format_number(d)
+
+
 def format_indian(value: Any, places: Optional[int] = None) -> str:
     """Indian digit grouping (12,34,56,789.50), as a lawyer would write it."""
     d = _decimal(value)
@@ -318,8 +359,8 @@ def make_cell(raw: Any, number_format: Optional[str] = None) -> Cell:
             # Stored as a fraction (0.155), shown as a percentage (15.5%).
             pct = _decimal(value) * 100
             value = int(pct) if pct == pct.to_integral_value() else float(pct)
-            return Cell(format_number(value) + "%", value, KIND_NUMBER)
-        return Cell(format_number(value), value, KIND_NUMBER)
+            return Cell(_display_number(value, number_format) + "%", value, KIND_NUMBER)
+        return Cell(_display_number(value, number_format), value, KIND_NUMBER)
     text = _clean_text(raw)
     if not text:
         return Cell("", None, KIND_TEXT)

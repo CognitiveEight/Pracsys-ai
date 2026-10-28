@@ -46,6 +46,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Chat replies keep their bullet points and headings.** The citation checker
+  splits a reply into sentences and joins them back, and a line break straight
+  after a full stop was never part of any sentence, so it was dropped: every
+  `* Row N` bullet and `####` heading ran into the line before it. The split
+  now covers the reply exactly (`_sentences` in `app/rag/citations.py`).
+  Panel and chat text built through the checker are otherwise unchanged.
+- **Spreadsheet figures read as the sheet shows them.** A float formula cell
+  was rendered with binary noise (`4532.849999999999`), which the model then
+  quoted. A cell's display text now follows its number format's decimal
+  places, or 12 significant digits for General; the exact value used by
+  `table_query` is unchanged. Existing workbooks show the new text after a
+  re-read (reload) of the document. Coverage: `tests/test_chat_formatting.py`.
+
 - **SIM-163: rejecting every analysis item and then uploading no longer leaves
   Missing Information, Weaknesses and Risks empty.** The model was never told
   what the lawyer dismissed, so it re-created the same items and the rejection

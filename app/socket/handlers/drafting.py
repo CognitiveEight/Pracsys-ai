@@ -217,10 +217,10 @@ class DraftingMixin:
             from app.langgraph.drafting_agent import drafting_agent
 
             role_upper = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper() or DEFAULT_WORKSPACE_ROLE
-            # Make sure the lawyer's template library is loaded into the
+            # Make sure the global template library is loaded into the
             # in-memory store BEFORE pre-matching. The backend only pushes
-            # template_sync on upload/rename/delete, so after an AI restart
-            # the store is cold — request a full snapshot and wait for it.
+            # global_template_sync on publish/retire/delete, so after an AI
+            # restart the store is cold — request a full snapshot and wait.
             if templates_ready is not None:
                 if not templates_ready.done():
                     await asyncio.wait(
@@ -234,7 +234,7 @@ class DraftingMixin:
                         settings.template_sync_in_lock_wait_seconds,
                     )
             else:
-                await self.ensure_templates_synced(user_id)
+                await self.ensure_templates_synced()
             brief = self._build_case_brief_for_drafting(workspace_id)
             suggestions = await drafting_agent.suggest(
                 role=role_upper,

@@ -25,7 +25,7 @@ Covers the fixes in a6f1e6b and 13ee4f9:
   * role: nothing known → PETITIONER; workspace_created with an empty or an
     invalid role stores PETITIONER;
   * logs: ``validation_fields`` never carries an input value; the case-law,
-    law-relevance and template_sync invalid-payload paths log none either.
+    law-relevance and global template sync invalid-payload paths log none either.
 
 Real handlers with Qdrant, the document processor, the generators, audit and
 the socket stubbed. No API key, no backend, no Qdrant, no GCS.
@@ -560,8 +560,8 @@ async def check_transfer():
     drafted = []
     synced = []
 
-    async def _ensure_synced(user_id, force=False):
-        synced.append(user_id)
+    async def _ensure_synced(*, timeout=None, force=False):
+        synced.append(force)
         await gate.wait()
 
     async def _draft(workspace_id, user_id, workspace_role=None, **_kw):
@@ -825,45 +825,29 @@ async def check_log_safety():
     check("applicable_law_relevance_request: invalid payload logs no input values",
           not _leaked(mark), detail=str(_leaked(mark))[:300])
 
-    # template_sync / template_sync_response: invalid payloads. The planted
-    # values sit in fields the validator rejects (template entries, a non-int
-    # count, an unknown action).
-    def _invalid_lines(mark, prefix):
-        return [m for _, m in _logs_since(mark)
-                if m.startswith(prefix) and SECRET in m]
-
-    def _received_lines(mark, prefix):
+    # global_template_sync / global_template_sync_response: invalid payloads.
+    # The planted values sit in fields the validator rejects (template entries,
+    # a non-int count, an unknown action).
+    def _secret_lines(mark, prefix):
         return [m for _, m in _logs_since(mark)
                 if m.startswith(prefix) and SECRET in m]
 
     mark = len(LOGS)
-    await H.handle("template_sync", {
-        "action": SECRET, "userId": OWNER,
-        "templates": [{"name": SECRET, "fileUrl": SECRET}]})  # id etc. missing
-    ts_mark = mark
-    # APP BUG (kept failing on purpose): the invalid-payload line still prints
-    # the raw `action` (template_sync.py:61-62), the very value that failed
-    # validation; validation_fields() was applied only to the error part.
-    check("[APP BUG template_sync.py:62] template_sync: the invalid-payload line "
-          "logs no input values",
-          not _invalid_lines(mark, "template_sync: invalid payload"),
-          detail=str(_invalid_lines(mark, "template_sync: invalid payload"))[:300])
+    await H.handle("global_template_sync", {
+        "action": SECRET,
+        "templates": [{"name": SECRET, "fileUrl": SECRET}]})  # id, version missing
+    check("global_template_sync: the received and invalid-payload lines log no "
+          "input values",
+          not _secret_lines(mark, "global_template_sync"),
+          detail=str(_secret_lines(mark, "global_template_sync"))[:300])
     mark = len(LOGS)
-    await H.handle("template_sync_response", {
-        "userId": OWNER, "requestId": "ts_1", "templates": [{"name": SECRET}],
+    await H.handle("global_template_sync_response", {
+        "requestId": "gts-fictional", "templates": [{"name": SECRET}],
         "count": SECRET})
-    check("template_sync_response: the invalid-payload line logs no input values",
-          not _invalid_lines(mark, "template_sync_response: invalid payload"),
-          detail=str(_invalid_lines(mark, "template_sync_response: invalid payload"))[:300])
-    # APP BUG (kept failing on purpose): both handlers log a "received" line
-    # BEFORE validation that prints raw, unvalidated fields — `action` in
-    # template_sync (app/socket/handlers/template_sync.py:49-50) and `count` in
-    # template_sync_response (template_sync.py:305-308). A malformed payload's
-    # value reaches the log verbatim. Fix: log type/len, or log after validation.
-    leaked = (_received_lines(ts_mark, "template_sync received")
-              + _received_lines(mark, "template_sync_response received"))
-    check("[APP BUG template_sync.py:49,305] the pre-validation 'received' lines "
-          "log no raw unvalidated field values", not leaked, detail=str(leaked)[:300])
+    check("global_template_sync_response: the received and invalid-payload lines "
+          "log no input values",
+          not _secret_lines(mark, "global_template_sync_response"),
+          detail=str(_secret_lines(mark, "global_template_sync_response"))[:300])
 
 
 # ------------------------------------------------------------------- runner

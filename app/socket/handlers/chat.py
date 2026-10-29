@@ -592,6 +592,8 @@ class ChatMixin:
             "templateUrl": payload.templateUrl,
             "templateOriginalName": payload.templateOriginalName,
             "templateMimeType": payload.templateMimeType,
+            "templateScope": (payload.templateScope or "").strip().lower() or None,
+            "templateVersion": payload.templateVersion,
             "draftMode": (payload.draftMode or "").strip().lower() or None,
             # Reserved layout hint — threaded through for future layout-aware
             # rendering; the drafting agent does not consume it yet.
@@ -599,11 +601,11 @@ class ChatMixin:
         }
 
         # When the turn may need to resolve/match a template (a suggested-draft
-        # or explicit template kickoff), make sure the in-memory store is warm
-        # first — no-op if already populated this session.
+        # or explicit template kickoff), make sure the global library is loaded
+        # first — no-op once a snapshot has been applied this connection.
         _src = (payload.source or "").strip().lower()
         if _src in ("suggesteddraft", "template") or payload.templateId:
-            await self.ensure_templates_synced(user_id)
+            await self.ensure_templates_synced()
 
         try:
             from app.langgraph.drafting_agent import drafting_agent

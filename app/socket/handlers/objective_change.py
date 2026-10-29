@@ -82,7 +82,7 @@ class ObjectiveChangeMixin:
             token = _EMIT_OBSERVER.set(emitted)
             # The template round trip runs OUTSIDE the lock (see drafting).
             templates_ready = self._prewarm_templates(
-                user_id, timeout=cap if cap > settings.pipeline_run_timeout_seconds else None
+                timeout=cap if cap > settings.pipeline_run_timeout_seconds else None
             )
             run_started = _loop_now()
             try:
@@ -2524,7 +2524,7 @@ class ObjectiveChangeMixin:
             # never send a second payload for a panel that already went out.
             token = _EMIT_OBSERVER.set(emitted)
             # The template round trip runs OUTSIDE the lock (see drafting).
-            templates_ready = self._prewarm_templates(user_id)
+            templates_ready = self._prewarm_templates()
             run_started = _loop_now()
             try:
                 # Take the per-workspace pipeline lock, as
@@ -2860,7 +2860,7 @@ class ObjectiveChangeMixin:
             # The template round trip runs OUTSIDE the lock (see drafting); a
             # run with audio lets it wait as long as the run itself may.
             templates_ready = self._prewarm_templates(
-                user_id, timeout=cap if cap > settings.pipeline_run_timeout_seconds else None
+                timeout=cap if cap > settings.pipeline_run_timeout_seconds else None
             )
             run_started = _loop_now()
             try:

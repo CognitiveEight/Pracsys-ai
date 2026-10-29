@@ -281,55 +281,47 @@ AI_HEARTBEAT_PING = "ai_heartbeat_ping"
 AI_HEARTBEAT_PONG = "ai_heartbeat_pong"
 
 # ============================================================================
-# Drafting Assistant — Template Library sync (Server → AI)
+# Drafting Assistant — template blueprint proposals
 # ============================================================================
 
-TEMPLATE_SYNC = "template_sync"
-
-# AI → Server: pull a user's full template library on demand (e.g. on
-# connect / before generating drafting suggestions, when the in-memory
-# store is cold after an AI restart). Server replies with TEMPLATE_SYNC_RESPONSE.
-REQUEST_TEMPLATE_SYNC = "request_template_sync"
-
-# Server → AI: full snapshot of the user's active templates, in reply to
-# REQUEST_TEMPLATE_SYNC. Same template shape as TEMPLATE_SYNC.
-TEMPLATE_SYNC_RESPONSE = "template_sync_response"
-
 # AI → Server: the AI's profiled "drafting blueprint" + interactive-variable
-# registry for a freshly-uploaded template, surfaced in the dashboard's
-# "AI Drafting Blueprint & Variables Approval" screen. The lawyer reviews /
-# edits it and the approved result returns via TEMPLATE_SYNC action
-# "formatting_updated".
+# registry for an admin's global template draft, surfaced on the admin panel's
+# approval screen. The approved result returns in the template's
+# `formatting.blueprint` on GLOBAL_TEMPLATE_SYNC "published". Carries
+# scope "global", the request's fileHash and no userId.
 TEMPLATE_BLUEPRINT_PROPOSAL = "template_blueprint_proposal"
 
-# Server → AI: the dashboard's "Regenerate Extra Info" action — re-profile the
-# template and emit a fresh TEMPLATE_BLUEPRINT_PROPOSAL. Payload carries
-# {userId, templateId, fileHash, fileUrl, timestamp}.
+# Server → AI: an admin uploaded (or clicked "Re-profile" on) a global template
+# draft — profile it and emit TEMPLATE_BLUEPRINT_PROPOSAL. Payload carries
+# {scope: "global", templateId, fileHash, fileUrl, originalName, mimeType,
+# timestamp}; no userId.
 REQUEST_BLUEPRINT_PROPOSAL = "request_blueprint_proposal"
 
+# ============================================================================
+# Drafting Assistant — Global Template Library (SIM-58 / SIM-173)
+# ============================================================================
 
-class TemplateAction:
-    """Action values for the template_sync event."""
+# Server → AI: an admin published / retired / deleted a global template. Sent
+# once for the whole platform; no userId.
+GLOBAL_TEMPLATE_SYNC = "global_template_sync"
 
-    UPLOADED = "uploaded"
-    DELETED = "deleted"
-    RENAMED = "renamed"
-    # New: a court/letterhead preset was created (no file body — carries a
-    # `formatting` layout blob), and the lawyer approved/edited a template's
-    # AI Blueprint (carries `formatting.blueprint`).
-    PRESET_CREATED = "preset_created"
-    FORMATTING_UPDATED = "formatting_updated"
+# AI → Server: send every published global template (on every connect).
+# Payload {requestId}.
+REQUEST_GLOBAL_TEMPLATE_SYNC = "request_global_template_sync"
+
+# Server → AI: the full published set, requestId echoed (even when empty).
+GLOBAL_TEMPLATE_SYNC_RESPONSE = "global_template_sync_response"
 
 
 class TemplateKind:
-    """`kind` values for a template_sync item."""
+    """`kind` values for a global template item."""
 
     FILE = "file"      # a file-backed template (has fileUrl / extracted text)
     PRESET = "preset"  # a layout-only preset (court header / letterhead / page)
 
 
 class TemplateCategory:
-    """Category values for templates in the lawyer's library."""
+    """Category values for templates in the Global Template Library."""
 
     LETTERHEAD = "Letterhead"
     FOLDER = "Folder"

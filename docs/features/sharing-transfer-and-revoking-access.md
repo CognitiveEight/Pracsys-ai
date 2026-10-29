@@ -127,7 +127,8 @@ Inbound: `workspace_sync` (`participants`), `workspace_version_restore`,
 `document_reload_request`, `workspace_resume_request`, `user_message_request`
 (`askedBy`), `missing_information_edited` (`editedBy`), `workspace_transferred`.
 Outbound after transfer: `document_feature_response` (`drafting_assistant`),
-`request_template_sync`. See
+and `request_global_template_sync` if the global template library is not loaded
+yet. See
 [the socket contract](../contracts/backend-ai-socket-events.md).
 
 ### Data

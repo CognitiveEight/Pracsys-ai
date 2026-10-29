@@ -204,8 +204,8 @@ class Settings(BaseSettings):
     # panel arrives, so nothing that holds the per-workspace pipeline lock may
     # wait without bound: while it is held, every later upload, objective change,
     # reconnect replay and resume for the case queues behind it.
-    # Bound on any request_template_sync wait. An undelivered request returns at
-    # once; a late snapshot still refreshes the Drafting Assistant on arrival.
+    # Bound on any request_global_template_sync wait. An undelivered request
+    # returns at once; a late snapshot still refreshes the Drafting Assistant.
     template_sync_timeout_seconds: float = 900.0
     # How long drafting waits on the template prewarm while holding the pipeline
     # lock. The prewarm itself keeps waiting (up to the bound above) outside it.

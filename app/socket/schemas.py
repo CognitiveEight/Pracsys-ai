@@ -718,6 +718,17 @@ class UserMessageRequestPayload(BaseModel):
         default=None,
         validation_alias=AliasChoices("templateMimeType", "template_mime_type"),
     )
+    # Global Template Library (SIM-173): "global" for a global template (absent
+    # on drafts from a lawyer's own template), and the version the draft
+    # started from. A draft started on v3 keeps getting v3.
+    templateScope: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("templateScope", "template_scope"),
+    )
+    templateVersion: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("templateVersion", "template_version"),
+    )
     draftMode: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("draftMode", "draft_mode"),
@@ -732,7 +743,7 @@ class UserMessageRequestPayload(BaseModel):
 
 
 # ============================================================================
-# Drafting Assistant — template_sync (Server → AI)
+# Drafting Assistant — Global Template Library (Server → AI)
 # ============================================================================
 
 
@@ -797,7 +808,7 @@ class TemplateBlueprint(BaseModel):
 
 
 class TemplateFormatting(BaseModel):
-    """The `formatting` blob attached to a template_sync item.
+    """The `formatting` blob attached to a global template item.
 
     `page`, `letterhead`, and `court` are free-form layout blobs used at DOCX
     export (kept as opaque dicts). `blueprint` is the drafting config the AI
@@ -812,80 +823,64 @@ class TemplateFormatting(BaseModel):
     blueprint: Optional[TemplateBlueprint] = None
 
 
-class TemplateSyncItem(BaseModel):
+class GlobalTemplateItem(BaseModel):
     """
-    One template row inside a template_sync payload.
+    One Global Template Library entry (SIM-58 / SIM-173), as carried by
+    ``global_template_sync`` and ``global_template_sync_response``.
 
-    Fields are populated based on the parent payload's `action`:
-      - uploaded: id, name, category, extension, mimeType, size, fileHash,
-        fileUrl, path all present; `formatting` optional.
-      - renamed: id, name, previousName, category, extension, mimeType,
-        fileHash, path present; size / fileUrl omitted (content unchanged).
-      - deleted: id, name, category, extension, mimeType, fileHash, path
-        present; size / fileUrl omitted.
-      - preset_created: kind="preset", no file fields; `formatting` carries
-        page / court / letterhead layout.
-      - formatting_updated: file unchanged (same fileHash); `formatting`
-        carries the approved `blueprint`.
+    A ``retired`` item may carry only id, version, name, category and kind.
+    Presets (``kind="preset"``) have no file fields.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     id: str
-    name: str
-    previousName: Optional[str] = None
-    category: str  # "Letterhead" | "Folder" | "Document Draft" | court types
-    extension: str  # pdf | doc | docx | txt | "" (presets)
+    version: int
+    name: Optional[str] = None
+    originalName: Optional[str] = None  # file name with its extension
+    category: Optional[str] = None
+    kind: Optional[str] = None  # "file" | "preset"
+    extension: Optional[str] = None
     mimeType: Optional[str] = None
     size: Optional[int] = None
     fileHash: Optional[str] = None
-    fileUrl: Optional[str] = None
-    path: Optional[str] = None
-    kind: Optional[str] = None  # "file" | "preset"
+    fileUrl: Optional[str] = None  # signed, ~1 hour; cache content, never the URL
     formatting: Optional[TemplateFormatting] = None
+    draftCategory: Optional[str] = None
 
 
-class TemplateSyncPayload(BaseModel):
+class GlobalTemplateSyncPayload(BaseModel):
     """
-    Schema for the template_sync event (Server → AI_Maverick).
-    Emitted when the lawyer uploads, renames, deletes, creates a preset, or
-    updates a template's formatting/blueprint. Supports bulk operations.
+    Schema for the global_template_sync event (Server → AI_Maverick).
+
+    Sent once for the whole platform (no ``userId``) when an admin publishes,
+    retires or deletes a global template.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
-    action: Literal[
-        "uploaded",
-        "deleted",
-        "renamed",
-        "preset_created",
-        "formatting_updated",
-    ]
-    userId: str = Field(validation_alias=AliasChoices("userId", "user_id"))
-    templates: List[TemplateSyncItem] = []
+    action: Literal["published", "retired", "deleted"]
+    templates: List[GlobalTemplateItem] = []
     timestamp: Optional[str] = None
 
 
-class TemplateSyncResponsePayload(BaseModel):
+class GlobalTemplateSyncResponsePayload(BaseModel):
     """
-    Schema for the template_sync_response event (Server → AI_Maverick).
+    Schema for the global_template_sync_response event (Server → AI_Maverick).
 
-    The server's reply to an AI-initiated ``request_template_sync`` — a full
-    snapshot of the user's active (non-deleted) templates. Treated exactly
-    like a ``template_sync`` with ``action="uploaded"`` for the whole list,
-    so the in-memory template store is (re)populated on demand (e.g. after
-    an AI restart, where the backend has not pushed any delta this session).
+    The reply to ``request_global_template_sync``: every published global
+    template. A full replace, never a delta; ``templates=[]`` means nothing is
+    published yet. ``requestId`` is always echoed, even on an empty list.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
-    userId: str = Field(validation_alias=AliasChoices("userId", "user_id"))
     requestId: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("requestId", "request_id"),
-    )  # Echoed from the request so the AI can correlate reply → request.
+    )
     count: Optional[int] = None  # === len(templates)
-    templates: List[TemplateSyncItem] = []
+    templates: List[GlobalTemplateItem] = []
     timestamp: Optional[str] = None
 
 

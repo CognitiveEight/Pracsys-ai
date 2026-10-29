@@ -61,7 +61,7 @@ The AI service is driven by **Socket.IO** events from the backend. Main events:
 | `workspace_version_restore` | Backend → AI | Workspace rolled back to an earlier document version: reconcile the vector store to that version and regenerate every panel |
 | `document_reload_request`    | Backend → AI | One document re-read on request ("reload" in Supporting Material, or a poor-quality score): purge everything held for that file, re-fetch and re-extract it, regenerate every panel |
 | `user_message_request`      | Backend → AI | User chat message: build context, run Intelligence Chat Agent (or the Drafting Assistant when `chat_type="DRAFTING_ASSISTANT"`), return reply. `askedBy` names a non-owner asker on a shared case (§4.2b) |
-| `template_sync`             | Backend → AI | Lawyer's template library changed (uploaded / renamed / deleted) |
+| `global_template_sync`      | Backend → AI | Global Template Library changed (published / retired / deleted); the full set arrives as `global_template_sync_response` to `request_global_template_sync` on every connect |
 | `add_case_law`              | Backend → AI | Add a precedent by citation / URL / pasted text ("Add Case Law" button) |
 | `case_law_document_request` | Backend → AI | Lawyer uploaded a judgment file (GCS); classify + extract it, reply with `case_law_document_response` |
 | `add_relevant_party` / `edit_relevant_party` / `delete_relevant_party` | Backend → AI | Relevant Parties panel CRUD (card add/edit/delete icons) |
@@ -290,13 +290,13 @@ context_builder → intent_classifier → explain_why → action_dispatcher → 
 
 ### 3.6 Drafting Assistant
 
-**Location:** `app/langgraph/drafting_agent.py` + `app/prompts/drafting.py` + `app/socket/events.py` (`on_template_sync`, `_generate_and_emit_drafting_suggestions`, `_handle_drafting_assistant_message`).
+**Location:** `app/langgraph/drafting_agent.py` + `app/prompts/drafting.py` + `app/socket/events.py` (`on_global_template_sync`, `_generate_and_emit_drafting_suggestions`, `_handle_drafting_assistant_message`).
 
-**Role:** Help the lawyer prepare case-specific pleadings, applications, legal notices, and replies — either from scratch (Blank Draft), from an AI-suggested draft, or by reusing one of their uploaded templates as a structural skeleton.
+**Role:** Help the lawyer prepare case-specific pleadings, applications, legal notices, and replies — either from scratch (Blank Draft), from an AI-suggested draft, or by reusing a published global template as a structural skeleton.
 
 Two surfaces:
 
-1. **Template Library** (lawyer-scoped, cross-workspace) — the lawyer uploads templates (Letterheads, Folders, Document Drafts). BE emits `template_sync` (`action="uploaded"|"renamed"|"deleted"`) to the AI service; AI downloads each new template, extracts the full text via `app/processing/file_handlers.py::FileProcessor.process_file_by_extension`, and persists it under a **lawyer-scoped Qdrant cache** keyed by `(userId, templateId)` via the new `upsert_user_state_cache` / `get_user_state_cache` helpers (zero-vector, metadata-only — same trick used for workspace state caches). `fileHash` is used as a content-identity check so a `template_sync` replay does not re-extract unchanged content. Templates are **not chunked or embedded** — they are reused as a whole-document structural reference.
+1. **Global Template Library** (platform-wide, versioned; SIM-58 / SIM-173) — admins upload templates (Letterheads, Document Drafts, court formats), the AI profiles each draft (`request_blueprint_proposal` → `template_blueprint_proposal`, `scope: "global"`), and admins publish or retire versions. BE emits `global_template_sync` (`action="published"|"retired"|"deleted"`); on every connect the AI requests the full published set (`request_global_template_sync` → `global_template_sync_response`, a full replace). The AI downloads each new file, extracts the full text via `app/processing/file_handlers.py::FileProcessor.process_file_by_extension`, and keeps it in process memory (`app/langgraph/template_store.py`), keyed by template id and version; a draft keeps the version it started from. `fileHash` is the content-identity check, so a re-sent or metadata-only publish does not re-extract. Lawyers no longer have templates of their own; the per-lawyer `template_sync` events are not handled. Templates are **not chunked or embedded** — they are reused as a whole-document structural reference.
 
    **Template ingest is noise-hardened.** Extracted template text is normalised before it is cached so extraction artifacts never reach the render LLM: a verbatim de-dup (`_normalize_template_text` / `_dedupe_leading_repeated_block`) collapses repeated PDF letterheads and `--- Page N ---` markers on both the OCR and text-layer paths, and a one-time LLM cleanup at ingest (`_clean_template_ocr_text`, chunked for long templates with an accept/reject gate) strips scanned-template seal/stamp garble, page footers, and margin notes while preserving every numbered paragraph, heading, recipient/signature block, and literal placeholder verbatim.
 
@@ -527,17 +527,19 @@ Backend emits user_message_request (chatId, workspaceId, userId, content, conver
     → Emit ai_response (content, metadata, suggestionChips)
 ```
 
-### 4.4 template_sync
+### 4.4 global_template_sync
 
 ```
-Backend emits template_sync (action: uploaded|renamed|deleted, userId, templates[])
-    → Socket handler (on_template_sync)
-    → action == "uploaded": for each template
-        → document_processor._download_file(fileUrl) → bytes
-        → file_processor.process_file_by_extension(bytes, filename) → extracted text
-        → vector_store.upsert_user_state_cache(userId, kind="template", scope_id=templateId, data={...})
-    → action == "renamed": patch cached payload's name; no re-download
-    → action == "deleted": vector_store.delete_user_state_cache(userId, "template", templateId)
+On every connect: AI emits request_global_template_sync {requestId}
+    → Backend replies global_template_sync_response {requestId, templates[]}
+    → every listed template applied as "published"; held ids not listed are retired
+Backend emits global_template_sync (action: published|retired|deleted, templates[]; no userId)
+    → Socket handler (on_global_template_sync)
+    → "published": same version + fileHash → no-op; same fileHash → reuse extraction;
+                   else download (fileUrl) → extract → classify/profile → current version
+                   (the previous version is kept for drafts pinned to it)
+    → "retired": never suggested again; drafts already started keep working
+    → "deleted": erase everything held for the id
 ```
 
 ---
@@ -547,7 +549,7 @@ Backend emits template_sync (action: uploaded|renamed|deleted, userId, templates
 | Component | Path / Responsibility |
 |-----------|------------------------|
 | **Socket handler** | `app/socket/events.py` — thin composition root: `SocketEventHandler` = 21 per-feature mixin classes from `app/socket/handlers/` (strategy, analysis_report, list_of_dates, applicable_laws, procedural_timeline, case_laws, relevant_parties, drafting, chat, objective_change, workspace_events, panel_edits, …) + `register`/`handle` + the `event_handler` singleton. Pure helpers/constants in `app/socket/event_utils.py`. See `docs/SOCKET_EVENTS_ARCHITECTURE.md`. |
-| **Socket client** | `app/socket/client.py` — Registers Socket.IO listeners (workspace_created, workspace_sync, user_message_request, template_sync, add_case_law, case_law_document_request, party CRUD, etc.) and delegates to handler. |
+| **Socket client** | `app/socket/client.py` — Registers Socket.IO listeners (workspace_created, workspace_sync, user_message_request, global_template_sync, add_case_law, case_law_document_request, party CRUD, etc.) and delegates to handler. |
 | **Workspace manager / context** | `app/workspace/` — In-memory workspace and context; stores role, evidence files, metadata. Integration syncs role from LangGraph state via `workspace_role_integration`. |
 | **Role-Based Agent** | `app/langgraph/role_agent.py` — Root LangGraph: role gate → role_selection / role_context_builder → role_validation. Output: validated `WorkspaceState` and `role_context` for downstream agents. |
 | **Strategy generation (socket path)** | `app/socket/events.py` → `_generate_strategies_from_documents()` — Uses vector store + Gemini to produce case summary, strategic objective, recommendations. Emits `strategy_objective` feature. |

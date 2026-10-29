@@ -362,7 +362,12 @@ class AnalysisReportMixin:
             # Build parts with per-document cap so ALL documents are represented (no limit on number of docs)
             # Large budget so 100+ docs each get a meaningful slice (100 docs → 1000 chars each, 200 → 500 each)
             graph_block = await self._graph_evidence_block("analysis_report", workspace_id)
-            max_total_content = max(20_000, panel_context_budget() - len(graph_block))
+            kb_block = await self._knowledge_base_block(
+                "analysis_report", workspace_id, docs=all_docs
+            )
+            max_total_content = max(
+                20_000, panel_context_budget() - len(graph_block) - len(kb_block)
+            )
             num_docs = len(
                 [
                     d
@@ -419,6 +424,8 @@ class AnalysisReportMixin:
                 )
             if graph_block:
                 combined_document_content += "\n\n" + graph_block
+            if kb_block:
+                combined_document_content += "\n\n" + kb_block
 
             doc_count = len(all_docs)
             if doc_count == 0:

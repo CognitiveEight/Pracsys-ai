@@ -38,6 +38,7 @@ from app.socket.handlers import (
     UserFactsMixin,
     DocxExportMixin,
     TemplateSyncMixin,
+    KnowledgeBaseMixin,
     WorkspaceMetadataMixin,
     WorkspaceEventsMixin,
     WorkspacePurgeMixin,
@@ -71,6 +72,7 @@ class SocketEventHandler(
     UserFactsMixin,
     DocxExportMixin,
     TemplateSyncMixin,
+    KnowledgeBaseMixin,
     WorkspaceMetadataMixin,
     WorkspaceEventsMixin,
     WorkspacePurgeMixin,
@@ -453,6 +455,10 @@ class SocketEventHandler(
         self.register(
             "request_blueprint_proposal", self.on_request_blueprint_proposal
         )
+        # Shared knowledge base (Server → AI): the platform-wide reference shelf.
+        self.register("kb_document_added", self.on_kb_document_added)
+        self.register("kb_document_deleted", self.on_kb_document_deleted)
+        self.register("kb_sync", self.on_kb_sync)
 
         # Legacy event handlers
         self.register("workspace_updated", self.on_workspace_updated)

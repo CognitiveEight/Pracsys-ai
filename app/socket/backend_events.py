@@ -307,6 +307,17 @@ TEMPLATE_BLUEPRINT_PROPOSAL = "template_blueprint_proposal"
 # {userId, templateId, fileHash, fileUrl, timestamp}.
 REQUEST_BLUEPRINT_PROPOSAL = "request_blueprint_proposal"
 
+# ============================================================================
+# Knowledge base — the shared reference shelf (Server → AI only)
+# ============================================================================
+
+# An admin added a document: fetch, read and index it (same id = replace).
+KB_DOCUMENT_ADDED = "kb_document_added"
+# An admin deleted a document: erase every copy on receipt.
+KB_DOCUMENT_DELETED = "kb_document_deleted"
+# The complete shelf, on every connect: a full replace, never a delta.
+KB_SYNC = "kb_sync"
+
 
 class TemplateAction:
     """Action values for the template_sync event."""

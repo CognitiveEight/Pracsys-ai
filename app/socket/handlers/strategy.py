@@ -153,7 +153,12 @@ class StrategyMixin:
                 and len((d.get("content") or "").strip()) >= 20
             ]
             graph_block = await self._graph_evidence_block("strategy_objective", workspace_id)
-            max_total_content = max(20_000, panel_context_budget() - len(graph_block))
+            kb_block = await self._knowledge_base_block(
+                "strategy_objective", workspace_id, docs=all_docs
+            )
+            max_total_content = max(
+                20_000, panel_context_budget() - len(graph_block) - len(kb_block)
+            )
             per_doc_cap = (
                 (max_total_content // max(1, len(valid_docs)))
                 if valid_docs
@@ -196,6 +201,8 @@ class StrategyMixin:
                 )
             if graph_block:
                 combined_document_content += "\n\n" + graph_block
+            if kb_block:
+                combined_document_content += "\n\n" + kb_block
             num_annexures = len(valid_docs)
             if num_annexures <= 0:
                 annexure_limit_block = (

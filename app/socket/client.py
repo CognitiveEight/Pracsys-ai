@@ -27,7 +27,13 @@ from app.socket.auth import (
     build_auth_headers,
     redact_auth_headers,
 )
-from app.socket.backend_events import AI_HEARTBEAT_PING, AI_HEARTBEAT_PONG
+from app.socket.backend_events import (
+    AI_HEARTBEAT_PING,
+    AI_HEARTBEAT_PONG,
+    KB_DOCUMENT_ADDED,
+    KB_DOCUMENT_DELETED,
+    KB_SYNC,
+)
 from app.socket.events import event_handler
 from app.utils.exceptions import SocketConnectionError
 
@@ -790,6 +796,21 @@ class SocketClient:
             the event falls through the catch-all and is silently dropped.
             """
             await event_handler.handle("request_blueprint_proposal", data)
+
+        @self.sio.on(KB_DOCUMENT_ADDED)
+        async def kb_document_added(data):
+            """Server → AI: an admin added a knowledge-base document; index it."""
+            await event_handler.handle(KB_DOCUMENT_ADDED, data)
+
+        @self.sio.on(KB_DOCUMENT_DELETED)
+        async def kb_document_deleted(data):
+            """Server → AI: an admin deleted a knowledge-base document; erase it now."""
+            await event_handler.handle(KB_DOCUMENT_DELETED, data)
+
+        @self.sio.on(KB_SYNC)
+        async def kb_sync(data):
+            """Server → AI: the complete knowledge base, sent on every connect."""
+            await event_handler.handle(KB_SYNC, data)
 
         @self.sio.on(AI_HEARTBEAT_PING)
         async def ai_heartbeat_ping(data):

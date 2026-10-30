@@ -151,6 +151,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SIM-153: Phase 3 delivery helpers for the agent pipeline (SIM-71 tasks
+  12–14).** Five standard-library scripts in `scripts/delivery/`, the
+  deterministic controls the agent workflows will call: `guard_branch.py`
+  (pushes only to the run's own `feature/SIM-<n>-*` / `fix/SIM-<n>-*`
+  branch, never `development`/`staging`/`main`; detects a spec stage that
+  already ran), `review_labels.py` (forces `needs-human-review` for the
+  sensitive paths), `notify_slack.py` (fixed-format notice to
+  `DELIVERY_CHANNEL_ID`), `jira_ops.py` (fetch a ticket to a data file,
+  transition, `agent-*` labels, fixed-format comments; refuses Done; Blocked
+  sets Flagged plus `agent-blocked`) and `agent_queue.py` (priority-ordered
+  pick of `agent-ready` + `ai-repo` tickets, honouring `AGENTS_ENABLED` and
+  `AGENT_MAX_CONCURRENT`). Comments and notices carry only key, stage,
+  outcome, counts, cost, a reason category and GitHub links, never ticket
+  or Slack text. Tests: `tests/test_delivery_scripts.py`. No socket payload
+  or `app/` change.
+  **Agent workflows (SIM-71 tasks 15-18):** `agent-dispatch.yml` (every 15
+  minutes: starts the implement stage for spec PRs carrying the G2 label,
+  then the spec stage for the next queued tickets, within
+  `AGENT_MAX_CONCURRENT`), `agent-spec.yml` (Claude writes the three specs,
+  a draft PR `<KEY>: specs` labelled `agent-pr`, design left
+  `Status: draft`) and `agent-implement.yml` (`workflow_dispatch` only,
+  started by the dispatcher once a `DESIGN_APPROVERS` login adds the PR
+  label `design-approved` on the current head: `/implement`, `/verify`,
+  `/review`, then the PR is marked ready only with green
+  `make lint`/`make test`, an approving review and every AC passing;
+  `needs-human-review` forced for sensitive paths). Each stage runs in separate jobs, so the agent never
+  shares a runner with `AGENT_PUSH_TOKEN`, Jira or Slack credentials;
+  `scripts/delivery/stage_io.py` re-checks what the agent hands back. All
+  off until `AGENTS_ENABLED=true`; nothing merges. CI-mode prompts in
+  `.github/agent-prompts/`, "In CI" sections in `.claude/commands/`.
+  Static rules: `tests/test_delivery_workflows.py`,
+  `tests/test_delivery_stage_io.py`.
+  **Review and security-audit fixes:** the implement `prepare` job now
+  checks out `development` and reads the pushed commits only as git data;
+  both publish jobs refuse (nothing pushed) an agent change to the pipeline,
+  the gates or any spec (`protected-path`) and run pinned gitleaks over the
+  commits first (new reason category `secret-found`); the G2 gate checks
+  every commit in the push for the agent's identity; `make lint` /
+  `make test` move to a secret-free `gates` job on a fresh runner;
+  harden-runner (`egress-policy: block`) on the agent and gates jobs; Qdrant
+  pinned by digest; only the normalised outcome is uploaded and no test-log
+  text is printed; new `jira_ops.py check-scope` (read-only, before any
+  fetch) and `unblock`; the queue skips keys that already have a ticket
+  branch; `AGENT_MAX_TURNS_IMPLEMENT` (default 120). No socket payload or
+  `app/` change.
+  **Second fix round (G2 is a PR label):** `agent-implement.yml` is no
+  longer `push`-triggered (a push ran the pushed branch's YAML with the
+  secrets); it is `workflow_dispatch` only (inputs `issue`, `pr`, `sha`),
+  runs from `main`, and is started by `agent-dispatch.yml` for spec PRs
+  carrying the label `design-approved` added by a `DESIGN_APPROVERS` login
+  on the current head (new `scripts/delivery/g2_gate.py`: PR, timeline and
+  push-record checks; the design now stays `Status: draft`, and `/implement`
+  in CI reads the verified `g2.json` instead). New PR label
+  `agent-implemented`; new reason categories `g2-refused` and
+  `gates-mismatch`; nothing is pushed on `budget` (AC-39); agent-added
+  `gitleaks:allow` lines are refused (`secret-found`); `CLAUDE.md`,
+  `AGENTS.md`, `.mcp.json`, gitleaks config and the conftest files are
+  protected; harden-runner disables sudo and containers; the agent step
+  scrubs secrets from subprocess environments; the spec stage no longer
+  flags an issue for "already ran" while its agent PR is open. Admin:
+  create the GitHub labels `design-approved` and `agent-implemented`. No
+  socket payload or `app/` change.
+  **Final review and security-audit fixes:** every agent job that reads a
+  secret declares the GitHub Environment `pracsys-agents` (admin, REQUIRED
+  BEFORE THE PILOT: create it with deployment branches `main` only, move
+  the agent secrets into it as separate credentials, delete the repository
+  copies, and give `AGENT_PUSH_TOKEN` to an identity outside
+  `DESIGN_APPROVERS`; `workflow_dispatch` alone does not stop a writer
+  running a modified copy). G2: a push in the same second as the label is
+  stale; a PR that is not the issue's own is refused without a Jira or
+  Slack notice; `git-check` also requires protected paths to match the
+  development tip (new refusal `protected-path-stale`) and protects
+  `conftest.py` at any depth; a `git-check` crash is reported once
+  (`git-check-failed`). The dispatcher survives a failed read for one PR,
+  and an empty `DESIGN_APPROVERS` fails it once with a clear error. Publish
+  judges `budget` before the outcome file and renames the PR to
+  `<KEY>: implementation` only when it pushed; notices say "design approved
+  at <sha7>" (new `--approved-sha` on `notify_slack.py` / `jira_ops.py`).
+  `protect-branch.sh` now parses commands with `shlex`
+  (`.claude/hooks/_git_commit_guard.py`), closing quoted-flag,
+  `-c core.hooksPath`, global-option and `GIT_CONFIG_*` bypasses. New
+  runbook `docs/runbooks/run-the-agent-pipeline.md` (pilot checklist,
+  re-running a blocked run). No socket payload or `app/` change.
+
 - **SIM-152: instant replies in #pracsys-requests.** A small GCP Cloud
   Function (`relay/slack_events/`) receives Slack events, checks Slack's
   signature, and starts the "Slack triage" workflow straight away for a

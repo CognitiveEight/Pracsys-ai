@@ -8,41 +8,38 @@ the reconnect replay and the role resolution that feeds every generator.
 
 The rules under test:
 
-  * workspace_created drives the whole suite, every panel once, in product
-    order, and never arms a ``workspace:refresh`` it does not pay off;
+  * workspace_created drives the whole suite, every panel once (drafting
+    twice: a first build re-runs it once laws and dates exist), and never arms
+    a ``workspace:refresh`` it does not pay off;
   * workspace_sync with a new upload arms its loaders and every armed
     featureType gets a terminal ``document_feature_response``; the cached
     document_assessments manifest is MERGED (never shrunk to the new files),
     while the emit itself stays incremental; a replayed sync is swallowed;
   * a deletion sync arms eight loaders and pays every one of them off, and
     prunes the deleted document from the manifest;
-  * a generator that fails still leaves its panel with a terminal state where
-    the code provides one (strategy error envelope, analysis fallback, case
-    laws fallback) and never skips the panels after it;
+  * a generator that fails still leaves its panel with a terminal state
+    (strategy settled from cache, analysis fallback, case laws fallback,
+    cache-or-empty for the rest) and never skips the panels after it;
   * an undelivered emit (socket returns False) is buffered — in memory AND
     persisted — and re-sent on reconnect BEFORE the cached replay;
   * every generator receives a validated role: a lower-case role is
-    normalised, an invalid one falls back to ADJUDICATOR, and a role-less sync
+    normalised, an invalid one falls back to DEFAULT_WORKSPACE_ROLE, and a role-less sync
     uses the persisted role rather than a fabricated default.
 
 NOT COVERED HERE (and why)
   * "No validated role → no downstream generator runs" (CLAUDE.md, role gate):
     the socket flow does not implement a hard gate. workspace_created replaces
-    an invalid role with ADJUDICATOR and carries on when
+    an invalid role with DEFAULT_WORKSPACE_ROLE and carries on when
     ``initialize_workspace_with_role`` raises. The checks below pin what the
     code guarantees (every generator gets a valid role); the gap is reported
     rather than pinned.
-  * A raising list_of_dates / applicable_laws / procedural_timeline /
-    relevant_parties / drafting_assistant generator, or a CancelledError in the
-    sync pipeline, leaves that panel's armed loader without a terminal emit.
-    That is current behaviour, not a contract, so it is printed as a GAP probe
-    (it does not fail the suite) instead of a check. Promote it to a check
-    once the pipeline releases its loaders.
 
 Drives the real handlers through ``event_handler.handle`` (run scopes, logging
 context and the stop fence apply) with Qdrant, persistence, the document
 processor, the panel generators and the socket stubbed. No API key, no
-backend, no Qdrant, no billed call.
+backend, no Qdrant, no billed call. The template library prewarm is stubbed
+off: the fake socket reports every emit delivered, so a real prewarm would
+wait for a template_sync_response that never comes.
 
 USAGE
     python tests/offline/verify_workspace_flow.py            # run everything
@@ -81,6 +78,7 @@ _persistence.persist_state = _record_persist
 _persistence.restore_state = _restore
 
 from app.core.config import settings  # noqa: E402
+from app.core.roles import DEFAULT_WORKSPACE_ROLE  # noqa: E402
 from app.langgraph.integration import workspace_role_integration  # noqa: E402
 from app.processing.document_processor import document_processor  # noqa: E402
 from app.socket.events import event_handler as H  # noqa: E402
@@ -93,7 +91,6 @@ RC.restore_state = _restore
 _gc = importlib.import_module("app.ai.gemini_client")
 
 RESULTS = []
-GAPS = []
 EMITS = []
 DROPPED = []
 CALLS = []
@@ -114,6 +111,8 @@ SUITE_IN_ORDER = [
 #: Panels produced by the stubbed generators (everything after ingestion).
 GENERATED = SUITE_IN_ORDER[2:]
 TAIL = SUITE_IN_ORDER[4:]
+#: A first build runs drafting once more at the end, when laws and dates exist.
+FIRST_BUILD = SUITE_IN_ORDER + ["drafting_assistant"]
 
 
 def _ws(name):
@@ -124,13 +123,6 @@ def check(name, ok, detail=""):
     RESULTS.append((name, bool(ok)))
     print(("  PASS  " if ok else "  FAIL  ") + name
           + (f"\n        {detail}" if detail and not ok else ""))
-
-
-def gap(name, holds, detail=""):
-    """A known gap: printed, never counted as a failure (see module docstring)."""
-    GAPS.append((name, bool(holds)))
-    print(("  OK    " if holds else "  GAP   ") + name
-          + (f"\n        {detail}" if detail and not holds else ""))
 
 
 # ----------------------------------------------------------------------- socket
@@ -161,6 +153,16 @@ SOCKET = _FakeSocket()
 def _features_emitted(ws):
     return [p.get("featureType") for e, p in EMITS
             if e == "document_feature_response" and p.get("workspaceId") == ws]
+
+
+def _tail_once(features):
+    """The TAIL panels emitted, each counted once and kept in TAIL order.
+
+    Panels after analysis generate concurrently and a first build re-runs
+    drafting, so emit order and count are not a contract; that each one
+    emitted is.
+    """
+    return [f for f in TAIL if f in features]
 
 
 def _feature_envelopes(ws, feature):
@@ -343,6 +345,11 @@ def _install_stubs():
     H._generate_and_emit_relevant_parties = _gen("relevant_parties")
     H._generate_and_emit_case_laws = _gen("case_laws")
     H._generate_and_emit_drafting_suggestions = _gen("drafting_assistant")
+    async def _templates_synced(user_id, *, timeout=None, force=False):
+        return None
+
+    H._prewarm_templates = lambda user_id, *, timeout=None: None
+    H.ensure_templates_synced = _templates_synced
     H._socket_client = SOCKET
 
 
@@ -435,10 +442,12 @@ async def check_created_suite():
     settled = await _create_settled(ws)
     check("the background pipeline finishes", settled)
     emitted = _features_emitted(ws)
-    check("workspace_created emits the full suite in product order, once each",
-          emitted == SUITE_IN_ORDER, detail=str(emitted))
-    check("every generator ran exactly once",
-          sorted(c[1] for c in CALLS if c[0] == "generate") == sorted(GENERATED),
+    check("workspace_created emits the full suite once each (drafting twice)",
+          sorted(emitted) == sorted(FIRST_BUILD)
+          and emitted[:2] == SUITE_IN_ORDER[:2], detail=str(emitted))
+    check("every generator ran exactly once (drafting twice)",
+          sorted(c[1] for c in CALLS if c[0] == "generate")
+          == sorted(GENERATED + ["drafting_assistant"]),
           detail=str([c[1] for c in CALLS if c[0] == "generate"]))
     check("evidence is ingested once, with every file",
           [c[1] for c in CALLS if c[0] == "process_batch"] == [sorted([DOC_A, DOC_B])])
@@ -581,14 +590,16 @@ async def check_failing_generators():
     await _sync_upload_with(ws, {"strategy_objective": RuntimeError("model down"),
                                  "analysis_report": RuntimeError("model down")})
     strat = _feature_envelopes(ws, "strategy_objective")
-    check("a raising strategy generator still emits a terminal error envelope",
-          len(strat) == 1 and strat[0].get("error"), detail=str(strat)[:200])
+    check("a raising strategy generator re-sends the cached strategy, not an error",
+          len(strat) == 1 and not strat[0].get("error")
+          and (strat[0].get("payload") or {}).get("strategicObjective")
+          == "Recover the unpaid invoice amount.", detail=str(strat)[:200])
     analysis = _feature_envelopes(ws, "analysis_report")
     check("a raising analysis generator is replaced by the fallback report",
           len(analysis) == 1 and not (analysis[0].get("payload") or {}).get("generated"),
           detail=str(analysis)[:200])
     check("the panels after a failure still run and emit",
-          [f for f in _features_emitted(ws) if f in TAIL] == TAIL,
+          _tail_once(_features_emitted(ws)) == TAIL,
           detail=str(_features_emitted(ws)))
     check("no armed loader is left without a terminal emit",
           not _unpaid_loaders(ws), detail=str(_unpaid_loaders(ws)))
@@ -605,14 +616,14 @@ async def check_failing_generators():
     ws3 = _ws("fail_list_of_dates")
     await _sync_upload_with(ws3, {"list_of_dates": RuntimeError("model down")})
     check("a raising list_of_dates generator does not skip the panels after it",
-          [f for f in _features_emitted(ws3) if f in TAIL[1:]] == TAIL[1:],
+          _tail_once(_features_emitted(ws3))[1:] == TAIL[1:],
           detail=str(_features_emitted(ws3)))
-    gap("a raising list_of_dates generator still gets a terminal emit",
+    check("a raising list_of_dates generator still gets a terminal emit",
         not _unpaid_loaders(ws3), detail=f"unpaid loaders: {sorted(_unpaid_loaders(ws3))}")
 
     ws4 = _ws("fail_cancelled")
     await _sync_upload_with(ws4, {"applicable_laws": asyncio.CancelledError()})
-    gap("a CancelledError in the sync pipeline releases its armed loaders",
+    check("a CancelledError in the sync pipeline releases its armed loaders",
         not _unpaid_loaders(ws4), detail=f"unpaid loaders: {sorted(_unpaid_loaders(ws4))}")
 
 
@@ -631,7 +642,7 @@ async def check_reconnect_redelivery():
     check("and persisted (survives a restart)",
           "analysis_report" in (STORE.get((ws, CacheKinds.PENDING_FEATURE_DELIVERY)) or {}))
     check("the panels after the drop still emit",
-          [f for f in _features_emitted(ws) if f in TAIL] == TAIL)
+          _tail_once(_features_emitted(ws)) == TAIL)
 
     # The socket comes back.
     SOCKET.drop = set()
@@ -676,16 +687,17 @@ async def check_reconnect_redelivery():
 async def check_role_resolution():
     ws = _ws("role_lower")
     _reset(ws)
-    await _create_settled(ws, role="petitioner")
+    # Not the default role, so a fallback cannot pass for a normalisation.
+    await _create_settled(ws, role="respondent")
     check("a lower-case role is normalised before any generator runs",
-          _generated_roles(ws) == {"PETITIONER"}, detail=str(_generated_roles(ws)))
+          _generated_roles(ws) == {"RESPONDENT"}, detail=str(_generated_roles(ws)))
     check("the role agent is initialised with the validated role",
-          [c[2] for c in CALLS if c[0] == "role_init"] == ["PETITIONER"])
+          [c[2] for c in CALLS if c[0] == "role_init"] == ["RESPONDENT"])
     order = [c[0] for c in CALLS]
     check("role initialisation happens before ingestion and generation",
           order and order[0] == "role_init", detail=str(order[:3]))
     check("the role is persisted for later events",
-          ROLE_STORE.get(f"{ws}:{OWNER}") == "PETITIONER")
+          ROLE_STORE.get(f"{ws}:{OWNER}") == "RESPONDENT")
 
     ws2 = _ws("role_invalid")
     _reset(ws2)
@@ -693,9 +705,10 @@ async def check_role_resolution():
     roles = _generated_roles(ws2)
     check("an invalid role never reaches a generator",
           roles and roles <= VALID_ROLES and "PLAINTIFF" not in roles, detail=str(roles))
-    check("it falls back to ADJUDICATOR", roles == {"ADJUDICATOR"}, detail=str(roles))
+    check("it falls back to DEFAULT_WORKSPACE_ROLE",
+          roles == {DEFAULT_WORKSPACE_ROLE}, detail=str(roles))
     check("and the role agent never sees the invalid role",
-          [c[2] for c in CALLS if c[0] == "role_init"] == ["ADJUDICATOR"])
+          [c[2] for c in CALLS if c[0] == "role_init"] == [DEFAULT_WORKSPACE_ROLE])
 
     ws3 = _ws("role_sync")
     _reset(ws3)
@@ -754,9 +767,6 @@ def main():
         asyncio.run(_run(set(args.only) if args.only else None))
     finally:
         settings.citations_enabled = old_citations
-    open_gaps = [n for n, holds in GAPS if not holds]
-    if open_gaps:
-        print(f"\n{len(open_gaps)} known gap(s) reported (not failures; see the docstring)")
     failed = [n for n, ok in RESULTS if not ok]
     print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
     if failed:

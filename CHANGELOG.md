@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **SIM-174: the AI reads the shared knowledge base and uses it for every
+  case, in its panels and in chat.**
+  The backend's three knowledge-base events had no handler, so documents
+  admins added never reached the AI.
+  - `kb_document_added` fetches the signed link at once, reads the file (OCR,
+    DOCX, XLSX, PPTX, TXT), redacts it and indexes it under `documentId` in a
+    platform-wide shelf: the evidence collection under the reserved id
+    `__knowledge_base__`, which no case query can reach. The same id replaces;
+    the link is never stored.
+  - `kb_document_deleted` erases every copy on receipt. An ingest in flight
+    for that id is cancelled, and a write already under way finishes first,
+    so it can never land after the erase. A failed erase retries, then logs
+    CRITICAL and audits `knowledge_base_erase_failed`.
+  - `kb_sync` (every connect) is a full replace: unlisted ids are erased,
+    new ones ingested, held ones not re-fetched; `documents: []` erases all.
+  - **Every case's panels:** when a case's documents are uploaded (and on
+    every regeneration), Strategy, Analysis Report and Applicable Laws get
+    up to `KNOWLEDGE_BASE_PANEL_PASSAGES` (6) shelf passages relevant to the
+    case, searched with the case's document types, subjects and cited
+    provisions, kept at rerank 5/10 or above. They come in a block marked
+    as reference material that is not the case's evidence: law, precedent and
+    format only, never facts, parties or a document the case holds. Fact
+    panels (List of Dates, Upcoming Dates, Relevant Parties) never read the
+    shelf. One search serves all panels of a run. `KNOWLEDGE_BASE_PANELS`
+    picks the panels (`""` = off).
+  - Chat adds up to `KNOWLEDGE_BASE_CHAT_PASSAGES` (4) shelf passages that
+    rerank at `KNOWLEDGE_BASE_MIN_RELEVANCE` (6/10) or above, in their own
+    prompt section under `[K#]` labels. An empty shelf costs nothing.
+    `KNOWLEDGE_BASE_CHAT_ENABLED=false` turns chat use off; the shelf is
+    still kept in step.
+  - **Socket payload:** `ai_response.citations[]` gains `type:
+    "knowledge_base"` with `documentId`, `title`, `category`, `page`, `quote`
+    (additive; the lawyer app needs to render it). No AI → backend events.
+  - Ingest cost has no case to bill: it is priced and logged as unbilled,
+    like template work. Shelf retrieval for a case's panels or chat turn is billed to that case.
+
 ### Changed
 
 - **SIM-163 (Phase 1): an upload's panels are generated in parallel; Strategy,

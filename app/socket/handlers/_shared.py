@@ -199,6 +199,45 @@ class JsonHelpersMixin:
             return ""
 
     # ------------------------------------------------------------------
+    # Shared knowledge base for panels (every case, augment mode)
+    # ------------------------------------------------------------------
+
+    async def _knowledge_base_block(
+        self,
+        panel: str,
+        workspace_id: str,
+        *,
+        docs: List[Dict[str, Any]],
+    ) -> str:
+        """Relevant shelf passages to ADD to a panel's prompt, marked as
+        reference material that is not the case's evidence.
+
+        Empty unless ``panel`` is in ``KNOWLEDGE_BASE_PANELS`` and the shelf
+        holds something relevant. ``docs`` must be ALL of the case's documents
+        (``get_all_documents``), unfiltered: every panel then describes the case
+        identically and one run shares one search. Never raises: the shelf
+        improves a panel, it never gates it.
+        """
+        enabled = {p.strip() for p in str(settings.knowledge_base_panels or "").split(",")}
+        if panel not in enabled or not workspace_id:
+            return ""
+        try:
+            from app.rag.knowledge_base import case_query, knowledge_base, render_panel_block
+
+            passages = await knowledge_base.passages_for_case(
+                workspace_id, case_query(docs or [])
+            )
+            block = render_panel_block(passages, int(settings.knowledge_base_panel_chars))
+            if block:
+                logger.info("Knowledge base for {}: {} passage(s)", panel, len(passages))
+            return block
+        except asyncio.CancelledError:
+            raise
+        except Exception as kb_err:
+            logger.warning("Knowledge base for {} skipped: {}", panel, kb_err)
+            return ""
+
+    # ------------------------------------------------------------------
     # Undelivered feature payloads
     #
     # SocketClient.emit returns False instead of raising when the socket is down,

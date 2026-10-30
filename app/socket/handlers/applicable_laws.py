@@ -562,6 +562,8 @@ class ApplicableLawsMixin:
             else ""
         )
         prompt = generate_applicable_laws_from_sources_prompt(objective_block=objective_block, self=self, signals=signals, source_blob=source_blob, targeted_acts_block=targeted_acts_block, targeted_acts_count=targeted_acts_count, workspace_id=workspace_id, workspace_role=workspace_role)
+        if signals.get("knowledgeBaseBlock"):
+            prompt += "\n\n" + signals["knowledgeBaseBlock"]
         # Authoritative user corrections lead the prompt so they outrank
         # the document content they contradict.
         prompt = self._with_user_facts(workspace_id, prompt)
@@ -670,6 +672,22 @@ class ApplicableLawsMixin:
         graph_block = await self._graph_evidence_block("applicable_laws", workspace_id)
         if graph_block:
             signals["evidenceSnippet"] = (signals.get("evidenceSnippet") or "") + "\n\n" + graph_block
+        # Kept apart from evidenceSnippet: the heuristic fallback mines that for
+        # statutes, and a shelf statute is not one this case cites. Described
+        # from all the case's documents, like Strategy and Analysis, so the run
+        # reuses their shelf search.
+        try:
+            from app.vectorstore.qdrant import vector_store
+
+            case_docs = await vector_store.get_all_documents(workspace_id=workspace_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as docs_err:
+            logger.warning("Applicable laws: no documents for the knowledge base: {}", docs_err)
+            case_docs = []
+        signals["knowledgeBaseBlock"] = await self._knowledge_base_block(
+            "applicable_laws", workspace_id, docs=case_docs
+        )
         # Bias the search query toward the new objective when provided, so a
         # perspective change actually changes which case-law is fetched.
         search_query = signals.get("query", "")

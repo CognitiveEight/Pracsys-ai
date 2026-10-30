@@ -642,8 +642,7 @@ touching it, and note the `.gitignore` `*.md` trap documented there.
 ## How work is done here
 
 Every non-trivial change follows `docs/development-workflow.md`: Jira ticket →
-a spec folder `specs/SIM-<n>-short-name/` (requirements, technical design,
-tasks, acceptance criteria, test cases) →
+specs in `specs/` (requirements, technical design, acceptance criteria) →
 ticket branch off `development` → PR → `development` → `staging` → `main`.
 Project subagents in `.claude/agents/` cover each stage (`planner`,
 `developer`, `tester`, `reviewer`, `security-auditor`), and `.claude/rules/`

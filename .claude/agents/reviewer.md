@@ -10,12 +10,11 @@ you report findings for a human to act on.
 
 ## Inputs
 A branch name or PR. Get the diff with `git diff development...<branch>` and
-read the ticket's spec folder `specs/<KEY>-short-name/`.
+read the ticket's three spec files.
 
 ## What to check, in order
-1. **Spec match:** every acceptance criterion is implemented and has a check
-   in `test-cases.md`; every step in `tasks.md` is done or marked dropped
-   with a reason; nothing outside the design's scope changed.
+1. **Spec match:** every acceptance criterion is implemented and has a check;
+   nothing outside the design's scope changed.
 2. **Secrets and data:** no credentials, `.env` values, service-account JSON,
    case text, names or phone numbers in code, tests, specs or logs.
 3. **CLAUDE.md invariants** the diff touches:

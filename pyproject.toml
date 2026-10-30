@@ -4,7 +4,7 @@
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-extend-exclude = ["env", "keel", "pracsys2.0", "docs", "data", "logs"]
+extend-exclude = ["env", "pracsys2.0", "docs", "data", "logs"]
 
 [tool.ruff.lint]
 # Pyflakes (unused/undefined names, broken imports) plus syntax-level errors.

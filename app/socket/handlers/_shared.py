@@ -4,11 +4,17 @@ Feature mixin extracted from events.py — methods moved verbatim.
 """
 
 import asyncio
+import contextlib
+import contextvars
 import json
 import re
-from typing import Any, Dict, List, Optional, Set
+import time
+from typing import Any, AsyncIterator, Dict, List, Optional, Set
 
 from loguru import logger
+
+from app.core.config import settings
+from app.observability.audit import audit_logger
 
 
 from app.socket.event_utils import (
@@ -16,6 +22,55 @@ from app.socket.event_utils import (
     _normalize_match_text,
     drafting_payload_to_wire,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
+
+#: Every panel an upload to an existing case arms with ``workspace:refresh``,
+#: in product (emit) order.
+UPLOAD_REFRESH_FEATURES = (
+    "document_assessments",
+    "strategy_objective",
+    "analysis_report",
+    "list_of_dates",
+    "applicable_laws",
+    "procedural_timeline",
+    "relevant_parties",
+    "case_laws",
+    "drafting_assistant",
+)
+
+#: The panels the dates/laws tail produces, in emit order.
+PIPELINE_TAIL_FEATURES = (
+    "list_of_dates",
+    "applicable_laws",
+    "procedural_timeline",
+    "relevant_parties",
+    "case_laws",
+    "drafting_assistant",
+)
+
+#: The pipeline-lock hold of the run this code belongs to. Set by
+#: ``_hold_pipeline_lock`` and inherited by tasks the run spawns, so only the
+#: holder (never an unlocked handler of the same case) can move its stage.
+_PIPELINE_HOLD: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
+    contextvars.ContextVar("simplertoday_pipeline_hold", default=None)
+)
+
+#: The lock watchdog's tick, and how often one hold may be reported again.
+_LOCK_WATCHDOG_INTERVAL_SECONDS = 60.0
+_LOCK_WARN_REPEAT_SECONDS = 300.0
+
+
+def _loop_now() -> float:
+    """The event loop's clock (what ``asyncio.timeout`` measures against)."""
+    try:
+        return asyncio.get_running_loop().time()
+    except RuntimeError:
+        return time.monotonic()
+
+
+def _cap_label(cap: Optional[float]) -> str:
+    """A cap for a log line: ``900s``, or ``none`` for an uncapped hold."""
+    return "none" if cap is None else str(int(round(cap))) + "s"
 
 
 class JsonHelpersMixin:
@@ -298,7 +353,7 @@ class JsonHelpersMixin:
             return []
         already = {str(f) for f in (skip or set())}
         released: List[str] = []
-        role = (workspace_role or "ADJUDICATOR").strip().upper() or "ADJUDICATOR"
+        role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper() or DEFAULT_WORKSPACE_ROLE
 
         for feature in feature_types:
             if not feature or feature in already:
@@ -430,6 +485,219 @@ class JsonHelpersMixin:
                 workspace_id[:12] if workspace_id else "",
             )
         return released
+
+    # ------------------------------------------------------------------
+    # Pipeline lock: holder record, stages, watchdog, hard cap
+    #
+    # While a run holds a case's pipeline lock, every later upload, objective
+    # change, reconnect replay and resume of that case queues behind it, and
+    # their armed loaders spin. So each hold is named (holder + stage), a
+    # watchdog reports holds past PIPELINE_LOCK_WARN_SECONDS, and the three
+    # long runners are cut at PIPELINE_RUN_TIMEOUT_SECONDS (audio-extended),
+    # settling their armed panels from cache.
+    # ------------------------------------------------------------------
+
+    @contextlib.asynccontextmanager
+    async def _hold_pipeline_lock(
+        self,
+        workspace_id: str,
+        holder: str,
+        *,
+        cap_seconds: Optional[float] = None,
+        wait_stage: Optional[str] = None,
+        stage_mode: str = "",
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """``async with`` the workspace pipeline lock, recording who holds it.
+
+        ``holder`` is a fixed label (``upload_pipeline``, ``dates_laws``,
+        ``cascade``, ``laws_only``, ``reemit``, ``resume``). ``cap_seconds`` is
+        only reported by the watchdog; enforcing it is the caller's job, so the
+        cap counts from acquisition and queueing never eats into it.
+        ``wait_stage`` names the stage line for the time spent queueing.
+        """
+        lock = self._workspace_pipeline_lock(workspace_id)
+        if lock.locked():
+            logger.debug(
+                "pipeline lock: {} waiting for workspace {}",
+                holder,
+                str(workspace_id)[:12],
+            )
+        wait_started = _loop_now()
+        async with lock:
+            if wait_stage:
+                self._log_stage(wait_stage, wait_started, mode=stage_mode)
+            record: Dict[str, Any] = {
+                "holder": holder,
+                "stage": "start",
+                "acquiredAt": _loop_now(),
+                "cap": cap_seconds,
+                "warnedAt": None,
+            }
+            self._workspace_pipeline_lock_holder[workspace_id] = record
+            token = _PIPELINE_HOLD.set(record)
+            try:
+                yield record
+            finally:
+                _PIPELINE_HOLD.reset(token)
+                if self._workspace_pipeline_lock_holder.get(workspace_id) is record:
+                    self._workspace_pipeline_lock_holder.pop(workspace_id, None)
+
+    def _set_pipeline_stage(self, workspace_id: str, stage: str) -> None:
+        """Name the step the lock holder is in (read by the watchdog and the cap)."""
+        record = _PIPELINE_HOLD.get()
+        if record is not None and (
+            self._workspace_pipeline_lock_holder.get(workspace_id) is record
+        ):
+            record["stage"] = stage
+
+    def _stage_begin(self, workspace_id: str, stage: str) -> float:
+        """Enter a stage: record it on the hold, return its start time."""
+        self._set_pipeline_stage(workspace_id, stage)
+        return _loop_now()
+
+    @staticmethod
+    def _log_stage(stage: str, started: float, *, mode: str = "") -> None:
+        """One ``stage <name> took`` line. Names and durations only."""
+        took = max(0.0, _loop_now() - started)
+        if mode:
+            logger.info("stage {} took {:.1f}s mode={}", stage, took, mode)
+        else:
+            logger.info("stage {} took {:.1f}s", stage, took)
+
+    def _check_pipeline_lock_holds(self, now: Optional[float] = None) -> int:
+        """Warn once per hold (at most every 5 minutes) past the threshold.
+
+        Informational only: it never releases anything (the cap does).
+        Returns how many holds it reported.
+        """
+        now = _loop_now() if now is None else now
+        threshold = float(settings.pipeline_lock_warn_seconds)
+        reported = 0
+        for workspace_id, record in list(self._workspace_pipeline_lock_holder.items()):
+            if not isinstance(record, dict):
+                continue
+            held = now - float(record.get("acquiredAt") or now)
+            if held < threshold:
+                continue
+            warned_at = record.get("warnedAt")
+            if warned_at is not None and now - warned_at < _LOCK_WARN_REPEAT_SECONDS:
+                continue
+            record["warnedAt"] = now
+            reported += 1
+            logger.warning(
+                "pipeline lock held {}s holder={} stage={} cap={} workspace={}",
+                int(held),
+                record.get("holder"),
+                record.get("stage"),
+                _cap_label(record.get("cap")),
+                str(workspace_id)[:12],
+            )
+        return reported
+
+    async def _pipeline_lock_watchdog(self) -> None:
+        """Tick forever, reporting long pipeline-lock holds."""
+        while True:
+            await asyncio.sleep(_LOCK_WATCHDOG_INTERVAL_SECONDS)
+            try:
+                self._check_pipeline_lock_holds()
+            except Exception as watch_err:  # pragma: no cover - never stop ticking
+                logger.debug("Pipeline lock watchdog check failed: {}", watch_err)
+
+    def start_pipeline_lock_watchdog(self) -> None:
+        """Start the watchdog (lifecycle.startup). Idempotent."""
+        task = self.__dict__.get("_pipeline_lock_watchdog_task")
+        if task is not None and not task.done():
+            return
+        self.__dict__["_pipeline_lock_watchdog_task"] = asyncio.create_task(
+            self._pipeline_lock_watchdog()
+        )
+
+    async def stop_pipeline_lock_watchdog(self) -> None:
+        """Stop the watchdog (lifecycle.shutdown)."""
+        task = self.__dict__.pop("_pipeline_lock_watchdog_task", None)
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    def _pipeline_run_cap(self, batch_result: Optional[Dict[str, Any]]) -> float:
+        """Seconds one run may hold the pipeline lock.
+
+        ``PIPELINE_RUN_TIMEOUT_SECONDS``, extended for audio in the run's batch
+        by ``AUDIO_TIMEOUT_FACTOR`` per second of audio, up to
+        ``PIPELINE_RUN_TIMEOUT_AUDIO_MAX_SECONDS``. An audio result with no
+        known duration takes the maximum.
+        """
+        base = float(settings.pipeline_run_timeout_seconds)
+        results = (batch_result or {}).get("results") if isinstance(batch_result, dict) else None
+        audio = [
+            r for r in (results or []) if isinstance(r, dict) and r.get("is_audio")
+        ]
+        if not audio:
+            return base
+        ceiling = max(base, float(settings.pipeline_run_timeout_audio_max_seconds))
+        total = 0.0
+        for result in audio:
+            duration = result.get("audio_duration_seconds")
+            if isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration < 0:
+                return ceiling
+            total += float(duration)
+        return min(base + float(settings.audio_timeout_factor) * total, ceiling)
+
+    async def _settle_pipeline_run_cap(
+        self,
+        workspace_id: str,
+        user_id: str,
+        *,
+        holder: str,
+        cap: float,
+        features: List[str],
+        emitted: Set[str],
+        workspace_role: str = "",
+    ) -> None:
+        """A run passed its cap: report it and settle its unemitted panels.
+
+        Called after ``asyncio.timeout`` has cancelled the run's body and while
+        the lock is still held, so the settled panels go out before any queued
+        run's.
+        """
+        record = _PIPELINE_HOLD.get() or {}
+        stage = record.get("stage") or "unknown"
+        held = _loop_now() - float(record.get("acquiredAt") or _loop_now())
+        logger.critical(
+            "pipeline run exceeded cap={} holder={} stage={} workspace={}",
+            _cap_label(cap),
+            holder,
+            stage,
+            str(workspace_id)[:12],
+        )
+        try:
+            audit_logger.log_event(
+                "pipeline_run_timeout",
+                {
+                    "workspace_id": workspace_id,
+                    "holder": holder,
+                    "stage": stage,
+                    "cap_seconds": int(round(cap)),
+                    "held_seconds": int(held),
+                },
+                workspace_id=workspace_id,
+                severity="CRITICAL",
+            )
+        except Exception:
+            pass
+        if features:
+            await self._release_refresh_loaders(
+                workspace_id,
+                user_id,
+                list(features),
+                skip=emitted,
+                reason=holder + "_run_cap",
+                workspace_role=workspace_role,
+            )
 
     def _prepare_json_candidate(
         self, raw_text: str, prefer: str = "object"

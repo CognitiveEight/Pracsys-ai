@@ -8,6 +8,8 @@ from typing import Any, Dict
 
 from loguru import logger
 
+from app.utils.redact import validation_fields
+
 from app.socket.schemas import (
     AnalysisDocxGenerateRequestPayload,
 )
@@ -39,7 +41,9 @@ class DocxExportMixin:
             req = AnalysisDocxGenerateRequestPayload(**payload_in)
             normalized_request = req.model_dump(exclude_none=True)
         except Exception as e:
-            logger.warning("analysis_docx_generate_request: invalid payload: {}", e)
+            logger.warning(
+                "analysis_docx_generate_request: invalid payload: {}", validation_fields(e)
+            )
             normalized_request = payload_in
 
         response_body = await asyncio.to_thread(

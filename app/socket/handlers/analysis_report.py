@@ -25,6 +25,7 @@ from app.langgraph.list_of_dates_agent import (
 from app.workspace.custom_instructions import (build_custom_instruction_suffix)
 
 from app.rag.packing import fit_to_budget, panel_context_budget
+from app.socket.handlers.extraction import document_set_key
 from app.socket.event_utils import (
     SPEAKER_LABEL_GUARDRAIL,
     _coerce_analysis_text_item,
@@ -47,9 +48,107 @@ from app.prompts.analysis_report_prompts import (
     generate_analysis_report_from_documents_prompt2,
     ensure_structured_relevant_jurisdiction_prompt,
     ensure_quality_score_explanation_prompt,
-    compute_rejection_score_delta_prompt,
+    rejection_reason_prompt,
     compute_added_missing_info_score_delta_prompt,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
+
+
+_MATCH_STOP_WORDS = frozenset({
+    "the", "a", "an", "and", "or", "for", "of", "to", "in", "on", "with", "by",
+    "from", "is", "are", "was", "were", "be", "been", "being", "that", "this",
+    "these", "those", "it", "its", "their", "his", "her", "our", "your", "at",
+    "as", "can", "could", "should", "would", "about", "into", "also", "than",
+    "then", "over", "under",
+})
+
+#: A rejected or added item matches a different-worded one only when this share
+#: of their informative words is common (Jaccard) and at least
+#: ``_SAME_ITEM_MIN_SHARED`` words are shared. Sharing a couple of words is
+#: normal between distinct gaps on one case ("copy", "booking", "email").
+_SAME_ITEM_MIN_JACCARD = 0.8
+_SAME_ITEM_MIN_SHARED = 3
+
+
+def _analysis_item_text(item: Any) -> str:
+    if isinstance(item, str):
+        return item.strip()
+    if isinstance(item, dict):
+        # Generated items carry "point"; tagged ones {id, text, isMatched}.
+        return str(item.get("point") or item.get("text") or "").strip()
+    return ""
+
+
+def _match_norm(text: str) -> str:
+    text = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _match_tokens(text: str) -> Set[str]:
+    return {
+        tok
+        for tok in _match_norm(text).split()
+        if len(tok) > 2 and tok not in _MATCH_STOP_WORDS
+    }
+
+
+def _same_item_score(item: Any, value: str) -> float:
+    """How surely ``item`` is the item ``value`` names: 2.0 for the same text
+    (ignoring case and punctuation), else the Jaccard share of informative
+    words when it clears the same-item bar, else 0."""
+    item_text = _analysis_item_text(item)
+    if not item_text or not (value or "").strip():
+        return 0.0
+    if _match_norm(item_text) == _match_norm(value):
+        return 2.0
+    a, b = _match_tokens(item_text), _match_tokens(value)
+    shared = len(a & b)
+    if shared < _SAME_ITEM_MIN_SHARED:
+        return 0.0
+    jaccard = shared / len(a | b)
+    return jaccard if jaccard >= _SAME_ITEM_MIN_JACCARD else 0.0
+
+
+def _indexes_of_rejected_item(items: List[Any], value: str) -> List[int]:
+    """The positions a rejection of ``value`` removes from ``items``.
+
+    Every same-text copy, else the one closest same-item match, else nothing.
+    Never a family of items that merely share words: one reject must remove
+    one gap.
+    """
+    scores = [_same_item_score(x, value) for x in items]
+    exact = [i for i, sc in enumerate(scores) if sc >= 2.0]
+    if exact:
+        return exact
+    best = max(range(len(scores)), key=lambda i: scores[i], default=None)
+    return [best] if best is not None and scores[best] > 0 else []
+
+
+_STALE_REJECTION_REASON = "This item was already removed, so the score is unchanged."
+_APPLIED_REJECTION_REASON = (
+    "Removed from the report; the readiness score reflects one fewer open item."
+)
+
+
+def _rejection_feedback_item(
+    event: Dict[str, Any], *, is_valid: bool, increase: int, reason: str
+) -> Dict[str, Any]:
+    """One entry of ``rejectionFeedback.items``: why this reject did or did
+    not move the readiness score. ``rejectedValue`` echoes what the frontend
+    sent, so it can pair the reason with the item."""
+    return {
+        "section": event.get("section"),
+        "rejectedValue": event.get("rejected_value"),
+        "isValidRejection": bool(is_valid),
+        "scoreIncrease": max(0, int(increase or 0)),
+        "reason": (reason or "").strip(),
+    }
+
+
+def _stale_rejection_feedback(event: Dict[str, Any]) -> Dict[str, Any]:
+    return _rejection_feedback_item(
+        event, is_valid=False, increase=0, reason=_STALE_REJECTION_REASON
+    )
 
 
 class AnalysisReportMixin:
@@ -89,9 +188,9 @@ class AnalysisReportMixin:
             if not instruction:
                 return False
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             # The cached report's text sections are now {id,text,isMatched}
             # dicts. The edit prompt expects plain strings ("the other lists
@@ -241,9 +340,9 @@ class AnalysisReportMixin:
                 workspace_role,
             )
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             all_docs = []
             try:
@@ -376,6 +475,8 @@ class AnalysisReportMixin:
                     + "\n"
                 )
 
+            rejected_items_block = self._build_rejected_items_block(workspace_id)
+
             # Tell the model exactly how many annexures exist so it cannot
             # invent "Annexure 2", "Annexure 3", ... when only one upload
             # is present. The post-processing clamp in
@@ -411,6 +512,7 @@ class AnalysisReportMixin:
             case_entities = await self._extract_case_entities(
                 workspace_id=workspace_id,
                 combined_document_content=combined_document_content,
+                cache_key=document_set_key(all_docs),
             )
             _ar_party_names = [
                 (p.get("name") or "").strip()
@@ -578,7 +680,7 @@ Carefully read the documents and identify key facts such as:
 
 Only treat something as "present" if it is explicitly stated in the documents.
 
-{removed_evidence_block}
+{removed_evidence_block}{rejected_items_block}
 --------------------------------------------------
 STEP 2 — MISSING INFORMATION VERIFICATION
 --------------------------------------------------
@@ -772,6 +874,7 @@ ENTITY-GROUNDING RULE (CRITICAL):
                 annexure_limit_block=annexure_limit_block,
                 current_year_ar=current_year_ar,
                 removed_evidence_block=removed_evidence_block,
+                rejected_items_block=rejected_items_block,
             )
 
             # Authoritative user corrections lead the prompt so they
@@ -991,6 +1094,15 @@ Rules:
                 _upload_wording(x)
                 for x in missing_info
             ]
+            # Items the lawyer dismissed never come back. Filtering here (the
+            # emit-time tagging filters again) lets the refill below replace a
+            # section the filter emptied instead of emitting it blank.
+            emptied_by_rejection: List[str] = []
+            missing_info, _dropped = self._drop_rejected_analysis_items(
+                workspace_id, "missingInfo", missing_info
+            )
+            if _dropped and not missing_info:
+                emptied_by_rejection.append("missingInfo")
 
             strengths_raw = data.get("strengths") or []
             if not isinstance(strengths_raw, list):
@@ -1115,6 +1227,16 @@ Rules:
                 _upload_wording(x)
                 for x in risks
             ]
+            weaknesses, _dropped = self._drop_rejected_analysis_items(
+                workspace_id, "riskOrWeakness", weaknesses
+            )
+            if _dropped and not weaknesses:
+                emptied_by_rejection.append("weaknesses")
+            risks, _dropped = self._drop_rejected_analysis_items(
+                workspace_id, "riskOrWeakness", risks
+            )
+            if _dropped and not risks:
+                emptied_by_rejection.append("risks")
 
             relevant_jurisdiction = (
                 data.get("relevantJurisdiction")
@@ -1136,6 +1258,8 @@ Rules:
             # Final guardrail for repeatedly-empty critical sections:
             # force a focused regeneration and, if still empty, apply deterministic defaults.
             must_fill = []
+            if "missingInfo" in emptied_by_rejection:
+                must_fill.append("missingInfo")
             if len(weaknesses) == 0:
                 must_fill.append("weaknesses")
             if len(risks) == 0:
@@ -1146,7 +1270,7 @@ Rules:
                 try:
                     force_tail_prompt = (
                         """Return ONLY one valid JSON object with keys:
-weaknesses, risks, relevantJurisdiction
+missingInfo, weaknesses, risks, relevantJurisdiction
 
 Context:
 - Role: {}
@@ -1158,6 +1282,8 @@ Documents:
 
 Rules:
 - Use only annexure facts; do not invent.
+- missingInfo: provide 1-3 specific evidence or information gaps that are NOT
+  present in the documents (return [] if the documents genuinely leave none).
 - weaknesses: provide 1-3 specific vulnerability points.
 - risks: provide 1-3 concrete procedural/legal risks.
 - relevantJurisdiction: provide 1-3 likely forums/courts/authorities.
@@ -1169,7 +1295,7 @@ Rules:
                         current_case_summary,
                         current_strategic_objective,
                         combined_document_content,
-                    )
+                    ) + rejected_items_block
                     force_raw = await gemini_client.generate(
                         prompt=force_tail_prompt,
                         system_instruction=get_structured_document_feature_system_instruction(
@@ -1181,14 +1307,29 @@ Rules:
                     )
                     force_obj = json.loads((force_raw or "").strip())
                     if isinstance(force_obj, dict):
+                        if not missing_info and isinstance(force_obj.get("missingInfo"), list):
+                            missing_info, _ = self._drop_rejected_analysis_items(
+                                workspace_id,
+                                "missingInfo",
+                                [
+                                    _upload_wording(x)
+                                    for x in _coerce_analysis_text_list(
+                                        force_obj.get("missingInfo")
+                                    )[:10]
+                                ],
+                            )
                         if not weaknesses and isinstance(force_obj.get("weaknesses"), list):
-                            weaknesses = _coerce_analysis_text_list(
-                                force_obj.get("weaknesses")
-                            )[:8]
+                            weaknesses, _ = self._drop_rejected_analysis_items(
+                                workspace_id,
+                                "riskOrWeakness",
+                                _coerce_analysis_text_list(force_obj.get("weaknesses"))[:8],
+                            )
                         if not risks and isinstance(force_obj.get("risks"), list):
-                            risks = _coerce_analysis_text_list(
-                                force_obj.get("risks")
-                            )[:8]
+                            risks, _ = self._drop_rejected_analysis_items(
+                                workspace_id,
+                                "riskOrWeakness",
+                                _coerce_analysis_text_list(force_obj.get("risks"))[:8],
+                            )
                         if (not relevant_jurisdiction) and isinstance(
                             force_obj.get("relevantJurisdiction"), list
                         ):
@@ -1405,7 +1546,7 @@ Rules:
         except Exception as e:
             logger.opt(exception=e).error("Analysis report generation failed: {}", e)
             return self._analysis_report_fallback(
-                (workspace_role or "ADJUDICATOR").strip().upper()
+                (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             )
 
     async def _ensure_structured_relevant_jurisdiction(
@@ -1873,9 +2014,7 @@ Rules:
             for existing in bucket:
                 if not isinstance(existing, str):
                     continue
-                if self._match_rejected_value(existing, rv) or self._match_rejected_value(
-                    rv, existing
-                ):
+                if self._same_analysis_item(existing, rv):
                     return
             bucket.append(rv)
             current[section] = bucket[-50:]
@@ -1910,23 +2049,95 @@ Rules:
             for prev_rv in bucket:
                 if not isinstance(prev_rv, str) or not prev_rv.strip():
                     continue
-                if self._match_rejected_value(candidate, prev_rv):
+                if self._same_analysis_item(candidate, prev_rv):
                     return True
         except Exception:
             return False
         return False
 
+    def _drop_rejected_analysis_items(
+        self, workspace_id: str, section: str, items: List[str]
+    ) -> Tuple[List[str], int]:
+        """``items`` without the ones the lawyer rejected, and how many went.
+
+        A gap re-created by a document the lawyer deleted is kept: the same
+        exemption ``_tag_analysis_report_against_current_state`` applies.
+        """
+        if not items:
+            return items, 0
+        try:
+            exempt = {
+                item["text"]
+                for item in self._removed_evidence_missing_info_items(workspace_id)
+            }
+        except Exception:
+            exempt = set()
+        kept = [
+            s
+            for s in items
+            if s in exempt
+            or not self._is_previously_rejected_analysis_item(
+                workspace_id=workspace_id, section=section, candidate=s
+            )
+        ]
+        return kept, len(items) - len(kept)
+
+    _REJECTED_ITEMS_PROMPT_LIMIT = 30
+
+    def _build_rejected_items_block(self, workspace_id: str) -> str:
+        """The items the lawyer dismissed, for the analysis prompts.
+
+        Without it the model spends its missingInfo / weakness / risk slots
+        re-creating the dismissed items, the rejection filter removes them
+        all, and the gaps a new document raises are never generated: rejecting
+        everything and then uploading left the three sections empty.
+        """
+        current = self._workspace_rejected_analysis_items.get(workspace_id) or {}
+        if not isinstance(current, dict):
+            return ""
+        limit = self._REJECTED_ITEMS_PROMPT_LIMIT
+
+        def _lines(section: str) -> List[str]:
+            bucket = current.get(section)
+            if not isinstance(bucket, list):
+                return []
+            return [
+                f"- {str(v).strip()[:200]}"
+                for v in bucket[-limit:]
+                if isinstance(v, str) and v.strip()
+            ]
+
+        missing = _lines("missingInfo")
+        risk_weak = _lines("riskOrWeakness")
+        if not missing and not risk_weak:
+            return ""
+        parts = [
+            "--------------------------------------------------",
+            "DISMISSED BY THE LAWYER (do not output these, or any rewording of them)",
+            "--------------------------------------------------",
+            "The lawyer has reviewed and removed the items below. Never list them "
+            "again. Use the slots for OTHER gaps, weaknesses and risks that the "
+            "documents support, especially ones raised by recently added documents.",
+        ]
+        if missing:
+            parts += ["Dismissed missingInfo:", *missing]
+        if risk_weak:
+            parts += ["Dismissed weaknesses / risks:", *risk_weak]
+        return "\n".join(parts) + "\n"
+
     def _match_rejected_value(self, item: Any, rejected_value: str) -> bool:
-        """Return True if item matches/addresses rejectedValue using robust text overlap."""
+        """Loose topical match: True when ``item`` is ABOUT ``rejected_value``.
+
+        Two shared informative words are enough, so distinct gaps on one case
+        often match each other. Use it only where the lawyer paraphrases (the
+        chat "remove this item" path, protecting user-added items). Anything
+        that removes or suppresses items uses ``_same_analysis_item`` /
+        ``_indexes_of_rejected_item`` instead.
+        """
         rv = (rejected_value or "").strip()
         if not rv:
             return False
-
-        item_text = ""
-        if isinstance(item, str):
-            item_text = item.strip()
-        elif isinstance(item, dict) and "point" in item:
-            item_text = (item.get("point") or "").strip()
+        item_text = _analysis_item_text(item)
         if not item_text:
             return False
 
@@ -1934,69 +2145,8 @@ Rules:
         if item_text == rv or rv in item_text or item_text in rv:
             return True
 
-        def _norm(s: str) -> str:
-            s = s.lower().strip()
-            s = re.sub(r"[^a-z0-9\s]", " ", s)
-            s = re.sub(r"\s+", " ", s).strip()
-            return s
-
-        stop_words = {
-            "the",
-            "a",
-            "an",
-            "and",
-            "or",
-            "for",
-            "of",
-            "to",
-            "in",
-            "on",
-            "with",
-            "by",
-            "from",
-            "is",
-            "are",
-            "was",
-            "were",
-            "be",
-            "been",
-            "being",
-            "that",
-            "this",
-            "these",
-            "those",
-            "it",
-            "its",
-            "their",
-            "his",
-            "her",
-            "our",
-            "your",
-            "at",
-            "as",
-            "can",
-            "could",
-            "should",
-            "would",
-            "about",
-            "into",
-            "also",
-            "than",
-            "then",
-            "over",
-            "under",
-        }
-
-        def _tokens(s: str) -> Set[str]:
-            out: Set[str] = set()
-            for tok in _norm(s).split():
-                if len(tok) <= 2 or tok in stop_words:
-                    continue
-                out.add(tok)
-            return out
-
-        item_tokens = _tokens(item_text)
-        rv_tokens = _tokens(rv)
+        item_tokens = _match_tokens(item_text)
+        rv_tokens = _match_tokens(rv)
         if not item_tokens or not rv_tokens:
             return False
 
@@ -2008,7 +2158,11 @@ Rules:
         if len(overlap) >= 2:
             return True
         return len(overlap) / max(1, len(item_tokens)) >= 0.6
-        return False
+
+    def _same_analysis_item(self, item: Any, value: str) -> bool:
+        """Strict match: ``item`` IS the item ``value`` names (same text, or a
+        near-identical rewording). See ``_same_item_score``."""
+        return _same_item_score(item, value) > 0
 
     def _parse_bullets_from_block(self, block: str) -> List[str]:
         """Parse a text block into a list of bullet items."""
@@ -2159,7 +2313,7 @@ Rules:
                         self._emit_analysis_report(
                             workspace_id=workspace_id,
                             user_id=user_id,
-                            workspace_role=(role or "ADJUDICATOR"),
+                            workspace_role=(role or DEFAULT_WORKSPACE_ROLE),
                             batch_result=None,
                             is_update=True,
                             log_context=log_context or " (marker miss refresh)",
@@ -2363,11 +2517,12 @@ Rules:
                         or current_report.get("case_resolution_score")
                         or 0
                     )
-                    delta = min(
-                        5, max(0, removed_missing * 2 + removed_weak + removed_risk)
+                    weights = self._REJECTION_SCORE_INCREASE
+                    delta = (
+                        removed_missing * weights["missingInfo"]
+                        + removed_weak * weights["weaknesses"]
+                        + removed_risk * weights["risks"]
                     )
-                    if delta < 1:
-                        delta = 1
 
                     # Cap based on pending items
                     new_max_allowed = self._analysis_report_max_allowed_score(
@@ -2442,52 +2597,32 @@ Rules:
             ),
         }
 
-    async def _compute_rejection_score_delta(
+    async def _rejection_reason(
         self,
-        current_score: int,
         section: str,
         rejected_value: str,
         report: Dict[str, Any],
         workspace_id: str = "",
-    ) -> Tuple[bool, int, str]:
-        """
-        Ask AI to (a) decide if the user's rejection is VALID — i.e. the rejected
-        item is genuinely not relevant to this specific case — and (b) compute a
-        score INCREASE (1-5) when valid. The system will ADD the returned delta
-        to the current case resolution score.
+    ) -> str:
+        """The one-sentence reason shown beside the score after a reject.
 
-        - Valid rejection (item truly not relevant) → isValidRejection=true,
-          scoreIncrease 1-5.
-        - Invalid rejection (item IS relevant; user is dismissing a real gap) →
-          isValidRejection=false, scoreIncrease=0.
-
-        Returns (is_valid_rejection, delta, reason). On AI failure returns
-        (True, default_bump, generic reason) so the legacy "always bump" behaviour
-        is preserved when Gemini is unavailable.
+        The score itself is not the model's call: every reject that removes an
+        item raises it by the section weight (``_REJECTION_SCORE_INCREASE``).
+        The model only says, for the lawyer, what removing the item means.
+        Falls back to a fixed sentence when the model is unavailable or its
+        output cannot be parsed.
         """
         try:
             from app.ai.gemini_client import gemini_client
 
             gemini_client.initialize()
             if not gemini_client.is_available():
-                return (
-                    True,
-                    self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT,
-                    "Score adjusted to reflect user rejection.",
-                )
-            remaining_missing = len(
-                report.get("missingInfo") or report.get("missing_info") or []
-            )
-            remaining_weak = len(report.get("weaknesses") or [])
-            remaining_risks = len(report.get("risks") or [])
+                return _APPLIED_REJECTION_REASON
 
             # The case description lives in the STRATEGY payload, not in the
             # analysis report: _generate_analysis_report_from_documents never
-            # writes caseSummary / reportCaseSummary / strategicObjective, so
-            # reading them off `report` always yielded "" and the prompt below
-            # rendered the literal "(not available)" — i.e. this scoring call
-            # judged relevance with no case description at all. Fall back to
-            # `report` so a caller that does pass an enriched dict still works.
+            # writes caseSummary / reportCaseSummary / strategicObjective. Fall
+            # back to `report` so a caller that passes an enriched dict works.
             _strategy_src = (
                 self._workspace_strategy_payload.get(workspace_id) or {}
                 if workspace_id
@@ -2514,154 +2649,71 @@ Rules:
                 or ""
             ).strip()
 
-            # Build short context: other items in the same section so the model can judge relative impact
+            # Other items in the same section, so the sentence can say what remains.
             section_items: List[str] = []
             if section == "missingInfo":
-                for x in report.get("missingInfo") or report.get("missing_info") or []:
-                    t = x.get("point", x) if isinstance(x, dict) else x
-                    if isinstance(t, str) and t.strip():
-                        section_items.append(t.strip()[:120])
+                pool = report.get("missingInfo") or report.get("missing_info") or []
             else:
-                for x in (report.get("weaknesses") or []) + (report.get("risks") or []):
-                    t = x.get("point", x) if isinstance(x, dict) else x
-                    if isinstance(t, str) and t.strip():
-                        section_items.append(t.strip()[:120])
+                pool = (report.get("weaknesses") or []) + (report.get("risks") or [])
+            for x in pool:
+                t = _analysis_item_text(x)
+                if t:
+                    section_items.append(t[:120])
             section_context = (
                 "Other items in this section (for context): "
                 + "; ".join(section_items[:8])
                 if section_items
                 else ""
             )
-            # When this rejection leaves no items in any category, score can reach 100%; otherwise capped at 95%
-            can_reach_100 = (
-                remaining_missing == 0 and remaining_weak == 0 and remaining_risks == 0
+            prompt = rejection_reason_prompt(
+                case_summary=case_summary,
+                rejected_value=rejected_value,
+                report_summary=report_summary,
+                section=section,
+                section_context=section_context,
+                strategic_objective=strategic_objective,
             )
-            prompt = compute_rejection_score_delta_prompt(can_reach_100=can_reach_100, case_summary=case_summary, current_score=current_score, rejected_value=rejected_value, remaining_missing=remaining_missing, remaining_risks=remaining_risks, remaining_weak=remaining_weak, report_summary=report_summary, section=section, section_context=section_context, strategic_objective=strategic_objective)
             raw = await gemini_client.generate(
                 prompt=prompt,
                 system_instruction=get_structured_document_feature_system_instruction(
                     None
                 ),
                 temperature=0.3,
-                max_tokens=12000,
+                max_tokens=2000,
                 response_mime_type="application/json",
             )
             raw = (raw or "").strip()
             if not raw or is_generation_error(raw):
                 logger.warning(
-                    "Rejection score delta: Gemini error or empty; using default. raw={}",
+                    "Rejection reason: model error or empty; using default. raw={}",
                     chars(raw),
                 )
-                return (
-                    True,
-                    self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT,
-                    "Score adjusted to reflect user rejection.",
+                return _APPLIED_REJECTION_REASON
+            reason = ""
+            json_str = self._prepare_json_candidate(raw, prefer="object")
+            if json_str:
+                try:
+                    obj = json.loads(json_str)
+                    if isinstance(obj, dict):
+                        reason = str(obj.get("reason") or "").strip()
+                except json.JSONDecodeError:
+                    reason = ""
+            if not reason:
+                match = re.search(r'"reason"\s*:\s*"([^"]*)"', raw)
+                reason = match.group(1).strip() if match else ""
+            if not reason:
+                logger.warning(
+                    "Rejection reason: could not parse response; using default. raw={}",
+                    chars(raw),
                 )
-            # Strip markdown code blocks if present
-            if "```" in raw:
-                match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
-                if match:
-                    raw = match.group(1).strip()
-                else:
-                    raw = re.sub(r"^```\w*\s*", "", raw)
-                    raw = re.sub(r"\s*```\s*$", "", raw)
-            obj: Optional[Dict[str, Any]] = None
-            start = raw.find("{")
-            if start >= 0:
-                depth = 0
-                for i in range(start, len(raw)):
-                    if raw[i] == "{":
-                        depth += 1
-                    elif raw[i] == "}":
-                        depth -= 1
-                        if depth == 0:
-                            try:
-                                obj = json.loads(raw[start : i + 1])
-                            except json.JSONDecodeError:
-                                obj = None
-                            break
-
-            def _coerce_bool(value: Any, default: bool) -> bool:
-                if isinstance(value, bool):
-                    return value
-                if isinstance(value, (int, float)):
-                    return bool(value)
-                if isinstance(value, str):
-                    return value.strip().lower() in ("true", "yes", "1")
-                return default
-
-            if obj and isinstance(obj, dict) and "scoreIncrease" in obj:
-                is_valid = _coerce_bool(
-                    obj.get("isValidRejection", obj.get("is_valid_rejection")),
-                    default=True,
-                )
-                delta = int(
-                    obj.get("scoreIncrease", self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT)
-                )
-                if not is_valid:
-                    delta = 0
-                else:
-                    delta = max(1, min(5, delta))  # Rejection bump 1-5 as per prompt
-                    if current_score + delta > 100:
-                        delta = max(0, 100 - current_score)
-                reason = (
-                    obj.get("reason") or "Score adjusted based on rejection priority."
-                ).strip()
-                logger.info(
-                    "Rejection score delta: AI isValid={} delta={}, reason={}",
-                    is_valid,
-                    delta,
-                    chars(reason),
-                )
-                return (is_valid, delta, reason[:200])
-            # Regex fallback: extract scoreIncrease from raw text (e.g. malformed or truncated JSON)
-            num_match = re.search(
-                r'"scoreIncrease"\s*:\s*(\d+)|scoreIncrease"\s*:\s*(\d+)|\bscoreIncrease\s*:\s*(\d+)',
-                raw,
-            )
-            if num_match:
-                valid_match = re.search(
-                    r'"isValidRejection"\s*:\s*(true|false)',
-                    raw,
-                    flags=re.IGNORECASE,
-                )
-                is_valid = (
-                    valid_match.group(1).strip().lower() == "true"
-                    if valid_match
-                    else True
-                )
-                delta = int(
-                    num_match.group(1) or num_match.group(2) or num_match.group(3) or 0
-                )
-                if not is_valid:
-                    delta = 0
-                else:
-                    delta = max(1, min(5, delta))  # Rejection bump 1-5 as per prompt
-                    if current_score + delta > 100:
-                        delta = max(0, 100 - current_score)
-                reason_match = re.search(r'"reason"\s*:\s*"([^"]*)"', raw)
-                reason = (
-                    reason_match.group(1).strip()
-                    if reason_match
-                    else "Score adjusted based on rejection priority."
-                )[:200]
-                logger.info(
-                    "Rejection score delta: parsed via regex isValid={} delta={}",
-                    is_valid,
-                    delta,
-                )
-                return (is_valid, delta, reason)
-            logger.warning(
-                "Rejection score delta: could not parse response; using default. raw={}",
-                chars(raw),
-            )
+                return _APPLIED_REJECTION_REASON
+            return reason[:300]
+        except asyncio.CancelledError:
+            logger.info("Rejection reason: cancelled")
+            raise
         except Exception as e:
-            logger.warning("Rejection score delta failed: {}; using default bump", e)
-        return (
-            True,
-            self._ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT,
-            "Score adjusted to reflect user rejection.",
-        )
+            logger.warning("Rejection reason failed: {}; using default", e)
+        return _APPLIED_REJECTION_REASON
 
     async def _retag_analysis_report_safe(
         self, workspace_id: str, report: Dict[str, Any]
@@ -2689,11 +2741,11 @@ Rules:
 
         - The matching item is always removed from the list (the user explicitly
           rejected it).
-        - The AI then judges whether the rejection itself is VALID — i.e. the
-          rejected item is genuinely not relevant to this case.
-            - VALID rejection → caseResolutionScore is bumped 1–5.
-            - INVALID rejection (item IS relevant; user dismissed a real gap) →
-              score is unchanged.
+        - caseResolutionScore rises by the weight of each list the item left
+          (``_REJECTION_SCORE_INCREASE``: missing info 5, weakness 5, risk 3),
+          capped at 95% while any item remains. The model only writes the
+          reason shown beside the score; it does not decide the increase.
+        - A reject that matches nothing (already removed) adds nothing.
         - qualityScoreExplanation and reportQualityScoreExplanation are
           regenerated either way, and the analysis report is always re-emitted
           so the FE loader clears.
@@ -2750,11 +2802,11 @@ Rules:
                 self._debounce_and_flush_feedback(workspace_id)
             )
         logger.info(
-            "analysis_report_feedback queued ({} pending) for workspace {} (section={}, value={!r})",
+            "analysis_report_feedback queued ({} pending) for workspace {} (section={}, value={})",
             len(self._pending_feedback_queue[workspace_id]),
             workspace_id,
             section,
-            rejected_value[:80],
+            chars(rejected_value),
         )
 
     async def _debounce_and_flush_feedback(self, workspace_id: str) -> None:
@@ -2787,6 +2839,75 @@ Rules:
                     workspace_id,
                     exc,
                 )
+
+    async def _emit_analysis_report_with_feedback(
+        self,
+        workspace_id: str,
+        user_id: str,
+        report: Dict[str, Any],
+        items: List[Dict[str, Any]],
+        *,
+        score_change: int,
+    ) -> None:
+        """Emit the cached ``report`` with ``rejectionFeedback`` added.
+
+        The field is additive and rides this emit only: it is removed from the
+        cached report afterwards, so a reconnect replay or a later rebuild
+        never shows an old reason again. The report object itself is emitted
+        (not a copy) because the emit chokepoint's in-place fixes are meant to
+        reach the cache. ``scoreChange`` is what was applied; it can be lower
+        than the sum of ``scoreIncrease`` when the score is capped (95% while
+        items remain, and the per-batch cap).
+        """
+        report["rejectionFeedback"] = {"scoreChange": int(score_change), "items": items}
+        try:
+            await self._emit_document_feature(
+                feature_type="analysis_report",
+                workspace_id=workspace_id,
+                user_id=user_id,
+                payload=report,
+                usage=current_usage(),
+            )
+        finally:
+            report.pop("rejectionFeedback", None)
+
+    def _rejected_item_aliases(
+        self,
+        workspace_id: str,
+        section: str,
+        rejected_value: str,
+        report: Any,
+    ) -> List[str]:
+        """Our wording of the item the lawyer rejected, found through its id.
+
+        For an item it already had (``isMatched``), the frontend keeps showing
+        its own wording, while a rebuild may have re-worded our cached copy:
+        then no text rule links the two. The rejected text is matched exactly
+        against ``currentState`` to get the item id, and the cached item with
+        that id gives the wording to remove. Empty when nothing links them.
+        """
+        fields = ("missingInfo",) if section == "missingInfo" else ("weaknesses", "risks")
+        current_state = self._workspace_current_state_payload.get(workspace_id) or {}
+        if not isinstance(current_state, dict) or not isinstance(report, dict):
+            return []
+        ids = {
+            str(item.get("id"))
+            for field in fields
+            for item in (current_state.get(field) or [])
+            if isinstance(item, dict)
+            and item.get("id")
+            and _same_item_score(item.get("text") or "", rejected_value) >= 2.0
+        }
+        if not ids:
+            return []
+        aliases = []
+        for field in fields:
+            for item in report.get(field) or []:
+                if isinstance(item, dict) and str(item.get("id") or "") in ids:
+                    text = _analysis_item_text(item)
+                    if text and _same_item_score(text, rejected_value) < 2.0:
+                        aliases.append(text)
+        return aliases
 
     @meter_usage
     async def _apply_batched_feedback(
@@ -2845,55 +2966,63 @@ Rules:
         )
 
         # Pass 1: remove every matching item up front. We collect the events
-        # that actually removed something so the score-delta calls only run for
-        # real removals, not stale duplicates.
+        # that actually removed something, with the score each one adds, so
+        # stale duplicates add nothing.
         removed_events: list[dict] = []
-        for ev in events:
+        for position, ev in enumerate(events):
             section = ev["section"]
             rejected_value = ev["rejected_value"]
-            removed_here = False
+            # The same item in our wording, when a rebuild re-worded it.
+            aliases = self._rejected_item_aliases(
+                workspace_id, section, rejected_value, current
+            )
+            values = [rejected_value, *aliases]
+
+            def _drop(items: List[Any]) -> Set[int]:
+                return {i for v in values for i in _indexes_of_rejected_item(items, v)}
+
+            # The score rises by the weight of each list the item left.
+            increase = 0
             if section == "missingInfo":
                 missing = (
                     report.get("missingInfo") or report.get("missing_info") or []
                 )
                 if isinstance(missing, list):
-                    new_missing = [
-                        x
-                        for x in missing
-                        if not self._match_rejected_value(x, rejected_value)
-                    ]
+                    drop = _drop(missing)
+                    new_missing = [x for i, x in enumerate(missing) if i not in drop]
                     if len(new_missing) < len(missing):
                         report["missingInfo"] = new_missing
-                        removed_here = True
+                        increase += self._REJECTION_SCORE_INCREASE["missingInfo"]
             else:
                 weaknesses = report.get("weaknesses") or []
                 if isinstance(weaknesses, list):
-                    new_weak = [
-                        x
-                        for x in weaknesses
-                        if not self._match_rejected_value(x, rejected_value)
-                    ]
+                    drop = _drop(weaknesses)
+                    new_weak = [x for i, x in enumerate(weaknesses) if i not in drop]
                     if len(new_weak) < len(weaknesses):
                         report["weaknesses"] = new_weak
-                        removed_here = True
+                        increase += self._REJECTION_SCORE_INCREASE["weaknesses"]
                 risks = report.get("risks") or []
                 if isinstance(risks, list):
-                    new_risks = [
-                        x
-                        for x in risks
-                        if not self._match_rejected_value(x, rejected_value)
-                    ]
+                    drop = _drop(risks)
+                    new_risks = [x for i, x in enumerate(risks) if i not in drop]
                     if len(new_risks) < len(risks):
                         report["risks"] = new_risks
-                        removed_here = True
+                        increase += self._REJECTION_SCORE_INCREASE["risks"]
 
-            if removed_here:
-                self._record_rejected_analysis_item(
-                    workspace_id=workspace_id,
-                    section=section,
-                    rejected_value=rejected_value,
-                )
-                removed_events.append(ev)
+            if increase:
+                for value in values:
+                    self._record_rejected_analysis_item(
+                        workspace_id=workspace_id,
+                        section=section,
+                        rejected_value=value,
+                    )
+                if aliases:
+                    logger.info(
+                        "analysis_report_feedback: rejected item resolved by id "
+                        "({} re-worded cached item(s))",
+                        len(aliases),
+                    )
+                removed_events.append({**ev, "score_increase": increase, "position": position})
 
         if not removed_events:
             # Every rejection was stale (already removed). Just refresh the
@@ -2907,54 +3036,52 @@ Rules:
             report = await self._retag_analysis_report_safe(workspace_id, report)
             self._workspace_analysis_payload[workspace_id] = report
             if self._socket_client:
-                await self._emit_document_feature(
-                    feature_type="analysis_report",
-                    workspace_id=workspace_id,
-                    user_id=user_id,
-                    payload=report,
-                    usage=current_usage(),
+                await self._emit_analysis_report_with_feedback(
+                    workspace_id,
+                    user_id,
+                    report,
+                    [_stale_rejection_feedback(ev) for ev in events],
+                    score_change=0,
                 )
             return
 
-        # Pass 2: validity check + score delta for each real removal, in parallel.
-        delta_tasks = [
-            self._compute_rejection_score_delta(
-                current_score=old_score,
-                section=ev["section"],
-                rejected_value=ev["rejected_value"],
-                report=report,
-                workspace_id=workspace_id,
-            )
-            for ev in removed_events
-        ]
-        delta_results = await asyncio.gather(*delta_tasks, return_exceptions=True)
+        # Pass 2: every real removal raises the score by its section weight;
+        # the model only writes the reason shown beside the score.
+        reason_results = await asyncio.gather(
+            *(
+                self._rejection_reason(
+                    section=ev["section"],
+                    rejected_value=ev["rejected_value"],
+                    report=report,
+                    workspace_id=workspace_id,
+                )
+                for ev in removed_events
+            ),
+            return_exceptions=True,
+        )
 
         total_delta = 0
-        for ev, result in zip(removed_events, delta_results):
-            if isinstance(result, BaseException):
+        removed_positions = {ev["position"] for ev in removed_events}
+        feedback = [
+            _stale_rejection_feedback(ev)
+            for position, ev in enumerate(events)
+            if position not in removed_positions
+        ]
+        for ev, reason in zip(removed_events, reason_results):
+            if isinstance(reason, asyncio.CancelledError):
+                raise reason
+            if isinstance(reason, BaseException):
                 logger.warning(
-                    "analysis_report_feedback batch: score-delta call failed for {!r}: {}",
-                    ev["rejected_value"][:80],
-                    result,
+                    "analysis_report_feedback batch: reason call failed for {}: {}",
+                    chars(ev["rejected_value"]),
+                    reason,
                 )
-                continue
-            is_valid, delta, _reason = result
-            if not is_valid:
-                logger.info(
-                    "analysis_report_feedback batch: rejection judged INVALID — no score bump for {!r}",
-                    ev["rejected_value"][:80],
-                )
-                continue
-            total_delta += int(delta or 0)
-
-        # Cap the batch's combined score bump.
-        if total_delta > self._feedback_batch_max_score_delta:
-            logger.info(
-                "analysis_report_feedback batch: capping combined score delta {}  {}",
-                total_delta,
-                self._feedback_batch_max_score_delta,
-            )
-            total_delta = self._feedback_batch_max_score_delta
+                reason = _APPLIED_REJECTION_REASON
+            increase = int(ev["score_increase"])
+            feedback.append(_rejection_feedback_item(
+                ev, is_valid=True, increase=increase, reason=reason,
+            ))
+            total_delta += increase
 
         new_score = min(100, old_score + total_delta)
         max_allowed = self._analysis_report_max_allowed_score(report=report)
@@ -3004,12 +3131,12 @@ Rules:
         self._workspace_analysis_payload[workspace_id] = report
 
         if self._socket_client:
-            await self._emit_document_feature(
-                feature_type="analysis_report",
-                workspace_id=workspace_id,
-                user_id=user_id,
-                payload=report,
-                usage=current_usage(),
+            await self._emit_analysis_report_with_feedback(
+                workspace_id,
+                user_id,
+                report,
+                feedback,
+                score_change=new_score - old_score,
             )
             logger.success(
                 "analysis_report_feedback batch applied: {} rejections, score {}%  {}% (delta +{})",
@@ -3339,7 +3466,7 @@ Rules:
             current_missing = [current_missing] if current_missing else []
 
         already_present = any(
-            self._match_rejected_value(x, new_entry) for x in current_missing
+            self._same_analysis_item(x, new_entry) for x in current_missing
         )
         if not already_present and new_entry:
             current_missing = list(current_missing) + [new_entry]

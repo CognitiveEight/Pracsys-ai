@@ -4,8 +4,9 @@ Feature mixin extracted from events.py — methods moved verbatim.
 """
 
 import asyncio
+import hashlib
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
 from loguru import logger
 
@@ -20,6 +21,18 @@ from app.prompts.extraction_prompts import (
     extract_timeline_subagent_prompt,
     extract_assets_and_law_subagent_prompt,
 )
+
+
+def document_set_key(docs: Sequence[Dict[str, Any]]) -> str:
+    """Cache key for ``_extract_case_entities``: each document's id and a hash
+    of its stored content, in order. A new, removed or re-read document
+    changes it; how a caller packs its prompt does not."""
+    h = hashlib.sha1()
+    for d in docs or []:
+        content = str(d.get("content") or "")
+        h.update(str(d.get("document_id") or "").encode("utf-8", errors="ignore"))
+        h.update(hashlib.sha1(content.encode("utf-8", errors="ignore")).digest())
+    return "docs:" + h.hexdigest()
 
 
 class ExtractionMixin:
@@ -162,6 +175,7 @@ class ExtractionMixin:
         self,
         workspace_id: str,
         combined_document_content: str,
+        cache_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Pass 1 of the strategy pipeline — "deep agents in spirit".
@@ -176,6 +190,11 @@ class ExtractionMixin:
         Combines into the unified ``case_entities`` dict that the synthesis
         pass anchors to. Any sub-extractor that fails contributes empty arrays
         so a single sub-failure never blocks the whole strategy generation.
+
+        ``cache_key`` (:func:`document_set_key`) identifies the documents the
+        content was packed from. Pass it: each caller packs its prompt with its
+        own graph block and budget, so the packed text alone never matches
+        between strategy and analysis.
         """
         if not combined_document_content or not combined_document_content.strip():
             return dict(self._EMPTY_CASE_ENTITIES)
@@ -185,9 +204,8 @@ class ExtractionMixin:
         # Content-hash short-circuit. Strategy and analysis_report both call this
         # helper inside the same generation pipeline; without the cache we would
         # pay for the 3-parallel-sub-extractor pass twice for the same content.
-        import hashlib as _hashlib
         try:
-            _content_hash = _hashlib.sha1(
+            _content_hash = cache_key or hashlib.sha1(
                 combined_document_content[:80000].encode("utf-8", errors="ignore")
             ).hexdigest()
         except Exception:

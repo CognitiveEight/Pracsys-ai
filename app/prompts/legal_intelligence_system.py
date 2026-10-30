@@ -6,6 +6,7 @@ evidence referencing, and role-specific behavior (Adjudicator, Petitioner, Respo
 
 from datetime import datetime
 from typing import Optional
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 # Four roles supported by the workspace (New Workspace modal).
 ROLES = ["Adjudicator", "Petitioner", "Respondent", "Mediator"]
@@ -797,7 +798,7 @@ def get_structured_document_feature_system_instruction(
     whose mandatory annexure gate ("do not analyze; show role picker only") overrides user
     JSON instructions and produces generic fallbacks.
     """
-    role_upper = (current_role or "").strip().upper() or "ADJUDICATOR"
+    role_upper = (current_role or "").strip().upper() or DEFAULT_WORKSPACE_ROLE
     today = datetime.utcnow()
     today_str = today.strftime("%Y-%m-%d")
     current_year = today.strftime("%Y")
@@ -885,7 +886,7 @@ def get_legal_intelligence_system_instruction(
     instruction += "\n\n" + APP_BRAND_EXCLUSION_DIRECTIVE
     instruction += "\n\n" + NAME_CAPITALISATION_DIRECTIVE
 
-    role_upper = (current_role or "").strip().upper() or "ADJUDICATOR"
+    role_upper = (current_role or "").strip().upper() or DEFAULT_WORKSPACE_ROLE
 
     if role_neutral_chat:
         instruction += INTELLIGENCE_CHAT_ROLE_NEUTRAL_SUPPLEMENT.replace(

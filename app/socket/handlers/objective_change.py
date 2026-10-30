@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from loguru import logger
 
@@ -20,8 +20,15 @@ from app.workspace.manager import workspace_manager
 from app.rag.packing import fit_to_budget
 from app.socket.event_utils import (
     OBJECTIVE_CHANGE_REFRESH_FEATURES,
+    gather_bounded,
     _coerce_analysis_text_list,
 )
+from app.socket.handlers._shared import (
+    PIPELINE_TAIL_FEATURES,
+    UPLOAD_REFRESH_FEATURES,
+    _loop_now,
+)
+from app.socket.handlers.run_control import _EMIT_OBSERVER
 
 
 from app.prompts.objective_change_prompts import (
@@ -33,6 +40,8 @@ from app.prompts.objective_change_prompts import (
     merge_applicable_laws_with_previous_prompt,
     llm_resolve_answered_missing_info_prompt,
 )
+from app.core.config import settings
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 class ObjectiveChangeMixin:
@@ -61,45 +70,97 @@ class ObjectiveChangeMixin:
         """
         ctx = log_context or ""
 
+        features = list(PIPELINE_TAIL_FEATURES)
+        cap = self._pipeline_run_cap(batch_result)
+
         async def _locked_runner() -> None:
-            # Queue behind any in-flight generation chain for this workspace so
-            # feature panels always reach the frontend in product order.
-            lock = self._workspace_pipeline_lock(workspace_id)
-            if lock.locked():
-                logger.debug(
-                    "pipeline lock: waiting{} for workspace {}",
-                    ctx,
-                    workspace_id[:12] if workspace_id else "",
-                )
+            # Every panel this tail produces is owed a terminal emit: it is
+            # armed by whichever event scheduled it (deletion, restore, reload,
+            # sync). The observer records what reached the socket layer, so a
+            # release covers exactly the rest.
+            emitted: Set[str] = set()
+            token = _EMIT_OBSERVER.set(emitted)
+            # The template round trip runs OUTSIDE the lock (see drafting).
+            templates_ready = self._prewarm_templates(
+                user_id, timeout=cap if cap > settings.pipeline_run_timeout_seconds else None
+            )
+            run_started = _loop_now()
             try:
-                async with lock:
+                # Queue behind any in-flight generation chain for this
+                # workspace so feature panels reach the frontend in product
+                # order.
+                async with self._hold_pipeline_lock(
+                    workspace_id, "dates_laws", cap_seconds=cap,
+                    wait_stage="lock_wait", stage_mode="sequential",
+                ):
                     logger.debug(
                         "pipeline lock: acquired{} for workspace {}",
                         ctx,
                         workspace_id[:12] if workspace_id else "",
                     )
-                    await self._run_list_of_dates_and_applicable_laws(
-                        workspace_id=workspace_id,
-                        user_id=user_id,
-                        workspace_role=workspace_role,
-                        batch_result=batch_result,
-                        log_context=log_context,
-                        deleted_doc_ids=deleted_doc_ids,
-                    )
+                    try:
+                        async with asyncio.timeout(cap) as run_cap:
+                            await self._run_list_of_dates_and_applicable_laws(
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                workspace_role=workspace_role,
+                                batch_result=batch_result,
+                                log_context=log_context,
+                                deleted_doc_ids=deleted_doc_ids,
+                                templates_ready=templates_ready,
+                            )
+                    except TimeoutError:
+                        if not run_cap.expired():
+                            raise
+                        await self._settle_pipeline_run_cap(
+                            workspace_id,
+                            user_id,
+                            holder="dates_laws",
+                            cap=cap,
+                            features=features,
+                            emitted=emitted,
+                            workspace_role=workspace_role,
+                        )
             except asyncio.CancelledError:
                 logger.error(
-                    "Dates/laws pipeline{} CANCELLED (workspace={})",
+                    "Dates/laws pipeline{} CANCELLED (workspace={}, emitted={})",
                     ctx,
                     workspace_id[:12] if workspace_id else "",
+                    sorted(emitted),
+                )
+                await self._release_refresh_loaders(
+                    workspace_id,
+                    user_id,
+                    features,
+                    skip=emitted,
+                    reason="dates_laws_cancelled",
+                    workspace_role=workspace_role,
                 )
                 raise
             except Exception as pipeline_err:
-                # This runner had no handler at all, so anything raised past the
-                # per-step traps inside _run_list_of_dates_and_applicable_laws
-                # disappeared into an unretrieved task exception.
+                # Anything raised past the per-step traps inside
+                # _run_list_of_dates_and_applicable_laws.
                 logger.opt(exception=pipeline_err).error(
                     "Dates/laws pipeline{} failed: {}", ctx, pipeline_err
                 )
+            finally:
+                try:
+                    # A no-op when every step emitted (the normal path).
+                    await self._release_refresh_loaders(
+                        workspace_id,
+                        user_id,
+                        features,
+                        skip=emitted,
+                        reason="dates_laws_terminal",
+                        workspace_role=workspace_role,
+                    )
+                except Exception as rel_err:
+                    logger.warning(
+                        "Dates/laws terminal loader release failed{}: {}", ctx, rel_err
+                    )
+                finally:
+                    _EMIT_OBSERVER.reset(token)
+                    self._log_stage("dates_laws_total", run_started, mode="sequential")
 
         try:
             self._track_background_task(
@@ -177,7 +238,7 @@ class ObjectiveChangeMixin:
             attempts = int(existing.get("attempts") or 0)
             marker: Dict[str, Any] = {
                 "userId": user_id,
-                "workspaceRole": (workspace_role or "ADJUDICATOR").strip().upper(),
+                "workspaceRole": (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper(),
                 "instruction": instruction,
                 "featureTypes": list(OBJECTIVE_CHANGE_REFRESH_FEATURES),
                 "attempts": attempts,
@@ -344,7 +405,7 @@ class ObjectiveChangeMixin:
                 OBJECTIVE_CHANGE_REFRESH_FEATURES
             )
             user_id = str(marker.get("userId") or "")
-            role = str(marker.get("workspaceRole") or "ADJUDICATOR")
+            role = str(marker.get("workspaceRole") or DEFAULT_WORKSPACE_ROLE)
 
             if attempts >= 1 or age > self._OBJECTIVE_RESUME_MAX_AGE_SECONDS:
                 logger.warning(
@@ -431,8 +492,7 @@ class ObjectiveChangeMixin:
             if ok:
                 resumed += 1
                 self._clear_pending_objective_change(workspace_id)
-                self._pending_reemit_workspace_id = workspace_id
-                self._pending_reemit_user_id = user_id
+                self._arm_reconnect_reemit(workspace_id, user_id)
                 self._schedule_objective_change_reanalysis(
                     workspace_id=workspace_id,
                     user_id=user_id,
@@ -469,6 +529,50 @@ class ObjectiveChangeMixin:
         so overlapping triggers cannot interleave their panel emits."""
         return self._workspace_pipeline_locks.setdefault(workspace_id, asyncio.Lock())
 
+    async def _run_tail_step(
+        self,
+        *,
+        feature: str,
+        stage: str,
+        label: str,
+        step: Any,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        log_context: str = "",
+        mode: str = "sequential",
+    ) -> None:
+        """Run one tail step; if it raises, settle its panel from cache.
+
+        The terminal emit is skipped when the step already emitted before
+        raising (the active emit observer saw it), so a panel never gets two.
+        """
+        ctx = log_context or ""
+        started = self._stage_begin(workspace_id, stage)
+        try:
+            logger.info(
+                "{}: invoking (background{}) for workspace {}",
+                label,
+                ctx,
+                workspace_id[:12] if workspace_id else "",
+            )
+            await step()
+        except asyncio.CancelledError:
+            raise
+        except Exception as step_err:
+            logger.warning("{} (background{}) failed: {}", label, ctx, step_err)
+            emitted = _EMIT_OBSERVER.get()
+            await self._release_refresh_loaders(
+                workspace_id,
+                user_id,
+                [feature],
+                skip=emitted if emitted is not None else set(),
+                reason=feature + "_failed",
+                workspace_role=workspace_role,
+            )
+        finally:
+            self._log_stage(stage, started, mode=mode)
+
     async def _run_list_of_dates_and_applicable_laws(
         self,
         workspace_id: str,
@@ -478,14 +582,74 @@ class ObjectiveChangeMixin:
         *,
         log_context: str = "",
         deleted_doc_ids: Optional[List[str]] = None,
+        templates_ready: Optional["asyncio.Task"] = None,
     ) -> None:
         """Sequential pipeline tail: list_of_dates → applicable_laws →
         procedural_timeline → relevant_parties → case_laws → drafting.
 
         Caller must hold the workspace pipeline lock. Each step traps its own
-        errors so one failure never skips the remaining panels.
+        errors so one failure never skips the remaining panels, and a step
+        that fails emits its cached (or empty) panel as its terminal state.
+        ``templates_ready`` is the runner's template prewarm (see drafting).
         """
-        ctx = log_context or ""
+        observed = _EMIT_OBSERVER.get()
+        token = _EMIT_OBSERVER.set(set()) if observed is None else None
+        try:
+            await self._run_tail_steps(
+                workspace_id,
+                user_id,
+                workspace_role,
+                batch_result,
+                log_context=log_context,
+                deleted_doc_ids=deleted_doc_ids,
+                templates_ready=templates_ready,
+            )
+        finally:
+            if token is not None:
+                _EMIT_OBSERVER.reset(token)
+
+    async def _run_tail_steps(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        batch_result: Optional[Dict[str, Any]],
+        *,
+        log_context: str = "",
+        deleted_doc_ids: Optional[List[str]] = None,
+        templates_ready: Optional["asyncio.Task"] = None,
+    ) -> None:
+        """Body of :meth:`_run_list_of_dates_and_applicable_laws`."""
+        common = {
+            "workspace_id": workspace_id,
+            "user_id": user_id,
+            "workspace_role": workspace_role,
+            "log_context": log_context,
+        }
+        # Order (per product): list_of_dates → applicable_laws → upcoming dates
+        # (procedural_timeline) → relevant_parties → case_laws → drafting.
+        for spec in self._tail_step_specs(
+            workspace_id,
+            user_id,
+            workspace_role,
+            batch_result,
+            deleted_doc_ids=deleted_doc_ids,
+            templates_ready=templates_ready,
+        ):
+            await self._run_tail_step(**spec, **common)
+
+    def _tail_step_specs(
+        self,
+        workspace_id: str,
+        user_id: str,
+        workspace_role: str,
+        batch_result: Optional[Dict[str, Any]],
+        *,
+        deleted_doc_ids: Optional[List[str]] = None,
+        templates_ready: Optional["asyncio.Task"] = None,
+    ) -> List[Dict[str, Any]]:
+        """The tail steps in product order, as ``_run_tail_step`` keyword sets
+        (``feature``, ``stage``, ``label``, ``step``)."""
         # On a document DELETION (deleted_doc_ids present) the web-search-derived
         # panels must REFLECT the reduced document set, not accumulate on top of
         # it. Case laws / applicable laws have no per-document linkage, so they
@@ -494,7 +658,8 @@ class ObjectiveChangeMixin:
         # keep the merge/accumulate behaviour ("keep what the user has seen +
         # fold in new").
         replace_derived = bool(deleted_doc_ids)
-        try:
+
+        async def _dates() -> None:
             await self._generate_and_emit_list_of_dates(
                 workspace_id=workspace_id,
                 user_id=user_id,
@@ -502,38 +667,16 @@ class ObjectiveChangeMixin:
                 batch_result=batch_result,
                 deleted_doc_ids=deleted_doc_ids,
             )
-        except Exception as lod_err:
-            logger.warning(
-                "List of dates (background{}) failed: {}",
-                ctx,
-                lod_err,
-            )
-        try:
-            logger.info(
-                "Applicable laws: invoking (background{}) for workspace {}",
-                ctx,
-                workspace_id[:12] if workspace_id else "",
-            )
+
+        async def _laws() -> None:
             await self._generate_and_emit_applicable_laws(
                 workspace_id=workspace_id,
                 user_id=user_id,
                 workspace_role=workspace_role,
                 merge_with_previous=not replace_derived,
             )
-        except Exception as laws_err:
-            logger.warning(
-                "Applicable laws (background{}) failed: {}",
-                ctx,
-                laws_err,
-            )
-        # Order (per product): applicable_laws → upcoming dates
-        # (procedural_timeline) → relevant_parties → case_laws → drafting.
-        try:
-            logger.info(
-                "Procedural timeline: invoking (background{}) for workspace {}",
-                ctx,
-                workspace_id[:12] if workspace_id else "",
-            )
+
+        async def _timeline() -> None:
             await self._generate_and_emit_procedural_timeline(
                 workspace_id=workspace_id,
                 user_id=user_id,
@@ -541,82 +684,44 @@ class ObjectiveChangeMixin:
                 batch_result=batch_result,
                 deleted_doc_ids=deleted_doc_ids,
             )
-        except Exception as pt_err:
-            logger.warning(
-                "Procedural timeline (background{}) failed: {}",
-                ctx,
-                pt_err,
-            )
-        try:
-            logger.info(
-                "Relevant parties: invoking (background{}) for workspace {}",
-                ctx,
-                workspace_id[:12] if workspace_id else "",
-            )
+
+        async def _parties() -> None:
             await self._generate_and_emit_relevant_parties(
                 workspace_id=workspace_id,
                 user_id=user_id,
                 workspace_role=workspace_role,
             )
-        except Exception as parties_err:
-            logger.warning(
-                "Relevant parties (background{}) failed: {}",
-                ctx,
-                parties_err,
-            )
-        try:
-            logger.info(
-                "Case laws: invoking (background{}) for workspace {}",
-                ctx,
-                workspace_id[:12] if workspace_id else "",
-            )
+
+        async def _case_laws() -> None:
             await self._generate_and_emit_case_laws(
                 workspace_id=workspace_id,
                 user_id=user_id,
                 workspace_role=workspace_role,
                 merge_with_previous=not replace_derived,
             )
-        except Exception as case_err:
-            logger.warning(
-                "Case laws (background{}) failed: {}",
-                ctx,
-                case_err,
-            )
-            # Never leave the panel stuck on "Analysis is in progress":
-            # emit the cached-or-empty payload as a terminal state.
-            if self._socket_client:
-                fallback = self._workspace_case_laws_payload.get(
-                    workspace_id
-                ) or {"caseLaws": []}
-                try:
-                    await self._emit_document_feature(
-                        feature_type="case_laws",
-                        workspace_id=workspace_id,
-                        user_id=user_id,
-                        payload=fallback,
-                        usage=None,
-                    )
-                except Exception as emit_err:
-                    logger.warning(
-                        "Case laws fallback emit failed{}: {}", ctx, emit_err
-                    )
-        try:
-            logger.info(
-                "Drafting suggestions: invoking (background{}) for workspace {}",
-                ctx,
-                workspace_id[:12] if workspace_id else "",
-            )
+
+        async def _drafting() -> None:
             await self._generate_and_emit_drafting_suggestions(
                 workspace_id=workspace_id,
                 user_id=user_id,
                 workspace_role=workspace_role,
+                templates_ready=templates_ready,
             )
-        except Exception as draft_err:
-            logger.warning(
-                "Drafting suggestions (background{}) failed: {}",
-                ctx,
-                draft_err,
-            )
+
+        return [
+            {"feature": "list_of_dates", "stage": "list_of_dates",
+             "label": "List of dates", "step": _dates},
+            {"feature": "applicable_laws", "stage": "applicable_laws",
+             "label": "Applicable laws", "step": _laws},
+            {"feature": "procedural_timeline", "stage": "procedural_timeline",
+             "label": "Procedural timeline", "step": _timeline},
+            {"feature": "relevant_parties", "stage": "relevant_parties",
+             "label": "Relevant parties", "step": _parties},
+            {"feature": "case_laws", "stage": "case_laws",
+             "label": "Case laws", "step": _case_laws},
+            {"feature": "drafting_assistant", "stage": "drafting",
+             "label": "Drafting suggestions", "step": _drafting},
+        ]
 
     def _schedule_applicable_laws_only(
         self,
@@ -632,12 +737,14 @@ class ObjectiveChangeMixin:
             try:
                 # Queue behind any in-flight generation chain so this single
                 # panel refresh cannot interleave a live pipeline's emits.
-                async with self._workspace_pipeline_lock(workspace_id):
+                async with self._hold_pipeline_lock(workspace_id, "laws_only"):
                     await self._generate_and_emit_applicable_laws(
                         workspace_id=workspace_id,
                         user_id=user_id,
                         workspace_role=workspace_role,
                     )
+            except asyncio.CancelledError:
+                raise
             except Exception as laws_err:
                 logger.warning(
                     "Applicable laws only (background{}) failed: {}",
@@ -1508,24 +1615,30 @@ class ObjectiveChangeMixin:
         # within each duplicate group.
         kept_indexes: set[int] = set(range(len(entries)))
 
-        for date_value, idxs in grouped.items():
-            if len(idxs) < 2:
-                continue
+        def _label_for(entry: Dict[str, Any]) -> str:
+            title = str(entry.get(title_field) or "").strip()
+            desc = str(entry.get(description_field) or "").strip()
+            return f"{title} — {desc}" if title and desc else (title or desc)
 
-            def _label_for(entry: Dict[str, Any]) -> str:
-                title = str(entry.get(title_field) or "").strip()
-                desc = str(entry.get(description_field) or "").strip()
-                return f"{title} — {desc}" if title and desc else (title or desc)
-
+        # One call per date with 2+ entries, LIST_OF_DATES_CONCURRENCY at a
+        # time. Dates never interact, so the result is the same as a
+        # one-at-a-time run.
+        async def _keep_for_date(group: Tuple[str, List[int]]) -> Optional[List[int]]:
+            date_value, idxs = group
             labels = [_label_for(entries[i]) for i in idxs]
-            if not all(labels):
-                continue
-
-            kept_label_indexes = await self._llm_semantic_keep_indexes(
+            if len(idxs) < 2 or not all(labels):
+                return None
+            return await self._llm_semantic_keep_indexes(
                 labels, item_type=f"{item_type} on {date_value}", max_keep=len(idxs)
             )
+
+        groups = list(grouped.items())
+        kept_per_date = await gather_bounded(
+            settings.list_of_dates_concurrency, groups, _keep_for_date
+        )
+        for (_date_value, idxs), kept_label_indexes in zip(groups, kept_per_date):
             if not kept_label_indexes:
-                continue  # Dedupe failed; keep all on this date.
+                continue  # Dedupe failed or nothing to compare; keep all on this date.
 
             keep_set_for_date = {idxs[i - 1] for i in kept_label_indexes if 1 <= i <= len(idxs)}
             for original_idx in idxs:
@@ -1702,38 +1815,16 @@ class ObjectiveChangeMixin:
         current_state = self._workspace_current_state_payload.get(workspace_id) or {}
         if not isinstance(current_state, dict):
             current_state = {}
-        # Gaps created by a document the user deleted are exempt from
-        # rejected-item memory. A user often dismisses a missingInfo item
-        # *because* a document answered it; once that document is withdrawn the
-        # gap is real again, and the permanent suppression below would hide it
-        # forever. Derived from the same ledger as the deterministic append in
-        # _apply_removed_evidence_missing_info, so the texts match exactly.
-        try:
-            removed_evidence_texts = {
-                item["text"]
-                for item in self._removed_evidence_missing_info_items(workspace_id)
-            }
-        except Exception as ledger_err:
-            logger.debug(
-                "Removed-evidence exemption unavailable (workspace={}): {}",
-                workspace_id,
-                ledger_err,
-            )
-            removed_evidence_texts = set()
         for report_field, cs_key, reject_section in self._ANALYSIS_TAGGED_SECTIONS:
             fresh = _coerce_analysis_text_list(analysis_report.get(report_field))
             # Honour rejected-item memory: never re-surface a dismissed item.
+            # Gaps created by a document the user deleted are exempt: a user
+            # often dismisses a missingInfo item *because* a document answered
+            # it, and once that document is withdrawn the gap is real again.
             if reject_section:
-                fresh = [
-                    s
-                    for s in fresh
-                    if s in removed_evidence_texts
-                    or not self._is_previously_rejected_analysis_item(
-                        workspace_id=workspace_id,
-                        section=reject_section,
-                        candidate=s,
-                    )
-                ]
+                fresh, _ = self._drop_rejected_analysis_items(
+                    workspace_id, reject_section, fresh
+                )
             prev_items = current_state.get(cs_key) if current_state else None
             analysis_report[report_field] = await self._reconcile_against_current_state(
                 fresh=fresh,
@@ -2007,6 +2098,7 @@ class ObjectiveChangeMixin:
         *,
         log_context: str = "",
         emitted: Optional[Set[str]] = None,
+        templates_ready: Optional["asyncio.Task"] = None,
     ) -> None:
         """Regenerate the objective-dependent panels and preserve the rest.
 
@@ -2032,6 +2124,7 @@ class ObjectiveChangeMixin:
         # (`_merge_analysis_report_with_previous` is unchanged and still used by
         # the document re-upload / sync paths, where incremental merge is correct.)
         new_analysis = None
+        _stage_t = self._stage_begin(workspace_id, "cascade_analysis")
         try:
             with capture_usage() as _u_obj_analysis:
                 new_analysis = await self._generate_analysis_report_from_documents(
@@ -2057,8 +2150,9 @@ class ObjectiveChangeMixin:
             _u_obj_analysis = None
         if not (isinstance(new_analysis, dict) and new_analysis):
             new_analysis = self._analysis_report_fallback(
-                (workspace_role or "ADJUDICATOR").strip().upper()
+                (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             )
+        self._log_stage("objective_cascade_analysis", _stage_t)
 
         # The quality score measures readiness FOR AN OBJECTIVE, so when the
         # objective changes the explanation of that score has to change with
@@ -2073,6 +2167,7 @@ class ObjectiveChangeMixin:
         # identical to the previous objective's. So force the issue here:
         # missing, or unchanged from the report we are replacing, means
         # regenerate it WITH the new objective in hand.
+        _stage_t = self._stage_begin(workspace_id, "cascade_quality_explanation")
         if isinstance(new_analysis, dict):
             try:
                 _prev_report = self._workspace_analysis_payload.get(workspace_id) or {}
@@ -2121,11 +2216,14 @@ class ObjectiveChangeMixin:
                     expl_err,
                 )
 
+        self._log_stage("objective_cascade_quality_explanation", _stage_t)
+
         # Tag the objective-aligned report against the frontend's currentState
         # so items that still textually match the previously-curated ones carry
         # their id (isMatched=True) and genuinely new objective-driven items get
         # a minted id (isMatched=False). This is identity-tagging only — content
         # is fully replaced by the objective-driven regeneration above.
+        _stage_t = self._stage_begin(workspace_id, "cascade_tagging")
         if isinstance(new_analysis, dict):
             try:
                 new_analysis = await self._tag_analysis_report_against_current_state(
@@ -2137,6 +2235,7 @@ class ObjectiveChangeMixin:
                     "emitting untagged",
                     ctx, tag_err,
                 )
+        self._log_stage("objective_cascade_tagging", _stage_t)
 
         self._workspace_analysis_payload[workspace_id] = new_analysis
         if self._socket_client:
@@ -2169,6 +2268,7 @@ class ObjectiveChangeMixin:
         # rewrite. Falls back to a plain preserve-and-re-emit if the re-eval fails
         # or there is no new objective text to score against.
         relevance_done = False
+        _stage_t = self._stage_begin(workspace_id, "cascade_dates_relevance")
         if new_objective_text:
             try:
                 relevance_done = await self._reeval_list_of_dates_relevance(
@@ -2213,7 +2313,9 @@ class ObjectiveChangeMixin:
         # objective_context steers the law selection + search query, and
         # merge_with_previous=False replaces stale laws instead of unioning them.
         # Falls back to preserve-and-re-emit on failure.
+        self._log_stage("objective_cascade_dates_relevance", _stage_t)
         laws_done = False
+        _stage_t = self._stage_begin(workspace_id, "cascade_laws")
         try:
             await self._generate_and_emit_applicable_laws(
                 workspace_id=workspace_id,
@@ -2248,6 +2350,8 @@ class ObjectiveChangeMixin:
                     "Objective-change applicable_laws preserved (regeneration skipped){}",
                     ctx,
                 )
+
+        self._log_stage("objective_cascade_laws", _stage_t)
 
         # 3b) Upcoming dates (procedural timeline): preserve existing payload on
         # objective change — same preserve-and-re-emit pattern as list_of_dates /
@@ -2299,6 +2403,7 @@ class ObjectiveChangeMixin:
         # Falls back to preserve-and-re-emit on failure so the panel never
         # sticks on a loader.
         case_done = False
+        _stage_t = self._stage_begin(workspace_id, "cascade_case_laws")
         try:
             await self._generate_and_emit_case_laws(
                 workspace_id=workspace_id,
@@ -2333,12 +2438,15 @@ class ObjectiveChangeMixin:
         # reads the freshly-updated strategicObjective from the strategy cache,
         # so a plain regeneration makes the suggested drafts objective-aware.
         # Falls back to preserve-and-re-emit on failure so the panel loader clears.
+        self._log_stage("objective_cascade_case_laws", _stage_t)
         draft_done = False
+        _stage_t = self._stage_begin(workspace_id, "cascade_drafting")
         try:
             await self._generate_and_emit_drafting_suggestions(
                 workspace_id=workspace_id,
                 user_id=user_id,
                 workspace_role=workspace_role,
+                templates_ready=templates_ready,
             )
             draft_done = True
             seen.add("drafting_assistant")
@@ -2362,6 +2470,7 @@ class ObjectiveChangeMixin:
                     ctx,
                     draft_preserve_err,
                 )
+        self._log_stage("objective_cascade_drafting", _stage_t)
 
     def _schedule_objective_change_reanalysis(
         self,
@@ -2379,7 +2488,7 @@ class ObjectiveChangeMixin:
         ctx = log_context or " (objective change)"
 
         # Resolve role with safe fallbacks so regeneration is always attempted.
-        role = "ADJUDICATOR"
+        role = DEFAULT_WORKSPACE_ROLE
         try:
             strategy_payload = self._workspace_strategy_payload.get(workspace_id) or {}
             candidate_role = (strategy_payload.get("role") or "").strip().upper()
@@ -2405,8 +2514,18 @@ class ObjectiveChangeMixin:
             if f != "strategy_objective"
         ]
 
+        # The cascade has no batch, so it takes the base cap.
+        cap = float(settings.pipeline_run_timeout_seconds)
+
         async def _runner() -> None:
             emitted: Set[str] = set()
+            # Every emit that reaches the socket layer is recorded, not only
+            # the ones a step remembered to add: the terminal release must
+            # never send a second payload for a panel that already went out.
+            token = _EMIT_OBSERVER.set(emitted)
+            # The template round trip runs OUTSIDE the lock (see drafting).
+            templates_ready = self._prewarm_templates(user_id)
+            run_started = _loop_now()
             try:
                 # Take the per-workspace pipeline lock, as
                 # _schedule_strategy_analysis_pipeline already does. This
@@ -2414,22 +2533,32 @@ class ObjectiveChangeMixin:
                 # full analysis-report REGEN-and-replace — so interleaving it
                 # with a document-upload pipeline let one clobber the other's
                 # emit for the same feature.
-                lock = self._workspace_pipeline_lock(workspace_id)
-                if lock.locked():
-                    logger.debug(
-                        "pipeline lock: objective-change reanalysis{} waiting for "
-                        "the in-flight pipeline (workspace={})",
-                        ctx,
-                        workspace_id[:12] if workspace_id else "",
-                    )
-                async with lock:
-                    await self._run_objective_change_incremental_refresh(
-                        workspace_id=workspace_id,
-                        user_id=user_id,
-                        workspace_role=role,
-                        log_context=ctx,
-                        emitted=emitted,
-                    )
+                async with self._hold_pipeline_lock(
+                    workspace_id, "cascade", cap_seconds=cap,
+                    wait_stage="objective_cascade_lock_wait",
+                ):
+                    try:
+                        async with asyncio.timeout(cap) as run_cap:
+                            await self._run_objective_change_incremental_refresh(
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                workspace_role=role,
+                                log_context=ctx,
+                                emitted=emitted,
+                                templates_ready=templates_ready,
+                            )
+                    except TimeoutError:
+                        if not run_cap.expired():
+                            raise
+                        await self._settle_pipeline_run_cap(
+                            workspace_id,
+                            user_id,
+                            holder="cascade",
+                            cap=cap,
+                            features=cascade_features,
+                            emitted=emitted,
+                            workspace_role=role,
+                        )
             except asyncio.CancelledError:
                 # Cancellation is a BaseException: the `except Exception` below
                 # never saw it, so a cascade killed by a reconnect or a shutdown
@@ -2479,6 +2608,9 @@ class ObjectiveChangeMixin:
                         ctx,
                         rel_err,
                     )
+                finally:
+                    _EMIT_OBSERVER.reset(token)
+                    self._log_stage("objective_cascade_total", run_started)
 
         try:
             self._track_background_task(
@@ -2506,10 +2638,16 @@ class ObjectiveChangeMixin:
         *,
         is_update: bool,
         analysis_log_context: str,
+        templates_ready: Optional["asyncio.Task"] = None,
     ) -> None:
         """
-        Strategy → analysis report → scheduled list_of_dates + applicable_laws.
+        Strategy → analysis report → the six tail panels.
         Runs inside asyncio.create_task so workspace_sync / workspace_created return quickly.
+
+        With ``PIPELINE_CONCURRENT_PANELS`` (default) the five panels that read
+        neither strategy nor analysis generate alongside them; see
+        :meth:`_run_upload_panels_concurrently`. Otherwise every step runs in
+        product order.
         """
         role = await self._resolve_workspace_role(
             workspace_id=workspace_id,
@@ -2518,6 +2656,122 @@ class ObjectiveChangeMixin:
         )
 
         logger.info("Using workspace role for background AI pipeline: {}", role)
+        if settings.pipeline_concurrent_panels:
+            await self._run_upload_panels_concurrently(
+                workspace_id,
+                user_id,
+                role,
+                batch_result,
+                is_update=is_update,
+                analysis_log_context=analysis_log_context,
+                templates_ready=templates_ready,
+            )
+            return
+
+        await self._run_pipeline_strategy_step(
+            workspace_id, user_id, role, batch_result, is_update=is_update
+        )
+        await self._emit_analysis_report(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            workspace_role=role,
+            batch_result=batch_result,
+            is_update=is_update,
+            log_context=analysis_log_context,
+            tail_inline=True,
+            templates_ready=templates_ready,
+        )
+
+    async def _run_upload_panels_concurrently(
+        self,
+        workspace_id: str,
+        user_id: str,
+        role: str,
+        batch_result: Dict[str, Any],
+        *,
+        is_update: bool,
+        analysis_log_context: str,
+        templates_ready: Optional["asyncio.Task"] = None,
+    ) -> None:
+        """Priority lane strategy → analysis → drafting, with the other five
+        panels generating from the start.
+
+        Dates, laws, timeline, parties and case laws read only their own caches
+        on this path, so they start at once. Every panel is sent the moment it
+        is ready, so the lawyer sees each one as it lands rather than a burst
+        once the priority lane finishes. On a first build
+        drafting runs once more at the end, when laws and dates exist (an
+        update's drafting reads the previous ones).
+
+        The children run in a TaskGroup inside the caller's run: they share its
+        scope, emit observer and lock, and are cancelled with it. A failing
+        child settles its own panel (``_run_tail_step``) and never cancels its
+        siblings.
+        """
+        common = {
+            "workspace_id": workspace_id,
+            "user_id": user_id,
+            "workspace_role": role,
+            "log_context": analysis_log_context or " (parallel)",
+            "mode": "parallel",
+        }
+        specs = self._tail_step_specs(
+            workspace_id, user_id, role, batch_result, templates_ready=templates_ready
+        )
+        drafting = next(sp for sp in specs if sp["feature"] == "drafting_assistant")
+
+        async with asyncio.TaskGroup() as group:
+            for spec in specs:
+                if spec is not drafting:
+                    group.create_task(self._run_tail_step(**spec, **common))
+            try:
+                await self._run_pipeline_strategy_step(
+                    workspace_id, user_id, role, batch_result,
+                    is_update=is_update, mode="parallel",
+                )
+                await self._emit_analysis_report(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    workspace_role=role,
+                    batch_result=batch_result,
+                    is_update=is_update,
+                    log_context=analysis_log_context,
+                    run_tail=False,
+                    defer_chips=True,
+                )
+                group.create_task(self._store_analysis_report_chips(workspace_id, role))
+                await self._run_tail_step(**drafting, **common)
+            except asyncio.CancelledError:
+                raise
+            except Exception as lane_err:
+                # The runner's terminal release settles whatever the lane did
+                # not emit; the other panels are unaffected.
+                logger.opt(exception=lane_err).error(
+                    "Priority panels failed for workspace {}: {}",
+                    workspace_id[:12] if workspace_id else "",
+                    lane_err,
+                )
+
+        if not is_update:
+            await self._run_tail_step(
+                **{**drafting, "stage": "drafting_refresh",
+                   "label": "Drafting suggestions (refresh)"},
+                **common,
+            )
+
+    async def _run_pipeline_strategy_step(
+        self,
+        workspace_id: str,
+        user_id: str,
+        role: str,
+        batch_result: Dict[str, Any],
+        *,
+        is_update: bool,
+        mode: str = "sequential",
+    ) -> None:
+        """Generate and emit strategy; settle its panel from cache on failure."""
+        strategy_started = self._stage_begin(workspace_id, "strategy")
+        strategy_settled = False
         try:
             # Meter this feature in its own scope: _generate_strategies_from_documents
             # does not self-emit (the pipeline emits below), so capture its tokens
@@ -2540,37 +2794,38 @@ class ObjectiveChangeMixin:
                     payload=strategies_result,
                     usage=_u_strategy,
                 )
+                strategy_settled = True
                 self._workspace_strategy_payload[workspace_id] = strategies_result
                 chips = strategies_result.get("suggestionChips") or []
                 if chips:
                     self._workspace_suggestion_chips[workspace_id] = list(chips)
                     self._last_workspace_id_with_chips = workspace_id
                 logger.success("Strategy & Objectives sent to backend (background)")
+        except asyncio.CancelledError:
+            raise
         except Exception as strategy_error:
-            logger.opt(exception=strategy_error).error("Background strategy generation failed: {}", strategy_error)
-            if self._socket_client:
-                try:
-                    await self._socket_client.emit(
-                        "document_feature_response",
-                        {
-                            "featureType": "strategy_objective",
-                            "workspaceId": workspace_id,
-                            "userId": user_id,
-                            "error": str(strategy_error),
-                        },
-                    )
-                except Exception as emit_error:
-                    logger.error("Failed to emit strategy error (bg): {}", emit_error)
+            # No raw {"error": str(e)} emit any more: it put exception text on
+            # the wire, was not buffered when undelivered, and carried no panel
+            # payload. The panel settles from cache below instead.
+            logger.opt(exception=strategy_error).error(
+                "Background strategy generation failed: {}", strategy_error
+            )
+        finally:
+            self._log_stage("strategy", strategy_started, mode=mode)
 
-        await self._emit_analysis_report(
-            workspace_id=workspace_id,
-            user_id=user_id,
-            workspace_role=role,
-            batch_result=batch_result,
-            is_update=is_update,
-            log_context=analysis_log_context,
-            tail_inline=True,
-        )
+        if not strategy_settled:
+            # _generate_strategies_from_documents returns None on failure, and
+            # nothing else would ever emit strategy_objective for this run:
+            # settle it with the cached strategy (the fallback on a first build).
+            observed = _EMIT_OBSERVER.get()
+            await self._release_refresh_loaders(
+                workspace_id,
+                user_id,
+                ["strategy_objective"],
+                skip=observed if observed is not None else set(),
+                reason="strategy_failed",
+                workspace_role=role,
+            )
 
     def _schedule_strategy_analysis_pipeline(
         self,
@@ -2581,38 +2836,115 @@ class ObjectiveChangeMixin:
         *,
         is_update: bool,
         analysis_log_context: str,
+        armed_features: Optional[List[str]] = None,
     ) -> None:
+        """Schedule strategy → analysis → tail as one locked background run.
+
+        ``armed_features`` are the loaders the caller armed with
+        ``workspace:refresh`` for this run. Each one is owed a terminal emit, so
+        whatever the run did not emit (a cancel, the run cap, a step that
+        returned nothing) is settled from cache at the end. ``document_assessments``
+        is the caller's own emit and is never released here.
+        """
+        release_features = [
+            f
+            for f in UPLOAD_REFRESH_FEATURES
+            if f in (armed_features or []) and f != "document_assessments"
+        ]
+        cap = self._pipeline_run_cap(batch_result)
+        role_hint = workspace_role
+
         async def _runner() -> None:
+            emitted: Set[str] = set()
+            token = _EMIT_OBSERVER.set(emitted)
+            # The template round trip runs OUTSIDE the lock (see drafting); a
+            # run with audio lets it wait as long as the run itself may.
+            templates_ready = self._prewarm_templates(
+                user_id, timeout=cap if cap > settings.pipeline_run_timeout_seconds else None
+            )
+            run_started = _loop_now()
             try:
                 # Serialize per workspace: with tail_inline=True downstream,
                 # this lock covers strategy → analysis → list_of_dates → laws →
                 # timeline → parties → case_laws → drafting as ONE critical
                 # section, so overlapping triggers cannot interleave emits.
-                lock = self._workspace_pipeline_lock(workspace_id)
-                if lock.locked():
-                    logger.debug(
-                        "pipeline lock: waiting (strategy pipeline) for workspace {}",
-                        workspace_id[:12] if workspace_id else "",
-                    )
-                async with lock:
+                async with self._hold_pipeline_lock(
+                    workspace_id, "upload_pipeline", cap_seconds=cap,
+                    wait_stage="lock_wait",
+                    stage_mode=(
+                        "parallel" if settings.pipeline_concurrent_panels else "sequential"
+                    ),
+                ):
                     logger.debug(
                         "pipeline lock: acquired (strategy pipeline) for workspace {}",
                         workspace_id[:12] if workspace_id else "",
                     )
-                    await self._run_strategy_analysis_timeline_pipeline(
-                        workspace_id=workspace_id,
-                        user_id=user_id,
-                        workspace_role=workspace_role,
-                        batch_result=batch_result,
-                        is_update=is_update,
-                        analysis_log_context=analysis_log_context,
-                    )
+                    try:
+                        async with asyncio.timeout(cap) as run_cap:
+                            await self._run_strategy_analysis_timeline_pipeline(
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                workspace_role=workspace_role,
+                                batch_result=batch_result,
+                                is_update=is_update,
+                                analysis_log_context=analysis_log_context,
+                                templates_ready=templates_ready,
+                            )
+                    except TimeoutError:
+                        if not run_cap.expired():
+                            raise
+                        await self._settle_pipeline_run_cap(
+                            workspace_id,
+                            user_id,
+                            holder="upload_pipeline",
+                            cap=cap,
+                            features=release_features,
+                            emitted=emitted,
+                            workspace_role=role_hint,
+                        )
+            except asyncio.CancelledError:
+                # A BaseException: the `except Exception` below never sees it,
+                # so a shutdown or disconnect-driven cancel used to strand every
+                # loader this run had not yet emitted.
+                logger.error(
+                    "Background strategy/analysis pipeline CANCELLED "
+                    "(workspace={}, emitted={})",
+                    workspace_id[:12] if workspace_id else "",
+                    sorted(emitted),
+                )
+                await self._release_refresh_loaders(
+                    workspace_id,
+                    user_id,
+                    release_features,
+                    skip=emitted,
+                    reason="upload_pipeline_cancelled",
+                    workspace_role=role_hint,
+                )
+                raise
             except Exception as e:
-                logger.exception(
+                logger.opt(exception=e).error(
                     "Background strategy/analysis pipeline failed for workspace {}: {}",
                     workspace_id[:12] if workspace_id else "",
                     e,
                 )
+            finally:
+                try:
+                    # A no-op when every armed panel emitted (the normal path).
+                    await self._release_refresh_loaders(
+                        workspace_id,
+                        user_id,
+                        release_features,
+                        skip=emitted,
+                        reason="upload_pipeline_terminal",
+                        workspace_role=role_hint,
+                    )
+                except Exception as rel_err:
+                    logger.warning(
+                        "Upload pipeline terminal loader release failed: {}", rel_err
+                    )
+                finally:
+                    _EMIT_OBSERVER.reset(token)
+                    self._log_stage("pipeline_total", run_started, mode="sequential")
 
         try:
             self._track_background_task(
@@ -2637,6 +2969,9 @@ class ObjectiveChangeMixin:
         log_context: str = "",
         *,
         tail_inline: bool = False,
+        templates_ready: Optional["asyncio.Task"] = None,
+        run_tail: bool = True,
+        defer_chips: bool = False,
     ) -> bool:
         """
         Generate analysis report (or use fallback on error), then emit to backend and cache.
@@ -2648,9 +2983,15 @@ class ObjectiveChangeMixin:
         whole strategy→drafting sequence is one critical section. Callers under
         a timeout (e.g. the 35s chat refresh in analysis_report.py) must keep
         the default False.
+
+        ``run_tail=False`` runs no tail at all and ``defer_chips=True`` leaves
+        the suggestion chips to the caller (:meth:`_store_analysis_report_chips`):
+        the concurrent upload pipeline runs the tail itself and the chips beside
+        drafting.
         """
         if not self._socket_client:
             return False
+        analysis_started = self._stage_begin(workspace_id, "analysis_report")
         try:
             analysis_report = await self._generate_analysis_report_from_documents(
                 workspace_id=workspace_id,
@@ -2661,7 +3002,7 @@ class ObjectiveChangeMixin:
             )
             if not analysis_report:
                 analysis_report = self._analysis_report_fallback(
-                    (workspace_role or "ADJUDICATOR").strip().upper()
+                    (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
                 )
         except Exception as e:
             logger.warning(
@@ -2670,7 +3011,7 @@ class ObjectiveChangeMixin:
                 e,
             )
             analysis_report = self._analysis_report_fallback(
-                (workspace_role or "ADJUDICATOR").strip().upper()
+                (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             )
         # Tag the fresh report's text sections against the frontend's
         # currentState so each item carries {id, text, isMatched}: items that
@@ -2700,8 +3041,7 @@ class ObjectiveChangeMixin:
         # pipeline lock, which is what actually prevents the interleaving.
         # Cache and set pending re-emit before emit so re-emit on reconnect has data if emit fails
         self._workspace_analysis_payload[workspace_id] = analysis_report
-        self._pending_reemit_workspace_id = workspace_id
-        self._pending_reemit_user_id = user_id
+        self._arm_reconnect_reemit(workspace_id, user_id)
         await self._emit_document_feature(
             feature_type="analysis_report",
             workspace_id=workspace_id,
@@ -2712,25 +3052,15 @@ class ObjectiveChangeMixin:
         logger.success("Analysis report sent to backend{}", log_context)
         # Brief yield so the socket can flush before caller continues (reduces risk of disconnect before delivery)
         await asyncio.sleep(0.15)
-        # Generate and cache 15-16 suggestion chips for Analysis Report (probing_prompts_request with chatType ANALYSIS_REPORT)
-        try:
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
-            analysis_chips = await self._generate_analysis_report_suggestion_chips(
-                workspace_id=workspace_id,
-                report=analysis_report,
-                role=role,
+        if defer_chips:
+            self._log_stage("analysis_report", analysis_started, mode="parallel")
+        else:
+            await self._store_analysis_report_chips(
+                workspace_id, workspace_role, report=analysis_report
             )
-            if analysis_chips:
-                self._workspace_analysis_suggestion_chips[workspace_id] = list(
-                    analysis_chips
-                )
-                logger.info(
-                    "Analysis report suggestion chips stored: {} for workspace {}",
-                    len(analysis_chips),
-                    workspace_id[:12] if workspace_id else "",
-                )
-        except Exception as chip_err:
-            logger.warning("Analysis report chips generation failed: {}", chip_err)
+            self._log_stage("analysis_report", analysis_started, mode="sequential")
+        if not run_tail:
+            return True
         if tail_inline:
             # Caller (pipeline runner) already holds the workspace pipeline
             # lock; run the tail inline so strategy→drafting emits as one
@@ -2741,6 +3071,7 @@ class ObjectiveChangeMixin:
                 workspace_role=workspace_role,
                 batch_result=batch_result,
                 log_context=log_context or " (after analysis)",
+                templates_ready=templates_ready,
             )
         else:
             # List of Dates + Applicable laws: background so intelligence chat can proceed
@@ -2752,6 +3083,41 @@ class ObjectiveChangeMixin:
                 log_context=log_context or " (after analysis)",
             )
         return True
+
+    async def _store_analysis_report_chips(
+        self,
+        workspace_id: str,
+        workspace_role: str,
+        *,
+        report: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Generate and cache 15-16 suggestion chips for the Analysis Report
+        (probing_prompts_request with chatType ANALYSIS_REPORT). ``report``
+        defaults to the cached report. Never raises."""
+        try:
+            if report is None:
+                report = self._workspace_analysis_payload.get(workspace_id)
+            if not isinstance(report, dict):
+                return
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
+            analysis_chips = await self._generate_analysis_report_suggestion_chips(
+                workspace_id=workspace_id,
+                report=report,
+                role=role,
+            )
+            if analysis_chips:
+                self._workspace_analysis_suggestion_chips[workspace_id] = list(
+                    analysis_chips
+                )
+                logger.info(
+                    "Analysis report suggestion chips stored: {} for workspace {}",
+                    len(analysis_chips),
+                    workspace_id[:12] if workspace_id else "",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as chip_err:
+            logger.warning("Analysis report chips generation failed: {}", chip_err)
 
     @meter_usage
     async def _generate_and_emit_analysis_report_for_sync(
@@ -2776,7 +3142,7 @@ class ObjectiveChangeMixin:
             )
             if not analysis_report:
                 analysis_report = self._analysis_report_fallback(
-                    (workspace_role or "ADJUDICATOR").strip().upper()
+                    (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
                 )
             # Tag the fresh report against the frontend's currentState so items
             # carry {id, text, isMatched} (matched → prior id; new → minted id;
@@ -2813,7 +3179,7 @@ class ObjectiveChangeMixin:
             )
             try:
                 fallback = self._analysis_report_fallback(
-                    (workspace_role or "ADJUDICATOR").strip().upper()
+                    (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
                 )
                 if self._socket_client:
                     await self._emit_document_feature(

@@ -1,7 +1,7 @@
 # Development workflow
 
 How a change goes from a Jira ticket to production. The Jira project key is
-`SIM`.
+**SIM**.
 
 ## Branches
 
@@ -22,11 +22,11 @@ fix/SIM-124-short-name     ──PR──┘
 | # | Step | Who | Output | Jira status |
 |---|---|---|---|---|
 | 1 | Ticket written with goal and scope | product owner | Jira ticket | To Do |
-| 2 | Specs | `planner` agent → reviewed by owner + tech lead | `specs/requirements`, `technical-design`, `acceptance-criteria` | Spec Review |
+| 2 | Specs | `planner` agent → reviewed by owner + tech lead | `specs/requirements`, `technical-design`, `acceptance-criteria` | Spec |
 | 3 | Implementation | `developer` agent or developer | commits on the ticket branch | In Progress |
 | 4 | Tests | `tester` agent | tests mapped to each AC; `make test` green | In Progress |
 | 5 | Review | `reviewer` agent, then a human approver | findings + verdict on the PR | In Review |
-| 6 | Merge to `development` | human | — | Done |
+| 6 | Merge to `development`, then QA | human | — | QA, then Done |
 | 7 | Promote to `staging`, then `main` | release owner | release PR, CHANGELOG, Release Management page | (no Jira status) |
 
 Run each step from Claude Code in this repo with its command. Each one reads
@@ -55,14 +55,14 @@ Project key `SIM`. Board columns, in order:
 | Status | Meaning |
 |---|---|
 | To Do | Ticket written; no spec yet |
-| Spec Review | Specs written; waiting for owner and tech lead approval |
+| Spec | Specs written; waiting for owner and tech lead approval |
 | In Progress | Design approved; code and tests on the ticket branch |
 | In Review | PR open; reviewer agent and a human approver |
-| Done | Merged to `development` |
+| QA | Merged to `development`; being checked |
+| Done | QA passed (only reachable from QA) |
 
-Spec Review is being added to the board by the Jira admin. Until it exists,
-an issue with specs under review stays in To Do, and `/spec` skips the
-transition.
+There is no Blocked status: blocked work is marked with the Flagged field
+and the `agent-blocked` label (SIM-71 technical design, decision 3).
 
 Work types: Epic, Task, Bug, Subtask. There is no Story type. A Subtask
 can track one step of a spec's task list.
@@ -99,11 +99,9 @@ make lint && make test
 
 ## Not set up yet
 
-- The Jira project exists (`SIM`). The Spec Review status is pending (see
-  "Jira" above).
-- CI (GitHub Actions running `make lint` and `make test` on every PR) is
-  being added in SIM-23.
 - Branch protection on `development` / `staging` / `main` and the GitHub for
   Jira link are pending (SIM-24).
-- Running agents from CI (`anthropics/claude-code-action@v1`, which needs an
-  `ANTHROPIC_API_KEY` repository secret added by an admin).
+
+CI (`lint`, `test`, `secrets-scan` on every PR, SIM-23) and the agent
+pipeline run from GitHub Actions (SIM-153,
+`docs/runbooks/run-the-agent-pipeline.md`) are in place.

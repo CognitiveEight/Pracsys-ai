@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, List, Optional
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 DRAFTING_SYSTEM_INSTRUCTION = """You are an expert Indian legal drafting assistant trained to generate professional, court-ready legal drafts in the style, tone, structure, and language commonly used by experienced Indian advocates and law firms.
@@ -660,7 +661,7 @@ def build_suggested_drafts_prompt(
 
     Returns a prompt that asks for a JSON array of 4-6 suggestion objects.
     """
-    role_upper = (role or "ADJUDICATOR").strip().upper()
+    role_upper = (role or DEFAULT_WORKSPACE_ROLE).strip().upper()
     return f"""WORKSPACE ROLE: {role_upper}
 
 CASE SUMMARY:
@@ -801,7 +802,7 @@ def build_template_applicability_prompt(
     genuinely fits — independent of the original matter's party names/facts.
     Returns a prompt asking for a single JSON object.
     """
-    role_upper = (role or "ADJUDICATOR").strip().upper()
+    role_upper = (role or DEFAULT_WORKSPACE_ROLE).strip().upper()
     return f"""WORKSPACE ROLE: {role_upper}
 
 CASE SUMMARY:
@@ -910,7 +911,7 @@ def build_template_match_score_prompt(
     original matter's party names or facts. Returns a prompt asking for a single
     JSON object ``{"match_score": <int 0-100>, "match_reason": "<= 120 chars"}``.
     """
-    role_upper = (role or "ADJUDICATOR").strip().upper()
+    role_upper = (role or DEFAULT_WORKSPACE_ROLE).strip().upper()
     return f"""WORKSPACE ROLE: {role_upper}
 
 CASE SUMMARY:
@@ -1123,7 +1124,7 @@ def build_template_kickoff_prompt(
     structure_outline: Optional[list] = None,
     prefilled_facts: Optional[Dict[str, Any]] = None,
 ) -> str:
-    role_upper = (role or "ADJUDICATOR").strip().upper()
+    role_upper = (role or DEFAULT_WORKSPACE_ROLE).strip().upper()
     instructions_block = (
         f"LAWYER INSTRUCTIONS (free-text addendum):\n{lawyer_instructions}\n"
         if lawyer_instructions
@@ -2015,7 +2016,7 @@ def build_draft_render_prompt(
     the draft title it decides the document CLASS (see `infer_document_class`),
     which gates the correspondence citation discipline below.
     """
-    role_upper = (role or "ADJUDICATOR").strip().upper()
+    role_upper = (role or DEFAULT_WORKSPACE_ROLE).strip().upper()
     document_class = infer_document_class(draft_title, template_document_type)
 
     # Template tone WINS over the default Indian-advocate register (decision:
@@ -2507,7 +2508,7 @@ def build_chat_reply_prompt(
     `{role: "user"|"assistant", content: str}` dicts (already truncated by
     the caller — typically the last 6 turns).
     """
-    role_upper = (role or "ADJUDICATOR").strip().upper()
+    role_upper = (role or DEFAULT_WORKSPACE_ROLE).strip().upper()
 
     # Render the conversation history as a compact transcript so the model
     # has continuity without us repeating the full system prompt context.
@@ -2656,7 +2657,7 @@ def build_draft_translate_prompt(
     target_language: str,
 ) -> str:
     """Build the user prompt for translating a finalised draft."""
-    role_upper = (role or "ADJUDICATOR").strip().upper()
+    role_upper = (role or DEFAULT_WORKSPACE_ROLE).strip().upper()
     target = (target_language or "Hindi").strip() or "Hindi"
     summary = (case_summary or "(no summary available)").strip()
     body = (draft_markdown or "").strip()

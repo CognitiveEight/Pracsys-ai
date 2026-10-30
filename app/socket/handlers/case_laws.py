@@ -34,6 +34,8 @@ from app.prompts.case_laws_prompts import (
     extract_judgment_digest_prompt,
     classify_and_extract_uploaded_case_law_prompt,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
+from app.utils.redact import chars, validation_fields
 
 
 def _citation_in_text(citation: str, judgment_text: str) -> Optional[bool]:
@@ -543,7 +545,7 @@ class CaseLawsMixin:
         merge_with_previous: bool = True,
     ) -> None:
         """Generate and emit document_feature_response with featureType case_laws."""
-        role = (workspace_role or "ADJUDICATOR").strip().upper()
+        role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
         logger.info(
             "Case laws: generation started for workspace {}",
             workspace_id[:12] if workspace_id else "",
@@ -646,7 +648,9 @@ class CaseLawsMixin:
         try:
             req = CaseLawDocumentRequest(**payload_in)
         except Exception as e:
-            logger.warning("case_law_document_request: invalid payload: {}", e)
+            logger.warning(
+                "case_law_document_request: invalid payload: {}", validation_fields(e)
+            )
             await self._emit_case_law_document_response(
                 request_id=(
                     payload_in.get("requestId") or payload_in.get("request_id")
@@ -669,12 +673,12 @@ class CaseLawsMixin:
         user_id = (req.userId or "").strip()
         document_url = (req.documentUrl or "").strip()
         document_name = (req.documentName or "").strip() or "case-law-document"
-        role = (req.workspaceRole or "ADJUDICATOR").strip().upper()
+        role = (req.workspaceRole or DEFAULT_WORKSPACE_ROLE).strip().upper()
 
         logger.info(
             "case_law_document_request: workspace={} doc={} requestId={}",
             workspace_id[:12] if workspace_id else "",
-            document_name,
+            chars(document_name),
             request_id,
         )
 

@@ -21,15 +21,18 @@ only as a diarization fallback when GCS-backed BatchRecognize is unavailable.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import uuid
 import warnings
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
@@ -95,7 +98,37 @@ MIN_SILENCE_SECONDS = 0.6
 MIN_CHUNK_SECONDS = 12.0
 SILENCE_NOISE_THRESHOLD_DB = -35
 DEFAULT_CHIRP_REGION = "us"
+# Chirp 3 BatchRecognize rejects any file longer than this with INVALID_ARGUMENT
+# ("Only audio files up to 20 minutes long are supported for BatchRecognize").
+BATCH_MAX_FILE_SECONDS = 20 * 60
+# Windowed sample format: every window clip is cut to PCM16 mono 16 kHz.
+_WINDOW_SAMPLE_RATE = 16000
 _PYANNOTE_PIPELINE = None
+
+
+class TranscriptionCancelled(Exception):
+    """The awaiting task was cancelled (Stop, purge, disconnect)."""
+
+
+class AudioTooLongError(RuntimeError):
+    """The recording exceeds ``audio_max_duration_minutes``."""
+
+
+# Set by ``_sync_transcribe`` in the worker thread's own context copy, so each
+# transcription sees only its own event. Window workers inherit it through
+# ``contextvars.copy_context``.
+_CANCEL_EVENT: contextvars.ContextVar[Optional[threading.Event]] = contextvars.ContextVar(
+    "audio_cancel_event", default=None
+)
+
+
+def _raise_if_cancelled() -> None:
+    """Checkpoint between paid calls: a thread cannot be cancelled from asyncio,
+    so long loops poll this and stop at the next step boundary."""
+    event = _CANCEL_EVENT.get()
+    if event is not None and event.is_set():
+        raise TranscriptionCancelled("audio transcription cancelled")
+
 
 # ── Dataclasses ───────────────────────────────────────────────────────────────
 @dataclass
@@ -310,6 +343,12 @@ def _generate_gemini_text(prompt: str, *, max_output_tokens: int = 128) -> Optio
     )
 
 
+# ── Project + credentials resolution ──────────────────────────────────────────
+# Cached so we resolve only once per process.
+_RESOLVED_CREDENTIALS_PATH: Optional[str] = None
+_CREDENTIALS_RESOLVED: bool = False
+
+
 def _candidate_base_dirs() -> list[str]:
     bases: list[str] = []
     cwd = os.getcwd()
@@ -505,6 +544,107 @@ def _prepare_audio_for_recognition(audio_file: str) -> PreparedAudio:
 def _wav_duration_seconds(audio_file: str) -> float:
     with wave.open(audio_file, "rb") as wav_file:
         return wav_file.getnframes() / float(wav_file.getframerate())
+
+
+def _probe_duration_seconds(audio_file: str) -> Optional[float]:
+    """Duration of any ffmpeg-readable file, without decoding it. None if unknown."""
+    if audio_file.lower().endswith(".wav"):
+        try:
+            return _wav_duration_seconds(audio_file)
+        except (wave.Error, EOFError, OSError):
+            pass
+    ffprobe_path = shutil.which("ffprobe")
+    if not ffprobe_path:
+        return None
+    cmd = [
+        ffprobe_path, "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        audio_file,
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, env=_ffmpeg_env(), timeout=120, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("Audio: ffprobe could not read duration: {}", exc)
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        value = float(result.stdout.strip())
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _enforce_duration_cap(duration_seconds: Optional[float]) -> None:
+    """Reject a recording over the configured cap before any paid call."""
+    cap_minutes = float(getattr(settings, "audio_max_duration_minutes", 0) or 0)
+    if duration_seconds is None or cap_minutes <= 0:
+        return
+    if duration_seconds > cap_minutes * 60:
+        raise AudioTooLongError(
+            f"audio_too_long: {duration_seconds / 60:.0f} min exceeds the "
+            f"{cap_minutes:.0f} min limit (AUDIO_MAX_DURATION_MINUTES)"
+        )
+
+
+@dataclass
+class AudioWindow:
+    """One BatchRecognize job's slice of a long recording, in seconds.
+
+    ``start_time``/``end_time`` is the audio sent to the recognizer, which
+    overlaps the neighbouring windows; ``keep_start``/``keep_end`` is the
+    non-overlapping part whose words this window contributes.
+    """
+
+    start_time: float
+    end_time: float
+    keep_start: float
+    keep_end: float
+
+
+def _plan_batch_windows(
+    duration_seconds: float,
+    split_points: list[float],
+    *,
+    window_seconds: float,
+    overlap_seconds: float,
+) -> list[AudioWindow]:
+    """Cut ``[0, duration]`` into windows no longer than ``window_seconds``.
+
+    Each cut lands on the last pause in the final quarter of the allowed span,
+    so a sentence is rarely split; with no pause there it is a hard cut, and
+    the overlap still lets both sides see the words around it.
+    """
+    window_seconds = min(float(window_seconds), float(BATCH_MAX_FILE_SECONDS))
+    overlap_seconds = max(0.0, float(overlap_seconds))
+    core_max = window_seconds - 2 * overlap_seconds
+    if core_max < 60.0:
+        raise ValueError(
+            "audio_batch_window_seconds must exceed 2 * audio_window_overlap_seconds + 60"
+        )
+    core_min = core_max * 0.75
+    windows: list[AudioWindow] = []
+    cursor = 0.0
+    while cursor < duration_seconds - 1e-6:
+        hard_end = cursor + core_max
+        if hard_end >= duration_seconds:
+            end = duration_seconds
+        else:
+            pauses = [p for p in split_points if cursor + core_min <= p <= hard_end]
+            end = pauses[-1] if pauses else hard_end
+        windows.append(
+            AudioWindow(
+                start_time=max(0.0, cursor - overlap_seconds),
+                end_time=min(duration_seconds, end + overlap_seconds),
+                keep_start=cursor,
+                keep_end=end,
+            )
+        )
+        cursor = end
+    return windows
 
 
 def _detect_silence_split_points(audio_file: str) -> list[float]:
@@ -959,15 +1099,49 @@ def _recognize_with_batch_chirp3_gcs(
     project_id: str,
     gcs_bucket: str,
 ) -> Optional[TranscriptResult]:
+    try:
+        duration = _wav_duration_seconds(prepared_audio.path)
+    except Exception:
+        duration = None
+    if duration is not None and duration > BATCH_MAX_FILE_SECONDS:
+        # Callers route long audio to the windowed path; this guard keeps a
+        # future caller from paying for an upload BatchRecognize must reject.
+        logger.warning(
+            "Audio: {:.0f}s exceeds the BatchRecognize limit; skipping batch", duration
+        )
+        return None
+    return _batch_recognize_wav(
+        client, recognizer, config, prepared_audio.path, project_id, gcs_bucket
+    )
+
+
+def _batch_recognize_wav(
+    client,
+    recognizer: str,
+    config,
+    wav_path: str,
+    project_id: str,
+    gcs_bucket: str,
+    *,
+    time_offset: float = 0.0,
+    label: str = "",
+) -> Optional[TranscriptResult]:
+    """One BatchRecognize job over one PCM16 WAV (at most 20 minutes).
+
+    Returns None when the job fails or comes back empty; the caller decides
+    the fallback. The temp GCS object is always deleted.
+    """
     import time
 
     gcs_uri: Optional[str] = None
     try:
+        _raise_if_cancelled()
         logger.info(
-            "Audio: uploading to gs://{}/chirp_audio_temp/ for BatchRecognize",
+            "Audio: uploading{} to gs://{}/chirp_audio_temp/ for BatchRecognize",
+            f" {label}" if label else "",
             gcs_bucket,
         )
-        gcs_uri = _upload_to_gcs_temp(gcs_bucket, prepared_audio.path, project_id)
+        gcs_uri = _upload_to_gcs_temp(gcs_bucket, wav_path, project_id)
 
         file_metadata = cloud_speech.BatchRecognizeFileMetadata(uri=gcs_uri)
         request = cloud_speech.BatchRecognizeRequest(
@@ -980,30 +1154,35 @@ def _recognize_with_batch_chirp3_gcs(
         )
 
         last_exc: Optional[BaseException] = None
-        # Cost basis: BatchRecognize bills the full audio duration per job, and
-        # each retry below submits a fresh billable job — so this is recorded
-        # per attempt, not once per function call. prepared_audio.path is always
-        # a normalised PCM16 WAV, so the duration read is exact.
+        # Cost basis: the audio duration of each job that actually processed
+        # the file. It is recorded only once the job returns without a per-file
+        # error: a rejected job (e.g. code 3, "too long") transcribed nothing,
+        # and charging it overstated the case's spend by the full duration.
+        # wav_path is always a normalised PCM16 WAV, so the duration is exact.
         billable_seconds = 0.0
         try:
-            billable_seconds = _wav_duration_seconds(prepared_audio.path)
+            billable_seconds = _wav_duration_seconds(wav_path)
         except Exception as dur_exc:  # duration is for costing only
             logger.debug("Audio: could not read duration for cost metering: {}", dur_exc)
         for attempt in range(1, _BATCH_MAX_ATTEMPTS + 1):
+            _raise_if_cancelled()
             try:
                 operation = client.batch_recognize(request=request)
+                batch_response = operation.result(timeout=900)
+                result = _v2_batch_response_to_transcript_result(
+                    batch_response, time_offset=time_offset
+                )
                 record_stt_seconds(billable_seconds)
-                batch_response = operation.result(timeout=600)
-                result = _v2_batch_response_to_transcript_result(batch_response)
                 if result.words or result.raw_transcript:
                     logger.info(
-                        "Audio: BatchRecognize with diarization succeeded (attempt {})",
+                        "Audio: BatchRecognize{} with diarization succeeded (attempt {})",
+                        f" {label}" if label else "",
                         attempt,
                     )
                     return result
                 logger.warning(
-                    "Audio: BatchRecognize returned empty result (attempt {}); "
-                    "falling back to chunked mode",
+                    "Audio: BatchRecognize{} returned empty result (attempt {})",
+                    f" {label}" if label else "",
                     attempt,
                 )
                 return None
@@ -1022,7 +1201,8 @@ def _recognize_with_batch_chirp3_gcs(
                 break
 
         logger.warning(
-            "Audio: BatchRecognize via GCS failed ({}); falling back to chunked",
+            "Audio: BatchRecognize{} via GCS failed ({})",
+            f" {label}" if label else "",
             last_exc,
         )
         return None
@@ -1031,19 +1211,243 @@ def _recognize_with_batch_chirp3_gcs(
             _delete_from_gcs(gcs_uri, project_id)
 
 
+def _normalise_token(word: str) -> str:
+    return re.sub(r"[^\w]", "", (word or "").lower())
+
+
+def _stitch_window_results(
+    results: list[Optional[TranscriptResult]],
+    windows: list[AudioWindow],
+    *,
+    min_speakers: int,
+) -> list[RecognizedWord]:
+    """Join per-window words into one timeline with consistent speaker tags.
+
+    Each BatchRecognize job numbers its speakers independently. Neighbouring
+    windows share ``2 * overlap`` seconds of audio, so the same word appears in
+    both at (nearly) the same time; those pairs vote on which local tag is
+    which global speaker. A speaker who is silent in the overlap is matched to
+    a known speaker not otherwise claimed (most recently active first) once at
+    least ``min_speakers`` are known, rather than minted as a new speaker.
+    Words are then kept only from each window's own ``[keep_start, keep_end)``
+    so nothing in an overlap is emitted twice.
+    """
+    stitched: list[RecognizedWord] = []
+    last_active: dict[int, int] = {}  # global tag -> index of last window it spoke in
+    next_global = 0
+    prev_words: list[RecognizedWord] = []
+    prev_window: Optional[AudioWindow] = None
+    last_idx = len(windows) - 1
+
+    for idx, (res, window) in enumerate(zip(results, windows)):
+        words = list(res.words) if res is not None else []
+        local_counts: dict[int, int] = {}
+        for w in words:
+            if w.speaker_tag > 0:
+                local_counts[w.speaker_tag] = local_counts.get(w.speaker_tag, 0) + 1
+        mapping: dict[int, int] = {}
+
+        if local_counts and prev_words and prev_window is not None:
+            ov_start, ov_end = window.start_time, prev_window.end_time
+            prev_ov = [
+                w for w in prev_words
+                if w.speaker_tag > 0 and w.start_time is not None
+                and ov_start <= w.start_time <= ov_end
+            ]
+            votes: dict[tuple[int, int], int] = {}
+            for cw in words:
+                if cw.speaker_tag <= 0 or cw.start_time is None:
+                    continue
+                if not (ov_start <= cw.start_time <= ov_end):
+                    continue
+                token = _normalise_token(cw.word)
+                if not token:
+                    continue
+                best: Optional[RecognizedWord] = None
+                best_gap = 0.75
+                for pw in prev_ov:
+                    gap = abs((pw.start_time or 0.0) - cw.start_time)
+                    if gap < best_gap and _normalise_token(pw.word) == token:
+                        best, best_gap = pw, gap
+                if best is not None:
+                    key = (cw.speaker_tag, best.speaker_tag)
+                    votes[key] = votes.get(key, 0) + 1
+            claimed: set[int] = set()
+            for (local_tag, global_tag), _ in sorted(
+                votes.items(), key=lambda kv: kv[1], reverse=True
+            ):
+                if local_tag not in mapping and global_tag not in claimed:
+                    mapping[local_tag] = global_tag
+                    claimed.add(global_tag)
+
+        claimed_globals = set(mapping.values())
+        spare = sorted(
+            (g for g in last_active if g not in claimed_globals),
+            key=lambda g: last_active[g],
+            reverse=True,
+        )
+        for local_tag in sorted(local_counts, key=lambda t: local_counts[t], reverse=True):
+            if local_tag in mapping:
+                continue
+            if spare and len(last_active) >= min_speakers:
+                mapping[local_tag] = spare.pop(0)
+            else:
+                next_global += 1
+                mapping[local_tag] = next_global
+
+        remapped = [
+            RecognizedWord(
+                speaker_tag=mapping.get(w.speaker_tag, w.speaker_tag) if w.speaker_tag > 0 else 0,
+                word=w.word,
+                start_time=w.start_time,
+                end_time=w.end_time,
+            )
+            for w in words
+        ]
+        for g in mapping.values():
+            last_active[g] = idx
+        for w in remapped:
+            if w.start_time is None:
+                stitched.append(w)
+                continue
+            in_keep = window.keep_start <= w.start_time < window.keep_end or (
+                idx == last_idx and w.start_time >= window.keep_start
+            )
+            if in_keep:
+                stitched.append(w)
+        if remapped:
+            prev_words = remapped
+            prev_window = window
+
+    return sorted(stitched, key=lambda w: ((w.start_time or 0.0), (w.end_time or 0.0)))
+
+
+def _recognize_long_audio_windowed(
+    client,
+    recognizer: str,
+    config,
+    source_path: str,
+    duration_seconds: float,
+    project_id: str,
+    gcs_bucket: str,
+    *,
+    min_speakers: int,
+) -> TranscriptResult:
+    """Transcribe a recording longer than BatchRecognize allows.
+
+    The recording is cut at pauses into overlapping windows (each under the
+    20-minute limit), cut straight from the source so the whole recording is
+    never held as one WAV. Windows run as parallel BatchRecognize jobs; a
+    window whose job fails falls back to chunked Recognize on that window
+    only. A window that cannot be transcribed at all fails the whole
+    transcription: a transcript silently missing twenty minutes is worse
+    than an explicit failure the lawyer can retry with Reload.
+    """
+    window_seconds = float(getattr(settings, "audio_batch_window_seconds", 1140.0))
+    overlap_seconds = float(getattr(settings, "audio_window_overlap_seconds", 15.0))
+    concurrency = max(1, int(getattr(settings, "audio_batch_concurrency", 4)))
+
+    split_points = _detect_silence_split_points(source_path)
+    windows = _plan_batch_windows(
+        duration_seconds,
+        split_points,
+        window_seconds=window_seconds,
+        overlap_seconds=overlap_seconds,
+    )
+    total = len(windows)
+    logger.info(
+        "Audio: {:.0f}s recording exceeds the {}s BatchRecognize limit; "
+        "transcribing in {} windows (concurrency {})",
+        duration_seconds, BATCH_MAX_FILE_SECONDS, total, concurrency,
+    )
+
+    work_dir = tempfile.mkdtemp(prefix="chirp_windows_")
+
+    def _transcribe_window(index: int, window: AudioWindow) -> TranscriptResult:
+        _raise_if_cancelled()
+        label = f"window {index + 1}/{total}"
+        clip_path = os.path.join(work_dir, f"window_{index:04d}.wav")
+        _extract_wav_clip(source_path, clip_path, window.start_time, window.end_time)
+        try:
+            res = _batch_recognize_wav(
+                client, recognizer, config, clip_path, project_id, gcs_bucket,
+                time_offset=window.start_time, label=label,
+            )
+            if res is not None and res.words:
+                return res
+            _raise_if_cancelled()
+            return _recognize_chunked_with_chirp3_v2(
+                client,
+                recognizer,
+                config,
+                PreparedAudio(
+                    path=clip_path,
+                    sample_rate_hertz=_WINDOW_SAMPLE_RATE,
+                    channel_count=1,
+                ),
+                reason=f"BatchRecognize returned nothing for {label}",
+                time_offset=window.start_time,
+            )
+        finally:
+            try:
+                os.remove(clip_path)
+            except OSError:
+                pass
+
+    results: list[Optional[TranscriptResult]] = []
+    try:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            # Each worker runs in a copy of this thread's context, so STT cost
+            # is billed to the case and logs keep their request_id, and the
+            # cancel event reaches every window.
+            futures = [
+                pool.submit(contextvars.copy_context().run, _transcribe_window, i, w)
+                for i, w in enumerate(windows)
+            ]
+            try:
+                results = [f.result() for f in futures]
+            except BaseException:
+                for f in futures:
+                    f.cancel()
+                raise
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    stitched = _stitch_window_results(results, windows, min_speakers=min_speakers)
+    detected_languages: list[str] = []
+    for r in results:
+        for code in (r.detected_languages if r is not None else []):
+            if code not in detected_languages:
+                detected_languages.append(code)
+    logger.info(
+        "Audio: stitched {} windows into {} words, {} speakers",
+        total, len(stitched), len({w.speaker_tag for w in stitched if w.speaker_tag > 0}),
+    )
+    return TranscriptResult(
+        raw_transcript=_render_text_from_words(stitched),
+        detected_languages=detected_languages,
+        words=stitched,
+        timed_turns=_build_timed_turns(stitched),
+    )
+
+
 def _recognize_chunked_with_chirp3_v2(
     client,
     recognizer: str,
     config,
     prepared_audio: PreparedAudio,
+    *,
+    reason: str = "no GCS bucket configured",
+    time_offset: float = 0.0,
 ) -> TranscriptResult:
-    logger.info("Audio: pause-aware chunking with Recognize (no GCS bucket configured)")
+    logger.info("Audio: pause-aware chunking with Recognize ({})", reason)
     chunks, chunk_dir = _split_pcm_wav_by_silence(prepared_audio.path)
     chunk_results: list[TranscriptResult] = []
     chunk_word_lists: list[list[RecognizedWord]] = []
     keep_windows: list[tuple[float, float]] = []
     try:
         for chunk_idx, chunk in enumerate(chunks):
+            _raise_if_cancelled()
             with open(chunk.path, "rb") as audio_handle:
                 request = cloud_speech.RecognizeRequest(
                     recognizer=recognizer,
@@ -1060,13 +1464,18 @@ def _recognize_chunked_with_chirp3_v2(
             # summed seconds legitimately exceed the file's wall-clock duration —
             # that is what Google bills, not a metering bug.
             record_stt_seconds(chunk.end_time - chunk.start_time)
-            res = _v2_response_to_transcript_result(response, time_offset=chunk.start_time)
+            # time_offset places a window's chunks on the whole recording's clock.
+            res = _v2_response_to_transcript_result(
+                response, time_offset=time_offset + chunk.start_time
+            )
+            keep_start = time_offset + chunk.keep_start
+            keep_end = time_offset + chunk.keep_end
             res.words = _trim_words_to_window(
-                res.words, keep_start=chunk.keep_start, keep_end=chunk.keep_end
+                res.words, keep_start=keep_start, keep_end=keep_end
             )
             chunk_results.append(res)
             chunk_word_lists.append(res.words)
-            keep_windows.append((chunk.keep_start, chunk.keep_end))
+            keep_windows.append((keep_start, keep_end))
     finally:
         shutil.rmtree(chunk_dir, ignore_errors=True)
 
@@ -1096,6 +1505,7 @@ def _transcribe_offline_with_diarization(
     max_speakers: int,
     chirp_region: str,
     enable_denoiser: bool,
+    duration_seconds: Optional[float] = None,
 ) -> TranscriptResult:
     if not _SPEECH_AVAILABLE:
         raise RuntimeError(
@@ -1120,7 +1530,39 @@ def _transcribe_offline_with_diarization(
     elif len(diarization_langs) > 3:
         diarization_langs = diarization_langs[:3]
 
-    prepared_audio = _prepare_audio_for_recognition(audio_file)
+    gcs_bucket = _get_gcs_bucket()
+    window_limit = min(
+        float(getattr(settings, "audio_batch_window_seconds", 1140.0)),
+        float(BATCH_MAX_FILE_SECONDS),
+    )
+    if duration_seconds is None:
+        duration_seconds = _probe_duration_seconds(audio_file)
+    _enforce_duration_cap(duration_seconds)
+
+    use_windows = bool(gcs_bucket) and duration_seconds is not None and (
+        duration_seconds > window_limit
+    )
+    if use_windows:
+        # Windows are cut straight from the source to PCM16 mono 16 kHz, so a
+        # long recording is never converted into one multi-GB WAV.
+        prepared_audio = PreparedAudio(
+            path=audio_file, sample_rate_hertz=_WINDOW_SAMPLE_RATE, channel_count=1
+        )
+    else:
+        prepared_audio = _prepare_audio_for_recognition(audio_file)
+        if duration_seconds is None:
+            # No ffprobe: the normalised WAV gives the exact duration.
+            duration_seconds = _wav_duration_seconds(prepared_audio.path)
+            try:
+                _enforce_duration_cap(duration_seconds)
+            except AudioTooLongError:
+                if prepared_audio.cleanup_path:
+                    try:
+                        os.remove(prepared_audio.cleanup_path)
+                    except OSError:
+                        pass
+                raise
+            use_windows = bool(gcs_bucket) and duration_seconds > window_limit
     sa_credentials = _load_service_account_credentials()
     client_kwargs: dict = {
         "client_options": ClientOptions(
@@ -1161,10 +1603,21 @@ def _transcribe_offline_with_diarization(
         config_kwargs["denoiser_config"] = denoiser_cfg
     config = cloud_speech.RecognitionConfig(**config_kwargs)
 
-    gcs_bucket = _get_gcs_bucket()
     transcript_result: Optional[TranscriptResult] = None
 
     def _run(cfg) -> TranscriptResult:
+        if use_windows:
+            return _recognize_long_audio_windowed(
+                client,
+                recognizer,
+                cfg,
+                prepared_audio.path,
+                float(duration_seconds),
+                project_id,
+                gcs_bucket,
+                min_speakers=min_speakers,
+            )
+        reason = "no GCS bucket configured"
         if gcs_bucket:
             res = _recognize_with_batch_chirp3_gcs(
                 client=client,
@@ -1176,8 +1629,13 @@ def _transcribe_offline_with_diarization(
             )
             if res is not None:
                 return res
+            reason = "BatchRecognize failed or returned nothing"
         return _recognize_chunked_with_chirp3_v2(
-            client=client, recognizer=recognizer, config=cfg, prepared_audio=prepared_audio
+            client=client,
+            recognizer=recognizer,
+            config=cfg,
+            prepared_audio=prepared_audio,
+            reason=reason,
         )
 
     try:
@@ -1339,13 +1797,96 @@ def _gemini_full_diarization(
             "Audio: Gemini diarization skipped ({} utterances)", len(utterance_items)
         )
         return None
-    if len(utterance_items) > max_utterances:
-        logger.warning(
-            "Audio: Gemini diarization truncating {} utterances to {}",
-            len(utterance_items), max_utterances,
-        )
-    utterance_items = utterance_items[:max_utterances]
     utterances = [u[0] for u in utterance_items]
+    if len(utterances) <= max_utterances:
+        speaker_map = _gemini_diarization_assignments(utterances)
+    else:
+        # Long recordings used to be cut to the first max_utterances here, and
+        # every later utterance was dropped from the transcript. Assign them in
+        # overlapping blocks instead.
+        speaker_map = _gemini_diarization_assignments_blocked(
+            utterances, block_size=max_utterances
+        )
+    if not speaker_map:
+        return None
+
+    prev = 1
+    segments: list[SpeakerSegment] = []
+    for i, (utt, start_t, end_t) in enumerate(utterance_items):
+        spk = speaker_map.get(i, prev)
+        prev = spk
+        if segments and segments[-1].speaker_tag == spk:
+            segments[-1].text = f"{segments[-1].text} {utt}".strip()
+            # Extend the trailing timestamp; keep start_time anchored to first turn.
+            if end_t is not None:
+                cur_end = segments[-1].end_time
+                segments[-1].end_time = end_t if cur_end is None else max(cur_end, end_t)
+        else:
+            segments.append(
+                SpeakerSegment(
+                    speaker_tag=spk, text=utt, start_time=start_t, end_time=end_t,
+                )
+            )
+    if len({s.speaker_tag for s in segments}) < 2:
+        return None
+    return segments
+
+
+# Utterances repeated at the start of each block so its 1/2 labels can be
+# checked against the previous block's and flipped if the model swapped them.
+_GEMINI_DIARIZATION_BLOCK_OVERLAP = 200
+
+
+def _gemini_diarization_assignments_blocked(
+    utterances: list[str], *, block_size: int
+) -> Optional[dict[int, int]]:
+    """Speaker assignments for more utterances than one call takes.
+
+    Returns None if any block fails: a partial map would label the rest of the
+    call with whoever spoke last, which is worse than native diarization tags.
+    """
+    total = len(utterances)
+    overlap = min(_GEMINI_DIARIZATION_BLOCK_OVERLAP, max(0, block_size // 4))
+    speaker_map: dict[int, int] = {}
+    start = 0
+    block_no = 0
+    while start < total:
+        _raise_if_cancelled()
+        block_no += 1
+        context_start = max(0, start - overlap)
+        end = min(total, context_start + block_size)
+        block = _gemini_diarization_assignments(utterances[context_start:end])
+        if not block:
+            logger.warning(
+                "Audio: Gemini diarization block {} failed; keeping native speaker tags",
+                block_no,
+            )
+            return None
+        flip = False
+        if context_start < start:
+            agree = disagree = 0
+            for j in range(context_start, start):
+                prev_tag, new_tag = speaker_map.get(j), block.get(j - context_start)
+                if prev_tag is None or new_tag is None:
+                    continue
+                if prev_tag == new_tag:
+                    agree += 1
+                else:
+                    disagree += 1
+            flip = disagree > agree
+        for j in range(start, end):
+            tag = block.get(j - context_start)
+            if tag is not None:
+                speaker_map[j] = 3 - tag if flip else tag
+        start = end
+    logger.info(
+        "Audio: Gemini diarization assigned {} utterances in {} blocks", total, block_no
+    )
+    return speaker_map
+
+
+def _gemini_diarization_assignments(utterances: list[str]) -> Optional[dict[int, int]]:
+    """One Gemini call: utterance index -> speaker 1 (lawyer) or 2 (caller)."""
     last_idx = len(utterances) - 1
     numbered = "\n".join(f"{i}. {s}" for i, s in enumerate(utterances))
 
@@ -1413,27 +1954,7 @@ def _gemini_full_diarization(
     if not speaker_map:
         logger.warning("Audio: Gemini diarization parsed zero valid assignments")
         return None
-
-    prev = 1
-    segments: list[SpeakerSegment] = []
-    for i, (utt, start_t, end_t) in enumerate(utterance_items):
-        spk = speaker_map.get(i, prev)
-        prev = spk
-        if segments and segments[-1].speaker_tag == spk:
-            segments[-1].text = f"{segments[-1].text} {utt}".strip()
-            # Extend the trailing timestamp; keep start_time anchored to first turn.
-            if end_t is not None:
-                cur_end = segments[-1].end_time
-                segments[-1].end_time = end_t if cur_end is None else max(cur_end, end_t)
-        else:
-            segments.append(
-                SpeakerSegment(
-                    speaker_tag=spk, text=utt, start_time=start_t, end_time=end_t,
-                )
-            )
-    if len({s.speaker_tag for s in segments}) < 2:
-        return None
-    return segments
+    return speaker_map
 
 
 def _build_role_prompt(segments: list[SpeakerSegment], max_chars: int = 12000) -> str:
@@ -1894,43 +2415,14 @@ def _split_long_utterance_for_translit(text: str, max_chars: int = _HINGLISH_MAX
     return [s]
 
 
-def _transliterate_one_batch_to_hinglish(
-    batch_texts: list[str],
+def _transliterate_piece_group(
+    expanded_texts: list[str],
     *,
     batch_label: str = "",
 ) -> Optional[list[Optional[str]]]:
-    """Single Gemini call that converts a batch of utterances from Devanagari
-    to Hinglish. Returns a list of strings the same length as ``batch_texts``
-    (may contain ``None`` for items where the model didn't emit a useful
-    string). Returns ``None`` on total failure (no data from Gemini AND no
-    salvage from JSON repair).
-
-    Long single utterances (multi-paragraph monologues) are split on sentence
-    boundaries before the Gemini call and re-joined after, so a single very
-    long turn never has to fit into one streaming response.
-    """
-    if not batch_texts:
-        return []
-
-    # Expand any over-long utterance into smaller sentence chunks. Keep a
-    # mapping from original index → range of expanded indices so we can
-    # rejoin the Hinglish parts after the call returns.
-    expanded_texts: list[str] = []
-    expansion_map: list[tuple[int, int]] = []  # (start_in_expanded, count)
-    for t in batch_texts:
-        parts = _split_long_utterance_for_translit(t or "")
-        if not parts:
-            parts = [(t or "").strip()]
-        expansion_map.append((len(expanded_texts), len(parts)))
-        expanded_texts.extend(parts)
-    expanded_was_split = len(expanded_texts) != len(batch_texts)
-    if expanded_was_split:
-        logger.info(
-            "Audio: Hinglish batch{} — expanded {} utterance(s) into {} "
-            "sentence-chunks (long-turn split)",
-            batch_label, len(batch_texts), len(expanded_texts),
-        )
-
+    """One model call (plus the terse retry) over at most
+    ``_HINGLISH_BATCH_SIZE`` pieces. Returns one entry per piece (``None``
+    where the model gave nothing), or ``None`` when nothing came back."""
     numbered = "\n".join(
         f"{i+1}. {(t or '').strip()}" for i, t in enumerate(expanded_texts)
     )
@@ -2020,15 +2512,81 @@ Utterances:
 
     if arr is None:
         return None
-
-    # Build the per-expanded-utterance result list, then collapse it back to
-    # one entry per original utterance by joining the consecutive parts of
-    # any utterance we split earlier.
-    expanded_out: list[Optional[str]] = [None] * len(expanded_texts)
+    out: list[Optional[str]] = [None] * len(expanded_texts)
     for i in range(min(len(arr), len(expanded_texts))):
         v = arr[i]
         if isinstance(v, str) and v.strip():
-            expanded_out[i] = v.strip()
+            out[i] = v.strip()
+    return out
+
+
+def _transliterate_one_batch_to_hinglish(
+    batch_texts: list[str],
+    *,
+    batch_label: str = "",
+) -> Optional[list[Optional[str]]]:
+    """Convert a batch of utterances from Devanagari to Hinglish, one Gemini
+    call per ``_HINGLISH_BATCH_SIZE`` pieces. Returns a list of strings the
+    same length as ``batch_texts`` (may contain ``None`` for items where the model didn't emit a useful
+    string). Returns ``None`` on total failure (no data from Gemini AND no
+    salvage from JSON repair).
+
+    Long single utterances (multi-paragraph monologues) are split on sentence
+    boundaries before the Gemini call and re-joined after, so a single very
+    long turn never has to fit into one streaming response.
+    """
+    if not batch_texts:
+        return []
+
+    # Expand any over-long utterance into smaller sentence chunks. Keep a
+    # mapping from original index → range of expanded indices so we can
+    # rejoin the Hinglish parts after the call returns.
+    expanded_texts: list[str] = []
+    expansion_map: list[tuple[int, int]] = []  # (start_in_expanded, count)
+    for t in batch_texts:
+        parts = _split_long_utterance_for_translit(t or "")
+        if not parts:
+            parts = [(t or "").strip()]
+        expansion_map.append((len(expanded_texts), len(parts)))
+        expanded_texts.extend(parts)
+    expanded_was_split = len(expanded_texts) != len(batch_texts)
+    if expanded_was_split:
+        logger.info(
+            "Audio: Hinglish batch{} — expanded {} utterance(s) into {} "
+            "sentence-chunks (long-turn split)",
+            batch_label, len(batch_texts), len(expanded_texts),
+        )
+
+    # Send the pieces in groups of _HINGLISH_BATCH_SIZE. The retry passes
+    # shrink the batch by SEGMENT, which cannot help when diarization collapsed
+    # a whole recording into one segment: all 134 pieces of an 87-minute call
+    # went into a single 8000-token call, which returned nothing every time.
+    # Pieces already in Roman script are kept as they are and not re-sent.
+    expanded_out: list[Optional[str]] = [
+        None if _has_devanagari(t) else ((t or "").strip() or None)
+        for t in expanded_texts
+    ]
+    todo = [i for i, t in enumerate(expanded_texts) if _has_devanagari(t)]
+    groups = [
+        todo[g:g + _HINGLISH_BATCH_SIZE]
+        for g in range(0, len(todo), _HINGLISH_BATCH_SIZE)
+    ]
+    any_group_ok = False
+    for gi, group in enumerate(groups, 1):
+        if gi > 1:
+            _raise_if_cancelled()
+        label = batch_label if len(groups) == 1 else f"{batch_label} group {gi}/{len(groups)}"
+        got = _transliterate_piece_group(
+            [expanded_texts[i] for i in group], batch_label=label
+        )
+        if got is None:
+            continue
+        any_group_ok = True
+        for i, v in zip(group, got):
+            if v is not None:
+                expanded_out[i] = v
+    if groups and not any_group_ok:
+        return None
 
     out: list[Optional[str]] = [None] * len(batch_texts)
     for orig_idx, (start, count) in enumerate(expansion_map):
@@ -2189,6 +2747,7 @@ def _run_hinglish_pass_on_indices(
     ]
     pass_converted = 0
     for ci, chunk in enumerate(chunks, 1):
+        _raise_if_cancelled()
         chunk_segs = [segments[i] for i in chunk]
         chunk_texts = [(s.text or "").strip() for s in chunk_segs]
         batch_label = f" {pass_label} {ci}/{len(chunks)} (size {len(chunk)})"
@@ -2506,9 +3065,13 @@ def _sync_transcribe(
     chirp_region: str,
     enable_denoiser: bool,
     enable_role_inference: bool,
+    cancel_event: Optional[threading.Event] = None,
 ) -> AudioTranscriptionResult:
+    # This thread runs in its own copy of the caller's context, so setting the
+    # event here is visible only to this transcription and its window workers.
+    _CANCEL_EVENT.set(cancel_event)
     if not os.path.exists(file_path):
-        return AudioTranscriptionResult(success=False, error=f"file_not_found: {file_path}")
+        return AudioTranscriptionResult(success=False, error="file_not_found")
 
     if not _SPEECH_AVAILABLE:
         return AudioTranscriptionResult(
@@ -2518,14 +3081,9 @@ def _sync_transcribe(
 
     duration_seconds: Optional[float] = None
     try:
-        # Best-effort duration via ffprobe alternative — wave only handles WAV.
-        # We use ffmpeg -i implicitly via _wav_duration_seconds after conversion;
-        # at this stage we'll just leave duration_seconds=None for non-WAV inputs.
-        if file_path.lower().endswith(".wav"):
-            try:
-                duration_seconds = _wav_duration_seconds(file_path)
-            except Exception:
-                duration_seconds = None
+        duration_seconds = _probe_duration_seconds(file_path)
+        if duration_seconds is not None:
+            logger.info("Audio: duration {:.0f}s", duration_seconds)
 
         transcript_result = _transcribe_offline_with_diarization(
             audio_file=file_path,
@@ -2535,6 +3093,12 @@ def _sync_transcribe(
             max_speakers=max_speakers,
             chirp_region=chirp_region,
             enable_denoiser=enable_denoiser,
+            duration_seconds=duration_seconds,
+        )
+    except TranscriptionCancelled:
+        logger.warning("Audio: transcription cancelled before recognition finished")
+        return AudioTranscriptionResult(
+            success=False, error="transcription_cancelled", duration_seconds=duration_seconds
         )
     except Exception as exc:
         logger.error("Audio transcription failed: {}", exc)
@@ -2664,7 +3228,16 @@ def _sync_transcribe(
     original_had_devanagari = _has_devanagari(raw_transcript) or any(
         _has_devanagari(s.text or "") for s in segments
     )
-    segments = _transliterate_segments_to_hinglish(segments)
+    try:
+        segments = _transliterate_segments_to_hinglish(segments)
+    except TranscriptionCancelled:
+        raise
+    except Exception as exc:
+        # Cosmetic step over a finished, already-billed transcript: a failure
+        # keeps the Devanagari text instead of discarding the whole recording.
+        logger.opt(exception=exc).error(
+            "Audio: Hinglish transliteration failed; keeping the original script"
+        )
 
     formatted = _format_transcript_with_speakers(segments)
 
@@ -2728,16 +3301,33 @@ async def transcribe_audio(
         or getattr(settings, "chirp_region", None)
         or DEFAULT_CHIRP_REGION
     )
-    return await asyncio.to_thread(
-        _sync_transcribe,
-        file_path,
-        languages=langs,
-        min_speakers=min_s,
-        max_speakers=max_s,
-        chirp_region=region,
-        enable_denoiser=enable_denoiser,
-        enable_role_inference=enable_role_inference,
-    )
+    cancel_event = threading.Event()
+
+    def _run_in_thread() -> AudioTranscriptionResult:
+        try:
+            return _sync_transcribe(
+                file_path,
+                languages=langs,
+                min_speakers=min_s,
+                max_speakers=max_s,
+                chirp_region=region,
+                enable_denoiser=enable_denoiser,
+                enable_role_inference=enable_role_inference,
+                cancel_event=cancel_event,
+            )
+        except TranscriptionCancelled:
+            # Raised by a checkpoint after recognition (diarization blocks,
+            # transliteration batches). Nobody awaits this result any more.
+            return AudioTranscriptionResult(success=False, error="transcription_cancelled")
+
+    try:
+        return await asyncio.to_thread(_run_in_thread)
+    except asyncio.CancelledError:
+        # asyncio cannot interrupt the worker thread. Signal it so it stops at
+        # its next checkpoint instead of running (and billing) for hours.
+        cancel_event.set()
+        logger.warning("Audio: transcription task cancelled; stopping worker at next checkpoint")
+        raise
 
 
 def _settings_languages() -> Optional[list[str]]:

@@ -273,8 +273,10 @@ class SocketEventHandler(
         self._background_tasks: Set[asyncio.Task] = set()
         # Re-emit after reconnect when socket dropped right after analysis report (so backend gets the update)
         self._had_disconnect: bool = False
-        self._pending_reemit_workspace_id: Optional[str] = None
-        self._pending_reemit_user_id: Optional[str] = None
+        # workspace_id -> (user_id, armed_at): every case whose cached panels
+        # are replayed after a reconnect (was a single slot: only the most
+        # recently active case was ever replayed).
+        self._pending_reemits: Dict[str, Tuple[str, float]] = {}
         # Per-workspace coalescing for analysis_report_feedback. Bulk-reject sends
         # N events in ~2ms; processing them sequentially under a lock is correct
         # but takes ~19s × N (Gemini scoring + explanation regeneration). We
@@ -290,14 +292,14 @@ class SocketEventHandler(
         # New triggers QUEUE behind the in-flight chain (FIFO); cross-workspace
         # runs stay concurrent because locks are keyed by workspace_id.
         self._workspace_pipeline_locks: Dict[str, asyncio.Lock] = {}
+        # Who holds each workspace's pipeline lock, in which stage, since when:
+        # workspace_id -> {"holder", "stage", "acquiredAt", "cap", "warnedAt"}.
+        # Read by the lock watchdog and the run cap (handlers/_shared.py).
+        self._workspace_pipeline_lock_holder: Dict[str, Dict[str, Any]] = {}
         self._pending_feedback_queue: Dict[str, List[Dict[str, Any]]] = {}
         self._pending_feedback_task: Dict[str, asyncio.Task] = {}
         # Window for collecting bulk-reject bursts before flushing.
         self._feedback_debounce_seconds: float = 0.5
-        # Max total score bump from a single batch (each valid rejection
-        # contributes 1–5; capping the sum prevents huge scores when the user
-        # rejects many items at once).
-        self._feedback_batch_max_score_delta: int = 15
         # Chat attachment cache: chat_id -> list of {fileName, content} so follow-up questions in same chat see the document
         self._chat_attachment_by_chat: Dict[str, List[Dict[str, Any]]] = {}
         # Intelligence chat: last assistant text per chat_id (client may omit conversation_history)
@@ -307,8 +309,10 @@ class SocketEventHandler(
         # - per user/workspace: f"{workspace_id}:{user_id}" -> role
         self._role_cache_by_chat: Dict[str, str] = {}
         self._role_cache_by_user_workspace: Dict[str, str] = {}
-        # Last ai_response payload; re-emit after reconnect when socket dropped right after emit so backend receives it
-        self._pending_ai_response: Optional[Dict[str, Any]] = None
+        # chat_id -> ai_response payload whose delivery failed; all re-sent on the
+        # next connect (was a single slot shared by every chat, so a second
+        # undelivered reply silently replaced the first).
+        self._pending_ai_responses: Dict[str, Dict[str, Any]] = {}
         # De-dup guard for replayed workspace_sync events (e.g., reconnect replay).
         # workspace_id -> {"fingerprint": str, "ts": float}
         self._last_workspace_sync_fingerprint: Dict[str, Dict[str, Any]] = {}
@@ -590,7 +594,9 @@ class SocketEventHandler(
         """Map any role wording to a canonical Title-Case role; default 'Other'."""
         return cls._PARTY_ROLE_MAP.get(str(raw or "").strip().upper(), "Other")
 
-    _ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT = 4
+    # What a reject that removes an item adds to caseResolutionScore: the same
+    # weights _derive_case_resolution_score deducts per open item.
+    _REJECTION_SCORE_INCREASE = {"missingInfo": 5, "weaknesses": 5, "risks": 3}
 
     _ADDED_MISSING_INFO_SCORE_DROP_DEFAULT = 3
 

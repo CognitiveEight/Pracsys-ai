@@ -89,6 +89,30 @@ class ModelRouter:
             json_mode=bool(opts.get("json_mode", caps.json_mode)),
         )
 
+    async def gate0_unserved_models(self) -> List[str]:
+        """Configured ``gate0:`` models the gateway does not list for this key.
+
+        Covers routes, fallbacks, grounding, user-selectable models and the
+        embedding profile. Raises ``ProviderError`` when gate0 cannot be asked."""
+        from app.llm.config import selectable_models
+
+        profiles = [
+            p
+            for p in (
+                self.routing.all_profiles()
+                + list(selectable_models().values())
+                + [self.embedding_profile()]
+            )
+            if p.provider == "gate0"
+        ]
+        if not profiles:
+            return []
+        provider = self.provider_for(profiles[0])
+        if provider.unavailable_reason():
+            return []
+        served = set(await provider.served_models())  # type: ignore[attr-defined]
+        return sorted({p.model for p in profiles if p.model not in served})
+
     def problems(self) -> List[Tuple[str, str]]:
         """(profile, reason) for every configured profile that cannot serve calls."""
         from app.llm.config import selectable_models
@@ -249,8 +273,10 @@ class ModelRouter:
                 status = result.finish
                 finish = result.raw_finish
                 in_t, out_t, think_t = result.input_tokens, result.output_tokens, result.thinking_tokens
+                cost, call_id = result.cost_usd, result.gateway_call_id
             else:
                 finish, in_t, out_t, think_t = "-", None, None, None
+                cost, call_id = None, None
             duration_ms = round((time.perf_counter() - started) * 1000)
             log = logger.bind(
                 llm=True,
@@ -264,13 +290,17 @@ class ModelRouter:
                 llm_in=in_t,
                 llm_out=out_t,
                 llm_think=think_t,
+                llm_cost=cost,
+                llm_gateway_call_id=call_id,
             )
             emit = log.info if status == "ok" else log.warning
             emit(
                 "llm_call {} feature={} provider={} model={} status={} finish={} ms={} "
-                "in={} out={} think={}{}",
+                "in={} out={} think={} cost={} gateway_call_id={}{}",
                 kind, feature, profile.provider, profile.model, status, finish,
-                duration_ms, in_t, out_t, think_t, f" error={error}" if error else "",
+                duration_ms, in_t, out_t, think_t,
+                "-" if cost is None else f"{cost:.10g}", call_id or "-",
+                f" error={error}" if error else "",
             )
         except Exception as exc:  # logging must never break generation
             logger.debug("llm_call logging failed: {}", exc)
@@ -334,9 +364,23 @@ class ModelRouter:
                 )
             if not any(v):
                 raise EmbeddingError("embedding came back all zeros")
-        logger.debug(
-            "embed_call provider={} texts={} task={} dims={} ms={}",
-            profile.provider, len(texts), task, dims, round((time.perf_counter() - started) * 1000),
+        # One llm_call line per embedding call, like a generation: the gateway's
+        # call id and cost let it be matched to gate0's spend record.
+        ModelRouter._log(
+            "embed",
+            "embeddings",
+            profile,
+            started,
+            result=LLMResult(
+                text="",
+                finish="ok",
+                provider=profile.provider,
+                model=profile.model,
+                input_tokens=int(getattr(vectors, "input_tokens", 0) or 0),
+                raw_finish=task,
+                cost_usd=getattr(vectors, "cost_usd", None),
+                gateway_call_id=getattr(vectors, "gateway_call_id", None),
+            ),
         )
         return [l2_normalise(v) for v in vectors]
 

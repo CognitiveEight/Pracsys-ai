@@ -260,6 +260,11 @@ async def check_model_client():
     # otherwise send these calls to a real, differently shaped client.
     saved_provider = settings.embedding_provider
     settings.embedding_provider = "gemini"
+    # The provider refuses to run without a key before the fake client is
+    # reached, so pin a placeholder: the check must not depend on a developer's
+    # .env (CI has none). The fake client means it is never sent anywhere.
+    saved_api_key = settings.google_api_key
+    settings.google_api_key = "test-placeholder"
     try:
         gemini = real.router.provider_for(real.router.embedding_profile())
         for label, vecs in [("wrong-size embedding is rejected", [[0.1] * 3072]),
@@ -275,6 +280,7 @@ async def check_model_client():
         check("embeddings are unit length", abs(sum(x * x for x in v) - 1.0) < 1e-9)
     finally:
         settings.embedding_provider = saved_provider
+        settings.google_api_key = saved_api_key
 
 
 def check_page_markers():

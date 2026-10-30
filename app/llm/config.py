@@ -204,6 +204,25 @@ def model_options(model: str) -> Dict[str, Any]:
     return dict(table.get(best) or {}) if best else {}
 
 
+def model_family(model: str) -> str:
+    """The vendor family whose protocol quirks the gate0 adapter must honour.
+
+    ``LLM_MODEL_OPTIONS[model].family`` when set (any value; only ``gemini``
+    and ``anthropic`` change what is sent). Otherwise the legacy rule that
+    existing configurations rely on: the ``gemini: true|false`` option, else a
+    name containing "gemini". Everything else is ``other``: a plain OpenAI
+    request, whatever model (open-source or proprietary) serves it.
+    """
+    opts = model_options(model)
+    family = str(opts.get("family") or "").strip().lower()
+    if family:
+        return family
+    gemini_flag = opts.get("gemini")
+    if gemini_flag is not None:
+        return "gemini" if gemini_flag else "other"
+    return "gemini" if "gemini" in (model or "").lower() else "other"
+
+
 def secret(value: Any) -> Optional[str]:
     """Plain value of a ``SecretStr`` (or str) setting; None when unset."""
     if value is None:

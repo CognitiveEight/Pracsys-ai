@@ -9,19 +9,33 @@ SimplerToday is a Python asyncio **Socket.IO client** (not a server). It connect
 ## Common commands
 
 ```bash
-make setup        # create venv, install deps, copy env.example → .env, mkdir logs/ data/
+make setup        # create venv/, install deps, copy env.example → .env, mkdir logs/audit data/workspaces
 make run          # python -m app.main  (the only entry point)
 make test         # pytest tests + tests/offline/verify_*.py (fails on any failure)
-make eval         # run the evaluation harness over the golden set
 make ontology-ddl # regenerate data/ontology/schema.{enterprise,community}.cypher
-make smoke-graph  # end-to-end check against a real Neo4j (needs NEO4J_URL)
-make statute-report  # statutory register coverage summary
+make graph-up     # start Neo4j via the docker-compose "graph" profile (needs NEO4J_PASSWORD)
 make docker-up    # bring up Qdrant + Redis from docker-compose.yml
 make docker-down
 make lint         # ruff check .  (rules in pyproject.toml; fails on findings)
 make format       # black app/   (only if black is installed; not enforced)
 ./dev.sh start    # interactive helper around the same actions
+
+# Single tests (pytest.ini sets asyncio_mode=auto, testpaths=tests)
+python -m pytest -q tests/test_ocr.py              # one file
+python -m pytest -q tests/test_ocr.py -k <name>    # one test
+python tests/offline/verify_rag.py                 # one offline suite (plain script, not pytest)
+
+# Retrieval eval (golden set is JSON Lines; see app/rag/eval/metrics.py)
+python scripts/eval_rag.py <golden.jsonl> [--answers] [--graph] [--out report.json]
+
+# Commit gates (gitleaks, ruff, …): install once per clone
+pip install -r requirements-dev.txt && pre-commit install
 ```
+
+The existing local virtualenv in this checkout is `env/` (not the `venv/` that
+`make setup` would create). `make eval`, `make smoke-graph` and
+`make statute-report` are referenced in `docs/AGENTIC_ONTOLOGY_RAG_FOUNDATIONS.md`
+but **do not exist in this Makefile**.
 
 `make test` runs `pytest tests` (ontology, graph, retrieval, statute layers) and
 the offline `tests/offline/verify_*.py` suites. **Before a deploy, also run `make e2e`**
@@ -62,7 +76,9 @@ The system is a multi-agent pipeline gated by a role agent and triggered by sock
 
 ### The role gate is non-bypassable
 
-`app/langgraph/role_agent.py` is the root agent. **Without a validated role (ADJUDICATOR / PETITIONER / RESPONDENT / MEDIATOR), no downstream agent runs** — workspace init calls `workspace_role_integration.initialize_workspace_with_role(...)` first, and role changes invalidate all derived intelligence. When adding a new agent or feature, gate it through this state and don't smuggle role-dependent logic past it.
+`app/langgraph/role_agent.py` is the root agent. Every panel and chat turn is produced for one validated role (ADJUDICATOR / PETITIONER / RESPONDENT / MEDIATOR) — workspace init calls `workspace_role_integration.initialize_workspace_with_role(...)` first, and role changes invalidate all derived intelligence. When adding a new agent or feature, gate it through this state and don't smuggle role-dependent logic past it.
+
+The role is a **mandatory field in the lawyer app, pre-selected as PETITIONER**, so the service does not block on a missing role. A missing or invalid role falls back to `DEFAULT_WORKSPACE_ROLE` (`app/core/roles.py`, PETITIONER, the app's own default) and logs a warning, because it means the role was lost upstream. Resolve a role with `_resolve_workspace_role` (payload → persisted cache → context → default); never type a literal role as a fallback — use the constant.
 
 ### Two strategy paths exist — know which one runs
 
@@ -228,7 +244,7 @@ change whose 2-minute regeneration was cancelled by a socket disconnect, dying
 without a log line or an emit because `asyncio.CancelledError` is a
 `BaseException` that every `except Exception` on the path missed.
 
-Four rules follow, and a new feature has to honour all of them:
+These rules follow, and a new feature has to honour all of them:
 
 - **Catch `asyncio.CancelledError` explicitly** (before `except Exception`) in
   any long-running generation a socket turn awaits — log it, mark the work, then
@@ -252,8 +268,33 @@ Four rules follow, and a new feature has to honour all of them:
   safety block surfaces as the far more misleading "model returned no JSON".
   All calls are bounded by `gemini_request_timeout_seconds` (default 300s; the
   legitimate strategy regeneration takes ~2 minutes).
+- **Never hold `_workspace_pipeline_lock` across an unbounded external round
+  trip.** While one run holds it, every later upload, objective change,
+  reconnect replay and resume of the case queues behind it. Take it through
+  `_hold_pipeline_lock(workspace_id, holder)`, which records the holder and
+  its stage (`_set_pipeline_stage` / `_stage_begin`). Template sync is bounded
+  (`TEMPLATE_SYNC_TIMEOUT_SECONDS`, 900 s; an undelivered request returns at
+  once) and runners start it **before** the lock (`_prewarm_templates`);
+  drafting under the lock waits on it only `TEMPLATE_SYNC_IN_LOCK_WAIT_SECONDS`
+  (`templates_ready=`), and a late library re-emits drafting by itself.
+- **A run's lock hold is capped.** The upload pipeline, the dates/laws runner
+  and the objective-change cascade run under `asyncio.timeout(cap)`:
+  `PIPELINE_RUN_TIMEOUT_SECONDS` (900 s), extended for audio up to
+  `PIPELINE_RUN_TIMEOUT_AUDIO_MAX_SECONDS` (`_pipeline_run_cap`). At the cap
+  the run logs CRITICAL `pipeline run exceeded cap=… stage=…`, audits
+  `pipeline_run_timeout` and settles its unemitted panels from cache
+  (`_settle_pipeline_run_cap`). A watchdog warns at
+  `PIPELINE_LOCK_WARN_SECONDS` (300 s) and releases nothing. Every step in a
+  long run must re-raise `CancelledError`, or the cap cannot cut it.
+- **A failed step settles its own panel.** Runners set the emit observer
+  (`_EMIT_OBSERVER`, `run_control.py`), so a release skips what already went
+  out. Each failing tail step, a strategy that returns nothing, a cancelled
+  runner, a `process_batch` crash and an upload whose files all fail release
+  their armed panels from cache — an existing case's panels are never replaced
+  by a fallback or emptied because an upload failed.
 
-Offline coverage: `tests/offline/verify_objective_change.py` group 12.
+Offline coverage: `tests/offline/verify_objective_change.py` group 12,
+`tests/offline/verify_stuck_loaders.py`.
 
 ### Stop is a fence, not a cancellation
 
@@ -393,7 +434,9 @@ Neo4j (`app/graph/store.py`) and planned and assembled by
 `app/retrieval/` (planner, critic, graph queries).
 
 It came from `feature/data_ingestion`, ported onto this branch's own RAG.
-**It does not use Keel.** Vector and exact-term sub-questions run on
+**It does not use Keel** (the separate knowledge-plane platform that is the
+planned long-term home for the graph write path; no Keel code is in this
+repo). Vector and exact-term sub-questions run on
 `app/rag/retriever` (hybrid search), and graph sub-questions run on Neo4j.
 
 **Configuration**
@@ -578,8 +621,9 @@ check of the sinks.
 **One line per model call**
 - `gemini_client` writes a single `llm_call` line with the kind, the feature
   (taken from the `@meter_usage` function name), model, status
-  (`ok`/`error`/`timeout`/`blocked`/`truncated`), finish reason, duration and
-  tokens.
+  (`ok`/`error`/`timeout`/`blocked`/`truncated`), finish reason, duration,
+  tokens, `cost=` and `gateway_call_id=` (gate0's call id: one line per gate0
+  usage record). Embeddings get one `llm_call embed` line per batch.
 - A failed call that returns the error sentinel is logged as `error`. Do not
   add per-call "generating…/generated" lines.
 
@@ -614,17 +658,6 @@ check of the sinks.
 
 `bns-ai-*.json` and `gcp-vision.json` are GCP service-account credential files that exist in the working tree. Do not read, log, or include their contents in commits, diffs, or chat output. Treat `.env` the same way.
 
-## Keel (`keel/`)
-
-`keel/` is a **vendored plain copy** of the Keel knowledge-plane platform
-(`github.com/keel-vc/keel-ai` @ `418cfb6`), copied 2026-08-24 so the Keel-side
-tasks of the Agentic Ontology RAG programme can be done in this tree. It is
-**not** part of the AI service and does not run in `env/` — its dependency pins
-conflict with this repo's on fastapi, uvicorn, qdrant-client, redis and
-python-multipart, so it needs its own venv or container. There is no git link to
-upstream; refreshing is a manual rsync. See `docs/KEEL_VENDORED.md` before
-touching it, and note the `.gitignore` `*.md` trap documented there.
-
 ## Where to look first
 
 - Handshake authentication → `app/socket/auth.py` (scheme `v1`: HMAC over `v1:AI_Maverick:<unix_seconds>:<nonce>`, sent as `x-signature` / `x-signature-timestamp` / `x-signature-nonce`). Headers are **single-use** — `SocketClient.connect` passes the builder as a *callable* so python-socketio re-signs on every reconnect; passing a dict breaks every reconnect with `replayed_nonce`. Spec and failure-code table: `docs/AI_SERVICE_AUTH_MIGRATION.md`. `SOCKET_AUTH_SCHEME=legacy` is a rollback-only escape hatch.
@@ -635,9 +668,11 @@ touching it, and note the `.gitignore` `*.md` trap documented there.
 - Vector retrieval → `app/vectorstore/qdrant.py` (storage) + `app/rag/` (chunking, hybrid retrieval, evidence, citations).
 - Model providers, routing, per-task model choice → `app/llm/` (router + `providers/`) behind `app/ai/gemini_client.py`; `docs/MODEL_PORTABILITY.md`.
 - Prompt edits (legal framing, guardrails) → `app/prompts/`.
-- Knowledge plane / Keel → `keel/` + `docs/KEEL_VENDORED.md`. Ontology, statutory register and eval harness → `app/ontology/`, `app/statutes/`, `app/eval/` + `docs/AGENTIC_ONTOLOGY_RAG_FOUNDATIONS.md`.
+- Ontology, statutory register and eval harness → `app/ontology/`, `app/statutes/`, `app/eval/` + `docs/AGENTIC_ONTOLOGY_RAG_FOUNDATIONS.md`.
 - Full event-flow narrative → `docs/SYSTEM_ARCHITECTURE.md`. Recent feature-level history → `CHANGELOG.md`.
 - Architecture map (start here) → `docs/architecture.md`.
+- Onboarding a person, a new Claude account, or migrating the service →
+  `docs/onboarding.md`, `docs/claude-code-setup.md`, `docs/migration-guide.md`.
 
 ## How work is done here
 
@@ -658,6 +693,7 @@ The Claude Code set-up, all committed except the `*.local.*` files:
 | `.claude/hooks/` | `block-secrets.sh` (credential files, incl. via Bash), `protect-branch.sh` (no commit on `development`/`staging`/`main`, no `--no-verify`, no push), `validate-code.sh` (ruff after each edit) |
 | `.claude/commands/` | `/spec`, `/implement`, `/verify`, `/review`, `/release-check`, `/retro`, `/meeting`, each taking a Jira key, branch or topic |
 | `.claude/skills/` | `spec-writing`, `testing-patterns`, `confluence-docs`, loaded when the task needs them |
+| `.claude/settings.local.json`, `CLAUDE.local.md` | Personal, gitignored |
 
 Every workflow step also records its result in Confluence. The space's
 **SimplerToday – SDLC Templates** tree holds one template per record:
@@ -665,4 +701,3 @@ Business Requirement, Product Management, Cross Functional Requirements, Risk
 & Backlogs, Release Management, Retrospective, Meeting & Discussion, Developer
 Onboarding. The `confluence-docs` skill maps each command to its page, and
 nothing is written to Confluence or Jira without the user's yes.
-| `.claude/settings.local.json`, `CLAUDE.local.md` | Personal, gitignored |

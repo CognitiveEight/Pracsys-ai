@@ -7,8 +7,341 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **SIM-163 (Phase 1): an upload's panels are generated in parallel; Strategy,
+  Analysis Report and Drafting Assistant are sent first.**
+  - List of Dates, Applicable Laws, Upcoming Dates, Relevant Parties and Case
+    Laws start with Strategy instead of after Analysis. Every panel is sent
+    the moment it is ready (an earlier hold until Strategy, Analysis and
+    Drafting were out made them all arrive in one burst; it is removed).
+  - Drafting runs right after Analysis. On a first build it runs once more at
+    the end, when laws and dates exist.
+  - `PIPELINE_CONCURRENT_PANELS=false` restores the old sequential run.
+  - Analysis no longer repeats Strategy's entity extraction (about 23 s per
+    update): the cache is keyed by the document set, not by each panel's
+    packed prompt text.
+  - List of Dates runs its per-document pass and its per-date duplicate check
+    4 calls at a time (`LIST_OF_DATES_CONCURRENCY`, 1 = old behaviour). The
+    result is the same; on a 27-file local case those two passes took 346 s
+    one call at a time.
+  - **Billing:** an emit reports the case's spend since its previous emit.
+    With panels overlapping, one panel's `price` can include another panel's
+    calls. `totalPrice` and gate0 reconciliation are unchanged.
+  - No payload or schema change. The order of `document_feature_response`
+    events changes as above.
+  - Coverage: `tests/test_parallel_panels.py`. Two `verify_stuck_loaders.py`
+    groups now run in the sequential mode they assume.
+
+- **SIM-163: the lawyer can see why a reject did or did not raise the score.**
+  The analysis report sent after a reject now carries `rejectionFeedback`:
+  `scoreChange` (what was applied) and one entry per reject with `section`,
+  `rejectedValue` (echoed), `isValidRejection`, `scoreIncrease` and a
+  one-sentence `reason` written for the lawyer. The score rule is unchanged:
+  a reject raises the score only when the item is judged not relevant to the
+  case. **Socket payload change (additive):** `RejectionFeedback` in
+  `app/socket/schemas.py`. It is on that emit only, never cached or replayed.
+  The backend must pass it through and the frontend show `reason` beside the
+  score. Coverage: `tests/test_reject_matching.py`.
+
 ### Fixed
 
+- **Chat replies keep their bullet points and headings.** The citation checker
+  splits a reply into sentences and joins them back, and a line break straight
+  after a full stop was never part of any sentence, so it was dropped: every
+  `* Row N` bullet and `####` heading ran into the line before it. The split
+  now covers the reply exactly (`_sentences` in `app/rag/citations.py`).
+  Panel and chat text built through the checker are otherwise unchanged.
+- **Spreadsheet figures read as the sheet shows them.** A float formula cell
+  was rendered with binary noise (`4532.849999999999`), which the model then
+  quoted. A cell's display text now follows its number format's decimal
+  places, or 12 significant digits for General; the exact value used by
+  `table_query` is unchanged. Existing workbooks show the new text after a
+  re-read (reload) of the document. Coverage: `tests/test_chat_formatting.py`.
+
+- **SIM-163: rejecting every analysis item and then uploading no longer leaves
+  Missing Information, Weaknesses and Risks empty.** The model was never told
+  what the lawyer dismissed, so it re-created the same items and the rejection
+  filter removed all of them. The analysis prompt now lists the dismissed
+  items, and a section the filter empties is refilled once with new items (the
+  refill is told what was dismissed too). No payload change. Coverage:
+  `tests/test_rejected_items_regeneration.py`.
+
+- **SIM-163: every upload panel is sent as soon as it is ready.** The tail
+  panels (List of Dates, Applicable Laws, Upcoming Dates, Relevant Parties,
+  Case Laws) were held until Strategy, Analysis and Drafting were sent, so they
+  arrived together. The hold is removed. The order of
+  `document_feature_response` events now follows completion; no payload
+  change. Coverage: `tests/test_parallel_panels.py`,
+  `tests/offline/verify_stuck_loaders.py`.
+
+- **SIM-163: rejecting a Missing Information or Risk/Weakness item now always
+  raises the quality score.** The model used to decide whether a reject was
+  "valid", and since every item comes from the case's own documents it nearly
+  always said no, so the score stayed put. A reject that removes an item now
+  adds a fixed amount: 5 for missing information, 5 for a weakness, 3 for a
+  risk (the same weights the score deducts per open item). The score is still
+  capped at 95% while any item remains, and reaches 100% only when none do. A
+  bulk reject counts every item (the old 15-point batch cap is gone). The model
+  now writes only the `reason` sentence. A reject of an item already removed
+  adds nothing. The chat "lawyer-provided updates" path uses the same weights.
+  No schema change: `rejectionFeedback.items[].isValidRejection` is `true` for
+  every applied reject and `scoreIncrease` is the section weight. Coverage:
+  `tests/test_reject_matching.py`.
+
+- **SIM-163: rejecting one Analysis Report item no longer removes the others.**
+  A reject removed every item sharing two informative words with the rejected
+  text, so on a case whose gaps all mention the same documents one reject
+  could empty Missing Information. The rejected text was then remembered with
+  the same loose rule, so later rebuilds dropped every new gap sharing those
+  words too. A reject now removes the item with the same text (ignoring case
+  and punctuation), or failing that the single closest near-identical
+  rewording, never more. The rejection memory and the duplicate check for a
+  lawyer-added Missing Information item use the same strict rule (a new gap
+  sharing a couple of words with an existing one was silently not added). The
+  chat "remove this item" path keeps the loose match, because there the lawyer
+  paraphrases. Reject log lines no longer carry the item text. No payload
+  change. Offline coverage: `tests/test_reject_matching.py`.
+  - An item a rebuild re-worded is still found: for an item it already had,
+    the frontend keeps its own wording under the same id, so the rejected text
+    is matched exactly against `currentState`, and our item with that id is
+    removed. Both wordings go into the rejection memory. (Found in local
+    testing: the second reject on an updated case removed nothing.)
+
+- **SIM-163 (Phase -1): panels no longer stick after an upload or an
+  objective change; a failed upload no longer replaces existing panels.**
+  - Template sync for the Drafting Assistant is bounded
+    (`TEMPLATE_SYNC_TIMEOUT_SECONDS`, 900 s). An undelivered
+    `request_template_sync` returns at once, an invalid reply releases its
+    waiter, and the round trip now runs outside the per-workspace pipeline lock
+    (drafting waits on it at most `TEMPLATE_SYNC_IN_LOCK_WAIT_SECONDS`, 5 s; a
+    library that arrives later re-emits drafting). Before, one unanswered
+    request held the lock forever and every later panel of the case span until
+    a restart.
+  - One upload pipeline, dates/laws run or objective-change cascade may hold
+    the lock for at most `PIPELINE_RUN_TIMEOUT_SECONDS` (900 s), extended for
+    audio by `AUDIO_TIMEOUT_FACTOR` per second of audio up to
+    `PIPELINE_RUN_TIMEOUT_AUDIO_MAX_SECONDS` (3600 s). At the cap the run is
+    cut, logged CRITICAL with its stage, audited (`pipeline_run_timeout`), and
+    its unemitted panels are settled from cache. A watchdog logs a WARNING
+    when a lock is held past `PIPELINE_LOCK_WARN_SECONDS` (300 s), with the
+    holder and stage.
+  - Every upload-tail step that fails, a cancelled upload or dates/laws run, a
+    strategy step that fails or returns nothing, and a `process_batch` crash
+    now emit the panel's cached (or empty/fallback) state as its terminal
+    emit, exactly once.
+  - An upload to an existing case whose files all fail re-emits the case's
+    panels unchanged. It no longer replaces the Analysis Report with a generic
+    fallback, empties the List of Dates, or schedules a full re-extract. A
+    first build keeps today's fallback behaviour.
+  - Stage timing lines (`stage <name> took Xs`) for the upload pipeline and
+    the objective-change cascade, so a slow step can be told from a hang.
+  - **Socket payload change (wire-visible):** a failed strategy step used to
+    emit `{"featureType": "strategy_objective", "error": "<exception text>"}`
+    with no panel payload. It now emits the cached `strategy_objective`
+    payload (the fallback on a first build) through the normal envelope; the
+    `error` field is gone. Backend owners to confirm nothing reads it. No
+    other shape changes; emits may arrive earlier.
+  - New settings (all in `env.example`): `TEMPLATE_SYNC_TIMEOUT_SECONDS`,
+    `TEMPLATE_SYNC_IN_LOCK_WAIT_SECONDS`, `PIPELINE_RUN_TIMEOUT_SECONDS`,
+    `AUDIO_TIMEOUT_FACTOR`, `PIPELINE_RUN_TIMEOUT_AUDIO_MAX_SECONDS`,
+    `PIPELINE_LOCK_WARN_SECONDS`.
+  - Offline coverage: `tests/offline/verify_stuck_loaders.py`. `make e2e`
+    (AC-113, AC-114) still to be run by a human.
+
+### Added
+
+- **SIM-153: Phase 3 delivery helpers for the agent pipeline (SIM-71 tasks
+  12–14).** Five standard-library scripts in `scripts/delivery/`, the
+  deterministic controls the agent workflows will call: `guard_branch.py`
+  (pushes only to the run's own `feature/SIM-<n>-*` / `fix/SIM-<n>-*`
+  branch, never `development`/`staging`/`main`; detects a spec stage that
+  already ran), `review_labels.py` (forces `needs-human-review` for the
+  sensitive paths), `notify_slack.py` (fixed-format notice to
+  `DELIVERY_CHANNEL_ID`), `jira_ops.py` (fetch a ticket to a data file,
+  transition, `agent-*` labels, fixed-format comments; refuses Done; Blocked
+  sets Flagged plus `agent-blocked`) and `agent_queue.py` (priority-ordered
+  pick of `agent-ready` + `ai-repo` tickets, honouring `AGENTS_ENABLED` and
+  `AGENT_MAX_CONCURRENT`). Comments and notices carry only key, stage,
+  outcome, counts, cost, a reason category and GitHub links, never ticket
+  or Slack text. Tests: `tests/test_delivery_scripts.py`. No socket payload
+  or `app/` change.
+  **Agent workflows (SIM-71 tasks 15-18):** `agent-dispatch.yml` (every 15
+  minutes: starts the implement stage for spec PRs carrying the G2 label,
+  then the spec stage for the next queued tickets, within
+  `AGENT_MAX_CONCURRENT`), `agent-spec.yml` (Claude writes the three specs,
+  a draft PR `<KEY>: specs` labelled `agent-pr`, design left
+  `Status: draft`) and `agent-implement.yml` (`workflow_dispatch` only,
+  started by the dispatcher once a `DESIGN_APPROVERS` login adds the PR
+  label `design-approved` on the current head: `/implement`, `/verify`,
+  `/review`, then the PR is marked ready only with green
+  `make lint`/`make test`, an approving review and every AC passing;
+  `needs-human-review` forced for sensitive paths). Each stage runs in separate jobs, so the agent never
+  shares a runner with `AGENT_PUSH_TOKEN`, Jira or Slack credentials;
+  `scripts/delivery/stage_io.py` re-checks what the agent hands back. All
+  off until `AGENTS_ENABLED=true`; nothing merges. CI-mode prompts in
+  `.github/agent-prompts/`, "In CI" sections in `.claude/commands/`.
+  Static rules: `tests/test_delivery_workflows.py`,
+  `tests/test_delivery_stage_io.py`.
+  **Review and security-audit fixes:** the implement `prepare` job now
+  checks out `development` and reads the pushed commits only as git data;
+  both publish jobs refuse (nothing pushed) an agent change to the pipeline,
+  the gates or any spec (`protected-path`) and run pinned gitleaks over the
+  commits first (new reason category `secret-found`); the G2 gate checks
+  every commit in the push for the agent's identity; `make lint` /
+  `make test` move to a secret-free `gates` job on a fresh runner;
+  harden-runner (`egress-policy: block`) on the agent and gates jobs; Qdrant
+  pinned by digest; only the normalised outcome is uploaded and no test-log
+  text is printed; new `jira_ops.py check-scope` (read-only, before any
+  fetch) and `unblock`; the queue skips keys that already have a ticket
+  branch; `AGENT_MAX_TURNS_IMPLEMENT` (default 120). No socket payload or
+  `app/` change.
+  **Second fix round (G2 is a PR label):** `agent-implement.yml` is no
+  longer `push`-triggered (a push ran the pushed branch's YAML with the
+  secrets); it is `workflow_dispatch` only (inputs `issue`, `pr`, `sha`),
+  runs from `main`, and is started by `agent-dispatch.yml` for spec PRs
+  carrying the label `design-approved` added by a `DESIGN_APPROVERS` login
+  on the current head (new `scripts/delivery/g2_gate.py`: PR, timeline and
+  push-record checks; the design now stays `Status: draft`, and `/implement`
+  in CI reads the verified `g2.json` instead). New PR label
+  `agent-implemented`; new reason categories `g2-refused` and
+  `gates-mismatch`; nothing is pushed on `budget` (AC-39); agent-added
+  `gitleaks:allow` lines are refused (`secret-found`); `CLAUDE.md`,
+  `AGENTS.md`, `.mcp.json`, gitleaks config and the conftest files are
+  protected; harden-runner disables sudo and containers; the agent step
+  scrubs secrets from subprocess environments; the spec stage no longer
+  flags an issue for "already ran" while its agent PR is open. Admin:
+  create the GitHub labels `design-approved` and `agent-implemented`. No
+  socket payload or `app/` change.
+  **Final review and security-audit fixes:** every agent job that reads a
+  secret declares the GitHub Environment `pracsys-agents` (admin, REQUIRED
+  BEFORE THE PILOT: create it with deployment branches `main` only, move
+  the agent secrets into it as separate credentials, delete the repository
+  copies, and give `AGENT_PUSH_TOKEN` to an identity outside
+  `DESIGN_APPROVERS`; `workflow_dispatch` alone does not stop a writer
+  running a modified copy). G2: a push in the same second as the label is
+  stale; a PR that is not the issue's own is refused without a Jira or
+  Slack notice; `git-check` also requires protected paths to match the
+  development tip (new refusal `protected-path-stale`) and protects
+  `conftest.py` at any depth; a `git-check` crash is reported once
+  (`git-check-failed`). The dispatcher survives a failed read for one PR,
+  and an empty `DESIGN_APPROVERS` fails it once with a clear error. Publish
+  judges `budget` before the outcome file and renames the PR to
+  `<KEY>: implementation` only when it pushed; notices say "design approved
+  at <sha7>" (new `--approved-sha` on `notify_slack.py` / `jira_ops.py`).
+  `protect-branch.sh` now parses commands with `shlex`
+  (`.claude/hooks/_git_commit_guard.py`), closing quoted-flag,
+  `-c core.hooksPath`, global-option and `GIT_CONFIG_*` bypasses. New
+  runbook `docs/runbooks/run-the-agent-pipeline.md` (pilot checklist,
+  re-running a blocked run). No socket payload or `app/` change.
+
+- **SIM-152: instant replies in #pracsys-requests.** A small GCP Cloud
+  Function (`relay/slack_events/`) receives Slack events, checks Slack's
+  signature, and starts the "Slack triage" workflow straight away for a
+  person's message or a ✅/❌ reaction in the channel, so replies arrive in
+  about a minute instead of about half an hour. It never logs message text.
+  Deploy with `docs/runbooks/deploy-slack-events-relay.md`; the 5-minute
+  schedule stays as a safety net.
+
+- **SIM-151: daily PracSys worklist in Slack.** At 09:00 IST, Mon–Sat,
+  `.github/workflows/daily-worklist.yml` posts one message to `#pracsys-daily`
+  from Jira SIM: work in progress by person, the next ten To Do tickets by
+  priority, and blocked or overdue tickets, for all components. No AI model;
+  Jira read-only (`scripts/delivery/daily_worklist.py`). Off unless the repo
+  variable `DAILY_ENABLED` is `true`.
+
+- **SIM-133: Slack triage and answers in GitHub Actions.** Every 5 minutes in
+  working hours, `.github/workflows/slack-triage.yml` runs Claude over the
+  triage channel: requests and bugs get a draft SIM ticket in the thread (a
+  Jira issue is created only after the approver's ✅), and questions about the
+  AI service get an answer from this repo's docs and code, with links. Slack
+  and Jira are reached only through `scripts/delivery/slack_io.py` and
+  `jira_triage.py`, which hold the tokens and refuse anything outside a thread
+  of the channel or a Bug/Task in SIM. Off unless the repo variable
+  `TRIAGE_ENABLED` is `true`. No service code or payload change.
+
+### Documentation
+
+- **SIM-113: AI service docs in the layered format (DR-0015).** `docs/features`,
+  `flows`, `architecture`, `contracts`, `runbooks`, `decisions` and `policies`,
+  written from the code, with `docs/README.md` as the index. They are published
+  read-only to PracSys Engineering as "… — AI service" pages;
+  `docs/.publish-map.json` maps each file to its page. No code or payload change.
+
+### Fixed
+
+- **A missing workspace role defaulted to ADJUDICATOR.** The lawyer app makes the
+  role mandatory and pre-selects PETITIONER, but 114 inline fallbacks turned a
+  missing or invalid role into a neutral judge's view. One constant
+  (`app/core/roles.py`, PETITIONER) now backs every fallback, with a warning.
+- **Deleting a case did not stop its running work.** The purge dropped the task
+  registry without cancelling the tasks, so panel generation kept running on an
+  erased case and could still emit. It now raises the stop fence and cancels
+  them first; the fence is no longer swept back to 0.
+- **Two background tasks escaped Stop and the purge**: the transfer re-emit and
+  the reconnect replay. Both are tracked and scoped to their workspace now.
+- **Payload values in logs.** Invalid-payload log lines printed the payload or a
+  pydantic error containing input values, and case-law uploads logged the file
+  name. `validation_fields()` (`app/utils/redact.py`) logs field paths only.
+- **Lost chat replies after a disconnect.** Undelivered replies were held in one
+  slot for the whole service and the re-send was skipped whenever a panel replay
+  was pending. They are now buffered per chat and always re-sent; cached panels
+  are replayed for every case active in the last 30 minutes, not only the last.
+  No socket payload change.
+
+- **Long audio whose speakers collapsed was discarded (hotfix).** When
+  diarization collapsed a recording to one speaker, the whole call became one
+  segment, split into ~134 pieces that all went into one 8000-token
+  transliteration call, which the model could not answer (finish_reason
+  MAX_TOKENS); the failure threw away the finished transcript ("Audio
+  transcription crashed", readability 0%). Now pieces are sent 10 per call,
+  pieces already in Roman script are not re-sent, and a transliteration failure
+  keeps the Devanagari transcript instead of failing the document. On `main` the
+  crash itself was `response.text` raising outside a `try`; here the router
+  already returns an error sentinel for that. No payload change.
+- **Every audio transcription failed with `NameError` (SIM-29 regression).**
+  The model-portability refactor dropped the module-level
+  `_RESOLVED_CREDENTIALS_PATH` / `_CREDENTIALS_RESOLVED` declarations that
+  `_resolve_credentials_path` reads, so its first call raised before any
+  recognition ran. Restored. Offline coverage:
+  `tests/test_audio_transliteration.py`.
+- **Python 3.10: every failed model call crashed its panel.**
+  `reraise_if_cancelled` (`app/llm/errors.py`) called `Task.cancelling()`,
+  which exists only from Python 3.11; the staging VM runs 3.10, so a model
+  error (e.g. gateway unreachable) raised `AttributeError` instead of failing
+  cleanly. It now falls back to the task's pending-cancel flag on 3.10. The
+  full suite passes on 3.10.18 and 3.12. Note: `requirements.lock.txt` needs
+  Python 3.11+ (`bidict==0.24.1`); a 3.10 host can only install `requirements.txt`.
+- **SIM-29: every case-scoped model call through gate0 was rejected (401).**
+  The gate0 adapter sent the workspace id as a `workspace_id` metadata key,
+  which LiteLLM bans (an Anthropic/Bedrock workspace selector), so any call
+  made inside a workspace event failed once gate0 was in use. The key is now
+  `case_id`; the `workspace_id:<id>` tag that reconciliation reads is unchanged.
+- **SIM-29: embedding cost through gate0 is gate0's own figure**, read from
+  `x-litellm-response-cost`, instead of a token estimate × a configured rate.
+  Gateway costs are also no longer rounded per call (a $0.00000975 call was
+  billed as $0.00001). **Value change, not a shape change:** `embedPrice`,
+  `servicePrice` and `price` in every emit's `metadata` move to gate0's figures.
+- **Audio recordings over 20 minutes (hotfix).** Chirp 3 BatchRecognize rejects
+  files longer than 20 minutes, so every long call paid for a doomed upload and
+  then fell back to ~40 s Recognize chunks, whose speaker tags drift across
+  dozens of joins. Recordings longer than `AUDIO_BATCH_WINDOW_SECONDS` (1140 s)
+  are now cut at pauses into overlapping windows straight from the source file,
+  run as parallel BatchRecognize jobs (`AUDIO_BATCH_CONCURRENCY`), and stitched
+  with speakers matched on the shared overlap audio. A window whose job fails
+  falls back to chunked Recognize for that window only; a window that cannot be
+  transcribed fails the transcription explicitly rather than leaving a silent gap.
+- Gemini re-diarization no longer drops every utterance after the 5,000th: long
+  transcripts are assigned in overlapping blocks, reconciled for 1/2 label swaps.
+- STT cost is recorded only for batch jobs that processed the audio; a rejected
+  job was charged at its full duration.
+- A cancelled transcription (Stop, purge, disconnect) now stops its worker thread
+  at the next window/batch instead of running on.
+- `AUDIO_MAX_DURATION_MINUTES` (default 1440, 0 = off) rejects a recording before
+  any paid call with `transcriptStatus: failed`.
+- Logs: the chunked-fallback line states its real reason (it always said "no GCS
+  bucket configured"), and document/audio log lines no longer carry file names,
+  which often contain party names.
 - **Per-case cost was missing background work.** A case's cost total now
   matches gate0/LiteLLM's spend for that workspace. Before, a case showed
   $0.24 while gate0 had charged $0.30: knowledge-graph ingestion and other
@@ -30,6 +363,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the case's unreported spend.
 
 ### Added
+
+- **SIM-29: gate0 as the single model, cost and log layer.**
+  - Every `llm_call` line has `cost=` and `gateway_call_id=` (gate0's call id),
+    and embeddings get their own `llm_call embed` line, so each call matches
+    one gate0 usage record.
+  - Model features through gate0 come from `LLM_MODEL_OPTIONS` (`thinking`,
+    `grounding`, `supports_documents`, `extra_body`, `family`), never from the
+    model name, so any model gate0 serves, open-source ones included, can be
+    configured. Gemini behaviour is unchanged.
+  - Cohere embeddings get the query/document `input_type` through gate0.
+  - Under `GATE0_ENFORCE`, startup reports configured models gate0 does not
+    serve, without blocking.
+  - `GATE0_METER_ENABLED` (off by default) reports OCR, Speech-to-Text, search
+    and unpriced grounding units to gate0's meter with an on-disk outbox.
+    Needs gate0's usage-record endpoint (schema 1.1.0), not yet deployed.
 
 - **The user chooses the model per case** (`aiModel`).
   - **Socket payload change:** a new optional `aiModel` field.

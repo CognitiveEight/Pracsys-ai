@@ -174,6 +174,17 @@ class Settings(BaseSettings):
     # Send Gemini safety_settings BLOCK_NONE for Gemini-backed gate0 models
     # (legal evidence trips the default filters; same policy as direct Gemini).
     gate0_gemini_block_none: bool = True
+    # Gate0 usage meter: report the non-model paid units (Vision OCR pages,
+    # Speech-to-Text seconds, Vertex AI Search queries, Google Search grounding
+    # requests gate0 did not price) to gate0, so gate0 holds the whole bill of
+    # every case. Needs gate0's usage-record endpoint (usage-record schema
+    # 1.1.0); off until that is deployed. Records carry ids and quantities only.
+    gate0_meter_enabled: bool = False
+    gate0_meter_path: str = "/usage-records"  # relative to GATE0_BASE_URL
+    gate0_meter_flush_seconds: float = 10.0
+    # Records gate0 could not take are kept here and re-sent on the next start
+    # (gate0 dedupes by call id). Billing records only — no case content.
+    gate0_meter_outbox_dir: str = "data/gate0_meter_outbox"
     # Embeddings: EMBEDDING_MODEL / EMBEDDING_DIMENSIONS above name the model.
     # gemini | openai | azure_openai | azure_foundry | bedrock | openai_compat:<account>
     embedding_provider: str = "gemini"
@@ -188,6 +199,35 @@ class Settings(BaseSettings):
     # finite. On expiry the call raises asyncio.TimeoutError, which the feature
     # handlers turn into a reported failure instead of a permanent loader.
     gemini_request_timeout_seconds: float = 300.0
+
+    # Stuck-loader bounds (SIM-163 Phase -1). A panel loader clears only when its
+    # panel arrives, so nothing that holds the per-workspace pipeline lock may
+    # wait without bound: while it is held, every later upload, objective change,
+    # reconnect replay and resume for the case queues behind it.
+    # Bound on any request_template_sync wait. An undelivered request returns at
+    # once; a late snapshot still refreshes the Drafting Assistant on arrival.
+    template_sync_timeout_seconds: float = 900.0
+    # How long drafting waits on the template prewarm while holding the pipeline
+    # lock. The prewarm itself keeps waiting (up to the bound above) outside it.
+    template_sync_in_lock_wait_seconds: float = 5.0
+    # Hard cap on one upload pipeline / dates-laws run / objective-change cascade
+    # holding the lock, measured from acquisition. At the cap the run is
+    # cancelled, logged CRITICAL with its stage, and its armed panels settle from
+    # cache.
+    pipeline_run_timeout_seconds: float = 900.0
+    # Seconds of cap added per second of audio in the run's batch, and the upper
+    # bound of that extension (also used when an audio duration is unknown).
+    audio_timeout_factor: float = 1.0
+    pipeline_run_timeout_audio_max_seconds: float = 3600.0
+    # Informational WARNING when a case's pipeline lock has been held this long.
+    pipeline_lock_warn_seconds: float = 300.0
+    # Upload pipeline: generate dates, laws, timeline, parties and case laws
+    # while strategy -> analysis -> drafting run, holding their emits until
+    # those three are sent. false restores the sequential run.
+    pipeline_concurrent_panels: bool = True
+    # List of Dates: per-document temporal calls and per-date dedupe calls
+    # running at once. 1 restores the sequential behaviour.
+    list_of_dates_concurrency: int = 4
 
     # Token pricing overrides (USD per 1,000,000 tokens). When BOTH are set they
     # take precedence over the built-in per-model table in app/ai/pricing.py, so
@@ -300,6 +340,16 @@ class Settings(BaseSettings):
     )
     audio_min_speakers: int = 2
     audio_max_speakers: int = 6
+    # Chirp 3 BatchRecognize rejects files over 20 minutes. Longer recordings
+    # are cut at pauses into windows of at most this many seconds (overlap
+    # included), transcribed in parallel and stitched back together.
+    audio_batch_window_seconds: float = 1140.0
+    # Audio shared by neighbouring windows; used to match speakers across them.
+    audio_window_overlap_seconds: float = 15.0
+    # BatchRecognize jobs in flight at once for one recording.
+    audio_batch_concurrency: int = 4
+    # Recordings longer than this are rejected before any paid call. 0 = no cap.
+    audio_max_duration_minutes: float = 1440.0
     huggingface_token: Optional[str] = None  # Optional, for pyannote fallback
     pyannote_model: str = "pyannote/speaker-diarization-3.1"
 

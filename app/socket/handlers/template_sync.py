@@ -9,11 +9,30 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from app.core.config import settings
+from app.utils.redact import chars, validation_fields
+
 from app.socket.schemas import (
     TemplateSyncPayload,
     TemplateSyncResponsePayload,
 )
 
+
+
+#: The actions TemplateSyncPayload accepts; anything else is logged as its size.
+_KNOWN_ACTIONS = frozenset(
+    {"uploaded", "deleted", "renamed", "preset_created", "formatting_updated"}
+)
+
+
+def _safe_action(value: Any) -> str:
+    """An inbound ``action`` for a log line: the value if known, else its size."""
+    return value if value in _KNOWN_ACTIONS else chars(value)
+
+
+def _safe_count(value: Any) -> Any:
+    """An inbound ``count`` for a log line: an int as-is, anything else its size."""
+    return value if isinstance(value, int) else chars(value)
 
 
 class TemplateSyncMixin:
@@ -45,7 +64,7 @@ class TemplateSyncMixin:
         # so a malformed/unexpected payload is still visible in the logs.
         logger.info(
             "template_sync received: action={} userId={} templates={} keys={}",
-            (payload_in or {}).get("action"),
+            _safe_action((payload_in or {}).get("action")),
             str((payload_in or {}).get("userId") or "")[:12],
             len((payload_in or {}).get("templates") or [])
             if isinstance((payload_in or {}).get("templates"), list)
@@ -57,9 +76,9 @@ class TemplateSyncMixin:
         except Exception as e:
             logger.warning(
                 "template_sync: invalid payload (action={}, keys={}): {}",
-                (payload_in or {}).get("action"),
+                _safe_action((payload_in or {}).get("action")),
                 list((payload_in or {}).keys()),
-                e,
+                validation_fields(e),
             )
             return
 
@@ -303,7 +322,7 @@ class TemplateSyncMixin:
             "template_sync_response received: userId={} requestId={} count={} keys={}",
             str((payload_in or {}).get("userId") or "")[:12],
             (payload_in or {}).get("requestId"),
-            (payload_in or {}).get("count"),
+            _safe_count((payload_in or {}).get("count")),
             list((payload_in or {}).keys()),
         )
         try:
@@ -312,8 +331,18 @@ class TemplateSyncMixin:
             logger.warning(
                 "template_sync_response: invalid payload (keys={}): {}",
                 list((payload_in or {}).keys()),
-                e,
+                validation_fields(e),
             )
+            # Still a reply to our request: release its waiter, which would
+            # otherwise sit out the whole bound (it used to wait forever).
+            raw_request_id = (payload_in or {}).get("requestId")
+            fut = (
+                self._pending_template_sync.get(raw_request_id)
+                if isinstance(raw_request_id, str) and raw_request_id
+                else None
+            )
+            if fut is not None and not fut.done():
+                fut.set_result(False)
             return
 
         user_id = (payload.userId or "").strip()
@@ -375,8 +404,8 @@ class TemplateSyncMixin:
                         )
         finally:
             # Always resolve the awaiting future — even if ingestion raised — so
-            # ensure_templates_synced (which now waits with no hard time cap)
-            # can never hang indefinitely on a failed ingest.
+            # ensure_templates_synced does not sit out its whole bound on a
+            # failed ingest.
             fut = (
                 self._pending_template_sync.get(request_id) if request_id else None
             )
@@ -528,12 +557,14 @@ class TemplateSyncMixin:
         snapshot reply also reconciles deletions, so a forced sync makes the
         store authoritative, not just a superset.
 
-        ``timeout`` is ``None`` by default: there is NO hard time cap, because a
-        template PDF can take longer than any fixed limit to OCR/ingest, and
-        cutting off early made matching run against an empty library. The future
-        is always resolved by ``on_template_sync_response`` (even if ingestion
-        fails), so this await cannot hang indefinitely. Pass an explicit
-        ``timeout`` only if a caller deliberately wants to bound the wait.
+        The wait is always bounded: ``timeout=None`` means
+        ``settings.template_sync_timeout_seconds``. It used to be unbounded on
+        the belief that the reply always comes; a dropped emit or a backend that
+        never answers then held the workspace pipeline lock forever and every
+        later panel of the case span. An undelivered request returns at once.
+        On expiry the caller proceeds with the current store, and a snapshot
+        that arrives later still refreshes the Drafting Assistant
+        (``_maybe_reemit_drafting_on_templates``).
         """
         if not user_id or not self._socket_client:
             return
@@ -546,35 +577,49 @@ class TemplateSyncMixin:
             except Exception:
                 pass
 
+        bound = (
+            float(timeout)
+            if timeout is not None
+            else float(settings.template_sync_timeout_seconds)
+        )
         request_id = f"tmpl-{(user_id or '')[:8]}-{uuid.uuid4().hex[:12]}"
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         fut: "asyncio.Future" = loop.create_future()
         self._pending_template_sync[request_id] = fut
         try:
-            await self._socket_client.emit(
+            delivered = await self._socket_client.emit(
                 "request_template_sync",
                 {"userId": user_id, "requestId": request_id},
             )
+            if not delivered:
+                # SocketClient.emit returns False for a dropped emit: no reply
+                # can come, so waiting would only hold the caller up.
+                logger.warning(
+                    "request_template_sync not delivered (user={}, requestId={}) — "
+                    "proceeding with current store",
+                    user_id[:12],
+                    request_id,
+                )
+                return
             logger.info(
-                "request_template_sync emitted (user={}, requestId={})",
+                "request_template_sync emitted (user={}, requestId={}, bound={}s)",
                 user_id[:12],
                 request_id,
+                round(bound),
             )
-            if timeout is None:
-                # No hard time cap — wait until templates are fully ingested.
-                await fut
-            else:
-                await asyncio.wait_for(fut, timeout=timeout)
+            await asyncio.wait_for(fut, timeout=bound)
             logger.info(
                 "template snapshot received for user={} (requestId={})",
                 user_id[:12],
                 request_id,
             )
+        except asyncio.CancelledError:
+            raise
         except asyncio.TimeoutError:
             logger.warning(
                 "request_template_sync timed out after {}s (user={}) — "
                 "proceeding with current store",
-                timeout,
+                round(bound),
                 user_id[:12],
             )
         except Exception as e:
@@ -583,3 +628,27 @@ class TemplateSyncMixin:
             )
         finally:
             self._pending_template_sync.pop(request_id, None)
+
+    def _prewarm_templates(
+        self, user_id: str, *, timeout: Optional[float] = None
+    ) -> Optional["asyncio.Task"]:
+        """Start the bounded template sync as a tracked task.
+
+        Pipeline runners call this BEFORE taking the workspace pipeline lock, so
+        the backend round trip never runs while the lock is held; drafting then
+        waits on the task only briefly (``templates_ready``). ``timeout`` is the
+        run's audio-extended cap, when it has one. Returns ``None`` when there
+        is nothing to warm.
+        """
+        if not user_id or not self._socket_client:
+            return None
+        try:
+            return self._track_background_task(
+                asyncio.create_task(
+                    self.ensure_templates_synced(user_id, timeout=timeout)
+                ),
+                label="template prewarm",
+            )
+        except RuntimeError as rt_err:
+            logger.warning("Could not start template prewarm: {}", rt_err)
+            return None

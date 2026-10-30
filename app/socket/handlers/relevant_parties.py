@@ -24,6 +24,7 @@ from app.socket.event_utils import (
 from app.prompts.relevant_parties_prompts import (
     classify_relevant_parties_prompt,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 class RelevantPartiesMixin:
@@ -406,7 +407,7 @@ class RelevantPartiesMixin:
         So deleting a document removes exactly that document's parties, and
         uploading one adds only the new document's parties.
         """
-        role = (workspace_role or "ADJUDICATOR").strip().upper()
+        role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
         logger.info(
             "Relevant parties: generation started for workspace {}",
             workspace_id[:12] if workspace_id else "",

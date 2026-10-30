@@ -2,6 +2,7 @@
 Application lifecycle management.
 """
 
+import asyncio
 from typing import Optional
 
 from loguru import logger
@@ -50,6 +51,13 @@ class ApplicationLifecycle:
             # explicitly configured profile that cannot be served stops startup)
             logger.info("Initializing model client...")
             gemini_client.initialize()
+            await self._check_gate0_models()
+
+            # Report non-model paid units (OCR, STT, search) to gate0's meter
+            # when GATE0_METER_ENABLED; a no-op otherwise.
+            from app.ai import gate0_meter
+
+            await gate0_meter.start()
 
             # Legal knowledge graph. Non-strict: an unreachable graph is
             # logged and the service keeps serving on hybrid search alone.
@@ -71,6 +79,10 @@ class ApplicationLifecycle:
             logger.info("Registering socket client with event handler...")
             event_handler.set_socket_client(self.socket_client)
 
+            # Reports any case whose pipeline lock is held past
+            # PIPELINE_LOCK_WARN_SECONDS, with the holder and its stage.
+            event_handler.start_pipeline_lock_watchdog()
+
             # Connect to socket server
             logger.info("Connecting to socket server: {}", safe_url(settings.socket_url))
             await self.socket_client.connect()
@@ -88,6 +100,11 @@ class ApplicationLifecycle:
         logger.info("Shutting down application...")
         self._running = False
 
+        try:
+            await event_handler.stop_pipeline_lock_watchdog()
+        except Exception as e:
+            logger.error("Error stopping the pipeline lock watchdog: {}", e)
+
         # Disconnect socket client
         if self.socket_client:
             try:
@@ -95,6 +112,13 @@ class ApplicationLifecycle:
                 logger.info("Socket client disconnected")
             except Exception as e:
                 logger.error("Error disconnecting socket client: {}", str(e))
+
+        try:
+            from app.ai import gate0_meter
+
+            await gate0_meter.stop()
+        except Exception as e:
+            logger.error("Error stopping the gate0 usage meter: {}", e)
 
         if self.graph_store is not None:
             try:
@@ -119,6 +143,37 @@ class ApplicationLifecycle:
                 logger.error("Error closing vector store: {}", str(e))
 
         logger.success("Application shutdown complete")
+
+    @staticmethod
+    async def _check_gate0_models() -> None:
+        """Under GATE0_ENFORCE, report configured models gate0 does not serve.
+
+        Never blocks startup: a gateway that is down at boot is logged, and
+        each failing call already surfaces on its own."""
+        if not getattr(settings, "gate0_enforce", False):
+            return
+        from app.llm.config import model_family, model_options, selectable_models
+
+        try:
+            missing = await gemini_client.router.gate0_unserved_models()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Could not list gate0 models at startup: {}", e)
+            return
+        for model in missing:
+            logger.error("gate0 does not serve configured model {}", model)
+        for model, profile in selectable_models().items():
+            if profile.provider == "gate0" and model_family(profile.model) != "gemini" and not (
+                model_options(profile.model).get("max_output_tokens")
+            ):
+                logger.warning(
+                    "Selectable model {} has no max_output_tokens in LLM_MODEL_OPTIONS; "
+                    "long outputs may be rejected by its backend",
+                    model,
+                )
+        if not missing:
+            logger.info("gate0 serves every configured model")
 
     def _validate_config(self) -> None:
         """Validate required configuration."""

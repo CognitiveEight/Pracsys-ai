@@ -33,6 +33,8 @@ from typing import Any, Awaitable, Callable, Iterator, Optional
 
 from loguru import logger
 
+from app.ai import gate0_meter
+
 
 @dataclass
 class UsageAccumulator:
@@ -68,6 +70,10 @@ class UsageAccumulator:
     grounding_requests: int = 0
     # Embedding input tokens (ESTIMATED — see record_embed_tokens).
     embed_tokens: int = 0
+    # The part of embed_tokens a gateway (gate0) priced itself, and that price.
+    # Those tokens are billed at the gateway's figure, not the local rate.
+    embed_gateway_tokens: int = 0
+    embed_gateway_cost: float = 0.0
 
     # OCR and STT report from asyncio.to_thread workers, and process_batch may
     # process several documents concurrently against one accumulator, so every
@@ -98,9 +104,11 @@ class UsageAccumulator:
         if cost is not None and cost >= 0:
             table_total = price["inputPrice"] + price["outputPrice"]
             in_share = price["inputPrice"] / table_total if table_total else 0.0
+            # Unrounded: per-call rounding to 6 dp drifted from gate0's figure
+            # (e.g. $0.00000975 billed as $0.00001); emits round the totals.
             price = {
-                "inputPrice": round(cost * in_share, 6),
-                "outputPrice": round(cost * (1 - in_share), 6),
+                "inputPrice": cost * in_share,
+                "outputPrice": cost * (1 - in_share),
             }
         with self._lock:
             self.input_tokens += in_tok
@@ -129,10 +137,16 @@ class UsageAccumulator:
         with self._lock:
             self.grounding_requests += max(int(requests or 0), 0)
 
-    def add_embed_tokens(self, tokens: int) -> None:
-        """Add embedding input tokens. Negative/None values are treated as 0."""
+    def add_embed_tokens(self, tokens: int, cost: Optional[float] = None) -> None:
+        """Add embedding input tokens. ``cost`` — a gateway's USD figure for
+        these tokens — bills them at that price instead of the local rate.
+        Negative/None values are treated as 0."""
+        tok = max(int(tokens or 0), 0)
         with self._lock:
-            self.embed_tokens += max(int(tokens or 0), 0)
+            self.embed_tokens += tok
+            if cost is not None and cost >= 0:
+                self.embed_gateway_tokens += tok
+                self.embed_gateway_cost += float(cost)
 
 
 # The active accumulator for the current async task, or None when no scope is
@@ -355,6 +369,10 @@ def current_workspace_id() -> Optional[str]:
 
 def _record(kind: str, quantity: float, apply: Callable[[UsageAccumulator], None]) -> None:
     """Apply one paid quantity to the active scope and to the workspace ledger."""
+    if gate0_meter.metered_kind(kind):
+        # Units that never pass through gate0 (OCR, STT, search) are reported
+        # to its meter here, the one point every recorder passes through.
+        gate0_meter.report(kind, quantity)
     accumulator = _current_usage.get()
     workspace_id = current_workspace_id()
     if accumulator is None and workspace_id is None:
@@ -392,6 +410,8 @@ def merge_usage(*parts: Optional[UsageAccumulator]) -> UsageAccumulator:
         out.search_queries += part.search_queries
         out.grounding_requests += part.grounding_requests
         out.embed_tokens += part.embed_tokens
+        out.embed_gateway_tokens += part.embed_gateway_tokens
+        out.embed_gateway_cost += part.embed_gateway_cost
     return out
 
 
@@ -474,6 +494,8 @@ def log_unbilled_usage(label: str, usage: Optional[UsageAccumulator]) -> None:
             search_queries=int(getattr(usage, "search_queries", 0) or 0),
             grounding_requests=int(getattr(usage, "grounding_requests", 0) or 0),
             embed_tokens=int(getattr(usage, "embed_tokens", 0) or 0),
+            embed_gateway_tokens=int(getattr(usage, "embed_gateway_tokens", 0) or 0),
+            embed_gateway_cost=float(getattr(usage, "embed_gateway_cost", 0.0) or 0.0),
         )
         llm = llm_price(usage)
         total = round(llm["price"] + service["servicePrice"], 6)
@@ -494,13 +516,15 @@ def log_unbilled_usage(label: str, usage: Optional[UsageAccumulator]) -> None:
         logger.debug("log_unbilled_usage failed ({}): {}", label, exc)
 
 
-def record_embed_tokens(tokens: int) -> None:
+def record_embed_tokens(tokens: int, cost: Optional[float] = None) -> None:
     """Report embedding input tokens.
 
-    The legacy ``genai.embed_content`` response carries no ``usage_metadata``, so
-    callers pass an ESTIMATE (~4 chars/token). ``embedPrice`` is therefore
-    approximate; at $0.15/1M tokens the error is negligible next to OCR/STT.
+    Through gate0, ``cost`` is the gateway's own figure for the call
+    (``x-litellm-response-cost``) and is billed as-is, so the case's
+    ``embedPrice`` matches gate0's spend. Without it (direct Gemini, whose
+    response carries no usage) callers pass an ESTIMATE (~4 chars/token)
+    priced at ``EMBED_PRICE_PER_MILLION_TOKENS``.
     """
     _record_service_unit(
-        "embedding", tokens, lambda acc: acc.add_embed_tokens(tokens)
+        "embedding", tokens, lambda acc: acc.add_embed_tokens(tokens, cost)
     )

@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
+from app.core.config import settings
 from app.llm.errors import is_generation_error
 
 from app.utils.document_dates import date_from_document_name
@@ -29,6 +30,7 @@ from app.workspace.custom_instructions import (build_custom_instruction_suffix)
 
 from app.rag.packing import fit_to_budget, panel_context_budget
 from app.socket.event_utils import (
+    gather_bounded,
     scrub_app_brand,
     _mint_item_id,
 )
@@ -39,6 +41,7 @@ from app.prompts.list_of_dates_prompts import (
     reeval_list_of_dates_relevance_prompt,
     generate_list_of_dates_from_documents_prompt,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 class ListOfDatesMixin:
@@ -77,9 +80,9 @@ class ListOfDatesMixin:
             if not instruction:
                 return False
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             current_json = json.dumps(current, ensure_ascii=True)
             prompt = regenerate_list_of_dates_with_feedback_prompt(current_json=current_json, instruction=instruction)
@@ -178,9 +181,9 @@ class ListOfDatesMixin:
             if not obj:
                 return False
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             current_json = json.dumps(current, ensure_ascii=True)
             prompt = reeval_list_of_dates_relevance_prompt(current_json=current_json, obj=obj)
@@ -1078,28 +1081,37 @@ class ListOfDatesMixin:
                 )
                 for e in result
             }
-            for idx, source_content in doc_content_by_index.items():
+            # One agent run per document, LIST_OF_DATES_CONCURRENCY at a time;
+            # merged below in document order, so the result is the same as a
+            # one-at-a-time run.
+            async def _temporal_events(item: Tuple[int, str]) -> List[Dict[str, Any]]:
+                idx, source_content = item
                 source_doc_id = doc_id_by_index.get(idx, "")
-                source_doc_name = doc_name_by_index.get(idx, "")
-                anchor_year = doc_anchor_year_by_index.get(idx)
-                rel_events: List[Dict[str, Any]] = []
                 try:
-                    rel_events = await list_of_dates_temporal_agent.infer_temporal_events(
+                    return await list_of_dates_temporal_agent.infer_temporal_events(
                         document_text=source_content,
                         source_doc_id=source_doc_id,
-                        source_doc_name=source_doc_name,
-                        anchor_year=anchor_year,
+                        source_doc_name=doc_name_by_index.get(idx, ""),
+                        anchor_year=doc_anchor_year_by_index.get(idx),
                         today_str=today_str,
                         document_date=doc_name_date_by_index.get(idx),
                     )
+                except asyncio.CancelledError:
+                    raise
                 except Exception as temporal_err:
                     logger.debug(
                         "List of dates temporal agent failed for doc {}: {}",
                         source_doc_id or idx,
                         temporal_err,
                     )
-                    rel_events = []
-                for e in rel_events:
+                    return []
+
+            doc_items = list(doc_content_by_index.items())
+            events_by_doc = await gather_bounded(
+                settings.list_of_dates_concurrency, doc_items, _temporal_events
+            )
+            for (idx, source_content), rel_events in zip(doc_items, events_by_doc):
+                for e in rel_events or []:
                     # Resolve best-effort page for inferred temporal events too.
                     e["pageNumber"] = _resolve_page_number(e, source_content)
                     key = (

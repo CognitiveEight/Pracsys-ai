@@ -279,6 +279,24 @@ class Settings(BaseSettings):
     # Spreadsheet calculations in chat (app/rag/table_query.py). Off → no
     # [T#] results; the prompt then forbids totals over partial rows.
     table_query_enabled: bool = True
+    # Shared knowledge base (kb_* events, app/rag/knowledge_base.py). Off → the
+    # shelf is still kept in step with the backend, but chat never reads it.
+    knowledge_base_chat_enabled: bool = True
+    # Shelf passages one chat turn may carry, and the rerank score (0-10) a
+    # passage needs: the shelf is supplementary, so a weak match stays out.
+    knowledge_base_chat_passages: int = 4
+    knowledge_base_min_relevance: float = 6.0
+    # Shelf documents fetched and indexed at once (a kb_sync can list many).
+    knowledge_base_ingest_concurrency: int = 2
+    # Panels that read the shelf alongside the case's documents, for every
+    # case. Fact panels (dates, timeline, parties) are deliberately absent: a
+    # judgment's facts must never become this case's facts. "" turns it off.
+    knowledge_base_panels: str = "strategy_objective,analysis_report,applicable_laws"
+    # Shelf passages and characters one panel prompt may carry, and the rerank
+    # score they need against the case's own description.
+    knowledge_base_panel_passages: int = 6
+    knowledge_base_panel_chars: int = 12_000
+    knowledge_base_panel_min_relevance: float = 5.0
     # Characters of document text one panel prompt may carry (~4 chars/token).
     # Documents over their share are excerpted by relevance, not cut from the
     # front (app/rag/packing.py). Raising it improves recall at token cost.

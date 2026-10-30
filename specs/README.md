@@ -10,8 +10,8 @@ specs/technical-design/SIM-123-short-name.md    how (files, payloads, risks)
 specs/acceptance-criteria/SIM-123-short-name.md how we prove it works
 ```
 
-The Jira project key is `SIM`. Start each file from the
-`_TEMPLATE.md` in its directory.
+The Jira project key is `SIM`. Start each file from the `_TEMPLATE.md` in
+its directory.
 
 ## Who writes what
 

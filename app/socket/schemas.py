@@ -885,6 +885,64 @@ class GlobalTemplateSyncResponsePayload(BaseModel):
 
 
 # ============================================================================
+# Knowledge base — the shared reference shelf (Server → AI)
+# ============================================================================
+
+
+class KnowledgeBaseDocument(BaseModel):
+    """
+    One knowledge-base document, as carried by ``kb_document_added`` and in
+    ``kb_sync.documents``. Platform-wide: no ``userId`` or ``workspaceId``.
+
+    ``fileUrl`` is a signed link valid for about 15 minutes; it is fetched once
+    and never stored. ``title`` is admin-written and is what a citation shows.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    documentId: str = Field(min_length=1)
+    title: str = ""
+    category: str = "other"  # judgment | statute | court_format | precedent | other
+    description: Optional[str] = None  # absent when the admin wrote none
+    fileUrl: str = Field(min_length=1)
+    mimeType: Optional[str] = None
+    sizeBytes: Optional[int] = None
+    uploadedAt: Optional[str] = None
+
+
+class KnowledgeBaseDocumentAddedPayload(KnowledgeBaseDocument):
+    """``kb_document_added``: index this document; the same id replaces it."""
+
+    requestId: Optional[str] = None  # kba_<id8>_<epochMs>, stable for de-duplication
+
+
+class KnowledgeBaseDocumentDeletedPayload(BaseModel):
+    """``kb_document_deleted``: erase everything held for ``documentId`` now."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    documentId: str = Field(min_length=1)
+    deletedAt: Optional[str] = None
+    requestId: Optional[str] = None
+
+
+class KnowledgeBaseSyncPayload(BaseModel):
+    """
+    ``kb_sync``: the complete current shelf, sent on every connect. A full
+    replace, never a delta — ``documents: []`` means the shelf is empty.
+
+    Items stay raw dicts here and are validated one by one, so a single bad
+    item is skipped (and kept, if held) instead of rejecting the whole shelf.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    documents: List[Dict[str, Any]]
+    syncedAt: Optional[str] = None
+    requestId: Optional[str] = None
+
+
+# ============================================================================
 # AI Response Schemas (AI → Server)
 # ============================================================================
 
@@ -1004,10 +1062,17 @@ class Citation(BaseModel):
     row of the quote). ``computed: true`` marks a figure the system calculated
     over every row of that sheet (app/rag/table_query.py); its ``quote`` states
     the calculation. All four are optional and additive.
+
+    ``knowledge_base`` is a passage of the shared reference shelf (the
+    ``kb_*`` events): ``documentId`` is the knowledge-base id, ``title`` the
+    admin-written name to show, ``category`` the shelf category, plus
+    ``page``/``pageEnd`` and a verbatim ``quote``. It is never one of the
+    case's documents, so it has no ``annexure`` or ``fileName``.
     """
 
     index: int
-    type: Literal["document", "case_law", "statute", "web"]
+    type: Literal["document", "case_law", "statute", "web", "knowledge_base"]
+    category: Optional[str] = None
     documentId: Optional[str] = None
     annexure: Optional[int] = None
     fileName: Optional[str] = None

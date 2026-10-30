@@ -208,6 +208,7 @@ python -m app.main
 ## Contributing and support
 
 - **Architecture and event flow:** [`docs/SYSTEM_ARCHITECTURE.md`](docs/SYSTEM_ARCHITECTURE.md)
+- **Testing:** [`docs/testing.md`](docs/testing.md)
 - **Additional docs:** see `docs/` and topic‑specific `*.md` files at the repo root where maintained.
 
 ---

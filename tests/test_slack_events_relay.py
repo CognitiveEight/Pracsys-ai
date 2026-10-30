@@ -145,3 +145,17 @@ def test_missing_configuration_fails_closed(monkeypatch):
     monkeypatch.delenv("SLACK_SIGNING_SECRET", raising=False)
     headers, body = _signed(_message())
     assert mod.process(headers, body, now=NOW)[0] == 401
+
+
+def test_dispatch_failure_logs_github_status(relay, monkeypatch, caplog):
+    import urllib.error
+
+    mod, _ = relay
+
+    def forbidden():
+        raise urllib.error.HTTPError("https://api.github.test", 403, "Forbidden", {}, None)
+
+    monkeypatch.setattr(mod, "_dispatch", forbidden)
+    with caplog.at_level(logging.INFO):
+        assert _run(mod, _message())[0] == 200
+    assert "workflow dispatch failed (HTTP 403)" in caplog.text

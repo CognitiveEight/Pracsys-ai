@@ -9,7 +9,7 @@ is not dropped during init/timeouts.
 import asyncio
 from datetime import datetime
 import bisect
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 from uuid import NAMESPACE_DNS, uuid5
 
 from loguru import logger
@@ -707,6 +707,34 @@ class QdrantStore:
             )
         out.sort(key=lambda x: (x["uploaded_at"] or "", x["document_id"]))
         return out
+
+    async def list_document_ids(self, workspace_id: str) -> Set[str]:
+        """Ids of every document with chunks in the evidence collection for
+        ``workspace_id`` (payload ids only, no text or vectors)."""
+        if self.client is None:
+            await self.initialize()
+
+        def _ids() -> Set[str]:
+            out: Set[str] = set()
+            offset = None
+            while True:
+                batch, offset = self.client.scroll(
+                    collection_name=self.chunks_collection,
+                    scroll_filter=self._chunk_filter(workspace_id),
+                    limit=256,
+                    offset=offset,
+                    with_payload=["original_document_id"],
+                    with_vectors=False,
+                )
+                out.update(
+                    str((p.payload or {}).get("original_document_id") or "")
+                    for p in batch
+                )
+                if offset is None:
+                    out.discard("")
+                    return out
+
+        return await asyncio.to_thread(_ids)
 
     def evidence_version(self, workspace_id: str) -> int:
         return self._evidence_versions.get(workspace_id, 0)

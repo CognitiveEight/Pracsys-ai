@@ -19,6 +19,7 @@ from app.socket.handlers.panel_edits import PanelEditsMixin
 from app.socket.handlers.user_facts import UserFactsMixin
 from app.socket.handlers.docx_export import DocxExportMixin
 from app.socket.handlers.template_sync import TemplateSyncMixin
+from app.socket.handlers.knowledge_base import KnowledgeBaseMixin
 from app.socket.handlers.workspace_metadata import WorkspaceMetadataMixin
 from app.socket.handlers.workspace_events import WorkspaceEventsMixin
 from app.socket.handlers.workspace_purge import WorkspacePurgeMixin
@@ -46,6 +47,7 @@ __all__ = [
     "UserFactsMixin",
     "DocxExportMixin",
     "TemplateSyncMixin",
+    "KnowledgeBaseMixin",
     "WorkspaceMetadataMixin",
     "WorkspaceEventsMixin",
     "WorkspacePurgeMixin",

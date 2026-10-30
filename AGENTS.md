@@ -1,36 +1,66 @@
-# Repository Guidelines
+# AGENTS.md
 
-## Project Structure & Module Organization
-Core application code lives in `app/`. Use `app/socket/` for Socket.IO integration, `app/langgraph/` for chat and strategy workflows, `app/processing/` for document ingestion, `app/vectorstore/` for Qdrant access, and `app/core/` for configuration and lifecycle setup. Shared prompts are in `app/prompts/`, observability helpers in `app/observability/`, and workspace state in `app/workspace/`.
+A short pointer for coding agents other than Claude Code (Codex and others).
+**`CLAUDE.md` is authoritative.** Read it before changing anything; if this
+file and `CLAUDE.md` disagree, `CLAUDE.md` wins.
 
-Operational files sit at the repo root: `requirements.txt`, `env.example`, `docker-compose.yml`, `run.sh`, and `Makefile`. Generated runtime data belongs under `logs/` and `data/workspaces/`; treat both as local artifacts, not source.
+## What the service is
 
-## Build, Test, and Development Commands
-Use the `Makefile` first:
+SimplerToday AI is a Python 3.11 asyncio **Socket.IO client**, not a server.
+It connects out to the application backend, receives workspace and chat
+events, and emits AI results back. There is no HTTP API. `python -m app.main`
+is the only entry point. Start with `docs/architecture.md`.
 
-- `make setup` creates `venv/`, installs dependencies, copies `.env`, and prepares local folders.
-- `make run` starts the service with `python -m app.main`.
-- `make docker-up` starts local services such as Qdrant and Redis.
-- `make docker-down` stops those containers.
-- `make lint` runs `ruff check .` (rules in `pyproject.toml`); `pre-commit install` adds the commit gates.
-- `make format` runs `black app/` when installed.
+## Commands
 
-For manual setup, use `python3 -m venv venv`, `source venv/bin/activate`, and `pip install -r requirements.txt`.
+| Command | What it does |
+|---|---|
+| `make setup` | Creates `venv/`, installs `requirements.txt`, copies `env.example` to `.env`, makes `logs/` and `data/` |
+| `pip install -r requirements-dev.txt` | pytest, ruff and pre-commit (not installed by `make setup`) |
+| `pre-commit install` | Commit gates: gitleaks, private-key and large-file checks, ruff |
+| `make run` | `python -m app.main` |
+| `make lint` | `ruff check .` (rules in `pyproject.toml`) |
+| `make test` | `pytest tests`, then every `tests/offline/verify_*.py`; any failure fails the run |
+| `make e2e` | `scripts/e2e_local_backend.py` against a local stand-in backend |
+| `make docker-up` / `make docker-down` | Local Qdrant and Redis |
 
-## Coding Style & Naming Conventions
-Follow existing Python style: 4-space indentation, type hints on public functions, short module docstrings, and `snake_case` for functions, variables, and modules. Use `PascalCase` for classes and keep configuration in `app/core/config.py`. Prefer small focused modules over large utility files.
+`make e2e` makes **real, billed model calls**. A human runs it, before a
+deploy, when a change touches socket handlers, panel agents or document
+processing. Agents do not run it. Nothing in `make test` may call a real
+model, Qdrant collection, GCS bucket, Neo4j or the backend.
 
-Format with Black and lint with Pylint when available. Keep environment-specific values in `.env`; never hardcode secrets or service credentials.
+## Rules (summary)
 
-## Testing Guidelines
-There is no dedicated `tests/` package yet. Add new tests under `tests/` using `test_*.py` names so the suite can grow cleanly. Before opening a PR, run the relevant workflow manually with `make run` and validate socket, Qdrant, and document-processing paths you touched.
+The full rules, and why, are in `CLAUDE.md`. The short version:
 
-Note: `make test` currently references `test_setup.py`, which is not present. If you add automated tests, update that target as part of the same change.
+- **Data:** never read, print, log or commit `.env` or credential files
+  (`bns-ai-*.json`, `gcp-*.json` and similar). No case text, names, phone
+  numbers or objective text in code, tests, specs, commits or logs. Tests use
+  fictional data.
+- **Logging:** Loguru with `{}` placeholders. Log ids and counts, never
+  payloads, prompts, model output, document text or URLs.
+- **Role gate:** nothing downstream runs without a validated role.
+- **Socket handlers:** long work through `_track_background_task`; emits
+  through `self._socket_client` / `_emit_document_feature` (the stop fence);
+  every armed `workspace:refresh` loader gets a terminal emit; catch
+  `asyncio.CancelledError` before `except Exception` and re-raise it.
+- **Model calls:** only through `gemini_client` (the provider-neutral router).
+  No provider SDK import outside `app/llm/providers/`. Check
+  `is_generation_error()` on every result. Meter paid calls once, at the
+  lowest call site.
+- **Storage:** write chunks with `add_document_chunks`; delete only through
+  `delete_documents` / `delete_workspace`. Any new per-workspace state must be
+  reached by the workspace purge, which is a compliance erasure.
+- **Shared workspaces:** chat paths that change workspace state are gated on
+  `mutations_allowed`.
+- **Indian law:** no IPC rows in `applicable_laws`.
 
-## Commit & Pull Request Guidelines
-Recent history uses concise Conventional Commit prefixes such as `feat:` and `fix:`. Keep that pattern, for example `fix: handle socket reconnect backoff`.
+## How work is done
 
-PRs should describe the user-visible behavior change, list config or schema impacts, and link the relevant issue or task. Include screenshots or payload examples for chat, reports, or socket contract changes.
-
-## Security & Configuration Tips
-Use `env.example` as the template for local configuration. Do not commit `.env`, API keys, or credential JSON files. When changing event payloads or auth behavior, update the matching docs under the repo root or `docs/` in the same PR.
+Jira project `SIM`. Every non-trivial change has spec files
+`specs/{requirements,technical-design,acceptance-criteria}/SIM-<n>-short-name.md`
+and a branch `feature/SIM-<n>-short-name` (or
+`fix/…`) off `development`. Commits: `feat(SIM-<n>): …`, `fix(SIM-<n>): …`,
+`docs(SIM-<n>): …`. Never commit on `development`, `staging` or `main`; never
+push, merge or use `--no-verify`. See `docs/development-workflow.md` and
+`specs/README.md`.

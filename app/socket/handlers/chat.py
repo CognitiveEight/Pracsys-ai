@@ -3,6 +3,7 @@
 Feature mixin extracted from events.py — methods moved verbatim.
 """
 
+import asyncio
 import re
 import uuid
 from datetime import datetime
@@ -1257,6 +1258,23 @@ class ChatMixin:
                 logger.warning(
                     "Could not load documents for chat context: {}", str(doc_err)
                 )
+
+            # Shared knowledge base (kb_* events): legal reference passages for
+            # this question, shown apart from the case's own documents and cited
+            # by title. It only ever adds to the answer, so it never blocks it.
+            if settings.knowledge_base_chat_enabled:
+                try:
+                    from app.rag.knowledge_base import knowledge_base
+
+                    kb_passages = await knowledge_base.passages_for_chat(
+                        payload.content or ""
+                    )
+                    if kb_passages:
+                        workspace_state["knowledge_base_passages"] = kb_passages
+                except asyncio.CancelledError:
+                    raise
+                except Exception as kb_err:
+                    logger.warning("Knowledge base skipped for this turn: {}", kb_err)
 
             # If user attached a document to this message, download and extract text; cache by chat_id so follow-ups see it
             attachment = getattr(payload, "attachment", None)

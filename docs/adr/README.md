@@ -36,7 +36,7 @@ A bug fix or a change that follows an existing rule does not need one.
 4. Never rewrite an accepted ADR's decision. To change it, write a new ADR
    and set the old one's status to `Superseded by NNNN`.
 5. Add a row to the index above in the same PR.
-6. Link the ADR from the spec's technical design (`specs/SIM-<n>-…/`) when a
+6. Link the ADR from the spec's technical design (`specs/technical-design/SIM-<n>-….md`) when a
    ticket makes or depends on the decision.
 
 ADRs 0001-0004 were written after the fact, from decisions already made and

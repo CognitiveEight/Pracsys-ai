@@ -57,8 +57,9 @@ The full rules, and why, are in `CLAUDE.md`. The short version:
 
 ## How work is done
 
-Jira project `SIM`. Every non-trivial change has a spec folder
-`specs/SIM-<n>-short-name/` and a branch `feature/SIM-<n>-short-name` (or
+Jira project `SIM`. Every non-trivial change has spec files
+`specs/{requirements,technical-design,acceptance-criteria}/SIM-<n>-short-name.md`
+and a branch `feature/SIM-<n>-short-name` (or
 `fix/…`) off `development`. Commits: `feat(SIM-<n>): …`, `fix(SIM-<n>): …`,
 `docs(SIM-<n>): …`. Never commit on `development`, `staging` or `main`; never
 push, merge or use `--no-verify`. See `docs/development-workflow.md` and

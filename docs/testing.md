@@ -142,10 +142,15 @@ or document processing, because those have no full automated coverage.
 - **Fictional data only:** no real names, case text, phone numbers or ids.
 - A test must fail without the change it covers. Never weaken or delete an
   existing check to make a run pass.
-- In a spec, each check is a row in `test-cases.md` (see `specs/README.md`).
+- In a spec, each check maps to an acceptance criterion in
+  `specs/acceptance-criteria/SIM-<n>-….md` (see `specs/README.md`).
 
 ## CI
 
-CI is not set up yet. SIM-23 adds GitHub Actions running `make lint` and
-`make test` on every PR. Until then, run both locally before handing a branch
-over; `docs/development-workflow.md` lists the gates.
+`.github/workflows/ci.yml` (SIM-23) runs three required checks on every PR
+into `development`, `staging` and `main`: `lint` (`make lint`), `test`
+(`make test`, with a real Qdrant service so the store checks run instead of
+skipping) and `secrets-scan` (gitleaks over the PR's commits). It is offline
+and free: no secrets, no model calls, and never `make e2e`. Run `make lint`
+and `make test` locally before handing a branch over;
+`docs/development-workflow.md` lists the gates.

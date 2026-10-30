@@ -127,7 +127,9 @@ def process(
         status = (dispatch or _dispatch)()
         log.info("event=%s matched: workflow dispatch status=%s", kind, status)
     except Exception as err:  # noqa: BLE001 - Slack must always get its 200
-        log.error("event=%s matched: workflow dispatch failed (%s)", kind, type(err).__name__)
+        code = getattr(err, "code", None)  # HTTPError carries GitHub's status code
+        detail = f"HTTP {code}" if isinstance(code, int) else type(err).__name__
+        log.error("event=%s matched: workflow dispatch failed (%s)", kind, detail)
     return 200, "ok"
 
 

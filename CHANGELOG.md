@@ -44,6 +44,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (additive; the lawyer app needs to render it). No AI → backend events.
   - Ingest cost has no case to bill: it is priced and logged as unbilled,
     like template work. Shelf retrieval for a case's panels or chat turn is billed to that case.
+- **SIM-173 (AI side of SIM-58): the Drafting Assistant uses the platform-wide
+  Global Template Library.**
+  - Admins publish one versioned template library for every lawyer in every
+    firm. Suggestions come only from the published global templates; lawyers
+    no longer have libraries of their own. A retired template is never
+    suggested, but a draft already started from it keeps working.
+  - A draft keeps the version it started from: after v4 is published, a draft
+    begun on v3 still renders v3 (fetched from `templateUrl` if not held).
+  - Admin uploads are profiled (blueprint + draft category) before publish and
+    are never suggested while still a draft.
+  - **Socket payload changes** (all additive; contract: Confluence AI brief for
+    SIM-58, version 2):
+    - new inbound `global_template_sync` (`published` / `retired` / `deleted`)
+      and `global_template_sync_response`;
+    - new outbound `request_global_template_sync` `{requestId}`, sent on every
+      connect;
+    - `request_blueprint_proposal` with `scope: "global"` (no `userId`;
+      `originalName`, `mimeType`) is answered by `template_blueprint_proposal`
+      with `scope: "global"`, no `userId` and the echoed `fileHash`; a failure
+      now replies `status: "failed"`;
+    - `user_message_request` accepts `templateScope` and `templateVersion`.
+  - **Removed:** the per-lawyer template events. `template_sync` and
+    `template_sync_response` are no longer handled, `request_template_sync` is
+    no longer sent, and a `request_blueprint_proposal` is always profiled as a
+    global template (a request without `scope` is treated as global). A draft
+    started earlier from a lawyer's own template still resolves through its
+    `templateUrl`.
+  - **Rollout:** deploy only once the backend sends the global feed and admins
+    have published templates; until then the Drafting Assistant has no
+    templates to suggest.
+  - Global template DOCX skeletons are stored at
+    `templates/global/{id}/v{version}.docx`.
 
 ### Changed
 

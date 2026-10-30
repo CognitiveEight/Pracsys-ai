@@ -20,12 +20,14 @@ related_specs: []
 
 ## In plain words
 
-Lawyers keep a library of their own templates: notices, applications,
-petitions. The AI service reads each template when it is uploaded and works out
-its structure, tone and the blanks it needs filled. The lawyer can approve or
-adjust that reading. For each case, the Drafting Assistant suggests four to six
-documents the lawyer is likely to need next, and says which of the lawyer's
-templates fit each one, with a match percentage. The lawyer can start a draft
+Administrators keep one Global Template Library for the whole platform:
+notices, applications, petitions, letterheads and court formats (SIM-58 /
+SIM-173). Lawyers no longer have templates of their own. The AI service reads
+each template when an admin uploads it and works out its structure, tone and
+the blanks it needs filled; the admin can approve or adjust that reading before
+publishing. For each case, the Drafting Assistant suggests four to six
+documents the lawyer is likely to need next, and says which published templates
+fit each one, with a match percentage. The lawyer can start a draft
 from a suggestion, from a template, or as a fully custom AI draft with no
 template. The assistant then works through a conversation: it asks for what is
 missing, fills what it can from the case evidence, and produces the draft. When
@@ -34,54 +36,61 @@ template's own formatting.
 
 ## Who uses it
 
-- Lawyers building drafts for a case.
-- Lawyers managing their template library on the dashboard.
-- A new owner after a workspace transfer, whose own library is used from then on.
+- Lawyers building drafts for a case, from the published global templates.
+- Administrators publishing, versioning and retiring templates in the admin
+  panel.
 
 ## What the user sees
 
 A Drafting Assistant panel with suggested drafts, each with its matching
-templates. A blueprint approval screen for each new template. A drafting chat
+templates. A blueprint approval screen in the admin panel for each new global
+template. A drafting chat
 that asks questions, then shows the draft with a download link. See the lawyer
 app page in `other_side`.
 
 ## How it works
 
-1. **Template library sync.** The backend sends `template_sync` with an
-   `action`:
-   - `uploaded`: each template is downloaded, its text extracted (scanned
-     templates are OCR'd), its type classified and profiled. An unchanged file
-     hash reuses the earlier extraction.
-   - `renamed`: only the cached name changes.
-   - `deleted`: the cached template is dropped.
-   - `formatting_updated`: the lawyer's approved blueprint is stored as
-     authoritative; the file is not re-read.
-   - `preset_created`: a court or letterhead preset (no file body) is stored
-     for use at Word export.
-2. **Template profiling.** For each new template without an approved
-   blueprint, the service emits `template_blueprint_proposal`: the variables it
-   found, tone, filing context and outline. `request_blueprint_proposal`
-   ("Regenerate Extra Info") re-profiles from scratch and resets any prior
-   approval.
-3. **Warm library.** Templates live in process memory only. Before matching,
-   `ensure_templates_synced` checks the store. If it is empty (for example
-   after a restart), it emits `request_template_sync` and waits for the
-   `template_sync_response` snapshot. A snapshot that answers our own request
-   is authoritative: cached templates missing from it are deleted.
+1. **Global template library sync.** Admins publish versioned templates; the
+   backend sends `global_template_sync` once for the platform (no `userId`):
+   - `published`: the template becomes the current version. A new file is
+     downloaded, its text extracted (scanned templates are OCR'd), its type
+     classified and profiled; the same file hash reuses the earlier extraction,
+     and the same version and hash again is a no-op. An approved blueprint in
+     `formatting.blueprint` is stored as authoritative. A preset (no file) is
+     stored for use at Word export.
+   - `retired`: never suggested again; a draft already started from it keeps
+     working.
+   - `deleted`: a never-published draft is erased.
+   The per-lawyer `template_sync` / `template_sync_response` /
+   `request_template_sync` events are no longer handled.
+2. **Template profiling.** `request_blueprint_proposal` (on admin upload or
+   "Re-profile"; `scope: "global"`, no `userId`) profiles the draft template,
+   which is never suggested before it is published. The service replies
+   `template_blueprint_proposal` with `scope: "global"`, the request's
+   `fileHash` and no `userId`: the variables it found, tone, filing context
+   and outline, or `status: "failed"`.
+3. **Warm library.** Templates live in process memory only. On every connect
+   the service emits `request_global_template_sync` and applies the
+   `global_template_sync_response` snapshot as a full replace: anything held
+   that it omits is retired. `ensure_templates_synced` waits (bounded) for that
+   snapshot before matching.
 4. **Suggested drafts.** After a run, the agent builds 4-6 suggestions from the
    case summary, laws, strategy, analysis and dates, and pre-matches each
-   against the owner's library. The panel goes out as
+   against the published global templates. The panel goes out as
    `document_feature_response` with `featureType: drafting_assistant`. Each
    card carries `{title, relevance, description, matches[]}`; each match is
    `{templateId, templateName, category, matchPercent}`; `matches` is `[]`
    when nothing fits.
 5. **Library changes heal the panel.** When the template count changes, cards
    that already have a live match stay frozen. Unmatched cards are re-matched,
-   and cards matched to a deleted template are demoted and re-matched.
+   and cards matched to a retired or deleted template are demoted and
+   re-matched.
 6. **Drafting chat.** A `user_message_request` with
    `chat_type: DRAFTING_ASSISTANT` goes to the drafting agent, not the general
    chat. The session is keyed by `actionableId`. A kickoff needs an explicit
    `templateId` or `suggestedDraftId`; a greeting alone never starts a draft.
+   A draft keeps the `templateVersion` it started from, fetched from
+   `templateUrl` when that version is not held.
    `draftMode: custom` ("Custom AI Draft") skips all template lookup and drafts
    from the case alone. Each reply carries `draftStatus` (analyzing,
    gathering_info, ready, revising), `openQuestions` and, when ready,
@@ -97,10 +106,12 @@ app page in `other_side`.
 - The backend owns the template library. This service only caches it.
 - Template work is user-scoped, not case-scoped, so its cost is priced and
   logged but not billed to any case.
-- Matches always come from the current owner's library. On transfer, the new
-  owner's library is force-synced before suggestions are rebuilt.
-- A deleted template must never drive a draft. Cards matched to it are
-  demoted.
+- Matches come only from the published Global Template Library (SIM-173),
+  the same for every lawyer and firm. A transfer changes nothing about it.
+- A retired global template is never suggested, but a draft already started
+  from it keeps working, at the version it started from.
+- A retired or deleted template must never drive a new draft. Cards matched
+  to it are demoted.
 - If Word export fails, the Markdown draft still ships without `downloadUrl`.
 - The Analysis report download (`analysis_docx_generate_request`) is a
   separate, deterministic export and is not part of drafting.
@@ -121,15 +132,17 @@ app page in `other_side`.
 
 ### Where the code is
 
-- `app/socket/handlers/template_sync.py` — `on_template_sync`,
-  `on_template_sync_response`, `on_request_blueprint_proposal`,
-  `ensure_templates_synced`.
+- `app/socket/handlers/template_sync.py` — `on_global_template_sync`,
+  `on_global_template_sync_response`, `request_global_template_sync`,
+  `on_request_blueprint_proposal`, `ensure_templates_synced`.
 - `app/socket/handlers/drafting.py` — suggestions panel, re-match on library
   change.
 - `app/socket/handlers/chat.py` — `_handle_drafting_assistant_message`.
 - `app/langgraph/drafting_agent.py` — suggest, ingest, profile, match,
   `handle_turn`, `_export_draft_docx`.
-- `app/langgraph/template_store.py` — in-memory, user-scoped template cache.
+- `app/langgraph/template_store.py` — in-memory template cache: lawyers' own
+  libraries plus the Global Template Library (current version, admin drafts,
+  older versions pinned by drafts).
 - `app/processing/docx_template_filler.py`, `app/processing/docx_generator.py`,
   `app/processing/pdf_to_docx.py`.
 - `app/prompts/drafting.py`; wire transform `drafting_payload_to_wire` in
@@ -137,16 +150,18 @@ app page in `other_side`.
 
 ### Events
 
-Inbound: `template_sync`, `template_sync_response`,
-`request_blueprint_proposal`, `user_message_request` (drafting chat),
-`workspace_transferred`. Outbound: `request_template_sync`,
+Inbound: `global_template_sync`, `global_template_sync_response`,
+`request_blueprint_proposal` (`scope: "global"`), `user_message_request`
+(drafting chat), `workspace_transferred`. Outbound:
+`request_global_template_sync` (every connect),
 `template_blueprint_proposal`, `document_feature_response`
 (`drafting_assistant`), `ai_response` (with draft fields). See
 [the socket contract](../contracts/backend-ai-socket-events.md).
 
 ### Data
 
-- Templates: process memory only, keyed by `(userId, templateId)`.
+- Templates: process memory only, keyed by `(userId, templateId)`; global
+  templates under a reserved owner, keyed by template id and version.
 - Draft sessions: the Qdrant workspace state cache (`drafting_session`).
 - Template DOCX skeletons and generated drafts: cloud storage
   (`GCS_DOCX_BUCKET_NAME`), under `templates/` and `draft/` prefixes.
@@ -161,27 +176,25 @@ Inbound: `template_sync`, `template_sync_response`,
 
 ### Tests that guard it
 
-- No dedicated drafting or template test suite exists. `drafting_assistant`
+- `tests/test_global_templates.py` covers the Global Template Library feed,
+  global profiling and version pinning.
+- No other dedicated drafting or template test suite exists. `drafting_assistant`
   appears only as one of the resumed panels in
   `tests/offline/verify_run_control.py` and in
   `tests/offline/verify_objective_change.py`.
 
 ### Known gaps
 
-- No automated tests for template sync, profiling, matching, the drafting
-  conversation or Word export.
-- `ensure_templates_synced` waits with no time cap by default. If the backend
-  never replies to `request_template_sync`, the wait does not end.
+- No automated tests for matching quality, the drafting conversation or Word
+  export.
 - Generated draft files and template skeletons in cloud storage are never
   deleted: not on template delete, and not by the workspace purge.
 - Approved blueprints and presets live in memory and rely on the backend
   re-sending them in the snapshot after a restart; this was not verified.
-- The docstring of `on_template_sync` describes a "lawyer-scoped Qdrant
-  cache"; the code now uses process memory (`template_store.py`). The
-  docstring is out of date (comment only, no behaviour impact).
 
 ## History
 
 | Date | Change | Spec / commit |
 |---|---|---|
 | 2026-10-21 | First version, written from the code | SIM-113 |
+| 2026-10-29 | Global Template Library feed, versions, global profiling; per-lawyer template events removed | SIM-173 |

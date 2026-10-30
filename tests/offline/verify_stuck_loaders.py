@@ -7,7 +7,7 @@ A panel loader armed by ``workspace:refresh`` clears only when a
 pin the rules that keep every armed loader paired with a terminal emit, and
 keep the per-workspace pipeline lock from being held forever:
 
-  * template sync is bounded (TEMPLATE_SYNC_TIMEOUT_SECONDS), an undelivered
+  * the global template sync is bounded (TEMPLATE_SYNC_TIMEOUT_SECONDS), an undelivered
     request returns at once, an invalid reply releases its waiter, and the
     round trip runs OUTSIDE the pipeline lock (drafting waits on it only
     TEMPLATE_SYNC_IN_LOCK_WAIT_SECONDS);
@@ -180,7 +180,13 @@ def _origin(envelope):
 
 
 def _template_requests():
-    return [p for e, p, _l in EMITS if e == "request_template_sync"]
+    return [p for e, p, _l in EMITS if e == "request_global_template_sync"]
+
+
+def _cold():
+    """No global template snapshot applied yet: the next sync asks the backend."""
+    TEMPLATES["count"] = 0
+    H._global_templates_synced = False
 
 
 def _logged(fragment, since=0, level=None):
@@ -385,16 +391,16 @@ def _install_stubs():
         HANDLE_TURN.append(asyncio.get_running_loop().time())
         raise RuntimeError("drafting turn stub")
 
-    async def _ingest(user_id, templates):
-        TEMPLATES["count"] += len(templates)
-        return len(templates)
+    async def _apply_published(item):
+        TEMPLATES["count"] += 1
+        return True
 
     template_store.count_for_user = _count_for_user
     template_store.list_for_user = _list_for_user
     drafting_agent.suggest = _suggest
     drafting_agent.rematch_unmatched_suggestions = _rematch
     drafting_agent.handle_turn = _handle_turn
-    H._ingest_template_items = _ingest
+    H._apply_global_published = _apply_published
 
     def _audit(event_type, data, *a, **kw):
         AUDITS.append((event_type, copy.deepcopy(data)))
@@ -441,6 +447,7 @@ def _reset(ws, *, seed=True):
     STRATEGY["mode"] = "ok"
     INGEST["mode"] = "ok"
     TEMPLATES["count"] = 1
+    H._global_templates_synced = True
     for d in (H._workspace_strategy_payload, H._workspace_analysis_payload,
               H._workspace_list_of_dates_payload, H._workspace_applicable_laws_payload,
               H._workspace_procedural_timeline_payload,
@@ -528,7 +535,7 @@ async def stuck_template_sync_no_answer():
     """AC-100."""
     ws = _ws("tmpl_noanswer")
     _reset(ws)
-    TEMPLATES["count"] = 0
+    _cold()
     real_drafting = H.__dict__.pop("_generate_and_emit_drafting_suggestions")
     mark = len(EMITS)
     lmark = len(LOGS)
@@ -599,28 +606,28 @@ async def stuck_template_sync_no_answer():
 async def stuck_template_sync_undelivered():
     """AC-101."""
     _reset(_ws("tmpl_undelivered"))
-    TEMPLATES["count"] = 0
-    DROP.add("request_template_sync")
+    _cold()
+    DROP.add("request_global_template_sync")
     mark = len(LOGS)
     loop = asyncio.get_running_loop()
     started = loop.time()
-    await asyncio.wait_for(H.ensure_templates_synced(OWNER), timeout=2.0)
+    await asyncio.wait_for(H.ensure_templates_synced(), timeout=2.0)
     check("an undelivered request returns at once", loop.time() - started < 1.0)
-    check("it logs 'request_template_sync not delivered'",
-          bool(_logged("request_template_sync not delivered", mark)))
+    check("it logs 'request_global_template_sync not delivered'",
+          bool(_logged("request_global_template_sync not delivered", mark)))
     check("no future is left pending", not H._pending_template_sync)
 
 
 async def stuck_template_sync_invalid_reply():
     """AC-102."""
     _reset(_ws("tmpl_invalid"))
-    TEMPLATES["count"] = 0
+    _cold()
     mark = len(EMITS)
-    task = asyncio.create_task(H.ensure_templates_synced(OWNER))
-    await _until(lambda: any(e == "request_template_sync" for e, _p, _l in EMITS[mark:]))
-    rid = [p for e, p, _l in EMITS[mark:] if e == "request_template_sync"][0]["requestId"]
+    task = asyncio.create_task(H.ensure_templates_synced())
+    await _until(lambda: any(e == "request_global_template_sync" for e, _p, _l in EMITS[mark:]))
+    rid = [p for e, p, _l in EMITS[mark:] if e == "request_global_template_sync"][0]["requestId"]
     check("the waiter is pending on its request", rid in H._pending_template_sync)
-    await H.on_template_sync_response({"requestId": rid, "userId": None, "templates": "x"})
+    await H.on_global_template_sync_response({"requestId": rid, "templates": "x"})
     await _until(lambda: task.done(), timeout=1.0)
     check("an invalid reply resolves the pending future; the waiter proceeds",
           task.done() and task.exception() is None)
@@ -631,26 +638,27 @@ async def stuck_template_sync_late():
     """AC-103."""
     ws = _ws("tmpl_late")
     _reset(ws)
-    TEMPLATES["count"] = 0
+    _cold()
     H._drafting_meta_by_workspace[ws] = {"user_id": OWNER, "role": "PETITIONER",
                                          "lib_count": 0}
     mark = len(EMITS)
-    task = asyncio.create_task(H.ensure_templates_synced(OWNER))
-    await _until(lambda: any(e == "request_template_sync" for e, _p, _l in EMITS[mark:]))
-    rid = [p for e, p, _l in EMITS[mark:] if e == "request_template_sync"][0]["requestId"]
+    task = asyncio.create_task(H.ensure_templates_synced())
+    await _until(lambda: any(e == "request_global_template_sync" for e, _p, _l in EMITS[mark:]))
+    rid = [p for e, p, _l in EMITS[mark:] if e == "request_global_template_sync"][0]["requestId"]
     _advance(901)
     await _until(lambda: task.done())
     check("the bound expired first", task.done() and not H._pending_template_sync)
     mark2 = len(EMITS)
-    await H.on_template_sync_response({
-        "requestId": rid, "userId": OWNER, "count": 1,
-        "templates": [{"id": "tpl_1", "name": "Notice.docx", "category": "Notice",
-                       "extension": "docx", "fileUrl": "https://storage.example/t?sig=x"}]})
+    await H.on_global_template_sync_response({
+        "requestId": rid, "count": 1,
+        "templates": [{"id": "tpl_1", "version": 1, "name": "Notice.docx",
+                       "category": "Notice", "extension": "docx",
+                       "fileUrl": "https://storage.example/t?sig=x"}]})
     await _until(lambda: _count(ws, "drafting_assistant", mark2) == 1)
     late = [(p, locked) for e, p, locked in EMITS[mark2:]
             if e == "document_feature_response" and p.get("workspaceId") == ws
             and p.get("featureType") == "drafting_assistant"]
-    check("drafting is re-emitted via _maybe_reemit_drafting_on_templates",
+    check("drafting is re-emitted via _reemit_drafting_on_global_change",
           len(late) == 1 and ("drafting_agent.rematch",) in CALLS)
     check("outside the pipeline lock", bool(late) and late[0][1] is False)
 
@@ -659,7 +667,7 @@ async def stuck_template_sync_other_callers():
     """AC-104: the chat drafting turn and workspace_transferred."""
     ws = _ws("tmpl_callers")
     _reset(ws)
-    TEMPLATES["count"] = 0
+    _cold()
     mark = len(EMITS)
     payload = UserMessageRequestPayload(
         content="Draft a reply to the notice", chat_type="DRAFTING_ASSISTANT",
@@ -667,7 +675,7 @@ async def stuck_template_sync_other_callers():
         timestamp="2026-10-26T10:00:00.000Z", source="template", templateId="tpl_1")
     turn = asyncio.create_task(H._handle_drafting_assistant_message(
         payload=payload, workspace_id=ws, user_id=OWNER, chat_id=f"chat_{RUN_ID}"))
-    await _until(lambda: any(e == "request_template_sync" for e, _p, _l in EMITS[mark:]))
+    await _until(lambda: any(e == "request_global_template_sync" for e, _p, _l in EMITS[mark:]))
     _advance(899)
     await _settle()
     check("the chat drafting turn is still waiting at 899 s", not HANDLE_TURN)
@@ -678,7 +686,7 @@ async def stuck_template_sync_other_callers():
 
     ws2 = _ws("tmpl_transfer")
     _reset(ws2)
-    TEMPLATES["count"] = 0
+    _cold()
     mark = len(EMITS)
     await H.handle("workspace_transferred", {
         "workspaceId": ws2, "previousUserId": OWNER, "newUserId": NEW_OWNER,
@@ -687,8 +695,8 @@ async def stuck_template_sync_other_callers():
         "reEmitFeatures": ["drafting_assistant"],
         "transferredAt": "2026-10-26T10:00:00.000Z"})
     sent = await _until(
-        lambda: any(e == "request_template_sync" for e, _p, _l in EMITS[mark:]))
-    check("workspace_transferred requests a forced template sync", sent)
+        lambda: any(e == "request_global_template_sync" for e, _p, _l in EMITS[mark:]))
+    check("workspace_transferred requests the global template sync", sent)
     _advance(899)
     await _settle()
     check("the transfer is still waiting at 899 s", not _called("drafting_assistant"))
@@ -700,9 +708,9 @@ async def stuck_template_sync_other_callers():
 async def stuck_template_wait_900():
     """AC-120."""
     _reset(_ws("tmpl_900"))
-    TEMPLATES["count"] = 0
+    _cold()
     mark = len(LOGS)
-    task = asyncio.create_task(H.ensure_templates_synced(OWNER))
+    task = asyncio.create_task(H.ensure_templates_synced())
     await _until(lambda: bool(H._pending_template_sync))
     _advance(899)
     await _settle()
@@ -712,7 +720,7 @@ async def stuck_template_wait_900():
     check("returns after TEMPLATE_SYNC_TIMEOUT_SECONDS with no explicit timeout",
           task.done() and task.exception() is None)
     check("logs a timeout warning",
-          bool(_logged("request_template_sync timed out after 900s", mark, "WARNING")))
+          bool(_logged("request_global_template_sync timed out after 900s", mark, "WARNING")))
     check("the pending future is removed", not H._pending_template_sync)
 
 
@@ -1137,7 +1145,7 @@ async def stuck_audio_cap():
     """AC-118."""
     ws = _ws("audio_cap")
     _reset(ws)
-    TEMPLATES["count"] = 0
+    _cold()
     batch = _batch(["68c1f0a9e4b0d2a1c3f4567a", "68c1f0a9e4b0d2a1c3f4567b"])
     batch["results"][0].update(is_audio=True, audio_duration_seconds=1200)
     batch["results"][1].update(is_audio=True, audio_duration_seconds=600)

@@ -345,10 +345,10 @@ def _install_stubs():
     H._generate_and_emit_relevant_parties = _gen("relevant_parties")
     H._generate_and_emit_case_laws = _gen("case_laws")
     H._generate_and_emit_drafting_suggestions = _gen("drafting_assistant")
-    async def _templates_synced(user_id, *, timeout=None, force=False):
+    async def _templates_synced(*, timeout=None, force=False):
         return None
 
-    H._prewarm_templates = lambda user_id, *, timeout=None: None
+    H._prewarm_templates = lambda *, timeout=None: None
     H.ensure_templates_synced = _templates_synced
     H._socket_client = SOCKET
 

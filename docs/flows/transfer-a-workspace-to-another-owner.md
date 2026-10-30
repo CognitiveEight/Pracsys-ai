@@ -25,9 +25,9 @@ takes over a matter. The documents and the analysis do not change, so the AI
 service does not read the files again or rebuild the panels. It only records
 that the case now belongs to the new lawyer, sets up the case's role for them,
 and forgets the previous owner's short-term settings for that case. The one
-panel it rebuilds is the suggested drafts, because those are matched against the
-owner's own template library, and the new owner's templates are different. To do
-that it first asks for a fresh copy of the new owner's templates. If the case
+panel it rebuilds is the suggested drafts, sent again for the new owner. The
+templates themselves do not change: every lawyer uses the same Global Template
+Library (SIM-173), so the service only makes sure it is loaded. If the case
 is archived, the drafts are not rebuilt until it is next used.
 
 ## The whole flow at a glance
@@ -37,10 +37,9 @@ is archived, the drafts are not rebuilt until it is next used.
 | 1 | Lawyer app or admin | Owner or an admin transfers the case to another lawyer | [Lawyer app page](https://simplertoday.atlassian.net/wiki/spaces/PRACENG/pages/4620343), [Admin page](https://simplertoday.atlassian.net/wiki/spaces/PRACENG/pages/5177345) |
 | 2 | Backend | Moves ownership and sends `workspace_transferred` with both user ids and `reEmitFeatures` | [Backend page](https://simplertoday.atlassian.net/wiki/spaces/PRACENG/pages/4882433) |
 | 3 | AI service | Re-keys owner state to the new owner | This page, steps 1-5 |
-| 4 | AI service | Asks for the new owner's templates (`request_template_sync`) | This page, step 6 |
-| 5 | Backend | Replies with `template_sync_response` | [Backend page](https://simplertoday.atlassian.net/wiki/spaces/PRACENG/pages/4882433) |
-| 6 | AI service | Rebuilds suggested drafts and sends `drafting_assistant` | This page, step 6 |
-| 7 | Lawyer app | New owner sees the case, with drafts matched to their templates | [Lawyer app page](https://simplertoday.atlassian.net/wiki/spaces/PRACENG/pages/4620343) |
+| 4 | AI service | Makes sure the global template library is loaded (`request_global_template_sync`, only if no snapshot this connection) | This page, step 6 |
+| 5 | AI service | Rebuilds suggested drafts and sends `drafting_assistant` | This page, step 6 |
+| 6 | Lawyer app | New owner sees the case, with drafts matched to the published global templates | [Lawyer app page](https://simplertoday.atlassian.net/wiki/spaces/PRACENG/pages/4620343) |
 
 ## The AI service's steps in detail
 
@@ -69,9 +68,10 @@ is archived, the drafts are not rebuilt until it is next used.
    informational; nothing is re-read. If `reEmitFeatures` is empty, or the
    status is `archived`, the handler stops here. Otherwise a background task
    handles each listed feature. Only `drafting_assistant` is supported:
-   - new owner: `ensure_templates_synced(new_user_id, force=True)` requests a
-     fresh template snapshot and waits until it has been ingested, then
-     `_generate_and_emit_drafting_suggestions` rebuilds and sends the panel;
+   - new owner: `ensure_templates_synced()` waits until the global template
+     library is loaded (a no-op once a snapshot was applied this connection),
+     then `_generate_and_emit_drafting_suggestions` rebuilds and sends the
+     panel;
    - same owner: the cached panel is re-sent, and regenerated only if nothing
      was cached.
    Any other feature name is skipped with a warning.
@@ -91,8 +91,9 @@ is archived, the drafts are not rebuilt until it is next used.
 
 **Entry and exit.** Entry: `on_workspace_transferred` in
 `app/socket/handlers/workspace_events.py`. Exit: one `document_feature_response`
-with `featureType: drafting_assistant`, plus the `request_template_sync` emit from
-`ensure_templates_synced` in `app/socket/handlers/template_sync.py`.
+with `featureType: drafting_assistant`, plus a `request_global_template_sync` emit
+from `ensure_templates_synced` in `app/socket/handlers/template_sync.py` when no
+snapshot has been applied this connection.
 
 **Events and payloads.** `WorkspaceTransferredPayload` (`workspaceId`,
 `previousUserId`, `newUserId`, `newUser`, `title`, `workspaceRole`, `status`,

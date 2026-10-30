@@ -234,11 +234,13 @@ class SocketEventHandler(
         self._workspace_current_state_payload: Dict[str, Any] = (
             PersistentWorkspaceDict(CacheKinds.CURRENT_STATE)
         )
-        # In-flight request_template_sync correlations: requestId -> Future,
-        # resolved by on_template_sync_response once the snapshot is ingested
-        # into the in-memory template store. Lets the suggestion/kickoff path
-        # await a cold-cache fill before matching.
+        # In-flight request_global_template_sync correlations: requestId ->
+        # Future, resolved by on_global_template_sync_response once the
+        # snapshot is ingested into the in-memory template store. Lets the
+        # suggestion/kickoff path await a cold-cache fill before matching.
         self._pending_template_sync: Dict[str, "asyncio.Future"] = {}
+        # True once a global template snapshot has been applied (SIM-173).
+        self._global_templates_synced: bool = False
         # Per-workspace drafting-suggestion provenance, used to self-heal the
         # panel when a template finishes ingesting *after* suggestions were
         # built (e.g. a slow scanned-PDF OCR that misses the template-sync
@@ -446,12 +448,8 @@ class SocketEventHandler(
             "analysis_docx_generate_request",
             self.on_analysis_docx_generate_request,
         )
-        # Drafting Assistant — template library sync from BE.
-        self.register("template_sync", self.on_template_sync)
-        # Reply to our AI-initiated request_template_sync (full snapshot).
-        self.register("template_sync_response", self.on_template_sync_response)
-        # "Regenerate Extra Info" — backend asks the AI to re-profile a template
-        # and emit a fresh blueprint proposal for the approval screen.
+        # Drafting Assistant — an admin's global template draft needs profiling
+        # (upload or "Re-profile"); the AI emits a blueprint proposal.
         self.register(
             "request_blueprint_proposal", self.on_request_blueprint_proposal
         )
@@ -459,6 +457,11 @@ class SocketEventHandler(
         self.register("kb_document_added", self.on_kb_document_added)
         self.register("kb_document_deleted", self.on_kb_document_deleted)
         self.register("kb_sync", self.on_kb_sync)
+        # Global Template Library (SIM-173): platform-wide feed, no userId.
+        self.register("global_template_sync", self.on_global_template_sync)
+        self.register(
+            "global_template_sync_response", self.on_global_template_sync_response
+        )
 
         # Legacy event handlers
         self.register("workspace_updated", self.on_workspace_updated)

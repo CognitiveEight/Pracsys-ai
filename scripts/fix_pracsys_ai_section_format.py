@@ -227,7 +227,7 @@ def main() -> int:
         ("analysis_report_feedback / added_missing_information", "Recalculate the quality score and suppress lawyer-rejected items."),
         ("applicable_law_relevance_request", "Assesses the relevance of a specific law to the current case facts."),
         ("analysis_docx_generate_request", "Normalises the analysis report for DOCX export."),
-        ("template_sync", "Caches or evicts the lawyer's drafting template library so the drafting agent stays in sync with the lawyer's uploads."),
+        ("global_template_sync / global_template_sync_response", "Keeps the platform-wide Global Template Library (published, retired, deleted) the drafting agent matches and drafts from."),
         ("ai_heartbeat_ping", "Periodic liveness probe from the Backend."),
     ]:
         last = insert_bullet(last, label, rest)

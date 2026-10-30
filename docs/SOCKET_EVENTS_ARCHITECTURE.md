@@ -57,7 +57,7 @@ pre-split file plus a runtime method/handler-key diff).
 | `handlers/law_relevance.py` | `LawRelevanceMixin` | Lawyer-selected applicable-law relevance assessment (`on_applicable_law_relevance_request`). |
 | `handlers/panel_edits.py` | `PanelEditsMixin` | User add/edit/delete for Case Laws and Relevant Parties panels. |
 | `handlers/docx_export.py` | `DocxExportMixin` | `on_analysis_docx_generate_request`. |
-| `handlers/template_sync.py` | `TemplateSyncMixin` | Drafting template library sync + blueprint proposals + `ensure_templates_synced`. |
+| `handlers/template_sync.py` | `TemplateSyncMixin` | Global Template Library feed (`global_template_sync`, connect-time snapshot) + global blueprint proposals + `ensure_templates_synced`. |
 | `handlers/workspace_metadata.py` | `WorkspaceMetadataMixin` | Workspace title/summary/category/description generation + fallbacks. |
 | `handlers/workspace_events.py` | `WorkspaceEventsMixin` | Connection lifecycle, `_do_reemit_after_reconnect`, and the big `on_workspace_created` / `on_workspace_sync` entrypoints. |
 | `handlers/workspace_purge.py` | `WorkspacePurgeMixin` | `on_workspace_deleted` — the compliance purge: honours the backend's absolute `purgeAfter`, dedupes the expected re-sends, and is revoked by any live workspace traffic via `cancel_pending_purge`. |

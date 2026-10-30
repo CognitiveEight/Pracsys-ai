@@ -297,6 +297,8 @@ class WorkspaceEventsMixin:
         """Handle connection event. Re-emit pending document_feature_response if we had disconnected during workspace init."""
         logger.info("Socket connected")
         audit_logger.log_event("socket_connect", {"status": "connected"})
+        # Pushes are fire-and-forget: catch up on the global template library.
+        self._schedule_global_template_sync()
         await self._recover_interrupted_work()
         await self._do_reemit_after_reconnect()
 
@@ -3183,12 +3185,9 @@ class WorkspaceEventsMixin:
                             if self._workspace_drafting_payload.get(workspace_id):
                                 continue
                         else:
-                            # Force a fresh snapshot of the new owner's library
-                            # (the reply also reconciles deletions) so the regen
-                            # below matches against current templates.
-                            await self.ensure_templates_synced(
-                                new_user_id, force=True
-                            )
+                            # Templates are global (SIM-173): the new owner sees
+                            # the same library, so only make sure it is loaded.
+                            await self.ensure_templates_synced()
                         await self._generate_and_emit_drafting_suggestions(
                             workspace_id=workspace_id,
                             user_id=new_user_id,

@@ -12,7 +12,8 @@ fix/SIM-124-short-name     ──PR──┘
 
 - Branch from `development`. Name it with the ticket key so Jira links the
   branch, commits and PR automatically (GitHub for Jira).
-- Commits: `feat(SIM-123): …`, `fix(SIM-123): …`, `chore: …`.
+- Commits: `feat(SIM-123): …`, `fix(SIM-123): …`, `docs(SIM-123): …`,
+  `chore: …`.
 - Nobody, human or agent, commits directly to `development`, `staging` or
   `main`.
 
@@ -21,12 +22,12 @@ fix/SIM-124-short-name     ──PR──┘
 | # | Step | Who | Output | Jira status |
 |---|---|---|---|---|
 | 1 | Ticket written with goal and scope | product owner | Jira ticket | To Do |
-| 2 | Specs | `planner` agent → reviewed by owner + tech lead | `specs/requirements`, `technical-design`, `acceptance-criteria` | Spec Review |
+| 2 | Specs | `planner` agent → reviewed by owner + tech lead | `specs/requirements`, `technical-design`, `acceptance-criteria` | Spec |
 | 3 | Implementation | `developer` agent or developer | commits on the ticket branch | In Progress |
 | 4 | Tests | `tester` agent | tests mapped to each AC; `make test` green | In Progress |
 | 5 | Review | `reviewer` agent, then a human approver | findings + verdict on the PR | In Review |
-| 6 | Merge to `development` | human | — | Done (dev) |
-| 7 | Promote to `staging`, then `main` | release owner | release PR, CHANGELOG | Released |
+| 6 | Merge to `development`, then QA | human | — | QA, then Done |
+| 7 | Promote to `staging`, then `main` | release owner | release PR, CHANGELOG, Release Management page | (no Jira status) |
 
 Run each step from Claude Code in this repo with its command. Each one reads
 the Jira issue and asks before writing anything back to Jira:
@@ -46,6 +47,25 @@ The templates live under **SimplerToday – SDLC Templates** in Confluence; the
 The rules are enforced, not only written down: `.claude/settings.json` denies
 credential files, `git push`/`merge` and `make e2e`, and the hooks in
 `.claude/hooks/` block commits on protected branches and `--no-verify`.
+
+## Jira
+
+Project key `SIM`. Board columns, in order:
+
+| Status | Meaning |
+|---|---|
+| To Do | Ticket written; no spec yet |
+| Spec | Specs written; waiting for owner and tech lead approval |
+| In Progress | Design approved; code and tests on the ticket branch |
+| In Review | PR open; reviewer agent and a human approver |
+| QA | Merged to `development`; being checked |
+| Done | QA passed (only reachable from QA) |
+
+There is no Blocked status: blocked work is marked with the Flagged field
+and the `agent-blocked` label (SIM-71 technical design, decision 3).
+
+Work types: Epic, Task, Bug, Subtask. There is no Story type. A Subtask
+can track one step of a spec's task list.
 
 ## Gates
 
@@ -79,8 +99,9 @@ make lint && make test
 
 ## Not set up yet
 
-- CI (GitHub Actions running `make lint` and `make test` on every PR) and
-  branch protection on `development` / `staging` / `main`.
-- The Jira project, its workflow statuses and the GitHub for Jira link.
-- Running agents from CI (`anthropics/claude-code-action@v1`, which needs an
-  `ANTHROPIC_API_KEY` repository secret added by an admin).
+- Branch protection on `development` / `staging` / `main` and the GitHub for
+  Jira link are pending (SIM-24).
+
+CI (`lint`, `test`, `secrets-scan` on every PR, SIM-23) and the agent
+pipeline run from GitHub Actions (SIM-153,
+`docs/runbooks/run-the-agent-pipeline.md`) are in place.

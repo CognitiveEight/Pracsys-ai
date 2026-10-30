@@ -1,7 +1,7 @@
-# ST-XXX: <title> — acceptance criteria
+# SIM-<n>: <title> — acceptance criteria
 
-- **Requirements:** `specs/requirements/ST-XXX-….md`
-- **Design:** `specs/technical-design/ST-XXX-….md`
+- **Requirements:** `specs/requirements/SIM-<n>-….md`
+- **Design:** `specs/technical-design/SIM-<n>-….md`
 
 Each criterion is testable and maps to exactly one automated check, or is
 marked **manual** with the reason (e.g. needs a live backend).

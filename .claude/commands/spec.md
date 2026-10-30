@@ -22,8 +22,7 @@ Write the specs for Jira issue **$ARGUMENTS**.
    - Epic: draft the **Product Management** child page instead.
 6. Ask me before writing anything to Jira. With my yes, add one comment to
    the issue listing the spec paths, the Confluence page links and open
-   questions (no code, no payloads), and move it to **Spec Review** if that
-   status exists.
+   questions (no code, no payloads), and move it to **Spec**.
 
 Do not write application code in this step.
 

@@ -356,8 +356,12 @@ class Settings(BaseSettings):
     audio_languages: str = (
         "en-IN,hi-IN"  # Comma-separated language codes (Chirp 3 diarization-supported)
     )
-    audio_min_speakers: int = 2
-    audio_max_speakers: int = 6
+    # Speaker range sent to Chirp 3 diarization (SIM-177). 1 lets a voice note
+    # stay one speaker; 8 covers meetings and hearings.
+    audio_min_speakers: int = 1
+    audio_max_speakers: int = 8
+    # Lower maximum tried once if Chirp rejects the range above.
+    audio_max_speakers_retry: int = 6
     # Chirp 3 BatchRecognize rejects files over 20 minutes. Longer recordings
     # are cut at pauses into windows of at most this many seconds (overlap
     # included), transcribed in parallel and stitched back together.

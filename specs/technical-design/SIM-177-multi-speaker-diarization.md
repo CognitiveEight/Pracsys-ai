@@ -361,4 +361,35 @@ it; it is billed. A manual staging check with fictional 1-, 2-, 3- and
 9. `CHANGELOG.md`; run `make lint` and `make test`; hand over for `make e2e`.
 
 ## Decisions
-(To be filled during implementation.)
+Recorded during implementation (2026-11-02):
+1. **`TranscriptResult.max_speakers_used`** (new, `Optional[int]`). §4 needs
+   "the maximum actually used (8, or 6 after a retry)" in `_sync_transcribe`,
+   but `_transcribe_offline_with_diarization` returns only a
+   `TranscriptResult`. It records the accepted maximum there; `None` falls back
+   to the requested maximum.
+2. **Rejection detection also matches a raised `InvalidArgument`.**
+   `_batch_error_code` reads `exc.code`, which on a google-api-core exception
+   is the HTTP status (400), not the gRPC code. `_is_speaker_range_rejection`
+   therefore accepts code 3 *or* `grpc_status_code.name == "INVALID_ARGUMENT"`,
+   with the same keyword rule. It never matches `TranscriptionCancelled`.
+3. **The chunked path raises `SpeakerRangeRejected`** (wrapping the original)
+   rather than re-raising the raw exception. A raw `InvalidArgument` is a
+   `GoogleAPICallError` and would otherwise enter the language-set retry.
+4. **`_map_block_tags` takes a keyword `max_speakers`** for the range-mode
+   limit, which the listed signature had no parameter for. The known speakers
+   are read from `prev_map`; the first block keeps its own numbering, so the
+   2-speaker pass keeps tag 1 = lawyer. Ties prefer the identity pair, so a
+   2-speaker tie does not flip (the old rule flipped only on a strict
+   majority). Greedy assignment can differ from the old agree/disagree sum in
+   contrived vote splits; the existing block-flip test passes unchanged.
+5. **Unreliable tags with `max <= 2`** (rollback setting) take the 2-speaker
+   call pass and keep `speaker_source=gemini_diarization`, so the implicit
+   roles apply exactly as before, rather than `gemini_multi_diarization`.
+6. **One shared dispatcher, `_gemini_assign_utterances`,** serves
+   `_gemini_full_diarization` and the correction pass (`_correct_native_tags`),
+   which needs per-turn assignments rather than merged segments. The 2-speaker
+   path still calls `_gemini_diarization_assignments(block)` with one
+   positional argument.
+7. **"Survives the near-silent cap"** (reliable, 1 native speaker): the cap
+   never merges below 2, so any N-speaker answer of 2 or more is accepted; the
+   cap then runs on it like any other result.

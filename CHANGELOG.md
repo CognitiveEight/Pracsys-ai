@@ -116,6 +116,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SIM-181: a socket reconnect no longer shows the strategy panel twice in chat.**
+  After a reconnect the service replays the cached panels of every case armed
+  in the last 30 minutes, including panels the backend already had, and the
+  frontend renders a re-sent `strategy_objective` as a second Case Summary /
+  Strategic Objective / next-steps message. `_emit_document_feature` now
+  records a fingerprint of each delivered panel, and the reconnect replay
+  (`replay=True`) skips a panel whose identical payload was delivered more
+  than `REPLAY_DELIVERY_GRACE_SECONDS` (60 s) before the disconnect. Changed,
+  undelivered and just-before-the-drop panels are still replayed, and so is
+  everything after a restart. No payload change. Coverage:
+  `tests/offline/verify_reconnect_replay.py`.
+
 - **Chat replies keep their bullet points and headings.** The citation checker
   splits a reply into sentences and joins them back, and a line break straight
   after a full stop was never part of any sentence, so it was dropped: every

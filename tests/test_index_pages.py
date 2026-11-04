@@ -152,7 +152,9 @@ def test_timeline_ignores_a_model_page_that_is_the_index():
     resolve = ProceduralTimelineAgent._resolve_page_number
     item = {"title": "Legal notice issued", "date": "12.03.2024", "pageNumber": 1}
     assert resolve(item, PAPER_BOOK) == 4
-    assert resolve({**item, "pageNumber": 3}, PAPER_BOOK) == 3  # a real page is kept
+    assert resolve({**item, "pageNumber": 4}, PAPER_BOOK) == 4  # a checked page is kept
+    # A page the date is not on is corrected, not trusted.
+    assert resolve({**item, "pageNumber": 3}, PAPER_BOOK) == 4
 
 
 def test_timeline_unplaceable_entry_gets_no_page_not_page_one():
@@ -422,8 +424,8 @@ def test_index_pages_cache_keeps_no_document_text():
     from app.rag import page_kinds
 
     index_pages(PAPER_BOOK)
-    cached = list(page_kinds._INDEX_CACHE.items())
-    assert cached and all(len(k) == 64 and "Arun" not in k for k, _ in cached)
+    cached = list(page_kinds._CACHE.items())
+    assert cached and all(len(k[1]) == 64 and "Arun" not in k[1] for k, _ in cached)
     assert all(isinstance(v, frozenset) for _, v in cached)
 
 

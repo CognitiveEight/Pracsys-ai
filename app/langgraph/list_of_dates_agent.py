@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, TypedDict
 from langgraph.graph import END, START, StateGraph
 from loguru import logger
 from app.rag.packing import fit_to_budget
-from app.rag.page_kinds import anchor_page, date_forms, index_pages, page_markers
+from app.rag.page_kinds import date_forms, resolve_entry_page
 
 from app.prompts.legal_intelligence_system import ENGLISH_ONLY_OUTPUT_DIRECTIVE
 
@@ -556,26 +556,18 @@ Legal text:
             arr = []
 
         def _resolve_page_from_text(item: Dict[str, Any], text: str) -> Optional[int]:
-            # The model's page unless it is a paper-book index page, else where
-            # the entry is in the text outside the index (SIM-192). 1 for text
-            # without page markers; None when the entry cannot be placed.
-            skip = index_pages(text or "")
-            raw_page = item.get("pageNumber")
-            if isinstance(raw_page, str) and raw_page.strip().isdigit():
-                raw_page = int(raw_page.strip())
-            if isinstance(raw_page, int) and raw_page > 0 and raw_page not in skip:
-                return raw_page
-            if not page_markers(text or ""):
-                return 1
-            return anchor_page(
-                text,
+            # The model's page only when the entry is on it and it is not the
+            # index / list of dates / synopsis; else where the entry is in the
+            # text; None when there are no pages or it cannot be placed (SIM-192).
+            return resolve_entry_page(
+                text or "",
+                item.get("pageNumber"),
                 [
                     str(item.get("evidenceSnippet") or ""),
                     *date_forms(str(item.get("date") or "")),
                     str(item.get("title") or ""),
                     str(item.get("description") or ""),
                 ],
-                skip=skip,
             )
 
         # Patterns that indicate garbage/scraped-UI content in description or evidence

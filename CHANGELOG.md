@@ -179,6 +179,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     longer tells the model to default to 1. The lookup also searches the
     date as documents write it (12.03.2024, 12/03/2024), not only the ISO
     form, and caches index pages by a digest of the text, never the text.
+  - Paper-book summaries: the advocate's LIST OF DATES and SYNOPSIS pages
+    restate every date, so they are now cited only as a last resort, like
+    the index (`avoid_pages`). Headings split over two lines ("LIST OF" /
+    "DATES") and more index headings (LIST OF DOCUMENTS, Hindi) are read.
+    On the Test Case 5 paper-book: index 1-3, summary 7-10; 12 of the 13
+    dates they list now cite a petition or annexure page. No other page of
+    the 47 text test-case PDFs is flagged.
+  - A page the model claims for a List of Dates / Timeline entry is kept only
+    when the entry's date (as written: 12.03.2024, 12th March, 2024, ...) or
+    quote is on it (`resolve_entry_page`); otherwise the entry is placed from
+    the text, or gets no page. Page-less documents (Word without layout,
+    spreadsheets, audio, text) no longer get a guessed page 1.
+  - Word files (`extract_text_from_docx(..., mark_pages=True)`, evidence and
+    chat attachments only): pages come from Word's saved layout
+    (`w:lastRenderedPageBreak`) when it agrees exactly with the saved page
+    count, else no page. Table text, which was dropped, is now read. On 45
+    real .docx: 16 get exact pages, 29 none, 0 lose any text. Drafting and
+    template text is unchanged.
+    Content controls (cover pages, contents lists) are read; if any page
+    start is still not reached, the file gets no pages rather than shifted
+    ones.
+  - Photos and scans (JPG/PNG/...) are Page 1. Knowledge-base uploads get the
+    same Word and photo pages.
+  - Audio: a citation's `timestamp` is the quoted line's own `[MM:SS]`, not
+    the start of the passage (up to a minute earlier).
+  - Anchors: a bare year or a short title (under 12 characters) no longer
+    places an entry; month-only dates ("2024-03") are searched as written
+    ("March 2024").
   - Chat: index passages are marked for the model, ranked after real pages in
     retrieval, and a sentence citing only an index passage is re-pointed to
     the passage holding its date/figure or (no figure) a same-document passage

@@ -27,7 +27,7 @@ from loguru import logger
 
 from app.rag.chunker import reassemble
 from app.rag.evidence import EvidencePack, render_document_block
-from app.rag.page_kinds import index_pages
+from app.rag.page_kinds import avoid_pages
 
 
 def _index_pages_by_doc(chunks: List[Dict[str, Any]]) -> Dict[str, Tuple[int, ...]]:
@@ -44,7 +44,7 @@ def _index_pages_by_doc(chunks: List[Dict[str, Any]]) -> Dict[str, Tuple[int, ..
                 for c in doc_chunks
             ]
         )
-        pages = index_pages(text)
+        pages = avoid_pages(text)
         if pages:
             out[did] = tuple(sorted(pages))
     return out

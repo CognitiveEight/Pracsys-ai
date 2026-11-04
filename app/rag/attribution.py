@@ -42,7 +42,7 @@ from app.rag.citations import (
     sheet_location,
 )
 from app.rag.evidence import EvidencePack
-from app.rag.page_kinds import index_pages
+from app.rag.page_kinds import avoid_pages
 from app.rag.sparse import tokens
 
 #: Minimum share of an item's distinctive words found in a passage, when the
@@ -132,7 +132,7 @@ class Attributor:
             "annexure": item.annexure,
             "fileName": item.file_name,
             "page": item.page_at(at),
-            "timestamp": item.time_start,
+            "timestamp": item.time_at(at),
             "quote": quote or None,
         }
         if item.sheet:
@@ -156,7 +156,7 @@ async def attributor_for(workspace_id: str) -> Optional[Attributor]:
     annexure_of = {d["document_id"]: i for i, d in enumerate(docs, 1)}
     names = {d["document_id"]: d.get("filename") or "" for d in docs}
     index_pages_of = {
-        d["document_id"]: index_pages(d.get("content") or "") for d in docs
+        d["document_id"]: avoid_pages(d.get("content") or "") for d in docs
     }
     attributor = Attributor(chunks, annexure_of, names, index_pages_of)
     _cache[workspace_id] = (time.time(), version, attributor)

@@ -394,10 +394,15 @@ local Qdrant.
   from the stored passage, and the page is where that quote is.
 - It re-points a chronology entry whose date is not in its claimed document.
   It gives no citation rather than a weak one.
-- A paper-book's INDEX pages (`app/rag/page_kinds.index_pages`) are cited
-  only when nothing else supports the item. Never pick "the first page that
-  mentions X" without skipping them: the index mentions everything. Place a
-  page with `page_kinds.anchor_page`, and give no page rather than a guessed 1.
+- A paper-book's INDEX, LIST OF DATES and SYNOPSIS pages
+  (`app/rag/page_kinds.avoid_pages`) are cited only when nothing else
+  supports the item. Never pick "the first page that mentions X" without
+  skipping them: they mention everything. Place an entry with
+  `page_kinds.resolve_entry_page` (a model's page is kept only if the entry
+  is on it), and give no page rather than a guessed 1.
+- Pages exist for PDFs, PPTX (slide), images (Page 1) and Word files whose
+  saved layout is complete (`_docx_marked_text`). Spreadsheets cite sheet and
+  row, audio a timestamp; nothing else gets a page.
 - **All fields it adds are additive.** Never change an item's type to carry a
   citation.
 

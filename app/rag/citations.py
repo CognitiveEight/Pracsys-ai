@@ -336,7 +336,7 @@ def verify_and_number(
                     "fileName": item.file_name,
                     "page": item.page_at(at),
                     "pageEnd": item.page_end,
-                    "timestamp": item.time_start,
+                    "timestamp": item.time_at(at),
                     "heading": item.heading,
                     "quote": quote or None,
                 }

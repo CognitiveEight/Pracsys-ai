@@ -24,7 +24,7 @@ from app.socket.event_utils import (
 from app.prompts.relevant_parties_prompts import (
     classify_relevant_parties_prompt,
 )
-from app.rag.page_kinds import index_pages
+from app.rag.page_kinds import avoid_pages
 from app.socket.handlers.party_details import (
     SOURCE_DOC_NAME_MAX,
     details_counts,
@@ -408,7 +408,7 @@ class RelevantPartiesMixin:
             # The page holding the details the panel shows, else the first
             # page naming the party; never the paper-book's index (SIM-192).
             text = content.get(doc_id, "")
-            skip = index_pages_by_doc.setdefault(doc_id, index_pages(text))
+            skip = index_pages_by_doc.setdefault(doc_id, avoid_pages(text))
             name = str(party.get("name") or "").strip()
             bare = self._PARTY_PREFIX_RE.sub("", name).strip()
             page = details_page(text, party, skip=skip) or first_mention_page(

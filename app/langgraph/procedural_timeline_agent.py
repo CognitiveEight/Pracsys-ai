@@ -41,7 +41,7 @@ from app.llm.errors import is_generation_error
 from app.utils.redact import chars
 
 from app.langgraph.list_of_dates_agent import snap_hallucinated_year
-from app.rag.page_kinds import anchor_page, date_forms, index_pages
+from app.rag.page_kinds import date_forms, resolve_entry_page
 from app.prompts.legal_intelligence_system import (
     APP_BRAND_EXCLUSION_DIRECTIVE,
     ENGLISH_ONLY_OUTPUT_DIRECTIVE,
@@ -1005,30 +1005,25 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
 
         Order of preference:
           1. Explicit ``pageNumber`` on the entry (set by the LLM or copied
-             from the matching raw entry), unless it is a paper-book index
-             page (SIM-192).
-          2. The page that carries the entry's title/description/date in
-             ``document_text``, skipping index pages
-             (``app.rag.page_kinds.anchor_page``).
+             from the matching raw entry), only when the entry's date or quote
+             is on that page and it is not a paper-book index / list of
+             dates / synopsis page (SIM-192).
+          2. The page that carries the entry's quote/date/title in
+             ``document_text``, skipping those pages
+             (``app.rag.page_kinds.resolve_entry_page``).
           3. ``0`` when no page information is recoverable (the caller will
              omit the field from the emit payload — audio transcripts and
              single-page notes legitimately have no page number).
         """
-        text = document_text or ""
-        skip = index_pages(text)
-        raw_page = item.get("pageNumber")
-        if isinstance(raw_page, str) and raw_page.strip().isdigit():
-            raw_page = int(raw_page.strip())
-        if isinstance(raw_page, int) and raw_page > 0 and raw_page not in skip:
-            return raw_page
-        page = anchor_page(
-            text,
+        page = resolve_entry_page(
+            document_text or "",
+            item.get("pageNumber"),
             [
+                str(item.get("evidenceSnippet") or item.get("excerpt") or ""),
+                *date_forms(str(item.get("date") or "")),
                 str(item.get("title") or ""),
                 str(item.get("description") or ""),
-                *date_forms(str(item.get("date") or "")),
             ],
-            skip=skip,
         )
         return page or 0
 

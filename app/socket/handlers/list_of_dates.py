@@ -29,7 +29,7 @@ from app.langgraph.list_of_dates_agent import (
 from app.workspace.custom_instructions import (build_custom_instruction_suffix)
 
 from app.rag.packing import fit_to_budget, panel_context_budget
-from app.rag.page_kinds import anchor_page, date_forms, index_pages, page_markers
+from app.rag.page_kinds import date_forms, resolve_entry_page
 from app.socket.event_utils import (
     gather_bounded,
     scrub_app_brand,
@@ -603,29 +603,21 @@ class ListOfDatesMixin:
                 item_payload: Dict[str, Any], source_content: str
             ) -> Optional[int]:
                 """
-                Page of the entry: the model's value unless it is a paper-book
-                index page, else where the date/title/description is in the
-                text, skipping index pages (SIM-192). 1 for a document without
-                page markers; None (field omitted) when the entry cannot be
-                placed, rather than a guessed page 1.
+                Page of the entry (SIM-192): the model's page only when the
+                entry's date or quote is on it and it is not the index / list
+                of dates / synopsis; else where the entry is in the text. None
+                (field omitted) when the document has no pages or the entry
+                cannot be placed: never a guessed page 1.
                 """
-                skip = index_pages(source_content or "")
-                raw_page = item_payload.get("pageNumber")
-                if isinstance(raw_page, str) and raw_page.strip().isdigit():
-                    raw_page = int(raw_page.strip())
-                if isinstance(raw_page, int) and raw_page > 0 and raw_page not in skip:
-                    return raw_page
-                if not page_markers(source_content or ""):
-                    return 1
-                return anchor_page(
-                    source_content,
+                return resolve_entry_page(
+                    source_content or "",
+                    item_payload.get("pageNumber"),
                     [
                         str(item_payload.get("evidenceSnippet") or ""),
                         *date_forms(str(item_payload.get("date") or "")),
                         str(item_payload.get("title") or ""),
                         str(item_payload.get("description") or ""),
                     ],
-                    skip=skip,
                 )
 
             def _extract_explicit_dates(source_content: str) -> set[str]:

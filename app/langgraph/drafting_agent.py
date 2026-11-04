@@ -4167,8 +4167,11 @@ class DraftingAgent:
                 request_fields.get("templateId"), request_fields.get("templateVersion")
             )
         else:
+            # A draft never saved has no session (None): a blank draft's first
+            # message, and every retry after it, crashed here (SIM-191).
             pin_template_version(
-                session_state.get("template_id"), session_state.get("template_version")
+                (session_state or {}).get("template_id"),
+                (session_state or {}).get("template_version"),
             )
 
         # Greeting fast-path — runs BEFORE any drafting-state branch.

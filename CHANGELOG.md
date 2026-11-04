@@ -116,6 +116,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SIM-191: a new blank draft in the Drafting Assistant works again.** Its
+  first message, and every retry, replied "I ran into an issue while preparing
+  the draft" (`'NoneType' object has no attribute 'get'`). SIM-173 pinned the
+  template version from `session_state`, which is None for a draft never
+  saved, and a blank draft sends no `templateId`. The read is now guarded like
+  the code around it. Drafts started from a template were not affected.
+  Coverage: `tests/test_drafting_blank_draft.py`.
+
 - **Chat replies keep their bullet points and headings.** The citation checker
   splits a reply into sentences and joins them back, and a line break straight
   after a full stop was never part of any sentence, so it was dropped: every

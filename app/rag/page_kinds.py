@@ -18,8 +18,9 @@ Conservative on purpose: a page is only an index when it looks like one, so a
 document without an index cites exactly as before.
 """
 
+import hashlib
 import re
-from typing import Dict, Set
+from typing import Collection, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 from app.rag.chunker import PAGE_MARKER_RE
 
@@ -79,10 +80,30 @@ def continues_index(page_text: str) -> bool:
     return _ranges(page_text) >= _MIN_RANGES and _numbered_rows(lines) >= _MIN_ROWS
 
 
-def index_pages(text: str) -> Set[int]:
-    """Page numbers of every index in ``text`` (empty when it has none)."""
+#: Results by a digest of the text, never the text itself: a deleted case's
+#: documents must not stay in memory (the workspace purge cannot reach
+#: module-level state). Holds only page numbers.
+_INDEX_CACHE: Dict[str, FrozenSet[int]] = {}
+_INDEX_CACHE_MAX = 256
+
+
+def index_pages(text: str) -> FrozenSet[int]:
+    """Page numbers of every index in ``text`` (empty when it has none).
+
+    Cached by digest: the panel builders ask once per entry of a document."""
+    key = hashlib.sha256((text or "").encode("utf-8", "ignore")).hexdigest()
+    hit = _INDEX_CACHE.get(key)
+    if hit is not None:
+        return hit
+    if len(_INDEX_CACHE) >= _INDEX_CACHE_MAX:
+        _INDEX_CACHE.clear()
+    _INDEX_CACHE[key] = found = _find_index_pages(text)
+    return found
+
+
+def _find_index_pages(text: str) -> FrozenSet[int]:
     pages = split_pages(text)
-    found: Set[int] = set()
+    found = set()
     numbers = sorted(pages)
     i = 0
     while i < len(numbers):
@@ -99,4 +120,70 @@ def index_pages(text: str) -> Set[int]:
             found.add(numbers[j])
             j += 1
         i = j
-    return found
+    return frozenset(found)
+
+
+#: Both marker styles the stored text carries: ``--- Page N ---`` and the
+#: older ``-- N of M --``.
+_ANY_PAGE_MARKER_RE = re.compile(r"---\s*Page\s+(\d+)\s*---|--\s*(\d+)\s+of\s+\d+\s*--", re.I)
+
+
+def page_markers(text: str) -> List[Tuple[int, int]]:
+    """``(offset, page)`` of every page marker in ``text``, in order."""
+    return [
+        (m.start(), int(m.group(1) or m.group(2)))
+        for m in _ANY_PAGE_MARKER_RE.finditer(text or "")
+    ]
+
+
+def _page_at(markers: List[Tuple[int, int]], pos: int) -> Optional[int]:
+    page = None
+    for at, number in markers:
+        if at > pos:
+            break
+        page = number if number > 0 else page
+    return page
+
+
+def anchor_page(
+    text: str, anchors: Iterable[str], *, skip: Optional[Collection[int]] = None
+) -> Optional[int]:
+    """Page of the first anchor found in ``text``, outside its index pages.
+
+    ``anchors`` are tried in order of preference (case-insensitive, at least 4
+    characters). Every occurrence counts, so a date restated in the index is
+    placed on the page that actually carries it. An anchor found only in the
+    index gives the index page, as a last resort. None when the text has no
+    page markers or no anchor is in it: callers must not guess a page then.
+    """
+    markers = page_markers(text)
+    if not markers:
+        return None
+    skip = index_pages(text) if skip is None else skip
+    haystack = text.lower()
+    fallback: Optional[int] = None
+    for anchor in anchors:
+        needle = str(anchor or "").strip().lower()
+        if len(needle) < 4:
+            continue
+        pos = haystack.find(needle)
+        while pos >= 0:
+            page = _page_at(markers, pos)
+            if page is not None and page not in skip:
+                return page
+            if fallback is None:
+                fallback = page
+            pos = haystack.find(needle, pos + 1)
+    return fallback
+
+
+def date_forms(iso: str) -> List[str]:
+    """An ISO date as documents write it (12.03.2024, 12/03/2024, ...), the
+    ISO form included, so a chronology entry can be found on its page."""
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", (iso or "").strip())
+    if not m:
+        return [iso] if iso else []
+    y, mo, d = m.groups()
+    forms = [f"{d}.{mo}.{y}", f"{d}/{mo}/{y}", f"{d}-{mo}-{y}", f"{y}-{mo}-{d}",
+             f"{int(d)}.{int(mo)}.{y}", f"{int(d)}/{int(mo)}/{y}"]
+    return list(dict.fromkeys(forms))

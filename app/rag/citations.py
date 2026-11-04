@@ -27,7 +27,7 @@ unsupported claim warrants a regeneration.
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from app.rag.evidence import CHECKABLE_KINDS, EvidenceItem, EvidencePack
 
@@ -151,6 +151,8 @@ def _best_quote(item: EvidenceItem, claim: str) -> Tuple[str, int]:
             continue
         words = set(_WORD_RE.findall(sent.lower()))
         score = len(words & claim_words) + 3 * len(_figures(sent) & claim_figs)
+        if item.index_pages and item.page_at(start) in item.index_pages:
+            score -= 1000  # a paper-book index line only when nothing else matches
         if score > best_score:
             best, best_score, best_at = sent, score, start
     if len(best) > _QUOTE_MAX:
@@ -181,6 +183,52 @@ def sheet_location(item: EvidenceItem, quote: str, at: int) -> Dict[str, Any]:
     return out
 
 
+#: A figure-free claim moves off an index passage only to a passage of the
+#: same document sharing at least this share of its words.
+_INDEX_REPOINT_MIN_OVERLAP = 0.5
+
+
+def _off_the_index(
+    bare: str,
+    figs: Set[str],
+    labels: List[str],
+    doc_labels: List[str],
+    pack: EvidencePack,
+    figure_home: Callable[[str], List[str]],
+    report: "CitationReport",
+) -> Tuple[List[str], List[str]]:
+    """Re-point a sentence that cites only paper-book index passages (SIM-192).
+
+    The index lists every party and every annexure's date, so a model given
+    whole documents often cites it. When the sentence's figures are on a real
+    page, or (figure-free) a passage of the same document shares most of its
+    words, that passage is cited instead. Otherwise the index citation stays.
+    """
+    if not doc_labels or not all(pack.items[lbl].is_index_only() for lbl in doc_labels):
+        return labels, doc_labels
+    target = None
+    for fig in sorted(figs):
+        homes = [h for h in figure_home(fig) if not pack.items[h].is_index_only()]
+        if homes:
+            target = homes[0]
+            break
+    if target is None and not figs:
+        words = {w for w in _WORD_RE.findall(bare.lower()) if len(w) > 3 and not w.isdigit()}
+        same_doc = {pack.items[lbl].document_id for lbl in doc_labels}
+        best = 0.0
+        for d in pack.checkable():
+            if d.document_id not in same_doc or d.is_index_only() or not words:
+                continue
+            share = len(words & set(_WORD_RE.findall(d.text.lower()))) / len(words)
+            if share >= _INDEX_REPOINT_MIN_OVERLAP and share > best:
+                best, target = share, d.label
+    if target is None:
+        return labels, doc_labels
+    report.repointed.append(("index", ",".join(doc_labels), target))
+    labels = [target] + [lbl for lbl in labels if lbl not in doc_labels and lbl != target]
+    return labels, [target]
+
+
 def verify_and_number(
     answer: str, pack: EvidencePack
 ) -> Tuple[str, List[Dict[str, Any]], CitationReport]:
@@ -195,7 +243,9 @@ def verify_and_number(
     doc_text_norm = {i.label: _normalised(i.text) for i in docs}
 
     def figure_home(fig: str) -> List[str]:
-        return [lbl for lbl, txt in doc_text_norm.items() if contains_figure(txt, fig)]
+        # A paper-book index restates every date: list it last (SIM-192).
+        homes = [lbl for lbl, txt in doc_text_norm.items() if contains_figure(txt, fig)]
+        return sorted(homes, key=lambda lbl: pack.items[lbl].is_index_only())
 
     # --- sentence by sentence: validate labels, check figures, repair
     rebuilt: List[str] = []
@@ -212,6 +262,7 @@ def verify_and_number(
         bare = re.sub(r"[ \t]+([.,;:!?])", r"\1", _LABEL_GROUP_RE.sub("", sentence))
         doc_labels = [l for l in labels if pack.items[l].kind in CHECKABLE_KINDS]
         figs = _figures(bare)
+        labels, doc_labels = _off_the_index(bare, figs, labels, doc_labels, pack, figure_home, report)
         for fig in sorted(figs):
             if doc_labels and any(contains_figure(doc_text_norm.get(l, ""), fig) for l in doc_labels):
                 continue

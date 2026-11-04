@@ -26,7 +26,7 @@ in the pack is recognised as invented.
 
 import re
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 _PAGE_MARKER_RE = re.compile(r"---\s*Page\s+(\d+)\s*---", re.I)
 
@@ -57,6 +57,16 @@ class EvidenceItem:
     row_offsets: Optional[List[List[Any]]] = None
     #: Knowledge-base passages: the shelf category (judgment, statute, ...).
     category: Optional[str] = None
+    #: Pages of this passage's document that are a paper-book index
+    #: (app/rag/page_kinds.py): cited only when nothing else supports a claim.
+    index_pages: Tuple[int, ...] = ()
+
+    def is_index_only(self) -> bool:
+        """The whole passage lies on index pages."""
+        if not self.index_pages or not self.page_start:
+            return False
+        end = self.page_end or self.page_start
+        return all(p in self.index_pages for p in range(self.page_start, end + 1))
 
     def row_at(self, offset: int) -> Optional[int]:
         """Spreadsheet row of a character offset inside this passage."""
@@ -287,6 +297,8 @@ def location_label(item: EvidenceItem) -> str:
             if not item.page_end or item.page_end == item.page_start
             else f"pp. {item.page_start}–{item.page_end}"
         )
+    if item.is_index_only():
+        where.append("paper-book index: cite the passage it points to, not this one")
     if item.time_start:
         where.append(f"at {item.time_start}")
     if item.sheet:

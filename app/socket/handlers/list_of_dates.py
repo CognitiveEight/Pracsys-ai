@@ -29,6 +29,7 @@ from app.langgraph.list_of_dates_agent import (
 from app.workspace.custom_instructions import (build_custom_instruction_suffix)
 
 from app.rag.packing import fit_to_budget, panel_context_budget
+from app.rag.page_kinds import anchor_page, date_forms, index_pages, page_markers
 from app.socket.event_utils import (
     gather_bounded,
     scrub_app_brand,
@@ -598,79 +599,34 @@ class ListOfDatesMixin:
                 text = f"{title} {description} {source_name}".strip()
                 return bool(background_timeline_pattern.search(text))
 
-            def _extract_page_markers(source_content: str) -> List[Tuple[int, int]]:
-                """
-                Extract page markers and their positions from OCR/plain text dumps.
-                Supports markers like:
-                - --- Page 3 ---
-                - -- 3 of 15 --
-                """
-                markers: List[Tuple[int, int]] = []
-                if not source_content:
-                    return markers
-                for m in re.finditer(r"---\s*Page\s+(\d+)\s*---", source_content, re.I):
-                    try:
-                        markers.append((m.start(), int(m.group(1))))
-                    except Exception:
-                        continue
-                for m in re.finditer(r"--\s*(\d+)\s+of\s+\d+\s*--", source_content, re.I):
-                    try:
-                        markers.append((m.start(), int(m.group(1))))
-                    except Exception:
-                        continue
-                markers.sort(key=lambda x: x[0])
-                return markers
-
             def _resolve_page_number(
                 item_payload: Dict[str, Any], source_content: str
-            ) -> int:
+            ) -> Optional[int]:
                 """
-                Ensure pageNumber is always an integer.
-                Uses model value when valid, then tries PDF page markers, then defaults to 1.
+                Page of the entry: the model's value unless it is a paper-book
+                index page, else where the date/title/description is in the
+                text, skipping index pages (SIM-192). 1 for a document without
+                page markers; None (field omitted) when the entry cannot be
+                placed, rather than a guessed page 1.
                 """
+                skip = index_pages(source_content or "")
                 raw_page = item_payload.get("pageNumber")
-                if isinstance(raw_page, int) and raw_page > 0:
+                if isinstance(raw_page, str) and raw_page.strip().isdigit():
+                    raw_page = int(raw_page.strip())
+                if isinstance(raw_page, int) and raw_page > 0 and raw_page not in skip:
                     return raw_page
-                if isinstance(raw_page, str):
-                    raw_page = raw_page.strip()
-                    if raw_page.isdigit() and int(raw_page) > 0:
-                        return int(raw_page)
-
-                if source_content:
-                    page_markers = _extract_page_markers(source_content)
-                    if page_markers:
-                        # Try to anchor by date/title/description and map to nearest prior page marker.
-                        anchors = [
-                            str(item_payload.get("date") or "").strip(),
-                            str(item_payload.get("title") or "").strip(),
-                            str(item_payload.get("description") or "").strip(),
-                        ]
-                        haystack = source_content.lower()
-                        pos = -1
-                        for anchor in anchors:
-                            if len(anchor) < 4:
-                                continue
-                            pos = haystack.find(anchor.lower())
-                            if pos >= 0:
-                                break
-                        if pos >= 0:
-                            nearest = 1
-                            for marker_pos, marker_page in page_markers:
-                                if marker_pos <= pos:
-                                    try:
-                                        nearest = int(marker_page)
-                                    except Exception:
-                                        nearest = 1
-                                else:
-                                    break
-                            return nearest if nearest > 0 else 1
-                        # Page markers exist but anchor was not found; default to first marker page.
-                        try:
-                            first_page = int(page_markers[0][1])
-                            return first_page if first_page > 0 else 1
-                        except Exception:
-                            return 1
-                return 1
+                if not page_markers(source_content or ""):
+                    return 1
+                return anchor_page(
+                    source_content,
+                    [
+                        str(item_payload.get("evidenceSnippet") or ""),
+                        *date_forms(str(item_payload.get("date") or "")),
+                        str(item_payload.get("title") or ""),
+                        str(item_payload.get("description") or ""),
+                    ],
+                    skip=skip,
+                )
 
             def _extract_explicit_dates(source_content: str) -> set[str]:
                 """Extract explicit full dates from source text as YYYY-MM-DD."""
@@ -1048,6 +1004,8 @@ class ListOfDatesMixin:
                     "eventType": normalized_event_type,
                     "relevance": (item.get("relevance") or "").strip() or None,
                 }
+                if not page_number:
+                    del entry["pageNumber"]  # unplaceable: no page, never a guessed 1
                 # For frontend compatibility: many UIs expect a generic 'source'/'sourceAnswer' field.
                 # Populate these from the resolved document name so UI does not show "N/A".
                 if source_doc_name:
@@ -1113,7 +1071,11 @@ class ListOfDatesMixin:
             for (idx, source_content), rel_events in zip(doc_items, events_by_doc):
                 for e in rel_events or []:
                     # Resolve best-effort page for inferred temporal events too.
-                    e["pageNumber"] = _resolve_page_number(e, source_content)
+                    page = _resolve_page_number(e, source_content)
+                    if page:
+                        e["pageNumber"] = page
+                    else:
+                        e.pop("pageNumber", None)
                     key = (
                         str(e.get("sourceDocId") or "").strip(),
                         str(e.get("date") or "").strip(),

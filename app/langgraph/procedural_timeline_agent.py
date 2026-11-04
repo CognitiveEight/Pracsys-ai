@@ -41,6 +41,7 @@ from app.llm.errors import is_generation_error
 from app.utils.redact import chars
 
 from app.langgraph.list_of_dates_agent import snap_hallucinated_year
+from app.rag.page_kinds import anchor_page, date_forms, index_pages
 from app.prompts.legal_intelligence_system import (
     APP_BRAND_EXCLUSION_DIRECTIVE,
     ENGLISH_ONLY_OUTPUT_DIRECTIVE,
@@ -1004,61 +1005,32 @@ Output ONLY the JSON array — no markdown fences, no commentary."""
 
         Order of preference:
           1. Explicit ``pageNumber`` on the entry (set by the LLM or copied
-             from the matching raw entry).
-          2. ``--- Page N ---`` / ``-- N of M --`` markers in ``document_text``,
-             choosing the marker that precedes the entry's evidence anchors
-             (title/description/date) closest in the text.
+             from the matching raw entry), unless it is a paper-book index
+             page (SIM-192).
+          2. The page that carries the entry's title/description/date in
+             ``document_text``, skipping index pages
+             (``app.rag.page_kinds.anchor_page``).
           3. ``0`` when no page information is recoverable (the caller will
              omit the field from the emit payload — audio transcripts and
              single-page notes legitimately have no page number).
         """
-        raw_page = item.get("pageNumber")
-        if isinstance(raw_page, int) and raw_page > 0:
-            return raw_page
-        if isinstance(raw_page, str):
-            p = raw_page.strip()
-            if p.isdigit() and int(p) > 0:
-                return int(p)
-
         text = document_text or ""
-        markers: List[tuple[int, int]] = []
-        for m in re.finditer(r"---\s*Page\s+(\d+)\s*---", text, flags=re.I):
-            try:
-                markers.append((m.start(), int(m.group(1))))
-            except (TypeError, ValueError):
-                continue
-        for m in re.finditer(r"--\s*(\d+)\s+of\s+\d+\s*--", text, flags=re.I):
-            try:
-                markers.append((m.start(), int(m.group(1))))
-            except (TypeError, ValueError):
-                continue
-        if not markers:
-            return 0
-        markers.sort(key=lambda x: x[0])
-
-        anchors = [
-            str(item.get("title") or "").strip(),
-            str(item.get("description") or "").strip(),
-            str(item.get("date") or "").strip(),
-        ]
-        haystack = text.lower()
-        pos = -1
-        for anchor in anchors:
-            if len(anchor) < 4:
-                continue
-            pos = haystack.find(anchor.lower())
-            if pos >= 0:
-                break
-        if pos < 0:
-            return markers[0][1] if markers and markers[0][1] > 0 else 0
-
-        page = 0
-        for marker_pos, marker_page in markers:
-            if marker_pos <= pos and marker_page > 0:
-                page = marker_page
-            else:
-                break
-        return page
+        skip = index_pages(text)
+        raw_page = item.get("pageNumber")
+        if isinstance(raw_page, str) and raw_page.strip().isdigit():
+            raw_page = int(raw_page.strip())
+        if isinstance(raw_page, int) and raw_page > 0 and raw_page not in skip:
+            return raw_page
+        page = anchor_page(
+            text,
+            [
+                str(item.get("title") or ""),
+                str(item.get("description") or ""),
+                *date_forms(str(item.get("date") or "")),
+            ],
+            skip=skip,
+        )
+        return page or 0
 
     # ------------------------------------------------------------------ public
 

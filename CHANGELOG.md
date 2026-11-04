@@ -168,6 +168,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Timeline, Analysis Report, Strategy case summary, Applicable Laws) skip
     index pages and cite one only when nothing else supports the item.
     Documents without an index cite exactly as before.
+  - When no supporting passage is found, List of Dates and Procedural
+    Timeline used to keep the model's page or the first page with a matching
+    word (the index), and List of Dates defaulted to 1. They now ignore a
+    model page that is an index page, place the entry by `anchor_page`
+    (skipping the index) and **omit `pageNumber`** when the entry cannot be
+    placed. Payload change: a `list_of_dates` entry can now arrive without
+    `pageNumber` (it was always an integer; `procedural_timeline` already
+    omitted it). A document without page markers still gets 1. The prompt no
+    longer tells the model to default to 1. The lookup also searches the
+    date as documents write it (12.03.2024, 12/03/2024), not only the ISO
+    form, and caches index pages by a digest of the text, never the text.
+  - Chat: index passages are marked for the model, ranked after real pages in
+    retrieval, and a sentence citing only an index passage is re-pointed to
+    the passage holding its date/figure or (no figure) a same-document passage
+    sharing most of its words. An uncited date is attached to a real page
+    before the index. Quotes avoid index lines inside a mixed passage.
   Coverage: `tests/test_index_pages.py`.
 
 - **Chat replies keep their bullet points and headings.** The citation checker

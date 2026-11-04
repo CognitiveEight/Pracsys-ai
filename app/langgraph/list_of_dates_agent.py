@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, TypedDict
 from langgraph.graph import END, START, StateGraph
 from loguru import logger
 from app.rag.packing import fit_to_budget
+from app.rag.page_kinds import anchor_page, date_forms, index_pages, page_markers
 
 from app.prompts.legal_intelligence_system import ENGLISH_ONLY_OUTPUT_DIRECTIVE
 
@@ -554,61 +555,28 @@ Legal text:
         if not isinstance(arr, list):
             arr = []
 
-        def _extract_page_markers(text: str) -> List[tuple[int, int]]:
-            markers: List[tuple[int, int]] = []
-            if not text:
-                return markers
-            for m in re.finditer(r"---\s*Page\s+(\d+)\s*---", text, flags=re.I):
-                try:
-                    markers.append((m.start(), int(m.group(1))))
-                except Exception:
-                    continue
-            for m in re.finditer(r"--\s*(\d+)\s+of\s+\d+\s*--", text, flags=re.I):
-                try:
-                    markers.append((m.start(), int(m.group(1))))
-                except Exception:
-                    continue
-            markers.sort(key=lambda x: x[0])
-            return markers
-
-        def _resolve_page_from_text(item: Dict[str, Any], text: str) -> int:
+        def _resolve_page_from_text(item: Dict[str, Any], text: str) -> Optional[int]:
+            # The model's page unless it is a paper-book index page, else where
+            # the entry is in the text outside the index (SIM-192). 1 for text
+            # without page markers; None when the entry cannot be placed.
+            skip = index_pages(text or "")
             raw_page = item.get("pageNumber")
-            if isinstance(raw_page, int) and raw_page > 0:
+            if isinstance(raw_page, str) and raw_page.strip().isdigit():
+                raw_page = int(raw_page.strip())
+            if isinstance(raw_page, int) and raw_page > 0 and raw_page not in skip:
                 return raw_page
-            if isinstance(raw_page, str):
-                p = raw_page.strip()
-                if p.isdigit() and int(p) > 0:
-                    return int(p)
-
-            markers = _extract_page_markers(text)
-            if not markers:
+            if not page_markers(text or ""):
                 return 1
-
-            anchors = [
-                str(item.get("evidenceSnippet") or "").strip(),
-                str(item.get("date") or "").strip(),
-                str(item.get("title") or "").strip(),
-                str(item.get("description") or "").strip(),
-            ]
-            haystack = (text or "").lower()
-            pos = -1
-            for anchor in anchors:
-                if len(anchor) < 4:
-                    continue
-                pos = haystack.find(anchor.lower())
-                if pos >= 0:
-                    break
-
-            if pos < 0:
-                return markers[0][1] if markers and markers[0][1] > 0 else 1
-
-            page = 1
-            for marker_pos, marker_page in markers:
-                if marker_pos <= pos:
-                    page = marker_page if marker_page > 0 else page
-                else:
-                    break
-            return page if page > 0 else 1
+            return anchor_page(
+                text,
+                [
+                    str(item.get("evidenceSnippet") or ""),
+                    *date_forms(str(item.get("date") or "")),
+                    str(item.get("title") or ""),
+                    str(item.get("description") or ""),
+                ],
+                skip=skip,
+            )
 
         # Patterns that indicate garbage/scraped-UI content in description or evidence
         _GARBAGE_PATTERNS = re.compile(

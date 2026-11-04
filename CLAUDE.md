@@ -396,7 +396,8 @@ local Qdrant.
   It gives no citation rather than a weak one.
 - A paper-book's INDEX pages (`app/rag/page_kinds.index_pages`) are cited
   only when nothing else supports the item. Never pick "the first page that
-  mentions X" without skipping them: the index mentions everything.
+  mentions X" without skipping them: the index mentions everything. Place a
+  page with `page_kinds.anchor_page`, and give no page rather than a guessed 1.
 - **All fields it adds are additive.** Never change an item's type to carry a
   citation.
 

@@ -73,6 +73,7 @@ class Attributor:
                 chunk, annexure=annexure_of.get(did), file_name=names.get(did) or None
             )
             if item is not None:
+                item.index_pages = tuple(sorted(self.index_pages_of.get(did, ())))
                 self.items.append(
                     (item, _normalised(item.text), set(tokens(item.text)))
                 )

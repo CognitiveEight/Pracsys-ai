@@ -371,7 +371,25 @@ recall citations that are not listed here.
             name = (p.get("name") or "N/A").strip()
             role = (p.get("role") or "Other").strip()
             desc = (p.get("details") or p.get("description") or "").strip()
-            party_lines.append(f"- {name} [{role}]: {desc}".rstrip(": "))
+            line = f"- {name} [{role}]: {desc}".rstrip(": ")
+            # Contact/identity details (SIM-186); identity numbers are masked.
+            extras = []
+            if (p.get("address") or "").strip():
+                extras.append(f"address: {p['address'].strip()}")
+            if (p.get("email") or "").strip():
+                extras.append(f"email: {p['email'].strip()}")
+            if (p.get("contactNumber") or "").strip():
+                extras.append(f"phone: {p['contactNumber'].strip()}")
+            ids = [
+                f"{i.get('label') or i.get('type')} {i.get('value')}"
+                for i in (p.get("identifiers") or [])
+                if isinstance(i, dict) and i.get("value")
+            ]
+            if ids:
+                extras.append("IDs (masked): " + ", ".join(ids))
+            if extras:
+                line += " | " + "; ".join(extras)
+            party_lines.append(line)
         parties_section = f"""
 RELEVANT PARTIES ({len(relevant_parties)} identified):
 {chr(10).join(party_lines)}

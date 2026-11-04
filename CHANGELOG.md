@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SIM-186: Relevant Parties shows each party's address, email, phone and
+  masked ID numbers.** Lawyers no longer have to find them in the documents
+  by hand.
+  - The per-document party extractor (Relevant Parties only) also returns
+    each party's address, emails, phones and identity numbers (Aadhaar, PAN,
+    passport, voter ID, driving licence, bank account, Udyam, GSTIN, CIN).
+  - Every value is checked against the text of the document it came from and
+    dropped if it is not there. The details are attached after
+    classification, so the classify call cannot lose or alter them.
+  - Identity numbers are always masked, at most the last 4 digits visible.
+    `_emit_document_feature` re-masks every identifier of this panel, so
+    GSTIN/CIN (not masked at ingestion), cache replays and numbers typed into
+    an edit all leave masked.
+  - A value already on the party (typed by the lawyer, or verified earlier)
+    wins over a new extraction, including on a full refresh.
+  - Chat about relevant parties sees the details.
+  - **Socket payload change**, aligned with the backend's SIM-184 contract.
+    `relevant_parties.parties[]` gains:
+    - `address`; `email` and `contactNumber` are now filled automatically
+      (several values joined with ", ");
+    - `sourceDocId` (the same evidence file id `list_of_dates` sends),
+      `sourceDocName` (≤ 500 chars) and `pageNumber` (page where the party
+      is first named, from the `--- Page N ---` markers);
+    - `identifiers: [{type, label, value, sourceDocId}]`, masked. **Not yet
+      in the backend contract.**
+
+    `address`, `email`, `contactNumber`, `sourceDocId`, `sourceDocName` and
+    `pageNumber` are **left out when unknown, never sent as ""** — a change
+    for `email` / `contactNumber`, which used to go out as "". A user-added
+    party has no source fields. `add_relevant_party` /
+    `edit_relevant_party` accept `address` and `identifiers: [{type, value}]`.
+  - Values are never logged: one line reports counts
+    (`relevant_parties details addresses= emails= phones= ids= dropped_unverified=`).
+  Coverage: `tests/test_party_details.py`,
+  `tests/offline/verify_relevant_party_details.py`.
+
 - **SIM-174: the AI reads the shared knowledge base and uses it for every
   case, in its panels and in chat.**
   The backend's three knowledge-base events had no handler, so documents

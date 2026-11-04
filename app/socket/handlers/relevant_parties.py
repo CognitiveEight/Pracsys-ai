@@ -24,6 +24,16 @@ from app.socket.event_utils import (
 from app.prompts.relevant_parties_prompts import (
     classify_relevant_parties_prompt,
 )
+from app.socket.handlers.party_details import (
+    SOURCE_DOC_NAME_MAX,
+    details_counts,
+    empty_details,
+    first_mention_page,
+    merge_party_details,
+    normalize_identifiers,
+    party_details_of,
+    verify_party_details,
+)
 from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
@@ -135,10 +145,13 @@ class RelevantPartiesMixin:
                     "name": name,
                     "role": self._normalize_party_role(item.get("role")),
                     "details": details,
-                    # PII — empty on auto-gen; only the user fills these in via
-                    # the add/edit_relevant_party panel-edit events.
+                    # Contact/identity details (SIM-186) are attached after
+                    # classification from verified extraction output, or typed
+                    # by the user; identifiers are always masked.
+                    "address": str(item.get("address") or "").strip(),
                     "contactNumber": str(item.get("contactNumber") or "").strip(),
                     "email": str(item.get("email") or "").strip(),
+                    "identifiers": normalize_identifiers(item.get("identifiers")),
                     "officialIdUrl": str(item.get("officialIdUrl") or "").strip(),
                 }
             )
@@ -309,6 +322,11 @@ class RelevantPartiesMixin:
                 existing["sourceDocIds"] = union
                 if p.get("userAdded"):
                     existing["userAdded"] = True
+                # The kept (earlier) entry's details win; the later one only
+                # fills blanks, so a lawyer's edit is never overwritten.
+                existing.update(
+                    merge_party_details(party_details_of(existing), party_details_of(p))
+                )
                 continue
             merged.append(
                 {
@@ -318,8 +336,7 @@ class RelevantPartiesMixin:
                     "details": str(
                         p.get("details") or p.get("description") or ""
                     ).strip(),
-                    "contactNumber": str(p.get("contactNumber") or "").strip(),
-                    "email": str(p.get("email") or "").strip(),
+                    **party_details_of(p),
                     "officialIdUrl": str(p.get("officialIdUrl") or "").strip(),
                     "sourceDocIds": self._party_source_doc_ids(p),
                     "userAdded": bool(p.get("userAdded")),
@@ -331,6 +348,65 @@ class RelevantPartiesMixin:
         for i, p in enumerate(merged):
             p["id"] = f"party_{i + 1}"
         return {"parties": merged}
+
+    def _document_names(
+        self, workspace_id: str, live_docs: List[Dict[str, Any]]
+    ) -> Dict[str, str]:
+        """documentId -> file name: the stored chunk metadata first, then the
+        cached document_assessments manifest (legacy stores carry no name)."""
+        names: Dict[str, str] = {}
+        cached = self._workspace_document_assessments_payload.get(workspace_id)
+        inner = (cached.get("payload") or {}) if isinstance(cached, dict) else {}
+        for entry in inner.get("documentAssessments") or []:
+            if isinstance(entry, dict) and entry.get("documentId"):
+                name = self._assessment_entry_name(entry)
+                if name:
+                    names[str(entry["documentId"]).strip()] = name
+        for d in live_docs:
+            did = str(d.get("document_id") or "").strip()
+            name = str(d.get("filename") or "").strip()
+            if did and name:
+                names[did] = name
+        return names
+
+    def _attach_party_sources(
+        self,
+        workspace_id: str,
+        parties: List[Dict[str, Any]],
+        live_docs: List[Dict[str, Any]],
+    ) -> None:
+        """Set ``sourceDocId`` / ``sourceDocName`` / ``pageNumber`` per party (SIM-184).
+
+        The source is the earliest live document (reading order) the party was
+        extracted from, the same document id list_of_dates sends; the page is
+        where the party is first named in it. Unknown fields are removed, not
+        set to "": a user-added party has no source document.
+        """
+        order = {
+            str(d.get("document_id") or "").strip(): i for i, d in enumerate(live_docs)
+        }
+        content = {
+            str(d.get("document_id") or "").strip(): d.get("content") or ""
+            for d in live_docs
+        }
+        names = self._document_names(workspace_id, live_docs)
+        for party in parties:
+            if not isinstance(party, dict):
+                continue
+            for field in ("sourceDocId", "sourceDocName", "pageNumber"):
+                party.pop(field, None)
+            live = [s for s in self._party_source_doc_ids(party) if s in order]
+            if not live:
+                continue
+            doc_id = min(live, key=lambda s: order[s])
+            party["sourceDocId"] = doc_id
+            if names.get(doc_id):
+                party["sourceDocName"] = names[doc_id][:SOURCE_DOC_NAME_MAX]
+            name = str(party.get("name") or "").strip()
+            bare = self._PARTY_PREFIX_RE.sub("", name).strip()
+            page = first_mention_page(content.get(doc_id, ""), [name, bare])
+            if page:
+                party["pageNumber"] = page
 
     def _tag_parties_against_current_state(
         self, workspace_id: str, payload: Dict[str, Any]
@@ -480,7 +556,9 @@ class RelevantPartiesMixin:
 
             async def _extract_one(doc_id: str) -> Tuple[str, List[Dict[str, Any]]]:
                 res = await self._extract_parties_subagent(
-                    workspace_id, content_by_id.get(doc_id, "")
+                    workspace_id,
+                    content_by_id.get(doc_id, ""),
+                    with_contact_details=True,
                 )
                 raws = res.get("parties") if isinstance(res, dict) else []
                 return doc_id, [r for r in (raws or []) if isinstance(r, dict)]
@@ -490,6 +568,11 @@ class RelevantPartiesMixin:
             )
             raw_all: List[Dict[str, Any]] = []
             src_docs_by_key: Dict[str, Set[str]] = {}
+            # Contact/identity details per name key, each value verified
+            # against the text of the document it was extracted from. They
+            # skip the classify call, which could only lose or alter them.
+            details_by_key: Dict[str, Dict[str, Any]] = {}
+            dropped_unverified = 0
             for r in results:
                 if isinstance(r, Exception) or not isinstance(r, tuple):
                     logger.warning("Relevant parties: per-doc extraction failed: {}", r)
@@ -500,9 +583,15 @@ class RelevantPartiesMixin:
                     if not nm:
                         continue
                     raw_all.append(raw)
-                    src_docs_by_key.setdefault(
-                        self._party_name_key(nm), set()
-                    ).add(doc_id)
+                    nk = self._party_name_key(nm)
+                    src_docs_by_key.setdefault(nk, set()).add(doc_id)
+                    details, dropped = verify_party_details(
+                        raw, content_by_id.get(doc_id, ""), source_doc_id=doc_id
+                    )
+                    dropped_unverified += dropped
+                    details_by_key[nk] = merge_party_details(
+                        details_by_key.get(nk) or empty_details(), details
+                    )
 
             if raw_all:
                 classified = await self._classify_relevant_parties(
@@ -519,12 +608,45 @@ class RelevantPartiesMixin:
                     cp = dict(cp)
                     cp["sourceDocIds"] = sorted(src_ids)
                     cp["userAdded"] = False
+                    extracted = empty_details()
+                    for rk, det in details_by_key.items():
+                        if self._party_names_match(ck, rk):
+                            extracted = merge_party_details(extracted, det)
+                    # A full refresh drops auto parties before this point, so
+                    # take the previous entry's details first: what the lawyer
+                    # typed (or an earlier verified value) wins.
+                    prev_match = next(
+                        (
+                            pp
+                            for pp in prev_parties
+                            if self._party_names_match(
+                                ck, self._party_name_key(pp.get("name"))
+                            )
+                        ),
+                        None,
+                    )
+                    if prev_match is not None:
+                        extracted = merge_party_details(
+                            party_details_of(prev_match), extracted
+                        )
+                    cp.update(extracted)
                     new_parties.append(cp)
+                counts = details_counts(new_parties)
+                logger.info(
+                    "relevant_parties details addresses={} emails={} phones={} ids={} "
+                    "dropped_unverified={}",
+                    counts["addresses"],
+                    counts["emails"],
+                    counts["phones"],
+                    counts["ids"],
+                    dropped_unverified,
+                )
 
         # 3) Merge carried-forward + newly-extracted (fuzzy dedup + provenance).
         payload = self._merge_relevant_parties_provenance(
             workspace_id, carried_prev, new_parties
         )
+        self._attach_party_sources(workspace_id, payload.get("parties") or [], live_docs)
         # Tag each party matched vs new against the frontend's currentState
         # (carry the FE id on match, else keep party_N). Cache the tagged
         # payload so reconnect re-emits the same ids.

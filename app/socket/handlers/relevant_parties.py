@@ -24,9 +24,11 @@ from app.socket.event_utils import (
 from app.prompts.relevant_parties_prompts import (
     classify_relevant_parties_prompt,
 )
+from app.rag.page_kinds import index_pages
 from app.socket.handlers.party_details import (
     SOURCE_DOC_NAME_MAX,
     details_counts,
+    details_page,
     empty_details,
     first_mention_page,
     merge_party_details,
@@ -390,6 +392,7 @@ class RelevantPartiesMixin:
             for d in live_docs
         }
         names = self._document_names(workspace_id, live_docs)
+        index_pages_by_doc: Dict[str, Set[int]] = {}
         for party in parties:
             if not isinstance(party, dict):
                 continue
@@ -402,9 +405,15 @@ class RelevantPartiesMixin:
             party["sourceDocId"] = doc_id
             if names.get(doc_id):
                 party["sourceDocName"] = names[doc_id][:SOURCE_DOC_NAME_MAX]
+            # The page holding the details the panel shows, else the first
+            # page naming the party; never the paper-book's index (SIM-192).
+            text = content.get(doc_id, "")
+            skip = index_pages_by_doc.setdefault(doc_id, index_pages(text))
             name = str(party.get("name") or "").strip()
             bare = self._PARTY_PREFIX_RE.sub("", name).strip()
-            page = first_mention_page(content.get(doc_id, ""), [name, bare])
+            page = details_page(text, party, skip=skip) or first_mention_page(
+                text, [name, bare], skip=skip
+            )
             if page:
                 party["pageNumber"] = page
 

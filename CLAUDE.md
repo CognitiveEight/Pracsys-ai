@@ -394,6 +394,9 @@ local Qdrant.
   from the stored passage, and the page is where that quote is.
 - It re-points a chronology entry whose date is not in its claimed document.
   It gives no citation rather than a weak one.
+- A paper-book's INDEX pages (`app/rag/page_kinds.index_pages`) are cited
+  only when nothing else supports the item. Never pick "the first page that
+  mentions X" without skipping them: the index mentions everything.
 - **All fields it adds are additive.** Never change an item's type to carry a
   citation.
 

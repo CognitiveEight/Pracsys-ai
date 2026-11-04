@@ -152,6 +152,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SIM-192: citations point at the evidence page, not the paper-book
+  index.** A court paper-book opens with an INDEX that names every party and
+  restates every annexure's date, so "the first page that matches" landed
+  there: a party whose phone and address are on page 11 showed "Page 1".
+  - `app/rag/page_kinds.py` finds index pages in the stored text: an INDEX /
+    TABLE OF CONTENTS heading near the top of a page that lists page
+    references, plus the following pages while they stay a list of page
+    ranges and numbered rows. Across the 55 test-case PDFs only the
+    paper-book is flagged (pages 1-3).
+  - Relevant Parties cites the page holding the party's verified details
+    (phone, email, ID, address), else the first page naming it outside the
+    index; a party named only in the index gets no page.
+  - Panel citations (`app/rag/attribution.py`: List of Dates, Procedural
+    Timeline, Analysis Report, Strategy case summary, Applicable Laws) skip
+    index pages and cite one only when nothing else supports the item.
+    Documents without an index cite exactly as before.
+  Coverage: `tests/test_index_pages.py`.
+
 - **Chat replies keep their bullet points and headings.** The citation checker
   splits a reply into sentences and joins them back, and a line break straight
   after a full stop was never part of any sentence, so it was dropped: every

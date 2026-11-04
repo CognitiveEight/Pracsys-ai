@@ -17,7 +17,7 @@ Pure functions, no I/O. Never log the values handled here.
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from app.rag.chunker import PAGE_MARKER_RE
+from app.rag.page_kinds import split_pages
 from app.processing.pii_detector import (
     _mask_keep_last,
     mask_aadhaar,
@@ -302,32 +302,65 @@ def mask_party_payload(payload: Any) -> None:
             del party["pageNumber"]
 
 
-def first_mention_page(text: str, names: Iterable[str]) -> Optional[int]:
-    """Page (from ``--- Page N ---`` markers) where any of ``names`` first appears.
+def first_mention_page(
+    text: str, names: Iterable[str], *, skip: Iterable[int] = ()
+) -> Optional[int]:
+    """First page (``--- Page N ---``) naming any of ``names``, outside ``skip``.
 
-    ``None`` when the text has no page markers (DOCX, audio, plain text) or no
-    name is found: the backend wants the field left out when unknown.
+    ``skip`` holds the document's index pages (SIM-192): a paper-book's index
+    names every party in its cause title, which made "Page 1" the citation for
+    everyone. ``None`` when the text has no page markers (DOCX, audio) or no
+    other page names the party: the backend wants the field left out then.
     """
-    if not text:
-        return None
-    markers = [(m.start(), int(m.group(1))) for m in PAGE_MARKER_RE.finditer(text)]
-    if not markers:
-        return None
-    lower = text.lower()
-    offsets = [
-        lower.find(n.strip().lower()) for n in names if n and len(n.strip()) >= 3
-    ]
-    offsets = [o for o in offsets if o >= 0]
-    if not offsets:
-        return None
-    first = min(offsets)
-    page = None
-    for start, number in markers:
-        if start > first:
-            break
-        page = number
-    return page if page is not None else markers[0][1]
+    wanted = [n.strip().lower() for n in names if n and len(n.strip()) >= 3]
+    skipped = set(skip)
+    for number, page_text in sorted(split_pages(text).items()):
+        if number in skipped:
+            continue
+        lower = page_text.lower()
+        if any(n in lower for n in wanted):
+            return number
+    return None
 
+
+def details_page(
+    text: str, party: Dict[str, Any], *, skip: Iterable[int] = ()
+) -> Optional[int]:
+    """First page, outside ``skip``, holding any of the party's verified details.
+
+    The panel shows the address, phone, email and IDs, so the page they were
+    read from is the citation a lawyer can check (SIM-192). ``None`` when the
+    party has no details or the text has no page markers.
+    """
+    phones = [_phone_digits(p) for p in _as_list(party.get("contactNumber"))]
+    phones = [p for p in phones if len(p) >= 8]
+    emails = [e.lower() for e in _as_list(party.get("email")) if "@" in e]
+    ids = [
+        _compact(i.get("value") or "")
+        for i in party.get("identifiers") or []
+        if isinstance(i, dict) and len(_compact(i.get("value") or "")) >= 6
+    ]
+    address = str(party.get("address") or "").strip()
+    if not (phones or emails or ids or address):
+        return None
+    skipped = set(skip)
+    for number, page_text in sorted(split_pages(text).items()):
+        if number in skipped:
+            continue
+        lower = page_text.lower()
+        digits = re.sub(r"\D", "", page_text)
+        compact = _compact(page_text)
+        if (
+            any(p in digits for p in phones)
+            or any(e in lower for e in emails)
+            or any(i in compact for i in ids)
+            or (
+                address
+                and _verify_address(address, lower, set(_WORD_RE.findall(lower)))
+            )
+        ):
+            return number
+    return None
 
 def details_counts(parties: Iterable[Dict[str, Any]]) -> Dict[str, int]:
     """How many parties carry each detail. For the log line; never log values."""

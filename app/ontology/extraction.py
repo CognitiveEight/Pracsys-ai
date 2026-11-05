@@ -128,10 +128,11 @@ def build_extraction_prompt(labels: Optional[Sequence[str]] = None) -> str:
     return f"""You extract structured legal facts from Indian litigation documents.
 
 Return ONLY a JSON object of the form:
-{{"nodes": [{{"label": "...", "properties": {{...}}, "confidence": 0.0-1.0}}],
+{{"nodes": [{{"label": "...", "properties": {{...}}, "confidence": 0.0-1.0,
+              "modality": "asserted|alleged|hedged|denied", "as_of": "..."}}],
   "edges": [{{"type": "...", "from": {{"label": "...", "key": "..."}},
               "to": {{"label": "...", "key": "..."}}, "properties": {{...}},
-              "confidence": 0.0-1.0}}]}}
+              "confidence": 0.0-1.0, "modality": "...", "as_of": "..."}}]}}
 
 NODE TYPES (properties marked * are required):
 {chr(10).join(node_lines)}
@@ -157,6 +158,16 @@ RULES
    (a Party's canonical_name, a Provision's section_number, and so on).
 8. Emit nothing rather than something uncertain. An empty result is a valid
    answer for a passage that contains no legal facts.
+9. `modality` says how the passage states the fact:
+   - "asserted": stated as true ("the respondent paid Rs. 5,00,000");
+   - "alleged": attributed to a party as their claim ("the complainant alleges
+     that the accused received ...");
+   - "hedged": possible, not stated ("may have", "likely", "it appears");
+   - "denied": the passage says it did NOT happen or is not true ("the accused
+     never received any amount"). Emit the fact being denied, with "denied".
+10. `as_of`: the date at which the passage says a status or value held
+   ("outstanding as on 01.03.2024"), in the text's own wording. Omit it when
+   the passage gives none; never use the document's date for it.
 """
 
 
@@ -403,6 +414,37 @@ def _normalise_dates(label: str, properties: Dict[str, Any]) -> Dict[str, Any]:
     return updated
 
 
+#: How a passage states a fact (rule 9 of the prompt). Hedged facts never
+#: reach the graph or the trust store; denied ones reach only the trust store,
+#: as denials (app/trust/claims.py).
+MODALITY_ASSERTED = "asserted"
+MODALITY_ALLEGED = "alleged"
+MODALITY_HEDGED = "hedged"
+MODALITY_DENIED = "denied"
+MODALITIES = (MODALITY_ASSERTED, MODALITY_ALLEGED, MODALITY_HEDGED, MODALITY_DENIED)
+
+
+def _statement(raw: Mapping[str, Any]) -> Dict[str, str]:
+    """The entry's ``modality`` (asserted when absent or unknown) and ``as_of``.
+
+    Both stay outside ``properties``: they describe the statement, not the
+    legal fact, and the graph schema does not carry them.
+    """
+    modality = str(raw.get("modality") or "").strip().lower()
+    if modality not in MODALITIES:
+        modality = MODALITY_ASSERTED
+    return {"modality": modality, "as_of": str(raw.get("as_of") or "").strip()[:60]}
+
+
+def is_graph_fact(entry: Mapping[str, Any]) -> bool:
+    """True when an extraction entry may be written to the graph as a fact.
+
+    A hedged statement is not a fact, and a denied one asserts the opposite of
+    what the entry describes; writing either would make the graph state it.
+    """
+    return entry.get("modality", MODALITY_ASSERTED) not in (MODALITY_HEDGED, MODALITY_DENIED)
+
+
 def extract_facts(
     chunks: Sequence[Mapping[str, Any]],
     complete: Callable[[str, str], str],
@@ -495,7 +537,7 @@ def extract_facts(
             result.rejected.append({"label": label, "reason": str(exc), "properties": properties})
             continue
 
-        entry = {"label": label, "properties": full}
+        entry = {"label": label, "properties": full, **_statement(node)}
         if confidence < confidence_floor:
             entry["unverified"] = True
             result.unverified.append(entry)
@@ -566,6 +608,7 @@ def extract_facts(
             "from": {"label": from_label, "key": from_key},
             "to": {"label": to_label, "key": to_key} if to_label else None,
             "properties": full,
+            **_statement(edge),
         }
         if confidence < confidence_floor:
             entry["unverified"] = True

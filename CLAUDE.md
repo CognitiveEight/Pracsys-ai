@@ -361,8 +361,9 @@ local Qdrant.
 **Re-indexing and deletion**
 - Legacy workspaces are re-indexed on first use (`ensure_workspace_indexed`),
   or in bulk with `scripts/reindex_chunks.py`.
-- **Deletion must hit both collections.** `delete_documents` and
-  `delete_workspace` already do; any new deletion path must go through them.
+- **Deletion must hit every collection** (evidence, tables, trust).
+  `delete_documents` and `delete_workspace` already do; any new deletion path
+  must go through them.
 
 **Panel packing**
 - Panel prompts no longer cut documents from the front.
@@ -479,6 +480,38 @@ repo). Vector and exact-term sub-questions run on
 
 Tests: `pytest tests` plus the `[knowledge graph]` group in
 `tests/offline/verify_rag.py`.
+
+### Trust pipeline: corroborated, conflict-checked facts (off by default)
+
+`app/trust/` runs after ontology extraction, in the same tracked task, when
+`TRUST_PIPELINE_ENABLED` (no graph needed; it adds no model calls). Stages:
+relevance (`relevance.py`), modality and canonical claims (`claims.py`,
+`canonical.py`), corroboration (`corroboration.py`), the contradiction engine
+(`conflicts.py`) and routing (`router.py`), composed purely in
+`evaluate.py`; `pipeline.py` stores, recomputes and projects.
+
+- **Facts are derived, never edited.** Evidence rows, document profiles and
+  review decisions are the stored inputs (`<collection>_trust_v1`); facts,
+  conflicts and review items are rebuilt from them on every pass. Never
+  bump a confidence incrementally or write a status anywhere but
+  `router.route`.
+- **Grouping before combining.** One document, or a verbatim copy of a
+  passage, is one source. A new source of evidence must say which document
+  it is, or it will inflate corroboration.
+- **A conflict needs two documents**, and a time-varying value with
+  non-overlapping `as_of` dates is a succession. A missing date is unbounded.
+- **Denials are never facts.** A hedged statement is never evidence, and
+  neither reaches the graph (`extraction.is_graph_fact`).
+- **Deletion:** evidence carries `original_document_id` and derived records
+  `document_ids`, so `delete_documents` reaches both, then
+  `on_documents_deleted` rebuilds. Any new trust record must carry one of
+  them.
+- Panels read `_trust_conflict_block`; chat reads `_add_trust_conflicts`,
+  which brings both passages into the pack so the citation checker verifies
+  both sides. Review-queue socket events do not exist yet.
+
+Offline coverage: `tests/test_trust_pipeline.py` (the deletion test needs a
+local Qdrant).
 
 ### The quality score explanation is objective-relative
 

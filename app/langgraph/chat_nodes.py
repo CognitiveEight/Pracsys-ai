@@ -527,6 +527,17 @@ CACHED ANALYSIS REPORT (same data as the Analysis Report panel; use for question
             "passages above):\n" + "\n".join(graph_facts[:30]) + "\n"
         )
 
+    # 5b-2b. Cross-document conflicts (app/trust): both sides, both passages.
+    trust_conflicts = workspace_state.get("trust_conflicts") or []
+    if trust_conflicts:
+        context_sections.append(
+            "\nCONFLICTS BETWEEN DOCUMENTS (machine-detected; each side ends with the "
+            "label of its passage). When the question touches one, give both versions "
+            "and cite both labels; never present either side as settled:\n"
+            + "\n".join(trust_conflicts[:15])
+            + "\n"
+        )
+
     # 5b-2a. Shared knowledge base (app/rag/knowledge_base.py): the platform's
     # legal reference shelf. Never the case's evidence, so it is rendered apart
     # from the annexures and cited by its own [K#] labels.

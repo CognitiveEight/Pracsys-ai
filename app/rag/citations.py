@@ -2,7 +2,7 @@
 Citation checking, repair and numbering.
 
 The model is told to cite evidence labels (``[E3]``, ``[C1]``, ``[S2]``,
-``[T1]`` for a spreadsheet calculation) next to the claims they support. Nothing it writes is trusted until checked here:
+``[T1]`` for a spreadsheet calculation, ``[K1]`` for a knowledge-base passage) next to the claims they support. Nothing it writes is trusted until checked here:
 
 1. **Invented labels are removed.** A label that is not in the evidence pack
    names nothing; it is dropped rather than shown as a citation.
@@ -29,10 +29,10 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from app.rag.evidence import EvidenceItem, EvidencePack
+from app.rag.evidence import CHECKABLE_KINDS, EvidenceItem, EvidencePack
 
-_LABEL_GROUP_RE = re.compile(r"\[((?:[ECST]\d+)(?:\s*[,;]\s*[ECST]?\d+)*)\]")
-_LABEL_RE = re.compile(r"([ECST])(\d+)")
+_LABEL_GROUP_RE = re.compile(r"\[((?:[ECSTK]\d+)(?:\s*[,;]\s*[ECSTK]?\d+)*)\]")
+_LABEL_RE = re.compile(r"([ECSTK])(\d+)")
 # Dates first: otherwise "12/03/2024" is read as three separate numbers and
 # every document from 2024 "supports" it. ISO dates (spreadsheet cells) too:
 # read as numbers, only their year was ever checked.
@@ -51,11 +51,17 @@ _HOLD = "\u2024"  # one-dot leader: stands in for a protected full stop
 
 
 def _sentences(text: str):
-    """(start, sentence) pairs; full stops after legal abbreviations and inside
-    numbers (6.5, 2.1) do not end a sentence."""
+    """(start, sentence) pairs covering ``text`` exactly; full stops after legal
+    abbreviations and inside numbers (6.5, 2.1) do not end a sentence.
+
+    Every character lands in some sentence, so joining them rebuilds the
+    text: a line break straight after a full stop ("... [E2].\n* Row 3") is a
+    sentence of its own. Requiring one non-break character dropped those
+    breaks, which ran bullet lists and headings into one paragraph.
+    """
     protected = _ABBREV_RE.sub(lambda m: m.group(0)[:-1] + _HOLD, text)
     protected = re.sub(r"(?<=\d)\.(?=\d)", _HOLD, protected)
-    for m in re.finditer(r"[^.!?\n]+(?:[.!?]+|\n|$)", protected):
+    for m in re.finditer(r"[^.!?\n]*(?:[.!?]+|\n|$)", protected):
         if m.group(0):
             yield m.start(), text[m.start() : m.end()]
 _WORD_RE = re.compile(r"[a-z0-9]+")
@@ -204,7 +210,7 @@ def verify_and_number(
                     report.invalid_labels.append(lbl)
         labels = list(dict.fromkeys(labels))
         bare = re.sub(r"[ \t]+([.,;:!?])", r"\1", _LABEL_GROUP_RE.sub("", sentence))
-        doc_labels = [l for l in labels if pack.items[l].kind in ("document", "computed")]
+        doc_labels = [l for l in labels if pack.items[l].kind in CHECKABLE_KINDS]
         figs = _figures(bare)
         for fig in sorted(figs):
             if doc_labels and any(contains_figure(doc_text_norm.get(l, ""), fig) for l in doc_labels):
@@ -280,6 +286,23 @@ def verify_and_number(
                     "page": item.page_at(at),
                     "pageEnd": item.page_end,
                     "timestamp": item.time_start,
+                    "heading": item.heading,
+                    "quote": quote or None,
+                }
+            )
+            if item.sheet:
+                entry.update(sheet_location(item, quote, at))
+        elif item.kind == "knowledge_base":
+            # Shared reference material, named by its admin-written title;
+            # never presented as one of the case's documents.
+            quote, at = _best_quote(item, claim_for_label.get(lbl, ""))
+            entry.update(
+                {
+                    "documentId": item.document_id,
+                    "title": item.title,
+                    "category": item.category,
+                    "page": item.page_at(at),
+                    "pageEnd": item.page_end,
                     "heading": item.heading,
                     "quote": quote or None,
                 }

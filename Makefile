@@ -1,11 +1,11 @@
-.PHONY: help install setup test e2e run clean docker-up docker-down docker-logs ontology-ddl graph-up
+.PHONY: help install setup test lint e2e run clean docker-up docker-down docker-logs ontology-ddl graph-up
 
 help:
 	@echo "SimplerToday - Available Commands"
 	@echo "=================================="
 	@echo "make install      - Install dependencies"
 	@echo "make setup        - Complete setup (venv + deps + services)"
-	@echo "make test         - Run setup tests"
+	@echo "make test         - Run pytest + offline verify suites"
 	@echo "make run          - Run the application"
 	@echo "make clean        - Clean temporary files"
 	@echo "make docker-up    - Start Docker services (Qdrant, Redis)"
@@ -35,8 +35,12 @@ setup:
 test:
 	@echo "Running unit tests and offline verification suites..."
 	python -m pytest -q tests
-	@for f in verify_logging.py verify_rag.py verify_run_control.py verify_document_reload.py verify_objective_change.py verify_workspace_share.py verify_fact_corrections.py verify_missing_info_edit.py; do \
-		echo "== $$f"; python $$f | tail -1 || exit 1; \
+	@# Capture each suite's output so its exit status is checked: piping into
+	@# `tail` reported tail's status, which let a failing suite pass the build.
+	@for f in tests/offline/verify_*.py; do \
+		echo "== $$f"; \
+		out=$$(python $$f 2>&1) || { echo "$$out" | tail -30; echo "FAILED: $$f"; exit 1; }; \
+		echo "$$out" | tail -1; \
 	done
 
 e2e:
@@ -79,12 +83,8 @@ docker-logs:
 	docker-compose logs -f
 
 lint:
-	@echo "Running linters..."
-	@if command -v pylint >/dev/null 2>&1; then \
-		pylint app/ || true; \
-	else \
-		echo "pylint not installed. Skipping..."; \
-	fi
+	@echo "Running ruff (rules in pyproject.toml)..."
+	ruff check .
 
 format:
 	@echo "Formatting code..."

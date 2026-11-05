@@ -164,7 +164,14 @@ def _run_until_routed(monkeypatch, payload: bytes, extension: str):
         seen["table_path"] = True
         raise RuntimeError("stop after routing")
 
+    async def fake_classify(self, text, filename):
+        # The failure path still classifies the error text; without this stub
+        # every test run made real, billed model calls.
+        return {"summary": "", "evidentiary_strength": "Low",
+                "document_type": "other", "extracted_fields": {}}
+
     monkeypatch.setattr(DocumentProcessor, "_download_file", fake_download)
+    monkeypatch.setattr(DocumentProcessor, "_classify_document", fake_classify)
     monkeypatch.setattr(file_processor, "process_file_by_extension", fake_extract)
     monkeypatch.setattr(tables, "parse_workbook", fake_parse)
     result = asyncio.run(

@@ -9,7 +9,6 @@ from app.statutes.register import (
     RegisterError,
     get_register,
     load_register,
-    normalize_act_name,
     normalize_section_number,
 )
 from app.statutes.resolver import (

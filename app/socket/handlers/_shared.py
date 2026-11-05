@@ -4,115 +4,73 @@ Feature mixin extracted from events.py — methods moved verbatim.
 """
 
 import asyncio
+import contextlib
+import contextvars
 import json
 import re
 import time
-import uuid
-from datetime import date as date_type
-from datetime import datetime
-from html import unescape
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import quote_plus
+from typing import Any, AsyncIterator, Dict, List, Optional, Set
 
-import httpx
 from loguru import logger
 
-from app.agents.role_models import RoleEnum
 from app.core.config import settings
-from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
-from app.processing.audio_transcription import (
-    _has_devanagari as _audio_has_devanagari,
-    transliterate_formatted_transcript_to_hinglish,
-)
-from app.processing.document_processor import document_processor
-from app.search.vertex_ai_search import search_indiankanoon as vertex_search_indiankanoon
-from app.search.case_law_finder import (
-    fetch_judgment_text,
-    find_case_law_sources,
-    scrape_indiankanoon,
-)
-from app.prompts.applicable_acts import (
-    TARGETED_INDIAN_ACTS,
-    format_targeted_acts_for_prompt,
-)
-from app.prompts.legal_intelligence_system import (
-    ANNEXURE_UPLOAD_GATE_MESSAGE,
-    APP_BRAND_EXCLUSION_DIRECTIVE,
-    ENGLISH_ONLY_OUTPUT_DIRECTIVE,
-    NAME_CAPITALISATION_DIRECTIVE,
-    get_legal_intelligence_system_instruction,
-    get_structured_document_feature_system_instruction,
-)
-from app.langgraph.chat_nodes import (
-    _last_ai_message_from_history,
-    is_user_affirmation_to_continue,
-    merge_intelligence_chat_history,
-)
-from app.langgraph.list_of_dates_agent import (
-    list_of_dates_temporal_agent,
-    snap_hallucinated_year,
-)
-from app.socket.schemas import (
-    AIResponseMetadata,
-    AIResponsePayload,
-    AnalysisDocxGenerateRequestPayload,
-    ApplicableLawRelevanceRequestPayload,
-    TemplateSyncPayload,
-    TemplateSyncResponsePayload,
-    UserMessageRequestPayload,
-    WorkspaceCreatedPayload,
-    WorkspaceSyncPayload,
-)
-from app.utils.exceptions import SocketEventError
-from app.workspace.custom_instructions import (build_custom_instruction_suffix,
-                                               hydrate_custom_instructions_from_cache,
-                                               set_custom_instructions)
-from app.workspace.manager import workspace_manager
-from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
-                                       hydrate_workspace_state, persist_state,
-                                       restore_state)
-from agent import process_analysis_docx_request
+
 
 from app.socket.event_utils import (
-    EventHandler,
-    _STRATEGY_ROLE_LABELS_RE,
-    OBJECTIVE_UPDATE_OFFER_QUESTION,
-    CHAT_SMALL_WORKSPACE_DOC_THRESHOLD,
-    CHAT_SEARCH_CHUNK_LIMIT,
-    CHAT_MAX_DOCS_INCLUDED,
-    CHAT_MAX_CHARS_PER_DOC,
-    CHAT_MAX_TOTAL_CHARS,
-    CHAT_MIN_SCORE_THRESHOLD,
-    _ANNEXURE_REF_RE,
-    _ROMAN_VALUES,
-    SPEAKER_LABEL_GUARDRAIL,
-    _ENUM_PREFIX_RE,
-    _UI_TRUNCATION_RE,
-    _APP_BRAND_RE,
-    _STRENGTH_POINT_MIN_LEN,
-    _ANNEXURE_SINGLE_RE,
-    _ANNEXURE_PLURAL_RE,
-    _OVERVIEW_CONTACTED_DATE_RE,
-    _OVERVIEW_TO_PHONE_RE,
-    _roman_or_int,
-    _derive_report_case_summary,
-    _coerce_analysis_text_item,
-    _strip_enum_prefix,
-    _strip_ui_truncated_tokens,
-    scrub_app_brand,
-    _coerce_analysis_text_list,
     _mint_item_id,
     _normalize_match_text,
-    _strip_strength_point_statute_boilerplate,
-    _annexure_wording_for_next_steps,
-    _clamp_annexure_references,
-    _format_document_for_prompt,
-    _normalize_report_mobile_from_overview,
-    _overview_conversation_date_to_iso,
-    extract_overview_conversation_report_contact_meta,
     drafting_payload_to_wire,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
+
+#: Every panel an upload to an existing case arms with ``workspace:refresh``,
+#: in product (emit) order.
+UPLOAD_REFRESH_FEATURES = (
+    "document_assessments",
+    "strategy_objective",
+    "analysis_report",
+    "list_of_dates",
+    "applicable_laws",
+    "procedural_timeline",
+    "relevant_parties",
+    "case_laws",
+    "drafting_assistant",
+)
+
+#: The panels the dates/laws tail produces, in emit order.
+PIPELINE_TAIL_FEATURES = (
+    "list_of_dates",
+    "applicable_laws",
+    "procedural_timeline",
+    "relevant_parties",
+    "case_laws",
+    "drafting_assistant",
+)
+
+#: The pipeline-lock hold of the run this code belongs to. Set by
+#: ``_hold_pipeline_lock`` and inherited by tasks the run spawns, so only the
+#: holder (never an unlocked handler of the same case) can move its stage.
+_PIPELINE_HOLD: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
+    contextvars.ContextVar("simplertoday_pipeline_hold", default=None)
+)
+
+#: The lock watchdog's tick, and how often one hold may be reported again.
+_LOCK_WATCHDOG_INTERVAL_SECONDS = 60.0
+_LOCK_WARN_REPEAT_SECONDS = 300.0
+
+
+def _loop_now() -> float:
+    """The event loop's clock (what ``asyncio.timeout`` measures against)."""
+    try:
+        return asyncio.get_running_loop().time()
+    except RuntimeError:
+        return time.monotonic()
+
+
+def _cap_label(cap: Optional[float]) -> str:
+    """A cap for a log line: ``900s``, or ``none`` for an uncapped hold."""
+    return "none" if cap is None else str(int(round(cap))) + "s"
 
 
 class JsonHelpersMixin:
@@ -238,6 +196,45 @@ class JsonHelpersMixin:
             return evidence.prompt_block
         except Exception as graph_err:
             logger.warning("Graph evidence for {} skipped: {}", panel, graph_err)
+            return ""
+
+    # ------------------------------------------------------------------
+    # Shared knowledge base for panels (every case, augment mode)
+    # ------------------------------------------------------------------
+
+    async def _knowledge_base_block(
+        self,
+        panel: str,
+        workspace_id: str,
+        *,
+        docs: List[Dict[str, Any]],
+    ) -> str:
+        """Relevant shelf passages to ADD to a panel's prompt, marked as
+        reference material that is not the case's evidence.
+
+        Empty unless ``panel`` is in ``KNOWLEDGE_BASE_PANELS`` and the shelf
+        holds something relevant. ``docs`` must be ALL of the case's documents
+        (``get_all_documents``), unfiltered: every panel then describes the case
+        identically and one run shares one search. Never raises: the shelf
+        improves a panel, it never gates it.
+        """
+        enabled = {p.strip() for p in str(settings.knowledge_base_panels or "").split(",")}
+        if panel not in enabled or not workspace_id:
+            return ""
+        try:
+            from app.rag.knowledge_base import case_query, knowledge_base, render_panel_block
+
+            passages = await knowledge_base.passages_for_case(
+                workspace_id, case_query(docs or [])
+            )
+            block = render_panel_block(passages, int(settings.knowledge_base_panel_chars))
+            if block:
+                logger.info("Knowledge base for {}: {} passage(s)", panel, len(passages))
+            return block
+        except asyncio.CancelledError:
+            raise
+        except Exception as kb_err:
+            logger.warning("Knowledge base for {} skipped: {}", panel, kb_err)
             return ""
 
     # ------------------------------------------------------------------
@@ -395,7 +392,7 @@ class JsonHelpersMixin:
             return []
         already = {str(f) for f in (skip or set())}
         released: List[str] = []
-        role = (workspace_role or "ADJUDICATOR").strip().upper() or "ADJUDICATOR"
+        role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper() or DEFAULT_WORKSPACE_ROLE
 
         for feature in feature_types:
             if not feature or feature in already:
@@ -527,6 +524,219 @@ class JsonHelpersMixin:
                 workspace_id[:12] if workspace_id else "",
             )
         return released
+
+    # ------------------------------------------------------------------
+    # Pipeline lock: holder record, stages, watchdog, hard cap
+    #
+    # While a run holds a case's pipeline lock, every later upload, objective
+    # change, reconnect replay and resume of that case queues behind it, and
+    # their armed loaders spin. So each hold is named (holder + stage), a
+    # watchdog reports holds past PIPELINE_LOCK_WARN_SECONDS, and the three
+    # long runners are cut at PIPELINE_RUN_TIMEOUT_SECONDS (audio-extended),
+    # settling their armed panels from cache.
+    # ------------------------------------------------------------------
+
+    @contextlib.asynccontextmanager
+    async def _hold_pipeline_lock(
+        self,
+        workspace_id: str,
+        holder: str,
+        *,
+        cap_seconds: Optional[float] = None,
+        wait_stage: Optional[str] = None,
+        stage_mode: str = "",
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """``async with`` the workspace pipeline lock, recording who holds it.
+
+        ``holder`` is a fixed label (``upload_pipeline``, ``dates_laws``,
+        ``cascade``, ``laws_only``, ``reemit``, ``resume``). ``cap_seconds`` is
+        only reported by the watchdog; enforcing it is the caller's job, so the
+        cap counts from acquisition and queueing never eats into it.
+        ``wait_stage`` names the stage line for the time spent queueing.
+        """
+        lock = self._workspace_pipeline_lock(workspace_id)
+        if lock.locked():
+            logger.debug(
+                "pipeline lock: {} waiting for workspace {}",
+                holder,
+                str(workspace_id)[:12],
+            )
+        wait_started = _loop_now()
+        async with lock:
+            if wait_stage:
+                self._log_stage(wait_stage, wait_started, mode=stage_mode)
+            record: Dict[str, Any] = {
+                "holder": holder,
+                "stage": "start",
+                "acquiredAt": _loop_now(),
+                "cap": cap_seconds,
+                "warnedAt": None,
+            }
+            self._workspace_pipeline_lock_holder[workspace_id] = record
+            token = _PIPELINE_HOLD.set(record)
+            try:
+                yield record
+            finally:
+                _PIPELINE_HOLD.reset(token)
+                if self._workspace_pipeline_lock_holder.get(workspace_id) is record:
+                    self._workspace_pipeline_lock_holder.pop(workspace_id, None)
+
+    def _set_pipeline_stage(self, workspace_id: str, stage: str) -> None:
+        """Name the step the lock holder is in (read by the watchdog and the cap)."""
+        record = _PIPELINE_HOLD.get()
+        if record is not None and (
+            self._workspace_pipeline_lock_holder.get(workspace_id) is record
+        ):
+            record["stage"] = stage
+
+    def _stage_begin(self, workspace_id: str, stage: str) -> float:
+        """Enter a stage: record it on the hold, return its start time."""
+        self._set_pipeline_stage(workspace_id, stage)
+        return _loop_now()
+
+    @staticmethod
+    def _log_stage(stage: str, started: float, *, mode: str = "") -> None:
+        """One ``stage <name> took`` line. Names and durations only."""
+        took = max(0.0, _loop_now() - started)
+        if mode:
+            logger.info("stage {} took {:.1f}s mode={}", stage, took, mode)
+        else:
+            logger.info("stage {} took {:.1f}s", stage, took)
+
+    def _check_pipeline_lock_holds(self, now: Optional[float] = None) -> int:
+        """Warn once per hold (at most every 5 minutes) past the threshold.
+
+        Informational only: it never releases anything (the cap does).
+        Returns how many holds it reported.
+        """
+        now = _loop_now() if now is None else now
+        threshold = float(settings.pipeline_lock_warn_seconds)
+        reported = 0
+        for workspace_id, record in list(self._workspace_pipeline_lock_holder.items()):
+            if not isinstance(record, dict):
+                continue
+            held = now - float(record.get("acquiredAt") or now)
+            if held < threshold:
+                continue
+            warned_at = record.get("warnedAt")
+            if warned_at is not None and now - warned_at < _LOCK_WARN_REPEAT_SECONDS:
+                continue
+            record["warnedAt"] = now
+            reported += 1
+            logger.warning(
+                "pipeline lock held {}s holder={} stage={} cap={} workspace={}",
+                int(held),
+                record.get("holder"),
+                record.get("stage"),
+                _cap_label(record.get("cap")),
+                str(workspace_id)[:12],
+            )
+        return reported
+
+    async def _pipeline_lock_watchdog(self) -> None:
+        """Tick forever, reporting long pipeline-lock holds."""
+        while True:
+            await asyncio.sleep(_LOCK_WATCHDOG_INTERVAL_SECONDS)
+            try:
+                self._check_pipeline_lock_holds()
+            except Exception as watch_err:  # pragma: no cover - never stop ticking
+                logger.debug("Pipeline lock watchdog check failed: {}", watch_err)
+
+    def start_pipeline_lock_watchdog(self) -> None:
+        """Start the watchdog (lifecycle.startup). Idempotent."""
+        task = self.__dict__.get("_pipeline_lock_watchdog_task")
+        if task is not None and not task.done():
+            return
+        self.__dict__["_pipeline_lock_watchdog_task"] = asyncio.create_task(
+            self._pipeline_lock_watchdog()
+        )
+
+    async def stop_pipeline_lock_watchdog(self) -> None:
+        """Stop the watchdog (lifecycle.shutdown)."""
+        task = self.__dict__.pop("_pipeline_lock_watchdog_task", None)
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    def _pipeline_run_cap(self, batch_result: Optional[Dict[str, Any]]) -> float:
+        """Seconds one run may hold the pipeline lock.
+
+        ``PIPELINE_RUN_TIMEOUT_SECONDS``, extended for audio in the run's batch
+        by ``AUDIO_TIMEOUT_FACTOR`` per second of audio, up to
+        ``PIPELINE_RUN_TIMEOUT_AUDIO_MAX_SECONDS``. An audio result with no
+        known duration takes the maximum.
+        """
+        base = float(settings.pipeline_run_timeout_seconds)
+        results = (batch_result or {}).get("results") if isinstance(batch_result, dict) else None
+        audio = [
+            r for r in (results or []) if isinstance(r, dict) and r.get("is_audio")
+        ]
+        if not audio:
+            return base
+        ceiling = max(base, float(settings.pipeline_run_timeout_audio_max_seconds))
+        total = 0.0
+        for result in audio:
+            duration = result.get("audio_duration_seconds")
+            if isinstance(duration, bool) or not isinstance(duration, (int, float)) or duration < 0:
+                return ceiling
+            total += float(duration)
+        return min(base + float(settings.audio_timeout_factor) * total, ceiling)
+
+    async def _settle_pipeline_run_cap(
+        self,
+        workspace_id: str,
+        user_id: str,
+        *,
+        holder: str,
+        cap: float,
+        features: List[str],
+        emitted: Set[str],
+        workspace_role: str = "",
+    ) -> None:
+        """A run passed its cap: report it and settle its unemitted panels.
+
+        Called after ``asyncio.timeout`` has cancelled the run's body and while
+        the lock is still held, so the settled panels go out before any queued
+        run's.
+        """
+        record = _PIPELINE_HOLD.get() or {}
+        stage = record.get("stage") or "unknown"
+        held = _loop_now() - float(record.get("acquiredAt") or _loop_now())
+        logger.critical(
+            "pipeline run exceeded cap={} holder={} stage={} workspace={}",
+            _cap_label(cap),
+            holder,
+            stage,
+            str(workspace_id)[:12],
+        )
+        try:
+            audit_logger.log_event(
+                "pipeline_run_timeout",
+                {
+                    "workspace_id": workspace_id,
+                    "holder": holder,
+                    "stage": stage,
+                    "cap_seconds": int(round(cap)),
+                    "held_seconds": int(held),
+                },
+                workspace_id=workspace_id,
+                severity="CRITICAL",
+            )
+        except Exception:
+            pass
+        if features:
+            await self._release_refresh_loaders(
+                workspace_id,
+                user_id,
+                list(features),
+                skip=emitted,
+                reason=holder + "_run_cap",
+                workspace_role=workspace_role,
+            )
 
     def _prepare_json_candidate(
         self, raw_text: str, prefer: str = "object"

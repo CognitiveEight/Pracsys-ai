@@ -56,6 +56,5 @@ Makefile
 docker-compose.yml
 dev.sh
 run.sh
-agent.py
 pytest.ini
 requirements-dev.txt

@@ -4,18 +4,15 @@ Implements governed, role-aware chat reasoning.
 """
 
 import re
-import time
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from app.agents.role_models import RoleEnum
 from app.ai.gemini_client import gemini_client
 from app.core.config import settings
 from app.rag.citations import verify_and_number
 from app.rag.evidence import EvidencePack
 from app.langgraph.chat_models import (
-    ChatIntent,
     ChatIntentEnum,
     ConfidenceLevel,
     GovernanceValidationResult,
@@ -228,7 +225,6 @@ def chat_context_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # Extract inputs
     chat_context = state.get("chat_context", {})
-    user_message = state.get("user_message", "")
 
     # Validate critical inputs
     role_context = chat_context.get("role_context")
@@ -323,6 +319,10 @@ APPROVED FACTS ({len(approved_facts)} available):
     evidence_pack = None
     if settings.citations_enabled and _ws_for_evidence.get("evidence_index"):
         evidence_pack = EvidencePack.from_state(_ws_for_evidence.get("evidence_index"))
+    elif settings.citations_enabled and _ws_for_evidence.get("knowledge_base_passages"):
+        # Knowledge-base passages are citable even when the case has no
+        # passage evidence of its own.
+        evidence_pack = EvidencePack()
 
     # 5. Applicable Laws
     applicable_laws = chat_context.get("applicable_laws", [])
@@ -526,6 +526,44 @@ CACHED ANALYSIS REPORT (same data as the Analysis Report panel; use for question
             "label of the passage it comes from — cite that label, exactly as for the "
             "passages above):\n" + "\n".join(graph_facts[:30]) + "\n"
         )
+
+    # 5b-2a. Shared knowledge base (app/rag/knowledge_base.py): the platform's
+    # legal reference shelf. Never the case's evidence, so it is rendered apart
+    # from the annexures and cited by its own [K#] labels.
+    kb_passages = workspace_state.get("knowledge_base_passages") or []
+    if kb_passages:
+        kb_blocks: List[str] = []
+        for chunk in kb_passages:
+            meta = chunk.get("metadata") or {}
+            title = str(meta.get("title") or "Untitled reference").strip()
+            category = str(meta.get("category") or "other").replace("_", " ")
+            label = ""
+            if evidence_pack is not None:
+                item = evidence_pack.add_knowledge_base(chunk)
+                if item is None:
+                    continue
+                label = f"[{item.label}] "
+            text = str(chunk.get("content") or "").strip()
+            if text:
+                kb_blocks.append(f"{label}{title} ({category})\n{text}")
+        if kb_blocks:
+            kb_section = (
+                "\nKNOWLEDGE BASE — SHARED LEGAL REFERENCE LIBRARY (judgments, statutes, "
+                "court formats and precedents curated by the platform; NOT part of this "
+                "case's documents):\n"
+                "Use these for law, precedent and formats. For facts about this case, rely "
+                "on the case's own documents above. Never describe a knowledge-base "
+                "passage as one of the case's annexures or documents. Whenever the "
+                "answer relies on one, write its title in the sentence itself (for "
+                "example: As held in <title>, ...): the lawyer sees only the answer "
+                "text, so the title is how they know the source.\n"
+            )
+            if evidence_pack is not None:
+                kb_section += (
+                    "Cite a knowledge-base passage with its [K#] label, exactly as "
+                    "written, after the sentence that relies on it.\n"
+                )
+            context_sections.append(kb_section + "\n\n".join(kb_blocks) + "\n")
 
     # 5b-3. Spreadsheet calculations (app/rag/table_query.py): computed in code
     # over every row. The rule applies whenever a spreadsheet is in evidence:
@@ -1122,9 +1160,6 @@ def action_dispatcher_node(state: Dict[str, Any]) -> Dict[str, Any]:
     logger.info("Dispatching action...")
 
     intent = state.get("intent", "EXPLAIN")
-    intent_classification = state.get("intent_classification", {})
-    requires_agent = intent_classification.get("requires_agent", False)
-    target_agent = intent_classification.get("target_agent")
 
     routed_to_agent = None
     dispatch_message = None
@@ -1250,9 +1285,7 @@ def governance_validator_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     logger.info("Validating governance compliance...")
 
-    role = state.get("role")
     chat_context = state.get("chat_context", {})
-    response_text = state.get("response_text", "")
     intent = state.get("intent")
 
     violations = []

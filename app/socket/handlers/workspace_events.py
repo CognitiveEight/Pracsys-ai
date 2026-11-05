@@ -6,149 +6,83 @@ Feature mixin extracted from events.py — methods moved verbatim.
 import asyncio
 import hashlib
 import json
-import re
 import time
-import uuid
-from datetime import date as date_type
-from datetime import datetime
-from html import unescape
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import quote_plus
+from typing import Any, Dict, List, Optional, Set
 
-import httpx
 from loguru import logger
 
 from app.agents.role_models import RoleEnum
 from app.ai.usage import capture_usage
-from app.core.config import settings
 from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
-from app.processing.audio_transcription import (
-    _has_devanagari as _audio_has_devanagari,
-    transliterate_formatted_transcript_to_hinglish,
-)
 from app.processing.document_processor import document_processor
-from app.search.vertex_ai_search import search_indiankanoon as vertex_search_indiankanoon
-from app.search.case_law_finder import (
-    fetch_judgment_text,
-    find_case_law_sources,
-    scrape_indiankanoon,
-)
-from app.prompts.applicable_acts import (
-    TARGETED_INDIAN_ACTS,
-    format_targeted_acts_for_prompt,
-)
-from app.prompts.legal_intelligence_system import (
-    ANNEXURE_UPLOAD_GATE_MESSAGE,
-    APP_BRAND_EXCLUSION_DIRECTIVE,
-    ENGLISH_ONLY_OUTPUT_DIRECTIVE,
-    NAME_CAPITALISATION_DIRECTIVE,
-    get_legal_intelligence_system_instruction,
-    get_structured_document_feature_system_instruction,
-)
-from app.langgraph.chat_nodes import (
-    _last_ai_message_from_history,
-    is_user_affirmation_to_continue,
-    merge_intelligence_chat_history,
-)
-from app.langgraph.list_of_dates_agent import (
-    list_of_dates_temporal_agent,
-    snap_hallucinated_year,
-)
 from app.socket.schemas import (
-    AIResponseMetadata,
-    AIResponsePayload,
-    AnalysisDocxGenerateRequestPayload,
-    ApplicableLawRelevanceRequestPayload,
-    TemplateSyncPayload,
-    TemplateSyncResponsePayload,
-    UserMessageRequestPayload,
     WorkspaceCreatedPayload,
     WorkspaceSyncPayload,
     WorkspaceTransferredPayload,
     WorkspaceVersionRestorePayload,
 )
-from app.utils.exceptions import SocketEventError
-from app.workspace.custom_instructions import (build_custom_instruction_suffix,
-                                               hydrate_custom_instructions_from_cache,
-                                               set_custom_instructions)
+from app.workspace.custom_instructions import (set_custom_instructions)
 from app.workspace.participants import set_participants
-from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
-                                       hydrate_workspace_state, persist_state,
-                                       restore_state)
-from agent import process_analysis_docx_request
 
 from app.socket.event_utils import (
-    EventHandler,
-    _STRATEGY_ROLE_LABELS_RE,
-    OBJECTIVE_UPDATE_OFFER_QUESTION,
-    CHAT_SMALL_WORKSPACE_DOC_THRESHOLD,
-    CHAT_SEARCH_CHUNK_LIMIT,
-    CHAT_MAX_DOCS_INCLUDED,
-    CHAT_MAX_CHARS_PER_DOC,
-    CHAT_MAX_TOTAL_CHARS,
-    CHAT_MIN_SCORE_THRESHOLD,
-    _ANNEXURE_REF_RE,
-    _ROMAN_VALUES,
-    SPEAKER_LABEL_GUARDRAIL,
-    _ENUM_PREFIX_RE,
-    _UI_TRUNCATION_RE,
-    _APP_BRAND_RE,
-    _STRENGTH_POINT_MIN_LEN,
-    _ANNEXURE_SINGLE_RE,
-    _ANNEXURE_PLURAL_RE,
-    _OVERVIEW_CONTACTED_DATE_RE,
-    _OVERVIEW_TO_PHONE_RE,
-    _roman_or_int,
-    _derive_report_case_summary,
-    _coerce_analysis_text_item,
-    _strip_enum_prefix,
-    _strip_ui_truncated_tokens,
-    scrub_app_brand,
-    _coerce_analysis_text_list,
-    _strip_strength_point_statute_boilerplate,
-    _annexure_wording_for_next_steps,
-    _clamp_annexure_references,
-    _format_document_for_prompt,
-    _normalize_report_mobile_from_overview,
-    _overview_conversation_date_to_iso,
-    extract_overview_conversation_report_contact_meta,
     drafting_payload_to_wire,
 )
+from app.socket.handlers._shared import UPLOAD_REFRESH_FEATURES
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
+from app.utils.redact import validation_fields
+
+#: Only workspaces armed this recently are replayed from cache after a reconnect.
+#: Undelivered panels have their own buffer (PENDING_FEATURE_DELIVERY); this
+#: replay is a safety net for work in progress, not a history of every case.
+_REEMIT_WINDOW_SECONDS = 1800
 
 
 class WorkspaceEventsMixin:
     """Connection lifecycle, reconnect re-emit, workspace_created/sync."""
 
+    def _arm_reconnect_reemit(self, workspace_id: str, user_id: str) -> None:
+        """Mark a workspace's cached panels for replay after the next reconnect."""
+        if workspace_id:
+            self._pending_reemits[str(workspace_id)] = (str(user_id or ""), time.time())
+
     async def _do_reemit_after_reconnect(self) -> None:
-        """Schedule a re-emit of cached document_feature_response payloads for the pending workspace after reconnect.
-        Covers all ten feature panels in product order (see _reemit_cached_features).
-        Clears pending state synchronously so it only runs once per disconnect/reconnect
-        cycle; the emits themselves run in a detached task under the workspace
-        pipeline lock so they never interleave a live generation chain."""
-        if (
-            not self._had_disconnect
-            or not self._pending_reemit_workspace_id
-            or not self._socket_client
-        ):
+        """Schedule a re-emit of cached document_feature_response payloads after reconnect.
+        Covers all ten feature panels in product order (see _reemit_cached_features),
+        for every workspace armed within _REEMIT_WINDOW_SECONDS (not only the most
+        recent one). Clears pending state synchronously so it only runs once per
+        disconnect/reconnect cycle; each replay runs in a detached task, in its
+        workspace's run scope (so a stop or purge can cancel it), under the
+        workspace pipeline lock so it never interleaves a live generation chain."""
+        if not self._had_disconnect or not self._pending_reemits or not self._socket_client:
             return
-        workspace_id = self._pending_reemit_workspace_id
-        user_id = self._pending_reemit_user_id or ""
+        pending = dict(self._pending_reemits)
         self._had_disconnect = False
-        self._pending_reemit_workspace_id = None
-        self._pending_reemit_user_id = None
+        self._pending_reemits.clear()
+        cutoff = time.time() - _REEMIT_WINDOW_SECONDS
+        recent = {ws: uid for ws, (uid, armed_at) in pending.items() if armed_at >= cutoff}
+        if len(recent) < len(pending):
+            logger.info(
+                "Reconnect replay skipped {} workspace(s) armed more than {}s ago",
+                len(pending) - len(recent),
+                _REEMIT_WINDOW_SECONDS,
+            )
 
-        async def _locked_reemit() -> None:
-            # Queue behind any in-flight generation chain so cached snapshots
-            # never interleave a live pipeline's emits. Runs detached so
-            # on_connect/on_connected return immediately.
-            async with self._workspace_pipeline_lock(workspace_id):
-                await self._reemit_cached_features(workspace_id, user_id)
+        for workspace_id, user_id in recent.items():
 
-        try:
-            asyncio.create_task(_locked_reemit())
-        except RuntimeError as rt_err:
-            logger.error("Could not schedule reconnect re-emit: {}", rt_err)
+            async def _locked_reemit(ws: str = workspace_id, uid: str = user_id) -> None:
+                # Queue behind any in-flight generation chain so cached snapshots
+                # never interleave a live pipeline's emits. Runs detached so
+                # on_connect/on_connected return immediately.
+                async with self._hold_pipeline_lock(ws, "reemit"):
+                    await self._reemit_cached_features(ws, uid)
+
+            try:
+                self._spawn_in_run_scope(
+                    workspace_id, _locked_reemit(), label="reconnect re-emit"
+                )
+            except RuntimeError as rt_err:
+                logger.error("Could not schedule reconnect re-emit: {}", rt_err)
 
     async def _reemit_cached_features(self, workspace_id: str, user_id: str) -> None:
         """Replay cached feature payloads for one workspace in product order.
@@ -337,7 +271,7 @@ class WorkspaceEventsMixin:
                 # id was recorded when the change was accepted.
                 marker_user = (
                     (self._pending_objective_changes.get(ws_id) or {}).get("userId")
-                    or self._pending_reemit_user_id
+                    or (self._pending_reemits.get(ws_id) or ("", 0.0))[0]
                     or ""
                 )
                 self._clear_pending_objective_change(ws_id)
@@ -363,6 +297,8 @@ class WorkspaceEventsMixin:
         """Handle connection event. Re-emit pending document_feature_response if we had disconnected during workspace init."""
         logger.info("Socket connected")
         audit_logger.log_event("socket_connect", {"status": "connected"})
+        # Pushes are fire-and-forget: catch up on the global template library.
+        self._schedule_global_template_sync()
         await self._recover_interrupted_work()
         await self._do_reemit_after_reconnect()
 
@@ -382,20 +318,32 @@ class WorkspaceEventsMixin:
         )
         await self._recover_interrupted_work()
         await self._do_reemit_after_reconnect()
-        # Re-emit last ai_response if we disconnected right after sending (so backend receives the chat response)
-        if self._had_disconnect and self._pending_ai_response and self._socket_client:
-            try:
-                await self._socket_client.emit_ai_response(self._pending_ai_response)
-                logger.success(
-                    "AI chat response re-emitted to backend after reconnect (chat: {})",
-                    self._pending_ai_response.get("chatId"),
-                )
-            except Exception as e:
-                logger.warning("Failed to re-emit ai_response after reconnect: {}", e)
-            finally:
-                self._pending_ai_response = None
+        await self._resend_pending_ai_responses()
         if self._had_disconnect:
             self._had_disconnect = False
+
+    async def _resend_pending_ai_responses(self) -> None:
+        """Re-send every chat reply whose delivery failed, one per chat.
+
+        Not conditioned on ``_had_disconnect``: a reply is only buffered when its
+        emit was not confirmed, and ``_do_reemit_after_reconnect`` clears that flag
+        first, which used to skip this re-send whenever a panel replay was pending.
+        A reply that fails again stays buffered for the next connect.
+        """
+        if not self._pending_ai_responses or not self._socket_client:
+            return
+        for chat_key, payload in list(self._pending_ai_responses.items()):
+            delivered = False
+            try:
+                delivered = bool(await self._socket_client.emit_ai_response(payload))
+            except Exception as e:
+                logger.warning("Failed to re-emit ai_response after reconnect: {}", e)
+            if delivered:
+                self._pending_ai_responses.pop(chat_key, None)
+                logger.success(
+                    "AI chat response re-emitted to backend after reconnect (chat: {})",
+                    chat_key,
+                )
 
     async def on_disconnect(self, data: Any) -> None:
         """Handle disconnection event. Mark that we disconnected (so on_connected can re-emit if needed)."""
@@ -476,21 +424,19 @@ class WorkspaceEventsMixin:
                 payload.workspaceRole,
             )
             # Set early so re-emit on reconnect works even if socket drops during document_assessments/metadata/strategy/analysis/list_of_dates
-            self._pending_reemit_workspace_id = str(payload.workspaceId)
-            self._pending_reemit_user_id = str(payload.userId)
+            self._arm_reconnect_reemit(str(payload.workspaceId), str(payload.userId))
 
             # STEP 1: Validate role (convert to uppercase for validation)
-            workspace_role = (
-                payload.workspaceRole.upper()
-                if payload.workspaceRole
-                else "ADJUDICATOR"
-            )
+            workspace_role = (payload.workspaceRole or "").strip().upper()
             if not RoleEnum.validate(workspace_role):
+                # Mandatory in the lawyer app, so a missing or unknown role here is
+                # an upstream bug; use the app's own default rather than stopping.
                 logger.warning(
-                    "Invalid workspace role '{}', defaulting to ADJUDICATOR",
-                    payload.workspaceRole,
+                    "Workspace created with missing or invalid role '{}'; defaulting to {}",
+                    payload.workspaceRole or "",
+                    DEFAULT_WORKSPACE_ROLE,
                 )
-                workspace_role = "ADJUDICATOR"
+                workspace_role = DEFAULT_WORKSPACE_ROLE
             await self._remember_workspace_role(
                 str(payload.workspaceId), str(payload.userId), workspace_role
             )
@@ -524,7 +470,7 @@ class WorkspaceEventsMixin:
 
             # STEP 2: Initialize role-based agent
             try:
-                state = await workspace_role_integration.initialize_workspace_with_role(
+                await workspace_role_integration.initialize_workspace_with_role(
                     workspace_id=payload.workspaceId,
                     user_id=payload.userId,
                     initial_role=workspace_role,
@@ -727,7 +673,7 @@ class WorkspaceEventsMixin:
                             if self._socket_client and batch_result is not None:
                                 try:
                                     fallback = self._analysis_report_fallback(
-                                        (workspace_role or "ADJUDICATOR")
+                                        (workspace_role or DEFAULT_WORKSPACE_ROLE)
                                         .strip()
                                         .upper()
                                     )
@@ -805,7 +751,7 @@ class WorkspaceEventsMixin:
             if not payload.evidenceFiles and self._socket_client:
                 try:
                     workspace_role = (
-                        (payload.workspaceRole or "ADJUDICATOR").strip().upper()
+                        (payload.workspaceRole or DEFAULT_WORKSPACE_ROLE).strip().upper()
                     )
                     fallback = self._analysis_report_fallback(workspace_role)
                     await self._emit_document_feature(
@@ -1189,7 +1135,7 @@ class WorkspaceEventsMixin:
                 )
             # Resolve the role BEFORE upserting the context: a doc-upload sync
             # carries no workspaceRole, and upserting first on cold memory
-            # would fabricate an ADJUDICATOR context that shadows the
+            # would fabricate a default-role context that shadows the
             # Qdrant-persisted role during resolution.
             resolved_workspace_role = await self._resolve_workspace_role(
                 workspace_id=str(payload.workspaceId),
@@ -1387,7 +1333,7 @@ class WorkspaceEventsMixin:
                         )
                     if not analysis_report or not isinstance(analysis_report, dict):
                         analysis_report = self._analysis_report_fallback(
-                            (workspace_role or "ADJUDICATOR").strip().upper()
+                            (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
                         )
                     # Document deletion REPLACES the analysis report with the
                     # freshly-regenerated one (derived from the remaining docs).
@@ -1443,6 +1389,10 @@ class WorkspaceEventsMixin:
 
             # Process new evidence files if any (skip files that are deleted: isDeleted true or in deleted_ids)
             files_to_process = []
+            # The loaders this sync armed with workspace:refresh. Every one is
+            # owed a terminal emit on every branch below (see
+            # _release_refresh_loaders); empty when nothing was armed.
+            armed_features: List[str] = []
             if payload.evidenceFiles:
                 for file in payload.evidenceFiles:
                     is_deleted = getattr(file, "isDeleted", False) or getattr(
@@ -1546,26 +1496,16 @@ class WorkspaceEventsMixin:
                         or self._workspace_procedural_timeline_payload.get(payload.workspaceId)
                     )
                     if has_prior_panels and self._socket_client:
+                        # Re-uploads rebuild the assessments payload below, and
+                        # a new document regenerates every panel (facts
+                        # changed), so every loader is shown.
+                        armed_features = list(UPLOAD_REFRESH_FEATURES)
                         try:
                             await self._emit_workspace_refresh(
                                 workspace_id=str(payload.workspaceId),
                                 user_id=str(payload.userId),
                                 reason="ai_update_started",
-                                feature_types=[
-                                    # Re-uploads rebuild the assessments payload
-                                    # below, so surface its loader too.
-                                    "document_assessments",
-                                    "strategy_objective",
-                                    "analysis_report",
-                                    "list_of_dates",
-                                    "applicable_laws",
-                                    "procedural_timeline",
-                                    # New-document upload regenerates these too
-                                    # (facts changed), so show their loaders as well.
-                                    "relevant_parties",
-                                    "case_laws",
-                                    "drafting_assistant",
-                                ],
+                                feature_types=list(armed_features),
                             )
                         except Exception as refresh_err:
                             logger.warning(
@@ -1614,12 +1554,14 @@ class WorkspaceEventsMixin:
                     # capture_usage bills the re-ingestion spend (OCR units, STT
                     # seconds, embeddings, per-document Gemini calls) — see the
                     # matching scope in on_workspace_created.
+                    ingest_started = self._stage_begin(str(payload.workspaceId), "ingest")
                     with capture_usage() as ingest_usage:
                         batch_result = await document_processor.process_batch(
                             files=files_to_process,
                             workspace_id=payload.workspaceId,
                             user_id=payload.userId,
                         )
+                    self._log_stage("ingest", ingest_started, mode="sequential")
 
                     logger.success(
                         "Document sync complete: {}/{} successful",
@@ -1694,11 +1636,17 @@ class WorkspaceEventsMixin:
                                 try:
                                     # Own scope — see the matching comment in
                                     # on_workspace_created.
+                                    meta_started = self._stage_begin(
+                                        str(payload.workspaceId), "metadata"
+                                    )
                                     with capture_usage() as meta_usage:
                                         meta = await self._get_workspace_category_and_subcategory(
                                             workspace_id=payload.workspaceId,
                                             user_id=payload.userId,
                                         )
+                                    self._log_stage(
+                                        "metadata", meta_started, mode="sequential"
+                                    )
                                     workspace_metadata_payload = {
                                         "featureType": "workspace_metadata",
                                         "workspaceId": payload.workspaceId,
@@ -1758,9 +1706,33 @@ class WorkspaceEventsMixin:
                                     batch_result=batch_result,
                                     is_update=True,
                                     analysis_log_context=" (sync)",
+                                    armed_features=armed_features,
+                                )
+                            elif armed_features:
+                                # An existing case whose new files ALL failed.
+                                # Its panels are unchanged, so they are settled
+                                # from cache as they are: never replaced by a
+                                # fallback report, never emptied, and nothing is
+                                # re-extracted.
+                                settled = await self._release_refresh_loaders(
+                                    str(payload.workspaceId),
+                                    str(payload.userId),
+                                    [
+                                        f
+                                        for f in armed_features
+                                        if f != "document_assessments"
+                                    ],
+                                    reason="sync_all_files_failed",
+                                    workspace_role=resolved_workspace_role,
+                                )
+                                logger.info(
+                                    "sync settled from cache reason={} features={}",
+                                    "all_files_failed",
+                                    len(settled),
                                 )
                             else:
-                                # When no files succeeded on sync, still emit analysis report (fallback)
+                                # First build: when no files succeeded on sync,
+                                # still emit analysis report (fallback)
                                 if self._socket_client:
                                     try:
                                         workspace_role = resolved_workspace_role
@@ -1837,6 +1809,22 @@ class WorkspaceEventsMixin:
                             logger.error(
                                 "Failed to emit sync error notification: {}", emit_error
                             )
+                    if armed_features:
+                        # The crash ended the run before any panel was
+                        # scheduled: settle every armed loader from cache
+                        # (document_assessments got its error emit above).
+                        settled = await self._release_refresh_loaders(
+                            str(payload.workspaceId),
+                            str(payload.userId),
+                            [f for f in armed_features if f != "document_assessments"],
+                            reason="sync_ingest_failed",
+                            workspace_role=resolved_workspace_role,
+                        )
+                        logger.info(
+                            "sync settled from cache reason={} features={}",
+                            "ingest_failed",
+                            len(settled),
+                        )
 
             # When we skipped re-processing (no new/changed/deleted docs), re-emit from cache only.
             # Do NOT regenerate — only when user adds/updates/deletes documents do we regenerate (paths above).
@@ -2135,7 +2123,7 @@ class WorkspaceEventsMixin:
                     )
                 if not analysis_report or not isinstance(analysis_report, dict):
                     analysis_report = self._analysis_report_fallback(
-                        (workspace_role or "ADJUDICATOR").strip().upper()
+                        (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
                     )
                 if isinstance(analysis_report, dict):
                     try:
@@ -2873,7 +2861,7 @@ class WorkspaceEventsMixin:
                 )
             if not analysis_report or not isinstance(analysis_report, dict):
                 analysis_report = self._analysis_report_fallback(
-                    (workspace_role or "ADJUDICATOR").strip().upper()
+                    (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
                 )
             # Replace, don't merge: the restored document set is authoritative,
             # so items tied to a document that is no longer here must drop.
@@ -2960,7 +2948,7 @@ class WorkspaceEventsMixin:
             logger.error(
                 "workspace_transferred: invalid payload (keys={}): {}",
                 list((data or {}).keys()) if isinstance(data, dict) else type(data).__name__,
-                e,
+                validation_fields(e),
             )
             return
 
@@ -3025,8 +3013,7 @@ class WorkspaceEventsMixin:
 
         # Reconnect safety: from now on any post-disconnect re-emit for this
         # workspace must carry the NEW owner (mirrors on_workspace_created).
-        self._pending_reemit_workspace_id = workspace_id
-        self._pending_reemit_user_id = new_user_id
+        self._arm_reconnect_reemit(workspace_id, new_user_id)
 
         # Resolve role for the new owner: payload → context → Qdrant → ADJUDICATOR.
         workspace_role = await self._resolve_workspace_role(
@@ -3198,12 +3185,9 @@ class WorkspaceEventsMixin:
                             if self._workspace_drafting_payload.get(workspace_id):
                                 continue
                         else:
-                            # Force a fresh snapshot of the new owner's library
-                            # (the reply also reconciles deletions) so the regen
-                            # below matches against current templates.
-                            await self.ensure_templates_synced(
-                                new_user_id, force=True
-                            )
+                            # Templates are global (SIM-173): the new owner sees
+                            # the same library, so only make sure it is loaded.
+                            await self.ensure_templates_synced()
                         await self._generate_and_emit_drafting_suggestions(
                             workspace_id=workspace_id,
                             user_id=new_user_id,
@@ -3225,8 +3209,11 @@ class WorkspaceEventsMixin:
                     )
 
         # Never block the socket loop — the forced template sync awaits a full
-        # snapshot ingest and suggestion generation is an LLM call.
-        asyncio.create_task(_runner())
+        # snapshot ingest and suggestion generation is an LLM call. Tracked, so
+        # a stop or a purge of this workspace can cancel it.
+        self._track_background_task(
+            asyncio.create_task(_runner()), label="workspace_transferred re-emit"
+        )
         logger.success(
             "workspace_transferred processed for {} — {} feature re-emit(s) scheduled",
             workspace_id,

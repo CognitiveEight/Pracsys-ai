@@ -74,6 +74,8 @@ from app.prompts.drafting import (
     build_template_profile_prompt,
     infer_document_class,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
+from app.langgraph.template_store import GLOBAL_SCOPE, pin_template_version, version_pins
 
 
 # ---------------------------------------------------------------------------
@@ -82,8 +84,9 @@ from app.prompts.drafting import (
 
 # Templates are no longer persisted in Qdrant — they live in the in-memory
 # `app.langgraph.template_store.template_store`, fed in real time by the
-# inbound `template_sync` socket event (backend re-pushes the full library
-# on reconnect). Only drafting-session state still uses the Qdrant cache.
+# inbound `global_template_sync` socket event (the full published set is
+# requested on every connect). Only drafting-session state still uses the
+# Qdrant cache.
 DRAFTING_SESSION_CACHE_KIND = "drafting_session"
 
 # How many characters of the extracted template body to read when
@@ -499,6 +502,19 @@ def _filename_for_extraction(name: Optional[str], extension: Optional[str]) -> s
     from app.processing.file_handlers import filename_for_extraction
 
     return filename_for_extraction((name or "").strip() or "template", extension)
+
+
+def _template_skeleton_blob(
+    user_id: str, template_id: str, scope: Optional[str], version: Any
+) -> str:
+    """GCS object name for a template's DOCX skeleton.
+
+    A global template's skeleton is shared by every lawyer and frozen per
+    version, so it is keyed by template and version, never by a lawyer.
+    """
+    if scope == GLOBAL_SCOPE:
+        return f"{_TEMPLATE_GCS_PREFIX}/global/{template_id}/v{version or 0}.docx"
+    return f"{_TEMPLATE_GCS_PREFIX}/{user_id}/{template_id}.docx"
 
 
 def _word_count(text: str) -> int:
@@ -1556,7 +1572,7 @@ class DraftingAgent:
         *,
         user_id: str,
         suggestions: List[Dict[str, Any]],
-        role: str = "ADJUDICATOR",
+        role: str = DEFAULT_WORKSPACE_ROLE,
         case_summary: str = "",
         applicable_laws_brief: str = "",
         strategy_brief: str = "",
@@ -1598,7 +1614,13 @@ class DraftingAgent:
             tid = (item.get("templateId") or "").strip()
             is_matched = (item.get("matchMode") == "matched") and bool(tid)
             if is_matched:
-                exists = await self.get_template(user_id=user_id, template_id=tid)
+                from app.langgraph.template_store import template_store
+
+                # A retired global template still resolves for drafts already
+                # started from it, but it must never stay on a suggestion card.
+                exists = None
+                if await template_store.is_suggestable(user_id=user_id, template_id=tid):
+                    exists = await self.get_template(user_id=user_id, template_id=tid)
                 if exists and (exists.get("extracted_text") or "").strip():
                     frozen_idx[idx] = item  # keep the advertised binding
                     # Re-assert the lock from the payload so a click without a
@@ -1688,7 +1710,7 @@ class DraftingAgent:
         return merged
 
     # ------------------------------------------------------------------
-    # 2) Template ingestion (called from template_sync handler)
+    # 2) Template ingestion (called from the global template sync handler)
     # ------------------------------------------------------------------
 
     async def ingest_template(
@@ -1706,6 +1728,8 @@ class DraftingAgent:
         previous_payload: Optional[Dict[str, Any]] = None,
         kind: Optional[str] = None,
         formatting: Optional[Dict[str, Any]] = None,
+        scope: Optional[str] = None,
+        version: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """Download a template, extract text, and persist under the user cache.
 
@@ -1716,6 +1740,9 @@ class DraftingAgent:
         When `formatting.blueprint` is supplied (a re-upload of an
         already-approved template), that lawyer-approved blueprint is stored as
         authoritative and the AI profiler is NOT re-run.
+
+        `scope="global"` with its `version` marks a Global Template Library
+        entry; the template store routes it (see ``template_store``).
         """
         if not file_url:
             logger.warning(
@@ -1863,8 +1890,8 @@ class DraftingAgent:
 
                 bucket = getattr(_settings, "gcs_docx_bucket_name", None)
                 if bucket:
-                    blob_name = (
-                        f"{_TEMPLATE_GCS_PREFIX}/{user_id}/{template_id}.docx"
+                    blob_name = _template_skeleton_blob(
+                        user_id, template_id, scope, version
                     )
                     await asyncio.to_thread(
                         _gcs.upload_bytes,
@@ -2050,6 +2077,9 @@ class DraftingAgent:
             "blueprint_approved": blueprint_approved,
             "kind": (kind or "file"),
         }
+        if scope == GLOBAL_SCOPE:
+            payload["scope"] = GLOBAL_SCOPE
+            payload["version"] = version
 
         try:
             from app.langgraph.template_store import template_store
@@ -2533,65 +2563,6 @@ class DraftingAgent:
             return "Petition"
         return "Other"
 
-    async def apply_approved_blueprint(
-        self, *, user_id: str, template_id: str, blueprint: Dict[str, Any]
-    ) -> bool:
-        """Store the lawyer-approved blueprint as authoritative (file unchanged).
-
-        Reconciles the approved variable set with our registry, enriches any
-        name-only added variables, and persists the controls (tone, context,
-        structure, depth, guardrails). Returns False when the template is
-        unknown (the snapshot will backfill it later)."""
-        tpl = await self.get_template(user_id=user_id, template_id=template_id)
-        if not tpl:
-            logger.warning(
-                "apply_approved_blueprint: template not in store (user={}, template={})",
-                str(user_id)[:12],
-                template_id,
-            )
-            return False
-        resolved = await self._resolve_approved_blueprint(
-            blueprint=blueprint or {},
-            existing_variables=tpl.get("interactive_variables") or [],
-            document_type=tpl.get("document_type") or "",
-            existing_tone=(tpl.get("template_tone") or ""),
-            existing_context=(tpl.get("filing_context") or ""),
-            existing_outline=tpl.get("structure_outline") or [],
-        )
-        updated = {
-            **tpl,
-            "interactive_variables": resolved["interactive_variables"],
-            "template_tone": resolved["template_tone"],
-            "filing_context": resolved["filing_context"],
-            "structure_outline": resolved["structure_outline"],
-            "draft_structure": resolved["draft_structure"],
-            "draft_depth": resolved["draft_depth"],
-            "guardrail_level": resolved["guardrail_level"],
-            "blueprint_approved": True,
-            "profile_schema_version": PROFILE_SCHEMA_VERSION,
-            "profiled_at": datetime.utcnow().isoformat(),
-        }
-        try:
-            from app.langgraph.template_store import template_store
-
-            await template_store.put(
-                user_id=user_id, template_id=template_id, payload=updated
-            )
-        except Exception as e:
-            logger.warning("apply_approved_blueprint: persist failed: {}", e)
-            return False
-        logger.success(
-            "Applied approved blueprint (template={}, vars={}, tone={!r}, "
-            "depth={!r}, structure={!r}, guardrails={!r})",
-            template_id,
-            len(resolved["interactive_variables"]),
-            resolved["template_tone"] or "(none)",
-            resolved["draft_depth"] or "(none)",
-            resolved["draft_structure"] or "(none)",
-            resolved["guardrail_level"] or "(none)",
-        )
-        return True
-
     async def store_preset(
         self,
         *,
@@ -2629,49 +2600,6 @@ class DraftingAgent:
             "Stored preset (template={}, category={!r})", template_id, category or "(none)"
         )
         return True
-
-    async def rename_template(
-        self,
-        *,
-        user_id: str,
-        template_id: str,
-        new_name: str,
-        previous_name: Optional[str],
-    ) -> bool:
-        """Patch the cached template's name; content untouched."""
-        from app.langgraph.template_store import template_store
-
-        existing = await template_store.get(
-            user_id=user_id,
-            template_id=template_id,
-        )
-        if not isinstance(existing, dict):
-            logger.debug(
-                "Rename: no cached template for user={} template={}",
-                user_id,
-                template_id,
-            )
-            return False
-        history = list(existing.get("name_history") or [])
-        if previous_name and previous_name not in history:
-            history.append(previous_name)
-        existing["name"] = new_name
-        existing["name_history"] = history
-        existing["ingested_at"] = datetime.utcnow().isoformat()
-        ok = await template_store.put(
-            user_id=user_id,
-            template_id=template_id,
-            payload=existing,
-        )
-        if ok:
-            logger.info(
-                "Template renamed (user={}, template={}): {!r}  {!r}",
-                user_id,
-                template_id,
-                previous_name,
-                new_name,
-            )
-        return ok
 
     async def delete_template(self, *, user_id: str, template_id: str) -> bool:
         from app.langgraph.template_store import template_store
@@ -4190,6 +4118,27 @@ class DraftingAgent:
         request_fields: Dict[str, Any],
         conversation_history: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        """Drive one turn of the drafting conversation (see :meth:`_handle_turn`).
+
+        The turn runs under a fresh template version-pin table, so a draft
+        started from a global template keeps reading the version it began on.
+        """
+        with version_pins():
+            return await self._handle_turn(
+                user_message=user_message,
+                case_context=case_context,
+                request_fields=request_fields,
+                conversation_history=conversation_history,
+            )
+
+    async def _handle_turn(
+        self,
+        *,
+        user_message: str,
+        case_context: Dict[str, Any],
+        request_fields: Dict[str, Any],
+        conversation_history: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
         """Drive one turn of the drafting conversation.
 
         Returns a dict with:
@@ -4210,6 +4159,20 @@ class DraftingAgent:
         session_state = await self._load_session_state(
             workspace_id=workspace_id, actionable_id=actionable_id
         )
+
+        # A global template is read at the version the draft started from: the
+        # request's own when it names a template, else the session's.
+        if (request_fields.get("templateId") or "").strip():
+            pin_template_version(
+                request_fields.get("templateId"), request_fields.get("templateVersion")
+            )
+        else:
+            # A draft never saved has no session (None): a blank draft's first
+            # message, and every retry after it, crashed here (SIM-191).
+            pin_template_version(
+                (session_state or {}).get("template_id"),
+                (session_state or {}).get("template_version"),
+            )
 
         # Greeting fast-path — runs BEFORE any drafting-state branch.
         # A bare "hi" / "hello" / "good morning" must always route to
@@ -4846,7 +4809,11 @@ class DraftingAgent:
         cached = await self.get_template(user_id=user_id, template_id=template_id)
         if cached and (cached.get("extracted_text") or "").strip():
             return cached
-        if not allow_lazy_fetch:
+        is_global = request_fields.get("templateScope") == GLOBAL_SCOPE
+        # A global template we do not hold at the requested version (older,
+        # retired, or the snapshot not in yet) is not a deleted one: the backend
+        # builds templateUrl for exactly that version, so fetch it.
+        if not allow_lazy_fetch and not is_global:
             # Deleted (absent from the synced store) — do NOT resurrect it.
             return None
         # Cold cache: lazy-fetch using fields on the request.
@@ -4873,6 +4840,8 @@ class DraftingAgent:
             path=request_fields.get("templatePath") or "",
             file_hash=request_fields.get("templateFileHash"),
             previous_payload=cached,
+            scope=GLOBAL_SCOPE if is_global else None,
+            version=request_fields.get("templateVersion") if is_global else None,
         )
 
     # ------------------------------------------------------------------ kickoff
@@ -4886,7 +4855,7 @@ class DraftingAgent:
     ) -> Dict[str, Any]:
         source = (request_fields.get("source") or "").strip()
         user_id = (request_fields.get("userId") or "").strip()
-        role = (case_context.get("role") or "ADJUDICATOR").upper()
+        role = (case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
         case_summary = case_context.get("case_summary") or ""
         case_facts = case_context.get("case_facts_brief") or ""
         lawyer_instructions = (user_message or "").strip() or None
@@ -5227,6 +5196,9 @@ class DraftingAgent:
             return {
                 "source": "template",
                 "template_id": template_payload.get("template_id"),
+                # The global version this draft started from; later turns read
+                # it again even after a newer version is published.
+                "template_version": template_payload.get("version"),
                 "template_name": template_payload.get("name"),
                 "template_document_type": template_payload.get("document_type") or "",
                 # Carry the template's tone / filing context + approved drafting
@@ -5533,7 +5505,7 @@ class DraftingAgent:
             inferred_doc_type = (classifier_result.get("document_type") or "").strip()
 
         if intent == "proceed_from_scratch":
-            role = (case_context.get("role") or "ADJUDICATOR").upper()
+            role = (case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
             case_summary = case_context.get("case_summary") or ""
             case_facts = case_context.get("case_facts_brief") or ""
             # If the lawyer named a specific document type (e.g. "draft
@@ -5817,7 +5789,7 @@ class DraftingAgent:
 
         if intent == "from_scratch":
             _clear_choice(session_state)
-            role = (case_context.get("role") or "ADJUDICATOR").upper()
+            role = (case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
             new_state = await self._scope_blank_draft(
                 role=role,
                 case_summary=case_context.get("case_summary") or "",
@@ -5862,7 +5834,7 @@ class DraftingAgent:
         — drafting still requires the lawyer to pick (a)/(b)/(c) on a
         later turn.
         """
-        role = (case_context.get("role") or "ADJUDICATOR").upper()
+        role = (case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
         case_summary = case_context.get("case_summary") or ""
         case_facts = case_context.get("case_facts_brief") or ""
         template_name = (session_state.get("template_name") or "(uploaded template)").strip()
@@ -6570,7 +6542,7 @@ class DraftingAgent:
         Failure mode: any LLM / JSON error returns a safe ``chat_reply``
         fallback so the turn never crashes the caller.
         """
-        role = (case_context.get("role") or "ADJUDICATOR").upper()
+        role = (case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
         case_summary = (case_context.get("case_summary") or "")
         case_facts = (case_context.get("case_facts_brief") or "")
 
@@ -6717,7 +6689,7 @@ class DraftingAgent:
             open_questions as before — there is no scoping progress to
             preserve.
         """
-        role = (case_context.get("role") or "ADJUDICATOR").upper()
+        role = (case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
         case_summary = case_context.get("case_summary") or ""
         case_facts = case_context.get("case_facts_brief") or ""
         prior_status = (session_state.get("draft_status") or "").strip()
@@ -7005,7 +6977,7 @@ OUTPUT FORMAT:
             )
             return session_state
 
-        role = (case_context.get("role") or "ADJUDICATOR").upper()
+        role = (case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
         case_summary = case_context.get("case_summary") or ""
         prompt = build_draft_translate_prompt(
             role=role,
@@ -7273,7 +7245,7 @@ OUTPUT FORMAT:
                     )
                     values = await self._extract_template_placeholder_values(
                         placeholders=placeholders,
-                        role=role or "ADJUDICATOR",
+                        role=role or DEFAULT_WORKSPACE_ROLE,
                         case_summary=case_summary or "",
                         case_facts_brief=case_facts_brief or "",
                         gathered_facts=gathered_facts or {},
@@ -7304,7 +7276,7 @@ OUTPUT FORMAT:
                 return None
             values = await self._extract_template_placeholder_values(
                 placeholders=placeholders,
-                role=role or "ADJUDICATOR",
+                role=role or DEFAULT_WORKSPACE_ROLE,
                 case_summary=case_summary or "",
                 case_facts_brief=case_facts_brief or "",
                 gathered_facts=gathered_facts or {},
@@ -7722,7 +7694,7 @@ OUTPUT FORMAT:
                     diff = await self._extract_template_diff(
                         template_docx_bytes=template_docx_bytes,
                         markdown=markdown,
-                        role=role or "ADJUDICATOR",
+                        role=role or DEFAULT_WORKSPACE_ROLE,
                         case_summary=case_summary or "",
                         case_facts_brief=case_facts_brief or "",
                         gathered_facts=gathered_facts or {},
@@ -7909,7 +7881,9 @@ OUTPUT FORMAT:
         try:
             from app.storage import gcs as _gcs
 
-            blob_name = f"{_TEMPLATE_GCS_PREFIX}/{user_id}/{template_id}.docx"
+            blob_name = _template_skeleton_blob(
+                user_id, template_id, tpl.get("scope"), tpl.get("version")
+            )
             await asyncio.to_thread(
                 _gcs.upload_bytes,
                 bucket,
@@ -7962,7 +7936,7 @@ OUTPUT FORMAT:
         mode_override: Optional[str],
         revision_instruction: Optional[str] = None,
     ) -> Dict[str, Any]:
-        role = (case_context.get("role") or "ADJUDICATOR").upper()
+        role = (case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
         case_summary = case_context.get("case_summary") or ""
         case_facts = case_context.get("case_facts_brief") or ""
         draft_title = session_state.get("draft_title") or "New Draft"
@@ -8304,7 +8278,7 @@ OUTPUT FORMAT:
             workspace_id=workspace_id,
             actionable_id=actionable_id,
             version=new_version,
-            role=(case_context.get("role") or "ADJUDICATOR").upper(),
+            role=(case_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper(),
             case_summary=case_context.get("case_summary") or "",
             case_facts_brief=case_context.get("case_facts_brief") or "",
             gathered_facts=session_state.get("gathered_facts") or {},

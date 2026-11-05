@@ -14,7 +14,10 @@ Each passage now gets a label the model must cite verbatim:
 * ``S1…Sn`` — a statutory provision from Applicable Laws (act, section, URL);
 * ``T1…Tn`` — a calculation the system computed over every row of a
   spreadsheet (app/rag/table_query.py): a count, total or filtered list, with
-  the document, sheet and rows it covers.
+  the document, sheet and rows it covers;
+* ``K1…Kn`` — a passage of the shared knowledge base (app/rag/knowledge_base.py):
+  legal reference material, never one of the case's documents, cited by its
+  admin-written title.
 
 The pack is serialised into the chat state (``to_state``) so the citation
 checker can map every label back to what it names, and so a label that is not
@@ -27,11 +30,14 @@ from typing import Any, Dict, Iterable, List, Optional
 
 _PAGE_MARKER_RE = re.compile(r"---\s*Page\s+(\d+)\s*---", re.I)
 
+#: Kinds whose text the citation checker reads figures from.
+CHECKABLE_KINDS = ("document", "computed", "knowledge_base")
+
 
 @dataclass
 class EvidenceItem:
     label: str
-    kind: str  # "document" | "case_law" | "statute" | "computed"
+    kind: str  # "document" | "case_law" | "statute" | "computed" | "knowledge_base"
     text: str
     document_id: Optional[str] = None
     annexure: Optional[int] = None
@@ -49,6 +55,8 @@ class EvidenceItem:
     row_start: Optional[int] = None
     row_end: Optional[int] = None
     row_offsets: Optional[List[List[Any]]] = None
+    #: Knowledge-base passages: the shelf category (judgment, statute, ...).
+    category: Optional[str] = None
 
     def row_at(self, offset: int) -> Optional[int]:
         """Spreadsheet row of a character offset inside this passage."""
@@ -101,7 +109,9 @@ class EvidencePack:
     #: Prompt notes from spreadsheet calculations: each result line with its
     #: [T#] label, or a statement that a calculation could not be made.
     table_notes: List[str] = field(default_factory=list)
-    _counters: Dict[str, int] = field(default_factory=lambda: {"E": 0, "C": 0, "S": 0, "T": 0})
+    _counters: Dict[str, int] = field(
+        default_factory=lambda: {"E": 0, "C": 0, "S": 0, "T": 0, "K": 0}
+    )
 
     def _next(self, prefix: str) -> str:
         self._counters[prefix] = self._counters.get(prefix, 0) + 1
@@ -173,6 +183,36 @@ class EvidencePack:
         self.items[item.label] = item
         return item
 
+    def add_knowledge_base(self, chunk: Dict[str, Any]) -> Optional[EvidenceItem]:
+        """A passage of the shared knowledge base (a stored shelf chunk)."""
+        meta = chunk.get("metadata") or {}
+        text = str(chunk.get("content") or "").strip()
+        if not text:
+            return None
+        item = EvidenceItem(
+            label=self._next("K"),
+            kind="knowledge_base",
+            text=text,
+            document_id=str(
+                chunk.get("original_document_id") or meta.get("original_document_id") or ""
+            ),
+            title=str(meta.get("title") or "").strip() or None,
+            category=meta.get("category"),
+            page_start=meta.get("page_start"),
+            page_end=meta.get("page_end"),
+            chunk_id=chunk.get("document_id"),
+            heading=meta.get("heading"),
+            sheet=meta.get("sheet"),
+            row_start=meta.get("row_start"),
+            row_end=meta.get("row_end"),
+            row_offsets=_shift_rows(
+                meta.get("row_offsets"),
+                len(str(chunk.get("content") or "")) - len(str(chunk.get("content") or "").lstrip()),
+            ),
+        )
+        self.items[item.label] = item
+        return item
+
     def add_case_law(self, case: Dict[str, Any]) -> EvidenceItem:
         title = str(case.get("title") or "").strip()
         citation = str(case.get("citation") or "").strip()
@@ -204,9 +244,9 @@ class EvidencePack:
         return (i for i in self.items.values() if i.kind == "document")
 
     def checkable(self) -> Iterable[EvidenceItem]:
-        """Items whose figures the citation checker verifies: document passages
-        and computed spreadsheet results."""
-        return (i for i in self.items.values() if i.kind in ("document", "computed"))
+        """Items whose figures the citation checker verifies: document passages,
+        computed spreadsheet results and knowledge-base passages."""
+        return (i for i in self.items.values() if i.kind in CHECKABLE_KINDS)
 
     def to_state(self) -> Dict[str, Dict[str, Any]]:
         return {label: asdict(item) for label, item in self.items.items()}

@@ -2,17 +2,15 @@
 
 When diarization collapses a long call into one speaker, the whole recording is
 one segment that the long-turn splitter cuts into ~134 pieces. All of them used
-to go into one 8000-token call; the model returned no Part (MAX_TOKENS), and
-``response.text`` raised ValueError out of the worker, discarding the finished
-transcript. Fake model clients only: no network calls, fictional text.
+to go into one 8000-token call, which the model could not answer (MAX_TOKENS),
+and the failure discarded the finished transcript. Fake model clients only: no
+network calls, fictional text.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from types import SimpleNamespace
-
 import app.processing.audio_transcription as at
 
 # ~550 chars of fictional Devanagari per sentence, so each sentence is one piece.
@@ -24,43 +22,36 @@ def _numbered_items(prompt: str) -> list[str]:
     return re.findall(r"^\d+\. (.*)$", body, flags=re.MULTILINE)
 
 
-class _NoPartResponse:
-    def __init__(self):
-        self.candidates = [SimpleNamespace(finish_reason=2)]
+def test_failed_model_call_returns_none(monkeypatch):
+    """A no-text response (MAX_TOKENS) comes back from the router as the error
+    sentinel; the audio helpers must turn it into None, never raise."""
+    from app.ai.gemini_client import gemini_client
 
-    @property
-    def text(self):
-        raise ValueError("The `response.text` quick accessor requires ... finish_reason is 2.")
-
-
-def test_response_text_without_a_part_is_empty_not_an_exception():
-    assert at._response_text(_NoPartResponse()) == ""
-    assert at._response_text(SimpleNamespace(text="ok")) == "ok"
-
-
-def test_json_call_with_no_part_returns_none(monkeypatch):
-    class _Model:
-        def __init__(self, name):
-            pass
-
-        def generate_content(self, *a, **k):
-            return _NoPartResponse()
-
-    fake_genai = SimpleNamespace(
-        GenerativeModel=_Model,
-        types=SimpleNamespace(GenerationConfig=lambda **k: k),
+    monkeypatch.setattr(gemini_client, "is_available", lambda: True)
+    monkeypatch.setattr(
+        gemini_client, "generate_sync",
+        lambda prompt, **k: "Error generating response: model returned no text",
     )
-    monkeypatch.setattr(at, "_genai", fake_genai)
-    monkeypatch.setattr(at, "_gemini_configured", lambda: True)
-    monkeypatch.setattr(at, "_record_audio_gemini_usage", lambda r: None)
     assert at._generate_gemini_json_raw("prompt", max_output_tokens=8000) is None
     assert at._generate_gemini_plaintext_raw("prompt") is None
+
+
+def test_credentials_resolution_does_not_raise_name_error(monkeypatch):
+    """The module-level cache flags were lost in a refactor, so the first
+    call raised NameError and every transcription failed before starting."""
+    monkeypatch.setattr(at, "_CREDENTIALS_RESOLVED", False)
+    monkeypatch.setattr(at, "_RESOLVED_CREDENTIALS_PATH", None)
+    monkeypatch.setattr(at.settings, "speech_google_application_credentials", None, raising=False)
+    monkeypatch.setattr(at.settings, "google_application_credentials", None, raising=False)
+    monkeypatch.delenv("SPEECH_GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    assert at._resolve_credentials_path() is None
 
 
 def test_one_long_segment_is_sent_in_small_groups(monkeypatch):
     sizes: list[int] = []
 
-    def fake_json_raw(prompt, *, max_output_tokens=2048):
+    def fake_json_raw(prompt, *, max_output_tokens=2048, **_):
         items = _numbered_items(prompt)
         sizes.append(len(items))
         return json.dumps({"transliterated": ["yeh ek kalpanik vakya hai"] * len(items)})
@@ -77,7 +68,7 @@ def test_one_long_segment_is_sent_in_small_groups(monkeypatch):
 def test_failed_group_keeps_its_devanagari_and_others_convert(monkeypatch):
     calls = {"n": 0}
 
-    def fake_json_raw(prompt, *, max_output_tokens=2048):
+    def fake_json_raw(prompt, *, max_output_tokens=2048, **_):
         calls["n"] += 1
         if calls["n"] <= 2:  # first group: primary and terse retry both empty
             return None
@@ -96,7 +87,7 @@ def test_failed_group_keeps_its_devanagari_and_others_convert(monkeypatch):
 def test_already_roman_pieces_are_not_resent(monkeypatch):
     sent: list[str] = []
 
-    def fake_json_raw(prompt, *, max_output_tokens=2048):
+    def fake_json_raw(prompt, *, max_output_tokens=2048, **_):
         items = _numbered_items(prompt)
         sent.extend(items)
         return json.dumps({"transliterated": ["roman"] * len(items)})

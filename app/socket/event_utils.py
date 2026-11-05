@@ -5,15 +5,10 @@ leaf) so any handler module can import these without circular-import risk.
 """
 
 import asyncio
-import json
 import re
-import time
 import uuid
 from datetime import date as date_type
-from datetime import datetime
-from html import unescape
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import quote_plus
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 __all__ = [
     'EventHandler',
@@ -197,6 +192,26 @@ _OVERVIEW_TO_PHONE_RE = re.compile(
     r"To:\s*(\+?91[\s\-]*\d[\d\s\-]{8,18})",
     re.I,
 )
+
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+
+
+async def gather_bounded(
+    limit: int, items: Iterable[_T], fn: Callable[[_T], Awaitable[_R]]
+) -> List[_R]:
+    """``fn(item)`` for every item, at most ``limit`` at once (``limit < 1``
+    means 1). Results come back in input order, so a caller that merges them
+    in order gets the same result as a one-at-a-time loop. An exception or
+    cancellation propagates as with ``asyncio.gather``."""
+    slots = asyncio.Semaphore(max(1, int(limit)))
+
+    async def _one(item: _T) -> _R:
+        async with slots:
+            return await fn(item)
+
+    return list(await asyncio.gather(*(_one(item) for item in items)))
 
 
 def _roman_or_int(token: str) -> Optional[int]:
@@ -596,7 +611,7 @@ def _strip_strength_point_statute_boilerplate(text: str) -> str:
     Guard: if stripping would collapse the point below ``_STRENGTH_POINT_MIN_LEN``
     characters (i.e. the model produced a label + boilerplate single-sentence form
     like "Youth of the accused, which is a relevant fact under <Act>, YYYY."), we
-    return the ORIGINAL prose instead. The universal law-strip in ``agent.py`` will
+    return the ORIGINAL prose instead. The universal law-strip in ``app/langgraph/output_filters.py`` will
     then remove the citation in a context-aware way without collapsing the whole
     point to a two-word fragment.
     """

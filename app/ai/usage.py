@@ -33,6 +33,8 @@ from typing import Any, Awaitable, Callable, Iterator, Optional
 
 from loguru import logger
 
+from app.ai import gate0_meter
+
 
 @dataclass
 class UsageAccumulator:
@@ -40,6 +42,17 @@ class UsageAccumulator:
 
     input_tokens: int = 0
     output_tokens: int = 0
+    # LLM cost, priced per call at record time by the model that served it — a
+    # scope can mix models once tasks are routed to different providers, so
+    # pricing the token totals by one model at the end would be wrong.
+    input_price: float = 0.0
+    output_price: float = 0.0
+    # model -> tokens (in + out) it consumed in this scope.
+    models: dict = field(default_factory=dict)
+    # The part of this scope recorded with NO workspace in context, so it never
+    # reached the workspace ledger; the scope's own emit reports it instead
+    # (see drain_for_emit). Everything else is reported from the ledger.
+    unattributed: Optional["UsageAccumulator"] = field(default=None, repr=False, compare=False)
     # Set once the turn's totals have been billed into the workspace cumulative,
     # so a second emit in the same turn (e.g. an error path after the main
     # response) does not double-count the same tokens.
@@ -57,6 +70,10 @@ class UsageAccumulator:
     grounding_requests: int = 0
     # Embedding input tokens (ESTIMATED — see record_embed_tokens).
     embed_tokens: int = 0
+    # The part of embed_tokens a gateway (gate0) priced itself, and that price.
+    # Those tokens are billed at the gateway's figure, not the local rate.
+    embed_gateway_tokens: int = 0
+    embed_gateway_cost: float = 0.0
 
     # OCR and STT report from asyncio.to_thread workers, and process_batch may
     # process several documents concurrently against one accumulator, so every
@@ -65,11 +82,40 @@ class UsageAccumulator:
         default_factory=threading.Lock, repr=False, compare=False
     )
 
-    def add(self, prompt_tokens: int, output_tokens: int) -> None:
-        """Add one generation's tokens. Negative/None values are treated as 0."""
+    def add(
+        self,
+        prompt_tokens: int,
+        output_tokens: int,
+        model: Optional[str] = None,
+        cost: Optional[float] = None,
+    ) -> None:
+        """Add one generation's tokens, priced by ``model`` (default: the
+        configured Gemini model). ``cost`` — an authoritative USD figure from a
+        gateway — replaces the table price; it is split into input/output in
+        the table's proportion so the per-side fields still add up to it.
+        Negative/None values are treated as 0."""
+        from app.ai.pricing import price_for
+        from app.core.config import settings
+
+        in_tok = max(int(prompt_tokens or 0), 0)
+        out_tok = max(int(output_tokens or 0), 0)
+        name = model or settings.gemini_model
+        price = price_for(name, in_tok, out_tok)
+        if cost is not None and cost >= 0:
+            table_total = price["inputPrice"] + price["outputPrice"]
+            in_share = price["inputPrice"] / table_total if table_total else 0.0
+            # Unrounded: per-call rounding to 6 dp drifted from gate0's figure
+            # (e.g. $0.00000975 billed as $0.00001); emits round the totals.
+            price = {
+                "inputPrice": cost * in_share,
+                "outputPrice": cost * (1 - in_share),
+            }
         with self._lock:
-            self.input_tokens += max(int(prompt_tokens or 0), 0)
-            self.output_tokens += max(int(output_tokens or 0), 0)
+            self.input_tokens += in_tok
+            self.output_tokens += out_tok
+            self.input_price += price["inputPrice"]
+            self.output_price += price["outputPrice"]
+            self.models[name] = self.models.get(name, 0) + in_tok + out_tok
 
     def add_ocr_units(self, units: int) -> None:
         """Add Vision OCR units. Negative/None values are treated as 0."""
@@ -91,10 +137,16 @@ class UsageAccumulator:
         with self._lock:
             self.grounding_requests += max(int(requests or 0), 0)
 
-    def add_embed_tokens(self, tokens: int) -> None:
-        """Add embedding input tokens. Negative/None values are treated as 0."""
+    def add_embed_tokens(self, tokens: int, cost: Optional[float] = None) -> None:
+        """Add embedding input tokens. ``cost`` — a gateway's USD figure for
+        these tokens — bills them at that price instead of the local rate.
+        Negative/None values are treated as 0."""
+        tok = max(int(tokens or 0), 0)
         with self._lock:
-            self.embed_tokens += max(int(tokens or 0), 0)
+            self.embed_tokens += tok
+            if cost is not None and cost >= 0:
+                self.embed_gateway_tokens += tok
+                self.embed_gateway_cost += float(cost)
 
 
 # The active accumulator for the current async task, or None when no scope is
@@ -170,6 +222,40 @@ def meter_usage(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[
     return wrapper
 
 
+def llm_price(usage: Any) -> "dict[str, float]":
+    """LLM cost of a scope: ``{inputPrice, outputPrice, price}``.
+
+    Uses the per-call prices accumulated at record time. An object without
+    them (a test double, or a scope from before per-model pricing) is priced by
+    the configured Gemini model, which is what every scope used to be.
+    """
+    from app.ai.pricing import price_for
+    from app.core.config import settings
+
+    in_tok = int(getattr(usage, "input_tokens", 0) or 0)
+    out_tok = int(getattr(usage, "output_tokens", 0) or 0)
+    models = getattr(usage, "models", None)
+    if isinstance(models, dict) and models:
+        in_price = round(float(getattr(usage, "input_price", 0.0) or 0.0), 6)
+        out_price = round(float(getattr(usage, "output_price", 0.0) or 0.0), 6)
+        return {
+            "inputPrice": in_price,
+            "outputPrice": out_price,
+            "price": round(in_price + out_price, 6),
+        }
+    return price_for(settings.gemini_model, in_tok, out_tok)
+
+
+def primary_model(usage: Any) -> str:
+    """The model that did most of a scope's work (for ``aiModel`` labels)."""
+    from app.core.config import settings
+
+    models = getattr(usage, "models", None)
+    if isinstance(models, dict) and models:
+        return max(models.items(), key=lambda kv: kv[1])[0]
+    return settings.gemini_model
+
+
 def begin_usage() -> "tuple[object, UsageAccumulator]":
     """Open a usage-capture scope imperatively (for try/finally call sites).
 
@@ -191,23 +277,29 @@ def reset_usage(token: object) -> None:
         logger.debug("reset_usage failed: {}", exc)
 
 
-def record_usage(prompt_tokens: int, output_tokens: int) -> None:
+def record_usage(
+    prompt_tokens: int,
+    output_tokens: int,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    cost: Optional[float] = None,
+) -> None:
     """Report one generation's token usage to the active scope, if any.
 
-    Safe to call from anywhere: when no :func:`capture_usage` scope is open
-    this does nothing but warns once (see ``_warned_unscoped_kinds`` below) —
-    tokens spent outside a scope are billed to nobody, and that must be visible
-    in the logs rather than silently swallowed. ``output_tokens`` should already
-    include thinking tokens (Gemini bills them as output).
+    Safe to call from anywhere. The call is billed to the active scope and to
+    the running event's workspace (see the workspace ledger below); with
+    neither, it warns once (``_warned_unscoped_kinds``) — tokens spent with no
+    scope and no workspace are billed to nobody, and that must be visible. ``output_tokens`` should already
+    include thinking tokens (every supported provider bills them as output).
+    ``model`` prices the call; ``cost`` (a gateway's own USD figure) overrides
+    the table price. ``provider`` is accepted for symmetry with the
+    ``llm_call`` log line and is not needed for pricing.
     """
-    accumulator = _current_usage.get()
-    if accumulator is None:
-        _warn_unscoped_once("LLM tokens", (prompt_tokens or 0) + (output_tokens or 0))
-        return
-    try:
-        accumulator.add(prompt_tokens, output_tokens)
-    except Exception as exc:  # usage tracking must never break generation
-        logger.debug("record_usage failed: {}", exc)
+    _record(
+        "LLM tokens",
+        (prompt_tokens or 0) + (output_tokens or 0),
+        lambda acc: acc.add(prompt_tokens, output_tokens, model, cost),
+    )
 
 
 # --- Paid non-LLM API recorders -------------------------------------------
@@ -244,14 +336,112 @@ def _record_service_unit(
     kind: str, quantity: float, apply: Callable[[UsageAccumulator], None]
 ) -> None:
     """Shared plumbing for the paid-unit recorders below."""
+    _record(kind, quantity, apply)
+
+
+# --- Workspace ledger -------------------------------------------------------
+#
+# Every paid unit is charged to the workspace it was spent for AT RECORD TIME,
+# keyed by the workspace_id bound in the logging context of the running event
+# (the same id gate0/LiteLLM tags each request with, so per-case totals
+# reconcile with the gateway's spend logs). Emits then report — and add to the
+# workspace's cumulative total — whatever the ledger holds since the last emit
+# (drain_for_emit). A cost spent in a scope that is never emitted (knowledge
+# graph ingestion, background re-evaluations, …) therefore still reaches the
+# case on its next emit instead of being billed to nobody.
+
+_ledger: dict = {}
+_ledger_lock = threading.Lock()
+
+
+def current_workspace_id() -> Optional[str]:
+    """workspace_id of the inbound event this code runs for, from the logging
+    context (``logger.contextualize``); None outside a workspace event."""
+    try:
+        import loguru._logger as _loguru
+
+        value = (_loguru.context.get() or {}).get("workspace_id")
+    except Exception:  # internal API; attribution degrades to the scope
+        return None
+    value = str(value or "").strip()
+    return value if value and value not in ("-", "unknown", "None") else None
+
+
+def _record(kind: str, quantity: float, apply: Callable[[UsageAccumulator], None]) -> None:
+    """Apply one paid quantity to the active scope and to the workspace ledger."""
+    if gate0_meter.metered_kind(kind):
+        # Units that never pass through gate0 (OCR, STT, search) are reported
+        # to its meter here, the one point every recorder passes through.
+        gate0_meter.report(kind, quantity)
     accumulator = _current_usage.get()
-    if accumulator is None:
+    workspace_id = current_workspace_id()
+    if accumulator is None and workspace_id is None:
         _warn_unscoped_once(kind, quantity)
         return
     try:
-        apply(accumulator)
-    except Exception as exc:
+        if accumulator is not None:
+            apply(accumulator)
+            if workspace_id is None:
+                with accumulator._lock:
+                    if accumulator.unattributed is None:
+                        accumulator.unattributed = UsageAccumulator()
+                apply(accumulator.unattributed)
+        if workspace_id is not None:
+            with _ledger_lock:
+                apply(_ledger.setdefault(workspace_id, UsageAccumulator()))
+    except Exception as exc:  # cost tracking must never break the work it measures
         logger.debug("record {} usage failed: {}", kind, exc)
+
+
+def merge_usage(*parts: Optional[UsageAccumulator]) -> UsageAccumulator:
+    """One accumulator holding the sum of ``parts`` (None entries skipped)."""
+    out = UsageAccumulator()
+    for part in parts:
+        if part is None:
+            continue
+        out.input_tokens += part.input_tokens
+        out.output_tokens += part.output_tokens
+        out.input_price += part.input_price
+        out.output_price += part.output_price
+        for name, tokens in part.models.items():
+            out.models[name] = out.models.get(name, 0) + tokens
+        out.ocr_units += part.ocr_units
+        out.stt_seconds += part.stt_seconds
+        out.search_queries += part.search_queries
+        out.grounding_requests += part.grounding_requests
+        out.embed_tokens += part.embed_tokens
+        out.embed_gateway_tokens += part.embed_gateway_tokens
+        out.embed_gateway_cost += part.embed_gateway_cost
+    return out
+
+
+def drain_for_emit(workspace_id: Optional[str], usage: Any = None) -> UsageAccumulator:
+    """The spend an emit for ``workspace_id`` must report, removed so no other
+    emit reports it again: everything charged to the workspace since its last
+    emit, plus the part of ``usage`` (the emitting scope) that had no workspace
+    in context when it was recorded."""
+    drained = None
+    if workspace_id:
+        with _ledger_lock:
+            drained = _ledger.pop(str(workspace_id), None)
+    unattributed = None
+    if isinstance(usage, UsageAccumulator):
+        with usage._lock:
+            unattributed, usage.unattributed = usage.unattributed, None
+    return merge_usage(drained, unattributed)
+
+
+def pending_workspace_usage(workspace_id: str) -> Optional[UsageAccumulator]:
+    """Copy of the not-yet-reported spend for a workspace (diagnostics/tests)."""
+    with _ledger_lock:
+        acc = _ledger.get(str(workspace_id))
+        return merge_usage(acc) if acc is not None else None
+
+
+def forget_workspace_usage(workspace_id: str) -> None:
+    """Drop a workspace's unreported spend (workspace purge)."""
+    with _ledger_lock:
+        _ledger.pop(str(workspace_id), None)
 
 
 def record_ocr_units(units: int = 1) -> None:
@@ -294,8 +484,7 @@ def log_unbilled_usage(label: str, usage: Optional[UsageAccumulator]) -> None:
     if usage is None:
         return
     try:
-        from app.ai.pricing import price_for, service_price_for
-        from app.core.config import settings
+        from app.ai.pricing import service_price_for
 
         in_tok = int(getattr(usage, "input_tokens", 0) or 0)
         out_tok = int(getattr(usage, "output_tokens", 0) or 0)
@@ -305,8 +494,10 @@ def log_unbilled_usage(label: str, usage: Optional[UsageAccumulator]) -> None:
             search_queries=int(getattr(usage, "search_queries", 0) or 0),
             grounding_requests=int(getattr(usage, "grounding_requests", 0) or 0),
             embed_tokens=int(getattr(usage, "embed_tokens", 0) or 0),
+            embed_gateway_tokens=int(getattr(usage, "embed_gateway_tokens", 0) or 0),
+            embed_gateway_cost=float(getattr(usage, "embed_gateway_cost", 0.0) or 0.0),
         )
-        llm = price_for(settings.gemini_model, in_tok, out_tok)
+        llm = llm_price(usage)
         total = round(llm["price"] + service["servicePrice"], 6)
         if not (in_tok or out_tok or service["servicePrice"]):
             return
@@ -325,13 +516,15 @@ def log_unbilled_usage(label: str, usage: Optional[UsageAccumulator]) -> None:
         logger.debug("log_unbilled_usage failed ({}): {}", label, exc)
 
 
-def record_embed_tokens(tokens: int) -> None:
+def record_embed_tokens(tokens: int, cost: Optional[float] = None) -> None:
     """Report embedding input tokens.
 
-    The legacy ``genai.embed_content`` response carries no ``usage_metadata``, so
-    callers pass an ESTIMATE (~4 chars/token). ``embedPrice`` is therefore
-    approximate; at $0.15/1M tokens the error is negligible next to OCR/STT.
+    Through gate0, ``cost`` is the gateway's own figure for the call
+    (``x-litellm-response-cost``) and is billed as-is, so the case's
+    ``embedPrice`` matches gate0's spend. Without it (direct Gemini, whose
+    response carries no usage) callers pass an ESTIMATE (~4 chars/token)
+    priced at ``EMBED_PRICE_PER_MILLION_TOKENS``.
     """
     _record_service_unit(
-        "embedding", tokens, lambda acc: acc.add_embed_tokens(tokens)
+        "embedding", tokens, lambda acc: acc.add_embed_tokens(tokens, cost)
     )

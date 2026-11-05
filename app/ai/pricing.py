@@ -20,7 +20,7 @@ crashes a response, it just prices at the default with a warning.
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 from loguru import logger
 
@@ -60,6 +60,15 @@ def _rates_for(model: str) -> Tuple[float, float]:
     if not model:
         return _DEFAULT_RATES
 
+    # 1b) Per-model operator rates (LLM_PRICING_OVERRIDES). This is how
+    #     non-Gemini models are priced: their rates are deliberately not
+    #     hard-coded here, because they change and must be taken from each
+    #     provider's own price page (OpenAI, Azure, AWS, DeepSeek, …), or for
+    #     self-hosted models computed from the serving cost.
+    override = _override_rates(model)
+    if override is not None:
+        return override
+
     # 2) Exact match.
     if model in MODEL_PRICING:
         return MODEL_PRICING[model]
@@ -73,13 +82,42 @@ def _rates_for(model: str) -> Tuple[float, float]:
     if best_key:
         return MODEL_PRICING[best_key]
 
-    # 4) Default — pricing is best-effort, never a hard failure.
-    logger.warning(
-        "No pricing entry for model '{}'; using default rates {} per 1M tokens",
-        model,
-        _DEFAULT_RATES,
-    )
+    # 4) Default — pricing is best-effort, never a hard failure. Every call is
+    #    priced, so warn once per model rather than on each call.
+    if model not in _warned_unpriced:
+        _warned_unpriced.add(model)
+        logger.warning(
+            "No pricing entry for model '{}'; using default rates {} per 1M tokens "
+            "(set LLM_PRICING_OVERRIDES)",
+            model,
+            _DEFAULT_RATES,
+        )
     return _DEFAULT_RATES
+
+
+_warned_unpriced: set = set()
+
+
+def _override_rates(model: str) -> Optional[Tuple[float, float]]:
+    """``LLM_PRICING_OVERRIDES`` rate for ``model`` (exact, else longest prefix)."""
+    try:
+        from app.llm.config import pricing_overrides
+
+        table = pricing_overrides()
+    except Exception as exc:  # malformed JSON is reported at startup validation
+        logger.debug("LLM_PRICING_OVERRIDES unreadable: {}", exc)
+        return None
+    key = model if model in table else max(
+        (k for k in table if model.startswith(k)), key=len, default=""
+    )
+    if not key:
+        return None
+    try:
+        in_rate, out_rate = table[key]
+        return float(in_rate), float(out_rate)
+    except (TypeError, ValueError):
+        logger.warning("LLM_PRICING_OVERRIDES['{}'] must be [input, output]", key)
+        return None
 
 
 def price_for(model: str, input_tokens: int, output_tokens: int) -> Dict[str, float]:
@@ -196,6 +234,8 @@ def service_price_for(
     search_queries: int = 0,
     grounding_requests: int = 0,
     embed_tokens: int = 0,
+    embed_gateway_tokens: int = 0,
+    embed_gateway_cost: float = 0.0,
 ) -> Dict[str, float]:
     """Return the USD cost of the paid non-LLM work in one scope.
 
@@ -203,6 +243,9 @@ def service_price_for(
     ``embedPrice`` and their sum ``servicePrice`` — each rounded to 6 decimal
     places (sub-cent precision), matching :func:`price_for`. Negative/None
     quantities are treated as 0. Never raises.
+
+    ``embed_gateway_tokens`` of the ``embed_tokens`` were priced by a gateway at
+    ``embed_gateway_cost``; only the rest are priced at the local rate.
     """
     ocr_units = max(int(ocr_units or 0), 0)
     stt_seconds = max(float(stt_seconds or 0.0), 0.0)
@@ -234,10 +277,13 @@ def service_price_for(
         ),
         6,
     )
+    gateway_tokens = min(max(int(embed_gateway_tokens or 0), 0), embed_tokens)
+    gateway_cost = max(float(embed_gateway_cost or 0.0), 0.0)
     embed_price = round(
-        embed_tokens / _PER_MILLION * _service_rate(
+        (embed_tokens - gateway_tokens) / _PER_MILLION * _service_rate(
             "embed_price_per_million_tokens", EMBED_PRICE_PER_MILLION_TOKENS
-        ),
+        )
+        + gateway_cost,
         6,
     )
 

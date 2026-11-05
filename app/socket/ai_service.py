@@ -27,8 +27,6 @@ from loguru import logger
 
 from app.core.config import settings
 from app.socket.client import SocketClient
-from app.socket.events import event_handler
-from app.utils.exceptions import SocketConnectionError
 
 
 class AISocketService:

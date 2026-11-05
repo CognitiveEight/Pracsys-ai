@@ -1,0 +1,17 @@
+# Tool configuration only: this service is run as `python -m app.main`, not
+# installed as a package.
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = ["env", "pracsys2.0", "docs", "data", "logs"]
+
+[tool.ruff.lint]
+# Pyflakes (unused/undefined names, broken imports) plus syntax-level errors.
+# Style rules are deliberately off for now: enabling them would reformat the
+# whole tree in one diff. Widen this list one rule family at a time.
+select = ["F", "E9"]
+
+[tool.ruff.lint.per-file-ignores]
+# Package __init__ modules re-export on purpose.
+"__init__.py" = ["F401"]

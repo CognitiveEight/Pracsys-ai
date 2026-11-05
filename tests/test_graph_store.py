@@ -1,13 +1,12 @@
 """Neo4j adapter — the connection that makes the ontology real."""
 
-from typing import Any, Dict, List
+from typing import Any, List
 
 import pytest
 
 from app.graph.store import (
     GraphConfig,
     GraphStore,
-    GraphStoreError,
     build_edge_merge,
     build_node_merge,
 )

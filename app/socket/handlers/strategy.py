@@ -6,122 +6,44 @@ Feature mixin extracted from events.py — methods moved verbatim.
 import asyncio
 import json
 import re
-import time
-import uuid
-from datetime import date as date_type
 from datetime import datetime
-from html import unescape
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import quote_plus
+from typing import Any, Dict, List, Optional
 
-import httpx
 from loguru import logger
 
 from app.utils.redact import chars
 
-from app.agents.role_models import RoleEnum
 from app.ai.gemini_client import is_generation_error
 from app.ai.usage import current_usage, meter_usage
-from app.core.config import settings
-from app.langgraph.integration import workspace_role_integration
-from app.observability.audit import audit_logger
-from app.processing.audio_transcription import (
-    _has_devanagari as _audio_has_devanagari,
-    transliterate_formatted_transcript_to_hinglish,
-)
-from app.processing.document_processor import document_processor
-from app.search.vertex_ai_search import search_indiankanoon as vertex_search_indiankanoon
-from app.search.case_law_finder import (
-    fetch_judgment_text,
-    find_case_law_sources,
-    scrape_indiankanoon,
-)
-from app.prompts.applicable_acts import (
-    TARGETED_INDIAN_ACTS,
-    format_targeted_acts_for_prompt,
-)
 from app.prompts.legal_intelligence_system import (
-    ANNEXURE_UPLOAD_GATE_MESSAGE,
-    APP_BRAND_EXCLUSION_DIRECTIVE,
-    ENGLISH_ONLY_OUTPUT_DIRECTIVE,
-    NAME_CAPITALISATION_DIRECTIVE,
-    get_legal_intelligence_system_instruction,
     get_structured_document_feature_system_instruction,
 )
 from app.langgraph.chat_nodes import (
-    _last_ai_message_from_history,
     is_user_affirmation_to_continue,
-    merge_intelligence_chat_history,
 )
 from app.langgraph.list_of_dates_agent import (
-    list_of_dates_temporal_agent,
-    snap_hallucinated_year,
     snap_years_in_text,
 )
-from app.socket.schemas import (
-    AIResponseMetadata,
-    AIResponsePayload,
-    AnalysisDocxGenerateRequestPayload,
-    ApplicableLawRelevanceRequestPayload,
-    TemplateSyncPayload,
-    TemplateSyncResponsePayload,
-    UserMessageRequestPayload,
-    WorkspaceCreatedPayload,
-    WorkspaceSyncPayload,
-)
-from app.utils.exceptions import SocketEventError
-from app.workspace.custom_instructions import (build_custom_instruction_suffix,
-                                               hydrate_custom_instructions_from_cache,
-                                               set_custom_instructions)
-from app.workspace.manager import workspace_manager
-from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
-                                       hydrate_workspace_state, persist_state,
-                                       restore_state)
-from agent import process_analysis_docx_request
+from app.workspace.custom_instructions import (build_custom_instruction_suffix)
 
 from app.rag.packing import fit_to_budget, panel_context_budget
+from app.socket.handlers.extraction import document_set_key
 from app.socket.event_utils import (
-    EventHandler,
-    _STRATEGY_ROLE_LABELS_RE,
     OBJECTIVE_UPDATE_OFFER_QUESTION,
-    CHAT_SMALL_WORKSPACE_DOC_THRESHOLD,
-    CHAT_SEARCH_CHUNK_LIMIT,
-    CHAT_MAX_DOCS_INCLUDED,
-    CHAT_MAX_CHARS_PER_DOC,
-    CHAT_MAX_TOTAL_CHARS,
-    CHAT_MIN_SCORE_THRESHOLD,
-    _ANNEXURE_REF_RE,
-    _ROMAN_VALUES,
     SPEAKER_LABEL_GUARDRAIL,
-    _ENUM_PREFIX_RE,
-    _UI_TRUNCATION_RE,
-    _APP_BRAND_RE,
-    _STRENGTH_POINT_MIN_LEN,
-    _ANNEXURE_SINGLE_RE,
-    _ANNEXURE_PLURAL_RE,
-    _OVERVIEW_CONTACTED_DATE_RE,
-    _OVERVIEW_TO_PHONE_RE,
-    _roman_or_int,
     _derive_report_case_summary,
-    _coerce_analysis_text_item,
-    _strip_enum_prefix,
     _strip_ui_truncated_tokens,
     scrub_app_brand,
-    _coerce_analysis_text_list,
     find_dropped_case_figures,
     find_ungrounded_proper_nouns,
-    _strip_strength_point_statute_boilerplate,
     _annexure_wording_for_next_steps,
     _clamp_annexure_references,
     _format_document_for_prompt,
-    _normalize_report_mobile_from_overview,
-    _overview_conversation_date_to_iso,
     extract_overview_conversation_report_contact_meta,
 )
 
 
 from app.prompts.strategy_prompts import (
-    generate_strategies_from_documents_prompt,
     generate_strategies_from_documents_prompt2,
     generate_strategies_from_documents_prompt3,
     generate_strategies_from_documents_prompt4,
@@ -139,6 +61,7 @@ from app.prompts.strategy_prompts import (
     llm_classify_panel_edit_intent_prompt2,
     panel_edit_ack_prompt,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 def _noop_key(value: Any) -> Any:
@@ -230,7 +153,12 @@ class StrategyMixin:
                 and len((d.get("content") or "").strip()) >= 20
             ]
             graph_block = await self._graph_evidence_block("strategy_objective", workspace_id)
-            max_total_content = max(20_000, panel_context_budget() - len(graph_block))
+            kb_block = await self._knowledge_base_block(
+                "strategy_objective", workspace_id, docs=all_docs
+            )
+            max_total_content = max(
+                20_000, panel_context_budget() - len(graph_block) - len(kb_block)
+            )
             per_doc_cap = (
                 (max_total_content // max(1, len(valid_docs)))
                 if valid_docs
@@ -273,6 +201,8 @@ class StrategyMixin:
                 )
             if graph_block:
                 combined_document_content += "\n\n" + graph_block
+            if kb_block:
+                combined_document_content += "\n\n" + kb_block
             num_annexures = len(valid_docs)
             if num_annexures <= 0:
                 annexure_limit_block = (
@@ -300,6 +230,7 @@ class StrategyMixin:
             case_entities: Dict[str, Any] = await self._extract_case_entities(
                 workspace_id=workspace_id,
                 combined_document_content=combined_document_content,
+                cache_key=document_set_key(all_docs),
             )
             _extracted_party_names = [
                 (p.get("name") or "").strip()
@@ -356,8 +287,6 @@ class StrategyMixin:
             _today = datetime.utcnow()
             today_str = _today.strftime("%Y-%m-%d")
             current_year = _today.strftime("%Y")
-
-            analysis_prompt = generate_strategies_from_documents_prompt(combined_document_content=combined_document_content, workspace_role=workspace_role)
 
             try:
                 strategy_inventory = self._build_document_inventory(workspace_id)
@@ -1409,9 +1338,9 @@ class StrategyMixin:
                     + "\n[... content truncated ...]"
                 )
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
             confirmed_party = self._resolve_confirmed_role_party(
                 workspace_id, role, explicit=confirmed_party
             )
@@ -1423,6 +1352,7 @@ class StrategyMixin:
                 case_entities = await self._extract_case_entities(
                     workspace_id=workspace_id,
                     combined_document_content=combined_document_content,
+                    cache_key=document_set_key(all_docs),
                 )
             except Exception as ent_err:
                 logger.debug("Objective regen: entity extraction failed: {}", ent_err)
@@ -1890,9 +1820,9 @@ class StrategyMixin:
                     + "\n[... content truncated ...]"
                 )
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             prompt = regenerate_case_summary_with_feedback_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, combined_document_content=combined_document_content, current_case_summary=current_case_summary, current_report_case_summary=current_report_case_summary, current_strategy=current_strategy, role=role, user_feedback=user_feedback)
 
@@ -2020,9 +1950,9 @@ class StrategyMixin:
             if not current_case_summary:
                 return False
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             prompt = regenerate_next_steps_with_feedback_prompt(current_case_summary=current_case_summary, current_strategic_objective=current_strategic_objective, current_strategy=current_strategy, role=role, user_feedback=user_feedback)
 
@@ -2180,9 +2110,9 @@ class StrategyMixin:
             if not current_strategic_objective:
                 return False
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             prompt = regenerate_strategic_objective_with_feedback_prompt(SPEAKER_LABEL_GUARDRAIL=SPEAKER_LABEL_GUARDRAIL, current_case_summary=current_case_summary, current_strategic_objective=current_strategic_objective, current_strategy=current_strategy, role=role, user_feedback=user_feedback)
 
@@ -2309,7 +2239,7 @@ class StrategyMixin:
         try:
             from app.ai.gemini_client import gemini_client
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             prompt = summarize_objective_instruction_from_thread_prompt(role=role, thread=thread)
             raw = await gemini_client.generate(
                 prompt=prompt,
@@ -2896,7 +2826,7 @@ class StrategyMixin:
         return {
             "workspaceId": workspace_id,
             "userId": user_id,
-            "role": (workspace_role or "ADJUDICATOR").strip().upper(),
+            "role": (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper(),
             "isUpdate": is_update,
             "isEmpty": True,
             "caseSummary": "",

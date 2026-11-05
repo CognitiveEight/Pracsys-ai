@@ -28,7 +28,6 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
-from typing import List
 
 from docx import Document
 from docx.oxml import OxmlElement
@@ -328,18 +327,18 @@ def main() -> int:
 
     doc.save(str(DOCX_PATH))
     print(f"Business-ified AI content in {DOCX_PATH.name}")
-    print(f"  rewrote §1 summary (2 tweaks)")
-    print(f"  rewrote §4.3 high-level bullets (3 of 5)")
-    print(f"  rewrote §4.3.1 Technology Stack (12 bullets)")
-    print(f"  renamed §4.3.2 → AI Capabilities, rewrote 11 bullets")
-    print(f"  renamed §4.3.3 → AI Deliverables, compressed 5 → 3 bullets")
+    print("  rewrote §1 summary (2 tweaks)")
+    print("  rewrote §4.3 high-level bullets (3 of 5)")
+    print("  rewrote §4.3.1 Technology Stack (12 bullets)")
+    print("  renamed §4.3.2 → AI Capabilities, rewrote 11 bullets")
+    print("  renamed §4.3.3 → AI Deliverables, compressed 5 → 3 bullets")
     print(f"  deleted §4.3.4 Socket Events ({removed_4_3_4} paragraphs)")
-    print(f"  renumbered Indian-Law Grounding to §4.3.4 and lightly scrubbed it")
-    print(f"  rewrote §5.3 Step 3, Step 4")
-    print(f"  rewrote §5.4 Intelligence Chat (3 paragraphs)")
-    print(f"  rewrote §5.5 Drafting Assistant (5 paragraphs)")
-    print(f"  rewrote §6.2 Audio Files")
-    print(f"  rewrote §7.2 Authentication")
+    print("  renumbered Indian-Law Grounding to §4.3.4 and lightly scrubbed it")
+    print("  rewrote §5.3 Step 3, Step 4")
+    print("  rewrote §5.4 Intelligence Chat (3 paragraphs)")
+    print("  rewrote §5.5 Drafting Assistant (5 paragraphs)")
+    print("  rewrote §6.2 Audio Files")
+    print("  rewrote §7.2 Authentication")
     print(f"  removed {removed_glossary} glossary tech entries")
     return 0
 

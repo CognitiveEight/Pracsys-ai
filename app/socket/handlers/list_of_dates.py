@@ -6,116 +6,33 @@ Feature mixin extracted from events.py — methods moved verbatim.
 import asyncio
 import json
 import re
-import time
-import uuid
-from datetime import date as date_type
 from datetime import datetime
-from html import unescape
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import quote_plus
+from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
 from loguru import logger
+
+from app.core.config import settings
+from app.llm.errors import is_generation_error
 
 from app.utils.document_dates import date_from_document_name
 
 from app.utils.redact import chars
 
-from app.agents.role_models import RoleEnum
 from app.ai.usage import current_usage, meter_usage
-from app.core.config import settings
-from app.langgraph.integration import workspace_role_integration
-from app.observability.audit import audit_logger
-from app.processing.audio_transcription import (
-    _has_devanagari as _audio_has_devanagari,
-    transliterate_formatted_transcript_to_hinglish,
-)
-from app.processing.document_processor import document_processor
-from app.search.vertex_ai_search import search_indiankanoon as vertex_search_indiankanoon
-from app.search.case_law_finder import (
-    fetch_judgment_text,
-    find_case_law_sources,
-    scrape_indiankanoon,
-)
-from app.prompts.applicable_acts import (
-    TARGETED_INDIAN_ACTS,
-    format_targeted_acts_for_prompt,
-)
 from app.prompts.legal_intelligence_system import (
-    ANNEXURE_UPLOAD_GATE_MESSAGE,
-    APP_BRAND_EXCLUSION_DIRECTIVE,
-    ENGLISH_ONLY_OUTPUT_DIRECTIVE,
-    NAME_CAPITALISATION_DIRECTIVE,
-    get_legal_intelligence_system_instruction,
     get_structured_document_feature_system_instruction,
-)
-from app.langgraph.chat_nodes import (
-    _last_ai_message_from_history,
-    is_user_affirmation_to_continue,
-    merge_intelligence_chat_history,
 )
 from app.langgraph.list_of_dates_agent import (
     list_of_dates_temporal_agent,
     snap_hallucinated_year,
 )
-from app.socket.schemas import (
-    AIResponseMetadata,
-    AIResponsePayload,
-    AnalysisDocxGenerateRequestPayload,
-    ApplicableLawRelevanceRequestPayload,
-    TemplateSyncPayload,
-    TemplateSyncResponsePayload,
-    UserMessageRequestPayload,
-    WorkspaceCreatedPayload,
-    WorkspaceSyncPayload,
-)
-from app.utils.exceptions import SocketEventError
-from app.workspace.custom_instructions import (build_custom_instruction_suffix,
-                                               hydrate_custom_instructions_from_cache,
-                                               set_custom_instructions)
-from app.workspace.manager import workspace_manager
-from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
-                                       hydrate_workspace_state, persist_state,
-                                       restore_state)
-from agent import process_analysis_docx_request
+from app.workspace.custom_instructions import (build_custom_instruction_suffix)
 
 from app.rag.packing import fit_to_budget, panel_context_budget
 from app.socket.event_utils import (
-    EventHandler,
-    _STRATEGY_ROLE_LABELS_RE,
-    OBJECTIVE_UPDATE_OFFER_QUESTION,
-    CHAT_SMALL_WORKSPACE_DOC_THRESHOLD,
-    CHAT_SEARCH_CHUNK_LIMIT,
-    CHAT_MAX_DOCS_INCLUDED,
-    CHAT_MAX_CHARS_PER_DOC,
-    CHAT_MAX_TOTAL_CHARS,
-    CHAT_MIN_SCORE_THRESHOLD,
-    _ANNEXURE_REF_RE,
-    _ROMAN_VALUES,
-    SPEAKER_LABEL_GUARDRAIL,
-    _ENUM_PREFIX_RE,
-    _UI_TRUNCATION_RE,
-    _APP_BRAND_RE,
-    _STRENGTH_POINT_MIN_LEN,
-    _ANNEXURE_SINGLE_RE,
-    _ANNEXURE_PLURAL_RE,
-    _OVERVIEW_CONTACTED_DATE_RE,
-    _OVERVIEW_TO_PHONE_RE,
-    _roman_or_int,
-    _derive_report_case_summary,
-    _coerce_analysis_text_item,
-    _strip_enum_prefix,
-    _strip_ui_truncated_tokens,
+    gather_bounded,
     scrub_app_brand,
-    _coerce_analysis_text_list,
     _mint_item_id,
-    _strip_strength_point_statute_boilerplate,
-    _annexure_wording_for_next_steps,
-    _clamp_annexure_references,
-    _format_document_for_prompt,
-    _normalize_report_mobile_from_overview,
-    _overview_conversation_date_to_iso,
-    extract_overview_conversation_report_contact_meta,
 )
 
 
@@ -124,6 +41,7 @@ from app.prompts.list_of_dates_prompts import (
     reeval_list_of_dates_relevance_prompt,
     generate_list_of_dates_from_documents_prompt,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 class ListOfDatesMixin:
@@ -162,9 +80,9 @@ class ListOfDatesMixin:
             if not instruction:
                 return False
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             current_json = json.dumps(current, ensure_ascii=True)
             prompt = regenerate_list_of_dates_with_feedback_prompt(current_json=current_json, instruction=instruction)
@@ -263,9 +181,9 @@ class ListOfDatesMixin:
             if not obj:
                 return False
 
-            role = (workspace_role or "ADJUDICATOR").strip().upper()
+            role = (workspace_role or DEFAULT_WORKSPACE_ROLE).strip().upper()
             if role not in ("ADJUDICATOR", "PETITIONER", "RESPONDENT", "MEDIATOR"):
-                role = "ADJUDICATOR"
+                role = DEFAULT_WORKSPACE_ROLE
 
             current_json = json.dumps(current, ensure_ascii=True)
             prompt = reeval_list_of_dates_relevance_prompt(current_json=current_json, obj=obj)
@@ -347,8 +265,6 @@ class ListOfDatesMixin:
         Returns list of items for payload.listOfDates (date, title, description, sourceDocId, sourceDocName, etc.).
         """
         import json
-        import re
-        from datetime import datetime
 
         if not all_docs:
             return []
@@ -370,7 +286,7 @@ class ListOfDatesMixin:
                 did = r.get("document_id")
                 name = r.get("filename") or r.get("originalName") or ""
                 if did:
-                    id_to_name[str(did)] = name or f"Annexure"
+                    id_to_name[str(did)] = name or "Annexure"
 
         valid_docs = [
             d
@@ -418,7 +334,7 @@ class ListOfDatesMixin:
             from app.ai.gemini_client import gemini_client
 
             gemini_client.initialize()
-            if not gemini_client.model:
+            if not gemini_client.is_available():
                 return []
 
             from datetime import timedelta as _timedelta
@@ -443,7 +359,7 @@ class ListOfDatesMixin:
                 response_mime_type="application/json",
             )
             raw = (raw or "").strip()
-            if not raw or raw.startswith("Error"):
+            if not raw or is_generation_error(raw):
                 logger.warning("List of dates: Gemini error or empty response")
                 return []
 
@@ -1165,28 +1081,37 @@ class ListOfDatesMixin:
                 )
                 for e in result
             }
-            for idx, source_content in doc_content_by_index.items():
+            # One agent run per document, LIST_OF_DATES_CONCURRENCY at a time;
+            # merged below in document order, so the result is the same as a
+            # one-at-a-time run.
+            async def _temporal_events(item: Tuple[int, str]) -> List[Dict[str, Any]]:
+                idx, source_content = item
                 source_doc_id = doc_id_by_index.get(idx, "")
-                source_doc_name = doc_name_by_index.get(idx, "")
-                anchor_year = doc_anchor_year_by_index.get(idx)
-                rel_events: List[Dict[str, Any]] = []
                 try:
-                    rel_events = await list_of_dates_temporal_agent.infer_temporal_events(
+                    return await list_of_dates_temporal_agent.infer_temporal_events(
                         document_text=source_content,
                         source_doc_id=source_doc_id,
-                        source_doc_name=source_doc_name,
-                        anchor_year=anchor_year,
+                        source_doc_name=doc_name_by_index.get(idx, ""),
+                        anchor_year=doc_anchor_year_by_index.get(idx),
                         today_str=today_str,
                         document_date=doc_name_date_by_index.get(idx),
                     )
+                except asyncio.CancelledError:
+                    raise
                 except Exception as temporal_err:
                     logger.debug(
                         "List of dates temporal agent failed for doc {}: {}",
                         source_doc_id or idx,
                         temporal_err,
                     )
-                    rel_events = []
-                for e in rel_events:
+                    return []
+
+            doc_items = list(doc_content_by_index.items())
+            events_by_doc = await gather_bounded(
+                settings.list_of_dates_concurrency, doc_items, _temporal_events
+            )
+            for (idx, source_content), rel_events in zip(doc_items, events_by_doc):
+                for e in rel_events or []:
                     # Resolve best-effort page for inferred temporal events too.
                     e["pageNumber"] = _resolve_page_number(e, source_content)
                     key = (
@@ -1561,19 +1486,6 @@ class ListOfDatesMixin:
         """
         Record outbound list_of_dates responses with generation timestamp for tracing.
         """
-        generated_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-        outbound = {
-            "featureType": "list_of_dates",
-            "workspaceId": workspace_id,
-            "userId": user_id,
-            "payload": {
-                "workspaceId": workspace_id,
-                "userId": user_id,
-                "listOfDates": list_of_dates,
-            },
-            "generatedAt": generated_at,
-            "context": context,
-        }
         logger.info(
             "list_of_dates outbound [{}]: {} entr(ies), {} with a source citation",
             context,

@@ -3,9 +3,8 @@ Workspace manager for handling workspace operations.
 """
 
 import asyncio
-import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import aiofiles
 import httpx
@@ -228,7 +227,7 @@ class WorkspaceManager:
             file_content = await self._download_file(file.url)
 
             # Save locally
-            local_path = await self._save_file_locally(
+            await self._save_file_locally(
                 context.workspace_id, file.filename, file_content
             )
 

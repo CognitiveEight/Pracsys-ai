@@ -25,3 +25,23 @@ def chars(value) -> str:
     (and often personal data); logs say how much there was, not what it said.
     """
     return f"<{len(str(value or ''))} chars>"
+
+
+def validation_fields(err: BaseException) -> str:
+    """Which fields failed validation, never their values.
+
+    A pydantic ``ValidationError`` prints each offending ``input_value``, which
+    for a socket payload is case content (document text, names, objectives).
+    Logs get the field paths and error types only.
+    """
+    errors = getattr(err, "errors", None)
+    if not callable(errors):
+        return type(err).__name__
+    try:
+        parts = [
+            "{}:{}".format(".".join(str(p) for p in e.get("loc", ())), e.get("type", ""))
+            for e in errors()
+        ]
+    except Exception:
+        return type(err).__name__
+    return "{}[{}]".format(type(err).__name__, ", ".join(parts))

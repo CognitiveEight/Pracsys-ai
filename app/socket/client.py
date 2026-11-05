@@ -7,7 +7,6 @@ sensible pingInterval so the connection is not closed while the AI service is ge
 """
 
 import asyncio
-import json
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -28,7 +27,13 @@ from app.socket.auth import (
     build_auth_headers,
     redact_auth_headers,
 )
-from app.socket.backend_events import AI_HEARTBEAT_PING, AI_HEARTBEAT_PONG
+from app.socket.backend_events import (
+    AI_HEARTBEAT_PING,
+    AI_HEARTBEAT_PONG,
+    KB_DOCUMENT_ADDED,
+    KB_DOCUMENT_DELETED,
+    KB_SYNC,
+)
 from app.socket.events import event_handler
 from app.utils.exceptions import SocketConnectionError
 
@@ -629,8 +634,8 @@ class SocketClient:
             """
             Handle workspace_transferred event (Server → AI_Maverick).
             Workspace ownership moved to another lawyer; AI re-keys owner state
-            and re-emits the features listed in reEmitFeatures against the new
-            owner's template library (drafting_assistant).
+            and re-emits the features listed in reEmitFeatures
+            (drafting_assistant, matched against the global template library).
             """
             await event_handler.handle("workspace_transferred", data)
 
@@ -763,34 +768,46 @@ class SocketClient:
             await event_handler.handle("analysis_docx_generate_request", data)
 
         @self.sio.event
-        async def template_sync(data):
-            """
-            Handle template_sync event (Server → AI_Maverick).
-            Lawyer-scoped Template Library sync — action ∈ uploaded|deleted|renamed.
-            Without this binding, python-socketio falls through to the catch-all
-            and the event is silently dropped (only logged at DEBUG level), so
-            deletions/renames/uploads never reach the drafting agent.
-            """
-            await event_handler.handle("template_sync", data)
-
-        @self.sio.event
-        async def template_sync_response(data):
-            """
-            Server → AI_Maverick: full snapshot of a user's active templates
-            in reply to our request_template_sync emit. Populates the
-            in-memory template store on demand (e.g. after an AI restart).
-            """
-            await event_handler.handle("template_sync_response", data)
-
-        @self.sio.event
         async def request_blueprint_proposal(data):
             """
-            Server → AI: the "Regenerate Extra Info" action on the dashboard's
-            blueprint-approval screen. The AI re-profiles the template and emits
-            a fresh template_blueprint_proposal. Without this explicit binding
-            the event falls through the catch-all and is silently dropped.
+            Server → AI: an admin's global template draft needs profiling
+            (upload or "Re-profile"). The AI profiles it and emits a
+            template_blueprint_proposal with scope "global". Without this
+            explicit binding the event falls through the catch-all and is
+            silently dropped.
             """
             await event_handler.handle("request_blueprint_proposal", data)
+
+        @self.sio.on(KB_DOCUMENT_ADDED)
+        async def kb_document_added(data):
+            """Server → AI: an admin added a knowledge-base document; index it."""
+            await event_handler.handle(KB_DOCUMENT_ADDED, data)
+
+        @self.sio.on(KB_DOCUMENT_DELETED)
+        async def kb_document_deleted(data):
+            """Server → AI: an admin deleted a knowledge-base document; erase it now."""
+            await event_handler.handle(KB_DOCUMENT_DELETED, data)
+
+        @self.sio.on(KB_SYNC)
+        async def kb_sync(data):
+            """Server → AI: the complete knowledge base, sent on every connect."""
+            await event_handler.handle(KB_SYNC, data)
+
+        @self.sio.event
+        async def global_template_sync(data):
+            """
+            Server → AI: an admin published, retired or deleted a Global
+            Template Library entry (SIM-173). Platform-wide; no userId.
+            """
+            await event_handler.handle("global_template_sync", data)
+
+        @self.sio.event
+        async def global_template_sync_response(data):
+            """
+            Server → AI: every published global template, in reply to our
+            request_global_template_sync (sent on every connect).
+            """
+            await event_handler.handle("global_template_sync_response", data)
 
         @self.sio.on(AI_HEARTBEAT_PING)
         async def ai_heartbeat_ping(data):

@@ -8,7 +8,7 @@ __all__ = [
     "generate_analysis_report_from_documents_prompt2",
     "ensure_structured_relevant_jurisdiction_prompt",
     "ensure_quality_score_explanation_prompt",
-    "compute_rejection_score_delta_prompt",
+    "rejection_reason_prompt",
     "compute_added_missing_info_score_delta_prompt",
 ]
 
@@ -164,45 +164,23 @@ f"You are a senior legal analyst. Given this case analysis summary (JSON only), 
     )
 
 
-def compute_rejection_score_delta_prompt(*, can_reach_100, case_summary, current_score, rejected_value, remaining_missing, remaining_risks, remaining_weak, report_summary, section, section_context, strategic_objective):
+def rejection_reason_prompt(*, case_summary, rejected_value, report_summary, section, section_context, strategic_objective):
     return (
-f"""You are a legal case analyst. The user rejected ONE item from their analysis report as not relevant. Two decisions are required:
+f"""You are a legal case analyst. The lawyer removed ONE item from their analysis report as not needed for this case. The item is removed and the readiness score already reflects one fewer open item; you are not asked to judge or score the removal.
 
-1) Is the rejection VALID? It is VALID only when the rejected item is genuinely NOT relevant to THIS case (per the case summary, strategic objective, and remaining items below). If the rejected item IS relevant — i.e. it is a real evidence gap, factual weakness, or procedural risk that this case actually faces — the rejection is INVALID and the user should not be rewarded with a score increase.
-2) If VALID, choose an integer scoreIncrease 1-5. The system will ADD this to the current score. If INVALID, set scoreIncrease=0.
-
-**Current case resolution score**: {current_score}%
 **Case summary**: {case_summary[:600] or "(not available)"}
 **Report-facing summary**: {report_summary[:400] or "(not available)"}
 **Strategic objective**: {strategic_objective[:400] or "(not available)"}
-**Section from which item was rejected**: {section}
-**Rejected item (exact text)**: "{rejected_value[:400]}"
-**Remaining counts after this rejection**: missingInfo={remaining_missing}, weaknesses={remaining_weak}, risks={remaining_risks}
+**Section the item was removed from**: {section}
+**Removed item (exact text)**: "{rejected_value[:400]}"
 {f'**{section_context}**' if section_context else ''}
-**Score rule**: When missingInfo, weaknesses, and risks are all 0 (no remaining items), the score can reach 100%. When any remain, score is capped at 95%. {"This rejection leaves no items in any category – score can go to 100%." if can_reach_100 else "Items still remain – score will be capped at 95%."}
 
-VALIDITY GUIDELINES (decide isValidRejection)
-- VALID: the rejected item is off-topic, generic boilerplate that doesn't fit this case's facts, addressed by another item, or clearly out-of-scope for the parties/role/jurisdiction.
-- INVALID: the rejected item is core to the pleaded facts, supports a key element the case relies on, or directly addresses a real risk this case faces. Generic items that DO apply to this case are still INVALID rejections.
-
-IMPACT RULES (only when isValidRejection=true) – choose scoreIncrease (1-5) based on the SPECIFIC rejected item:
-- scoreIncrease MUST be an integer between 1 and 5.
-- When this is the last rejection (all counts 0 above), use 4 or 5 so the score can reach 100%.
-
-SECTION GUIDELINES (when isValidRejection=true)
-
-missingInfo (user says this "missing" item is not needed):
-- Minor detail (dates, small clarification): scoreIncrease = 1
-- Useful but not critical evidence: scoreIncrease = 2–3
-- Important missing evidence that would have weakened the case: scoreIncrease = 4–5
-
-riskOrWeakness (user says this risk/weakness does not apply):
-- Minor procedural or generic risk: scoreIncrease = 1
-- Moderate risk or weakness: scoreIncrease = 2–3
-- Major legal risk or strong weakness: scoreIncrease = 4–5
+Write ONE short sentence to the lawyer, in plain words, on what removing this item means for the
+case's readiness (for example, which open point no longer needs to be addressed, or what the case
+now rests on). Do not mention scores, percentages, validity, "the user" or this assessment.
 
 Output ONLY valid JSON, no markdown, no code block:
-{{"isValidRejection": <true|false>, "scoreIncrease": <integer 0-5>, "reason": "<one short sentence>"}}
+{{"reason": "<one short sentence>"}}
 """
     )
 

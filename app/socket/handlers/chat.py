@@ -4,81 +4,35 @@ Feature mixin extracted from events.py — methods moved verbatim.
 """
 
 import asyncio
-import json
 import re
-import time
 import uuid
-from datetime import date as date_type
 from datetime import datetime
-from html import unescape
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import quote_plus
+from typing import Any, Dict, List, Optional, Set
 
-import httpx
 from loguru import logger
 
-from app.agents.role_models import RoleEnum
+from app.ai.usage import current_usage, primary_model
 from app.core.config import settings
-from app.langgraph.integration import workspace_role_integration
 from app.observability.audit import audit_logger
-from app.processing.audio_transcription import (
-    _has_devanagari as _audio_has_devanagari,
-    transliterate_formatted_transcript_to_hinglish,
-)
-from app.processing.document_processor import document_processor
-from app.search.vertex_ai_search import search_indiankanoon as vertex_search_indiankanoon
-from app.search.case_law_finder import (
-    fetch_judgment_text,
-    find_case_law_sources,
-    scrape_indiankanoon,
-)
-from app.prompts.applicable_acts import (
-    TARGETED_INDIAN_ACTS,
-    format_targeted_acts_for_prompt,
-)
 from app.prompts.legal_intelligence_system import (
     ANNEXURE_UPLOAD_GATE_MESSAGE,
-    APP_BRAND_EXCLUSION_DIRECTIVE,
-    ENGLISH_ONLY_OUTPUT_DIRECTIVE,
-    NAME_CAPITALISATION_DIRECTIVE,
-    get_legal_intelligence_system_instruction,
-    get_structured_document_feature_system_instruction,
 )
 from app.langgraph.chat_nodes import (
     _last_ai_message_from_history,
     is_user_affirmation_to_continue,
     merge_intelligence_chat_history,
 )
-from app.langgraph.list_of_dates_agent import (
-    list_of_dates_temporal_agent,
-    snap_hallucinated_year,
-)
 from app.socket.schemas import (
     Citation,
     AIResponseMetadata,
     AIResponsePayload,
-    AnalysisDocxGenerateRequestPayload,
-    ApplicableLawRelevanceRequestPayload,
-    TemplateSyncPayload,
-    TemplateSyncResponsePayload,
     UserMessageRequestPayload,
-    WorkspaceCreatedPayload,
-    WorkspaceSyncPayload,
 )
-from app.utils.exceptions import SocketEventError
-from app.workspace.custom_instructions import (build_custom_instruction_suffix,
-                                               hydrate_custom_instructions_from_cache,
-                                               set_custom_instructions)
+from app.workspace.custom_instructions import (build_custom_instruction_suffix)
 from app.workspace.manager import workspace_manager
 from app.workspace.participants import resolve_asker
-from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
-                                       hydrate_workspace_state, persist_state,
-                                       restore_state)
-from agent import process_analysis_docx_request
 
 from app.socket.event_utils import (
-    EventHandler,
-    _STRATEGY_ROLE_LABELS_RE,
     OBJECTIVE_CHANGE_FAILED_MESSAGE,
     OBJECTIVE_CHANGE_REFRESH_FEATURES,
     OBJECTIVE_UPDATE_OFFER_QUESTION,
@@ -89,31 +43,9 @@ from app.socket.event_utils import (
     CHAT_MAX_TOTAL_CHARS,
     CHAT_MIN_SCORE_THRESHOLD,
     _ANNEXURE_REF_RE,
-    _ROMAN_VALUES,
-    SPEAKER_LABEL_GUARDRAIL,
-    _ENUM_PREFIX_RE,
-    _UI_TRUNCATION_RE,
-    _APP_BRAND_RE,
-    _STRENGTH_POINT_MIN_LEN,
-    _ANNEXURE_SINGLE_RE,
-    _ANNEXURE_PLURAL_RE,
-    _OVERVIEW_CONTACTED_DATE_RE,
-    _OVERVIEW_TO_PHONE_RE,
     _roman_or_int,
-    _derive_report_case_summary,
-    _coerce_analysis_text_item,
-    _strip_enum_prefix,
-    _strip_ui_truncated_tokens,
-    scrub_app_brand,
-    _coerce_analysis_text_list,
-    _strip_strength_point_statute_boilerplate,
-    _annexure_wording_for_next_steps,
-    _clamp_annexure_references,
-    _format_document_for_prompt,
-    _normalize_report_mobile_from_overview,
-    _overview_conversation_date_to_iso,
-    extract_overview_conversation_report_contact_meta,
 )
+from app.core.roles import DEFAULT_WORKSPACE_ROLE
 
 
 # Edit verbs recognised by the cheap panel-edit precheck in
@@ -182,29 +114,36 @@ class ChatMixin:
     def _token_usage_metadata(
         self, workspace_id: str, usage: Any
     ) -> Dict[str, Any]:
-        """Build the usage/price metadata fields for one ai_response.
+        """Build the usage/price metadata fields for one emitted response.
 
-        Prices this turn's accumulated tokens with the active model's rate AND the
-        paid non-LLM work it triggered (Vision OCR units, Speech-to-Text seconds,
-        Vertex AI Search queries, Google Search grounding requests, embedding
-        tokens), increments the workspace's cumulative totals (persisted to
-        Qdrant), and returns a dict merged into ``AIResponseMetadata``.
+        Reports the workspace's spend since its previous emit
+        (``drain_for_emit``): every model call and paid non-LLM unit (Vision OCR,
+        Speech-to-Text, Vertex AI Search, grounding, embeddings) charged to this
+        workspace at record time — this turn's own work and any background work
+        that has no emit of its own (knowledge-graph ingestion, re-evaluations)
+        — plus the part of ``usage`` recorded with no workspace in context.
+        Adds exactly that to the workspace's cumulative totals (persisted to
+        Qdrant). Each charge is reported by exactly one emit, so the sum of
+        per-response ``price`` equals ``totalPrice`` and, for model calls
+        through gate0, LiteLLM's spend for the same ``workspace_id`` tag.
 
-        ``price`` is the FULL cost of this response — ``inputPrice + outputPrice
-        + servicePrice`` — with each component also exposed on its own field so
-        the backend can break the bill down by source.
+        ``price`` is the FULL cost reported — ``inputPrice + outputPrice +
+        servicePrice`` — with each component on its own field.
 
         Best-effort: returns ``{}`` if anything fails so a pricing hiccup never
-        blocks a response. Call exactly once per emitted response.
+        blocks a response.
         """
         try:
-            from app.ai.pricing import price_for, service_price_for
+            from app.ai.pricing import service_price_for
+            from app.ai.usage import drain_for_emit, llm_price
             from app.workspace.context import context_manager
 
+            usage = drain_for_emit(workspace_id, usage)
             input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
             output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
-            model = settings.gemini_model
-            price = price_for(model, input_tokens, output_tokens)
+            # Priced per call by the model that served it (a turn can mix
+            # models once tasks are routed to different providers).
+            price = llm_price(usage)
             total_tokens = input_tokens + output_tokens
 
             # Paid non-LLM units consumed inside the same capture scope.
@@ -223,6 +162,9 @@ class ChatMixin:
                 search_queries=service_units["searchQueries"],
                 grounding_requests=service_units["groundingRequests"],
                 embed_tokens=service_units["embedTokens"],
+                # Embeddings gate0 priced itself are billed at its figure.
+                embed_gateway_tokens=int(getattr(usage, "embed_gateway_tokens", 0) or 0),
+                embed_gateway_cost=float(getattr(usage, "embed_gateway_cost", 0.0) or 0.0),
             )
 
             fields: Dict[str, Any] = {
@@ -240,12 +182,8 @@ class ChatMixin:
 
             ctx = context_manager.get_context(workspace_id)
             if ctx is not None:
-                already_counted = bool(getattr(usage, "counted", False))
-                if already_counted:
-                    # Second emit in the same turn — don't bill again; report the
-                    # totals as they already stand.
-                    totals = ctx.get_metadata("token_usage") or {}
-                else:
+                spent = input_tokens or output_tokens or price["price"] or service["servicePrice"]
+                if spent:
                     totals = ctx.add_token_usage(
                         input_tokens,
                         output_tokens,
@@ -253,10 +191,8 @@ class ChatMixin:
                         service=service,
                         service_units=service_units,
                     )
-                    try:
-                        usage.counted = True
-                    except Exception:
-                        pass
+                else:
+                    totals = ctx.get_metadata("token_usage") or {}
                 fields.update(
                     {
                         "totalInputTokens": totals.get("totalInputTokens", 0),
@@ -287,18 +223,16 @@ class ChatMixin:
         this wrapper adds the same two fields. Without ``messageId`` the backend
         ``WorkspaceCostService`` drops the cost record entirely.
 
-        Idempotent per accumulator: once a scope's spend has been reported the
-        accumulator is flagged ``counted``, and any further call degrades to the
-        cumulative-only block. That makes this safe to call from both the success
-        emit and the ingestion error path — whichever runs first reports the real
-        (possibly partial) spend, and the other cannot double-report it.
+        Safe to call from both the success emit and the ingestion error path:
+        reporting drains the ledger, so whichever runs first reports the real
+        (possibly partial) spend and the other reports only what was spent since.
         """
-        if usage is None or bool(getattr(usage, "counted", False)):
+        if usage is None:
             return self._cumulative_usage_metadata(workspace_id)
         metadata = self._token_usage_metadata(workspace_id, usage)
         if isinstance(metadata, dict):
             metadata.setdefault("messageId", uuid.uuid4().hex)
-            metadata.setdefault("aiModel", settings.gemini_model)
+            metadata.setdefault("aiModel", primary_model(usage))
             # Hand-built payloads bypass _emit_document_feature's check, so run it
             # here too — same reason: an unknown key means an unrecorded cost.
             self._warn_unknown_metadata_keys("ingestion payload", metadata)
@@ -446,11 +380,12 @@ class ChatMixin:
         permanently-stuck panel unless the caller knows. On a drop the envelope is
         recorded via ``_note_pending_feature_delivery`` and re-sent on reconnect.
 
-        ``usage`` is the ``capture_usage()`` accumulator for a FRESH generation —
-        its tokens are priced and the workspace cumulative is incremented exactly
-        once (guarded by the accumulator's ``counted`` flag). Pass ``usage=None``
-        for a re-emit (reconnect replay, cached / no-op re-emit): the block reports
-        per-response zeros plus the current cumulative, with no increment.
+        ``usage`` is the ``capture_usage()`` accumulator for a FRESH generation.
+        The block reports the workspace's spend since its last emit (drained
+        from the usage ledger, so each cost is reported exactly once) and adds
+        it to the cumulative. Pass ``usage=None`` for a re-emit (reconnect
+        replay, cached / no-op re-emit): the block reports per-response zeros
+        plus the current cumulative, with no increment.
 
         The metadata block uses the same field names as ``AIResponseMetadata`` so
         the backend reads it identically to the chat ``ai_response`` contract.
@@ -504,7 +439,7 @@ class ChatMixin:
                 # (usage-based) metadata block has no messageId, so mint a unique
                 # one per emit here. aiModel mirrors the ai_response contract.
                 metadata.setdefault("messageId", uuid.uuid4().hex)
-                metadata.setdefault("aiModel", settings.gemini_model)
+                metadata.setdefault("aiModel", primary_model(usage))
                 self._warn_unknown_metadata_keys(feature_type, metadata)
         except Exception as exc:
             logger.warning(
@@ -575,13 +510,13 @@ class ChatMixin:
 
         # Resolve role from workspace context (same logic as the main chat
         # path, but minimised because drafting is role-aware not gated).
-        role = "ADJUDICATOR"
+        role = DEFAULT_WORKSPACE_ROLE
         try:
             from app.workspace.manager import workspace_manager
 
             ctx = workspace_manager.get_workspace(workspace_id)
             if ctx and getattr(ctx, "workspace_role", None):
-                role = (ctx.workspace_role or "ADJUDICATOR").upper()
+                role = (ctx.workspace_role or DEFAULT_WORKSPACE_ROLE).upper()
         except Exception:
             pass
         cached_role = await self._restore_workspace_role(
@@ -658,6 +593,8 @@ class ChatMixin:
             "templateUrl": payload.templateUrl,
             "templateOriginalName": payload.templateOriginalName,
             "templateMimeType": payload.templateMimeType,
+            "templateScope": (payload.templateScope or "").strip().lower() or None,
+            "templateVersion": payload.templateVersion,
             "draftMode": (payload.draftMode or "").strip().lower() or None,
             # Reserved layout hint — threaded through for future layout-aware
             # rendering; the drafting agent does not consume it yet.
@@ -665,11 +602,11 @@ class ChatMixin:
         }
 
         # When the turn may need to resolve/match a template (a suggested-draft
-        # or explicit template kickoff), make sure the in-memory store is warm
-        # first — no-op if already populated this session.
+        # or explicit template kickoff), make sure the global library is loaded
+        # first — no-op once a snapshot has been applied this connection.
         _src = (payload.source or "").strip().lower()
         if _src in ("suggesteddraft", "template") or payload.templateId:
-            await self.ensure_templates_synced(user_id)
+            await self.ensure_templates_synced()
 
         try:
             from app.langgraph.drafting_agent import drafting_agent
@@ -697,7 +634,6 @@ class ChatMixin:
             logger.error("Socket client unavailable; cannot emit drafting ai_response")
             return
 
-        from app.ai.usage import current_usage
 
         ai_response_payload: Dict[str, Any] = {
             "chatId": chat_id,
@@ -712,7 +648,7 @@ class ChatMixin:
             "draftDocument": turn.get("draftDocument"),
             "metadata": {
                 "messageId": chat_id,
-                "aiModel": settings.gemini_model,
+                "aiModel": primary_model(current_usage()),
                 # Per-response token/price + incremented workspace totals for
                 # this drafting turn (scope opened in on_user_message_request).
                 **self._token_usage_metadata(workspace_id, current_usage()),
@@ -757,7 +693,7 @@ class ChatMixin:
             self._intelligence_last_ai_by_chat[chat_id] = ai_response_payload[
                 "content"
             ]
-        # _pending_ai_response represents an emit that did NOT make it to BE
+        # _pending_ai_responses holds emits that did NOT make it to BE
         # and must be retried on the next reconnect. If we buffer the payload
         # unconditionally (the old behaviour) every disconnect/reconnect cycle
         # re-emits the last delivered message, producing duplicate drafts in
@@ -776,7 +712,7 @@ class ChatMixin:
         if emit_succeeded:
             # Drop any stale pending payload from a previous failed emit so
             # reconnect doesn't re-emit it after we just delivered fresh content.
-            self._pending_ai_response = None
+            self._pending_ai_responses.pop(str(chat_id), None)
             logger.success(
                 "Drafting ai_response emitted (status={}, version={})",
                 ai_response_payload.get("draftStatus"),
@@ -785,7 +721,7 @@ class ChatMixin:
         else:
             # Emit raised or socket was silently disconnected — keep the
             # payload buffered so on_connected can retry once we reconnect.
-            self._pending_ai_response = ai_response_payload
+            self._pending_ai_responses[str(chat_id)] = ai_response_payload
             logger.warning(
                 "Drafting ai_response not confirmed delivered — will retry on reconnect"
             )
@@ -832,7 +768,7 @@ class ChatMixin:
         # detection, drafting agent, …) accumulates here via ContextVar, and the
         # single ai_response emitted for this turn reads the totals. Reset in the
         # finally so the scope never leaks into another task/turn.
-        from app.ai.usage import begin_usage, current_usage, reset_usage
+        from app.ai.usage import begin_usage, reset_usage
 
         usage_token, _usage_acc = begin_usage()
         try:
@@ -849,7 +785,6 @@ class ChatMixin:
             from app.langgraph.chat_models import ChatContext
             from app.langgraph.intelligence_chat_agent import \
                 intelligence_chat_agent
-            from app.langgraph.role_agent import role_agent
 
             # STEP 1: Get workspace context (role, documents count) from workspace manager
             workspace_id = payload.workspaceId or "unknown"
@@ -905,7 +840,7 @@ class ChatMixin:
                 return
 
             role_context = {
-                "role": "ADJUDICATOR",
+                "role": DEFAULT_WORKSPACE_ROLE,
                 "workspace_id": workspace_id,
                 "user_id": user_id,
             }
@@ -930,14 +865,14 @@ class ChatMixin:
 
                 ctx = workspace_manager.get_workspace(workspace_id)
                 if ctx:
-                    workspace_role = (ctx.workspace_role or "ADJUDICATOR").upper()
+                    workspace_role = (ctx.workspace_role or DEFAULT_WORKSPACE_ROLE).upper()
                     if workspace_role not in (
                         "ADJUDICATOR",
                         "PETITIONER",
                         "RESPONDENT",
                         "MEDIATOR",
                     ):
-                        workspace_role = "ADJUDICATOR"
+                        workspace_role = DEFAULT_WORKSPACE_ROLE
                     role_context["role"] = workspace_role
                     await self._remember_workspace_role(
                         workspace_id, user_id, workspace_role, chat_id=chat_id
@@ -1005,7 +940,7 @@ class ChatMixin:
             ):
                 workspace_state["role_selected"] = True
                 role_context["role"] = (
-                    (role_context.get("role") or "ADJUDICATOR").strip().upper()
+                    (role_context.get("role") or DEFAULT_WORKSPACE_ROLE).strip().upper()
                 )
                 logger.warning(
                     "Role not found for workspace {} with existing documents; bypassing gate with role={}",
@@ -1079,7 +1014,7 @@ class ChatMixin:
                                 ),
                                 metadata=AIResponseMetadata(
                                     messageId=chat_id,
-                                    aiModel=settings.gemini_model,
+                                    aiModel=primary_model(current_usage()),
                                     **self._token_usage_metadata(
                                         workspace_id, current_usage()
                                     ),
@@ -1087,7 +1022,7 @@ class ChatMixin:
                             )
                             payload_dict = ai_response.dict(by_alias=True)
                             await self._socket_client.emit_ai_response(payload_dict)
-                            # Do NOT populate _pending_ai_response here — the
+                            # Do NOT populate _pending_ai_responses here — the
                             # role-confirmation ack does not need reconnect
                             # retry, and leaving a stale buffer here caused
                             # this acknowledgement to be re-emitted on the
@@ -1323,6 +1258,23 @@ class ChatMixin:
                 logger.warning(
                     "Could not load documents for chat context: {}", str(doc_err)
                 )
+
+            # Shared knowledge base (kb_* events): legal reference passages for
+            # this question, shown apart from the case's own documents and cited
+            # by title. It only ever adds to the answer, so it never blocks it.
+            if settings.knowledge_base_chat_enabled:
+                try:
+                    from app.rag.knowledge_base import knowledge_base
+
+                    kb_passages = await knowledge_base.passages_for_chat(
+                        payload.content or ""
+                    )
+                    if kb_passages:
+                        workspace_state["knowledge_base_passages"] = kb_passages
+                except asyncio.CancelledError:
+                    raise
+                except Exception as kb_err:
+                    logger.warning("Knowledge base skipped for this turn: {}", kb_err)
 
             # If user attached a document to this message, download and extract text; cache by chat_id so follow-ups see it
             attachment = getattr(payload, "attachment", None)
@@ -1593,7 +1545,7 @@ class ChatMixin:
                             and (classification.get("reassignParty") or "").strip()
                         ):
                             _ws_role = (
-                                role_context.get("role") or "ADJUDICATOR"
+                                role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                             ).strip().upper()
                             _reassign_role = (
                                 classification.get("reassignRole") or ""
@@ -1914,7 +1866,7 @@ class ChatMixin:
                                 workspace_id=workspace_id,
                                 user_id=user_id,
                                 workspace_role=(
-                                    role_context.get("role") or "ADJUDICATOR"
+                                    role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                 ),
                                 user_feedback=so_slot["instruction"],
                                 current_strategy=cur_strat_for_edit,
@@ -1968,7 +1920,7 @@ class ChatMixin:
                                     workspace_id=workspace_id,
                                     user_id=user_id,
                                     workspace_role=(
-                                        role_context.get("role") or "ADJUDICATOR"
+                                        role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                     ),
                                     user_feedback=_combined_instr,
                                     current_strategy=cur_strat_for_edit,
@@ -2002,7 +1954,7 @@ class ChatMixin:
                                 workspace_id=workspace_id,
                                 user_id=user_id,
                                 workspace_role=(
-                                    role_context.get("role") or "ADJUDICATOR"
+                                    role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                 ),
                                 user_feedback=ns_slot["instruction"],
                                 current_strategy=cur_strat_for_edit,
@@ -2040,7 +1992,7 @@ class ChatMixin:
                                     workspace_id=workspace_id,
                                     user_id=user_id,
                                     workspace_role=(
-                                        role_context.get("role") or "ADJUDICATOR"
+                                        role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                     ),
                                     user_feedback=ar_slot["instruction"],
                                     current_report=cur_report_for_edit,
@@ -2074,7 +2026,7 @@ class ChatMixin:
                                 workspace_id=workspace_id,
                                 user_id=user_id,
                                 workspace_role=(
-                                    role_context.get("role") or "ADJUDICATOR"
+                                    role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                 ),
                                 user_feedback=lod_slot["instruction"],
                                 outcome=_o,
@@ -2106,7 +2058,7 @@ class ChatMixin:
                                 workspace_id=workspace_id,
                                 user_id=user_id,
                                 workspace_role=(
-                                    role_context.get("role") or "ADJUDICATOR"
+                                    role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                 ),
                                 user_feedback=_rename_instr,
                                 outcome=_o,
@@ -2124,7 +2076,7 @@ class ChatMixin:
                                 workspace_id=workspace_id,
                                 user_id=user_id,
                                 workspace_role=(
-                                    role_context.get("role") or "ADJUDICATOR"
+                                    role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                 ),
                                 user_feedback=_rename_instr,
                                 outcome=_o,
@@ -2328,7 +2280,7 @@ class ChatMixin:
                         )
                         instr = await self._summarize_objective_instruction_from_thread(
                             thread_txt,
-                            (role_context.get("role") or "ADJUDICATOR"),
+                            (role_context.get("role") or DEFAULT_WORKSPACE_ROLE),
                         )
                         cur_strat = self._workspace_strategy_payload.get(workspace_id)
                         if (
@@ -2348,7 +2300,7 @@ class ChatMixin:
                                     workspace_id=workspace_id,
                                     user_id=user_id,
                                     workspace_role=(
-                                        role_context.get("role") or "ADJUDICATOR"
+                                        role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                     ),
                                     user_objective_instruction=instr,
                                     current_strategy=cur_strat,
@@ -2376,7 +2328,7 @@ class ChatMixin:
                                     list(OBJECTIVE_CHANGE_REFRESH_FEATURES),
                                     reason="objective_followup_regen_failed",
                                     workspace_role=(
-                                        role_context.get("role") or "ADJUDICATOR"
+                                        role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                                     ),
                                 )
                                 objective_regen_ok = True
@@ -2467,7 +2419,7 @@ class ChatMixin:
                     if isinstance(cur_strat, dict) and (
                         cur_strat.get("caseSummary") or ""
                     ).strip():
-                        _obj_role = role_context.get("role") or "ADJUDICATOR"
+                        _obj_role = role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                         await self._emit_workspace_refresh(
                             workspace_id=workspace_id,
                             user_id=user_id,
@@ -2494,10 +2446,9 @@ class ChatMixin:
                             objective_ack_kind = "direct"
                             self._clear_pending_objective_change(workspace_id)
                             # Reconnect replay was unreachable for a chat-driven
-                            # change: _pending_reemit_workspace_id is armed only
+                            # change: the reconnect replay is armed only
                             # by workspace_created / transfer / analysis emit.
-                            self._pending_reemit_workspace_id = workspace_id
-                            self._pending_reemit_user_id = user_id
+                            self._arm_reconnect_reemit(workspace_id, user_id)
                             self._schedule_objective_change_reanalysis(
                                 workspace_id=workspace_id,
                                 user_id=user_id,
@@ -2735,7 +2686,7 @@ class ChatMixin:
                     if isinstance(cur_strat, dict) and (
                         cur_strat.get("caseSummary") or ""
                     ).strip():
-                        _promoted_role = role_context.get("role") or "ADJUDICATOR"
+                        _promoted_role = role_context.get("role") or DEFAULT_WORKSPACE_ROLE
                         await self._emit_workspace_refresh(
                             workspace_id=workspace_id,
                             user_id=user_id,
@@ -2764,8 +2715,7 @@ class ChatMixin:
                             )
                         if regen_ok:
                             self._clear_pending_objective_change(workspace_id)
-                            self._pending_reemit_workspace_id = workspace_id
-                            self._pending_reemit_user_id = user_id
+                            self._arm_reconnect_reemit(workspace_id, user_id)
                             self._schedule_objective_change_reanalysis(
                                 workspace_id=workspace_id,
                                 user_id=user_id,
@@ -2894,7 +2844,7 @@ class ChatMixin:
                     # Generate 10-12 contextual chips, store for this workspace; send random 4 in response (backend polls every few sec and we return random 4 each time)
                     suggestion_chips_for_payload = []
                     try:
-                        role_for_chips = (role_context.get("role") or "ADJUDICATOR").upper()
+                        role_for_chips = (role_context.get("role") or DEFAULT_WORKSPACE_ROLE).upper()
                         generated = await self._generate_contextual_suggestion_chips(
                             workspace_id=workspace_id,
                             role=role_for_chips,
@@ -2935,7 +2885,7 @@ class ChatMixin:
                 content=response_text_to_emit,
                 metadata=AIResponseMetadata(
                     messageId=response.message_id,
-                    aiModel=settings.gemini_model,
+                    aiModel=primary_model(current_usage()),
                     responseTime=processing_time,
                     confidence=(
                         response.confidence.value
@@ -2957,7 +2907,7 @@ class ChatMixin:
                 ),
             )
 
-            # STEP 6: Emit ai_response back to server. _pending_ai_response is
+            # STEP 6: Emit ai_response back to server. _pending_ai_responses is
             # the buffer that on_connected re-emits after a reconnect — we
             # populate it ONLY when the emit was not confirmed delivered, so a
             # successful emit does not get duplicated on the next disconnect
@@ -2973,18 +2923,19 @@ class ChatMixin:
                     )
                 except Exception as emit_err:
                     logger.error("Failed to emit ai_response: {}", emit_err)
+                pending_key = str(payload_dict.get("chatId") or chat_id or "")
                 if emit_succeeded:
-                    self._pending_ai_response = None
+                    self._pending_ai_responses.pop(pending_key, None)
                     logger.success("AI response sent successfully")
                 else:
-                    self._pending_ai_response = payload_dict
+                    self._pending_ai_responses[pending_key] = payload_dict
                     logger.warning(
                         "ai_response not confirmed delivered — will retry on reconnect"
                     )
                 await self._remember_workspace_role(
                     workspace_id,
                     user_id,
-                    (role_context.get("role") or "ADJUDICATOR"),
+                    (role_context.get("role") or DEFAULT_WORKSPACE_ROLE),
                     chat_id=chat_id,
                 )
                 # Cache assistant text for follow-ups like "yes" when conversation_history is incomplete
@@ -3031,7 +2982,7 @@ class ChatMixin:
                 if self._socket_client and chat_id:
                     error_meta = AIResponseMetadata(
                         messageId=chat_id,
-                        aiModel=settings.gemini_model,
+                        aiModel=primary_model(current_usage()),
                         error=str(e),
                         **self._token_usage_metadata(workspace_id, current_usage()),
                     )
@@ -3069,7 +3020,6 @@ class ChatMixin:
         nothing, so the usage metadata is attached only when tokens were actually
         consumed — see the emit below.
         """
-        import random
 
         from app.ai.usage import capture_usage
 
@@ -3195,11 +3145,11 @@ class ChatMixin:
                         or last_ai
                         or (conv_history and len(conv_history) >= 2)
                     ):
-                        role = "ADJUDICATOR"
+                        role = DEFAULT_WORKSPACE_ROLE
                         try:
                             ctx = workspace_manager.get_workspace(workspace_id)
                             if ctx and ctx.workspace_role:
-                                role = (ctx.workspace_role or "ADJUDICATOR").upper()
+                                role = (ctx.workspace_role or DEFAULT_WORKSPACE_ROLE).upper()
                         except Exception:
                             pass
                         if last_user or last_ai:
@@ -3258,11 +3208,11 @@ class ChatMixin:
                                 or []
                             )
                         if not chips:
-                            role = "ADJUDICATOR"
+                            role = DEFAULT_WORKSPACE_ROLE
                             try:
                                 ctx = workspace_manager.get_workspace(workspace_id)
                                 if ctx and ctx.workspace_role:
-                                    role = (ctx.workspace_role or "ADJUDICATOR").upper()
+                                    role = (ctx.workspace_role or DEFAULT_WORKSPACE_ROLE).upper()
                             except Exception:
                                 pass
                             chips = self._fallback_chips_for_role(role, 16)

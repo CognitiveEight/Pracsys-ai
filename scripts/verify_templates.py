@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import re
 import sys
 from dataclasses import dataclass
 from io import BytesIO

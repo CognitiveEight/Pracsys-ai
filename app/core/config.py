@@ -4,6 +4,7 @@ Application configuration management.
 
 from typing import List, Optional
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -87,6 +88,110 @@ class Settings(BaseSettings):
     # embedding_failed (kept for full-context reads, excluded from search).
     embedding_max_attempts: int = 3
 
+    # ── Model portability (app/llm/) ──────────────────────────────────────
+    # Every model call goes gemini_client -> app.llm router -> a provider
+    # adapter. A "profile" is "<provider>:<model>" or, for the providers that
+    # hold several named accounts, "<provider>:<account>:<model>":
+    #   gemini:<model>                     Google AI Studio (GOOGLE_API_KEY)
+    #   openai:<model>                     api.openai.com (OPENAI_API_KEY)
+    #   azure_openai:<model>               Azure OpenAI; <model> is looked up in
+    #                                      AZURE_OPENAI_DEPLOYMENTS, else used as
+    #                                      the deployment name
+    #   azure_foundry:<model>              Azure AI Foundry (OpenAI-compatible)
+    #   bedrock:<model-id>                 AWS Bedrock Converse API
+    #   sagemaker:<endpoint-name>          SageMaker endpoint (SAGEMAKER_ENDPOINTS)
+    #   openai_compat:<account>:<model>    any OpenAI-compatible server — vLLM,
+    #                                      Ollama, TGI, DeepSeek, Qwen/DashScope,
+    #                                      Together, Groq (OPENAI_COMPAT_PROFILES)
+    # Unset LLM_DEFAULT means "gemini:<GEMINI_MODEL>" — today's behaviour.
+    llm_default: Optional[str] = None
+    # JSON {task: [profile, fallback, ...]}; task = the @meter_usage feature
+    # label (see docs/MODEL_PORTABILITY.md). Unlisted tasks use the default.
+    llm_routes: Optional[str] = None
+    # JSON [profile, ...] tried after a task's own chain on error/timeout.
+    llm_fallbacks: Optional[str] = None
+    # Models the user may choose per case (the `aiModel` field on workspace /
+    # chat events). JSON {"<id>": "<profile>"} — the id is what the frontend
+    # sends, e.g. {"gemini-3.8-flash": "gate0:gemini-3.8-flash",
+    # "gpt-4o": "gate0:gpt-4o"} — or a JSON list of profiles (id = model part).
+    # The LLM_DEFAULT model is always selectable. An unknown id is ignored and
+    # the case keeps its model. Tasks listed in LLM_ROUTES are pinned to their
+    # route and ignore the selection; grounding and embeddings never follow it.
+    llm_selectable_models: Optional[str] = None
+    # Profiles allowed to serve Google-Search-grounded calls (only Gemini can).
+    llm_grounding_profiles: Optional[str] = None
+    # Extra attempts on the SAME profile for a transient error (429/5xx/network)
+    # before moving down the chain. Timeouts are never retried.
+    llm_transient_retries: int = 1
+    # JSON {model: [input_usd_per_million, output_usd_per_million]}.
+    llm_pricing_overrides: Optional[str] = None
+    # JSON {model: {"max_output_tokens": 8192, "supports_images": false,
+    #   "json_mode": true}} — per-model limits the adapters cannot know (output
+    # ceilings differ widely across Bedrock / open-weight models, and a request
+    # above the ceiling is a hard 400). Applies to every provider.
+    llm_model_options: Optional[str] = None
+
+    # OpenAI (api.openai.com, or OPENAI_BASE_URL for a gateway)
+    openai_api_key: Optional[SecretStr] = None
+    openai_base_url: Optional[str] = None
+    openai_organization: Optional[str] = None
+    # Azure OpenAI. With no API key, Entra ID (DefaultAzureCredential) is used.
+    azure_openai_endpoint: Optional[str] = None
+    azure_openai_api_key: Optional[SecretStr] = None
+    azure_openai_api_version: str = "2024-10-21"
+    azure_openai_deployments: Optional[str] = None  # JSON {model: deployment}
+    # Azure AI Foundry, OpenAI-compatible endpoint (…/openai/v1). With no API
+    # key, Entra ID is used.
+    azure_foundry_endpoint: Optional[str] = None
+    azure_foundry_api_key: Optional[SecretStr] = None
+    # AWS. Credentials come ONLY from the standard boto3 chain (env, profile,
+    # instance/task role) — never from this file.
+    aws_region: Optional[str] = None
+    bedrock_region: Optional[str] = None
+    bedrock_guardrail_id: Optional[str] = None
+    bedrock_guardrail_version: Optional[str] = None
+    # JSON {name: {"endpoint": "...", "payload_format": "openai_messages"|"tgi_generate",
+    #              "region": "...", "max_output_tokens": 4096}}
+    sagemaker_endpoints: Optional[str] = None
+    # JSON {account: {"base_url": "...", "api_key_env": "DEEPSEEK_API_KEY",
+    #   "json_mode": true, "supports_images": false, "max_output_tokens": 8192,
+    #   "query_prefix": "..."}}
+    openai_compat_profiles: Optional[str] = None
+    # Gate0 — ViitorCloud's governed AI gateway (LiteLLM proxy). Profiles are
+    # "gate0:<model>" where <model> is whatever name gate0 serves (a model
+    # group such as "gemini-3.8-flash", or a task class such as "gate0/lite").
+    gate0_base_url: Optional[str] = None  # e.g. https://gate0.example.internal/v1
+    gate0_api_key: Optional[SecretStr] = None  # a gate0 virtual key for this service
+    # Governance mode: every model call (generation, grounding, embeddings) MUST
+    # go through gate0. Startup refuses any direct-provider profile, and the
+    # router never calls one, so nothing can bypass the gateway's keys,
+    # budgets and audit trail.
+    gate0_enforce: bool = False
+    # Tag every request with app / feature / workspace / request ids (sent as
+    # LiteLLM request metadata + tags) for per-workspace spend in gate0.
+    gate0_tag_requests: bool = True
+    gate0_app_name: str = "simplertoday"
+    # Send Gemini safety_settings BLOCK_NONE for Gemini-backed gate0 models
+    # (legal evidence trips the default filters; same policy as direct Gemini).
+    gate0_gemini_block_none: bool = True
+    # Gate0 usage meter: report the non-model paid units (Vision OCR pages,
+    # Speech-to-Text seconds, Vertex AI Search queries, Google Search grounding
+    # requests gate0 did not price) to gate0, so gate0 holds the whole bill of
+    # every case. Needs gate0's usage-record endpoint (usage-record schema
+    # 1.1.0); off until that is deployed. Records carry ids and quantities only.
+    gate0_meter_enabled: bool = False
+    gate0_meter_path: str = "/usage-records"  # relative to GATE0_BASE_URL
+    gate0_meter_flush_seconds: float = 10.0
+    # Records gate0 could not take are kept here and re-sent on the next start
+    # (gate0 dedupes by call id). Billing records only — no case content.
+    gate0_meter_outbox_dir: str = "data/gate0_meter_outbox"
+    # Embeddings: EMBEDDING_MODEL / EMBEDDING_DIMENSIONS above name the model.
+    # gemini | openai | azure_openai | azure_foundry | bedrock | openai_compat:<account>
+    embedding_provider: str = "gemini"
+    # Prepended to queries for embedding models without task types
+    # (e.g. Qwen3-Embedding expects an instruction prefix on queries).
+    embedding_query_prefix: str = ""
+
     # Hard ceiling on a single Gemini generation. Without it a stalled request
     # blocks its caller forever: the long feature generations are awaited inline
     # by socket handlers, and a strategy/objective regeneration legitimately runs
@@ -94,6 +199,35 @@ class Settings(BaseSettings):
     # finite. On expiry the call raises asyncio.TimeoutError, which the feature
     # handlers turn into a reported failure instead of a permanent loader.
     gemini_request_timeout_seconds: float = 300.0
+
+    # Stuck-loader bounds (SIM-163 Phase -1). A panel loader clears only when its
+    # panel arrives, so nothing that holds the per-workspace pipeline lock may
+    # wait without bound: while it is held, every later upload, objective change,
+    # reconnect replay and resume for the case queues behind it.
+    # Bound on any request_global_template_sync wait. An undelivered request
+    # returns at once; a late snapshot still refreshes the Drafting Assistant.
+    template_sync_timeout_seconds: float = 900.0
+    # How long drafting waits on the template prewarm while holding the pipeline
+    # lock. The prewarm itself keeps waiting (up to the bound above) outside it.
+    template_sync_in_lock_wait_seconds: float = 5.0
+    # Hard cap on one upload pipeline / dates-laws run / objective-change cascade
+    # holding the lock, measured from acquisition. At the cap the run is
+    # cancelled, logged CRITICAL with its stage, and its armed panels settle from
+    # cache.
+    pipeline_run_timeout_seconds: float = 900.0
+    # Seconds of cap added per second of audio in the run's batch, and the upper
+    # bound of that extension (also used when an audio duration is unknown).
+    audio_timeout_factor: float = 1.0
+    pipeline_run_timeout_audio_max_seconds: float = 3600.0
+    # Informational WARNING when a case's pipeline lock has been held this long.
+    pipeline_lock_warn_seconds: float = 300.0
+    # Upload pipeline: generate dates, laws, timeline, parties and case laws
+    # while strategy -> analysis -> drafting run, holding their emits until
+    # those three are sent. false restores the sequential run.
+    pipeline_concurrent_panels: bool = True
+    # List of Dates: per-document temporal calls and per-date dedupe calls
+    # running at once. 1 restores the sequential behaviour.
+    list_of_dates_concurrency: int = 4
 
     # Token pricing overrides (USD per 1,000,000 tokens). When BOTH are set they
     # take precedence over the built-in per-model table in app/ai/pricing.py, so
@@ -145,6 +279,24 @@ class Settings(BaseSettings):
     # Spreadsheet calculations in chat (app/rag/table_query.py). Off → no
     # [T#] results; the prompt then forbids totals over partial rows.
     table_query_enabled: bool = True
+    # Shared knowledge base (kb_* events, app/rag/knowledge_base.py). Off → the
+    # shelf is still kept in step with the backend, but chat never reads it.
+    knowledge_base_chat_enabled: bool = True
+    # Shelf passages one chat turn may carry, and the rerank score (0-10) a
+    # passage needs: the shelf is supplementary, so a weak match stays out.
+    knowledge_base_chat_passages: int = 4
+    knowledge_base_min_relevance: float = 6.0
+    # Shelf documents fetched and indexed at once (a kb_sync can list many).
+    knowledge_base_ingest_concurrency: int = 2
+    # Panels that read the shelf alongside the case's documents, for every
+    # case. Fact panels (dates, timeline, parties) are deliberately absent: a
+    # judgment's facts must never become this case's facts. "" turns it off.
+    knowledge_base_panels: str = "strategy_objective,analysis_report,applicable_laws"
+    # Shelf passages and characters one panel prompt may carry, and the rerank
+    # score they need against the case's own description.
+    knowledge_base_panel_passages: int = 6
+    knowledge_base_panel_chars: int = 12_000
+    knowledge_base_panel_min_relevance: float = 5.0
     # Characters of document text one panel prompt may carry (~4 chars/token).
     # Documents over their share are excerpted by relevance, not cut from the
     # front (app/rag/packing.py). Raising it improves recall at token cost.

@@ -2,4 +2,5 @@
 -r requirements.txt
 pytest>=8.0
 pytest-asyncio>=0.23
-pyflakes>=3.0
+ruff==0.16.9        # lint (config: [tool.ruff] in pyproject.toml)
+pre-commit==4.6.2   # commit gates (.pre-commit-config.yaml)

@@ -2,11 +2,10 @@
 Chat agent for handling general conversation and queries.
 """
 
-from typing import Any, Dict
 
 from loguru import logger
 
-from app.agents.base import AgentConfig, AgentError, AgentResponse, BaseAgent
+from app.agents.base import AgentConfig, AgentResponse, BaseAgent
 from app.vectorstore.memory import memory_manager
 from app.workspace.context import WorkspaceContext
 

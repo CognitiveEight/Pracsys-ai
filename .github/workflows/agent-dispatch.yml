@@ -1,0 +1,222 @@
+# Agent pipeline queue (SIM-153; SIM-71 Phase 3, task 17).
+#
+# Every 15 minutes in working hours:
+#   1. starts the implement stage for open `agent-pr` spec PRs that carry the
+#      G2 approval (label `design-approved` by a DESIGN_APPROVERS login, on
+#      the current head: scripts/delivery/g2_gate.py, the same check the
+#      implement stage repeats), not yet labelled `agent-implemented`, whose
+#      issue is in scope (no `agent-running` / `agent-blocked`); a refusal
+#      other than "not approved yet" is also started, so the implement stage
+#      reports it once and flags the issue;
+#   2. with the room left, starts the spec stage for the next `agent-ready` +
+#      `ai-repo` SIM tickets (scripts/delivery/agent_queue.py: priority, then
+#      oldest).
+# At most AGENT_MAX_CONCURRENT (default 1) agent-spec / agent-implement runs
+# go at once.
+#
+# Guardrails:
+#   * off unless repo variable AGENTS_ENABLED is exactly "true" (kill switch);
+#   * no model, no Anthropic key, no push token: this job only reads Jira and
+#     starts agent-spec.yml with its own token (`actions: write`);
+#   * the started run's inputs are values g2_gate.py / agent_queue.py printed,
+#     re-checked here and again by the stage workflow before any use;
+#   * a key that already has a feature/SIM-<n>-* or fix/SIM-<n>-* branch is
+#     skipped (EXISTING_TICKET_BRANCH_KEYS), so an already-ran ticket is not
+#     re-dispatched every 15 minutes.
+#
+# A scheduled run uses the default branch's copy (`main`); a human copies
+# this file there. A workflow_dispatch run uses whatever ref the dispatcher
+# names, so `--ref main` alone is no control: the Jira secrets this job reads
+# live only in the GitHub Environment `pracsys-agents`, whose deployment
+# branches are `main` only (an admin action REQUIRED BEFORE THE PILOT; see
+# agent-implement.yml and docs/runbooks/run-the-agent-pipeline.md). Code and
+# scripts come from `development`.
+#
+# DESIGN_APPROVERS empty or unset: no implement run is started and the job
+# fails once, at the end (after the spec queue), with one clear error.
+
+name: Agent dispatch
+
+on:
+  schedule:
+    - cron: "*/15 3-15 * * 1-6" # Mon–Sat, 08:30–21:15 IST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-dispatch
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    if: vars.AGENTS_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    environment: pracsys-agents
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: development
+          persist-credentials: false
+
+      # Runs that are queued or in progress count against the limit. Any
+      # failure here stops the job, so nothing starts on a wrong count.
+      - name: Count running stages and spec PRs waiting for G2
+        id: count
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          running=0
+          for wf in agent-spec.yml agent-implement.yml; do
+            for status in queued in_progress waiting pending requested; do
+              n="$(gh run list --workflow "$wf" --status "$status" --limit 100 --json databaseId --jq 'length')"
+              running=$((running + n))
+            done
+          done
+          keys="$(gh pr list --label agent-pr --state open --limit 200 --json headRefName,title \
+            --jq '[.[] | (.headRefName + " " + .title) | scan("SIM-[0-9]+")] | unique | join(",")')"
+          # Keys that already have a ticket branch: the spec stage would only
+          # report already-ran for them, so the queue skips them.
+          # A failed lookup stops the job like the counts above; no branch at all is fine.
+          for refs in matching-refs/heads/feature/SIM- matching-refs/heads/fix/SIM-; do
+            gh api --paginate "repos/${GH_REPO}/git/${refs}" --jq '.[].ref'
+          done > "$RUNNER_TEMP/ticket-refs.txt"
+          branch_keys="$( (grep -oE 'SIM-[0-9]+' "$RUNNER_TEMP/ticket-refs.txt" || true) | sort -u | paste -sd, -)"
+          echo "running=${running}" >> "$GITHUB_OUTPUT"
+          echo "open_keys=${keys}" >> "$GITHUB_OUTPUT"
+          echo "branch_keys=${branch_keys}" >> "$GITHUB_OUTPUT"
+          echo "running=${running}"
+
+      # GitHub only, read-only job token: the same G2 check the implement
+      # stage repeats. A failed read for one PR is that PR's refusal only:
+      # the PR or timeline as `null` (bad-data: quiet, retried next tick),
+      # the push record as `[]` (push-unverified: the implement stage reads
+      # it again and reports a second failure once). The listing itself
+      # failing still stops the job, so nothing starts on a wrong list.
+      - name: Find spec PRs carrying the design approval (G2)
+        id: g2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DESIGN_APPROVERS: ${{ vars.DESIGN_APPROVERS }}
+        run: |
+          set -euo pipefail
+          g="$RUNNER_TEMP/g2"
+          mkdir -p "$g"
+          echo '[]' > "$RUNNER_TEMP/g2-start.json"
+          if [ -z "$(printf '%s' "$DESIGN_APPROVERS" | tr -d ', \t\n')" ]; then
+            echo "approvers_missing=true" >> "$GITHUB_OUTPUT"
+            echo "G2 not checked: DESIGN_APPROVERS is empty." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh pr list --state open --label agent-pr --label design-approved --limit 100 \
+            --json number,headRefName,headRefOid,baseRefName,labels,isCrossRepository > "$g/listed.json"
+          python3 scripts/delivery/g2_gate.py candidates < "$g/listed.json" > "$g/candidates.json"
+          while IFS=$'\t' read -r issue pr sha branch; do
+            [ -n "$issue" ] || continue
+            gh api "repos/${GH_REPO}/pulls/${pr}" > "$g/pr.json" \
+              || echo null > "$g/pr.json"
+            gh api "repos/${GH_REPO}/issues/${pr}/timeline" --paginate --jq '.[]' | jq -s . > "$g/timeline.json" \
+              || echo null > "$g/timeline.json"
+            gh api "repos/${GH_REPO}/activity?ref=refs/heads/${branch}&per_page=100" > "$g/activity.json" \
+              || echo '[]' > "$g/activity.json"
+            python3 scripts/delivery/g2_gate.py check --issue "$issue" --pr "$pr" --sha "$sha" \
+              --pr-file "$g/pr.json" --timeline-file "$g/timeline.json" --activity-file "$g/activity.json" \
+              --approvers "$DESIGN_APPROVERS" --repo "$GH_REPO" > "$g/verdict.json"
+            echo "G2 ${issue} (PR #${pr}): $(jq -r '.reason' "$g/verdict.json")" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$(jq -r '.go or .notify' "$g/verdict.json")" = "true" ]; then
+              jq --slurpfile v "$g/verdict.json" '. + [{issue: $v[0].issue, pr: $v[0].pr, sha: $v[0].sha}]' \
+                "$RUNNER_TEMP/g2-start.json" > "$g/next.json"
+              mv "$g/next.json" "$RUNNER_TEMP/g2-start.json"
+            fi
+          done < <(jq -r '.[] | [.issue, (.pr | tostring), .sha, .branch] | @tsv' "$g/candidates.json")
+
+      # Jira only (no GitHub token here): keep the approved issues that are in
+      # the agents' scope, up to the room AGENT_MAX_CONCURRENT leaves.
+      - name: Check the approved issues are in scope
+        id: scope
+        env:
+          AGENT_MAX_CONCURRENT: ${{ vars.AGENT_MAX_CONCURRENT || '1' }}
+          AGENT_RUNNING: ${{ steps.count.outputs.running }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$AGENT_MAX_CONCURRENT" =~ ^[0-9]{1,4}$ ]] || ! [[ "$AGENT_RUNNING" =~ ^[0-9]{1,6}$ ]]; then
+            echo "AGENT_MAX_CONCURRENT or the running count is not a number"; exit 1
+          fi
+          room=$((AGENT_MAX_CONCURRENT - AGENT_RUNNING))
+          echo '[]' > "$RUNNER_TEMP/implement-start.json"
+          started=0
+          while IFS=$'\t' read -r issue row; do
+            [ -n "$issue" ] || continue
+            [ "$started" -lt "$room" ] || break
+            if [ "$(python3 scripts/delivery/jira_ops.py check-scope --issue "$issue" | jq -r '.inScope')" = "true" ]; then
+              jq --argjson r "$row" '. + [$r]' "$RUNNER_TEMP/implement-start.json" > "$RUNNER_TEMP/next.json"
+              mv "$RUNNER_TEMP/next.json" "$RUNNER_TEMP/implement-start.json"
+              started=$((started + 1))
+            fi
+          done < <(jq -r '.[] | [.issue, (. | tojson)] | @tsv' "$RUNNER_TEMP/g2-start.json")
+          echo "implement_started=${started}" >> "$GITHUB_OUTPUT"
+
+      - name: Pick the next tickets
+        env:
+          AGENTS_ENABLED: ${{ vars.AGENTS_ENABLED }}
+          AGENT_MAX_CONCURRENT: ${{ vars.AGENT_MAX_CONCURRENT || '1' }}
+          # Implement runs started this tick count against the limit.
+          IMPLEMENT_STARTED: ${{ steps.scope.outputs.implement_started }}
+          AGENT_RUNNING: ${{ steps.count.outputs.running }}
+          OPEN_SPEC_PR_KEYS: ${{ steps.count.outputs.open_keys }}
+          EXISTING_TICKET_BRANCH_KEYS: ${{ steps.count.outputs.branch_keys }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          AGENT_RUNNING=$((AGENT_RUNNING + ${IMPLEMENT_STARTED:-0})) \
+            python3 scripts/delivery/agent_queue.py next > "$RUNNER_TEMP/queue.json"
+          cat "$RUNNER_TEMP/queue.json"
+
+      - name: Start the implement stage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r issue pr sha; do
+            [ -n "$issue" ] || continue
+            if ! [[ "$issue" =~ ^SIM-[0-9]+$ && "$pr" =~ ^[0-9]{1,7}$ && "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "skipping malformed implement inputs"; continue
+            fi
+            gh workflow run agent-implement.yml --ref main -f issue="$issue" -f pr="$pr" -f sha="$sha"
+            echo "started the implement stage for ${issue}"
+          done < <(jq -r '.[] | [.issue, (.pr | tostring), .sha] | @tsv' "$RUNNER_TEMP/implement-start.json")
+
+      - name: Start the spec stage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for key in $(jq -r '.start[]' "$RUNNER_TEMP/queue.json"); do
+            if ! printf '%s' "$key" | grep -Eq '^SIM-[0-9]+$'; then
+              echo "skipping a malformed key"; continue
+            fi
+            gh workflow run agent-spec.yml --ref main -f issue="$key"
+            echo "started the spec stage for ${key}"
+          done
+
+      # After the spec queue, so a missing approver list does not stop it.
+      - name: Fail on a missing approver list
+        if: steps.g2.outputs.approvers_missing == 'true'
+        run: |
+          echo "::error::DESIGN_APPROVERS is empty or unset: no implement run was started. Set the repository variable to the comma-separated GitHub logins allowed to add design-approved."
+          exit 1

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import wave
+from itertools import pairwise
 from types import SimpleNamespace
 
 import pytest
@@ -34,7 +35,7 @@ def test_windows_stay_under_batch_limit_and_tile_the_recording(duration):
     )
     assert windows[0].keep_start == 0.0
     assert windows[-1].keep_end == pytest.approx(duration)
-    for prev, cur in zip(windows, windows[1:]):
+    for prev, cur in pairwise(windows):
         assert cur.keep_start == prev.keep_end  # no gap, no double coverage
     for w in windows:
         assert w.end_time - w.start_time <= at.BATCH_MAX_FILE_SECONDS

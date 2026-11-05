@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(make lint)",
+      "Bash(make test)",
+      "Bash(ruff check *)",
+      "Bash(python -m pytest *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git branch *)",
+      "Bash(git show *)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./bns-ai-*.json)",
+      "Read(./gcp-*.json)",
+      "Read(./application-service-*.json)",
+      "Read(./*Creds*.txt)",
+      "Edit(./.env)",
+      "Edit(./bns-ai-*.json)",
+      "Edit(./gcp-*.json)",
+      "Edit(./application-service-*.json)",
+      "Bash(git push *)",
+      "Bash(git push)",
+      "Bash(git merge *)",
+      "Bash(git rebase *)",
+      "Bash(git reset --hard *)",
+      "Bash(git branch -D *)",
+      "Bash(make e2e)",
+      "Bash(python scripts/e2e_local_backend.py *)",
+      "Bash(python scripts/e2e_local_backend.py)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/block-secrets.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/protect-branch.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/validate-code.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -3,111 +3,20 @@ Socket.IO event handlers with Intelligence Chat Agent integration.
 Updated to match backend Socket.IO specification.
 """
 import asyncio
-import json
-import re
 import time
 import uuid
-from datetime import date as date_type
-from datetime import datetime
-from html import unescape
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import quote_plus
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-import httpx
 from loguru import logger
 
-from app.agents.role_models import RoleEnum
-from app.core.config import settings
-from app.langgraph.integration import workspace_role_integration
-from app.observability.audit import audit_logger
-from app.processing.audio_transcription import (
-    _has_devanagari as _audio_has_devanagari,
-    transliterate_formatted_transcript_to_hinglish,
-)
-from app.processing.document_processor import document_processor
-from app.search.vertex_ai_search import search_indiankanoon as vertex_search_indiankanoon
-from app.search.case_law_finder import (
-    fetch_judgment_text,
-    find_case_law_sources,
-    scrape_indiankanoon,
-)
-from app.prompts.applicable_acts import (
-    TARGETED_INDIAN_ACTS,
-    format_targeted_acts_for_prompt,
-)
 from app.prompts.legal_intelligence_system import (
-    ANNEXURE_UPLOAD_GATE_MESSAGE,
-    APP_BRAND_EXCLUSION_DIRECTIVE,
-    ENGLISH_ONLY_OUTPUT_DIRECTIVE,
-    NAME_CAPITALISATION_DIRECTIVE,
     get_legal_intelligence_system_instruction,
-    get_structured_document_feature_system_instruction,
-)
-from app.langgraph.chat_nodes import (
-    _last_ai_message_from_history,
-    is_user_affirmation_to_continue,
-    merge_intelligence_chat_history,
-)
-from app.langgraph.list_of_dates_agent import (
-    list_of_dates_temporal_agent,
-    snap_hallucinated_year,
-)
-from app.socket.schemas import (
-    AIResponseMetadata,
-    AIResponsePayload,
-    AnalysisDocxGenerateRequestPayload,
-    ApplicableLawRelevanceRequestPayload,
-    TemplateSyncPayload,
-    TemplateSyncResponsePayload,
-    UserMessageRequestPayload,
-    WorkspaceCreatedPayload,
-    WorkspaceSyncPayload,
 )
 from app.utils.exceptions import SocketEventError
-from app.workspace.custom_instructions import (build_custom_instruction_suffix,
-                                               hydrate_custom_instructions_from_cache,
-                                               set_custom_instructions)
-from app.workspace.manager import workspace_manager
-from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict,
-                                       hydrate_workspace_state, persist_state,
-                                       restore_state)
-from agent import process_analysis_docx_request
+from app.workspace.persistence import (CacheKinds, PersistentWorkspaceDict)
 
 from app.socket.event_utils import (
     EventHandler,
-    _STRATEGY_ROLE_LABELS_RE,
-    OBJECTIVE_UPDATE_OFFER_QUESTION,
-    CHAT_SMALL_WORKSPACE_DOC_THRESHOLD,
-    CHAT_SEARCH_CHUNK_LIMIT,
-    CHAT_MAX_DOCS_INCLUDED,
-    CHAT_MAX_CHARS_PER_DOC,
-    CHAT_MAX_TOTAL_CHARS,
-    CHAT_MIN_SCORE_THRESHOLD,
-    _ANNEXURE_REF_RE,
-    _ROMAN_VALUES,
-    SPEAKER_LABEL_GUARDRAIL,
-    _ENUM_PREFIX_RE,
-    _UI_TRUNCATION_RE,
-    _APP_BRAND_RE,
-    _STRENGTH_POINT_MIN_LEN,
-    _ANNEXURE_SINGLE_RE,
-    _ANNEXURE_PLURAL_RE,
-    _OVERVIEW_CONTACTED_DATE_RE,
-    _OVERVIEW_TO_PHONE_RE,
-    _roman_or_int,
-    _derive_report_case_summary,
-    _coerce_analysis_text_item,
-    _strip_enum_prefix,
-    _strip_ui_truncated_tokens,
-    scrub_app_brand,
-    _coerce_analysis_text_list,
-    _strip_strength_point_statute_boilerplate,
-    _annexure_wording_for_next_steps,
-    _clamp_annexure_references,
-    _format_document_for_prompt,
-    _normalize_report_mobile_from_overview,
-    _overview_conversation_date_to_iso,
-    extract_overview_conversation_report_contact_meta,
 )
 from app.socket.handlers import (
     JsonHelpersMixin,
@@ -129,6 +38,7 @@ from app.socket.handlers import (
     UserFactsMixin,
     DocxExportMixin,
     TemplateSyncMixin,
+    KnowledgeBaseMixin,
     WorkspaceMetadataMixin,
     WorkspaceEventsMixin,
     WorkspacePurgeMixin,
@@ -162,6 +72,7 @@ class SocketEventHandler(
     UserFactsMixin,
     DocxExportMixin,
     TemplateSyncMixin,
+    KnowledgeBaseMixin,
     WorkspaceMetadataMixin,
     WorkspaceEventsMixin,
     WorkspacePurgeMixin,
@@ -323,11 +234,13 @@ class SocketEventHandler(
         self._workspace_current_state_payload: Dict[str, Any] = (
             PersistentWorkspaceDict(CacheKinds.CURRENT_STATE)
         )
-        # In-flight request_template_sync correlations: requestId -> Future,
-        # resolved by on_template_sync_response once the snapshot is ingested
-        # into the in-memory template store. Lets the suggestion/kickoff path
-        # await a cold-cache fill before matching.
+        # In-flight request_global_template_sync correlations: requestId ->
+        # Future, resolved by on_global_template_sync_response once the
+        # snapshot is ingested into the in-memory template store. Lets the
+        # suggestion/kickoff path await a cold-cache fill before matching.
         self._pending_template_sync: Dict[str, "asyncio.Future"] = {}
+        # True once a global template snapshot has been applied (SIM-173).
+        self._global_templates_synced: bool = False
         # Per-workspace drafting-suggestion provenance, used to self-heal the
         # panel when a template finishes ingesting *after* suggestions were
         # built (e.g. a slow scanned-PDF OCR that misses the template-sync
@@ -364,8 +277,10 @@ class SocketEventHandler(
         self._background_tasks: Set[asyncio.Task] = set()
         # Re-emit after reconnect when socket dropped right after analysis report (so backend gets the update)
         self._had_disconnect: bool = False
-        self._pending_reemit_workspace_id: Optional[str] = None
-        self._pending_reemit_user_id: Optional[str] = None
+        # workspace_id -> (user_id, armed_at): every case whose cached panels
+        # are replayed after a reconnect (was a single slot: only the most
+        # recently active case was ever replayed).
+        self._pending_reemits: Dict[str, Tuple[str, float]] = {}
         # Per-workspace coalescing for analysis_report_feedback. Bulk-reject sends
         # N events in ~2ms; processing them sequentially under a lock is correct
         # but takes ~19s × N (Gemini scoring + explanation regeneration). We
@@ -381,14 +296,14 @@ class SocketEventHandler(
         # New triggers QUEUE behind the in-flight chain (FIFO); cross-workspace
         # runs stay concurrent because locks are keyed by workspace_id.
         self._workspace_pipeline_locks: Dict[str, asyncio.Lock] = {}
+        # Who holds each workspace's pipeline lock, in which stage, since when:
+        # workspace_id -> {"holder", "stage", "acquiredAt", "cap", "warnedAt"}.
+        # Read by the lock watchdog and the run cap (handlers/_shared.py).
+        self._workspace_pipeline_lock_holder: Dict[str, Dict[str, Any]] = {}
         self._pending_feedback_queue: Dict[str, List[Dict[str, Any]]] = {}
         self._pending_feedback_task: Dict[str, asyncio.Task] = {}
         # Window for collecting bulk-reject bursts before flushing.
         self._feedback_debounce_seconds: float = 0.5
-        # Max total score bump from a single batch (each valid rejection
-        # contributes 1–5; capping the sum prevents huge scores when the user
-        # rejects many items at once).
-        self._feedback_batch_max_score_delta: int = 15
         # Chat attachment cache: chat_id -> list of {fileName, content} so follow-up questions in same chat see the document
         self._chat_attachment_by_chat: Dict[str, List[Dict[str, Any]]] = {}
         # Intelligence chat: last assistant text per chat_id (client may omit conversation_history)
@@ -398,8 +313,10 @@ class SocketEventHandler(
         # - per user/workspace: f"{workspace_id}:{user_id}" -> role
         self._role_cache_by_chat: Dict[str, str] = {}
         self._role_cache_by_user_workspace: Dict[str, str] = {}
-        # Last ai_response payload; re-emit after reconnect when socket dropped right after emit so backend receives it
-        self._pending_ai_response: Optional[Dict[str, Any]] = None
+        # chat_id -> ai_response payload whose delivery failed; all re-sent on the
+        # next connect (was a single slot shared by every chat, so a second
+        # undelivered reply silently replaced the first).
+        self._pending_ai_responses: Dict[str, Dict[str, Any]] = {}
         # De-dup guard for replayed workspace_sync events (e.g., reconnect replay).
         # workspace_id -> {"fingerprint": str, "ts": float}
         self._last_workspace_sync_fingerprint: Dict[str, Dict[str, Any]] = {}
@@ -531,14 +448,19 @@ class SocketEventHandler(
             "analysis_docx_generate_request",
             self.on_analysis_docx_generate_request,
         )
-        # Drafting Assistant — template library sync from BE.
-        self.register("template_sync", self.on_template_sync)
-        # Reply to our AI-initiated request_template_sync (full snapshot).
-        self.register("template_sync_response", self.on_template_sync_response)
-        # "Regenerate Extra Info" — backend asks the AI to re-profile a template
-        # and emit a fresh blueprint proposal for the approval screen.
+        # Drafting Assistant — an admin's global template draft needs profiling
+        # (upload or "Re-profile"); the AI emits a blueprint proposal.
         self.register(
             "request_blueprint_proposal", self.on_request_blueprint_proposal
+        )
+        # Shared knowledge base (Server → AI): the platform-wide reference shelf.
+        self.register("kb_document_added", self.on_kb_document_added)
+        self.register("kb_document_deleted", self.on_kb_document_deleted)
+        self.register("kb_sync", self.on_kb_sync)
+        # Global Template Library (SIM-173): platform-wide feed, no userId.
+        self.register("global_template_sync", self.on_global_template_sync)
+        self.register(
+            "global_template_sync_response", self.on_global_template_sync_response
         )
 
         # Legacy event handlers
@@ -591,6 +513,7 @@ class SocketEventHandler(
             logger.log(level, "event {} received (keys: {})", event_name, sorted(body.keys()))
             started = time.monotonic()
             status = "ok"
+            model_token = self._apply_model_selection(event_name, body)
             try:
                 # Every workspace-scoped event runs inside its run scope, which
                 # is what lets workspace_stop_request cancel and fence it.
@@ -606,6 +529,9 @@ class SocketEventHandler(
                     details={"event": event_name, "error": str(e)},
                 )
             finally:
+                from app.workspace.model_selection import reset_message_model
+
+                reset_message_model(model_token)
                 # Long panel work runs in background tasks after this returns;
                 # each of those reports its own "result" line when it emits.
                 logger.log(
@@ -613,6 +539,27 @@ class SocketEventHandler(
                     "event {} finished in {:.1f}s status={}",
                     event_name, time.monotonic() - started, status,
                 )
+
+    #: Events whose ``aiModel`` sets the CASE's model (see model_selection.py).
+    _CASE_MODEL_EVENTS = frozenset(
+        {"workspace_created", "workspace_sync", "workspace_version_restore"}
+    )
+
+    def _apply_model_selection(self, event_name: str, body: Dict[str, Any]) -> Any:
+        """Apply ``aiModel`` from an inbound event. Workspace events set the
+        case's model (absent = unchanged, null/"" = default); a chat message
+        overrides it for that turn only. Returns the turn-override token for
+        ``handle`` to reset. Never raises."""
+        try:
+            from app.workspace.model_selection import set_message_model, set_workspace_model
+
+            if event_name in self._CASE_MODEL_EVENTS and "aiModel" in body:
+                set_workspace_model(str(body.get("workspaceId") or ""), body.get("aiModel"))
+            elif event_name == "user_message_request" and body.get("aiModel"):
+                return set_message_model(body.get("aiModel"))
+        except Exception as exc:  # a bad selection must never block the event
+            logger.warning("aiModel not applied: {}", exc)
+        return None
 
     _EMPTY_CASE_ENTITIES: Dict[str, List[Any]] = {
         "parties": [],
@@ -656,7 +603,9 @@ class SocketEventHandler(
         """Map any role wording to a canonical Title-Case role; default 'Other'."""
         return cls._PARTY_ROLE_MAP.get(str(raw or "").strip().upper(), "Other")
 
-    _ANALYSIS_FEEDBACK_SCORE_BUMP_DEFAULT = 4
+    # What a reject that removes an item adds to caseResolutionScore: the same
+    # weights _derive_case_resolution_score deducts per open item.
+    _REJECTION_SCORE_INCREASE = {"missingInfo": 5, "weaknesses": 5, "risks": 3}
 
     _ADDED_MISSING_INFO_SCORE_DROP_DEFAULT = 3
 

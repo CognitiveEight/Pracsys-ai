@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.0] - 2026-11-05
+
+Also versions the changes that reached `main` after 5.1.0 without a version
+number. Release notes: `RELEASE.md`.
+
 ### Added
 
 - **SIM-174: the AI reads the shared knowledge base and uses it for every

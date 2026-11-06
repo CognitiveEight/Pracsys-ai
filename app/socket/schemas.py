@@ -1360,6 +1360,19 @@ PartyRole = Literal[
 ]
 
 
+class PartyIdentifier(BaseModel):
+    """One identity number of a party. ``value`` is ALWAYS masked (last 4 kept)."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    # aadhaar | pan | passport | voter_id | driving_licence | bank_account |
+    # udyam | gstin | cin | other
+    type: str = "other"
+    label: str = "ID"  # display label, e.g. "Aadhaar", "PAN"
+    value: str  # masked, e.g. "XXXX-XXXX-1234", "ABCXX1234X"
+    sourceDocId: str = ""  # document it was read from; "" when user-entered
+
+
 class RelevantPartyItem(BaseModel):
     """
     One party in the Relevant Parties panel.
@@ -1367,9 +1380,10 @@ class RelevantPartyItem(BaseModel):
     Emitted inside document_feature_response payload.parties[] under
     featureType="relevant_parties". Names are taken verbatim from the uploaded
     documents (never invented); ``role`` is a normalized enum the frontend
-    colour-codes. Contact fields are PII: they are emitted empty on
-    document-driven auto-generation and only populated when the user supplies
-    them via the add/edit_relevant_party panel-edit events.
+    colour-codes. Contact and identity fields are PII (SIM-186): auto-generation
+    fills them only with values found in the party's own source document, a
+    value the user supplies via add/edit_relevant_party always wins, and every
+    identity number is masked.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -1378,9 +1392,18 @@ class RelevantPartyItem(BaseModel):
     name: str  # exact name/title as written, e.g. "Rajesh Kumar", "President, BCCI"
     role: PartyRole = "Other"
     details: str  # one neutral sentence on this party's role in the matter
-    contactNumber: str = ""  # user-supplied (panel edit); "" on auto-gen
-    email: str = ""  # user-supplied (panel edit); "" on auto-gen
+    # Contact fields: as written in the evidence, or user-entered. Left OUT of
+    # the payload when unknown (never sent as ""), per the backend contract.
+    address: Optional[str] = None  # may span several lines
+    contactNumber: Optional[str] = None  # several joined by ", "
+    email: Optional[str] = None  # several joined by ", "
+    identifiers: List[PartyIdentifier] = []  # masked identity numbers
     officialIdUrl: str = ""  # user-supplied (panel edit); "" on auto-gen
+    # Source (SIM-184): the uploaded file the party was first found in, the
+    # same id list_of_dates sends; all left out when unknown (user-added).
+    sourceDocId: Optional[str] = None
+    sourceDocName: Optional[str] = Field(None, max_length=500)
+    pageNumber: Optional[int] = Field(None, ge=1)  # page where first named
     isMatched: bool = False  # True when this party carried over from currentState
 
 
@@ -1408,8 +1431,11 @@ class AddRelevantPartyRequest(BaseModel):
     role: Optional[str] = None  # coerced to PartyRole; AI infers when omitted
     details: Optional[str] = None  # contract field; `description` kept for back-compat
     description: Optional[str] = None
+    address: Optional[str] = None
     contactNumber: Optional[str] = None
     email: Optional[str] = None
+    # [{type, value}]; masked on receipt, so a full number is never stored
+    identifiers: Optional[List[Dict[str, Any]]] = None
     officialIdUrl: Optional[str] = None
     timestamp: Optional[str] = None
 
@@ -1430,8 +1456,11 @@ class EditRelevantPartyRequest(BaseModel):
     role: Optional[str] = None
     details: Optional[str] = None  # contract field; `description` kept for back-compat
     description: Optional[str] = None
+    address: Optional[str] = None
     contactNumber: Optional[str] = None
     email: Optional[str] = None
+    # [{type, value}]; masked on receipt, so a full number is never stored
+    identifiers: Optional[List[Dict[str, Any]]] = None
     officialIdUrl: Optional[str] = None
     timestamp: Optional[str] = None
 

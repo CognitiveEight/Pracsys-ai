@@ -37,8 +37,9 @@ HARD RULES:
   anything unclear → Other.
 - `details` is ONE neutral sentence, English only, no app/brand name, no
   advocacy.
-- Do NOT include contact numbers, emails, ID numbers or any other personal
-  contact details — those are supplied separately by the user.
+- Keep `details` narrative: never put addresses, emails, phone numbers or ID
+  numbers in it — those are attached to each party separately, from the
+  documents.
 
 RELEVANCE FILTER — decide, for each extracted entry, whether to KEEP or DROP it:
 - KEEP only parties with a direct, material role in THIS dispute:

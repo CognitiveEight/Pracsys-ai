@@ -9,6 +9,205 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SIM-186: Relevant Parties shows each party's address, email, phone and
+  masked ID numbers.** Lawyers no longer have to find them in the documents
+  by hand.
+  - The per-document party extractor (Relevant Parties only) also returns
+    each party's address, emails, phones and identity numbers (Aadhaar, PAN,
+    passport, voter ID, driving licence, bank account, Udyam, GSTIN, CIN).
+  - Every value is checked against the text of the document it came from and
+    dropped if it is not there. The details are attached after
+    classification, so the classify call cannot lose or alter them.
+  - Identity numbers are always masked, at most the last 4 digits visible.
+    `_emit_document_feature` re-masks every identifier of this panel, so
+    GSTIN/CIN (not masked at ingestion), cache replays and numbers typed into
+    an edit all leave masked.
+  - A value already on the party (typed by the lawyer, or verified earlier)
+    wins over a new extraction, including on a full refresh.
+  - Chat about relevant parties sees the details.
+  - **Socket payload change**, aligned with the backend's SIM-184 contract.
+    `relevant_parties.parties[]` gains:
+    - `address`; `email` and `contactNumber` are now filled automatically
+      (several values joined with ", ");
+    - `sourceDocId` (the same evidence file id `list_of_dates` sends),
+      `sourceDocName` (≤ 500 chars) and `pageNumber` (page where the party
+      is first named, from the `--- Page N ---` markers);
+    - `identifiers: [{type, label, value, sourceDocId}]`, masked. **Not yet
+      in the backend contract.**
+
+    `address`, `email`, `contactNumber`, `sourceDocId`, `sourceDocName` and
+    `pageNumber` are **left out when unknown, never sent as ""** — a change
+    for `email` / `contactNumber`, which used to go out as "". A user-added
+    party has no source fields. `add_relevant_party` /
+    `edit_relevant_party` accept `address` and `identifiers: [{type, value}]`.
+  - Values are never logged: one line reports counts
+    (`relevant_parties details addresses= emails= phones= ids= dropped_unverified=`).
+  Coverage: `tests/test_party_details.py`,
+  `tests/offline/verify_relevant_party_details.py`.
+
+- **SIM-195: trust pipeline and contradiction engine (`app/trust/`), behind
+  `TRUST_PIPELINE_ENABLED` (default off).** Every fact extracted from a
+  case's documents is corroborated across documents, checked against every
+  other document in the case, and routed trusted / contested / dropped.
+  - **Relevance:** each document is scored against the case's other
+    documents (leave-one-out, calibrated; an average document scores 1.0).
+    Log-only; it only discounts that document's evidence, never below 0.70.
+  - **Modality:** extraction now says whether a fact is asserted, alleged,
+    hedged or denied, and the date a status held (`as_of`). Hedged facts are
+    discarded and no longer reach the graph; denied ones are compared, never
+    stored as facts. This applies to the graph whether or not the trust
+    pipeline is on.
+  - **Corroboration:** confidence is noisy-OR over independent source groups,
+    recomputed from all evidence on every change. Two passages of one
+    document, or a passage copied into another (a petition quoting its
+    annexure, a .docx and its PDF), are one source.
+  - **Contradictions across the whole case:** different dates, amounts
+    (lakh/crore aware), statuses, opposed roles; one payment to two parties;
+    one advocate for opposed parties; a fact one document asserts and another
+    denies. A status that changed between two dated statements is a
+    succession, not a conflict. Both sides of a conflict become contested.
+    Recurring events (adjournments, instalments, notices) on two dates are
+    two events, not a conflict; a party's role differing across forums is
+    not a conflict. Amounts written "lac"/"lacs"/"Cr." and statuses such as
+    "unpaid" / "not complied" now parse correctly (also fixes the old
+    batch detector).
+  - **Routing:** trusted >= 0.85, dropped < 0.50, contested between or when in
+    an unresolved conflict (confidence x0.65). One review item per contested
+    fact; `resolve_review` records keep_a / keep_b / keep_both / dismissed /
+    confirm_trusted / confirm_dropped, which survive recomputation and new
+    documents (matched on a hashed signature; no case text is stored).
+  - **Where it shows:** the analysis report and strategy prompts get a
+    "conflicts between documents" block with both sources and pages; chat
+    brings both passages into the evidence pack so both sides are cited and
+    checked. Graph queries skip dropped facts and mark contested ones.
+  - **Graph fixes:** contradiction edges for events, amounts and obligations
+    are now written (they used a single value as the key of a composite
+    node and were always rejected); a fact another document still supports
+    is re-written after a document delete instead of disappearing with it.
+  - **Storage and deletion:** new payload-only Qdrant collection
+    `<collection>_trust_v1`. `delete_documents` erases a document's evidence
+    and every fact or conflict naming it, then rebuilds the case;
+    `delete_workspace` erases the whole slice.
+  - Ontology 1.3.0: optional `trust_status`, `trust_confidence`,
+    `source_count` on every node. No socket payload or event changes; the
+    review queue's socket events are a follow-up.
+
+### Changed
+
+- **SIM-177: audio transcripts separate 1 to 8 speakers instead of forcing
+  every recording into a two-person call.**
+  - Chirp 3 is asked for 1 to `AUDIO_MAX_SPEAKERS` speakers. If it rejects
+    that range (INVALID_ARGUMENT naming speakers or diarization), it is asked
+    once more with `AUDIO_MAX_SPEAKERS_RETRY`. The rejected job is not billed;
+    a second rejection fails the recording (`transcriptStatus: failed`) rather
+    than running chunked Recognize under a refused range.
+  - Reliable native tags with 3 or more speakers are kept. The Gemini text
+    pass may only correct turns: same count, one-to-one, at most 25% of turns.
+    Two native speakers keep today's 2-speaker call pass (Caller / Receiver).
+    One native speaker, or drifting chunked tags, go through a new neutral
+    N-speaker pass (`speaker_source=gemini_multi_diarization`, internal).
+    Long recordings keep one label per person across Gemini blocks.
+  - The "more than 3 speakers -> one speaker" rule is replaced by a cap that
+    folds only near-silent false speakers (under 2% of words and at most 2
+    turns; 3+ speakers only, never below 2). Only a result above the maximum
+    collapses to one speaker (`collapsed_no_diarization`).
+  - Three or more speakers are always labelled `Speaker A`, `B`, `C`... in
+    order of first appearance; Caller / Receiver stays for exactly two.
+  - `SPEAKER_LABEL_GUARDRAIL` and the parties extractor prompt now treat
+    every Speaker letter as a placeholder, not only A and B.
+  - New log line per recording: `Audio: diarization mode=... native_speakers=...
+    reliable=... final_speakers=... near_silent_merged=... source=...`.
+  - **Config:** `AUDIO_MIN_SPEAKERS` default 2 -> 1, `AUDIO_MAX_SPEAKERS`
+    default 6 -> 8, new `AUDIO_MAX_SPEAKERS_RETRY` (6). Rollback without a
+    deploy: `AUDIO_MIN_SPEAKERS=2`, `AUDIO_MAX_SPEAKERS=2`.
+  - **Socket payload: shape unchanged.** The `document_assessments` audio
+    entry keeps its keys and types; only the transcript text may now carry
+    `Speaker C` to `Speaker H`. The frontend should confirm those labels render.
+  - Offline coverage: `tests/offline/verify_multi_speaker_diarization.py`.
+
+### Fixed
+
+- **SIM-192: citations point at the evidence page, not the paper-book
+  index.** A court paper-book opens with an INDEX that names every party and
+  restates every annexure's date, so "the first page that matches" landed
+  there: a party whose phone and address are on page 11 showed "Page 1".
+  - `app/rag/page_kinds.py` finds index pages in the stored text: an INDEX /
+    TABLE OF CONTENTS heading near the top of a page that lists page
+    references, plus the following pages while they stay a list of page
+    ranges and numbered rows. Across the 55 test-case PDFs only the
+    paper-book is flagged (pages 1-3).
+  - Relevant Parties cites the page holding the party's verified details
+    (phone, email, ID, address), else the first page naming it outside the
+    index; a party named only in the index gets no page.
+  - Panel citations (`app/rag/attribution.py`: List of Dates, Procedural
+    Timeline, Analysis Report, Strategy case summary, Applicable Laws) skip
+    index pages and cite one only when nothing else supports the item.
+    Documents without an index cite exactly as before.
+  - When no supporting passage is found, List of Dates and Procedural
+    Timeline used to keep the model's page or the first page with a matching
+    word (the index), and List of Dates defaulted to 1. They now ignore a
+    model page that is an index page, place the entry by `anchor_page`
+    (skipping the index) and **omit `pageNumber`** when the entry cannot be
+    placed. Payload change: a `list_of_dates` entry can now arrive without
+    `pageNumber` (it was always an integer; `procedural_timeline` already
+    omitted it). A document without page markers still gets 1. The prompt no
+    longer tells the model to default to 1. The lookup also searches the
+    date as documents write it (12.03.2024, 12/03/2024), not only the ISO
+    form, and caches index pages by a digest of the text, never the text.
+  - Paper-book summaries: the advocate's LIST OF DATES and SYNOPSIS pages
+    restate every date, so they are now cited only as a last resort, like
+    the index (`avoid_pages`). Headings split over two lines ("LIST OF" /
+    "DATES") and more index headings (LIST OF DOCUMENTS, Hindi) are read.
+    On the Test Case 5 paper-book: index 1-3, summary 7-10; 12 of the 13
+    dates they list now cite a petition or annexure page. No other page of
+    the 47 text test-case PDFs is flagged.
+  - A page the model claims for a List of Dates / Timeline entry is kept only
+    when the entry's date (as written: 12.03.2024, 12th March, 2024, ...) or
+    quote is on it (`resolve_entry_page`); otherwise the entry is placed from
+    the text, or gets no page. Page-less documents (Word without layout,
+    spreadsheets, audio, text) no longer get a guessed page 1.
+  - Word files (`extract_text_from_docx(..., mark_pages=True)`, evidence and
+    chat attachments only): pages come from Word's saved layout
+    (`w:lastRenderedPageBreak`) when it agrees exactly with the saved page
+    count, else no page. Table text, which was dropped, is now read. On 45
+    real .docx: 16 get exact pages, 29 none, 0 lose any text. Drafting and
+    template text is unchanged.
+    Content controls (cover pages, contents lists) are read; if any page
+    start is still not reached, the file gets no pages rather than shifted
+    ones.
+  - Photos and scans (JPG/PNG/...) are Page 1. Knowledge-base uploads get the
+    same Word and photo pages.
+  - Audio: a citation's `timestamp` is the quoted line's own `[MM:SS]`, not
+    the start of the passage (up to a minute earlier).
+  - Anchors: a bare year or a short title (under 12 characters) no longer
+    places an entry; month-only dates ("2024-03") are searched as written
+    ("March 2024").
+  - Chat: index passages are marked for the model, ranked after real pages in
+    retrieval, and a sentence citing only an index passage is re-pointed to
+    the passage holding its date/figure or (no figure) a same-document passage
+    sharing most of its words. An uncited date is attached to a real page
+    before the index. Quotes avoid index lines inside a mixed passage.
+  Coverage: `tests/test_index_pages.py`.
+
+- **SIM-181: a socket reconnect no longer shows the strategy panel twice in chat.**
+  After a reconnect the service replays the cached panels of every case armed
+  in the last 30 minutes, including panels the backend already had, and the
+  frontend renders a re-sent `strategy_objective` as a second Case Summary /
+  Strategic Objective / next-steps message. `_emit_document_feature` now
+  records a fingerprint of each delivered panel, and the reconnect replay
+  (`replay=True`) skips a panel whose identical payload was delivered more
+  than `REPLAY_DELIVERY_GRACE_SECONDS` (60 s) before the disconnect. Changed,
+  undelivered and just-before-the-drop panels are still replayed, and so is
+  everything after a restart. No payload change. Coverage:
+  `tests/offline/verify_reconnect_replay.py`.
+
+## [6.0.0] - 2026-11-05
+
+Also versions the changes that reached `main` after 5.1.0 without a version
+number. Release notes: `RELEASE.md`.
+
+### Added
+
 - **SIM-174: the AI reads the shared knowledge base and uses it for every
   case, in its panels and in chat.**
   The backend's three knowledge-base events had no handler, so documents
@@ -116,17 +315,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **SIM-181: a socket reconnect no longer shows the strategy panel twice in chat.**
-  After a reconnect the service replays the cached panels of every case armed
-  in the last 30 minutes, including panels the backend already had, and the
-  frontend renders a re-sent `strategy_objective` as a second Case Summary /
-  Strategic Objective / next-steps message. `_emit_document_feature` now
-  records a fingerprint of each delivered panel, and the reconnect replay
-  (`replay=True`) skips a panel whose identical payload was delivered more
-  than `REPLAY_DELIVERY_GRACE_SECONDS` (60 s) before the disconnect. Changed,
-  undelivered and just-before-the-drop panels are still replayed, and so is
-  everything after a restart. No payload change. Coverage:
-  `tests/offline/verify_reconnect_replay.py`.
+- **SIM-191: a new blank draft in the Drafting Assistant works again.** Its
+  first message, and every retry, replied "I ran into an issue while preparing
+  the draft" (`'NoneType' object has no attribute 'get'`). SIM-173 pinned the
+  template version from `session_state`, which is None for a draft never
+  saved, and a blank draft sends no `templateId`. The read is now guarded like
+  the code around it. Drafts started from a template were not affected.
+  Coverage: `tests/test_drafting_blank_draft.py`.
 
 - **Chat replies keep their bullet points and headings.** The citation checker
   splits a reply into sentences and joins them back, and a line break straight
@@ -754,7 +949,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `LOG_DIAGNOSE=true`.
   - **Regression guard:** `verify_logging.py`.
 
-
 ### Added
 
 - **Accurate retrieval with verified citations** (`app/rag/`). Socket payloads
@@ -802,7 +996,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Re-ingesting a document duplicated its chunks.**
 - **`CHAT_MIN_SCORE_THRESHOLD` was never applied.**
 - **Deleting a document or workspace now clears both collections.**
-
 
 ### Added
 

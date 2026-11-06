@@ -448,6 +448,13 @@ class ChatMixin:
             from app.statutes.register import annotate_law_rows
 
             annotate_law_rows(payload)
+        if feature_type == "relevant_parties":
+            # Every path leaves with its identity numbers masked (SIM-186):
+            # GSTIN/CIN are not masked at ingestion, and an edit can carry a
+            # full number typed by the lawyer.
+            from app.socket.handlers.party_details import mask_party_payload
+
+            mask_party_payload(payload)
         if settings.citations_enabled and feature_type in _CITED_PANELS:
             from app.rag.attribution import attach_panel_citations
 
@@ -1188,6 +1195,8 @@ class ChatMixin:
                         workspace_state["graph_facts"] = list(pack.graph_facts)
                     if pack.table_notes:
                         workspace_state["table_notes"] = list(pack.table_notes)
+                    if pack.conflict_notes:
+                        workspace_state["trust_conflicts"] = list(pack.conflict_notes)
                     if any(i.sheet for i in pack.items.values()):
                         workspace_state["has_spreadsheet_evidence"] = True
                 else:

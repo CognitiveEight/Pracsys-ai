@@ -362,6 +362,9 @@ class AnalysisReportMixin:
             # Build parts with per-document cap so ALL documents are represented (no limit on number of docs)
             # Large budget so 100+ docs each get a meaningful slice (100 docs → 1000 chars each, 200 → 500 each)
             graph_block = await self._graph_evidence_block("analysis_report", workspace_id)
+            conflicts = await self._trust_conflict_block(workspace_id, all_docs)
+            if conflicts:
+                graph_block = f"{graph_block}\n\n{conflicts}" if graph_block else conflicts
             kb_block = await self._knowledge_base_block(
                 "analysis_report", workspace_id, docs=all_docs
             )

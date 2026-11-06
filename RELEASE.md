@@ -1,3 +1,63 @@
+# Release v6.0.0 - 2026-11-05
+
+This release (`v6.0.0`) promotes `development` (3c1f36c) to `main`. It moves the Drafting Assistant to the platform-wide Global Template Library, brings the admin knowledge base into every case's panels and chat, makes every model call provider-neutral with gate0 as an optional governed gateway, lets the lawyer pick the model per case, and generates an upload's panels in parallel so the first three arrive sooner. It also ends a class of stuck panel loaders, fixes how Analysis Report rejects move the score, and hardens the purge, Stop and logging. **One breaking change for the backend:** the per-lawyer template events (`template_sync`, `template_sync_response`, `request_template_sync`) are removed in favour of the global feed, so this release must not be deployed before the backend sends `global_template_sync`. The `CHANGELOG.md` section `[6.0.0]` also versions the fixes that reached `main` after v5.1.0 without a version number (spreadsheet and slide evidence, OCR, verified citations, Stop/Resume and others).
+
+## Highlights
+
+- **Global Template Library (SIM-173).** Suggestions come only from the admins' published global templates, versioned; a draft keeps the version it started from, and a retired template is never suggested but its drafts keep working.
+- **Shared knowledge base in every case (SIM-174).** Documents admins add to the knowledge base are read, redacted and indexed in a platform-wide shelf no case query can reach. Strategy, Analysis Report and Applicable Laws get relevant shelf passages as reference material (never as case facts), and chat cites them as `[K#]`.
+- **Faster uploads (SIM-163).** Panels generate in parallel: Strategy, Analysis Report and Drafting Assistant go first, and every panel is sent the moment it is ready. List of Dates runs its per-document passes four at a time.
+- **No more endless loaders (SIM-163).** Template sync is bounded and runs outside the pipeline lock, a run's lock hold is capped, and every failed step settles its own panel from cache. An upload whose files all fail leaves the case's panels unchanged.
+- **Rejects behave as the lawyer expects (SIM-163).** Rejecting one Analysis Report item removes that item only, always raises the score by the item's weight, and the report says why (`rejectionFeedback`).
+- **Any model, one layer (SIM-29, model portability).** Gemini, OpenAI, Azure OpenAI, Azure AI Foundry, Bedrock, SageMaker or any OpenAI-compatible server, routed per task, with gate0 as an optional single gateway for keys, budgets and spend. With no `LLM_*` settings behaviour is exactly as before (Gemini).
+- **Model choice per case.** A new optional `aiModel` sets the case's model; only ids in `LLM_SELECTABLE_MODELS` are honoured.
+
+## Features Delivered
+
+- `kb_document_added`, `kb_document_deleted` and `kb_sync` handlers; the shelf lives in the evidence collection under the reserved id `__knowledge_base__`. A delete erases every copy, cancels an ingest in flight, and retries then escalates (`knowledge_base_erase_failed`) on failure. Tuning: `KNOWLEDGE_BASE_PANELS`, `KNOWLEDGE_BASE_PANEL_PASSAGES`, `KNOWLEDGE_BASE_CHAT_PASSAGES`, `KNOWLEDGE_BASE_MIN_RELEVANCE`, `KNOWLEDGE_BASE_CHAT_ENABLED`.
+- Global template events: inbound `global_template_sync` (`published` / `retired` / `deleted`) and `global_template_sync_response`, outbound `request_global_template_sync` on every connect, global `request_blueprint_proposal` profiling, and `templateScope` / `templateVersion` on `user_message_request`. Skeletons are stored at `templates/global/{id}/v{version}.docx`.
+- Provider-neutral model layer (`app/llm/`, `docs/MODEL_PORTABILITY.md`): per-task routes (`LLM_DEFAULT`, `LLM_ROUTES`, `LLM_FALLBACKS`), capability checks, one transient retry, per-model pricing, provider-neutral embeddings with one collection per embedding space (the existing Gemini space keeps its collection; nothing is re-indexed on deploy).
+- Gate0 gateway mode (`gate0:<model>`): `GATE0_ENFORCE` makes it the only path; requests carry case and request attribution; the case is billed gate0's own cost. `scripts/reconcile_gate0_spend.py` compares each case with gate0's spend logs.
+- Per-case model choice (`aiModel`), persisted per case and purged with it.
+
+## Quality and Stability Improvements
+
+- Bounded pipeline: `TEMPLATE_SYNC_TIMEOUT_SECONDS`, `TEMPLATE_SYNC_IN_LOCK_WAIT_SECONDS`, `PIPELINE_RUN_TIMEOUT_SECONDS` (extended for audio up to `PIPELINE_RUN_TIMEOUT_AUDIO_MAX_SECONDS`), a lock watchdog at `PIPELINE_LOCK_WARN_SECONDS`, and `stage <name> took Xs` timing lines.
+- `PIPELINE_CONCURRENT_PANELS=false` and `LIST_OF_DATES_CONCURRENCY=1` restore the old sequential behaviour without a redeploy.
+- Analysis no longer repeats Strategy's entity extraction (about 23 s per update).
+- A case's cost total now includes background work with no emit of its own (knowledge-graph ingestion and similar), so it matches gate0's spend for the workspace.
+- Logs no longer carry payload values, validation input values or file names; `validation_fields()` logs field paths only.
+- CI runs lint, the tests and a secret scan on every PR (SIM-23); offline coverage for workspace handler flow (SIM-25).
+
+## Bug Fixes
+
+- A new blank draft in the Drafting Assistant failed on its first message (SIM-191).
+- Rejecting every analysis item and then uploading left Missing Information, Weaknesses and Risks empty.
+- One Analysis Report reject could remove every item sharing two words with it.
+- Chat replies lost their bullet points and headings.
+- Spreadsheet figures were quoted with binary noise (`4532.849999999999`).
+- A missing workspace role defaulted to ADJUDICATOR instead of the app's PETITIONER.
+- Deleting a case did not stop its running work; the transfer re-emit and the reconnect replay escaped Stop and the purge.
+- Chat replies undelivered during a disconnect could be lost.
+- Long audio whose speakers collapsed was discarded; every audio transcription failed with `NameError` after the model refactor.
+- Every failed model call crashed its panel on Python 3.10.
+- Every case-scoped model call through gate0 was rejected (401).
+
+## Compatibility Notes
+
+- **Breaking (backend):** `template_sync` and `template_sync_response` are no longer handled and `request_template_sync` is no longer sent. **Deploy only once the backend sends the global feed and admins have published templates**; until then the Drafting Assistant has nothing to suggest. A draft started from a lawyer's own template still resolves through its `templateUrl`.
+- **Wire-visible:** a failed strategy step no longer emits `{"featureType": "strategy_objective", "error": ...}`; it emits the cached panel through the normal envelope. Backend owners to confirm nothing reads `error`.
+- **Additive payload changes:** `ai_response.citations[]` type `knowledge_base` (`documentId`, `title`, `category`, `page`, `quote`); `rejectionFeedback` on the analysis report sent after a reject; optional `aiModel` on `workspace_created`, `workspace_sync`, `workspace_version_restore` and `user_message_request`. The frontend needs to render the knowledge-base citation and the reject `reason`.
+- **Ordering:** `document_feature_response` events now arrive in completion order, and earlier. An emit's `price` is the case's spend since its previous emit, so with overlapping panels one panel's `price` can include another's calls; `totalPrice` is unchanged.
+- **Value change:** through gate0, `embedPrice`, `servicePrice` and `price` use gate0's own figures.
+- **Dependencies:** `google-generativeai`, `google-ai-generativelanguage` and `langchain-google-genai` are removed; `openai`, `azure-identity` and `aioboto3` are added. `requirements.lock.txt` needs Python 3.11+.
+- **Configuration:** no new required environment variables. Every new setting has a default; with no `LLM_*` or `GATE0_*` settings, every call goes to Gemini as before. `GATE0_METER_ENABLED` stays off until gate0's usage-record endpoint is deployed.
+- **No migration:** no Qdrant re-index, collection or schema change.
+- **Deploy check:** run `make e2e` on the release candidate (handlers, panels and ingestion changed).
+- **Rollback:** redeploy the previous `main` image (`c69da50`). The removed template events mean a rollback also needs the backend to keep sending the per-lawyer feed, or drafting suggestions stop.
+
+---
+
 # Release v5.1.0 - 2026-07-31
 
 This release (`v5.1.0`) completes the workspace bill and repairs the document manifest. Paid non-LLM Google Cloud work — Vision OCR, Speech-to-Text, Vertex AI Search, Google Search grounding and embeddings — is now metered and priced alongside LLM tokens, and the cached document inventory that every feature prompt treats as ground truth is now kept accurate in both directions: deleted evidence is reported as a gap instead of vanishing, and previously-uploaded documents are no longer flagged as missing after an incremental upload. One new inbound event, `workspace_version_restore`, is added for workspace version rollback. **One semantically breaking change for consumers:** `metadata.price` / `totalPrice` now include paid service cost, not just token cost. It also carries the workspace-ownership handover event, curated-panel-state reconciliation, a role-resolution correction that affects every downstream panel, and a batch of ingestion and drafting fixes.

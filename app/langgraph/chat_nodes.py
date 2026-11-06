@@ -371,7 +371,25 @@ recall citations that are not listed here.
             name = (p.get("name") or "N/A").strip()
             role = (p.get("role") or "Other").strip()
             desc = (p.get("details") or p.get("description") or "").strip()
-            party_lines.append(f"- {name} [{role}]: {desc}".rstrip(": "))
+            line = f"- {name} [{role}]: {desc}".rstrip(": ")
+            # Contact/identity details (SIM-186); identity numbers are masked.
+            extras = []
+            if (p.get("address") or "").strip():
+                extras.append(f"address: {p['address'].strip()}")
+            if (p.get("email") or "").strip():
+                extras.append(f"email: {p['email'].strip()}")
+            if (p.get("contactNumber") or "").strip():
+                extras.append(f"phone: {p['contactNumber'].strip()}")
+            ids = [
+                f"{i.get('label') or i.get('type')} {i.get('value')}"
+                for i in (p.get("identifiers") or [])
+                if isinstance(i, dict) and i.get("value")
+            ]
+            if ids:
+                extras.append("IDs (masked): " + ", ".join(ids))
+            if extras:
+                line += " | " + "; ".join(extras)
+            party_lines.append(line)
         parties_section = f"""
 RELEVANT PARTIES ({len(relevant_parties)} identified):
 {chr(10).join(party_lines)}
@@ -525,6 +543,17 @@ CACHED ANALYSIS REPORT (same data as the Analysis Report panel; use for question
             "\nKNOWLEDGE GRAPH FACTS (extracted from the annexures; each ends with the "
             "label of the passage it comes from — cite that label, exactly as for the "
             "passages above):\n" + "\n".join(graph_facts[:30]) + "\n"
+        )
+
+    # 5b-2b. Cross-document conflicts (app/trust): both sides, both passages.
+    trust_conflicts = workspace_state.get("trust_conflicts") or []
+    if trust_conflicts:
+        context_sections.append(
+            "\nCONFLICTS BETWEEN DOCUMENTS (machine-detected; each side ends with the "
+            "label of its passage). When the question touches one, give both versions "
+            "and cite both labels; never present either side as settled:\n"
+            + "\n".join(trust_conflicts[:15])
+            + "\n"
         )
 
     # 5b-2a. Shared knowledge base (app/rag/knowledge_base.py): the platform's

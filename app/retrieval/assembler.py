@@ -163,6 +163,8 @@ def render_graph_fact(row: Mapping[str, Any]) -> str:
         f"{key}={value}"
         for key, value in row.items()
         if key not in skip and value not in (None, "", [], {})
+        # Trusted is the default; only a contested fact needs saying so.
+        and not (key == "trust_status" and value == "trusted")
     ]
     return "; ".join(parts)
 

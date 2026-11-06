@@ -14,6 +14,53 @@ number. Release notes: `RELEASE.md`.
 
 ### Added
 
+- **SIM-195: trust pipeline and contradiction engine (`app/trust/`), behind
+  `TRUST_PIPELINE_ENABLED` (default off).** Every fact extracted from a
+  case's documents is corroborated across documents, checked against every
+  other document in the case, and routed trusted / contested / dropped.
+  - **Relevance:** each document is scored against the case's other
+    documents (leave-one-out, calibrated; an average document scores 1.0).
+    Log-only; it only discounts that document's evidence, never below 0.70.
+  - **Modality:** extraction now says whether a fact is asserted, alleged,
+    hedged or denied, and the date a status held (`as_of`). Hedged facts are
+    discarded and no longer reach the graph; denied ones are compared, never
+    stored as facts. This applies to the graph whether or not the trust
+    pipeline is on.
+  - **Corroboration:** confidence is noisy-OR over independent source groups,
+    recomputed from all evidence on every change. Two passages of one
+    document, or a passage copied into another (a petition quoting its
+    annexure, a .docx and its PDF), are one source.
+  - **Contradictions across the whole case:** different dates, amounts
+    (lakh/crore aware), statuses, opposed roles; one payment to two parties;
+    one advocate for opposed parties; a fact one document asserts and another
+    denies. A status that changed between two dated statements is a
+    succession, not a conflict. Both sides of a conflict become contested.
+    Recurring events (adjournments, instalments, notices) on two dates are
+    two events, not a conflict; a party's role differing across forums is
+    not a conflict. Amounts written "lac"/"lacs"/"Cr." and statuses such as
+    "unpaid" / "not complied" now parse correctly (also fixes the old
+    batch detector).
+  - **Routing:** trusted >= 0.85, dropped < 0.50, contested between or when in
+    an unresolved conflict (confidence x0.65). One review item per contested
+    fact; `resolve_review` records keep_a / keep_b / keep_both / dismissed /
+    confirm_trusted / confirm_dropped, which survive recomputation and new
+    documents (matched on a hashed signature; no case text is stored).
+  - **Where it shows:** the analysis report and strategy prompts get a
+    "conflicts between documents" block with both sources and pages; chat
+    brings both passages into the evidence pack so both sides are cited and
+    checked. Graph queries skip dropped facts and mark contested ones.
+  - **Graph fixes:** contradiction edges for events, amounts and obligations
+    are now written (they used a single value as the key of a composite
+    node and were always rejected); a fact another document still supports
+    is re-written after a document delete instead of disappearing with it.
+  - **Storage and deletion:** new payload-only Qdrant collection
+    `<collection>_trust_v1`. `delete_documents` erases a document's evidence
+    and every fact or conflict naming it, then rebuilds the case;
+    `delete_workspace` erases the whole slice.
+  - Ontology 1.3.0: optional `trust_status`, `trust_confidence`,
+    `source_count` on every node. No socket payload or event changes; the
+    review queue's socket events are a follow-up.
+
 - **SIM-174: the AI reads the shared knowledge base and uses it for every
   case, in its panels and in chat.**
   The backend's three knowledge-base events had no handler, so documents

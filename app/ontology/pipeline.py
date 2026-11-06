@@ -45,7 +45,7 @@ from loguru import logger
 from app.ai.usage import meter_usage
 from app.ontology.contradictions import detect_contradictions
 from app.ontology.entity_resolution import reconcile_with_existing
-from app.ontology.extraction import extract_facts
+from app.ontology.extraction import extract_facts, is_graph_fact
 
 #: Concurrent extraction calls across ALL documents being ingested — a large
 #: upload must not open hundreds of model calls at once and be rate-limited.
@@ -71,6 +71,7 @@ class IngestReport:
     edges_written: int = 0
     withdrawn: int = 0
     contradictions: int = 0
+    trust: Dict[str, Any] = field(default_factory=dict)
     errors: List[Dict[str, str]] = field(default_factory=list)
     skipped: List[str] = field(default_factory=list)
 
@@ -83,9 +84,30 @@ class IngestReport:
             "edgesWritten": self.edges_written,
             "withdrawn": self.withdrawn,
             "contradictions": self.contradictions,
+            "trust": self.trust,
             "errors": self.errors,
             "skipped": self.skipped,
         }
+
+
+def cap_chunks_per_document(
+    chunks: Sequence[Mapping[str, Any]], cap: int
+) -> tuple:
+    """At most ``cap`` chunks per document, in order; ``(kept, skipped)``.
+
+    One LLM call per chunk: an uncapped 1,000-page paper-book would hold the
+    extraction slots for an hour. The skip is counted and logged, never silent.
+    """
+    seen: Dict[str, int] = {}
+    kept, skipped = [], 0
+    for chunk in chunks:
+        doc = str(chunk.get("document_id") or "")
+        seen[doc] = seen.get(doc, 0) + 1
+        if cap and seen[doc] > cap:
+            skipped += 1
+            continue
+        kept.append(chunk)
+    return kept, skipped
 
 
 def chunks_for_extraction(stored: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
@@ -183,6 +205,17 @@ async def ingest_to_knowledge_plane(
         report.errors.append({"stage": "read_chunks", "error": str(exc)})
         logger.opt(exception=exc).warning("Ontology ingest could not read evidence chunks")
         return report
+    from app.core.config import settings
+    from app.trust import pipeline as trust
+
+    trust_on = trust.enabled()
+    # The cap is a trust-pipeline setting: with the pipeline off, ingest is
+    # exactly what it was.
+    cap = settings.trust_max_chunks_per_document if trust_on else 0
+    chunks, skipped = cap_chunks_per_document(chunks, cap)
+    if skipped:
+        report.skipped.append(f"{skipped} chunk(s) over the per-document cap were not extracted")
+        logger.warning("Ontology ingest: {} chunk(s) over the per-document cap skipped", skipped)
     report.chunks = len(chunks)
     if not report.documents:
         report.documents = len({c["document_id"] for c in chunks})
@@ -213,8 +246,16 @@ async def ingest_to_knowledge_plane(
         "rejected": extracted.rejected[:20],
     }
 
+    # Hedged and denied statements never become graph facts; the trust
+    # pipeline still sees them (a denial is a contradiction to report).
+    all_nodes, all_edges = extracted.nodes, extracted.edges
+    extracted.nodes = [n for n in all_nodes if is_graph_fact(n)]
+    extracted.edges = [e for e in all_edges if is_graph_fact(e)]
+
     if graph_store is None:
         report.skipped.append("no graph configured; extracted facts were not persisted")
+        if trust_on:
+            report.trust = await trust.run_trust_pass(workspace_id, chunks, all_nodes, all_edges)
         return report
 
     # --- replace this batch's documents ---------------------------------------
@@ -248,7 +289,23 @@ async def ingest_to_knowledge_plane(
         logger.opt(exception=exc).error("Graph write failed")
         return report
 
-    # --- contradictions --------------------------------------------------------
+    # --- trust: corroboration, contradictions, routing (whole case) ---------
+    if trust_on:
+        # Reconciled names, so the graph and the trust store agree on entities
+        # (and an edge re-projected after a delete still attaches to its node).
+        report.trust = await trust.run_trust_pass(
+            workspace_id,
+            chunks,
+            _reconciled_entries(all_nodes, nodes),
+            _reconciled_entries(all_edges, edges),
+            graph_store=graph_store,
+            rewrite_nodes=report.withdrawn > 0,
+        )
+        report.contradictions = int(report.trust.get("unresolvedConflicts") or 0)
+        _log_ingest(report)
+        return report
+
+    # --- contradictions (batch-only detector, when the trust pipeline is off) --
     try:
         detected = detect_contradictions(workspace_id, **_facts_for_contradictions(nodes))
         if detected["edges"]:
@@ -259,6 +316,11 @@ async def ingest_to_knowledge_plane(
         report.errors.append({"stage": "contradictions", "error": str(exc)})
         logger.warning("Contradiction detection failed: {}", exc)
 
+    _log_ingest(report)
+    return report
+
+
+def _log_ingest(report: IngestReport) -> None:
     logger.info(
         "Ontology ingest: {} chunk(s) -> {} node(s), {} edge(s), {} contradiction(s), "
         "{} previous fact(s) replaced, {} error(s)",
@@ -269,7 +331,16 @@ async def ingest_to_knowledge_plane(
         report.withdrawn,
         len(report.errors),
     )
-    return report
+
+
+def _reconciled_entries(
+    extracted: Sequence[Mapping[str, Any]], written: Sequence[Mapping[str, Any]]
+) -> List[Mapping[str, Any]]:
+    """``extracted`` (nodes or edges) with the graph-reconciled versions of the
+    ones written. Reconciliation renames written entries onto entities already
+    in the graph; the hedged/denied ones it never saw keep their extracted
+    names."""
+    return [*written, *(e for e in extracted if not is_graph_fact(e))]
 
 
 _PAGE_MARKER = re.compile(r"---\s*Page\s+(\d+)\s*---", re.I)
@@ -306,18 +377,23 @@ def schedule_document_ingest(workspace_id: str, document_ids: Sequence[str]) -> 
     """Queue ontology extraction for freshly stored documents.
 
     Called after a document's chunks are written. No-op unless
-    ``ONTOLOGY_INGEST_ENABLED`` and a graph is connected. Runs as a tracked
+    ``ONTOLOGY_INGEST_ENABLED`` and a graph is connected, or
+    ``TRUST_PIPELINE_ENABLED`` (which needs no graph). Runs as a tracked
     background task, so it inherits the event's log context and run scope — a
     ``workspace_stop_request`` cancels it like any other work of that run.
     """
     from app.core.config import settings
 
-    if not settings.ontology_ingest_enabled or not document_ids:
+    if not document_ids:
+        return
+    trust_on = bool(settings.trust_pipeline_enabled)
+    if not settings.ontology_ingest_enabled and not trust_on:
         return
     from app.socket.events import event_handler
 
     graph_store = getattr(event_handler, "_graph_store", None)
-    if graph_store is None:
+    # Without a graph, extraction runs only for the trust pipeline.
+    if graph_store is None and not trust_on:
         return
     try:
         event_handler._track_background_task(

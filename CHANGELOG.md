@@ -84,6 +84,37 @@ number. Release notes: `RELEASE.md`.
 
 ### Changed
 
+- **SIM-177: audio transcripts separate 1 to 8 speakers instead of forcing
+  every recording into a two-person call.**
+  - Chirp 3 is asked for 1 to `AUDIO_MAX_SPEAKERS` speakers. If it rejects
+    that range (INVALID_ARGUMENT naming speakers or diarization), it is asked
+    once more with `AUDIO_MAX_SPEAKERS_RETRY`. The rejected job is not billed;
+    a second rejection fails the recording (`transcriptStatus: failed`) rather
+    than running chunked Recognize under a refused range.
+  - Reliable native tags with 3 or more speakers are kept. The Gemini text
+    pass may only correct turns: same count, one-to-one, at most 25% of turns.
+    Two native speakers keep today's 2-speaker call pass (Caller / Receiver).
+    One native speaker, or drifting chunked tags, go through a new neutral
+    N-speaker pass (`speaker_source=gemini_multi_diarization`, internal).
+    Long recordings keep one label per person across Gemini blocks.
+  - The "more than 3 speakers -> one speaker" rule is replaced by a cap that
+    folds only near-silent false speakers (under 2% of words and at most 2
+    turns; 3+ speakers only, never below 2). Only a result above the maximum
+    collapses to one speaker (`collapsed_no_diarization`).
+  - Three or more speakers are always labelled `Speaker A`, `B`, `C`... in
+    order of first appearance; Caller / Receiver stays for exactly two.
+  - `SPEAKER_LABEL_GUARDRAIL` and the parties extractor prompt now treat
+    every Speaker letter as a placeholder, not only A and B.
+  - New log line per recording: `Audio: diarization mode=... native_speakers=...
+    reliable=... final_speakers=... near_silent_merged=... source=...`.
+  - **Config:** `AUDIO_MIN_SPEAKERS` default 2 -> 1, `AUDIO_MAX_SPEAKERS`
+    default 6 -> 8, new `AUDIO_MAX_SPEAKERS_RETRY` (6). Rollback without a
+    deploy: `AUDIO_MIN_SPEAKERS=2`, `AUDIO_MAX_SPEAKERS=2`.
+  - **Socket payload: shape unchanged.** The `document_assessments` audio
+    entry keeps its keys and types; only the transcript text may now carry
+    `Speaker C` to `Speaker H`. The frontend should confirm those labels render.
+  - Offline coverage: `tests/offline/verify_multi_speaker_diarization.py`.
+
 - **SIM-163 (Phase 1): an upload's panels are generated in parallel; Strategy,
   Analysis Report and Drafting Assistant are sent first.**
   - List of Dates, Applicable Laws, Upcoming Dates, Relevant Parties and Case

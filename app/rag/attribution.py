@@ -19,13 +19,18 @@ Two corrections fall out of this:
   absent from that document but present in another, the source is re-pointed.
 * **Guessed page numbers.** The page is replaced by the page the quote is on.
 
+A paper-book's INDEX restates every annexure's title and date, so it matches
+almost anything and, coming first, used to win ties. Index pages
+(``app/rag/page_kinds.py``) are therefore cited only when no other page
+supports the item (SIM-192).
+
 An item that matches no passage well enough simply gets no citation: a missing
 citation is honest, a wrong one is not.
 """
 
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from loguru import logger
 
@@ -37,6 +42,7 @@ from app.rag.citations import (
     sheet_location,
 )
 from app.rag.evidence import EvidencePack
+from app.rag.page_kinds import avoid_pages
 from app.rag.sparse import tokens
 
 #: Minimum share of an item's distinctive words found in a passage, when the
@@ -50,7 +56,15 @@ _cache: Dict[str, Tuple[float, int, "Attributor"]] = {}
 class Attributor:
     """Matches statements to stored evidence passages for one workspace."""
 
-    def __init__(self, chunks: List[Dict[str, Any]], annexure_of: Dict[str, int], names: Dict[str, str]):
+    def __init__(
+        self,
+        chunks: List[Dict[str, Any]],
+        annexure_of: Dict[str, int],
+        names: Dict[str, str],
+        index_pages_of: Optional[Dict[str, Set[int]]] = None,
+    ):
+        #: documentId -> its index pages, cited only as a last resort.
+        self.index_pages_of = index_pages_of or {}
         self.pack = EvidencePack()
         self.items = []
         for chunk in chunks:
@@ -59,6 +73,7 @@ class Attributor:
                 chunk, annexure=annexure_of.get(did), file_name=names.get(did) or None
             )
             if item is not None:
+                item.index_pages = tuple(sorted(self.index_pages_of.get(did, ())))
                 self.items.append(
                     (item, _normalised(item.text), set(tokens(item.text)))
                 )
@@ -78,9 +93,14 @@ class Attributor:
             return None
         figs = _figures(claim + " " + anchor)
         words = {t for t in tokens(claim) if len(t) > 3 and not t.isdigit()}
-        best: Optional[Tuple[float, Any]] = None
+        query = claim + " " + anchor
+        # Best non-index match, searching the claimed document first. An index
+        # match is kept only as the fallback, from the first pass that had one.
+        fallback: Optional[Tuple[Any, str, int]] = None
+        chosen: Optional[Tuple[Any, str, int]] = None
         for restrict in ([document_id] if document_id else []) + [None]:
-            for item, norm, toks in self.items:
+            scored: List[Tuple[float, int, Any]] = []
+            for order, (item, norm, toks) in enumerate(self.items):
                 if restrict and item.document_id != restrict:
                     continue
                 fig_hits = sum(1 for f in figs if contains_figure(norm, f))
@@ -89,22 +109,30 @@ class Attributor:
                     continue
                 if not figs and (len(words) < _MIN_WORDS or overlap < _MIN_OVERLAP):
                     continue
-                score = fig_hits * 5 + overlap * 10
-                if best is None or score > best[0]:
-                    best = (score, item)
-            if best is not None:
+                scored.append((fig_hits * 5 + overlap * 10, order, item))
+            # Highest score first; on a tie the earlier passage, as before.
+            scored.sort(key=lambda c: (-c[0], c[1]))
+            for _score, _order, item in scored:
+                quote, at = _best_quote(item, query)
+                if item.page_at(at) in self.index_pages_of.get(item.document_id, ()):
+                    if fallback is None:
+                        fallback = (item, quote, at)
+                    continue
+                chosen = (item, quote, at)
                 break
-        if best is None:
+            if chosen is not None:
+                break
+        chosen = chosen or fallback
+        if chosen is None:
             return None
-        item = best[1]
-        quote, at = _best_quote(item, claim + " " + anchor)
+        item, quote, at = chosen
         cite = {
             "type": "document",
             "documentId": item.document_id,
             "annexure": item.annexure,
             "fileName": item.file_name,
             "page": item.page_at(at),
-            "timestamp": item.time_start,
+            "timestamp": item.time_at(at),
             "quote": quote or None,
         }
         if item.sheet:
@@ -127,7 +155,10 @@ async def attributor_for(workspace_id: str) -> Optional[Attributor]:
     docs = await vector_store.get_all_documents(workspace_id)
     annexure_of = {d["document_id"]: i for i, d in enumerate(docs, 1)}
     names = {d["document_id"]: d.get("filename") or "" for d in docs}
-    attributor = Attributor(chunks, annexure_of, names)
+    index_pages_of = {
+        d["document_id"]: avoid_pages(d.get("content") or "") for d in docs
+    }
+    attributor = Attributor(chunks, annexure_of, names, index_pages_of)
     _cache[workspace_id] = (time.time(), version, attributor)
     return attributor
 

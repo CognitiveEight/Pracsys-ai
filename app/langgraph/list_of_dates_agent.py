@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, TypedDict
 from langgraph.graph import END, START, StateGraph
 from loguru import logger
 from app.rag.packing import fit_to_budget
+from app.rag.page_kinds import date_forms, resolve_entry_page
 
 from app.prompts.legal_intelligence_system import ENGLISH_ONLY_OUTPUT_DIRECTIVE
 
@@ -554,61 +555,20 @@ Legal text:
         if not isinstance(arr, list):
             arr = []
 
-        def _extract_page_markers(text: str) -> List[tuple[int, int]]:
-            markers: List[tuple[int, int]] = []
-            if not text:
-                return markers
-            for m in re.finditer(r"---\s*Page\s+(\d+)\s*---", text, flags=re.I):
-                try:
-                    markers.append((m.start(), int(m.group(1))))
-                except Exception:
-                    continue
-            for m in re.finditer(r"--\s*(\d+)\s+of\s+\d+\s*--", text, flags=re.I):
-                try:
-                    markers.append((m.start(), int(m.group(1))))
-                except Exception:
-                    continue
-            markers.sort(key=lambda x: x[0])
-            return markers
-
-        def _resolve_page_from_text(item: Dict[str, Any], text: str) -> int:
-            raw_page = item.get("pageNumber")
-            if isinstance(raw_page, int) and raw_page > 0:
-                return raw_page
-            if isinstance(raw_page, str):
-                p = raw_page.strip()
-                if p.isdigit() and int(p) > 0:
-                    return int(p)
-
-            markers = _extract_page_markers(text)
-            if not markers:
-                return 1
-
-            anchors = [
-                str(item.get("evidenceSnippet") or "").strip(),
-                str(item.get("date") or "").strip(),
-                str(item.get("title") or "").strip(),
-                str(item.get("description") or "").strip(),
-            ]
-            haystack = (text or "").lower()
-            pos = -1
-            for anchor in anchors:
-                if len(anchor) < 4:
-                    continue
-                pos = haystack.find(anchor.lower())
-                if pos >= 0:
-                    break
-
-            if pos < 0:
-                return markers[0][1] if markers and markers[0][1] > 0 else 1
-
-            page = 1
-            for marker_pos, marker_page in markers:
-                if marker_pos <= pos:
-                    page = marker_page if marker_page > 0 else page
-                else:
-                    break
-            return page if page > 0 else 1
+        def _resolve_page_from_text(item: Dict[str, Any], text: str) -> Optional[int]:
+            # The model's page only when the entry is on it and it is not the
+            # index / list of dates / synopsis; else where the entry is in the
+            # text; None when there are no pages or it cannot be placed (SIM-192).
+            return resolve_entry_page(
+                text or "",
+                item.get("pageNumber"),
+                [
+                    str(item.get("evidenceSnippet") or ""),
+                    *date_forms(str(item.get("date") or "")),
+                    str(item.get("title") or ""),
+                    str(item.get("description") or ""),
+                ],
+            )
 
         # Patterns that indicate garbage/scraped-UI content in description or evidence
         _GARBAGE_PATTERNS = re.compile(

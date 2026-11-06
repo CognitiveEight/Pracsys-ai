@@ -83,7 +83,7 @@ Each entry MUST have:
 - "title": string, 3-5 word title for the event (e.g. "FIR Registered", "Salary Deducted", "Marriage Ceremony", "Possession Delay")
 - "description": string, one concise sentence describing what happened (max 12 words, no raw text dumps)
 - "sourceDocumentIndex": integer (1-based), which document (1, 2, 3...) the event comes from
-- "pageNumber": integer (mandatory, default 1 if unclear)
+- "pageNumber": integer, the page of the nearest preceding "--- Page N ---" marker where the event itself is stated (never an INDEX / table-of-contents page); omit it if unclear
 - "isIncident": boolean (optional, default true)
 - "eventType": one of "Incident" | "Agreement" | "Payment" | "Communication" | "Other"
   (procedural event types — Court Hearing, Filing, Deadline, Meeting — belong

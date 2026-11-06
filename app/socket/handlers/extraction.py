@@ -98,10 +98,16 @@ class ExtractionMixin:
         self,
         workspace_id: str,
         combined_document_content: str,
+        with_contact_details: bool = False,
     ) -> Dict[str, Any]:
-        """Sub-extractor A: parties + designations (people and organisations)."""
-        prompt = (
-            extract_parties_subagent_prompt(combined_document_content=combined_document_content)
+        """Sub-extractor A: parties + designations (people and organisations).
+
+        ``with_contact_details`` (Relevant Parties only) also asks for each
+        party's address, emails, phones and identity numbers.
+        """
+        prompt = extract_parties_subagent_prompt(
+            combined_document_content=combined_document_content,
+            with_contact_details=with_contact_details,
         )
         # SPEAKER_LABEL_GUARDRAIL was imported here but never used, so the
         # extractors ran without it and returned diarization placeholders

@@ -26,7 +26,9 @@ in the pack is recognised as invented.
 
 import re
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from app.rag.chunker import _AUDIO_TS_RE  # the "[MM:SS]" transcript line stamp
 
 _PAGE_MARKER_RE = re.compile(r"---\s*Page\s+(\d+)\s*---", re.I)
 
@@ -57,6 +59,17 @@ class EvidenceItem:
     row_offsets: Optional[List[List[Any]]] = None
     #: Knowledge-base passages: the shelf category (judgment, statute, ...).
     category: Optional[str] = None
+    #: Pages of this passage's document that are a paper-book index, list of
+    #: dates or synopsis (app/rag/page_kinds.avoid_pages): cited only when
+    #: nothing else supports a claim.
+    index_pages: Tuple[int, ...] = ()
+
+    def is_index_only(self) -> bool:
+        """The whole passage lies on index pages."""
+        if not self.index_pages or not self.page_start:
+            return False
+        end = self.page_end or self.page_start
+        return all(p in self.index_pages for p in range(self.page_start, end + 1))
 
     def row_at(self, offset: int) -> Optional[int]:
         """Spreadsheet row of a character offset inside this passage."""
@@ -88,6 +101,18 @@ class EvidenceItem:
                 header = nxt if nxt and nxt_at not in row_starts else None
             pos += len(line) + 1
         return header
+
+    def time_at(self, offset: int) -> Optional[str]:
+        """Audio timestamp of a character offset inside this passage: the
+        last ``[MM:SS]`` line before it, else the passage's first (SIM-192).
+        A transcript passage spans a minute or more; the quote's own line is
+        where the lawyer has to listen."""
+        stamp = self.time_start
+        for m in _AUDIO_TS_RE.finditer(self.text):
+            if m.start() > offset:
+                break
+            stamp = m.group(0).strip("[]")
+        return stamp
 
     def page_at(self, offset: int) -> Optional[int]:
         """Physical page of a character offset inside this passage: the last
@@ -290,6 +315,8 @@ def location_label(item: EvidenceItem) -> str:
             if not item.page_end or item.page_end == item.page_start
             else f"pp. {item.page_start}–{item.page_end}"
         )
+    if item.is_index_only():
+        where.append("paper-book index or list of dates/synopsis: cite the passage it points to, not this one")
     if item.time_start:
         where.append(f"at {item.time_start}")
     if item.sheet:

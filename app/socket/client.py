@@ -380,6 +380,7 @@ class SocketClient:
                 # So re-emit runs after reconnect even if disconnect event was not fired
                 try:
                     event_handler._had_disconnect = True
+                    event_handler._last_disconnect_at = time.time()
                 except Exception:
                     pass
             # Do not raise: allow caller to cache payload and re-emit after reconnect

@@ -281,6 +281,13 @@ class SocketEventHandler(
         # are replayed after a reconnect (was a single slot: only the most
         # recently active case was ever replayed).
         self._pending_reemits: Dict[str, Tuple[str, float]] = {}
+        # "<workspace_id>:<featureType>" -> (payload fingerprint, delivered_at):
+        # the last panel handed to the socket, so a reconnect replay can skip
+        # what the backend already has (it rendered a second strategy message).
+        # Prefixed keys so the purge sweep reaches them.
+        self._delivered_feature_fingerprints: Dict[str, Tuple[str, float]] = {}
+        # When the socket last dropped; a delivery just before it is not trusted.
+        self._last_disconnect_at: float = 0.0
         # Per-workspace coalescing for analysis_report_feedback. Bulk-reject sends
         # N events in ~2ms; processing them sequentially under a lock is correct
         # but takes ~19s × N (Gemini scoring + explanation regeneration). We

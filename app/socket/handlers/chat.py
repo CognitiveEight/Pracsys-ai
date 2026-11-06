@@ -1152,6 +1152,8 @@ class ChatMixin:
                         workspace_state["graph_facts"] = list(pack.graph_facts)
                     if pack.table_notes:
                         workspace_state["table_notes"] = list(pack.table_notes)
+                    if pack.conflict_notes:
+                        workspace_state["trust_conflicts"] = list(pack.conflict_notes)
                     if any(i.sheet for i in pack.items.values()):
                         workspace_state["has_spreadsheet_evidence"] = True
                 else:

@@ -327,6 +327,26 @@ class Settings(BaseSettings):
     # "augment" (evidence added alongside the existing context). "replace" is
     # not enabled in this release.
     retrieval_mode: str = "augment"
+    # --- Trust pipeline (app/trust): corroboration, contradictions, routing
+    # over extracted facts. Default OFF. On, it runs the ontology extraction
+    # (one LLM call per chunk) even without a graph; it adds no model calls.
+    trust_pipeline_enabled: bool = False
+    # Confidence bands: >= trusted is served as fact, < review is dropped,
+    # between (or with an unresolved conflict) is contested.
+    trust_band_trusted: float = 0.85
+    trust_band_review: float = 0.50
+    # Confidence multiplier (1 - penalty) for a fact in an unresolved conflict.
+    trust_conflict_penalty: float = 0.35
+    # A document's relevance discounts its evidence down to this, never to 0.
+    trust_relevance_floor: float = 0.70
+    # Documents needed before relevance is calibrated; fewer score 1.0.
+    trust_relevance_min_docs: int = 10
+    # 5-word-shingle Jaccard at which two passages are one copied source.
+    trust_copy_similarity: float = 0.80
+    # Chunks extracted per document; the rest are skipped and logged.
+    trust_max_chunks_per_document: int = 500
+    # Evidence and derived trust records (no vectors). None → "<name>_trust_v1".
+    qdrant_trust_collection: Optional[str] = None
 
     @property
     def graph_enabled(self) -> bool:
@@ -356,8 +376,12 @@ class Settings(BaseSettings):
     audio_languages: str = (
         "en-IN,hi-IN"  # Comma-separated language codes (Chirp 3 diarization-supported)
     )
-    audio_min_speakers: int = 2
-    audio_max_speakers: int = 6
+    # Speaker range sent to Chirp 3 diarization (SIM-177). 1 lets a voice note
+    # stay one speaker; 8 covers meetings and hearings.
+    audio_min_speakers: int = 1
+    audio_max_speakers: int = 8
+    # Lower maximum tried once if Chirp rejects the range above.
+    audio_max_speakers_retry: int = 6
     # Chirp 3 BatchRecognize rejects files over 20 minutes. Longer recordings
     # are cut at pauses into windows of at most this many seconds (overlap
     # included), transcribed in parallel and stitched back together.

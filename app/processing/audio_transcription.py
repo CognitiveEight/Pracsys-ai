@@ -114,6 +114,12 @@ class AudioTooLongError(RuntimeError):
     """The recording exceeds ``audio_max_duration_minutes``."""
 
 
+class SpeakerRangeRejected(RuntimeError):
+    """Chirp 3 refused the requested diarization speaker range (INVALID_ARGUMENT
+    naming speakers or diarization). The caller retries once at a lower maximum
+    rather than falling back to chunked Recognize under a refused range."""
+
+
 # Set by ``_sync_transcribe`` in the worker thread's own context copy, so each
 # transcription sees only its own event. Window workers inherit it through
 # ``contextvars.copy_context``.
@@ -172,6 +178,12 @@ class TranscriptResult:
     words: list[RecognizedWord]
     timed_turns: Optional[list[dict]] = None
     speaker_source: str = "diarization"
+    # False when the tags come from chunked Recognize, whose per-chunk tags are
+    # aligned across chunks and drift; the speaker count is then not trusted.
+    native_tags_reliable: bool = True
+    # The diarization maximum Chirp accepted (audio_max_speakers, or
+    # audio_max_speakers_retry after a rejected range). None = not recorded.
+    max_speakers_used: Optional[int] = None
 
 
 @dataclass
@@ -1091,6 +1103,27 @@ def _batch_error_code(exc: BaseException) -> Optional[int]:
     return None
 
 
+def _is_speaker_range_rejection(exc: BaseException) -> bool:
+    """True when ``exc`` is Chirp refusing the diarization speaker range.
+
+    Matches INVALID_ARGUMENT only (gRPC code 3, as a per-file BatchRecognize
+    error or a raised ``InvalidArgument``) whose text names speakers or
+    diarization. Everything else, cancellation included, is not a rejection.
+    """
+    if isinstance(exc, SpeakerRangeRejected):
+        return True
+    if isinstance(exc, TranscriptionCancelled):
+        return False
+    grpc_code = getattr(exc, "grpc_status_code", None)
+    invalid_argument = _batch_error_code(exc) == 3 or (
+        getattr(grpc_code, "name", "") == "INVALID_ARGUMENT"
+    )
+    if not invalid_argument:
+        return False
+    text = str(exc).lower()
+    return "speaker" in text or "diarization" in text
+
+
 def _recognize_with_batch_chirp3_gcs(
     client,
     recognizer: str,
@@ -1129,7 +1162,10 @@ def _batch_recognize_wav(
     """One BatchRecognize job over one PCM16 WAV (at most 20 minutes).
 
     Returns None when the job fails or comes back empty; the caller decides
-    the fallback. The temp GCS object is always deleted.
+    the fallback. Raises ``SpeakerRangeRejected`` when Chirp refuses the
+    diarization speaker range, so the caller can retry at a lower maximum
+    instead of silently landing on chunked Recognize. The temp GCS object is
+    always deleted.
     """
     import time
 
@@ -1188,6 +1224,12 @@ def _batch_recognize_wav(
                 return None
             except Exception as exc:
                 last_exc = exc
+                if _is_speaker_range_rejection(exc):
+                    # Not billed (record_stt_seconds runs only after a clean
+                    # job) and the temp object is still deleted (finally).
+                    raise SpeakerRangeRejected(
+                        "BatchRecognize rejected the diarization speaker range"
+                    ) from exc
                 code = _batch_error_code(exc)
                 if code in _BATCH_RETRYABLE_CODES and attempt < _BATCH_MAX_ATTEMPTS:
                     delay = _BATCH_BACKOFF_SECONDS[attempt - 1]
@@ -1413,7 +1455,10 @@ def _recognize_long_audio_windowed(
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
-    stitched = _stitch_window_results(results, windows, min_speakers=min_speakers)
+    # At least 2, so a default minimum of 1 does not change how windows are
+    # matched: with 1, a speaker silent in the first overlap would be merged
+    # into the only known speaker one window earlier than before.
+    stitched = _stitch_window_results(results, windows, min_speakers=max(2, min_speakers))
     detected_languages: list[str] = []
     for r in results:
         for code in (r.detected_languages if r is not None else []):
@@ -1428,6 +1473,8 @@ def _recognize_long_audio_windowed(
         detected_languages=detected_languages,
         words=stitched,
         timed_turns=_build_timed_turns(stitched),
+        # A window that fell back to chunked Recognize carries False.
+        native_tags_reliable=all(r.native_tags_reliable for r in results if r is not None),
     )
 
 
@@ -1457,6 +1504,12 @@ def _recognize_chunked_with_chirp3_v2(
             try:
                 response = client.recognize(request=request)
             except Exception as exc:
+                if _is_speaker_range_rejection(exc):
+                    # Every chunk would be refused the same way; skipping them
+                    # all would return an empty recording.
+                    raise SpeakerRangeRejected(
+                        "Recognize rejected the diarization speaker range"
+                    ) from exc
                 logger.warning("Audio: Recognize failed for chunk {} ({}); skipping", chunk_idx, exc)
                 continue
             # Cost: billed per chunk of submitted audio. CHUNK_OVERLAP_SECONDS is
@@ -1493,8 +1546,11 @@ def _recognize_chunked_with_chirp3_v2(
             ),
             words=aligned_words,
             timed_turns=timed_turns,
+            native_tags_reliable=False,
         )
-    return _merge_transcript_results(chunk_results)
+    merged = _merge_transcript_results(chunk_results)
+    merged.native_tags_reliable = False
+    return merged
 
 
 def _transcribe_offline_with_diarization(
@@ -1581,27 +1637,28 @@ def _transcribe_offline_with_diarization(
         except AttributeError:
             logger.debug("Audio: DenoiserConfig unavailable in installed google-cloud-speech")
 
-    diarization_config = cloud_speech.SpeakerDiarizationConfig(
-        min_speaker_count=max(1, min_speakers),
-        max_speaker_count=max(min_speakers, max_speakers),
-    )
-    config_kwargs: dict = dict(
-        explicit_decoding_config=cloud_speech.ExplicitDecodingConfig(
-            encoding=cloud_speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=prepared_audio.sample_rate_hertz,
-            audio_channel_count=prepared_audio.channel_count,
-        ),
-        language_codes=diarization_langs,
-        model="chirp_3",
-        features=cloud_speech.RecognitionFeatures(
-            enable_automatic_punctuation=True,
-            enable_word_time_offsets=True,
-            diarization_config=diarization_config,
-        ),
-    )
-    if denoiser_cfg is not None:
-        config_kwargs["denoiser_config"] = denoiser_cfg
-    config = cloud_speech.RecognitionConfig(**config_kwargs)
+    def _config_kwargs_for(max_count: int) -> dict:
+        diarization_config = cloud_speech.SpeakerDiarizationConfig(
+            min_speaker_count=max(1, min_speakers),
+            max_speaker_count=max(min_speakers, max_count),
+        )
+        kwargs: dict = dict(
+            explicit_decoding_config=cloud_speech.ExplicitDecodingConfig(
+                encoding=cloud_speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=prepared_audio.sample_rate_hertz,
+                audio_channel_count=prepared_audio.channel_count,
+            ),
+            language_codes=diarization_langs,
+            model="chirp_3",
+            features=cloud_speech.RecognitionFeatures(
+                enable_automatic_punctuation=True,
+                enable_word_time_offsets=True,
+                diarization_config=diarization_config,
+            ),
+        )
+        if denoiser_cfg is not None:
+            kwargs["denoiser_config"] = denoiser_cfg
+        return kwargs
 
     transcript_result: Optional[TranscriptResult] = None
 
@@ -1638,30 +1695,59 @@ def _transcribe_offline_with_diarization(
             reason=reason,
         )
 
-    try:
-        transcript_result = _run(config)
-    except Unauthenticated as exc:
-        raise RuntimeError(
-            "Google auth failed (401) for Speech-to-Text V2. "
-            "Verify service-account access and Speech API permissions."
-        ) from exc
-    except ServiceUnavailable:
-        raise RuntimeError(
-            "Google Speech service returned 503. Retry later."
-        ) from None
-    except GoogleAPICallError as exc:
-        text = str(exc)
-        if "invalid argument" in text.lower() and len(diarization_langs) > 1:
-            primary = diarization_langs[0]
-            logger.warning(
-                "Audio: Chirp 3 rejected language set; retrying with primary language '{}'",
-                primary,
-            )
-            retry_kwargs = {**config_kwargs, "language_codes": [primary]}
-            retry_config = cloud_speech.RecognitionConfig(**retry_kwargs)
-            transcript_result = _run(retry_config)
-        else:
+    def _attempt(config_kwargs: dict) -> TranscriptResult:
+        try:
+            return _run(cloud_speech.RecognitionConfig(**config_kwargs))
+        except Unauthenticated as exc:
+            raise RuntimeError(
+                "Google auth failed (401) for Speech-to-Text V2. "
+                "Verify service-account access and Speech API permissions."
+            ) from exc
+        except ServiceUnavailable:
+            raise RuntimeError(
+                "Google Speech service returned 503. Retry later."
+            ) from None
+        except GoogleAPICallError as exc:
+            text = str(exc)
+            if "invalid argument" in text.lower() and len(diarization_langs) > 1:
+                primary = diarization_langs[0]
+                logger.warning(
+                    "Audio: Chirp 3 rejected language set; retrying with primary language '{}'",
+                    primary,
+                )
+                retry_kwargs = {**config_kwargs, "language_codes": [primary]}
+                return _run(cloud_speech.RecognitionConfig(**retry_kwargs))
             raise RuntimeError(f"Speech V2 Chirp 3 recognition failed: {exc}") from exc
+
+    # At most two speaker ranges: the configured one, then once at the lower
+    # retry maximum if Chirp refuses the first. SpeakerRangeRejected is not a
+    # GoogleAPICallError, so the language-set retry above never sees it.
+    retry_cap = int(getattr(settings, "audio_max_speakers_retry", 6))
+    speaker_maxima = [max_speakers]
+    retry_max = max(min_speakers, min(max_speakers, retry_cap))
+    if retry_max < max_speakers:
+        speaker_maxima.append(retry_max)
+    used_max = max_speakers
+    try:
+        for attempt_no, max_count in enumerate(speaker_maxima):
+            if attempt_no:
+                _raise_if_cancelled()
+                logger.warning(
+                    "Audio: Chirp 3 rejected speaker range max {}; retrying with max {}",
+                    speaker_maxima[attempt_no - 1], max_count,
+                )
+            try:
+                transcript_result = _attempt(_config_kwargs_for(max_count))
+            except SpeakerRangeRejected:
+                if attempt_no + 1 < len(speaker_maxima):
+                    continue
+                # Fail rather than run chunked Recognize under a range we know
+                # is refused: transcriptStatus "failed" lets the lawyer reload.
+                raise RuntimeError(
+                    f"Speech V2 Chirp 3 rejected the speaker range (max {max_count})"
+                ) from None
+            used_max = max_count
+            break
     finally:
         if prepared_audio.cleanup_path and os.path.exists(prepared_audio.cleanup_path):
             try:
@@ -1677,6 +1763,7 @@ def _transcribe_offline_with_diarization(
         rebuilt = _render_text_from_words(transcript_result.words)
         if rebuilt:
             transcript_result.raw_transcript = rebuilt
+    transcript_result.max_speakers_used = used_max
     return transcript_result
 
 
@@ -1733,6 +1820,176 @@ def _merge_consecutive_same_speaker(segments: list[SpeakerSegment]) -> list[Spea
     return merged
 
 
+# A Gemini correction of reliable native tags (3+ speakers) may move at most
+# this share of turns; more than that is a different diarization, not a fix.
+_MAX_NATIVE_CORRECTION_SHARE = 0.25
+# Near-silent false speakers (3+ speakers only): under this share of all words
+# AND at most this many turns. Conservative; tune on real recordings.
+_NEAR_SILENT_WORD_SHARE = 0.02
+_NEAR_SILENT_MAX_TURNS = 2
+
+
+def _distinct_tags(segments: list[SpeakerSegment]) -> set[int]:
+    return {int(s.speaker_tag or 0) for s in segments}
+
+
+def _merge_near_silent_speakers(
+    segments: list[SpeakerSegment],
+) -> tuple[list[SpeakerSegment], int]:
+    """Fold near-silent false speakers into their neighbours.
+
+    Runs only with 3 or more distinct speakers, and never merges below 2, so a
+    two-person call is never reduced to one. A speaker is near-silent when it
+    has under ``_NEAR_SILENT_WORD_SHARE`` of all words and at most
+    ``_NEAR_SILENT_MAX_TURNS`` turns. Each of its turns takes the speaker of
+    the previous turn (the next one for the opening turn). Returns the new
+    segments and how many speakers were merged.
+    """
+    segments = _merge_consecutive_same_speaker(segments)
+    merged = 0
+    while len(_distinct_tags(segments)) > 2:
+        words: dict[int, int] = {}
+        turns: dict[int, int] = {}
+        for seg in segments:
+            tag = int(seg.speaker_tag or 0)
+            words[tag] = words.get(tag, 0) + len((seg.text or "").split())
+            turns[tag] = turns.get(tag, 0) + 1
+        total_words = sum(words.values())
+        if total_words <= 0:
+            break
+        candidates = [
+            t for t in words
+            if words[t] / total_words < _NEAR_SILENT_WORD_SHARE
+            and turns[t] <= _NEAR_SILENT_MAX_TURNS
+        ]
+        if not candidates:
+            break
+        target = min(candidates, key=lambda t: (words[t], turns[t], t))
+        for i, seg in enumerate(segments):
+            if int(seg.speaker_tag or 0) != target:
+                continue
+            if i > 0:
+                seg.speaker_tag = segments[i - 1].speaker_tag
+            else:
+                following = next(
+                    (s for s in segments[1:] if int(s.speaker_tag or 0) != target), None
+                )
+                if following is not None:
+                    seg.speaker_tag = following.speaker_tag
+        segments = _merge_consecutive_same_speaker(segments)
+        merged += 1
+    return segments, merged
+
+
+def _correct_native_tags(
+    segments: list[SpeakerSegment], native_count: int, max_speakers: int
+) -> Optional[list[SpeakerSegment]]:
+    """Gemini correction of reliable native tags (3+ speakers).
+
+    Accepted only when Gemini returns exactly ``native_count`` speakers that
+    map one to one onto the native tags (majority vote per Gemini speaker) and
+    it changes at most ``_MAX_NATIVE_CORRECTION_SHARE`` of turns. Corrected
+    turns take the native tag their Gemini speaker maps to, so letters still
+    follow the native first-appearance order. Returns None to keep the native
+    tags as they are.
+    """
+    native = [int(s.speaker_tag or 0) for s in segments]
+    assignments = _gemini_assign_utterances(
+        [s.text for s in segments],
+        speaker_count=native_count,
+        max_speakers=max_speakers,
+    )
+    if not assignments:
+        return None
+    gemini: list[int] = []
+    prev = assignments.get(0, 1)
+    for i in range(len(segments)):
+        prev = assignments.get(i, prev)
+        gemini.append(prev)
+    if len(set(gemini)) != native_count:
+        logger.info(
+            "Audio: correction pass returned {} speakers for {} native; keeping native tags",
+            len(set(gemini)), native_count,
+        )
+        return None
+    votes: dict[int, dict[int, int]] = {}
+    for g, n in zip(gemini, native):
+        votes.setdefault(g, {})
+        votes[g][n] = votes[g].get(n, 0) + 1
+    mapping = {
+        g: max(counts, key=lambda n: (counts[n], -n)) for g, counts in votes.items()
+    }
+    if len(set(mapping.values())) != native_count:
+        logger.info("Audio: correction pass does not map one to one; keeping native tags")
+        return None
+    corrected = [mapping[g] for g in gemini]
+    changed = sum(1 for c, n in zip(corrected, native) if c != n)
+    if changed > _MAX_NATIVE_CORRECTION_SHARE * len(native):
+        logger.info(
+            "Audio: correction pass would change {} of {} turns; keeping native tags",
+            changed, len(native),
+        )
+        return None
+    logger.info("Audio: correction pass changed {} of {} turns", changed, len(native))
+    out = [
+        SpeakerSegment(
+            speaker_tag=tag, text=seg.text, start_time=seg.start_time, end_time=seg.end_time
+        )
+        for seg, tag in zip(segments, corrected)
+    ]
+    return _merge_consecutive_same_speaker(out)
+
+
+def _choose_speaker_segments(
+    segments: list[SpeakerSegment],
+    transcript_result: TranscriptResult,
+    raw_transcript: str,
+    *,
+    max_speakers: int,
+) -> tuple[list[SpeakerSegment], str, str]:
+    """Decide whose speaker tags to trust. Returns (segments, speaker_source, mode).
+
+    - reliable native tags, 3+ speakers: kept; Gemini may only correct turns
+      without changing the count (``_correct_native_tags``);
+    - reliable, 2 speakers: today's 2-speaker call pass (``gemini_diarization``);
+    - reliable, 1 speaker: N-speaker pass over 1..max; accepted only if it finds
+      2 or more speakers (``gemini_multi_diarization``);
+    - unreliable (chunked) tags: N-speaker pass over 1..max
+      (``gemini_multi_diarization``), or the 2-speaker pass when max <= 2.
+    Any Gemini failure keeps the native tags, merged.
+    """
+    source = transcript_result.speaker_source
+    reliable = transcript_result.native_tags_reliable
+    native_count = len({t for t in _distinct_tags(segments) if t > 0})
+    native_merged = _merge_consecutive_same_speaker(segments)
+    timed_turns = transcript_result.timed_turns
+
+    if reliable and native_count >= 3:
+        corrected = _correct_native_tags(native_merged, native_count, max_speakers)
+        return (corrected or native_merged), source, "correction"
+
+    if (reliable and native_count == 2) or (not reliable and max_speakers <= 2):
+        mode = "two_speaker" if reliable else "chunked_two_speaker"
+        gemini_segs = _gemini_full_diarization(raw_transcript, timed_turns=timed_turns)
+        if gemini_segs and len(_distinct_tags(gemini_segs)) >= 2:
+            return gemini_segs, "gemini_diarization", mode
+        return native_merged, source, mode
+
+    if max_speakers <= 1:
+        return native_merged, source, "single"
+
+    mode = "split_check" if reliable else "chunked"
+    gemini_segs = _gemini_full_diarization(
+        raw_transcript, timed_turns=timed_turns, max_speakers=max_speakers
+    )
+    if not gemini_segs:
+        return native_merged, source, mode
+    if reliable and len(_distinct_tags(gemini_segs)) < 2:
+        # The N-speaker pass agrees it is one voice: keep the native result.
+        return native_merged, source, mode
+    return gemini_segs, "gemini_multi_diarization", mode
+
+
 def _split_utterances(raw_transcript: str) -> list[str]:
     out: list[str] = []
     for line in (raw_transcript or "").splitlines():
@@ -1759,8 +2016,16 @@ def _gemini_full_diarization(
     raw_transcript: str,
     max_utterances: int = _GEMINI_DIARIZATION_MAX_UTTERANCES,
     timed_turns: Optional[list[dict]] = None,
+    *,
+    speaker_count: Optional[int] = None,
+    max_speakers: int = 2,
 ) -> Optional[list[SpeakerSegment]]:
-    """Content-based 2-speaker re-diarization using Gemini.
+    """Content-based re-diarization using Gemini.
+
+    The defaults run today's 2-speaker call pass (tag 1 = lawyer, 2 = caller)
+    and return None unless both speakers appear. With ``speaker_count`` (exact)
+    or ``max_speakers`` above 2 it runs the neutral N-speaker pass instead, in
+    which one speaker is a valid answer.
 
     Primary speaker-assignment path when Chirp 3 BatchRecognize is unavailable
     (the chunked Recognize fallback does not produce reliable cross-chunk
@@ -1798,15 +2063,13 @@ def _gemini_full_diarization(
         )
         return None
     utterances = [u[0] for u in utterance_items]
-    if len(utterances) <= max_utterances:
-        speaker_map = _gemini_diarization_assignments(utterances)
-    else:
-        # Long recordings used to be cut to the first max_utterances here, and
-        # every later utterance was dropped from the transcript. Assign them in
-        # overlapping blocks instead.
-        speaker_map = _gemini_diarization_assignments_blocked(
-            utterances, block_size=max_utterances
-        )
+    two_speaker = _is_two_speaker_mode(speaker_count, max_speakers)
+    speaker_map = _gemini_assign_utterances(
+        utterances,
+        max_utterances=max_utterances,
+        speaker_count=speaker_count,
+        max_speakers=max_speakers,
+    )
     if not speaker_map:
         return None
 
@@ -1827,9 +2090,42 @@ def _gemini_full_diarization(
                     speaker_tag=spk, text=utt, start_time=start_t, end_time=end_t,
                 )
             )
-    if len({s.speaker_tag for s in segments}) < 2:
+    if two_speaker and len({s.speaker_tag for s in segments}) < 2:
         return None
     return segments
+
+
+def _is_two_speaker_mode(speaker_count: Optional[int], max_speakers: int) -> bool:
+    """Today's 2-speaker call pass: no exact count asked and a maximum of 2."""
+    return speaker_count is None and max_speakers <= 2
+
+
+def _gemini_assign_utterances(
+    utterances: list[str],
+    *,
+    max_utterances: int = _GEMINI_DIARIZATION_MAX_UTTERANCES,
+    speaker_count: Optional[int] = None,
+    max_speakers: int = 2,
+) -> Optional[dict[int, int]]:
+    """Utterance index -> speaker, in one call or in overlapping blocks.
+
+    The assignment functions are looked up at call time so tests can patch them.
+    """
+    if len(utterances) > max_utterances:
+        # Long recordings used to be cut to the first max_utterances here, and
+        # every later utterance was dropped from the transcript. Assign them in
+        # overlapping blocks instead.
+        return _gemini_diarization_assignments_blocked(
+            utterances,
+            block_size=max_utterances,
+            speaker_count=speaker_count,
+            max_speakers=max_speakers,
+        )
+    if _is_two_speaker_mode(speaker_count, max_speakers):
+        return _gemini_diarization_assignments(utterances)
+    return _gemini_multi_speaker_assignments(
+        utterances, speaker_count=speaker_count, max_speakers=max_speakers
+    )
 
 
 # Utterances repeated at the start of each block so its 1/2 labels can be
@@ -1837,16 +2133,93 @@ def _gemini_full_diarization(
 _GEMINI_DIARIZATION_BLOCK_OVERLAP = 200
 
 
+def _map_block_tags(
+    prev_map: dict[int, int],
+    block: dict[int, int],
+    overlap_range: range,
+    known_count: int,
+    expected_count: Optional[int],
+    *,
+    max_speakers: Optional[int] = None,
+) -> Optional[dict[int, int]]:
+    """Map one block's local speaker numbers onto the speakers already known.
+
+    Each call numbers its speakers independently. In the overlap (global
+    indices ``overlap_range``; ``block`` is indexed from ``overlap_range.start``)
+    the pairs ``(block_tag, known_tag)`` vote, and tags are assigned greedily by
+    vote count, one to one: the same method as ``_stitch_window_results``.
+    A block tag absent from the overlap takes an unclaimed known speaker once
+    ``known_count`` has reached ``expected_count`` (exact mode), otherwise the
+    next new tag. In range mode a block that would push the total above
+    ``max_speakers`` is rejected (None). For two speakers this is the old
+    flip / no-flip decision.
+
+    The first block (nothing known yet) keeps its own numbers, so the
+    2-speaker pass keeps tag 1 = lawyer, tag 2 = caller.
+    """
+    block_tags: list[int] = []
+    for j in sorted(block):
+        if block[j] not in block_tags:
+            block_tags.append(block[j])
+    if known_count <= 0 or not prev_map:
+        mapping = {b: b for b in block_tags}
+    else:
+        votes: dict[tuple[int, int], int] = {}
+        offset = overlap_range.start
+        for j in overlap_range:
+            prev_tag, new_tag = prev_map.get(j), block.get(j - offset)
+            if prev_tag is None or new_tag is None:
+                continue
+            votes[(new_tag, prev_tag)] = votes.get((new_tag, prev_tag), 0) + 1
+        mapping = {}
+        claimed: set[int] = set()
+        # Ties go to the identity pair, then the lowest tags, so a 2-speaker
+        # tie keeps the labels as they are (the old rule flipped only on a
+        # strict majority).
+        for (new_tag, prev_tag), _ in sorted(
+            votes.items(), key=lambda kv: (-kv[1], kv[0][0] != kv[0][1], kv[0])
+        ):
+            if new_tag not in mapping and prev_tag not in claimed:
+                mapping[new_tag] = prev_tag
+                claimed.add(prev_tag)
+        known = sorted(set(prev_map.values()))
+        count = len(known)
+        next_new = max(known, default=0) + 1
+        for b in block_tags:
+            if b in mapping:
+                continue
+            unclaimed = [g for g in known if g not in claimed]
+            if expected_count is not None and count >= expected_count and unclaimed:
+                mapping[b] = unclaimed[0]
+            else:
+                mapping[b] = next_new
+                next_new += 1
+                count += 1
+            claimed.add(mapping[b])
+    total = len(set(prev_map.values()) | set(mapping.values()))
+    limit = expected_count if expected_count is not None else max_speakers
+    if limit is not None and total > limit:
+        return None
+    return mapping
+
+
 def _gemini_diarization_assignments_blocked(
-    utterances: list[str], *, block_size: int
+    utterances: list[str],
+    *,
+    block_size: int,
+    speaker_count: Optional[int] = None,
+    max_speakers: int = 2,
 ) -> Optional[dict[int, int]]:
     """Speaker assignments for more utterances than one call takes.
 
-    Returns None if any block fails: a partial map would label the rest of the
-    call with whoever spoke last, which is worse than native diarization tags.
+    Returns None if any block fails, or would raise the speaker total above the
+    limit: a partial map would label the rest of the recording with whoever
+    spoke last, which is worse than native diarization tags.
     """
     total = len(utterances)
     overlap = min(_GEMINI_DIARIZATION_BLOCK_OVERLAP, max(0, block_size // 4))
+    two_speaker = _is_two_speaker_mode(speaker_count, max_speakers)
+    expected = 2 if two_speaker else speaker_count
     speaker_map: dict[int, int] = {}
     start = 0
     block_no = 0
@@ -1855,32 +2228,42 @@ def _gemini_diarization_assignments_blocked(
         block_no += 1
         context_start = max(0, start - overlap)
         end = min(total, context_start + block_size)
-        block = _gemini_diarization_assignments(utterances[context_start:end])
+        sub = utterances[context_start:end]
+        if two_speaker:
+            block = _gemini_diarization_assignments(sub)
+        else:
+            block = _gemini_multi_speaker_assignments(
+                sub, speaker_count=speaker_count, max_speakers=max_speakers
+            )
         if not block:
             logger.warning(
                 "Audio: Gemini diarization block {} failed; keeping native speaker tags",
                 block_no,
             )
             return None
-        flip = False
-        if context_start < start:
-            agree = disagree = 0
-            for j in range(context_start, start):
-                prev_tag, new_tag = speaker_map.get(j), block.get(j - context_start)
-                if prev_tag is None or new_tag is None:
-                    continue
-                if prev_tag == new_tag:
-                    agree += 1
-                else:
-                    disagree += 1
-            flip = disagree > agree
+        tag_map = _map_block_tags(
+            speaker_map,
+            block,
+            range(context_start, start),
+            len(set(speaker_map.values())),
+            expected,
+            max_speakers=max_speakers,
+        )
+        if tag_map is None:
+            logger.warning(
+                "Audio: Gemini diarization block {} exceeds the speaker limit; "
+                "keeping native speaker tags",
+                block_no,
+            )
+            return None
         for j in range(start, end):
             tag = block.get(j - context_start)
             if tag is not None:
-                speaker_map[j] = 3 - tag if flip else tag
+                speaker_map[j] = tag_map[tag]
         start = end
     logger.info(
-        "Audio: Gemini diarization assigned {} utterances in {} blocks", total, block_no
+        "Audio: Gemini diarization assigned {} utterances in {} blocks, {} speakers",
+        total, block_no, len(set(speaker_map.values())),
     )
     return speaker_map
 
@@ -1953,6 +2336,110 @@ def _gemini_diarization_assignments(utterances: list[str]) -> Optional[dict[int,
 
     if not speaker_map:
         logger.warning("Audio: Gemini diarization parsed zero valid assignments")
+        return None
+    return speaker_map
+
+
+# Assignments are one digit per utterance, so the N-speaker pass can name at
+# most 9 speakers (the configured maximum is 8).
+_MAX_DIGIT_SPEAKERS = 9
+
+
+def _gemini_multi_speaker_assignments(
+    utterances: list[str],
+    *,
+    speaker_count: Optional[int] = None,
+    max_speakers: int = 8,
+) -> Optional[dict[int, int]]:
+    """One Gemini call: utterance index -> speaker 1..K (or 1..M), neutral roles.
+
+    ``speaker_count`` asks for exactly that many speakers (the correction pass
+    over reliable native tags); otherwise the model decides, between 1 and
+    ``max_speakers``. Speakers are numbered in order of first appearance.
+    Unlike the 2-speaker parser, a digit out of range (or any other character
+    besides whitespace and commas) rejects the whole block: stripping it would
+    shift every later utterance onto the wrong speaker.
+    """
+    if not utterances:
+        return None
+    limit = int(speaker_count) if speaker_count else int(max_speakers)
+    limit = max(1, min(limit, _MAX_DIGIT_SPEAKERS))
+    last_idx = len(utterances) - 1
+    numbered = "\n".join(f"{i}. {s}" for i, s in enumerate(utterances))
+    if speaker_count:
+        count_rule = (
+            f"There are exactly {limit} speakers. Use every number from 1 to {limit} "
+            "at least once and no other number.\n"
+        )
+    else:
+        count_rule = (
+            f"There are between 1 and {limit} speakers. Decide how many from the "
+            "content (who answers whom, changes of voice, names used in address). "
+            "Use 1 if only one person speaks. Do not invent speakers.\n"
+        )
+    prompt = (
+        "This is a transcript of a recording of a meeting, hearing or call.\n"
+        "The transcript may be in English, Hindi, or code-switched between them.\n"
+        "Decide which speaker said each numbered utterance.\n\n"
+        + count_rule
+        + "Number the speakers 1, 2, 3... in the order they first speak: utterance 0 "
+        "is always speaker 1, and the next new voice is speaker 2.\n\n"
+        "CRITICAL — Quoted speech: when one speaker quotes another (\"He said:\n"
+        "...\"), the whole sentence is still that speaker. Do not switch the\n"
+        "speaker inside a quote.\n\n"
+        f"Assign EVERY numbered utterance from 0 to {last_idx}.\n\n"
+        "Output format — ONLY this JSON, no commentary:\n"
+        f'{{"assignments":"<string of exactly {len(utterances)} digits, each from 1 to '
+        f'{limit}, indexed by utterance order>"}}\n'
+        'Example for 5 utterances by 3 speakers: {"assignments":"12131"}\n\n'
+        "Utterances:\n" + numbered
+    )
+
+    logger.info(
+        "Audio: Gemini N-speaker diarization running on {} utterances (mode={} limit={})",
+        len(utterances), "exact" if speaker_count else "range", limit,
+    )
+    data = _generate_gemini_json(prompt, max_output_tokens=_GEMINI_MAX_OUTPUT_TOKENS)
+    if not data:
+        logger.warning("Audio: Gemini N-speaker diarization failed (empty/invalid response)")
+        return None
+    assignments_raw = data.get("assignments")
+    allowed = {str(d) for d in range(1, limit + 1)}
+    speaker_map: dict[int, int] = {}
+    if isinstance(assignments_raw, str):
+        compact = re.sub(r"[\s,]", "", assignments_raw)
+        if not compact:
+            logger.warning("Audio: Gemini N-speaker diarization returned empty digit string")
+            return None
+        bad = sum(1 for ch in compact if ch not in allowed)
+        if bad:
+            logger.warning(
+                "Audio: Gemini N-speaker diarization returned {} invalid characters "
+                "(limit {}, {}); rejecting the block",
+                bad, limit, chars(compact),
+            )
+            return None
+        for i, ch in enumerate(compact[: last_idx + 1]):
+            speaker_map[i] = int(ch)
+    elif isinstance(assignments_raw, list):
+        for item in assignments_raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                idx = int(item.get("i", item.get("index", -1)))
+                spk = int(item.get("s", item.get("speaker", 0)))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx <= last_idx and 1 <= spk <= limit:
+                speaker_map[idx] = spk
+    else:
+        logger.warning(
+            "Audio: Gemini N-speaker diarization returned unexpected assignments type: {}",
+            type(assignments_raw).__name__,
+        )
+        return None
+    if not speaker_map:
+        logger.warning("Audio: Gemini N-speaker diarization parsed zero valid assignments")
         return None
     return speaker_map
 
@@ -2189,8 +2676,11 @@ def _build_role_label_map(
 
     Falls back to ``Speaker A/B`` when role inference is missing OR ambiguous
     (e.g. the model assigned the same role to multiple speakers — a low-confidence
-    signal that's safer not to render).
+    signal that's safer not to render). Three or more speakers are always
+    neutral (``Speaker A``, ``B``, ``C``...), whatever roles the segments carry.
     """
+    if len(letter_map) > 2:
+        return {tag: f"Speaker {letter}" for tag, letter in letter_map.items()}
     role_by_tag: dict[int, str] = {}
     for seg in segments:
         tag = int(seg.speaker_tag or 0)
@@ -3037,8 +3527,9 @@ def transliterate_formatted_transcript_to_hinglish(formatted: str) -> str:
 def _format_transcript_with_speakers(segments: list[SpeakerSegment]) -> str:
     """Produce ``[MM:SS] <label>: text`` lines for the document_assessments transcript.
 
-    ``<label>`` is ``Caller`` / ``Receiver`` when role inference succeeded, and
-    falls back to ``Speaker A`` / ``Speaker B`` otherwise.
+    ``<label>`` is ``Caller`` / ``Receiver`` for a two-person call whose roles
+    were inferred, and ``Speaker A``, ``Speaker B``, ``Speaker C``... otherwise
+    (always for three or more speakers).
     """
     if not segments:
         return ""
@@ -3128,40 +3619,28 @@ def _sync_transcribe(
         transcript_result.speaker_source, len(segments), initial_speaker_count,
     )
 
-    # Content-based re-diarization with Gemini. Always preferred when available —
-    # the chunked-Recognize fallback path produces unreliable cross-chunk speaker
-    # tags (each chunk's local "1"/"2" can drift into fresh global tags), so for
-    # any call that didn't come from BatchRecognize we strongly want Gemini to
-    # collapse the output back to 2 speakers. ``timed_turns`` carries the original
-    # word timestamps so the re-diarized segments don't all collapse to [00:00].
+    max_used = int(transcript_result.max_speakers_used or max_speakers)
+    reliable = transcript_result.native_tags_reliable
+    mode = "native"
+    # Choose whose speaker tags to trust (native vs a Gemini text pass).
+    # ``timed_turns`` carries the word timestamps so re-diarized segments keep
+    # their times instead of all collapsing to [00:00].
     if enable_role_inference:
-        gemini_segs = _gemini_full_diarization(
-            raw_transcript, timed_turns=transcript_result.timed_turns
+        segments, transcript_result.speaker_source, mode = _choose_speaker_segments(
+            segments, transcript_result, raw_transcript, max_speakers=max_used
         )
-        if gemini_segs and len({s.speaker_tag for s in gemini_segs}) >= 2:
-            segments = gemini_segs
-            transcript_result.speaker_source = "gemini_diarization"
-            logger.info(
-                "Audio: Gemini diarization succeeded — {} segments, {} speakers",
-                len(segments), len({s.speaker_tag for s in segments}),
-            )
-        else:
-            segments = _merge_consecutive_same_speaker(segments)
     else:
         segments = _merge_consecutive_same_speaker(segments)
 
-    # Safety net: a 2-party phone call should never end up with more than 2-3
-    # distinct speakers in the final output. If we still have many speakers at
-    # this point, the chunked-Recognize alignment failed AND Gemini diarization
-    # didn't rescue it. Better to render a single "Speaker" rather than emit a
-    # transcript with a dozen+ fake speaker labels.
-    final_speakers = {s.speaker_tag for s in segments}
-    if len(final_speakers) > 3:
+    # Near-silent cap: fold speakers with almost no words into a neighbour
+    # (3+ speakers only, never below 2). Only a result still above the
+    # configured maximum collapses to one speaker; that can happen only on the
+    # unreliable chunked path or after a stitch that minted extra speakers.
+    segments, near_silent_merged = _merge_near_silent_speakers(segments)
+    if len(_distinct_tags(segments)) > max_used:
         logger.warning(
-            "Audio: detected {} distinct speakers in final output ({}); "
-            "collapsing to single speaker (chunked-recognize alignment failed and "
-            "Gemini diarization did not produce 2 speakers)",
-            len(final_speakers), sorted(final_speakers),
+            "Audio: {} distinct speakers exceed the maximum {}; collapsing to one speaker",
+            len(_distinct_tags(segments)), max_used,
         )
         for seg in segments:
             seg.speaker_tag = 1
@@ -3169,16 +3648,25 @@ def _sync_transcribe(
         segments = _merge_consecutive_same_speaker(segments)
         transcript_result.speaker_source = "collapsed_no_diarization"
 
+    final_count = len({t for t in _distinct_tags(segments) if t > 0})
+    logger.info(
+        "Audio: diarization mode={} native_speakers={} reliable={} final_speakers={} "
+        "near_silent_merged={} source={}",
+        mode, initial_speaker_count, reliable, final_count, near_silent_merged,
+        transcript_result.speaker_source,
+    )
+
     role_inference: Optional[RoleInference] = None
-    if enable_role_inference and segments:
-        # When the speaker tags came from `_gemini_full_diarization`, the
-        # diarization PROMPT itself has already pinned roles per tag:
+    if final_count >= 3:
+        # Three or more speakers always get neutral Speaker A, B, C... labels.
+        for seg in segments:
+            seg.inferred_role = None
+    elif enable_role_inference and segments and final_count == 2:
+        # When the speaker tags came from the 2-speaker `_gemini_full_diarization`
+        # pass, its PROMPT has already pinned roles per tag:
         #   tag 1 = Lawyer, tag 2 = Caller (= victim_party).
-        # So we can derive `inferred_role` directly from the tag — no second
-        # Gemini call needed (and no second Gemini failure mode). This removes
-        # the most common cause of "Speaker A / Speaker B" labels: a transient
-        # role-inference Gemini hiccup wiping out roles on a perfectly-diarized
-        # call.
+        # So we derive `inferred_role` directly from the tag — no second
+        # Gemini call needed (and no second Gemini failure mode).
         if transcript_result.speaker_source == "gemini_diarization":
             implicit_role_by_tag = {1: "lawyer", 2: "victim_party"}
             for seg in segments:
@@ -3189,9 +3677,9 @@ def _sync_transcribe(
                 "Audio: roles derived from gemini_diarization tags "
                 "(tag 1=lawyer, tag 2=caller) — skipping role-inference Gemini call"
             )
-        elif len({s.speaker_tag for s in segments if int(s.speaker_tag or 0) > 0}) >= 2:
-            # BatchRecognize / native diarization gave reliable tags but no role
-            # meaning. Run the second Gemini call to assign roles.
+        else:
+            # Native tags or the neutral N-speaker pass: reliable tags but no
+            # role meaning. Run the role-inference call, heuristic on failure.
             role_inference = _infer_speaker_roles_with_gemini(segments)
             if role_inference:
                 for seg in segments:
@@ -3199,9 +3687,6 @@ def _sync_transcribe(
                     if inferred and inferred != "unknown":
                         seg.inferred_role = inferred
             else:
-                # Gemini-based role inference failed AND retries inside the
-                # function exhausted. Fall back to a content heuristic so we
-                # don't render bare Speaker A / B for a clearly 2-party call.
                 heuristic_roles = _heuristic_speaker_roles(segments)
                 if heuristic_roles:
                     for seg in segments:
@@ -3212,13 +3697,12 @@ def _sync_transcribe(
                         "Audio: applied heuristic role inference {}",
                         heuristic_roles,
                     )
-        else:
-            # Single-speaker source (no_diarization / collapsed_no_diarization).
-            # Role labels would be misleading for a single tag — skip.
-            logger.debug(
-                "Audio: single-speaker source ({}); skipping role inference",
-                transcript_result.speaker_source,
-            )
+    else:
+        # One speaker: role labels would be misleading for a single tag.
+        logger.debug(
+            "Audio: single-speaker source ({}); skipping role inference",
+            transcript_result.speaker_source,
+        )
 
     # Devanagari → Hinglish: convert Hindi script to Roman so the transcript
     # is readable for users not literate in Devanagari. English / code-switched
@@ -3294,8 +3778,8 @@ async def transcribe_audio(
     ``transcript_status: "failed"`` when False.
     """
     langs = languages or _settings_languages() or DEFAULT_LANGUAGE_CODES
-    min_s = int(min_speakers if min_speakers is not None else getattr(settings, "audio_min_speakers", 2))
-    max_s = int(max_speakers if max_speakers is not None else getattr(settings, "audio_max_speakers", 6))
+    min_s = int(min_speakers if min_speakers is not None else getattr(settings, "audio_min_speakers", 1))
+    max_s = int(max_speakers if max_speakers is not None else getattr(settings, "audio_max_speakers", 8))
     region = (
         chirp_region
         or getattr(settings, "chirp_region", None)

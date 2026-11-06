@@ -170,6 +170,11 @@ async def build_chat_evidence(
         except Exception as graph_err:  # the graph improves chat; it never gates it
             logger.warning("Graph facts skipped for this turn: {}", graph_err)
 
+    try:
+        await _add_trust_conflicts(pack, by_doc, chunks, workspace_id, annexure_of, names)
+    except Exception as trust_err:  # conflicts inform chat; they never gate it
+        logger.warning("Trust conflicts skipped for this turn: {}", type(trust_err).__name__)
+
     uploaded: List[Dict[str, Any]] = []
     for did, items in by_doc.items():
         entry: Dict[str, Any] = {
@@ -182,12 +187,14 @@ async def build_chat_evidence(
         uploaded.append(entry)
     uploaded.sort(key=lambda e: e.get("annexure_number") or 10**6)
     logger.info(
-        "Chat evidence: mode={} documents={} passages={} graph_facts={} table_notes={}",
+        "Chat evidence: mode={} documents={} passages={} graph_facts={} table_notes={} "
+        "conflicts={}",
         mode,
         len(uploaded),
         len(pack.items),
         len(pack.graph_facts),
         len(pack.table_notes),
+        len(pack.conflict_notes),
     )
     return pack, mode, uploaded
 
@@ -236,6 +243,57 @@ async def _add_table_calculations(
 
 #: Graph facts added to one chat turn, at most.
 _MAX_GRAPH_FACTS = 30
+
+
+#: Conflicts one chat turn may carry (each brings up to two passages).
+_MAX_CONFLICTS = 8
+
+
+async def _add_trust_conflicts(
+    pack: EvidencePack,
+    by_doc: Dict[str, List[Any]],
+    chunks: List[Dict[str, Any]],
+    workspace_id: str,
+    annexure_of: Dict[str, int],
+    names: Dict[str, str],
+) -> None:
+    """Add the case's unresolved cross-document conflicts (app/trust).
+
+    Each side's passage is brought into the pack when it is not there yet, so
+    the model cites a real ``[E#]`` and the citation checker verifies the quote
+    — a conflict is never stated on the strength of the trust store alone.
+    A side whose passage is no longer stored is left out, and a conflict with
+    no side left is not shown.
+    """
+    from app.trust.pipeline import render_conflict, unresolved_conflicts
+
+    conflicts = await unresolved_conflicts(workspace_id)
+    if not conflicts:
+        return
+    label_of_chunk = {item.chunk_id: label for label, item in pack.items.items()}
+    chunk_by_id = {c.get("document_id"): c for c in chunks}
+
+    def label_for(chunk_id: Any) -> Optional[str]:
+        label = label_of_chunk.get(chunk_id)
+        if label is None and chunk_id in chunk_by_id:
+            did = str(chunk_by_id[chunk_id].get("original_document_id") or "")
+            item = pack.add_passage(
+                chunk_by_id[chunk_id], annexure=annexure_of.get(did), file_name=names.get(did)
+            )
+            if item is not None:
+                by_doc.setdefault(did, []).append(item)
+                label_of_chunk[chunk_id] = label = item.label
+        return label
+
+    for conflict in conflicts[:_MAX_CONFLICTS]:
+        labels = []
+        for side in conflict.get("sides") or ():
+            source = next(iter(side.get("sources") or ()), {})
+            labels.append(label_for(source.get("chunk_id")))
+        if not any(labels):
+            continue
+        cited = " ".join(f"[{label}]" for label in labels if label)
+        pack.conflict_notes.append(f"{render_conflict(conflict, names)} {cited}")
 
 
 async def _add_graph_facts(

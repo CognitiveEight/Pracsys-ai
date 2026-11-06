@@ -111,7 +111,7 @@ class ExtractionMixin:
         )
         # SPEAKER_LABEL_GUARDRAIL was imported here but never used, so the
         # extractors ran without it and returned diarization placeholders
-        # ("Caller", "Receiver") as real entities — which the EXTRACTED
+        # ("Caller", "Receiver", "Speaker A".."H") as real entities — which the EXTRACTED
         # FACTS block then authorised for every downstream prompt.
         prompt = prompt + "\n\n" + SPEAKER_LABEL_GUARDRAIL
         return await self._run_extraction_subagent(
@@ -129,7 +129,7 @@ class ExtractionMixin:
         )
         # SPEAKER_LABEL_GUARDRAIL was imported here but never used, so the
         # extractors ran without it and returned diarization placeholders
-        # ("Caller", "Receiver") as real entities — which the EXTRACTED
+        # ("Caller", "Receiver", "Speaker A".."H") as real entities — which the EXTRACTED
         # FACTS block then authorised for every downstream prompt.
         prompt = prompt + "\n\n" + SPEAKER_LABEL_GUARDRAIL
         return await self._run_extraction_subagent(
@@ -147,7 +147,7 @@ class ExtractionMixin:
         )
         # SPEAKER_LABEL_GUARDRAIL was imported here but never used, so the
         # extractors ran without it and returned diarization placeholders
-        # ("Caller", "Receiver") as real entities — which the EXTRACTED
+        # ("Caller", "Receiver", "Speaker A".."H") as real entities — which the EXTRACTED
         # FACTS block then authorised for every downstream prompt.
         prompt = prompt + "\n\n" + SPEAKER_LABEL_GUARDRAIL
         return await self._run_extraction_subagent(

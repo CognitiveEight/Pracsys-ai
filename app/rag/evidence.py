@@ -134,6 +134,9 @@ class EvidencePack:
     #: Prompt notes from spreadsheet calculations: each result line with its
     #: [T#] label, or a statement that a calculation could not be made.
     table_notes: List[str] = field(default_factory=list)
+    #: Cross-document conflicts (app/trust), each side ending in the [E#]
+    #: label of its passage, so the citation checker verifies both.
+    conflict_notes: List[str] = field(default_factory=list)
     _counters: Dict[str, int] = field(
         default_factory=lambda: {"E": 0, "C": 0, "S": 0, "T": 0, "K": 0}
     )

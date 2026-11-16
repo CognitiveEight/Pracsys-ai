@@ -25,17 +25,22 @@ falls back to plain ``\\n\\n``-split paragraphs.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from io import BytesIO
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from loguru import logger
 
 from docx import Document
 from docx.document import Document as _DocxDocument
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Inches, Pt
+from docx.shared import Emu, Inches, Pt, RGBColor
+
+from app.processing.draft_markdown import PLACEHOLDER_RE, is_placeholder
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +53,9 @@ class Run:
     text: str
     bold: bool = False
     italic: bool = False
+    # A Word line break (Markdown hard break, or a soft break inside a block
+    # of short lines such as a signature block). ``text`` is empty.
+    br: bool = False
 
 
 @dataclass
@@ -72,6 +80,12 @@ class Paragraph:
 @dataclass
 class ListItem:
     runs: List[Run] = field(default_factory=list)
+    # Nested lists under this item (``BulletList`` / ``OrderedList``).
+    children: List["Block"] = field(default_factory=list)
+
+    @property
+    def text(self) -> str:
+        return "".join(r.text for r in self.runs)
 
 
 @dataclass
@@ -82,11 +96,16 @@ class BulletList:
 @dataclass
 class OrderedList:
     items: List[ListItem] = field(default_factory=list)
+    start: int = 1
+    delimiter: str = "."
 
 
 @dataclass
 class Table:
     rows: List[List[List[Run]]] = field(default_factory=list)  # rows[r][c] = runs
+    # Per-column alignment from the separator row: "left" | "center" | "right".
+    aligns: List[Optional[str]] = field(default_factory=list)
+    has_header: bool = True
 
 
 Block = object  # union: Heading | Paragraph | BulletList | OrderedList | Table
@@ -95,6 +114,26 @@ Block = object  # union: Heading | Paragraph | BulletList | OrderedList | Table
 # ---------------------------------------------------------------------------
 # Markdown parser (markdown-it-py)
 # ---------------------------------------------------------------------------
+
+
+_UNDERSCORE_LINE_RE = re.compile(r"^(\s{0,3})(_{3,})(\s*)$")
+
+
+def _escape_inline_signature_lines(md: str) -> str:
+    """Keep a "_____" signature line inside its signature block.
+
+    CommonMark reads a line of underscores as a thematic break, which cut a
+    signature block into three paragraphs (name / line / witness) that could
+    land on different pages. When the line sits directly after a text line,
+    its underscores are escaped so it stays a line of that paragraph.
+    Rendering only; the stored draft is unchanged.
+    """
+    lines = md.split("\n")
+    for i, line in enumerate(lines):
+        m = _UNDERSCORE_LINE_RE.match(line)
+        if m and i > 0 and lines[i - 1].strip():
+            lines[i] = m.group(1) + "\\_" * len(m.group(2)) + m.group(3)
+    return "\n".join(lines)
 
 
 def parse_markdown_blocks(md: str) -> List[Block]:
@@ -106,10 +145,13 @@ def parse_markdown_blocks(md: str) -> List[Block]:
     md = (md or "").strip()
     if not md:
         return []
+    md = _escape_inline_signature_lines(md)
     try:
         from markdown_it import MarkdownIt
 
-        parser = MarkdownIt("commonmark", {"breaks": False, "html": False})
+        # The commonmark preset ships with GFM tables switched OFF; without
+        # this every pipe table in a draft was rendered as lines of text.
+        parser = MarkdownIt("commonmark", {"breaks": False, "html": False}).enable("table")
         tokens = parser.parse(md)
         return list(_tokens_to_blocks(tokens))
     except Exception as exc:
@@ -118,12 +160,31 @@ def parse_markdown_blocks(md: str) -> List[Block]:
                 for chunk in md.split("\n\n") if chunk.strip()]
 
 
+# A soft break becomes a Word line break when every line of the block is
+# short: signature blocks, addresses and "Name: / Address:" stacks are written
+# one item per line, and joining them into one line ruins them. Prose lines
+# are long, so a wrapped prose paragraph still joins with spaces.
+_SHORT_LINE_CHARS = 100
+_BR_TAG_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+
+
+def _short_line_block(children) -> bool:
+    lines: List[str] = [""]
+    for ch in children:
+        if ch.type in ("softbreak", "hardbreak"):
+            lines.append("")
+        else:
+            lines[-1] += getattr(ch, "content", "") or ""
+    return len(lines) > 1 and all(len(s.strip()) < _SHORT_LINE_CHARS for s in lines)
+
+
 def _inline_runs(token) -> List[Run]:
     """Walk an inline token's children → list[Run]."""
     runs: List[Run] = []
     bold_depth = 0
     italic_depth = 0
     children = token.children or []
+    soft_as_break = _short_line_block(children)
     for ch in children:
         t = ch.type
         if t == "strong_open":
@@ -135,16 +196,24 @@ def _inline_runs(token) -> List[Run]:
         elif t == "em_close":
             italic_depth = max(0, italic_depth - 1)
         elif t == "text":
-            if ch.content:
-                runs.append(Run(text=ch.content,
-                                bold=bold_depth > 0,
-                                italic=italic_depth > 0))
+            # "<br>" is how a model puts a line break inside a table cell
+            # (an address in an addressee block). HTML is off in the parser,
+            # so it arrives as text; turn it into a real line break.
+            for k, piece in enumerate(_BR_TAG_RE.split(ch.content or "")):
+                if k:
+                    runs.append(Run(text="", br=True))
+                if piece:
+                    runs.append(Run(text=piece,
+                                    bold=bold_depth > 0,
+                                    italic=italic_depth > 0))
         elif t == "code_inline":
             if ch.content:
                 runs.append(Run(text=ch.content,
                                 bold=bold_depth > 0,
                                 italic=italic_depth > 0))
-        elif t == "softbreak" or t == "hardbreak":
+        elif t == "hardbreak" or (t == "softbreak" and soft_as_break):
+            runs.append(Run(text="", br=True))
+        elif t == "softbreak":
             runs.append(Run(text=" ",
                             bold=bold_depth > 0,
                             italic=italic_depth > 0))
@@ -176,43 +245,39 @@ def _tokens_to_blocks(tokens) -> Iterable[Block]:
             i += 3
             continue
         if t in ("bullet_list_open", "ordered_list_open"):
-            ordered = t == "ordered_list_open"
-            items: List[ListItem] = []
-            i += 1
-            while i < n and tokens[i].type not in ("bullet_list_close",
-                                                    "ordered_list_close"):
-                if tokens[i].type == "list_item_open":
-                    # find inline inside the item
-                    j = i + 1
-                    item_runs: List[Run] = []
-                    while j < n and tokens[j].type != "list_item_close":
-                        if tokens[j].type == "inline":
-                            item_runs.extend(_inline_runs(tokens[j]))
-                        j += 1
-                    items.append(ListItem(runs=item_runs or [Run(text="")]))
-                    i = j + 1
-                else:
-                    i += 1
-            yield (OrderedList(items=items) if ordered else BulletList(items=items))
-            i += 1  # skip *_list_close
+            block, i = _parse_list(tokens, i)
+            yield block
             continue
         if t == "table_open":
             rows: List[List[List[Run]]] = []
+            aligns: List[Optional[str]] = []
             current_row: List[List[Run]] = []
+            has_header = False
             i += 1
             while i < n and tokens[i].type != "table_close":
                 tt = tokens[i].type
-                if tt == "tr_open":
+                if tt == "thead_open":
+                    has_header = True
+                elif tt == "tr_open":
                     current_row = []
                 elif tt in ("th_open", "td_open"):
                     inline = tokens[i + 1] if i + 1 < n else None
                     cell_runs = (_inline_runs(inline)
                                  if inline and inline.type == "inline" else [])
                     current_row.append(cell_runs)
+                    if tt == "th_open":
+                        aligns.append(_cell_alignment(tokens[i]))
                 elif tt == "tr_close":
                     rows.append(current_row)
                 i += 1
-            yield Table(rows=rows)
+            # GFM always has a header row. An all-empty one ("|  |  |") means
+            # the table has none — an addressee block, a party grid — so drop
+            # it rather than print a grey, empty first row.
+            if rows and has_header and not any(
+                    "".join(r.text for r in cell).strip() for cell in rows[0]):
+                rows = rows[1:]
+                has_header = False
+            yield Table(rows=rows, aligns=aligns, has_header=has_header)
             i += 1  # skip table_close
             continue
         if t == "fence" or t == "code_block":
@@ -220,11 +285,65 @@ def _tokens_to_blocks(tokens) -> Iterable[Block]:
             i += 1
             continue
         if t == "hr":
-            yield Paragraph(runs=[Run(text="—" * 20)])
+            # "_____" on its own line is a signature line, which CommonMark
+            # also reads as a thematic break; keep it as written. "---" and
+            # "***" rules are dropped: headings already separate the parts of
+            # a draft, and a row of dashes is never wanted in a legal document.
+            if (tok.markup or "").startswith("_"):
+                yield Paragraph(runs=[Run(text="_" * max(len(tok.markup or ""), 30))])
             i += 1
             continue
         # Unknown — skip
         i += 1
+
+
+def _cell_alignment(token) -> Optional[str]:
+    style = token.attrGet("style") or ""
+    m = re.search(r"text-align:\s*(left|center|right)", style)
+    return m.group(1) if m else None
+
+
+def _parse_list(tokens, i: int) -> Tuple[Block, int]:
+    """Parse a (possibly nested) list starting at ``tokens[i]``.
+
+    Returns the block and the index just past its ``*_list_close``.
+    """
+    open_tok = tokens[i]
+    ordered = open_tok.type == "ordered_list_open"
+    close_type = "ordered_list_close" if ordered else "bullet_list_close"
+    items: List[ListItem] = []
+    n = len(tokens)
+    i += 1
+    while i < n and tokens[i].type != close_type:
+        if tokens[i].type != "list_item_open":
+            i += 1
+            continue
+        item = ListItem()
+        i += 1
+        while i < n and tokens[i].type != "list_item_close":
+            tt = tokens[i].type
+            if tt in ("bullet_list_open", "ordered_list_open"):
+                child, i = _parse_list(tokens, i)
+                item.children.append(child)
+                continue
+            if tt == "inline":
+                if item.runs:
+                    item.runs.append(Run(text="", br=True))
+                item.runs.extend(_inline_runs(tokens[i]))
+            i += 1
+        if not item.runs:
+            item.runs = [Run(text="")]
+        items.append(item)
+        i += 1  # skip list_item_close
+    i += 1  # skip *_list_close
+    if ordered:
+        try:
+            start = int(open_tok.attrGet("start") or 1)
+        except (TypeError, ValueError):
+            start = 1
+        delimiter = ")" if (open_tok.markup or ".") == ")" else "."
+        return OrderedList(items=items, start=start, delimiter=delimiter), i
+    return BulletList(items=items), i
 
 
 # ---------------------------------------------------------------------------
@@ -424,26 +543,241 @@ def _apply_run_style(docx_run, style: Optional[RunStyle]) -> None:
 
 
 def _add_runs(paragraph, runs: List[Run], inherit: Optional[RunStyle] = None) -> None:
+    """Append ``runs`` to ``paragraph``.
+
+    Every ``<Label>`` fill-in becomes its own yellow-highlighted run so the
+    lawyer can find each one at a glance; hard breaks become Word line breaks.
+    """
     for r in runs:
+        if r.br:
+            paragraph.add_run().add_break()
+            continue
         if not r.text:
             continue
-        dr = paragraph.add_run(r.text)
-        # Template-inherited font first; markdown emphasis overlays it.
-        _apply_run_style(dr, inherit)
-        if r.bold:
-            dr.bold = True
-        if r.italic:
-            dr.italic = True
+        pos = 0
+        for m in PLACEHOLDER_RE.finditer(r.text):
+            if not is_placeholder(m.group(1)):
+                continue
+            if m.start() > pos:
+                _add_one_run(paragraph, r.text[pos:m.start()], r, inherit)
+            _add_one_run(paragraph, m.group(0), r, inherit, highlight=True)
+            pos = m.end()
+        if pos < len(r.text):
+            _add_one_run(paragraph, r.text[pos:], r, inherit)
 
 
-def _safe_set_style(paragraph, style_name: Optional[str]) -> None:
+def _add_one_run(paragraph, text: str, r: Run, inherit: Optional[RunStyle],
+                 *, highlight: bool = False) -> None:
+    dr = paragraph.add_run(text)
+    # Template-inherited font first; markdown emphasis overlays it.
+    _apply_run_style(dr, inherit)
+    if r.bold:
+        dr.bold = True
+    if r.italic:
+        dr.italic = True
+    if highlight:
+        dr.font.highlight_color = WD_COLOR_INDEX.YELLOW
+
+
+def _safe_set_style(paragraph, style_name: Optional[str]) -> bool:
+    """Apply ``style_name``; False when the document does not define it."""
     if not style_name:
-        return
+        return False
     try:
         paragraph.style = style_name
+        return True
     except Exception:
         # style not defined in this document — leave default
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Shared block writers (both render paths)
+# ---------------------------------------------------------------------------
+
+# Headings that open a new part of the document start on a new page.
+_PAGE_BREAK_HEADING_RE = re.compile(
+    r"^\s*(schedule|annexure|annex|appendix|exhibit|execution page|"
+    r"in witness whereof|signature page)\b",
+    re.IGNORECASE,
+)
+# A list item whose text already carries its own legal label: "(a)", "(iv)",
+# "a.", "3.2", "1)". Rendered as a hanging-indent paragraph with that label,
+# never with an extra bullet or a second Word number.
+_LABELLED_ITEM_RE = re.compile(
+    r"^\s*(\((?:[a-z]{1,2}|[ivxl]{1,5}|\d{1,3})\)|(?:[ivxl]{1,5}|[a-z])[.)]"
+    r"|\d{1,3}(?:\.\d{1,3})*[.)]?)\s",
+    re.IGNORECASE,
+)
+_LIST_INDENT = Inches(0.4)
+
+
+def _starts_new_part(heading: Heading, level: int) -> bool:
+    return level <= 3 and bool(_PAGE_BREAK_HEADING_RE.match(heading.text))
+
+
+def _is_line_block(runs: List[Run]) -> bool:
+    """A paragraph made of lines (signature, witness, address stacks)."""
+    return any(r.br for r in runs)
+
+
+def _format_line_block(paragraph) -> None:
+    """Lay out a signature/witness/address stack.
+
+    Left-aligned: Word justifies every line that ends in a manual line
+    break, which stretched "EXECUTED AS A DEED by:" across the page. Single
+    spacing, kept on one page, with a gap before it so consecutive
+    signatories read as separate blocks.
+    """
+    pf = paragraph.paragraph_format
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    pf.line_spacing = 1.15
+    pf.space_before = Pt(12)
+    pf.space_after = Pt(6)
+    pf.keep_together = True
+
+
+def _keep_with_next(paragraph) -> None:
+    try:
+        paragraph.paragraph_format.keep_with_next = True
+    except Exception:
         pass
+
+
+def _write_list(doc, block, level: int, *, bullet_style: Optional[str],
+                run_style: Optional[RunStyle]) -> None:
+    """Write a (nested) list.
+
+    Ordered items are written with their number as text and a hanging
+    indent. Word's auto-numbering is not used for them: every "List Number"
+    paragraph in a document shares one numbering, so a second list would
+    carry on from the first (4, 5, 6 …) in Word.
+    """
+    ordered = isinstance(block, OrderedList)
+    for idx, item in enumerate(block.items):
+        p = doc.add_paragraph()
+        left = _LIST_INDENT * (level + 1)
+        labelled = bool(_LABELLED_ITEM_RE.match(item.text))
+        runs = list(item.runs)
+        if ordered and not labelled:
+            runs = [Run(text="{}{}\t".format(block.start + idx, block.delimiter))] + runs
+            labelled = True
+        if labelled:
+            pf = p.paragraph_format
+            pf.left_indent = left
+            pf.first_line_indent = -_LIST_INDENT
+            _set_tab_stop(p, left)
+        else:
+            style = bullet_style if level == 0 else None
+            if level > 0:
+                style = "List Bullet {}".format(min(level + 1, 3))
+            if not _safe_set_style(p, style):
+                p.paragraph_format.left_indent = left
+                runs = [Run(text="•\t")] + runs
+                p.paragraph_format.first_line_indent = -_LIST_INDENT
+                _set_tab_stop(p, left)
+        _add_runs(p, runs, inherit=run_style)
+        if _is_line_block(item.runs):
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            p.paragraph_format.keep_together = True
+        for child in item.children:
+            _write_list(doc, child, level + 1, bullet_style=bullet_style,
+                        run_style=run_style)
+
+
+def _set_tab_stop(paragraph, position) -> None:
+    try:
+        paragraph.paragraph_format.tab_stops.add_tab_stop(position)
+    except Exception:
+        pass
+
+
+def _text_width(doc) -> int:
+    try:
+        s = doc.sections[-1]
+        return int(s.page_width - s.left_margin - s.right_margin)
+    except Exception:
+        return int(Inches(6.5))
+
+
+def _shade_cell(cell, fill_hex: str) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), fill_hex)
+    tc_pr.append(shd)
+
+
+def _mark_row(row, *, header: bool) -> None:
+    tr_pr = row._tr.get_or_add_trPr()
+    cant = OxmlElement("w:cantSplit")
+    tr_pr.append(cant)
+    if header:
+        rep = OxmlElement("w:tblHeader")
+        tr_pr.append(rep)
+
+
+def _column_widths(block: Table, ncols: int, total: int) -> List[int]:
+    """Widths proportional to each column's longest cell, within bounds."""
+    lengths = [0] * ncols
+    for row in block.rows:
+        for ci, cell in enumerate(row[:ncols]):
+            n = sum(len(r.text) for r in cell)
+            lengths[ci] = max(lengths[ci], n)
+    weights = [min(max(n, 6), 60) for n in lengths]
+    floor = int(Inches(0.8))
+    raw = [total * w / sum(weights) for w in weights]
+    widths = [max(int(w), floor) for w in raw]
+    scale = total / sum(widths)
+    return [int(w * scale) for w in widths]
+
+
+def _write_table(doc, block: Table, *, style_name: Optional[str],
+                 run_style: Optional[RunStyle]) -> None:
+    if not block.rows:
+        return
+    ncols = max(len(r) for r in block.rows)
+    table = doc.add_table(rows=len(block.rows), cols=ncols)
+    if not style_name:
+        style_name = "Table Grid"
+    try:
+        table.style = style_name
+    except Exception:
+        try:
+            table.style = "Table Grid"
+        except Exception:
+            pass
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = False
+    widths = _column_widths(block, ncols, _text_width(doc))
+    align_map = {
+        "left": WD_ALIGN_PARAGRAPH.LEFT,
+        "center": WD_ALIGN_PARAGRAPH.CENTER,
+        "right": WD_ALIGN_PARAGRAPH.RIGHT,
+    }
+    for ri, row in enumerate(block.rows):
+        is_header = block.has_header and ri == 0
+        docx_row = table.rows[ri]
+        _mark_row(docx_row, header=is_header)
+        for ci in range(ncols):
+            cell = docx_row.cells[ci]
+            cell.width = Emu(widths[ci])
+            para = cell.paragraphs[0]  # a new cell holds one empty paragraph
+            pf = para.paragraph_format
+            pf.line_spacing = 1.0
+            pf.space_before = Pt(2)
+            pf.space_after = Pt(2)
+            align = block.aligns[ci] if ci < len(block.aligns) else None
+            para.alignment = align_map.get(align or "", WD_ALIGN_PARAGRAPH.LEFT)
+            runs = row[ci] if ci < len(row) else []
+            if is_header:
+                runs = [Run(text=r.text, bold=True, italic=r.italic, br=r.br) for r in runs]
+                _shade_cell(cell, "D9D9D9")
+            _add_runs(para, runs, inherit=run_style)
+    # Breathing room after the table so the next paragraph does not touch it.
+    gap = doc.add_paragraph()
+    gap.paragraph_format.space_after = Pt(0)
 
 
 def _clear_body(doc: _DocxDocument, *, preserve_first_n_paragraphs: int = 0) -> None:
@@ -498,24 +832,39 @@ def _render_with_template_skeleton(
     # Track the most recently matched template heading index so paragraphs
     # under it can inherit the section's body style.
     last_matched_heading_idx: Optional[int] = None
+    tpl_table_style: Optional[str] = None
+    try:
+        if tpl_doc.tables and tpl_doc.tables[0].style:
+            tpl_table_style = tpl_doc.tables[0].style.name
+    except Exception:
+        tpl_table_style = None
 
-    for block in blocks:
+    for bi, block in enumerate(blocks):
         if isinstance(block, Heading):
             idx = _fuzzy_find_heading(block.text, tpl_index)
+            level = min(max(block.level, 1), 9)
+            p = doc.add_paragraph()
             if idx is not None:
                 last_matched_heading_idx = idx
                 tpl_para = tpl_index[idx]
-                p = doc.add_paragraph()
                 _safe_set_style(p, tpl_para.style_name)
                 if tpl_para.alignment is not None:
                     p.alignment = tpl_para.alignment
                 _add_runs(p, block.runs, inherit=tpl_para.run_style)
             else:
                 last_matched_heading_idx = None
-                heading_style = f"Heading {min(max(block.level, 1), 9)}"
-                p = doc.add_paragraph()
-                _safe_set_style(p, heading_style)
-                _add_runs(p, block.runs)
+                if _safe_set_style(p, f"Heading {level}"):
+                    _add_runs(p, block.runs)
+                else:
+                    # Template without that heading style: bold body text,
+                    # never a literal "####".
+                    _add_runs(p, [Run(text=r.text, bold=True, italic=r.italic, br=r.br)
+                                  for r in block.runs],
+                              inherit=default_body_style.run_style
+                              if default_body_style else None)
+            _keep_with_next(p)
+            if bi > 0 and _starts_new_part(block, level):
+                p.paragraph_format.page_break_before = True
             continue
 
         if isinstance(block, Paragraph):
@@ -532,6 +881,8 @@ def _render_with_template_skeleton(
                 _add_runs(p, block.runs, inherit=inherit_style.run_style)
             else:
                 _add_runs(p, block.runs)
+            if _is_line_block(block.runs):
+                _format_line_block(p)
             continue
 
         if isinstance(block, (BulletList, OrderedList)):
@@ -549,40 +900,21 @@ def _render_with_template_skeleton(
                         list_style_name = ps.style_name
                         list_run_style = ps.run_style
                         break
-            if not list_style_name:
-                list_style_name = "List Number" if ordered else "List Bullet"
+            if not list_style_name or ordered:
+                # Ordered items carry their number as text (see _write_list).
+                list_style_name = "List Bullet"
             if list_run_style is None and default_body_style:
                 # Fall back to the template's body font for list items so
                 # they don't visually drift from the surrounding paragraphs.
                 list_run_style = default_body_style.run_style
-            for item in block.items:
-                p = doc.add_paragraph()
-                _safe_set_style(p, list_style_name)
-                _add_runs(p, item.runs, inherit=list_run_style)
+            _write_list(doc, block, 0, bullet_style=list_style_name,
+                        run_style=list_run_style)
             continue
 
         if isinstance(block, Table):
-            if not block.rows:
-                continue
-            ncols = max(len(r) for r in block.rows)
-            table = doc.add_table(rows=len(block.rows), cols=ncols)
-            tbl_style = None
-            try:
-                if tpl_doc.tables:
-                    tbl_style = tpl_doc.tables[0].style.name if tpl_doc.tables[0].style else None
-            except Exception:
-                tbl_style = None
-            try:
-                table.style = tbl_style or "Table Grid"
-            except Exception:
-                pass
-            for ri, row in enumerate(block.rows):
-                for ci, cell_runs in enumerate(row):
-                    if ci >= ncols:
-                        continue
-                    cell = table.rows[ri].cells[ci]
-                    cell.text = ""
-                    _add_runs(cell.paragraphs[0], cell_runs)
+            _write_table(doc, block, style_name=tpl_table_style,
+                         run_style=default_body_style.run_style
+                         if default_body_style else None)
             continue
 
     out = BytesIO()
@@ -615,57 +947,94 @@ def _apply_legal_defaults(doc: _DocxDocument) -> None:
     except Exception:
         pass
 
-    # Heading styles — bold, sizes 16/14/12.
-    for level, size in ((1, 16), (2, 14), (3, 12)):
+    # Heading styles 1-6 — black, bold, Times New Roman, kept with the text
+    # that follows. Word's defaults are blue theme headings, and levels 4-6
+    # were left unstyled.
+    for level, size in ((1, 16), (2, 14), (3, 12), (4, 12), (5, 12), (6, 12)):
         try:
             hs = doc.styles[f"Heading {level}"]
             hs.font.name = "Times New Roman"
             hs.font.size = Pt(size)
             hs.font.bold = True
+            hs.font.italic = level >= 5
+            hs.font.color.rgb = RGBColor(0, 0, 0)
+            # East-Asian font slot, or Word keeps the theme heading font.
+            rpr = hs.element.get_or_add_rPr()
+            fonts = rpr.find(qn("w:rFonts"))
+            if fonts is not None:
+                for attr in ("w:asciiTheme", "w:hAnsiTheme", "w:eastAsiaTheme", "w:cstheme"):
+                    fonts.attrib.pop(qn(attr), None)
+            hpf = hs.paragraph_format
+            hpf.space_before = Pt(12 if level <= 2 else 8)
+            hpf.space_after = Pt(6)
+            hpf.keep_with_next = True
+            hpf.alignment = WD_ALIGN_PARAGRAPH.CENTER if level == 1 else WD_ALIGN_PARAGRAPH.LEFT
         except Exception:
             pass
+
+
+def _add_field(paragraph, instr: str) -> None:
+    """Append a Word field (PAGE, NUMPAGES) that Word fills in on open."""
+    run = paragraph.add_run()
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    code = OxmlElement("w:instrText")
+    code.set(qn("xml:space"), "preserve")
+    code.text = " {} ".format(instr)
+    sep = OxmlElement("w:fldChar")
+    sep.set(qn("w:fldCharType"), "separate")
+    shown = OxmlElement("w:t")
+    shown.text = "1"
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    for el in (begin, code, sep, shown, end):
+        run._r.append(el)
+
+
+def _add_page_number_footer(doc: _DocxDocument) -> None:
+    """"Page X of Y" at the bottom right of every page (no-template drafts).
+
+    A template keeps its own header and footer; this is only for drafts
+    rendered with the default styles.
+    """
+    for section in doc.sections:
+        p = section.footer.paragraphs[0] if section.footer.paragraphs else \
+            section.footer.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        p.add_run("Page ")
+        _add_field(p, "PAGE")
+        p.add_run(" of ")
+        _add_field(p, "NUMPAGES")
+        for r in p.runs:
+            r.font.size = Pt(9)
 
 
 def _render_with_defaults(markdown_text: str) -> bytes:
     doc = Document()
     _apply_legal_defaults(doc)
+    _add_page_number_footer(doc)
 
     blocks = parse_markdown_blocks(markdown_text)
-    for block in blocks:
+    for bi, block in enumerate(blocks):
         if isinstance(block, Heading):
             level = min(max(block.level, 1), 9)
             p = doc.add_paragraph()
             _safe_set_style(p, f"Heading {level}")
             _add_runs(p, block.runs)
+            if bi > 0 and _starts_new_part(block, level):
+                p.paragraph_format.page_break_before = True
             continue
         if isinstance(block, Paragraph):
             p = doc.add_paragraph()
             _add_runs(p, block.runs)
+            if _is_line_block(block.runs):
+                _format_line_block(p)
             continue
         if isinstance(block, (BulletList, OrderedList)):
-            style_name = ("List Number"
-                          if isinstance(block, OrderedList) else "List Bullet")
-            for item in block.items:
-                p = doc.add_paragraph()
-                _safe_set_style(p, style_name)
-                _add_runs(p, item.runs)
+            _write_list(doc, block, 0, bullet_style="List Bullet", run_style=None)
             continue
         if isinstance(block, Table):
-            if not block.rows:
-                continue
-            ncols = max(len(r) for r in block.rows)
-            table = doc.add_table(rows=len(block.rows), cols=ncols)
-            try:
-                table.style = "Table Grid"
-            except Exception:
-                pass
-            for ri, row in enumerate(block.rows):
-                for ci, cell_runs in enumerate(row):
-                    if ci >= ncols:
-                        continue
-                    cell = table.rows[ri].cells[ci]
-                    cell.text = ""
-                    _add_runs(cell.paragraphs[0], cell_runs)
+            _write_table(doc, block, style_name="Table Grid", run_style=None)
 
     out = BytesIO()
     doc.save(out)
@@ -698,6 +1067,70 @@ def render_markdown_to_docx(
                 exc,
             )
     return _render_with_defaults(markdown_text)
+
+
+# ---------------------------------------------------------------------------
+# Structure checks (SIM-202) — counts only, safe to log
+# ---------------------------------------------------------------------------
+
+_LEFTOVER_MARKUP_RE = re.compile(r"^\s*(\||#{1,6}\s|-{3,}\s*$|\*{3,}\s*$)|\\<|\\>")
+
+
+def _norm_words(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def markdown_structure(markdown_text: str) -> Dict[str, Any]:
+    """Tables and top-level section headings the Markdown draft contains."""
+    blocks = parse_markdown_blocks(markdown_text)
+    return {
+        "tables": sum(1 for b in blocks if isinstance(b, Table) and b.rows),
+        "headings": [_norm_words(b.text) for b in blocks
+                     if isinstance(b, Heading) and b.level <= 2 and _norm_words(b.text)],
+    }
+
+
+def docx_structure(docx_bytes: bytes) -> Dict[str, Any]:
+    """Counts describing a rendered .docx: tables, placeholders, leftover markup.
+
+    ``leftover_markup`` counts body paragraphs that still read as Markdown
+    (``| …``, ``## …``, ``---``, ``\\<…``); it should always be 0.
+    """
+    doc = Document(BytesIO(docx_bytes))
+    texts = [p.text for p in doc.paragraphs]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                texts.extend(p.text for p in cell.paragraphs)
+    highlighted = 0
+    for p in doc.paragraphs:
+        for r in p.runs:
+            if r.font.highlight_color is not None:
+                highlighted += 1
+    return {
+        "tables": len(doc.tables),
+        "leftover_markup": sum(1 for t in texts if _LEFTOVER_MARKUP_RE.search(t)),
+        "highlighted_runs": highlighted,
+        "text": _norm_words(" ".join(texts)),
+    }
+
+
+def template_fill_lost_structure(markdown_text: str, docx_bytes: bytes) -> bool:
+    """True when a filled template dropped tables or sections the draft has.
+
+    The template fill paths edit only the template's own text, so a table or
+    clause the draft added never reaches the file. When that happens the
+    export should render the full draft in the template's styles instead.
+    """
+    want = markdown_structure(markdown_text)
+    have = docx_structure(docx_bytes)
+    if want["tables"] > have["tables"]:
+        return True
+    headings = want["headings"]
+    if len(headings) < 3:
+        return False
+    missing = sum(1 for h in headings if h not in have["text"])
+    return missing * 3 > len(headings)
 
 
 # ---------------------------------------------------------------------------

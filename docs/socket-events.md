@@ -164,7 +164,11 @@ delivery and never raises.
 
 `DraftDocument`: `title: str`, `format: "markdown"`, `content: str`,
 `version: int`, `sourceTemplateId?`, `sourceTemplateName?`, `sourceType?:
-str`, `wordCount?: int`, `downloadUrl?: str`.
+str`, `wordCount?: int`, `downloadUrl?: str`, `docxStatus?: "ready" |
+"failed"`, `placeholderCount?: int` (SIM-202). `content` is normalised
+Markdown: GFM tables with contiguous rows, `<Label>` placeholders, headings
+`#`–`###`. When `docxStatus` is `"ready"`, `downloadUrl` is the finished Word
+file and should be served as-is.
 
 ## Not fully typed
 

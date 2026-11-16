@@ -2387,6 +2387,22 @@ CONSTRAINTS:
     RULES in the base instruction DO NOT apply here.
   - Do not output any preamble, JSON, or commentary — output ONLY the
     Markdown draft body, starting with the document's title heading.
+
+FORMAT CONTRACT (the draft is converted to a Word file exactly as written):
+  - Tables: GitHub pipe tables. One header row, then the separator row
+    (| --- | --- |), then the data rows, with NO blank line between any two
+    rows of the same table. Every row has the same number of cells.
+  - Headings: use #, ## and ### only. Never #### or deeper; use bold text
+    for a lower-level caption instead.
+  - Sub-clauses under a list item are a nested list, indented two spaces
+    under their parent: "  - (a) …". Do not prefix a numbered clause with a
+    bullet ("- 3.2 …"); write "3.2 …" as its own paragraph.
+  - Unfilled values are written as <Label>. Never escape the angle brackets
+    (no \\<Label\\>).
+  - Do not use horizontal rules (---, ***). Start each schedule, annexure
+    and the execution page with its own ## heading.
+  - Signature and witness blocks: one item per line, ending each line with
+    two spaces so the line breaks are kept.
 """
 
 

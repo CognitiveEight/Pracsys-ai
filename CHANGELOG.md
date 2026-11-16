@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **SIM-202: Drafting Assistant Word files no longer need manual repair.**
+  Draft tables reached the Word file as lines of `| … |` text. `####`
+  headings, `---` rules and escaped placeholders (`\<Bank Name\>`) were
+  printed literally, and `(a)` sub-clauses were flattened.
+  - New deterministic normaliser (`app/processing/draft_markdown.py`). It
+    joins table rows the model split with blank lines, adds a missing
+    separator row and pads ragged rows. It also unescapes placeholders,
+    lowers headings deeper than `###`, drops `---` rules and nests `(a)`
+    sub-clauses under their list item. It runs on render, revision,
+    translation and finalize, so older stored drafts are repaired on their
+    next export.
+  - Renderer (`app/processing/docx_generator.py`):
+    - GFM tables are now parsed. The commonmark preset had them off.
+    - Tables are real Word tables: a bold, shaded, repeating header row,
+      column alignment, widths that fit the page, and rows that do not split.
+    - Nested lists are supported. Ordered items carry their own number, so a
+      second list restarts at 1 instead of continuing in Word.
+    - Headings 1–6 are styled in black Times New Roman.
+    - Schedules, annexures and the execution page start on a new page.
+    - `<Label>` placeholders are highlighted in yellow.
+    - Signature and witness lines keep their line breaks.
+  - Template path: when the filled template lost tables or sections the
+    draft has, the full draft is rendered in the template's styles instead.
+  - The draft render prompt states a format contract: tables, heading depth,
+    placeholders, no rules.
+  - **Socket payload (additive):** `ai_response.draftDocument` gains
+    `docxStatus` (`ready` | `failed`) and `placeholderCount`. `content` is
+    the normalised Markdown. **Backend:** download and "Generate final
+    draft" should serve `downloadUrl` rather than building their own file
+    from `content`.
+  - Log: one `docx_export route= tables= placeholders= leftover_markup=`
+    line per export (counts only).
+  - Signature, witness and address blocks are left-aligned, single-spaced
+    and kept on one page. Word justifies every line that ends in a manual
+    break, so these blocks used to stretch across the page. A `_____`
+    signature line now stays inside its block.
+  - The draft body call has a stable route key, `draft_render`, so
+    `LLM_ROUTES` can send drafting alone to a stronger model (see
+    `docs/MODEL_PORTABILITY.md`). The default model is unchanged.
+  - Rollback: `DRAFT_MARKDOWN_NORMALIZE=false`.
+  - Coverage: `tests/test_draft_markdown.py`, `tests/test_docx_generator.py`.
+
 ## [6.1.0] - 2026-11-16
 
 Release notes: `RELEASE.md`.

@@ -383,6 +383,9 @@ class Settings(BaseSettings):
     # editable .docx from their measured format (falls back to pdf2docx).
     # TEMPLATE_SCAN_VISION: one routed Gemini vision call per scanned page
     # for tables and font family (paid; off = measured styles only).
+    # SIM-209: a wrong table total is flagged in the draft ("<check total: X>");
+    # true replaces it with the computed figure instead.
+    draft_totals_fix: bool = False
     template_fill_v2: bool = False
     template_fidelity_ingest: bool = False
     template_scan_vision: bool = True

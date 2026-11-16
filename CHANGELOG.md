@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SIM-209: table totals in drafts are re-added in code.**
+  - Every total, grand total or sub-total row in a draft's tables is checked
+    with exact decimals. This understands Indian and international grouping,
+    INR/Rs./₹/USD prefixes and percentages (with rounding tolerance).
+  - A wrong figure is flagged in place as a highlighted
+    `<check total: 1,000,000>`. `DRAFT_TOTALS_FIX=true` corrects it instead.
+  - Columns containing a placeholder or text are left alone.
+  - No model call; the log reports counts only.
+  - Coverage: `tests/test_draft_totals.py`.
+
 - **SIM-203 (SIM-204 to SIM-207): drafts follow any uploaded template's
   format, whether .docx, text PDF, scanned PDF or photo.** All of it is off
   by default. New package: `app/processing/template_fidelity/`.

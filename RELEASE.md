@@ -1,3 +1,61 @@
+# Release v6.1.0 - 2026-11-16
+
+This release (`v6.1.0`) promotes `development` (0fabffc) to `main`. It adds each party's address, email, phone and masked ID numbers to Relevant Parties. Audio transcripts now separate 1 to 8 speakers instead of forcing every recording into a two-person call. Citations point at the real evidence page rather than a paper-book's index. A socket reconnect no longer shows the strategy panel twice in chat. The release also ships the trust pipeline and contradiction engine, switched off by default. **No breaking changes and no new required settings.** Two payload changes need a frontend/backend check: `list_of_dates` entries can now arrive without `pageNumber`, and `relevant_parties` omits unknown contact fields instead of sending `""`.
+
+## Highlights
+
+- **Party contact and identity details (SIM-186).** Relevant Parties now fills in each party's address, emails, phones and identity numbers (Aadhaar, PAN, passport, voter ID, driving licence, bank account, Udyam, GSTIN, CIN) from the documents. Every value is checked against the text of the document it came from and dropped if it is not there. Identity numbers are always masked, with at most the last 4 digits visible. Details the lawyer typed in always win over a new extraction.
+- **Multi-speaker audio (SIM-177).** Hearings, meetings and voice notes are no longer forced into two speakers. Three or more speakers are labelled `Speaker A`, `B`, `C`… in order of first appearance; exactly two keep Caller / Receiver.
+- **Citations land on the evidence page, not the index (SIM-192).** A court paper-book's INDEX, LIST OF DATES and SYNOPSIS pages name every party and date, so citations used to land on "Page 1". These pages are now detected and cited only when nothing else supports the item. Entries that cannot be placed get no page instead of a guessed one. Word files gain real pages when their saved layout is exact.
+- **No duplicate strategy message after a reconnect (SIM-181).** The reconnect replay skips panels whose identical payload was already delivered.
+- **Trust pipeline and contradiction engine (SIM-195), off by default.** Extracted facts are corroborated across documents and checked for contradictions across the whole case: dates, amounts, statuses and opposed roles. Each fact is then routed as trusted, contested or dropped. When the pipeline is enabled, conflicts reach the Analysis Report and Strategy prompts, and chat cites both sides.
+
+## Features Delivered
+
+- `relevant_parties.parties[]` gains `address`, `sourceDocId`, `sourceDocName`, `pageNumber` and `identifiers: [{type, label, value, sourceDocId}]` (always masked). `email` and `contactNumber` are now filled automatically, with several values joined by ", ". `add_relevant_party` / `edit_relevant_party` accept `address` and `identifiers`. Chat about parties sees the details.
+- Audio diarization asks Chirp 3 for 1 to `AUDIO_MAX_SPEAKERS` speakers. If Chirp rejects that range, it retries once with `AUDIO_MAX_SPEAKERS_RETRY`. Only near-silent false speakers are folded together; the old "more than 3 speakers → one speaker" rule is removed. A new N-speaker Gemini pass handles recordings where native tags are unreliable.
+- Index and summary page detection (`app/rag/page_kinds.py`) is used by Relevant Parties, all panel citations (List of Dates, Procedural Timeline, Analysis Report, Strategy case summary, Applicable Laws) and chat retrieval.
+- Trust pipeline (`app/trust/`) stores its data in a new payload-only Qdrant collection, `<collection>_trust_v1`, created only when enabled. Review decisions survive recomputation and new documents. Ontology 1.3.0 adds the optional node properties `trust_status`, `trust_confidence` and `source_count`.
+
+## Quality and Stability Improvements
+
+- List of Dates and Procedural Timeline keep a page claimed by the model only when the entry's date or quote is actually on that page. Dates are searched as documents write them (12.03.2024, 12th March, 2024), not only in ISO form.
+- Word evidence: table text, which used to be dropped, is now read, and so are content controls (cover pages, contents lists). Across 45 real .docx files, none lose any text.
+- Audio citations carry the quoted line's own `[MM:SS]`, not the start of the passage.
+- Graph: contradiction edges for events, amounts and obligations are now written (they were always rejected before). A fact that another document still supports survives a document delete. Hedged facts no longer reach the graph.
+- Amounts written as "lac"/"lacs"/"Cr." and statuses such as "unpaid" / "not complied" now parse correctly.
+- New log lines contain counts only, never values: `relevant_parties details …` and `Audio: diarization mode=… final_speakers=…`.
+
+## Bug Fixes
+
+- After a socket reconnect, the Case Summary / Strategic Objective / next steps appeared twice in chat (SIM-181).
+- A party whose details are on page 11 of a paper-book was cited as "Page 1", the index (SIM-192).
+- List of Dates defaulted unplaceable entries to page 1, and page-less documents (spreadsheets, audio, Word without layout) got a guessed page 1 (SIM-192).
+- Recordings with more than 3 speakers were collapsed into a single speaker (SIM-177).
+
+## Compatibility Notes
+
+- **Payload change, `list_of_dates`:** an entry can now arrive **without `pageNumber`**. Before, it was always an integer. Frontend and backend owners should confirm that a missing page renders correctly. `procedural_timeline` already omitted it.
+- **Payload change, `relevant_parties`:** `address`, `email`, `contactNumber`, `sourceDocId`, `sourceDocName` and `pageNumber` are **left out when unknown, never sent as `""`**. That is new for `email` / `contactNumber`. The new fields are additive and match the backend's SIM-184 contract, **except `identifiers`, which is not yet in the backend contract**.
+- **Transcript text:** the `document_assessments` audio shape is unchanged, but transcripts may now contain `Speaker C` through `Speaker H`. The frontend should confirm these labels render.
+- **Configuration:** no new required variables. Changed defaults: `AUDIO_MIN_SPEAKERS` 2 → 1 and `AUDIO_MAX_SPEAKERS` 6 → 8. New: `AUDIO_MAX_SPEAKERS_RETRY` (6), `TRUST_PIPELINE_ENABLED` (false) and the optional `TRUST_*` tuning settings. If production `.env` pins `AUDIO_MIN_SPEAKERS=2` / `AUDIO_MAX_SPEAKERS=6`, update it, or the speaker change will not take effect.
+- **No migration:** nothing is re-indexed. The trust collection is created only if `TRUST_PIPELINE_ENABLED=true`. Existing documents get index-page detection and Word pages when they are next re-read.
+- **Rollback without a redeploy:** setting `AUDIO_MIN_SPEAKERS=2` and `AUDIO_MAX_SPEAKERS=2` restores two-speaker audio. The trust pipeline stays off unless enabled.
+- **Verified:** tested end to end before promotion.
+- **Rollback:** redeploy the previous `main` image (`6786cda`).
+
+## Included
+
+| Jira | Change | PR |
+|---|---|---|
+| SIM-177 | Multi-speaker diarization (1–8 speakers) | #32 |
+| SIM-195 | Trust pipeline and contradiction engine (off by default) | #33 |
+| SIM-186 | Relevant party address, email, phone, masked IDs | #34 |
+| SIM-192 | Cite the evidence page, not the paper-book index | #34 |
+| SIM-181 | Skip reconnect replay of panels already delivered | #35 |
+
+---
+
 # Release v6.0.0 - 2026-11-05
 
 This release (`v6.0.0`) promotes `development` (3c1f36c) to `main`. It moves the Drafting Assistant to the platform-wide Global Template Library, brings the admin knowledge base into every case's panels and chat, makes every model call provider-neutral with gate0 as an optional governed gateway, lets the lawyer pick the model per case, and generates an upload's panels in parallel so the first three arrive sooner. It also ends a class of stuck panel loaders, fixes how Analysis Report rejects move the score, and hardens the purge, Stop and logging. **One breaking change for the backend:** the per-lawyer template events (`template_sync`, `template_sync_response`, `request_template_sync`) are removed in favour of the global feed, so this release must not be deployed before the backend sends `global_template_sync`. The `CHANGELOG.md` section `[6.0.0]` also versions the fixes that reached `main` after v5.1.0 without a version number (spreadsheet and slide evidence, OCR, verified citations, Stop/Resume and others).

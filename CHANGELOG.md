@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SIM-208: drafts without a template use the standard layout of their
+  document type.**
+  - The type is inferred from the draft title: notice/letter, court filing,
+    affidavit, vakalatnama, agreement/deed.
+  - Each type sets its own margins (a wider left margin for court filings),
+    body size, line spacing and alignment.
+  - The title block is centred until the body starts: court name, case
+    number, "VERSUS" and the document title. Cause-title party lines and
+    letterheads stay left.
+  - The model's layout list gains rent/lease, will, SHA/addendum/MoU,
+    power of attorney, undertaking/indemnity and other deeds.
+  - These are conventional defaults, not any court's filing rules. Untitled
+    drafts are unchanged, and templates keep their own format.
+  - Coverage: `tests/test_draft_layouts.py`.
+
 - **SIM-209: table totals in drafts are re-added in code.**
   - Every total, grand total or sub-total row in a draft's tables is checked
     with exact decimals. This understands Indian and international grouping,

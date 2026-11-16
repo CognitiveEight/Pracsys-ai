@@ -560,6 +560,76 @@ placeholder.
   an annexure).
 
 ──────────────────────────────────────────────────────────────────
+11. RENT / LEAVE AND LICENCE / LEASE AGREEMENT (residential or commercial)
+──────────────────────────────────────────────────────────────────
+- Opening: title as a level-1 heading, then "This Agreement is made at
+  <place> on <date>", then the parties (owner/lessor/licensor and
+  tenant/lessee/licensee) each in its own paragraph with "BETWEEN" and
+  "AND" as separate short lines.
+- Recitals (WHEREAS) on ownership and the agreement to let.
+- Numbered clauses: term and lock-in, rent (a table for rent, deposit
+  and escalation), security deposit and refund, maintenance and charges,
+  use, repairs, sub-letting, termination and notice, stamp duty and
+  registration, governing law and jurisdiction.
+- Schedule of the premises on its own page (## SCHEDULE heading).
+- Execution: "IN WITNESS WHEREOF", a signature block per party, two
+  witnesses with name and address.
+
+──────────────────────────────────────────────────────────────────
+12. WILL (simple or with trusts and schedules)
+──────────────────────────────────────────────────────────────────
+- Opening: "LAST WILL AND TESTAMENT" (or "WILL") heading, then the
+  testator's declaration of identity, age, address and sound mind.
+- Numbered clauses: revocation of earlier wills, appointment of
+  executor(s) (and alternates), specific bequests (sub-clauses (a), (b)
+  ...), trusts for minors where needed, residuary clause, guardianship
+  if relevant.
+- Schedule(s) of assets as tables on their own page.
+- Attestation: testator's signature, then the attestation clause
+  ("Signed by the Testator in our presence ...") and two witnesses with
+  name, address and signature lines. No court heading.
+
+──────────────────────────────────────────────────────────────────
+13. SHAREHOLDERS' / SUBSCRIPTION AGREEMENT, ADDENDUM, MoU
+──────────────────────────────────────────────────────────────────
+- Opening: title heading, date and place, parties (company,
+  shareholders, investors) with CIN/addresses, each as a numbered party.
+- Recitals A, B, C ...
+- Clause 1 Definitions and Interpretation, then numbered operative
+  clauses (subscription or transaction, conditions precedent, closing,
+  board and governance, reserved matters, transfer restrictions — ROFR,
+  tag-along, drag-along —, anti-dilution, representations and
+  warranties, confidentiality, termination, dispute resolution,
+  governing law, miscellaneous), with 1.1 / (a) / (i) sub-numbering.
+- Capitalisation and similar data as tables; schedules on their own
+  pages; an execution page with a block per party and witnesses.
+
+──────────────────────────────────────────────────────────────────
+14. POWER OF ATTORNEY
+──────────────────────────────────────────────────────────────────
+- Opening: "GENERAL / SPECIAL POWER OF ATTORNEY" heading, then "KNOW ALL
+  MEN BY THESE PRESENTS that I, <principal> ...".
+- Recitals of why the power is given; then numbered powers granted to
+  the attorney; ratification clause; revocability.
+- Execution by the principal, acceptance by the attorney, two witnesses,
+  and a space for notarisation or registration.
+
+──────────────────────────────────────────────────────────────────
+15. UNDERTAKING / INDEMNITY BOND / DECLARATION
+──────────────────────────────────────────────────────────────────
+- Opening: heading, then "I/We, <name>, aged ..., residing at ...".
+- Numbered undertakings or indemnities; the consideration or occasion.
+- Signature of the executant with place and date; witnesses where the
+  document is a bond.
+
+──────────────────────────────────────────────────────────────────
+16. OTHER DEEDS (sale, gift, settlement, partnership, relinquishment)
+──────────────────────────────────────────────────────────────────
+- Title heading; date and place; parties; recitals; numbered operative
+  clauses; schedule of property on its own page; execution with
+  witnesses. Stamp duty and registration clause where the deed needs it.
+
+──────────────────────────────────────────────────────────────────
 FALLBACK (document type not in registry)
 ──────────────────────────────────────────────────────────────────
 If the requested document does not match any entry above, infer the

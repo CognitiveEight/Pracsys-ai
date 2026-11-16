@@ -153,6 +153,9 @@ class StrategyMixin:
                 and len((d.get("content") or "").strip()) >= 20
             ]
             graph_block = await self._graph_evidence_block("strategy_objective", workspace_id)
+            conflicts = await self._trust_conflict_block(workspace_id, all_docs)
+            if conflicts:
+                graph_block = f"{graph_block}\n\n{conflicts}" if graph_block else conflicts
             kb_block = await self._knowledge_base_block(
                 "strategy_objective", workspace_id, docs=all_docs
             )

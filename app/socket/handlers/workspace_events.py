@@ -132,6 +132,7 @@ class WorkspaceEventsMixin:
                     user_id=user_id,
                     payload=strategies_result,
                     usage=None,
+                    replay=True,
                 )
                 logger.success("Strategy re-emitted to backend after reconnect")
                 await asyncio.sleep(0.2)
@@ -144,6 +145,7 @@ class WorkspaceEventsMixin:
                     user_id=user_id,
                     payload=analysis_report,
                     usage=None,
+                    replay=True,
                 )
                 logger.success(
                     "Analysis report re-emitted to backend after reconnect"
@@ -161,6 +163,7 @@ class WorkspaceEventsMixin:
                         "listOfDates": list_of_dates,
                     },
                     usage=None,
+                    replay=True,
                 )
                 logger.success("List of dates re-emitted to backend after reconnect")
                 self._log_list_of_dates_outbound(
@@ -178,6 +181,7 @@ class WorkspaceEventsMixin:
                     user_id=user_id,
                     payload=applicable_laws,
                     usage=None,
+                    replay=True,
                 )
                 logger.success(
                     "Applicable laws re-emitted to backend after reconnect"
@@ -191,6 +195,7 @@ class WorkspaceEventsMixin:
                     user_id=user_id,
                     payload={"proceduralTimeline": procedural_timeline},
                     usage=None,
+                    replay=True,
                 )
                 logger.success(
                     "Procedural timeline re-emitted to backend after reconnect"
@@ -204,6 +209,7 @@ class WorkspaceEventsMixin:
                     user_id=user_id,
                     payload=relevant_parties,
                     usage=None,
+                    replay=True,
                 )
                 logger.success(
                     "Relevant parties re-emitted to backend after reconnect"
@@ -217,6 +223,7 @@ class WorkspaceEventsMixin:
                     user_id=user_id,
                     payload=case_laws,
                     usage=None,
+                    replay=True,
                 )
                 logger.success(
                     "Case laws re-emitted to backend after reconnect"
@@ -232,6 +239,7 @@ class WorkspaceEventsMixin:
                     user_id=user_id,
                     payload=drafting_payload_to_wire(drafting_payload),
                     usage=None,
+                    replay=True,
                 )
                 logger.success(
                     "Drafting suggestions re-emitted to backend after reconnect"
@@ -348,6 +356,7 @@ class WorkspaceEventsMixin:
     async def on_disconnect(self, data: Any) -> None:
         """Handle disconnection event. Mark that we disconnected (so on_connected can re-emit if needed)."""
         self._had_disconnect = True
+        self._last_disconnect_at = time.time()
         logger.info("Socket disconnected")
         audit_logger.log_event("socket_disconnect", {"status": "disconnected"})
 

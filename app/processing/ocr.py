@@ -326,6 +326,19 @@ def _call(method: str, image_bytes: bytes) -> Any:
     raise RuntimeError("unreachable")  # pragma: no cover
 
 
+def ocr_word_boxes(image_bytes: bytes) -> List[Tuple[float, float, float, float, str]]:
+    """Every word Vision reads, as ``(x0, y0, x1, y1, text)`` in image pixels.
+
+    Used by the template scan reader (SIM-206), which needs positions, not
+    just text. Billed like any other Vision read; raises on failure.
+    """
+    response = _call("document_text_detection", image_bytes)
+    if response.error.message:
+        raise RuntimeError("GCP Vision API error: {}".format(response.error.message))
+    words, _rightward = _words(response)
+    return [(w.x0, w.y0, w.x1, w.y1, w.text) for w in words]
+
+
 def ocr_image(image_bytes: bytes) -> OcrResult:
     """Read one image. Never raises: failures come back in ``error``.
 

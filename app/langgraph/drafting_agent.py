@@ -110,6 +110,8 @@ _DOCX_MIME = (
 )
 _TEMPLATE_GCS_PREFIX = "templates"
 _DRAFT_GCS_PREFIX = "draft"
+# Photo/scan template uploads that the SIM-206 reader can rebuild as .docx.
+_TEMPLATE_IMAGE_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "tif", "tiff", "bmp")
 
 
 def _safe_filename(name: str, *, default: str = "draft") -> str:
@@ -1861,6 +1863,28 @@ class DraftingAgent:
         ):
             template_docx_gcs_uri = previous_payload.get("template_docx_gcs_uri")
         else:
+            from app.core.config import settings as _fid_settings
+
+            if ext_lower in ("pdf",) + _TEMPLATE_IMAGE_EXTENSIONS and downloaded_bytes \
+                    and getattr(_fid_settings, "template_fidelity_ingest", False):
+                # SIM-205/206: rebuild a PDF, scan or photo template as a
+                # clean, editable .docx from its measured format. None (or an
+                # error) leaves the previous converter below to run.
+                try:
+                    from app.processing.template_fidelity.ingest import build_template_docx
+
+                    rebuilt = await build_template_docx(downloaded_bytes, ext_lower)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.opt(exception=exc).warning(
+                        "Template fidelity rebuild failed (template={}); falling back",
+                        template_id,
+                    )
+                    rebuilt = None
+                if rebuilt:
+                    downloaded_bytes = rebuilt
+                    ext_lower = "docx"
             if ext_lower == "pdf" and downloaded_bytes:
                 # Convert PDF → DOCX so the existing upload-as-DOCX block
                 # below can handle it. On failure we log and continue
@@ -7590,6 +7614,68 @@ OUTPUT FORMAT:
         return values or None
 
     @staticmethod
+    async def _template_map_fill(markdown: str, template_docx_bytes: bytes) -> Optional[bytes]:
+        """SIM-204: place the draft into the template; None to fall back.
+
+        The model sees the template as a map of ids (every paragraph, table
+        row and cell) and returns one operation per line; the operations are
+        applied inside the template bytes. A result that dropped the draft's
+        tables or sections is rejected so the fallback chain runs.
+        """
+        from app.llm.errors import is_generation_error
+        from app.prompts.drafting import (
+            TEMPLATE_MAP_FILL_INSTRUCTION,
+            build_template_map_fill_prompt,
+        )
+        from app.processing.docx_generator import template_fill_lost_structure
+        from app.processing.template_fidelity.docx_fill import apply_ops, parse_ops
+        from app.processing.template_fidelity.docx_map import build_map, load, map_text
+
+        try:
+            tmap_text = await asyncio.to_thread(
+                lambda: map_text(build_map(load(template_docx_bytes))))
+        except Exception as exc:
+            logger.opt(exception=exc).warning("template_fill could not read the template")
+            return None
+        prompt = build_template_map_fill_prompt(template_map=tmap_text, draft_markdown=markdown)
+        raw = await gemini_client.generate_longform(
+            prompt,
+            system_instruction=TEMPLATE_MAP_FILL_INSTRUCTION,
+            temperature=0.1,
+            max_tokens=65536,
+            thinking_level="LOW",
+            task="template_fill",
+        )
+        if not raw or is_generation_error(raw):
+            logger.warning("template_fill model call failed; falling back")
+            return None
+        ops = parse_ops(raw)
+        if not ops:
+            logger.warning("template_fill returned no operations; falling back")
+            return None
+        try:
+            out, stats = await asyncio.to_thread(apply_ops, template_docx_bytes, ops)
+        except Exception as exc:
+            logger.opt(exception=exc).warning("template_fill could not apply operations")
+            return None
+        logger.info(
+            "template_fill ops={} applied={} inserted={} rows_added={} deleted={} "
+            "unknown={} invalid={}",
+            len(ops), stats.applied, stats.inserted, stats.rows_added, stats.deleted,
+            stats.unknown, stats.invalid,
+        )
+        if stats.applied + stats.inserted + stats.rows_added == 0:
+            return None
+        try:
+            lost = await asyncio.to_thread(template_fill_lost_structure, markdown, out)
+        except Exception:
+            lost = False
+        if lost:
+            logger.info("template_fill dropped draft tables or sections; falling back")
+            return None
+        return out
+
+    @staticmethod
     async def _fill_lost_structure(markdown: str, docx_bytes: bytes, *, route: str) -> bool:
         """True when a template fill dropped tables/sections the draft has."""
         from app.processing.docx_generator import template_fill_lost_structure
@@ -7735,7 +7821,15 @@ OUTPUT FORMAT:
             docx_bytes: Optional[bytes] = None
             path_used = chosen_path
 
-            if chosen_path == "llm_diff":
+            # SIM-204: write the draft into the template paragraph by
+            # paragraph (every edit keeps that paragraph's own format). Any
+            # failure falls through to the llm_diff chain below.
+            if chosen_path == "llm_diff" and getattr(_settings, "template_fill_v2", False):
+                docx_bytes = await self._template_map_fill(markdown, template_docx_bytes)
+                if docx_bytes is not None:
+                    path_used = "template_fill"
+
+            if chosen_path == "llm_diff" and docx_bytes is None:
                 # LLM-guided template edit. Gemini sees the template's
                 # text plus the AI's markdown and returns
                 # {keep_sections, text_edits}. We clone the template,

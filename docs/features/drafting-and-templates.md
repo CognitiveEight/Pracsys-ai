@@ -119,6 +119,30 @@ app page in `other_side`.
    One `docx_export route= tables= placeholders= leftover_markup=` line is
    logged per export. `DRAFT_MARKDOWN_NORMALIZE=false` turns off the
    normaliser and the template structure check.
+8. **Template fidelity (SIM-203, off by default).** Package
+   `app/processing/template_fidelity/`.
+   - **`TEMPLATE_FIDELITY_INGEST`.** A PDF, scanned PDF or photo template is
+     rebuilt as a clean, editable .docx from its measured format. That
+     covers fonts, sizes, emphasis, alignment, indents, numbering labels,
+     spacing, tables, letterhead and logo, header/footer, page numbers and
+     margins.
+     - A text PDF is read from its own spans.
+     - A scan is read from Vision OCR word positions plus pixel
+       measurements.
+     - `TEMPLATE_SCAN_VISION` adds one Gemini vision call per page, for
+       tables and the font family.
+     - On any failure, pdf2docx runs as before.
+   - **`TEMPLATE_FILL_V2`.** At export the draft is written *into* the
+     template.
+     - The model sees an ID for every paragraph, row and cell, and returns
+       operations (`replace`, `insert_after` with `like`, `add_row`,
+       `delete`).
+     - The operations are applied in place, so each edit keeps that
+       paragraph's own format, new clauses copy their sibling's format, and
+       the header and footer are never touched.
+     - On any failure, the `llm_diff` chain runs.
+   - Logs: `template fidelity built …` and `template_fill ops= applied= …`
+     (counts only).
 
 ## Rules and limits
 

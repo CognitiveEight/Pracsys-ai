@@ -3522,6 +3522,63 @@ def build_template_diff_prompt(
     return "\n\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# SIM-204: write the draft INTO the template, paragraph by paragraph
+# ---------------------------------------------------------------------------
+
+TEMPLATE_MAP_FILL_INSTRUCTION = (
+    "You place a finished legal draft into the lawyer's own template so the "
+    "result looks exactly like the template: same fonts, headings, "
+    "numbering, tables, letterhead and spacing. You do not write or change "
+    "legal content — the DRAFT is the content; the TEMPLATE MAP is the form.\n\n"
+    "The TEMPLATE MAP lists every paragraph (p0, p1, ...) and every table row "
+    "(t0.r0, ...) with its cells (cell ids are <row id>.c0, .c1, ...). Tags in "
+    "[...] show style, alignment, label and emphasis.\n\n"
+    "Output ONE JSON object per line, nothing else (no array, no fences):\n"
+    '{"op":"replace","id":"p7","text":"..."}           replace a paragraph\'s text\n'
+    '{"op":"replace","id":"t0.r1.c2","text":"..."}     replace one cell\n'
+    '{"op":"insert_after","id":"p7","text":"...","like":"p8"}  new paragraph after p7, formatted like p8\n'
+    '{"op":"add_row","id":"t0.r3","cells":["...","..."]}   new row after t0.r3, formatted like it\n'
+    '{"op":"delete","id":"p9"}                          remove a paragraph, a row (t0.r4) or a table (t1)\n\n'
+    "Rules:\n"
+    "1. Walk the draft in order and give every part of it a place in the "
+    "template. Template text that already matches the draft needs no "
+    "operation (unnamed ids are kept as they are).\n"
+    "2. Replace placeholders, blanks, choice markers (He|She) and sample "
+    "values with the draft's values. Keep the template's wording wherever "
+    "the draft says the same thing.\n"
+    "3. Draft content with no slot in the template (an extra clause, party, "
+    "recital, schedule item) → insert_after the right paragraph, with "
+    "\"like\" = a template paragraph of the same kind and level (a clause "
+    "like a clause, a sub-clause like a sub-clause, a heading like a "
+    "heading), so it takes that paragraph's format.\n"
+    "4. Template content the draft does not use (instructions to the "
+    "lawyer, alternatives not chosen, sample clauses, empty optional "
+    "sections) → delete.\n"
+    "5. Tables: replace cells; add_row after the last data row for extra "
+    "rows (copy the row whose format fits, never a header row); delete "
+    "surplus rows. Keep the header row's text unless the draft changes it.\n"
+    "6. Numbering: for a paragraph tagged label=..., write the text WITH its "
+    "number exactly as the draft numbers it (e.g. \"3.2\\tThe Lessee shall "
+    "...\"). For a paragraph tagged auto-numbered, write the text WITHOUT a "
+    "number — Word numbers it.\n"
+    "7. In text: **bold**, *italic*, __underline__ only where the draft has "
+    "that emphasis; \\n for a line break inside the paragraph (signature and "
+    "address blocks). Keep unfilled values as <Label>.\n"
+    "8. Never touch the letterhead, header, footer or page numbers — they "
+    "are not in the map. Never invent facts; use only the draft."
+)
+
+
+def build_template_map_fill_prompt(*, template_map: str, draft_markdown: str) -> str:
+    """User prompt for the SIM-204 template fill (operations per template id)."""
+    return (
+        "TEMPLATE MAP:\n" + template_map.strip()
+        + "\n\nDRAFT (the final content, in reading order):\n" + draft_markdown.strip()
+        + "\n\nReturn the operations, one JSON object per line."
+    )
+
+
 def build_template_fill_prompt(
     *,
     role: str,

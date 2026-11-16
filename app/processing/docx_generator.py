@@ -991,6 +991,9 @@ def _add_field(paragraph, instr: str) -> None:
         run._r.append(el)
 
 
+add_field = _add_field  # shared with template_fidelity.docx_builder
+
+
 def _add_page_number_footer(doc: _DocxDocument) -> None:
     """"Page X of Y" at the bottom right of every page (no-template drafts).
 

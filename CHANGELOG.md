@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **SIM-203 (SIM-204 to SIM-207): drafts follow any uploaded template's
+  format, whether .docx, text PDF, scanned PDF or photo.** All of it is off
+  by default. New package: `app/processing/template_fidelity/`.
+  - **Reading any template (SIM-205, SIM-206).** Every source is read into
+    one format model and rebuilt as a clean, editable .docx: real
+    paragraphs, numbering labels, tables (merged cells, header rows) and the
+    letterhead and logo in the header.
+    - **Text PDFs** are read from their spans: font, size, bold/italic,
+      position, underline strokes, ruled and borderless tables, and the
+      logo. This replaces pdf2docx's positioned text boxes. Ligatures are
+      expanded.
+    - **Scans and photos** are read from Vision OCR word positions, after
+      de-skewing both the words and the image. Bold, underline and the logo
+      are measured from the pixels; an optional Gemini vision pass adds
+      tables and the font family.
+    - **Layout** is measured from the document itself: line pitch,
+      justification, margins, running header/footer, "Page X of Y",
+      headings and title, page breaks, and signature blocks.
+  - **Writing into the template (SIM-204).** The model sees an ID for every
+    paragraph, row and cell, and returns one operation per line: `replace`,
+    `insert_after` with `like`, `add_row` or `delete`.
+    - Operations are applied inside the template, so every edit keeps that
+      paragraph's own formatting and new clauses and rows copy their
+      sibling's.
+    - Auto-numbering is never doubled, and the header and footer are never
+      touched.
+    - It falls back to the `llm_diff` chain.
+  - **Test corpus (SIM-207).** Six fictional document types (residential
+    and commercial rent, simple and complex will, simple and complex SHA)
+    in four deliberately different layouts, each as .docx, text PDF and
+    simulated scan, plus a format checklist. All 24 keep their format
+    through the PDF reader and the scan reader, including at 2° tilt.
+  - **Settings:**
+    - `TEMPLATE_FIDELITY_INGEST` (false);
+    - `TEMPLATE_FILL_V2` (false);
+    - `TEMPLATE_SCAN_VISION` (true). This is a paid Gemini call per scanned
+      page and only runs when ingest is on.
+  - **New paid calls,** both routed and metered:
+    - `template_fill`: one per export when `TEMPLATE_FILL_V2` is on;
+    - `template_scan_vision`: one per scanned page.
+  - No socket payload change.
+  - Coverage: `tests/test_template_fidelity.py`,
+    `tests/test_template_fill_route.py`.
+
 ### Fixed
 
 - **SIM-202: Drafting Assistant Word files no longer need manual repair.**

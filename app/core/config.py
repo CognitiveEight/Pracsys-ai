@@ -377,6 +377,15 @@ class Settings(BaseSettings):
     # that a filled template kept the draft's tables and sections. False is
     # the rollback switch.
     draft_markdown_normalize: bool = True
+    # SIM-203 template fidelity. TEMPLATE_FILL_V2: write drafts INTO the
+    # template paragraph by paragraph (falls back to the llm_diff chain).
+    # TEMPLATE_FIDELITY_INGEST: rebuild PDF/scan/photo templates as a clean,
+    # editable .docx from their measured format (falls back to pdf2docx).
+    # TEMPLATE_SCAN_VISION: one routed Gemini vision call per scanned page
+    # for tables and font family (paid; off = measured styles only).
+    template_fill_v2: bool = False
+    template_fidelity_ingest: bool = False
+    template_scan_vision: bool = True
     chirp_region: str = "us"  # Speech-to-Text V2 regional endpoint (us / eu / asia)
     audio_languages: str = (
         "en-IN,hi-IN"  # Comma-separated language codes (Chirp 3 diarization-supported)

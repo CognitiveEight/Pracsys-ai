@@ -37,7 +37,7 @@ from app.llm.errors import (  # noqa: F401  (re-exported for callers)
 )
 from app.llm.json_utils import coerce_valid_json_text
 from app.llm.router import ModelRouter
-from app.llm.types import LLMRequest, LLMResult, Message, TextPart
+from app.llm.types import ImagePart, LLMRequest, LLMResult, Message, TextPart
 
 #: Texts per embedding batch handed to the router (which splits further to the
 #: provider's own per-request ceiling).
@@ -201,6 +201,44 @@ class ModelClient:
                 text = valid
             elif repair_json:
                 text = await self._ensure_json(text, label, request.max_tokens)
+        return text
+
+    async def generate_with_images(
+        self,
+        prompt: str,
+        images: List[Tuple[bytes, str]],
+        system_instruction: Optional[str] = None,
+        temperature: float = 0.1,
+        max_tokens: int = 8192,
+        thinking_level: str = "LOW",
+        task: Optional[str] = None,
+        json_mode: bool = True,
+    ) -> str:
+        """Generate from a prompt plus page images ``[(bytes, mime_type), ...]``.
+
+        Routed like :meth:`generate` (only profiles that accept images are
+        tried), metered on the router, and returns the error sentinel on
+        failure — check it with :func:`is_generation_error`.
+        """
+        label = _task_label(task)
+        parts: list = [TextPart(prompt)]
+        parts.extend(ImagePart(data, mime) for data, mime in images)
+        request = LLMRequest(
+            messages=[Message("user", parts)],
+            system=system_instruction,
+            temperature=temperature,
+            max_tokens=int(max_tokens or 0) or 8192,
+            json_mode=json_mode,
+            thinking=thinking_level,
+        )
+        result = await self.router.complete(request, task=label, kind="generate")
+        if result.finish in ("error", "timeout"):
+            return _sentinel(result)
+        text = result.text
+        if json_mode and text:
+            valid = coerce_valid_json_text(text)
+            if valid is not None:
+                text = valid
         return text
 
     async def _ensure_json(self, text: str, task: str, max_tokens: int) -> str:

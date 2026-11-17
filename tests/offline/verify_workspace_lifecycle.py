@@ -79,6 +79,7 @@ from app.socket.handlers import run_control as RC  # noqa: E402
 from app.socket.handlers import workspace_events as WE  # noqa: E402
 from app.socket.handlers import workspace_purge as WP  # noqa: E402
 from app.socket.schemas import CaseLawDocumentRequest  # noqa: E402
+from app.storage import draft_files  # noqa: E402
 from app.utils.redact import validation_fields  # noqa: E402
 from app.vectorstore.qdrant import vector_store  # noqa: E402
 from app.workspace import participants as P  # noqa: E402
@@ -194,6 +195,8 @@ def _batch(ids):
 class _DeleteControl:
     fail_times = 0  # how many delete_workspace calls raise before succeeding
     calls = 0
+    draft_fail_times = 0  # how many draft-file deletes raise before succeeding
+    draft_calls = 0
 
 
 DELETE = _DeleteControl()
@@ -248,6 +251,15 @@ def _install_stubs():
     vector_store.get_workspace_role = _get_role
     vector_store.upsert_workspace_role = _upsert_role
     workspace_manager.delete_workspace = _wm_delete_workspace
+
+    def _delete_draft_files(workspace_id):
+        ORDER.append(("draft_files_delete", workspace_id))
+        DELETE.draft_calls += 1
+        if DELETE.draft_fail_times:
+            DELETE.draft_fail_times -= 1
+            raise RuntimeError("simulated draft storage outage")
+        return 2
+    draft_files.delete_workspace_draft_files = _delete_draft_files
 
     real_block = WP.block_workspace_persistence
 
@@ -318,6 +330,8 @@ def _reset(*workspaces):
     ORDER.clear()
     DELETE.fail_times = 0
     DELETE.calls = 0
+    DELETE.draft_fail_times = 0
+    DELETE.draft_calls = 0
     SOCKET.fail_chats.clear()
     for ws in workspaces:
         WP.allow_workspace_persistence(ws)
@@ -460,6 +474,13 @@ async def check_purge():
           < stages.index("vector_delete"), detail=str(stages))
     check("persistence was already blocked when the running work was cancelled",
           seen["blocked_at_cancel"] is True)
+    check("the purge deletes the case's draft Word files after the vector delete (SIM-211)",
+          "draft_files_delete" in stages
+          and stages.index("vector_delete") < stages.index("draft_files_delete"),
+          detail=str(stages))
+    purged_audit = _audits("workspace_purged", ws)
+    check("the purge audit records how many draft files were deleted",
+          bool(purged_audit) and purged_audit[-1].get("draft_files_deleted") == 2)
     check("the case's running registered task is cancelled (bug 2)", running.cancelled())
     check("the stop fence is raised: epoch incremented and NOT swept (bug 2)",
           H._run_epochs.get(ws) == epoch_before + 1,
@@ -500,6 +521,21 @@ async def check_purge():
         check("a failed purge attempt is retried and then completes",
               ws in H._purged_workspaces and DELETE.calls == 2,
               detail=f"calls={DELETE.calls}")
+
+        # 1f'. A draft-file storage error fails the attempt (SIM-211 AC-6):
+        #      the purge is not reported done, and the retry completes it.
+        ws = _ws("purge_draft_retry")
+        _reset(ws)
+        DELETE.draft_fail_times = 1
+        await H.handle("workspace_deleted", _deleted(
+            ws, purge_after=_iso(datetime.now(timezone.utc) - timedelta(seconds=1))))
+        await _until(lambda: ws in H._purged_workspaces)
+        check("a draft-file storage error fails the purge attempt, which is retried "
+              "and then completes (SIM-211)",
+              ws in H._purged_workspaces and DELETE.draft_calls == 2
+              and len(_audits("workspace_purged", ws)) == 1
+              and not _audits("workspace_purge_failed", ws),
+              detail=f"draft_calls={DELETE.draft_calls}")
 
         # 1g. Every attempt fails: critical + workspace_purge_failed.
         ws = _ws("purge_fail")

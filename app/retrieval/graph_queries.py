@@ -11,6 +11,11 @@ values, ever, which is both Keel's stated store convention and the only safe way
 to build a query from extracted text. Every query is also **workspace-scoped in
 its first predicate**, matching the indexes the generated DDL creates.
 
+Every evidence query skips nodes the trust pipeline routed ``dropped`` and
+returns ``trust_status``, so a contested fact reaches the prompt marked as such
+(app/trust/router.py). A graph built without the trust pipeline has no status,
+which reads as trusted.
+
 Nothing here connects to a database. Each function returns
 ``(cypher, parameters)`` so the queries are reviewable and testable without
 Neo4j running — which is the whole reason this layer can be built before the
@@ -54,21 +59,27 @@ def chronology(workspace_id: str, limit: int = DEFAULT_LIMIT) -> Query:
     cypher = """
     CALL () {
       MATCH (n:Event) WHERE n.workspace_id = $workspace_id AND n.event_date IS NOT NULL
+        AND coalesce(n.trust_status, 'trusted') <> 'dropped'
       RETURN n.event_date AS date, n.date_precision AS precision, n.description AS description,
              'Event' AS kind, n.event_type AS subtype,
+             n.trust_status AS trust_status,
              n.source_document_id AS source_document_id, n.chunk_id AS chunk_id, n.page AS page
       UNION ALL
       MATCH (n:Hearing) WHERE n.workspace_id = $workspace_id AND n.hearing_date IS NOT NULL
+        AND coalesce(n.trust_status, 'trusted') <> 'dropped'
       RETURN n.hearing_date AS date, 'day' AS precision, n.purpose AS description,
              'Hearing' AS kind, n.outcome AS subtype,
+             n.trust_status AS trust_status,
              n.source_document_id AS source_document_id, n.chunk_id AS chunk_id, n.page AS page
       UNION ALL
       MATCH (n:Filing) WHERE n.workspace_id = $workspace_id AND n.filed_on IS NOT NULL
+        AND coalesce(n.trust_status, 'trusted') <> 'dropped'
       RETURN n.filed_on AS date, 'day' AS precision, n.filing_type AS description,
              'Filing' AS kind, n.filed_by AS subtype,
+             n.trust_status AS trust_status,
              n.source_document_id AS source_document_id, n.chunk_id AS chunk_id, n.page AS page
     }
-    RETURN date, precision, description, kind, subtype,
+    RETURN date, precision, description, kind, subtype, trust_status,
            source_document_id, chunk_id, page
     ORDER BY date ASC
     LIMIT $limit
@@ -84,7 +95,7 @@ def party_network(workspace_id: str, limit: int = DEFAULT_LIMIT) -> Query:
     a normal state, and an inner join would silently drop them from the panel.
     """
     cypher = """
-    MATCH (p:Party) WHERE p.workspace_id = $workspace_id
+    MATCH (p:Party) WHERE p.workspace_id = $workspace_id AND coalesce(p.trust_status, 'trusted') <> 'dropped'
     OPTIONAL MATCH (p)-[r:REPRESENTED_BY]->(a:Advocate)
       WHERE a.workspace_id = $workspace_id
     OPTIONAL MATCH (p)-[:IS_PARTY_TO]->(m:Matter)
@@ -92,7 +103,7 @@ def party_network(workspace_id: str, limit: int = DEFAULT_LIMIT) -> Query:
     RETURN p.canonical_name AS party, p.party_role AS role, p.aliases AS aliases,
            p.is_natural_person AS is_natural_person,
            collect(DISTINCT a.canonical_name) AS advocates,
-           m.cause_title AS matter,
+           m.cause_title AS matter, p.trust_status AS trust_status,
            p.source_document_id AS source_document_id, p.chunk_id AS chunk_id, p.page AS page
     ORDER BY p.canonical_name
     LIMIT $limit
@@ -111,6 +122,7 @@ def obligation_chain(workspace_id: str, limit: int = DEFAULT_LIMIT) -> Query:
     cypher = """
     MATCH (debtor:Party)-[:OWES]->(o:Obligation)
       WHERE o.workspace_id = $workspace_id AND debtor.workspace_id = $workspace_id
+        AND coalesce(o.trust_status, 'trusted') <> 'dropped'
     OPTIONAL MATCH (o)-[:OWED_TO]->(creditor:Party)
       WHERE creditor.workspace_id = $workspace_id
     OPTIONAL MATCH (b:Breach)-[:VIOLATES]->(o)
@@ -124,6 +136,7 @@ def obligation_chain(workspace_id: str, limit: int = DEFAULT_LIMIT) -> Query:
            b.breach_date AS breach_date, b.severity AS severity,
            alleger.canonical_name AS alleged_by,
            prov.statute_ref AS statute, prov.section_number AS section,
+           o.trust_status AS trust_status,
            o.source_document_id AS source_document_id, o.chunk_id AS chunk_id, o.page AS page
     ORDER BY o.due_date ASC
     LIMIT $limit
@@ -141,10 +154,12 @@ def authority_chain(workspace_id: str, limit: int = DEFAULT_LIMIT) -> Query:
     cypher = """
     MATCH (source)-[:CITES]->(prec:Precedent)
       WHERE prec.workspace_id = $workspace_id AND source.workspace_id = $workspace_id
+        AND coalesce(prec.trust_status, 'trusted') <> 'dropped'
     RETURN prec.case_title AS case_title, prec.citation AS citation, prec.court AS court,
            prec.decision_date AS decision_date, prec.binding_strength AS binding_strength,
            labels(source)[0] AS cited_by_type,
            coalesce(source.filing_type, source.operative_direction) AS cited_by,
+           prec.trust_status AS trust_status,
            prec.source_document_id AS source_document_id, prec.chunk_id AS chunk_id,
            prec.page AS page
     ORDER BY prec.decision_date DESC
@@ -162,7 +177,7 @@ def provisions(workspace_id: str, limit: int = DEFAULT_LIMIT) -> Query:
     panel can decide whether to show them flagged or not at all.
     """
     cypher = """
-    MATCH (p:Provision) WHERE p.workspace_id = $workspace_id
+    MATCH (p:Provision) WHERE p.workspace_id = $workspace_id AND coalesce(p.trust_status, 'trusted') <> 'dropped'
     OPTIONAL MATCH (p)-[:CONTAINED_IN]->(s:Statute)
       WHERE s.workspace_id = $workspace_id
     OPTIONAL MATCH (subject)-[:GOVERNED_BY]->(p)
@@ -170,7 +185,7 @@ def provisions(workspace_id: str, limit: int = DEFAULT_LIMIT) -> Query:
     RETURN p.section_number AS section, p.heading AS heading,
            p.resolution_status AS resolution_status,
            coalesce(s.short_title, p.statute_ref) AS act, s.framework AS framework,
-           collect(DISTINCT labels(subject)[0]) AS engaged_by,
+           collect(DISTINCT labels(subject)[0]) AS engaged_by, p.trust_status AS trust_status,
            p.source_document_id AS source_document_id, p.chunk_id AS chunk_id, p.page AS page
     ORDER BY act, section
     LIMIT $limit
@@ -181,12 +196,12 @@ def provisions(workspace_id: str, limit: int = DEFAULT_LIMIT) -> Query:
 def orders(workspace_id: str, limit: int = DEFAULT_LIMIT) -> Query:
     """Orders passed, the forum that passed them, and what they superseded."""
     cypher = """
-    MATCH (o:Order) WHERE o.workspace_id = $workspace_id
+    MATCH (o:Order) WHERE o.workspace_id = $workspace_id AND coalesce(o.trust_status, 'trusted') <> 'dropped'
     OPTIONAL MATCH (f:Forum)-[:PASSED_ORDER]->(o) WHERE f.workspace_id = $workspace_id
     OPTIONAL MATCH (o)-[:SUPERSEDES]->(prior:Order) WHERE prior.workspace_id = $workspace_id
     RETURN o.order_date AS order_date, o.operative_direction AS direction,
            o.complied AS complied, f.canonical_name AS forum,
-           prior.order_date AS supersedes_order_dated,
+           prior.order_date AS supersedes_order_dated, o.trust_status AS trust_status,
            o.source_document_id AS source_document_id, o.chunk_id AS chunk_id, o.page AS page
     ORDER BY o.order_date DESC
     LIMIT $limit
@@ -199,8 +214,9 @@ def reliefs(workspace_id: str, limit: int = DEFAULT_LIMIT) -> Query:
     cypher = """
     MATCH (p:Party)-[:SEEKS]->(r:Relief)
       WHERE r.workspace_id = $workspace_id AND p.workspace_id = $workspace_id
+        AND coalesce(r.trust_status, 'trusted') <> 'dropped'
     RETURN p.canonical_name AS sought_by, r.relief_type AS relief,
-           r.quantum AS quantum, r.granted AS granted,
+           r.quantum AS quantum, r.granted AS granted, r.trust_status AS trust_status,
            r.source_document_id AS source_document_id, r.chunk_id AS chunk_id, r.page AS page
     ORDER BY p.canonical_name
     LIMIT $limit

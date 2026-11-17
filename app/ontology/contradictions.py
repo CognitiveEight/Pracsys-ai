@@ -47,12 +47,30 @@ CONFLICT_PARTY = "party"
 CONFLICT_TEXT = "text"
 
 #: Obligation/relief status words that cannot both be true of one obligation.
+#: Matched as whole words, outstanding group first: "unpaid" contains "paid"
+#: and "not complied" contains "complied", and a substring test read both as
+#: discharged.
 _STATUS_GROUPS = (
     frozenset({"discharged", "satisfied", "complied", "performed", "paid", "closed", "fulfilled"}),
     frozenset(
-        {"outstanding", "pending", "unpaid", "breached", "defaulted", "not complied", "due"}
+        {
+            "outstanding",
+            "pending",
+            "unpaid",
+            "breached",
+            "defaulted",
+            "due",
+            "not complied",
+            "not paid",
+            "not discharged",
+            "not satisfied",
+            "not performed",
+            "non payment",
+            "non-payment",
+        }
     ),
 )
+_DISCHARGED, _OUTSTANDING = 0, 1
 
 #: Adversarial role pairs. One party holding both across two documents is a real
 #: finding — usually a mis-extraction, occasionally a genuinely disputed record.
@@ -64,9 +82,13 @@ _OPPOSED_ROLES = (
     frozenset({"claimant", "opposite party"}),
 )
 
-_AMOUNT = re.compile(
-    r"(?:rs\.?|inr|₹)?\s*([\d,]+(?:\.\d{1,2})?)\s*(lakh|lakhs|crore|crores)?", re.IGNORECASE
+#: Lakh is also written lac/lacs/lakhs; crore as cr/crs/cr.
+_UNIT = r"(lakhs?|lacs?|crores?|crs?\.?)?"
+_AMOUNT_WITH_CURRENCY = re.compile(
+    r"(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d+)?)(?:\s*/-)?\s*" + _UNIT + r"(?![a-z])", re.IGNORECASE
 )
+#: A bare number not followed by "%": "interest @ 18% on 5,00,000" is 5,00,000.
+_AMOUNT = re.compile(r"([\d,]*\d(?:\.\d+)?)(?!\s*%)(?![\d.,])\s*" + _UNIT + r"(?![a-z])", re.IGNORECASE)
 
 
 @dataclass
@@ -150,7 +172,9 @@ def parse_amount(text: Any) -> Optional[float]:
     """
     if isinstance(text, (int, float)):
         return float(text)
-    match = _AMOUNT.search(str(text or ""))
+    raw = str(text or "")
+    # The figure the currency marker names wins over any other number in it.
+    match = _AMOUNT_WITH_CURRENCY.search(raw) or _AMOUNT.search(raw)
     if not match:
         return None
     try:
@@ -158,9 +182,9 @@ def parse_amount(text: Any) -> Optional[float]:
     except ValueError:
         return None
     unit = (match.group(2) or "").lower()
-    if unit.startswith("lakh"):
+    if unit.startswith(("lakh", "lac")):
         value *= 100_000
-    elif unit.startswith("crore"):
+    elif unit.startswith(("crore", "cr")):
         value *= 10_000_000
     return value
 
@@ -277,10 +301,11 @@ def detect_quantum_conflicts(
 
 
 def _status_group(status: str) -> Optional[int]:
-    normalized = " ".join(str(status or "").lower().split())
-    for index, group in enumerate(_STATUS_GROUPS):
-        if any(word in normalized for word in group):
-            return index
+    normalized = " ".join(re.findall(r"[a-z]+(?:-[a-z]+)?", str(status or "").lower()))
+    for index in (_OUTSTANDING, _DISCHARGED):
+        for word in sorted(_STATUS_GROUPS[index], key=len, reverse=True):
+            if re.search(rf"\b{re.escape(word)}\b", normalized):
+                return index
     return None
 
 

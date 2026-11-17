@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import Dict, FrozenSet, Iterable, List, Mapping, Optional, Tuple
 
 #: Semantic version of this schema. Minor = additive, major = breaking.
-ONTOLOGY_VERSION = "1.2.0"
+ONTOLOGY_VERSION = "1.3.0"
 
 
 class OntologyViolation(ValueError):
@@ -100,6 +100,15 @@ MANDATORY_PROPERTIES: Tuple[PropertySpec, ...] = SCOPE_PROPERTIES + PROVENANCE_P
 
 MANDATORY_PROPERTY_NAMES: FrozenSet[str] = frozenset(p.name for p in MANDATORY_PROPERTIES)
 
+#: Written onto a node by the trust pipeline (app/trust), never by extraction.
+#: Optional: a graph built without the trust pipeline has none, and every query
+#: treats an absent status as trusted. Added in 1.3.0.
+TRUST_PROPERTIES: Tuple[PropertySpec, ...] = (
+    _p("trust_status", "string", False, "trusted | contested | dropped (app/trust/router.py)"),
+    _p("trust_confidence", "float", False, "Corroborated confidence in [0.0, 1.0]"),
+    _p("source_count", "int", False, "Independent source groups supporting the node"),
+)
+
 #: Names that must be present and non-null on every write.
 REQUIRED_PROPERTY_NAMES: FrozenSet[str] = frozenset(
     p.name for p in MANDATORY_PROPERTIES if p.required
@@ -134,8 +143,9 @@ class NodeSpec:
 
     @property
     def all_properties(self) -> Tuple[PropertySpec, ...]:
-        """Domain properties plus the mandatory workspace/provenance block."""
-        return self.properties + MANDATORY_PROPERTIES
+        """Domain properties, the mandatory workspace/provenance block and the
+        optional trust block."""
+        return self.properties + MANDATORY_PROPERTIES + TRUST_PROPERTIES
 
     @property
     def property_names(self) -> FrozenSet[str]:

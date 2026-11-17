@@ -4,7 +4,10 @@ Feature mixin extracted from events.py — methods moved verbatim.
 """
 
 import asyncio
+import hashlib
+import json
 import re
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
@@ -89,6 +92,21 @@ _CORRECTION_SHAPE_RE = re.compile(
 _CITED_PANELS = frozenset(
     {"list_of_dates", "procedural_timeline", "analysis_report", "strategy_objective", "applicable_laws"}
 )
+
+#: A delivery this close to the last disconnect is still replayed on reconnect.
+#: ``emit`` returning True means "handed to the socket", not acknowledged, and a
+#: connection can be dead for up to ping_interval + ping_timeout before the drop
+#: is noticed; anything handed over in that window may never have arrived.
+REPLAY_DELIVERY_GRACE_SECONDS = 60.0
+
+
+def _payload_fingerprint(payload: Any) -> str:
+    """Stable hash of a panel payload, to tell an unchanged replay from a new one."""
+    try:
+        blob = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):
+        blob = repr(payload)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 
@@ -372,6 +390,7 @@ class ChatMixin:
         user_id: str,
         payload: Any,
         usage: Any = None,
+        replay: bool = False,
     ) -> bool:
         """Emit a ``document_feature_response`` with a top-level token-usage metadata block.
 
@@ -390,6 +409,12 @@ class ChatMixin:
         The metadata block uses the same field names as ``AIResponseMetadata`` so
         the backend reads it identically to the chat ``ai_response`` contract.
         Best-effort throughout: a pricing hiccup never blocks the emit.
+
+        ``replay=True`` marks a reconnect replay of a cached payload. It is
+        skipped (and reported as delivered) when this exact payload was handed to
+        the socket more than ``REPLAY_DELIVERY_GRACE_SECONDS`` before the last
+        disconnect: the backend already has it, and the frontend renders a
+        re-sent ``strategy_objective`` as a second chat message.
 
         The metadata block is built BEFORE the socket-client check: building it is
         what folds the spend into the workspace cumulative, and money already
@@ -423,10 +448,34 @@ class ChatMixin:
             from app.statutes.register import annotate_law_rows
 
             annotate_law_rows(payload)
+        if feature_type == "relevant_parties":
+            # Every path leaves with its identity numbers masked (SIM-186):
+            # GSTIN/CIN are not masked at ingestion, and an edit can carry a
+            # full number typed by the lawyer.
+            from app.socket.handlers.party_details import mask_party_payload
+
+            mask_party_payload(payload)
         if settings.citations_enabled and feature_type in _CITED_PANELS:
             from app.rag.attribution import attach_panel_citations
 
             await attach_panel_citations(workspace_id, feature_type, payload)
+
+        delivery_key = f"{workspace_id}:{feature_type}"
+        fingerprint = _payload_fingerprint(payload)
+        if replay:
+            last = self._delivered_feature_fingerprints.get(delivery_key)
+            if (
+                last is not None
+                and last[0] == fingerprint
+                and last[1] < self._last_disconnect_at - REPLAY_DELIVERY_GRACE_SECONDS
+            ):
+                logger.info(
+                    "result {} replay skipped: unchanged since its delivery {:.0f}s "
+                    "before the disconnect",
+                    feature_type,
+                    self._last_disconnect_at - last[1],
+                )
+                return True
 
         try:
             if usage is not None:
@@ -485,6 +534,7 @@ class ChatMixin:
             return False
         logger.info("result {} delivered=yes items={} price={}", feature_type, summary, price)
         self._clear_pending_feature_delivery(workspace_id, feature_type)
+        self._delivered_feature_fingerprints[delivery_key] = (fingerprint, time.time())
         return True
 
     async def _handle_drafting_assistant_message(
@@ -1145,6 +1195,8 @@ class ChatMixin:
                         workspace_state["graph_facts"] = list(pack.graph_facts)
                     if pack.table_notes:
                         workspace_state["table_notes"] = list(pack.table_notes)
+                    if pack.conflict_notes:
+                        workspace_state["trust_conflicts"] = list(pack.conflict_notes)
                     if any(i.sheet for i in pack.items.values()):
                         workspace_state["has_spreadsheet_evidence"] = True
                 else:

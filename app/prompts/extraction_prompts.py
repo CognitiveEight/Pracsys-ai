@@ -2,13 +2,48 @@
 
 
 __all__ = [
+    "PARTY_CONTACT_DETAILS_BLOCK",
     "extract_parties_subagent_prompt",
     "extract_timeline_subagent_prompt",
     "extract_assets_and_law_subagent_prompt",
 ]
 
 
-def extract_parties_subagent_prompt(*, combined_document_content):
+#: Appended to the parties extractor for the Relevant Parties panel only
+#: (SIM-186). Strategy and analysis share the extractor and do not get it.
+PARTY_CONTACT_DETAILS_BLOCK = (
+    "CONTACT AND IDENTITY DETAILS — for EVERY party also return these keys:\n"
+    '  "address": "postal address of THIS party exactly as written, or \"\""\n'
+    '  "emails": ["email addresses of THIS party exactly as written"]\n'
+    '  "phones": ["phone / mobile numbers of THIS party exactly as written"]\n'
+    '  "identifiers": [ { "type": "aadhaar | pan | passport | voter_id | '
+    'driving_licence | bank_account | udyam | gstin | cin | other", '
+    '"value": "the number exactly as written" } ]\n'
+    "Rules for these keys:\n"
+    "- Copy every value VERBATIM from the documents. Never guess, never "
+    "complete, never reformat.\n"
+    "- Identity numbers in these documents are partly masked (e.g. "
+    "XXXX-XXXX-1234, ABCXX1234X). Copy them exactly as they appear; never "
+    "try to reconstruct the hidden digits.\n"
+    "- Give a detail ONLY to the party it belongs to. Never give a party the "
+    "address, email or phone of its advocate, of the court, of a registry or "
+    "of a letterhead it merely received.\n"
+    "- When the documents give no such detail for a party, use \"\" or [].\n"
+)
+
+
+def extract_parties_subagent_prompt(*, combined_document_content, with_contact_details=False):
+    if with_contact_details:
+        return _extract_parties_subagent_prompt(
+            combined_document_content=combined_document_content,
+            extra=PARTY_CONTACT_DETAILS_BLOCK + "\n",
+        )
+    return _extract_parties_subagent_prompt(
+        combined_document_content=combined_document_content, extra=""
+    )
+
+
+def _extract_parties_subagent_prompt(*, combined_document_content, extra):
     return (
 "You are a focused entity extractor for legal documents. Your ONLY "
             "job is to list every PARTY (person, firm, company, government "
@@ -63,11 +98,13 @@ def extract_parties_subagent_prompt(*, combined_document_content):
             "is mentioned in a policy's own text.\n"
             "- SPEAKER / DIARIZATION PLACEHOLDERS. Audio annexures are "
             "transcribed with labels such as 'Caller', 'Receiver', 'Speaker A', "
-            "'Speaker B' plus [MM:SS] timestamps. These are placeholders, NOT "
+            "'Speaker B', 'Speaker C' ... (any letter, up to eight speakers) plus "
+            "[MM:SS] timestamps. These are placeholders, NOT "
             "names. NEVER return them as a party. If the transcript reveals a "
             "speaker's real name, use that name; otherwise DROP the entry.\n"
             "- Reference uploaded files only as Annexure N.\n"
             "- Return ONLY valid JSON. No commentary, no markdown fences.\n\n"
+            f"{extra}"
             "DOCUMENTS:\n"
             f"{combined_document_content}"
     )

@@ -30,6 +30,7 @@ import hashlib
 import json
 import re
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -102,32 +103,20 @@ DRAFTING_SESSION_CACHE_KIND = "drafting_session"
 # appears AFTER that boiler-plate, so a generous window matters.
 _CLASSIFY_CONTENT_CHARS = 4000
 
-# DOCX export — public bucket prefix for generated drafts, private prefix
-# for the original template skeletons we retain so future drafts can
-# reuse the lawyer's formatting.
+# DOCX export. Generated drafts are stored by app.storage.draft_files
+# (drafts/<workspaceId>/, SIM-211); this prefix holds the original template
+# skeletons we retain so future drafts can reuse the lawyer's formatting.
 _DOCX_MIME = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 )
-_TEMPLATE_GCS_PREFIX = "templates"
-_DRAFT_GCS_PREFIX = "draft"
+# The drafts bucket is shared with the backend, which owns `templates/`,
+# `letterheads/`, `avatars/` and `audio/`. The AI's template skeletons live
+# under their own prefix so the two can never overwrite each other. Skeletons
+# saved earlier under `templates/` stay readable: each template stores its full
+# gs:// URI (`template_docx_gcs_uri`).
+_TEMPLATE_GCS_PREFIX = "ai-templates"
 # Photo/scan template uploads that the SIM-206 reader can rebuild as .docx.
 _TEMPLATE_IMAGE_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "tif", "tiff", "bmp")
-
-
-def _safe_filename(name: str, *, default: str = "draft") -> str:
-    """Slugify a draft title for safe inclusion in a GCS object key.
-
-    Rules (matches the convention used elsewhere in the platform):
-      - Spaces → ``_``.
-      - Any character outside ``[A-Za-z0-9._-]`` is stripped.
-      - Empty result falls back to ``default``.
-    """
-    name = (name or "").strip()
-    if not name:
-        return default
-    name = name.replace(" ", "_")
-    cleaned = re.sub(r"[^A-Za-z0-9._-]", "", name)
-    return cleaned or default
 
 
 def _is_missing_object_error(exc: Exception) -> bool:
@@ -542,6 +531,23 @@ def _check_totals(markdown: str) -> str:
         logger.info("draft_totals wrong={} tables={} action={}", len(issues),
                     len({i.table for i in issues}), "fixed" if fix else "flagged")
     return out
+
+
+@dataclass(frozen=True)
+class DocxBuildResult:
+    """Outcome of :meth:`DraftingAgent.build_docx_from_text` (SIM-216).
+
+    ``reason`` is None on success, else ``render_failed`` / ``upload_failed``.
+    ``route`` is the render route taken (``defaults``, ``skeleton_clone``,
+    ``llm_diff``, ``template_fill``, ``heuristic_fill``) or ``none``.
+    ``template`` is ``none`` (no template asked for), ``found`` or ``missing``
+    (asked for but not held; the standard layout was used instead).
+    """
+
+    url: Optional[str]
+    route: str
+    reason: Optional[str]
+    template: str
 
 
 def _docx_delivery_fields(markdown: str, download_url: Optional[str]) -> Dict[str, Any]:
@@ -7729,6 +7735,86 @@ OUTPUT FORMAT:
             s["leftover_markup"],
         )
 
+    async def build_docx_from_text(
+        self,
+        *,
+        markdown: str,
+        title: str,
+        user_id: str,
+        workspace_id: str,
+        template_id: Optional[str] = None,
+        template_version: Optional[int] = None,
+        template_scope: Optional[str] = None,
+        role: Optional[str] = None,
+    ) -> DocxBuildResult:
+        """Build and upload a Word file from existing draft Markdown (SIM-216).
+
+        Same renderer as the drafting chat (:meth:`_render_draft_docx`) and the
+        same template lookup (:meth:`_resolve_template`, version-pinned like a
+        drafting turn). Without a template, or when the template is no longer
+        held, the defaults path applies the SIM-208 standard layout inferred
+        from ``title``. Never raises except ``asyncio.CancelledError``; logs
+        exception types only, never the draft text, title or link.
+        """
+        from app.storage.draft_files import draft_bucket, upload_draft_docx
+
+        template_id = (template_id or "").strip() or None
+        template_state = "none"
+        bucket = draft_bucket()
+        if not bucket:
+            logger.warning("draft_docx_build: GCS_DOCX_BUCKET_NAME not configured")
+            return DocxBuildResult(None, "none", "upload_failed", template_state)
+
+        with version_pins():
+            tpl: Optional[Dict[str, Any]] = None
+            if template_id:
+                pin_template_version(template_id, template_version)
+                try:
+                    tpl = await self._resolve_template(
+                        user_id=user_id,
+                        request_fields={
+                            "templateId": template_id,
+                            "templateVersion": template_version,
+                            "templateScope": template_scope,
+                        },
+                        # No templateUrl on this event; a template absent from
+                        # the synced store was deleted and is not resurrected.
+                        allow_lazy_fetch=False,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "draft_docx_build: template lookup failed ({})",
+                        type(exc).__name__,
+                    )
+                    tpl = None
+                template_state = "found" if tpl else "missing"
+            try:
+                docx_bytes, route = await self._render_draft_docx(
+                    markdown=markdown,
+                    draft_title=title,
+                    tpl=tpl,
+                    user_id=user_id,
+                    template_id=template_id if tpl else None,
+                    bucket=bucket,
+                    role=(role or DEFAULT_WORKSPACE_ROLE).upper(),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "draft_docx_build: render failed ({})", type(exc).__name__
+                )
+                return DocxBuildResult(None, "none", "render_failed", template_state)
+        if not docx_bytes:
+            return DocxBuildResult(None, route, "render_failed", template_state)
+
+        try:
+            url = await asyncio.to_thread(upload_draft_docx, workspace_id, docx_bytes)
+        except Exception as exc:
+            logger.warning(
+                "draft_docx_build: upload failed ({})", type(exc).__name__
+            )
+            return DocxBuildResult(None, route, "upload_failed", template_state)
+        return DocxBuildResult(url, route, None, template_state)
+
     async def _export_draft_docx(
         self,
         *,
@@ -7770,8 +7856,6 @@ OUTPUT FORMAT:
         """
         try:
             from app.core.config import settings as _settings
-            from app.processing.docx_generator import render_markdown_to_docx
-            from app.storage import gcs as _gcs
 
             bucket = getattr(_settings, "gcs_docx_bucket_name", None)
             if not bucket:
@@ -7780,203 +7864,31 @@ OUTPUT FORMAT:
                 )
                 return None
 
-            template_docx_bytes: Optional[bytes] = None
-            if tpl and tpl.get("template_docx_gcs_uri"):
-                try:
-                    b, n = _gcs.parse_gs_uri(tpl["template_docx_gcs_uri"])
-                    template_docx_bytes = await asyncio.to_thread(
-                        _gcs.download_bytes, b, n
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to fetch template skeleton from GCS "
-                        "(template={}, uri={}): {}",
-                        template_id,
-                        tpl.get("template_docx_gcs_uri"),
-                        exc,
-                    )
-                    template_docx_bytes = None
-                    # Self-heal: a 404/NoSuchKey means the skeleton file was
-                    # deleted on the backend — this cached template is an
-                    # orphan. Purge it so it stops polluting future matches.
-                    if template_id and _is_missing_object_error(exc):
-                        await self._purge_orphan_template(
-                            user_id=user_id, template_id=template_id
-                        )
-
-            # Lazy backfill: legacy templates ingested before this feature
-            # have no `template_docx_gcs_uri`. Try one re-download via the
-            # cached `source_url`; if it works, convert (PDF→DOCX) when
-            # needed and upload to GCS, then persist the URI to the
-            # template cache for next time.
-            if (
-                template_docx_bytes is None
-                and tpl
-                and (tpl.get("extension") or "").lower() in ("docx", "pdf")
-                and tpl.get("source_url")
-            ):
-                template_docx_bytes = await self._lazy_backfill_template_skeleton(
-                    tpl=tpl,
-                    user_id=user_id,
-                    template_id=template_id or "",
-                    bucket=bucket,
-                )
-
-            # ----- Choose the DOCX render path -----
-            chosen_path, dispatch_info = self._decide_render_path(
-                markdown, template_docx_bytes
-            )
-            logger.info(
-                "DOCX dispatch: path={} | template={} | tpl_len={} | md_len={}",
-                chosen_path,
-                dispatch_info["has_template"],
-                dispatch_info["tpl_text_len"],
-                dispatch_info["md_len"],
+            docx_bytes, path_used = await self._render_draft_docx(
+                markdown=markdown,
+                draft_title=draft_title,
+                tpl=tpl,
+                user_id=user_id,
+                template_id=template_id,
+                bucket=bucket,
+                role=role,
+                case_summary=case_summary,
+                case_facts_brief=case_facts_brief,
+                gathered_facts=gathered_facts,
+                lawyer_instructions=lawyer_instructions,
             )
 
-            docx_bytes: Optional[bytes] = None
-            path_used = chosen_path
+            # SIM-211: filed under drafts/<workspaceId>/ (the workspace purge
+            # deletes that prefix), no title in the object name, short link.
+            from app.storage.draft_files import upload_draft_docx
 
-            # SIM-204: write the draft into the template paragraph by
-            # paragraph (every edit keeps that paragraph's own format). Any
-            # failure falls through to the llm_diff chain below.
-            if chosen_path == "llm_diff" and getattr(_settings, "template_fill_v2", False):
-                docx_bytes = await self._template_map_fill(markdown, template_docx_bytes)
-                if docx_bytes is not None:
-                    path_used = "template_fill"
-
-            if chosen_path == "llm_diff" and docx_bytes is None:
-                # LLM-guided template edit. Gemini sees the template's
-                # text plus the AI's markdown and returns
-                # {keep_sections, text_edits}. We clone the template,
-                # drop unrequested catalog sections, and apply the
-                # edits in place. Template formatting (fonts, headings,
-                # alignment, numbering, tables, headers/footers, theme)
-                # is preserved byte-for-byte; only the slot text is
-                # replaced.
-                try:
-                    from app.processing.docx_template_filler import (
-                        apply_template_diff as _apply_diff,
-                    )
-
-                    diff = await self._extract_template_diff(
-                        template_docx_bytes=template_docx_bytes,
-                        markdown=markdown,
-                        role=role or DEFAULT_WORKSPACE_ROLE,
-                        case_summary=case_summary or "",
-                        case_facts_brief=case_facts_brief or "",
-                        gathered_facts=gathered_facts or {},
-                        lawyer_instructions=lawyer_instructions,
-                    )
-                    if diff and (diff.get("text_edits")
-                                 or diff.get("keep_sections")):
-                        keep = diff.get("keep_sections") or []
-                        edits = diff.get("text_edits") or []
-                        docx_bytes = await asyncio.to_thread(
-                            _apply_diff,
-                            template_docx_bytes,
-                            keep,
-                            edits,
-                        )
-                    else:
-                        logger.warning(
-                            "LLM diff returned no usable output — "
-                            "falling back to sectional/placeholder fill"
-                        )
-                except Exception as exc:
-                    logger.warning(
-                        "LLM diff failed: {} — falling back to "
-                        "sectional/placeholder fill",
-                        exc,
-                    )
-
-                # SIM-202: the diff only edits the template's own text, so a
-                # table or section the draft added never reaches the file.
-                # When the filled template lost structure the draft has,
-                # render the full draft in the template's styles instead.
-                lost_structure = False
-                if docx_bytes is not None and normalization_enabled():
-                    lost_structure = await self._fill_lost_structure(
-                        markdown, docx_bytes, route="llm_diff"
-                    )
-                    if lost_structure:
-                        docx_bytes = None
-
-                # Heuristic fallback chain — try sectional_fill /
-                # placeholder_fill before skeleton-clone so we still
-                # preserve template formatting when the LLM diff path
-                # didn't produce a result.
-                if docx_bytes is None and not lost_structure:
-                    docx_bytes = await self._fallback_heuristic_fill(
-                        markdown=markdown,
-                        template_docx_bytes=template_docx_bytes,
-                        template_id=template_id,
-                        role=role,
-                        case_summary=case_summary,
-                        case_facts_brief=case_facts_brief,
-                        gathered_facts=gathered_facts,
-                        lawyer_instructions=lawyer_instructions,
-                    )
-                    if docx_bytes is not None:
-                        path_used = "heuristic_fill"
-                        if normalization_enabled() and await self._fill_lost_structure(
-                            markdown, docx_bytes, route="heuristic_fill"
-                        ):
-                            docx_bytes = None
-
-                if docx_bytes is None:
-                    path_used = "skeleton_clone"
-
-            if path_used == "skeleton_clone":
-                # AI markdown drives content; template provides fonts,
-                # styles, theme, and (when detectable) preamble. Works
-                # for ANY template — prose, catalog, form, mixed.
-                docx_bytes = await asyncio.to_thread(
-                    render_markdown_to_docx,
-                    markdown,
-                    template_docx_bytes=template_docx_bytes,
-                    title=draft_title,
-                )
-            elif path_used == "defaults":
-                # No template — standard legal styling for AI-only drafts.
-                docx_bytes = await asyncio.to_thread(
-                    render_markdown_to_docx,
-                    markdown,
-                    template_docx_bytes=None,
-                    title=draft_title,
-                )
-
-            await self._log_docx_structure(path_used, markdown, docx_bytes)
-
-            # Object key convention (matches the rest of the platform):
-            #   draft/{userId}/{uuid4}-{safeOriginalName}.docx
-            # A fresh UUID per upload prevents collisions across revisions
-            # and across users re-using the same draft title. The user id
-            # scopes the object to its owner for easy lifecycle policies.
-            import uuid as _uuid
-
-            safe_user = user_id or "anonymous"
-            safe_name = _safe_filename(draft_title) + ".docx"
-            file_uuid = _uuid.uuid4().hex
-            blob_name = (
-                f"{_DRAFT_GCS_PREFIX}/{safe_user}/{file_uuid}-{safe_name}"
-            )
-            await asyncio.to_thread(
-                _gcs.upload_bytes,
-                bucket,
-                blob_name,
-                docx_bytes,
-                _DOCX_MIME,
-            )
-            # V2 signed URL — long-lived (~25 years), works under UBLA.
-            # Matches the platform's TS uploader (expires 2050-01-01).
             url = await asyncio.to_thread(
-                _gcs.generate_signed_url, bucket, blob_name
+                upload_draft_docx, workspace_id, docx_bytes
             )
             logger.success(
                 "DOCX exported (user={}, workspace={}, session={}, "
                 "version={}, path={}): {}",
-                safe_user,
+                user_id or "-",
                 workspace_id or "-",
                 actionable_id or "-",
                 version,
@@ -7993,6 +7905,202 @@ OUTPUT FORMAT:
                 e,
             )
             return None
+
+    async def _render_draft_docx(
+        self,
+        *,
+        markdown: str,
+        draft_title: str,
+        tpl: Optional[Dict[str, Any]],
+        user_id: str,
+        template_id: Optional[str],
+        bucket: str,
+        role: Optional[str] = None,
+        case_summary: Optional[str] = None,
+        case_facts_brief: Optional[str] = None,
+        gathered_facts: Optional[Dict[str, Any]] = None,
+        lawyer_instructions: Optional[str] = None,
+    ) -> Tuple[Optional[bytes], str]:
+        """Render the draft Markdown into .docx bytes; return ``(bytes, route)``.
+
+        The render half of :meth:`_export_draft_docx` (see there for the
+        routes). Raises on a render failure, so callers that must tell a
+        render failure from an upload failure (``draft_docx_build_request``,
+        SIM-216) can; ``_export_draft_docx`` still swallows both.
+        """
+        from app.core.config import settings as _settings
+        from app.processing.docx_generator import render_markdown_to_docx
+        from app.storage import gcs as _gcs
+
+
+        template_docx_bytes: Optional[bytes] = None
+        if tpl and tpl.get("template_docx_gcs_uri"):
+            try:
+                b, n = _gcs.parse_gs_uri(tpl["template_docx_gcs_uri"])
+                template_docx_bytes = await asyncio.to_thread(
+                    _gcs.download_bytes, b, n
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to fetch template skeleton from GCS "
+                    "(template={}, uri={}): {}",
+                    template_id,
+                    tpl.get("template_docx_gcs_uri"),
+                    exc,
+                )
+                template_docx_bytes = None
+                # Self-heal: a 404/NoSuchKey means the skeleton file was
+                # deleted on the backend — this cached template is an
+                # orphan. Purge it so it stops polluting future matches.
+                if template_id and _is_missing_object_error(exc):
+                    await self._purge_orphan_template(
+                        user_id=user_id, template_id=template_id
+                    )
+
+        # Lazy backfill: legacy templates ingested before this feature
+        # have no `template_docx_gcs_uri`. Try one re-download via the
+        # cached `source_url`; if it works, convert (PDF→DOCX) when
+        # needed and upload to GCS, then persist the URI to the
+        # template cache for next time.
+        if (
+            template_docx_bytes is None
+            and tpl
+            and (tpl.get("extension") or "").lower() in ("docx", "pdf")
+            and tpl.get("source_url")
+        ):
+            template_docx_bytes = await self._lazy_backfill_template_skeleton(
+                tpl=tpl,
+                user_id=user_id,
+                template_id=template_id or "",
+                bucket=bucket,
+            )
+
+        # ----- Choose the DOCX render path -----
+        chosen_path, dispatch_info = self._decide_render_path(
+            markdown, template_docx_bytes
+        )
+        logger.info(
+            "DOCX dispatch: path={} | template={} | tpl_len={} | md_len={}",
+            chosen_path,
+            dispatch_info["has_template"],
+            dispatch_info["tpl_text_len"],
+            dispatch_info["md_len"],
+        )
+
+        docx_bytes: Optional[bytes] = None
+        path_used = chosen_path
+
+        # SIM-204: write the draft into the template paragraph by
+        # paragraph (every edit keeps that paragraph's own format). Any
+        # failure falls through to the llm_diff chain below.
+        if chosen_path == "llm_diff" and getattr(_settings, "template_fill_v2", False):
+            docx_bytes = await self._template_map_fill(markdown, template_docx_bytes)
+            if docx_bytes is not None:
+                path_used = "template_fill"
+
+        if chosen_path == "llm_diff" and docx_bytes is None:
+            # LLM-guided template edit. Gemini sees the template's
+            # text plus the AI's markdown and returns
+            # {keep_sections, text_edits}. We clone the template,
+            # drop unrequested catalog sections, and apply the
+            # edits in place. Template formatting (fonts, headings,
+            # alignment, numbering, tables, headers/footers, theme)
+            # is preserved byte-for-byte; only the slot text is
+            # replaced.
+            try:
+                from app.processing.docx_template_filler import (
+                    apply_template_diff as _apply_diff,
+                )
+
+                diff = await self._extract_template_diff(
+                    template_docx_bytes=template_docx_bytes,
+                    markdown=markdown,
+                    role=role or DEFAULT_WORKSPACE_ROLE,
+                    case_summary=case_summary or "",
+                    case_facts_brief=case_facts_brief or "",
+                    gathered_facts=gathered_facts or {},
+                    lawyer_instructions=lawyer_instructions,
+                )
+                if diff and (diff.get("text_edits")
+                             or diff.get("keep_sections")):
+                    keep = diff.get("keep_sections") or []
+                    edits = diff.get("text_edits") or []
+                    docx_bytes = await asyncio.to_thread(
+                        _apply_diff,
+                        template_docx_bytes,
+                        keep,
+                        edits,
+                    )
+                else:
+                    logger.warning(
+                        "LLM diff returned no usable output — "
+                        "falling back to sectional/placeholder fill"
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "LLM diff failed: {} — falling back to "
+                    "sectional/placeholder fill",
+                    exc,
+                )
+
+            # SIM-202: the diff only edits the template's own text, so a
+            # table or section the draft added never reaches the file.
+            # When the filled template lost structure the draft has,
+            # render the full draft in the template's styles instead.
+            lost_structure = False
+            if docx_bytes is not None and normalization_enabled():
+                lost_structure = await self._fill_lost_structure(
+                    markdown, docx_bytes, route="llm_diff"
+                )
+                if lost_structure:
+                    docx_bytes = None
+
+            # Heuristic fallback chain — try sectional_fill /
+            # placeholder_fill before skeleton-clone so we still
+            # preserve template formatting when the LLM diff path
+            # didn't produce a result.
+            if docx_bytes is None and not lost_structure:
+                docx_bytes = await self._fallback_heuristic_fill(
+                    markdown=markdown,
+                    template_docx_bytes=template_docx_bytes,
+                    template_id=template_id,
+                    role=role,
+                    case_summary=case_summary,
+                    case_facts_brief=case_facts_brief,
+                    gathered_facts=gathered_facts,
+                    lawyer_instructions=lawyer_instructions,
+                )
+                if docx_bytes is not None:
+                    path_used = "heuristic_fill"
+                    if normalization_enabled() and await self._fill_lost_structure(
+                        markdown, docx_bytes, route="heuristic_fill"
+                    ):
+                        docx_bytes = None
+
+            if docx_bytes is None:
+                path_used = "skeleton_clone"
+
+        if path_used == "skeleton_clone":
+            # AI markdown drives content; template provides fonts,
+            # styles, theme, and (when detectable) preamble. Works
+            # for ANY template — prose, catalog, form, mixed.
+            docx_bytes = await asyncio.to_thread(
+                render_markdown_to_docx,
+                markdown,
+                template_docx_bytes=template_docx_bytes,
+                title=draft_title,
+            )
+        elif path_used == "defaults":
+            # No template — standard legal styling for AI-only drafts.
+            docx_bytes = await asyncio.to_thread(
+                render_markdown_to_docx,
+                markdown,
+                template_docx_bytes=None,
+                title=draft_title,
+            )
+
+        await self._log_docx_structure(path_used, markdown, docx_bytes)
+        return docx_bytes, path_used
 
     async def _lazy_backfill_template_skeleton(
         self,

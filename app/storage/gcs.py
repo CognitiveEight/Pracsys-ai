@@ -11,17 +11,17 @@ when invoked from coroutines.
 
 **URL strategy (UBLA-safe).** This module never calls ``blob.make_public()``
 — that path uses legacy per-object ACLs and breaks under Uniform Bucket-
-Level Access. Long-lived links are produced via V2 signed URLs
-(``generate_signed_url`` below). V2 has no 7-day cap (V4 does), so the
-URLs can be valid for years — matching the platform's existing TypeScript
-upload service.
+Level Access. Links are produced via V2 signed URLs
+(``generate_signed_url`` below), and every caller passes a short expiry:
+a signed link cannot be revoked, so long-lived links are not issued
+(SIM-211).
 """
 
 from __future__ import annotations
 
 import datetime as _dt
 import os
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 from loguru import logger
 
@@ -203,13 +203,13 @@ def generate_signed_url(
     bucket: str,
     blob_name: str,
     *,
-    expires_at: Optional[Union[_dt.datetime, str]] = None,
+    expires_at: Union[_dt.datetime, str],
 ) -> str:
-    """Generate a long-lived V2 signed URL for a blob.
+    """Generate a V2 signed URL for a blob that expires at ``expires_at``.
 
-    Mirrors the platform's TypeScript upload service which signs with
-    ``expires: '2050-01-01T00:00:00Z'``. V2 signing (unlike V4) has no
-    7-day cap, so the link remains valid for the configured horizon.
+    There is deliberately no default: a signed link cannot be revoked, so
+    every caller must choose a short expiry (SIM-211). The old default,
+    2050-01-01, is gone; the backend dropped it too.
 
     Requires the service-account credentials to carry a usable private
     key (the JSON file already does — no IAM Credentials API needed).
@@ -218,12 +218,11 @@ def generate_signed_url(
         bucket: bucket name.
         blob_name: object key inside the bucket.
         expires_at: a ``datetime`` (timezone-aware preferred) or ISO-8601
-            string. Defaults to ``2050-01-01T00:00:00Z`` to match the TS
-            convention.
+            string.
     """
     if expires_at is None:
-        expires_at = _dt.datetime(2050, 1, 1, tzinfo=_dt.timezone.utc)
-    elif isinstance(expires_at, str):
+        raise ValueError("generate_signed_url needs an explicit expires_at")
+    if isinstance(expires_at, str):
         # Accept ISO with or without trailing Z.
         s = expires_at.rstrip("Z")
         expires_at = _dt.datetime.fromisoformat(s).replace(
@@ -237,6 +236,27 @@ def generate_signed_url(
         expiration=expires_at,
         method="GET",
     )
+
+
+def list_blob_names(bucket: str, prefix: str) -> List[str]:
+    """Names of every object under ``prefix`` (raises on storage errors)."""
+    client = get_gcs_client()
+    return [b.name for b in client.list_blobs(bucket, prefix=prefix)]
+
+
+def delete_blob_strict(bucket: str, blob_name: str) -> None:
+    """Delete one object. Not-found counts as deleted; any other error raises.
+
+    For erasure paths (the workspace purge, the legacy cleanup), where a
+    swallowed failure would report data as gone while it still exists.
+    """
+    from google.api_core.exceptions import NotFound  # type: ignore
+
+    client = get_gcs_client()
+    try:
+        client.bucket(bucket).blob(blob_name).delete()
+    except NotFound:
+        return
 
 
 def delete_blob(bucket: str, blob_name: str) -> None:

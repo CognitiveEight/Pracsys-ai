@@ -143,6 +143,25 @@ app page in `other_side`.
      - On any failure, the `llm_diff` chain runs.
    - Logs: `template fidelity built …` and `template_fill ops= applied= …`
      (counts only).
+9. **Rebuild Word file (SIM-216).** `draft_docx_build_request` builds a
+   .docx from a draft the backend already stores ("Rebuild Word file", and
+   the first Word file of an older draft) and always answers
+   `draft_docx_build_response`.
+   - `format: "markdown"` goes through the normaliser; `format: "html"` (the
+     in-app editor) is first converted to the same Markdown
+     (`app/processing/draft_html.py`: headings, bold/italic, nested lists,
+     tables, line breaks; scripts, styles and unknown tags dropped, no
+     attributes kept).
+   - Same renderer as the chat (`DraftingAgent.build_docx_from_text` →
+     `_render_draft_docx`): the template when `templateId` is given and
+     held, else the standard layout for the title. Uploaded through
+     `upload_draft_docx`, so the purge reaches it.
+   - Idempotent on `requestId` (in flight: swallowed; answered: replayed
+     for 10 minutes). Capped by `DRAFT_DOCX_BUILD_TIMEOUT_SECONDS` (120).
+     A deleted case is refused and its pending purge is not revoked. Stop
+     does not cancel it.
+   - One `draft_docx_build status= reason= format= route= template= chars=
+     placeholders=` line per build; never the title, text or link.
 
 ## Rules and limits
 
@@ -167,7 +186,8 @@ app page in `other_side`.
 | Template OCR finishes after suggestions were built | A card gains a template match later | Library count change triggers a re-match of unmatched cards |
 | Matched template deleted | The card shows other matches or none | Card demoted and re-matched against the current library |
 | Draft storage bucket not configured (`GCS_DOCX_BUCKET_NAME`) | Draft shows, no Word download | Export returns nothing; Markdown still returned |
-| Word export fails | Draft shows, no Word download | Returns `draftDocument` without `downloadUrl` |
+| Word export fails | Draft shows, no Word download | Returns `draftDocument` without `downloadUrl`; the backend can ask again with `draft_docx_build_request` |
+| Rebuild requested for a deleted case | Rebuild fails | `draft_docx_build_response` `failed` / `invalid_request`; the purge stays armed |
 | Suggestion generation fails | Empty Drafting Assistant panel | Returns an empty list; never blocks case creation |
 | Blueprint profiling fails | No approval screen for that template | Per-template failure is logged and skipped |
 
@@ -181,6 +201,8 @@ app page in `other_side`.
 - `app/socket/handlers/drafting.py` — suggestions panel, re-match on library
   change.
 - `app/socket/handlers/chat.py` — `_handle_drafting_assistant_message`.
+- `app/socket/handlers/draft_docx_build.py` — `on_draft_docx_build_request`
+  (SIM-216); `app/processing/draft_html.py` — editor HTML to draft Markdown.
 - `app/langgraph/drafting_agent.py` — suggest, ingest, profile, match,
   `handle_turn`, `_export_draft_docx`.
 - `app/langgraph/template_store.py` — in-memory template cache: lawyers' own
@@ -195,10 +217,12 @@ app page in `other_side`.
 
 Inbound: `global_template_sync`, `global_template_sync_response`,
 `request_blueprint_proposal` (`scope: "global"`), `user_message_request`
-(drafting chat), `workspace_transferred`. Outbound:
+(drafting chat), `workspace_transferred`, `draft_docx_build_request`.
+Outbound:
 `request_global_template_sync` (every connect),
 `template_blueprint_proposal`, `document_feature_response`
-(`drafting_assistant`), `ai_response` (with draft fields). See
+(`drafting_assistant`), `ai_response` (with draft fields),
+`draft_docx_build_response`. See
 [the socket contract](../contracts/backend-ai-socket-events.md).
 
 ### Data
@@ -207,7 +231,14 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
   templates under a reserved owner, keyed by template id and version.
 - Draft sessions: the Qdrant workspace state cache (`drafting_session`).
 - Template DOCX skeletons and generated drafts: cloud storage
-  (`GCS_DOCX_BUCKET_NAME`), under `templates/` and `draft/` prefixes.
+  (`GCS_DOCX_BUCKET_NAME`, the same bucket the backend uses for
+  `templates/`, `letterheads/`, `avatars/` and `audio/`). AI skeletons under
+  `ai-templates/` (older ones stay under `templates/` and remain readable
+  through their stored gs:// URI); generated drafts under
+  `drafts/<workspaceId>/<uuid>.docx` (SIM-211), written only through
+  `app/storage/draft_files.upload_draft_docx`. The old
+  `draft/<userId>/<uuid>-<title>.docx` layout is removed by
+  `scripts/cleanup_legacy_draft_files.py`.
 - Suggestions: `_workspace_drafting_payload`, re-emitted on reconnect.
 
 ### Security
@@ -221,6 +252,9 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
 
 - `tests/test_global_templates.py` covers the Global Template Library feed,
   global profiling and version pinning.
+- `tests/test_draft_html.py` (HTML to Markdown) and
+  `tests/offline/verify_docx_build.py` (`draft_docx_build_request`) cover
+  the Word-file rebuild (SIM-216).
 - No other dedicated drafting or template test suite exists. `drafting_assistant`
   appears only as one of the resumed panels in
   `tests/offline/verify_run_control.py` and in
@@ -245,3 +279,4 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
 |---|---|---|
 | 2026-10-21 | First version, written from the code | SIM-113 |
 | 2026-10-29 | Global Template Library feed, versions, global profiling; per-lawyer template events removed | SIM-173 |
+| 2026-11-17 | `draft_docx_build_request`: Word file from stored draft text (Markdown or editor HTML) | SIM-216 |

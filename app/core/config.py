@@ -400,6 +400,12 @@ class Settings(BaseSettings):
     # as base_unreadable.
     draft_base_download_timeout_seconds: float = 30.0
     draft_base_max_bytes: int = 25 * 1024 * 1024
+    # SIM-220: return a revision as the lawyer's own file with the AI's edits
+    # written as Word tracked changes (author "SimplerToday AI"). Off: the
+    # SIM-219 clean rebuild. A revision that changes more than the ratio of
+    # the base's blocks (changed or removed / all) comes as a clean file.
+    draft_revisions_as_tracked_changes: bool = False
+    draft_tracked_changes_max_changed_ratio: float = 0.4
     chirp_region: str = "us"  # Speech-to-Text V2 regional endpoint (us / eu / asia)
     audio_languages: str = (
         "en-IN,hi-IN"  # Comma-separated language codes (Chirp 3 diarization-supported)

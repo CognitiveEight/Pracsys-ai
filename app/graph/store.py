@@ -453,6 +453,48 @@ class GraphStore:
         )
         return result
 
+    async def set_trust(
+        self, workspace_id: str, label: str, rows: Sequence[Mapping[str, Any]]
+    ) -> int:
+        """Write trust status onto existing nodes of one label (app/trust).
+
+        Each row is ``{"identity": {...}, "trust_status", "trust_confidence",
+        "source_count"}``. Nodes are matched, never created: a node the graph
+        does not hold (its write was rejected) simply gets no status.
+
+        Returns:
+            Number of nodes updated.
+        """
+        spec = NODES_BY_LABEL.get(label)
+        if spec is None or not rows:
+            return 0
+        fragment = ", ".join(f"{key}: row.identity.{key}" for key in spec.identity)
+        cypher = (
+            f"UNWIND $rows AS row MATCH (n:{label} {{workspace_id: $workspace_id, {fragment}}}) "
+            "SET n.trust_status = row.trust_status, n.trust_confidence = row.trust_confidence, "
+            "n.source_count = row.source_count RETURN count(n) AS updated"
+        )
+        params_rows = [
+            {
+                **dict(row),
+                "identity": {k: _merge_key((row.get("identity") or {}).get(k)) for k in spec.identity},
+            }
+            for row in rows
+        ]
+        result = await self._run(cypher, {"workspace_id": workspace_id, "rows": params_rows})
+        return int(result[0]["updated"]) if result else 0
+
+    async def clear_contradictions(self, workspace_id: str, detector: str) -> int:
+        """Remove one detector's CONTRADICTS edges before it writes its new set,
+        so a conflict a reviewer resolved, or whose evidence was deleted, does
+        not linger in the graph."""
+        result = await self._run(
+            "MATCH ()-[c:CONTRADICTS]->() WHERE c.workspace_id = $workspace_id "
+            "AND c.detector = $detector DELETE c RETURN count(c) AS removed",
+            {"workspace_id": workspace_id, "detector": detector},
+        )
+        return int(result[0]["removed"]) if result else 0
+
     # -- reads -------------------------------------------------------------
 
     async def query(self, name: str, workspace_id: str, limit: int = 200) -> List[Dict[str, Any]]:

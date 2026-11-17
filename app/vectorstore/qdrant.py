@@ -121,6 +121,10 @@ class QdrantStore:
             settings.qdrant_tables_collection
             or f"{self.collection_name}_tables_v1"
         )
+        # Trust-pipeline evidence and derived facts/conflicts (app/trust/store.py).
+        self.trust_collection = (
+            settings.qdrant_trust_collection or f"{self.collection_name}_trust_v1"
+        )
         # (workspace, document, sheet_index, evidence_version) -> rows.
         self._table_row_cache: Dict[tuple, List[Dict[str, Any]]] = {}
         # Workspaces whose legacy chunks have been re-indexed into the chunk
@@ -133,6 +137,12 @@ class QdrantStore:
         # Graph-fact withdrawal run on every delete (see
         # app/core/knowledge_plane.py). None when no graph is configured.
         self._graph_withdrawal = None
+        # Trust-pipeline recompute run after a document delete (app/trust).
+        self._trust_recompute = None
+
+    def set_trust_recompute(self, callback) -> None:
+        """``async callback(workspace_id, deleted_document_ids)``; None disables."""
+        self._trust_recompute = callback
 
     def set_graph_withdrawal(self, callback) -> None:
         """``async callback(workspace_id, document_ids_or_None)``; None disables."""
@@ -181,6 +191,7 @@ class QdrantStore:
         self._ensure_payload_indexes_sync()
         self._ensure_chunks_collection_sync()
         self._ensure_tables_collection_sync()
+        self._ensure_trust_collection_sync()
 
     def _dense_size_sync(self, collection: str, name: Optional[str] = None) -> Optional[int]:
         """Dense vector size of an existing collection (``name`` for a named
@@ -250,6 +261,112 @@ class QdrantStore:
                 )
             except Exception as index_err:
                 logger.debug("Payload index on {} not created: {}", field_name, index_err)
+
+    def _ensure_trust_collection_sync(self) -> None:
+        """Trust records: payload only, read whole per workspace."""
+        if not self.client.collection_exists(self.trust_collection):
+            logger.info("Creating trust collection: {}", self.trust_collection)
+            self.client.create_collection(
+                collection_name=self.trust_collection, vectors_config={}
+            )
+        self._ensure_payload_indexes_sync(self.trust_collection)
+        for field_name in ("record", "document_ids"):
+            try:
+                self.client.create_payload_index(
+                    collection_name=self.trust_collection,
+                    field_name=field_name,
+                    field_schema=PayloadSchemaType.KEYWORD,
+                )
+            except Exception as index_err:
+                logger.debug("Payload index on {} not created: {}", field_name, index_err)
+
+    def _delete_trust_sync(self, workspace_id: str, document_ids: List[str]) -> None:
+        """A deleted document's trust evidence AND every derived record naming it.
+
+        Evidence and document profiles carry ``original_document_id``; facts,
+        conflicts and review items carry ``document_ids``. Both go, so nothing
+        derived from the document outlives it even if the recompute that
+        rebuilds the case afterwards fails.
+        """
+        workspace = FieldCondition(key="workspace_id", match=MatchValue(value=workspace_id))
+        for key in ("original_document_id", "document_ids"):
+            self.client.delete(
+                collection_name=self.trust_collection,
+                points_selector=models.FilterSelector(
+                    filter=Filter(
+                        must=[
+                            workspace,
+                            FieldCondition(key=key, match=MatchAny(any=list(document_ids))),
+                        ]
+                    )
+                ),
+            )
+
+    async def documents_present(self, workspace_id: str, document_ids: Sequence[str]) -> Set[str]:
+        """Which of these documents still have chunks in the evidence store."""
+        if not document_ids:
+            return set()
+        if self.client is None:
+            await self.initialize()
+
+        def _check() -> Set[str]:
+            present: Set[str] = set()
+            for doc in document_ids:
+                batch, _ = self.client.scroll(
+                    collection_name=self.chunks_collection,
+                    scroll_filter=self._chunk_filter(workspace_id, [doc]),
+                    limit=1,
+                    with_payload=False,
+                    with_vectors=False,
+                )
+                if batch:
+                    present.add(str(doc))
+            return present
+
+        return await asyncio.to_thread(_check)
+
+    async def get_document_vectors(
+        self, workspace_id: str, document_ids: Optional[List[str]] = None
+    ) -> Dict[str, List[float]]:
+        """``document_id -> mean dense vector`` of its chunks.
+
+        Chunks whose embedding failed are skipped: they hold no real vector.
+        A document with none is absent from the result.
+        """
+        if self.client is None:
+            await self.initialize()
+
+        def _read() -> Dict[str, List[float]]:
+            sums: Dict[str, List[float]] = {}
+            counts: Dict[str, int] = {}
+            offset = None
+            flt = self._chunk_filter(workspace_id, document_ids, exclude_failed_embeddings=True)
+            while True:
+                batch, offset = self.client.scroll(
+                    collection_name=self.chunks_collection,
+                    scroll_filter=flt,
+                    limit=200,
+                    offset=offset,
+                    with_payload=["original_document_id"],
+                    with_vectors=[DENSE_VECTOR],
+                )
+                for point in batch:
+                    doc = str((point.payload or {}).get("original_document_id") or "")
+                    vectors = point.vector if isinstance(point.vector, dict) else {}
+                    vector = vectors.get(DENSE_VECTOR)
+                    if not doc or not vector:
+                        continue
+                    if doc not in sums:
+                        sums[doc], counts[doc] = [0.0] * len(vector), 0
+                    if len(vector) != len(sums[doc]):
+                        continue
+                    sums[doc] = [a + b for a, b in zip(sums[doc], vector)]
+                    counts[doc] += 1
+                if offset is None:
+                    break
+            return {doc: [v / counts[doc] for v in total] for doc, total in sums.items()}
+
+        return await asyncio.to_thread(_read)
 
     def _ensure_payload_indexes_sync(self, collection: Optional[str] = None) -> None:
         """Index the fields every query filters on. Idempotent; best-effort.
@@ -1220,10 +1337,17 @@ class QdrantStore:
                     filter=self._chunk_filter(workspace_id, document_ids)
                 ),
             )
+            # And the trust store: evidence, and every fact/conflict it fed.
+            await asyncio.to_thread(self._delete_trust_sync, workspace_id, list(document_ids))
             self._drop_table_cache(workspace_id)
             self._bump_evidence_version(workspace_id)
             if self._graph_withdrawal is not None:
                 await self._graph_withdrawal(workspace_id, list(document_ids))
+            if self._trust_recompute is not None:
+                # Rebuilds the case from the remaining evidence and re-projects
+                # facts other documents still support. Never raises: the data
+                # of the deleted document is already gone above.
+                await self._trust_recompute(workspace_id, list(document_ids))
             logger.info(
                 "Deleted documents {} for workspace {}",
                 document_ids,
@@ -1265,11 +1389,13 @@ class QdrantStore:
                 await self.initialize()
             # Every collection: the legacy one holds the state caches, the
             # evidence one the document chunks, the tables one the spreadsheet
-            # rows. A compliance purge that misses any leaves client data behind.
+            # rows, the trust one extracted facts and their passages. A
+            # compliance purge that misses any leaves client data behind.
             for collection in (
                 self.collection_name,
                 self.chunks_collection,
                 self.tables_collection,
+                self.trust_collection,
             ):
                 await asyncio.to_thread(
                     self.client.delete,

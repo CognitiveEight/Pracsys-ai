@@ -198,6 +198,23 @@ class JsonHelpersMixin:
             logger.warning("Graph evidence for {} skipped: {}", panel, graph_err)
             return ""
 
+    async def _trust_conflict_block(self, workspace_id: str, docs: List[Dict[str, Any]]) -> str:
+        """The case's unresolved cross-document conflicts (app/trust), to ADD to
+        a panel prompt. Empty while TRUST_PIPELINE_ENABLED is off or nothing
+        conflicts. Never raises: it informs a panel, it never gates it."""
+        try:
+            from app.trust.pipeline import conflict_block
+
+            names = {
+                str(d.get("document_id")): str(d.get("filename") or "")
+                for d in docs or ()
+                if d.get("document_id") and d.get("filename")
+            }
+            return await conflict_block(workspace_id, names)
+        except Exception as trust_err:  # noqa: BLE001
+            logger.warning("Trust conflicts for the panel skipped: {}", type(trust_err).__name__)
+            return ""
+
     # ------------------------------------------------------------------
     # Shared knowledge base for panels (every case, augment mode)
     # ------------------------------------------------------------------

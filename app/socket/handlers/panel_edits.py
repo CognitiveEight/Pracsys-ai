@@ -12,6 +12,7 @@ from app.search.case_law_finder import (
     find_case_law_sources,
 )
 from app.core.roles import DEFAULT_WORKSPACE_ROLE
+from app.socket.handlers.party_details import normalize_identifiers
 
 
 
@@ -169,8 +170,11 @@ class PanelEditsMixin:
             "name": name,
             "role": self._normalize_party_role(payload.get("role")),
             "details": (payload.get("details") or payload.get("description") or "").strip(),
+            "address": (payload.get("address") or "").strip(),
             "contactNumber": (payload.get("contactNumber") or "").strip(),
             "email": (payload.get("email") or "").strip(),
+            # Masked on receipt: a typed full number is never stored.
+            "identifiers": normalize_identifiers(payload.get("identifiers")),
             "officialIdUrl": (payload.get("officialIdUrl") or "").strip(),
             # No document provenance — flag it so per-document purging on a
             # document delete never removes a manually-added party.
@@ -235,6 +239,11 @@ class PanelEditsMixin:
                         if payload.get("details") is not None
                         else payload.get("description") or ""
                     ).strip()
+                if payload.get("address") is not None:
+                    p["address"] = (payload.get("address") or "").strip()
+                if payload.get("identifiers") is not None:
+                    # Masked on receipt: a typed full number is never stored.
+                    p["identifiers"] = normalize_identifiers(payload.get("identifiers"))
                 if payload.get("contactNumber") is not None:
                     p["contactNumber"] = (payload.get("contactNumber") or "").strip()
                 if payload.get("email") is not None:

@@ -72,8 +72,14 @@ def register_knowledge_plane(graph_store: Optional[Any]) -> None:
     from app.socket.events import event_handler
     from app.vectorstore.qdrant import vector_store
 
+    from app.trust.pipeline import on_documents_deleted
+
     event_handler.set_graph_store(graph_store)
     vector_store.set_graph_withdrawal(_withdrawal_hook(graph_store) if graph_store else None)
+    # Runs after the graph withdrawal: rebuilds the case from the remaining
+    # evidence and re-projects what other documents still support. A no-op
+    # while TRUST_PIPELINE_ENABLED is off.
+    vector_store.set_trust_recompute(on_documents_deleted)
     logger.info("Knowledge plane registered (graph={})", graph_store is not None)
 
 

@@ -410,3 +410,113 @@ def test_word_numbered_list_keeps_word_numbering():
     assert new_p.find("w:pPr/w:pStyle", NS).get(W("val")) == "ListNumber"
     assert not _text_of(new_p).lstrip().startswith("4")  # Word draws the number
     assert [_text_of(c) for c in _changes(res.docx) if c.tag == W("ins") and _text_of(c) == "cash "]
+
+
+# ------------------------------------------------- stricter checks (tester)
+
+
+def _block_signature(data):
+    """Every body paragraph as (paragraph properties, [(char, run rPr), ...]).
+
+    An empty ``w:rPr`` left in a paragraph's ``w:pPr`` by settling a mark (and
+    an empty ``w:pPr`` it leaves behind) carries no formatting, so it is
+    dropped before comparing; everything else must match exactly.
+    """
+    out = []
+    for p in _doc_xml(data).find(W("body")).iter(W("p")):
+        ppr = p.find(W("pPr"))
+        if ppr is not None:
+            ppr = etree.fromstring(etree.tostring(ppr))
+            mark = ppr.find(W("rPr"))
+            if mark is not None and len(mark) == 0:
+                ppr.remove(mark)
+            if len(ppr) == 0 and not ppr.attrib:
+                ppr = None
+        seq = []
+        for r in p.iter(W("r")):
+            rpr = r.find(W("rPr"))
+            key = etree.tostring(rpr) if rpr is not None else b""
+            for t in r.iter(W("t")):
+                seq.extend((ch, key) for ch in (t.text or ""))
+        out.append((etree.tostring(ppr) if ppr is not None else b"", seq))
+    return out
+
+
+def _mixed_revision(md):
+    return (
+        md.replace("in March", "in **early** April")
+        .replace("The noticee has not paid the amount due despite reminders.\n", "")
+        .replace("| Interest | 18,000 |", "| Interest | 19,000 |\n| Costs | 5,000 |")
+        + "\nA fictional closing paragraph.\n"
+    )
+
+
+def test_reject_all_restores_base_text_and_run_formatting_exactly():
+    # AC-8, exact form: no whitespace folding, no markup stripping. The
+    # rejected file converts to the very same Markdown, and every character
+    # of every paragraph keeps its original run formatting.
+    base = _rendered()
+    md = docx_to_draft_markdown(base)
+    res = _apply(base, _mixed_revision(md), max_changed_ratio=0.6)
+    assert res is not None
+    rejected = _settle(res.docx, accept=False)
+    assert docx_to_draft_markdown(rejected) == md
+    assert _block_signature(rejected) == _block_signature(base)
+
+
+def test_accept_all_markdown_equals_the_revision_exactly():
+    # AC-8, exact form: bold markup and table cells included (the plain-text
+    # comparison above strips '*' and '|').
+    base = _rendered()
+    md = docx_to_draft_markdown(base)
+    revised = _mixed_revision(md)
+    res = _apply(base, revised, max_changed_ratio=0.6)
+    assert res is not None
+    accepted = docx_to_draft_markdown(_settle(res.docx, accept=True))
+    assert accepted.strip() == re.sub(r"\n{3,}", "\n\n", revised).strip()
+    assert "**early**" in accepted
+
+
+def test_change_ids_never_reuse_an_existing_id_and_default_date_is_iso_utc():
+    # AC-10: ids stay unique against ids already in the package (a comment
+    # here), and with no date passed the stamp is the current UTC time in
+    # ISO form with a Z suffix. A non-UTC date is converted to UTC.
+    base = _docx_with_header_footer_comments()
+    existing = set()
+    for name, blob in _parts(base).items():
+        if name.startswith("word/") and name.endswith(".xml"):
+            existing.update(m.decode() for m in re.findall(rb'w:id="(-?\d+)"', blob))
+    assert existing  # the comment's id at least
+    md = docx_to_draft_markdown(base)
+    revised = md.replace("within a week", "within ten days")
+    before = datetime.now(timezone.utc).replace(microsecond=0)
+    res = build_tracked_revision(base, md, revised)
+    after = datetime.now(timezone.utc)
+    assert res.applied and res.docx is not None
+    changes = _changes(res.docx)
+    ids = [c.get(W("id")) for c in changes]
+    assert ids and len(ids) == len(set(ids)) and not (set(ids) & existing)
+    for c in changes:
+        stamp = c.get(W("date"))
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stamp), stamp
+        when = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        assert before <= when <= after
+    from datetime import timedelta
+
+    ist = timezone(timedelta(hours=5, minutes=30))
+    res_ist = build_tracked_revision(base, md, revised, date=datetime(2026, 11, 17, 15, 30, tzinfo=ist))
+    assert {c.get(W("date")) for c in _changes(res_ist.docx)} == {"2026-11-17T10:00:00Z"}
+
+
+def test_written_file_is_refused_as_the_next_revision_base():
+    # AC-9: the SIM-219 base inspection (scan, then convert) refuses the file
+    # this service wrote, because its suggested changes are still open.
+    from app.processing.draft_revision_base import OUTCOME_OPEN_CHANGES, _inspect
+
+    base = _rendered()
+    res = _apply(base, docx_to_draft_markdown(base).replace("fifteen", "thirty"))
+    assert res is not None
+    inspected = _inspect(res.docx)
+    assert inspected.outcome == OUTCOME_OPEN_CHANGES
+    assert inspected.refusal() == {"code": OUTCOME_OPEN_CHANGES, "trackedChanges": 2, "comments": 0}
+    assert inspected.docx_bytes == b""  # a refused base is not kept

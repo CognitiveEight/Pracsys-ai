@@ -254,3 +254,111 @@ async def test_full_rewrite_comes_as_a_clean_file_with_a_notice(fakes):
 
 async def test_open_changes_message_mentions_the_ais_own_edits():
     assert "including any changes suggested by the AI" in base_module.OPEN_CHANGES_MESSAGE
+
+
+# ------------------------------------------------- stricter checks (tester)
+
+
+def _ratio_of(fakes, revised):
+    """The changed ratio the turn will compute for ``revised`` (both sides
+    through the same post-processing the turn applies)."""
+    def post(md):
+        return agent_module._check_totals(normalize_if_enabled(md))
+
+    res = track_module.build_tracked_revision(
+        fakes.base, post(fakes.base_md), post(revised), max_changed_ratio=1.0
+    )
+    assert res.applied and res.changed_ratio > 0
+    return res.changed_ratio
+
+
+async def test_ratio_setting_on_both_sides_of_the_threshold_on_the_turn(fakes, monkeypatch):
+    # AC-12 through the turn: the setting (not the writer's default) decides.
+    fakes.revised = fakes.base_md.replace("fifteen days", "thirty days").replace(
+        "fictional proceedings", "fictional civil proceedings"
+    )
+    ratio = _ratio_of(fakes, fakes.revised)
+
+    monkeypatch.setattr(settings, "draft_tracked_changes_max_changed_ratio", ratio)
+    at = await _turn()
+    assert at["draftDocument"]["downloadUrl"] == TRACKED_LINK
+    assert at["draftDocument"]["trackedChanges"] is True
+    assert TRACKED_FALLBACK_NOTICE not in at["content"]
+
+    monkeypatch.setattr(settings, "draft_tracked_changes_max_changed_ratio", ratio - 0.01)
+    over = await _turn()
+    assert over["draftDocument"]["downloadUrl"] == CLEAN_LINK
+    assert not over["draftDocument"].get("trackedChanges")
+    assert over["content"].rstrip().endswith(TRACKED_FALLBACK_NOTICE)
+    assert len(fakes.uploads) == 1 and fakes.clean_exports == 1
+
+
+async def test_no_bucket_and_upload_failure_fall_back_without_notice(fakes, monkeypatch):
+    # AC-17 (technical fallbacks): clean file, no trackedChanges, no notice.
+    monkeypatch.setattr(draft_files, "draft_bucket", lambda: "")
+    result = await _turn()
+    assert result["draftDocument"]["downloadUrl"] == CLEAN_LINK
+    assert not result["draftDocument"].get("trackedChanges")
+    assert TRACKED_FALLBACK_NOTICE not in result["content"]
+    assert fakes.uploads == []
+
+    monkeypatch.setattr(draft_files, "draft_bucket", lambda: "bucket-fictional")
+
+    def _upload_fails(*_a, **_kw):
+        raise RuntimeError("fictional upload failure")
+
+    monkeypatch.setattr(draft_files, "upload_draft_docx", _upload_fails)
+    result = await _turn()
+    assert result["draftDocument"]["downloadUrl"] == CLEAN_LINK
+    assert not result["draftDocument"].get("trackedChanges")
+    assert TRACKED_FALLBACK_NOTICE not in result["content"]
+    assert fakes.clean_exports == 2
+
+
+def _holds_bytes_or(value, needle):
+    if isinstance(value, (bytes, bytearray)):
+        return True
+    if isinstance(value, str):
+        return needle in value
+    if isinstance(value, dict):
+        return any(_holds_bytes_or(v, needle) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_holds_bytes_or(v, needle) for v in value)
+    return False
+
+
+async def test_saved_session_never_holds_the_base_file(fakes, monkeypatch):
+    # AC-14 ("base not kept after the turn"): nothing the turn saves carries
+    # the file's bytes or the backend's base URL.
+    saved = []
+
+    async def _record(*args, **kwargs):
+        saved.append((args, kwargs))
+
+    monkeypatch.setattr(drafting_agent, "_save_session_state", _record)
+    result = await _turn()
+    assert result["draftDocument"]["trackedChanges"] is True
+    assert saved, "the turn saves its session"
+    assert not _holds_bytes_or(saved, FAKE_URL)
+    assert not _holds_bytes_or(result, FAKE_URL)
+
+
+async def test_next_turn_on_the_tracked_file_is_refused_without_a_model_call(fakes, monkeypatch):
+    # AC-9 through the turn: the lawyer's next request, sent with the file
+    # this service wrote as its base, is refused as open changes before any
+    # model call.
+    first = await _turn()
+    assert first["draftDocument"]["trackedChanges"] is True
+    tracked_file = fakes.uploads[0]
+
+    async def _fetch_tracked(url, **_kw):
+        return tracked_file
+
+    monkeypatch.setattr(base_module, "fetch_base_docx", _fetch_tracked)
+    monkeypatch.setattr(gemini_client, "generate", _unexpected("generate"))
+    monkeypatch.setattr(gemini_client, "generate_longform", _unexpected("generate_longform"))
+    second = await _turn()
+    assert second["draftRefusal"]["code"] == base_module.OUTCOME_OPEN_CHANGES
+    assert second["draftRefusal"]["trackedChanges"] == 2
+    assert second["draftDocument"] is None
+    assert second["content"] == base_module.OPEN_CHANGES_MESSAGE

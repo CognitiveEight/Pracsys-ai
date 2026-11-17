@@ -114,6 +114,20 @@ app page in `other_side`.
    - yellow-highlighted `<Label>` placeholders;
    - line breaks inside signature blocks.
 
+   **The lawyer's chosen format is applied last (SIM-217).** The
+   `formatLayout` sent with every drafting message (court or letterhead) is
+   applied to the rendered file by `app/processing/draft_format.py`
+   (`apply_format_layout`), on every route: template fill, `llm_diff`,
+   heuristic fill, skeleton clone and defaults. Its page settings override
+   the template's and the SIM-208 standard layout; a letterhead replaces the
+   header and footer; a court block is inserted at the top unless the draft
+   already starts with it. Letterhead images are fetched once by
+   `app/processing/format_images.py`; a failed image is skipped. A formatter
+   failure uploads the unformatted file. One `draft_format applied type= …`
+   line (counts and enum values only) is logged per export. The function
+   works on any .docx, so it can later re-apply a format to a lawyer-edited
+   file.
+
    The file is uploaded to cloud storage and its link is returned as
    `draftDocument.downloadUrl`, with `docxStatus` and `placeholderCount`.
    One `docx_export route= tables= placeholders= leftover_markup=` line is
@@ -186,6 +200,8 @@ app page in `other_side`.
 - `app/langgraph/template_store.py` — in-memory template cache: lawyers' own
   libraries plus the Global Template Library (current version, admin drafts,
   older versions pinned by drafts).
+- `app/processing/draft_format.py` (chosen court/letterhead format, SIM-217)
+  and `app/processing/format_images.py` (its image fetcher).
 - `app/processing/docx_template_filler.py`, `app/processing/docx_generator.py`,
   `app/processing/pdf_to_docx.py`.
 - `app/prompts/drafting.py`; wire transform `drafting_payload_to_wire` in
@@ -207,13 +223,22 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
   templates under a reserved owner, keyed by template id and version.
 - Draft sessions: the Qdrant workspace state cache (`drafting_session`).
 - Template DOCX skeletons and generated drafts: cloud storage
-  (`GCS_DOCX_BUCKET_NAME`), under `templates/` and `draft/` prefixes.
+  (`GCS_DOCX_BUCKET_NAME`, the same bucket the backend uses for
+  `templates/`, `letterheads/`, `avatars/` and `audio/`). AI skeletons under
+  `ai-templates/` (older ones stay under `templates/` and remain readable
+  through their stored gs:// URI); generated drafts under
+  `drafts/<workspaceId>/<uuid>.docx` (SIM-211), written only through
+  `app/storage/draft_files.upload_draft_docx`. The old
+  `draft/<userId>/<uuid>-<title>.docx` layout is removed by
+  `scripts/cleanup_legacy_draft_files.py`.
 - Suggestions: `_workspace_drafting_payload`, re-emitted on reconnect.
 
 ### Security
 
-- Download links for generated drafts are long-lived signed URLs (about 25
-  years). Only `safe_url()` forms are logged.
+- Download links for generated drafts are short-lived signed URLs
+  (`DRAFT_DOCX_LINK_TTL_SECONDS`, default 15 minutes): a hand-off the backend
+  copies at once. No draft title in object names. Only `safe_url()` forms are
+  logged.
 - Drafting chat is not gated by sharing permission: a view-only collaborator
   can run a drafting session. Drafting does not change case panels.
 
@@ -221,6 +246,9 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
 
 - `tests/test_global_templates.py` covers the Global Template Library feed,
   global profiling and version pinning.
+- `tests/test_draft_format.py` covers the chosen format (SIM-217): page,
+  letterhead, court block, images, bad input, the export path and the
+  session copy.
 - No other dedicated drafting or template test suite exists. `drafting_assistant`
   appears only as one of the resumed panels in
   `tests/offline/verify_run_control.py` and in
@@ -234,8 +262,8 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
   (`llm_diff`) is not.
 - Template tables are not read at ingestion, so the model never sees a
   template's tables (`extract_text_from_docx` without `mark_pages`).
-- Generated draft files and template skeletons in cloud storage are never
-  deleted: not on template delete, and not by the workspace purge.
+- Template skeletons in cloud storage are not deleted on template delete.
+  Generated draft files are deleted by the workspace purge (SIM-211).
 - Approved blueprints and presets live in memory and rely on the backend
   re-sending them in the snapshot after a restart; this was not verified.
 
@@ -245,3 +273,4 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
 |---|---|---|
 | 2026-10-21 | First version, written from the code | SIM-113 |
 | 2026-10-29 | Global Template Library feed, versions, global profiling; per-lawyer template events removed | SIM-173 |
+| 2026-11-17 | The lawyer's chosen court/letterhead format is applied to the draft's Word file | SIM-217 |

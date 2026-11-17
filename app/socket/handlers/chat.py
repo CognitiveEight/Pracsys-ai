@@ -646,9 +646,11 @@ class ChatMixin:
             "templateScope": (payload.templateScope or "").strip().lower() or None,
             "templateVersion": payload.templateVersion,
             "draftMode": (payload.draftMode or "").strip().lower() or None,
-            # Reserved layout hint — threaded through for future layout-aware
-            # rendering; the drafting agent does not consume it yet.
+            # SIM-217: the chosen court/letterhead format, applied to the
+            # draft's Word file. The agent falls back to
+            # draftOrigin.formatLayout, then to the session's stored format.
             "formatLayout": payload.formatLayout,
+            "draftOrigin": payload.draftOrigin,
         }
 
         # When the turn may need to resolve/match a template (a suggested-draft

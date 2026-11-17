@@ -26,6 +26,7 @@ The agent reuses:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import re
@@ -75,6 +76,7 @@ from app.prompts.drafting import (
     infer_document_class,
 )
 from app.core.roles import DEFAULT_WORKSPACE_ROLE
+from app.processing.draft_format import select_format_layout, without_image_links
 from app.processing.draft_markdown import (
     count_placeholders,
     normalization_enabled,
@@ -94,6 +96,14 @@ from app.langgraph.template_store import GLOBAL_SCOPE, pin_template_version, ver
 # Qdrant cache.
 DRAFTING_SESSION_CACHE_KIND = "drafting_session"
 
+# SIM-217: the lawyer's chosen court / letterhead format for the turn being
+# handled — the request's own, else the one stored in the drafting session.
+# Read by `_export_draft_docx`, so every render route (first draft, revision,
+# translation, finalize) applies it without each caller passing it through.
+_TURN_FORMAT_LAYOUT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
+    contextvars.ContextVar("drafting_turn_format_layout", default=None)
+)
+
 # How many characters of the extracted template body to read when
 # classifying the document type. Indian legal documents often spend the
 # first 1-2k chars on court header, addressee block, "REGISTERED A.D."
@@ -102,32 +112,20 @@ DRAFTING_SESSION_CACHE_KIND = "drafting_session"
 # appears AFTER that boiler-plate, so a generous window matters.
 _CLASSIFY_CONTENT_CHARS = 4000
 
-# DOCX export — public bucket prefix for generated drafts, private prefix
-# for the original template skeletons we retain so future drafts can
-# reuse the lawyer's formatting.
+# DOCX export. Generated drafts are stored by app.storage.draft_files
+# (drafts/<workspaceId>/, SIM-211); this prefix holds the original template
+# skeletons we retain so future drafts can reuse the lawyer's formatting.
 _DOCX_MIME = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 )
-_TEMPLATE_GCS_PREFIX = "templates"
-_DRAFT_GCS_PREFIX = "draft"
+# The drafts bucket is shared with the backend, which owns `templates/`,
+# `letterheads/`, `avatars/` and `audio/`. The AI's template skeletons live
+# under their own prefix so the two can never overwrite each other. Skeletons
+# saved earlier under `templates/` stay readable: each template stores its full
+# gs:// URI (`template_docx_gcs_uri`).
+_TEMPLATE_GCS_PREFIX = "ai-templates"
 # Photo/scan template uploads that the SIM-206 reader can rebuild as .docx.
 _TEMPLATE_IMAGE_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "tif", "tiff", "bmp")
-
-
-def _safe_filename(name: str, *, default: str = "draft") -> str:
-    """Slugify a draft title for safe inclusion in a GCS object key.
-
-    Rules (matches the convention used elsewhere in the platform):
-      - Spaces → ``_``.
-      - Any character outside ``[A-Za-z0-9._-]`` is stripped.
-      - Empty result falls back to ``default``.
-    """
-    name = (name or "").strip()
-    if not name:
-        return default
-    name = name.replace(" ", "_")
-    cleaned = re.sub(r"[^A-Za-z0-9._-]", "", name)
-    return cleaned or default
 
 
 def _is_missing_object_error(exc: Exception) -> bool:
@@ -657,6 +655,16 @@ def _normalize_suggestions(raw: List[Any]) -> List[Dict[str, Any]]:
         )
     cleaned = _filter_forbidden_acts(_dedupe_suggestions(cleaned))
     return cleaned[:_MAX_SUGGESTIONS]
+
+
+def _incoming_format_layout(request_fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The request's chosen format: top-level ``formatLayout``, else
+    ``draftOrigin.formatLayout``; None when neither carries formatting."""
+    origin = (request_fields or {}).get("draftOrigin")
+    nested = None
+    if isinstance(origin, dict):
+        nested = origin.get("formatLayout", origin.get("format_layout"))
+    return select_format_layout((request_fields or {}).get("formatLayout"), nested)
 
 
 class DraftingAgent:
@@ -4181,13 +4189,17 @@ class DraftingAgent:
         The turn runs under a fresh template version-pin table, so a draft
         started from a global template keeps reading the version it began on.
         """
-        with version_pins():
-            return await self._handle_turn(
-                user_message=user_message,
-                case_context=case_context,
-                request_fields=request_fields,
-                conversation_history=conversation_history,
-            )
+        token = _TURN_FORMAT_LAYOUT.set(None)
+        try:
+            with version_pins():
+                return await self._handle_turn(
+                    user_message=user_message,
+                    case_context=case_context,
+                    request_fields=request_fields,
+                    conversation_history=conversation_history,
+                )
+        finally:
+            _TURN_FORMAT_LAYOUT.reset(token)
 
     async def _handle_turn(
         self,
@@ -4216,6 +4228,16 @@ class DraftingAgent:
         # ----- 3a. Load or initialize the session state -----
         session_state = await self._load_session_state(
             workspace_id=workspace_id, actionable_id=actionable_id
+        )
+
+        # SIM-217: the chosen format rides on every drafting message (top
+        # level or inside draftOrigin). A turn that omits it keeps the
+        # session's, so revisions, translations and finalize stay formatted.
+        incoming_format = _incoming_format_layout(request_fields)
+        stored_format = (session_state or {}).get("format_layout")
+        _TURN_FORMAT_LAYOUT.set(
+            incoming_format
+            or (stored_format if isinstance(stored_format, dict) else None)
         )
 
         # A global template is read at the version the draft started from: the
@@ -4642,6 +4664,13 @@ class DraftingAgent:
             # draft body be mistaken for an offered menu. Clear any stale
             # value so the next turn starts clean.
             session_state.pop("last_offered_options", None)
+
+        # SIM-217: keep the latest format (without its short-lived image
+        # links) so a later turn that omits it still applies it.
+        if incoming_format:
+            session_state["format_layout"] = without_image_links(incoming_format)
+        elif isinstance(stored_format, dict) and not session_state.get("format_layout"):
+            session_state["format_layout"] = stored_format
 
         # Persist the updated session state (best-effort).
         await self._save_session_state(
@@ -7948,35 +7977,23 @@ OUTPUT FORMAT:
 
             await self._log_docx_structure(path_used, markdown, docx_bytes)
 
-            # Object key convention (matches the rest of the platform):
-            #   draft/{userId}/{uuid4}-{safeOriginalName}.docx
-            # A fresh UUID per upload prevents collisions across revisions
-            # and across users re-using the same draft title. The user id
-            # scopes the object to its owner for easy lifecycle policies.
-            import uuid as _uuid
+            # SIM-217: the lawyer's chosen format is applied last, so its page
+            # settings win over the template's and the standard layout, its
+            # letterhead replaces the header/footer, and its court block sits
+            # at the top. A failure ships the unformatted file.
+            docx_bytes = await self._apply_chosen_format(docx_bytes, route=path_used)
 
-            safe_user = user_id or "anonymous"
-            safe_name = _safe_filename(draft_title) + ".docx"
-            file_uuid = _uuid.uuid4().hex
-            blob_name = (
-                f"{_DRAFT_GCS_PREFIX}/{safe_user}/{file_uuid}-{safe_name}"
-            )
-            await asyncio.to_thread(
-                _gcs.upload_bytes,
-                bucket,
-                blob_name,
-                docx_bytes,
-                _DOCX_MIME,
-            )
-            # V2 signed URL — long-lived (~25 years), works under UBLA.
-            # Matches the platform's TS uploader (expires 2050-01-01).
+            # SIM-211: filed under drafts/<workspaceId>/ (the workspace purge
+            # deletes that prefix), no title in the object name, short link.
+            from app.storage.draft_files import upload_draft_docx
+
             url = await asyncio.to_thread(
-                _gcs.generate_signed_url, bucket, blob_name
+                upload_draft_docx, workspace_id, docx_bytes
             )
             logger.success(
                 "DOCX exported (user={}, workspace={}, session={}, "
                 "version={}, path={}): {}",
-                safe_user,
+                user_id or "-",
                 workspace_id or "-",
                 actionable_id or "-",
                 version,
@@ -7993,6 +8010,56 @@ OUTPUT FORMAT:
                 e,
             )
             return None
+
+    async def _apply_chosen_format(
+        self, docx_bytes: Optional[bytes], *, route: str
+    ) -> Optional[bytes]:
+        """Apply the turn's chosen court/letterhead format (SIM-217).
+
+        Never loses the draft: any failure logs and returns the file as it
+        was. Logs one summary line of counts and enum values only.
+        """
+        format_layout = _TURN_FORMAT_LAYOUT.get()
+        if not docx_bytes or not format_layout:
+            return docx_bytes
+        try:
+            from app.processing.draft_format import apply_format_layout, summary_fields
+            from app.processing.format_images import fetch_format_image
+
+            result = await asyncio.to_thread(
+                apply_format_layout,
+                docx_bytes,
+                format_layout,
+                fetch_image=fetch_format_image,
+            )
+        except asyncio.CancelledError:
+            logger.warning("draft_format cancelled route={}", route)
+            raise
+        except Exception as exc:
+            logger.opt(exception=exc).error(
+                "draft_format failed route={}; uploading the unformatted file", route
+            )
+            return docx_bytes
+        f = summary_fields(result)
+        logger.info(
+            "draft_format applied route={} type={} page={} watermark={} page_number={} "
+            "letterhead_blocks={} court_blocks={} court_duplicates={} images_ok={} "
+            "images_failed={} unknown_keys={} [{}] invalid={}",
+            route,
+            f["type"],
+            f["page"],
+            f["watermark"],
+            f["page_number"],
+            f["letterhead_blocks"],
+            f["court_blocks"],
+            f["court_duplicates"],
+            f["images_ok"],
+            f["images_failed"],
+            f["unknown_keys"],
+            f["unknown_names"],
+            f["invalid"],
+        )
+        return result.docx_bytes
 
     async def _lazy_backfill_template_skeleton(
         self,

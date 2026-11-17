@@ -389,6 +389,11 @@ class Settings(BaseSettings):
     template_fill_v2: bool = False
     template_fidelity_ingest: bool = False
     template_scan_vision: bool = True
+    # SIM-211: how long a draft .docx link works. The backend copies the file
+    # into its own storage as soon as the draft arrives, so the link only has
+    # to outlive that copy; matches the backend's GCS_SIGNED_URL_TTL_MINUTES (15). Never set
+    # this to years: a signed link cannot be revoked.
+    draft_docx_link_ttl_seconds: int = 900
     chirp_region: str = "us"  # Speech-to-Text V2 regional endpoint (us / eu / asia)
     audio_languages: str = (
         "en-IN,hi-IN"  # Comma-separated language codes (Chirp 3 diarization-supported)

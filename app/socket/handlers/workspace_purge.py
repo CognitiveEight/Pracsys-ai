@@ -30,6 +30,8 @@ What "delete everything under it" covers
 - Qdrant: document chunks AND every workspace state-cache point, via a single
   workspace_id-scoped delete.
 - The workspace context and any files staged on local disk.
+- Generated draft Word files under ``drafts/<workspaceId>/`` in the drafts
+  bucket (``app.storage.draft_files``, SIM-211).
 - Every in-memory cache in the event handler keyed by this workspace.
 - Future writes: a purged workspace is blocked at
   ``app.workspace.persistence`` so an upsert already in flight cannot land
@@ -50,6 +52,7 @@ from loguru import logger
 
 from app.observability.audit import audit_logger
 from app.socket.schemas import WorkspaceDeletedPayload
+from app.storage import draft_files
 from app.workspace.manager import workspace_manager
 from app.workspace.persistence import (
     allow_workspace_persistence,
@@ -455,6 +458,13 @@ class WorkspacePurgeMixin:
         #    the manager short-circuits on a workspace it never loaded.
         await vector_store.delete_workspace(workspace_id)
 
+        # 6. Generated draft Word files (SIM-211): everything under
+        #    drafts/<workspaceId>/ in the drafts bucket. A storage error raises,
+        #    so the purge retries and escalates rather than reporting success.
+        draft_files_deleted = await asyncio.to_thread(
+            draft_files.delete_workspace_draft_files, workspace_id
+        )
+
         self._pending_purges.pop(workspace_id, None)
         self._purged_workspaces[workspace_id] = {
             "purgedAt": datetime.now(timezone.utc).isoformat(),
@@ -465,12 +475,13 @@ class WorkspacePurgeMixin:
 
         logger.success(
             "Workspace {} purged (owner={}, reason={}, request={}) — {} in-memory "
-            "entr(ies) cleared",
+            "entr(ies) cleared, {} draft file(s) deleted",
             workspace_id,
             user_id or "<unknown>",
             reason or "unspecified",
             request_id or "<none>",
             cleared,
+            draft_files_deleted,
         )
         audit_logger.log_event(
             "workspace_purged",
@@ -480,6 +491,7 @@ class WorkspacePurgeMixin:
                 "request_id": request_id,
                 "reason": reason,
                 "cleared_entries": cleared,
+                "draft_files_deleted": draft_files_deleted,
             },
         )
 

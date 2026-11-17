@@ -78,7 +78,7 @@ says otherwise, `aiModel` is not used.
 | `document_reload_request` | backend → AI | Lawyer reloads one document, or it scored poorly | `requestId`, `workspaceId`, `userId`, `targetFile`, `evidenceFiles[]`, `currentState` (mandatory), `reason` | Resolve the document id from the payload, never invent one. Purge, re-read and re-run the suite. Swallow a re-send while in flight or just completed (180 s). Re-run after a failure. |
 | `workspace_stop_request` | backend → AI | Lawyer clicks Stop | `requestId`, `workspaceId`, `stoppedBy`, `receivedFeatures[]`, `pendingFeatures[]`, `stoppedAt` | **Never reply.** Bump the run epoch. Cancel the run's tasks. Drop buffered panels in memory and on disk. Ignore a stop older than newer work. Dedupe on `requestId` for 24 h. |
 | `workspace_resume_request` | backend → AI | Lawyer clicks "Finish update" | `requestId`, `workspaceId`, `userId`, `reEmitFeatures[]`, `evidenceFiles[]`, `currentState` | Emit `workspace:refresh` naming exactly `reEmitFeatures`. Then emit one panel per declared feature, in product order, and nothing else. Dedupe on `requestId` like a reload. |
-| `user_message_request` | backend → AI | Lawyer sends a chat message | `content`, `chatType`, `conversation_history[]`, `workspaceId`, `userId`, `chatId`, `timestamp`, `attachment`, `askedBy` (non-owner only), drafting fields (`actionableId`, `templateId`, `templateScope`, `templateVersion`, `templateUrl`, …), `aiModel` | Answer with one `ai_response`. A draft from a global template reads the `templateVersion` it started from. A `view` collaborator gets the answer but no case change. `aiModel` applies to this turn only. Chat is never cancelled by Stop. |
+| `user_message_request` | backend → AI | Lawyer sends a chat message | `content`, `chatType`, `conversation_history[]`, `workspaceId`, `userId`, `chatId`, `timestamp`, `attachment`, `askedBy` (non-owner only), drafting fields (`actionableId`, `templateId`, `templateScope`, `templateVersion`, `templateUrl`, `formatLayout` or `draftOrigin.formatLayout`, …), `aiModel` | Answer with one `ai_response`. A draft from a global template reads the `templateVersion` it started from. A draft's Word file applies the chosen `formatLayout.formatting` (see "Chosen draft format" below). A `view` collaborator gets the answer but no case change. `aiModel` applies to this turn only. Chat is never cancelled by Stop. |
 | `probing_prompts_request` | backend → AI | Frontend polls for suggestion chips | `workspaceId`, `userId`, `chatId`, `chatType`, `actionableId`, `viewType`, last messages (optional) | Reply with `probing_prompts_response`. Logged at DEBUG. |
 | `analysis_report_feedback` | backend → AI | Lawyer rejects a Missing Information or Risk item | `workspaceId`, `userId`, `workspaceRole`, `section`, `rejectedValue`, `isRejected`, `timestamp` | Remember the rejection. Recalculate the score. Re-emit `analysis_report`. |
 | `added_missing_information` | backend → AI | Lawyer supplies missing information | `workspaceId`, `userId`, `title`, `description`, `workspaceRole`, `timestamp` | Assess relevance. If related, adjust the score and its explanation. Re-emit `analysis_report`. |
@@ -113,6 +113,44 @@ says otherwise, `aiModel` is not used.
 | `template_blueprint_proposal` | AI → backend | A template needs a blueprint | proposal for one template; a global one has `scope: "global"`, no `userId`, and the request's `fileHash` | Show it on the approval screen. Drop a global proposal whose `fileHash` no longer matches. |
 | `request_global_template_sync` | AI → backend | Every (re)connect | `requestId` | Reply `global_template_sync_response` with every published global template and the same `requestId`, even when empty. |
 | `ai_heartbeat_pong` | AI → backend | Every ping | `requestId`, `serverSentAt` (echoed), `aiTimestamp`, `status`, `version`, `uptimeMs` | Mark the AI link alive. |
+
+### Chosen draft format (`formatLayout`, SIM-217)
+
+Every drafting `user_message_request` carries the lawyer's chosen format as
+`formatLayout` (`{id, name, type: "court" | "letterhead", formatting}`), top
+level or as `draftOrigin.formatLayout`. The AI applies `formatting` to the
+draft's Word file (`draftDocument.downloadUrl`) on every export: first draft,
+revision, translation and final draft. No field is new; the AI used to ignore
+this one.
+
+- **`formatting.page`** (both types): `font`, `fontSize`, `lineSpacing`,
+  `pageSize` (`A4` / `Legal` / `Letter`), `orientation`, `margins {top,
+  bottom, left, right}` ("1in", "2.54cm", "25mm", "72pt"; a bare number is
+  inches), `alignment` (`justified` / `left`), `watermark` (`None` / `DRAFT` /
+  `CONFIDENTIAL` / `URGENT`), `pageNumber` (`<left|center|right>_<top|bottom>`,
+  or `None`). These override the template's own settings.
+- **`formatting.letterhead`** (`type: "letterhead"` only): `headerType`,
+  `footerType` (`text` / `image`), `header{Text,Html,FontFamily,FontSize,
+  Spacing,Bold,Italic,Underline,Align,Show}{Left,Center,Right}`, the same
+  `footer…` keys, `headerImageUrl`, `headerImage{Left,Center,Right}`,
+  `footerImageUrl`, `pageApplication` (`all` / `first`). `header…Html…`, when
+  present (even `""`), replaces that block's text and bold; only `b`, `strong`,
+  `i`, `em`, `u`, `br`, `p` and `div` are kept. `header…Show…` unset means
+  shown. The letterhead replaces any header and footer the file had.
+- **`formatting.court`** (`type: "court"` only): `courtHeader`,
+  `jurisdiction`, `documentType`, `caseNumber`, `customFields[]`, each
+  `{text, font, fontSize, bold, italic, underline, uppercase, lineSpacing,
+  align}` (a custom field without `text` uses `label: value`). Inserted at the
+  top of the body in that order; a line the draft already starts with is not
+  repeated. The header is not touched.
+- **Images must be fresh, short-lived `https` links to PNG or JPEG.** The AI
+  downloads each once (about 10 s and 5 MB at most, public hosts only, no
+  redirects), never stores the link, and skips an image it cannot fetch. A
+  link to private storage the AI cannot read means no image, not a failed
+  draft.
+- Unknown keys and values are ignored, never an error; their key names (never
+  values) are counted in the `draft_format applied` log line. A turn without
+  the field keeps the session's last format, stored without image links.
 
 ## Rules both sides must follow
 
@@ -189,3 +227,4 @@ says otherwise, `aiModel` is not used.
 | 2026-10-21 | First version, written from the code | SIM-113 |
 | 2026-10-27 | `rejectionFeedback` on the analysis report sent after a reject (additive) | SIM-163 |
 | 2026-10-29 | AI handles `kb_document_added` / `kb_document_deleted` / `kb_sync`; chat citations gain `type: "knowledge_base"` (additive) | SIM-174 |
+| 2026-11-17 | AI applies the existing `formatLayout` (also read from `draftOrigin.formatLayout`) to the draft's Word file; letterhead images must be fresh https PNG/JPEG links | SIM-217 |

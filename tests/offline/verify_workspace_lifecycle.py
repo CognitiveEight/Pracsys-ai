@@ -79,6 +79,7 @@ from app.socket.handlers import run_control as RC  # noqa: E402
 from app.socket.handlers import workspace_events as WE  # noqa: E402
 from app.socket.handlers import workspace_purge as WP  # noqa: E402
 from app.socket.schemas import CaseLawDocumentRequest  # noqa: E402
+from app.storage import draft_files  # noqa: E402
 from app.utils.redact import validation_fields  # noqa: E402
 from app.vectorstore.qdrant import vector_store  # noqa: E402
 from app.workspace import participants as P  # noqa: E402
@@ -248,6 +249,11 @@ def _install_stubs():
     vector_store.get_workspace_role = _get_role
     vector_store.upsert_workspace_role = _upsert_role
     workspace_manager.delete_workspace = _wm_delete_workspace
+
+    def _delete_draft_files(workspace_id):
+        ORDER.append(("draft_files_delete", workspace_id))
+        return 2
+    draft_files.delete_workspace_draft_files = _delete_draft_files
 
     real_block = WP.block_workspace_persistence
 
@@ -460,6 +466,13 @@ async def check_purge():
           < stages.index("vector_delete"), detail=str(stages))
     check("persistence was already blocked when the running work was cancelled",
           seen["blocked_at_cancel"] is True)
+    check("the purge deletes the case's draft Word files after the vector delete (SIM-211)",
+          "draft_files_delete" in stages
+          and stages.index("vector_delete") < stages.index("draft_files_delete"),
+          detail=str(stages))
+    purged_audit = _audits("workspace_purged", ws)
+    check("the purge audit records how many draft files were deleted",
+          bool(purged_audit) and purged_audit[-1].get("draft_files_deleted") == 2)
     check("the case's running registered task is cancelled (bug 2)", running.cancelled())
     check("the stop fence is raised: epoch incremented and NOT swept (bug 2)",
           H._run_epochs.get(ws) == epoch_before + 1,

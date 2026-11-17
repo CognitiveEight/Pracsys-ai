@@ -164,13 +164,22 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
   templates under a reserved owner, keyed by template id and version.
 - Draft sessions: the Qdrant workspace state cache (`drafting_session`).
 - Template DOCX skeletons and generated drafts: cloud storage
-  (`GCS_DOCX_BUCKET_NAME`), under `templates/` and `draft/` prefixes.
+  (`GCS_DOCX_BUCKET_NAME`, the same bucket the backend uses for
+  `templates/`, `letterheads/`, `avatars/` and `audio/`). AI skeletons under
+  `ai-templates/` (older ones stay under `templates/` and remain readable
+  through their stored gs:// URI); generated drafts under
+  `drafts/<workspaceId>/<uuid>.docx` (SIM-211), written only through
+  `app/storage/draft_files.upload_draft_docx`. The old
+  `draft/<userId>/<uuid>-<title>.docx` layout is removed by
+  `scripts/cleanup_legacy_draft_files.py`.
 - Suggestions: `_workspace_drafting_payload`, re-emitted on reconnect.
 
 ### Security
 
-- Download links for generated drafts are long-lived signed URLs (about 25
-  years). Only `safe_url()` forms are logged.
+- Download links for generated drafts are short-lived signed URLs
+  (`DRAFT_DOCX_LINK_TTL_SECONDS`, default 15 minutes): a hand-off the backend
+  copies at once. No draft title in object names. Only `safe_url()` forms are
+  logged.
 - Drafting chat is not gated by sharing permission: a view-only collaborator
   can run a drafting session. Drafting does not change case panels.
 
@@ -187,8 +196,8 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
 
 - No automated tests for matching quality, the drafting conversation or Word
   export.
-- Generated draft files and template skeletons in cloud storage are never
-  deleted: not on template delete, and not by the workspace purge.
+- Template skeletons in cloud storage are not deleted on template delete.
+  Generated draft files are deleted by the workspace purge (SIM-211).
 - Approved blueprints and presets live in memory and rely on the backend
   re-sending them in the snapshot after a restart; this was not verified.
 

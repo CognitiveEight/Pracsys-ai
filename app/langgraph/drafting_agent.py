@@ -102,32 +102,20 @@ DRAFTING_SESSION_CACHE_KIND = "drafting_session"
 # appears AFTER that boiler-plate, so a generous window matters.
 _CLASSIFY_CONTENT_CHARS = 4000
 
-# DOCX export — public bucket prefix for generated drafts, private prefix
-# for the original template skeletons we retain so future drafts can
-# reuse the lawyer's formatting.
+# DOCX export. Generated drafts are stored by app.storage.draft_files
+# (drafts/<workspaceId>/, SIM-211); this prefix holds the original template
+# skeletons we retain so future drafts can reuse the lawyer's formatting.
 _DOCX_MIME = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 )
-_TEMPLATE_GCS_PREFIX = "templates"
-_DRAFT_GCS_PREFIX = "draft"
+# The drafts bucket is shared with the backend, which owns `templates/`,
+# `letterheads/`, `avatars/` and `audio/`. The AI's template skeletons live
+# under their own prefix so the two can never overwrite each other. Skeletons
+# saved earlier under `templates/` stay readable: each template stores its full
+# gs:// URI (`template_docx_gcs_uri`).
+_TEMPLATE_GCS_PREFIX = "ai-templates"
 # Photo/scan template uploads that the SIM-206 reader can rebuild as .docx.
 _TEMPLATE_IMAGE_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "tif", "tiff", "bmp")
-
-
-def _safe_filename(name: str, *, default: str = "draft") -> str:
-    """Slugify a draft title for safe inclusion in a GCS object key.
-
-    Rules (matches the convention used elsewhere in the platform):
-      - Spaces → ``_``.
-      - Any character outside ``[A-Za-z0-9._-]`` is stripped.
-      - Empty result falls back to ``default``.
-    """
-    name = (name or "").strip()
-    if not name:
-        return default
-    name = name.replace(" ", "_")
-    cleaned = re.sub(r"[^A-Za-z0-9._-]", "", name)
-    return cleaned or default
 
 
 def _is_missing_object_error(exc: Exception) -> bool:
@@ -522,6 +510,25 @@ def _template_skeleton_blob(
     if scope == GLOBAL_SCOPE:
         return f"{_TEMPLATE_GCS_PREFIX}/global/{template_id}/v{version or 0}.docx"
     return f"{_TEMPLATE_GCS_PREFIX}/{user_id}/{template_id}.docx"
+
+
+def _as_int(value: Any) -> Optional[int]:
+    """A backend version number, or None when absent or not a whole number."""
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value) if value is not None and str(value).strip() else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_heading(markdown: str) -> str:
+    """The text of a Markdown draft's first heading (title fallback)."""
+    for line in (markdown or "").splitlines():
+        m = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
+        if m:
+            return m.group(1).replace("**", "").strip()[:120]
+    return ""
 
 
 def _word_count(text: str) -> int:
@@ -4232,6 +4239,22 @@ class DraftingAgent:
                 (session_state or {}).get("template_version"),
             )
 
+        # SIM-219: the backend sends its latest stored .docx of the draft
+        # (with the lawyer's own editor changes). Revise THAT, not our copy.
+        # Checked before any model call: a refusal returns here, unsaved.
+        draft_id = (request_fields.get("draftId") or "").strip() or None
+        base_url = (request_fields.get("baseDocumentUrl") or "").strip()
+        base_version = request_fields.get("baseVersion")
+        adopted_base_chars: Optional[int] = None
+        if base_url:
+            refusal, session_state, adopted_base_chars = await self._adopt_revision_base(
+                base_url=base_url,
+                base_version=base_version,
+                session_state=session_state,
+            )
+            if refusal is not None:
+                return refusal
+
         # Greeting fast-path — runs BEFORE any drafting-state branch.
         # A bare "hi" / "hello" / "good morning" must always route to
         # chat, regardless of session state, `source` signals, or
@@ -4651,14 +4674,96 @@ class DraftingAgent:
             session_state=session_state,
         )
 
+        draft_document = session_state.get("last_draft_document")
+        if adopted_base_chars is not None:
+            logger.info(
+                "draft_revise_from_base outcome={} tracked=0 comments=0 chars={}",
+                "revised" if is_draft_delivery else "adopted",
+                adopted_base_chars,
+            )
+        if isinstance(draft_document, dict) and (draft_id or adopted_base_chars is not None):
+            # Echo the backend's ids on a copy: the persisted session keeps
+            # the AI's own record unchanged.
+            draft_document = dict(draft_document)
+            if draft_id:
+                draft_document["draftId"] = draft_id
+            if adopted_base_chars is not None and is_draft_delivery:
+                draft_document["baseVersion"] = _as_int(base_version)
+
         return {
             "content": session_state.get("last_assistant_message") or "",
             "draftStatus": session_state.get("draft_status") or "gathering_info",
             "openQuestions": list(session_state.get("open_questions") or []),
-            "draftDocument": session_state.get("last_draft_document"),
+            "draftDocument": draft_document,
             "isDraft": is_draft_delivery,
             "session_state": session_state,
         }
+
+    async def _adopt_revision_base(
+        self,
+        *,
+        base_url: str,
+        base_version: Any,
+        session_state: Optional[Dict[str, Any]],
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[int]]:
+        """Read the backend's latest .docx and make it the session's draft.
+
+        Returns ``(refusal_turn, session_state, adopted_chars)``. A refusal
+        turn (``open_changes`` / ``base_unreadable``) is the whole reply for
+        this turn: no model call, no ``draftDocument``, ``draftStatus`` stays
+        ``ready`` and the session is left as it was. Otherwise the base text
+        replaces ``last_draft_markdown`` so every later step of the turn
+        (router preview, revision prompt, regressed-value restore, finalize,
+        translate) works from the lawyer's version.
+        """
+        from app.processing.draft_revision_base import (
+            OUTCOME_OK,
+            load_revision_base,
+        )
+
+        try:
+            base = await load_revision_base(base_url)
+        except asyncio.CancelledError:
+            logger.warning("draft_revise_from_base cancelled while reading the base file")
+            raise
+
+        if base.outcome != OUTCOME_OK:
+            logger.info(
+                "draft_revise_from_base outcome={} tracked={} comments={} chars=0 reason={}",
+                base.outcome,
+                base.tracked_changes,
+                base.comments,
+                base.reason or "-",
+            )
+            return (
+                {
+                    "content": base.message(),
+                    "draftStatus": "ready",
+                    "openQuestions": [],
+                    "draftDocument": None,
+                    "draftRefusal": base.refusal(),
+                    "isDraft": False,
+                    "session_state": session_state,
+                },
+                session_state,
+                None,
+            )
+
+        state: Dict[str, Any] = session_state if session_state is not None else {}
+        markdown = normalize_if_enabled(base.markdown).strip()
+        state["last_draft_markdown"] = markdown
+        version = _as_int(base_version)
+        if version is not None:
+            # The backend's version is the only one that counts; aligning ours
+            # makes the next AI version vN+1 of the lawyer's vN.
+            state["current_draft_version"] = version
+            state["base_version"] = version
+        if not (state.get("draft_title") or "").strip():
+            state["draft_title"] = _first_heading(markdown) or "Draft"
+        if (state.get("draft_status") or "").strip() not in self._ACTIVE_DRAFT_STATUSES:
+            # A stored version exists, so the draft is ready to revise.
+            state["draft_status"] = "ready"
+        return None, state, len(markdown)
 
     async def _dispatch_classified_turn(
         self,
@@ -7948,35 +8053,17 @@ OUTPUT FORMAT:
 
             await self._log_docx_structure(path_used, markdown, docx_bytes)
 
-            # Object key convention (matches the rest of the platform):
-            #   draft/{userId}/{uuid4}-{safeOriginalName}.docx
-            # A fresh UUID per upload prevents collisions across revisions
-            # and across users re-using the same draft title. The user id
-            # scopes the object to its owner for easy lifecycle policies.
-            import uuid as _uuid
+            # SIM-211: filed under drafts/<workspaceId>/ (the workspace purge
+            # deletes that prefix), no title in the object name, short link.
+            from app.storage.draft_files import upload_draft_docx
 
-            safe_user = user_id or "anonymous"
-            safe_name = _safe_filename(draft_title) + ".docx"
-            file_uuid = _uuid.uuid4().hex
-            blob_name = (
-                f"{_DRAFT_GCS_PREFIX}/{safe_user}/{file_uuid}-{safe_name}"
-            )
-            await asyncio.to_thread(
-                _gcs.upload_bytes,
-                bucket,
-                blob_name,
-                docx_bytes,
-                _DOCX_MIME,
-            )
-            # V2 signed URL — long-lived (~25 years), works under UBLA.
-            # Matches the platform's TS uploader (expires 2050-01-01).
             url = await asyncio.to_thread(
-                _gcs.generate_signed_url, bucket, blob_name
+                upload_draft_docx, workspace_id, docx_bytes
             )
             logger.success(
                 "DOCX exported (user={}, workspace={}, session={}, "
                 "version={}, path={}): {}",
-                safe_user,
+                user_id or "-",
                 workspace_id or "-",
                 actionable_id or "-",
                 version,

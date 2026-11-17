@@ -95,6 +95,27 @@ app page in `other_side`.
    from the case alone. Each reply carries `draftStatus` (analyzing,
    gathering_info, ready, revising), `openQuestions` and, when ready,
    `draftDocument` (Markdown).
+
+   **Revising the lawyer's latest version (SIM-219).** The backend stores
+   every version as a .docx, including the lawyer's edits made in the editor.
+   When a drafting turn carries `baseDocumentUrl` (with `baseVersion` and
+   `draftId`), the agent reads that file once, before any model call
+   (`app/processing/draft_revision_base.py`):
+   - tracked changes or comments still open (`docx_review_state.py`, the
+     contract's list) → refused with `draftRefusal.code: "open_changes"` and
+     the counts; the lawyer settles them in the editor first;
+   - link failed or expired, file too large, or not a .docx → refused with
+     `base_unreadable`;
+   - otherwise the body is read back into the drafting Markdown
+     (`docx_markdown.py`: headings, GFM tables, lists, bold/italic, line
+     breaks) and replaces the session's draft, so the revision is vN+1 of the
+     lawyer's vN. `draftDocument` echoes `draftId` and `baseVersion`.
+
+   A refusal makes no model call, sends no `draftDocument`, and keeps
+   `draftStatus: ready`. Turns without `baseDocumentUrl` behave as before.
+   One `draft_revise_from_base outcome= tracked= comments= chars=` line is
+   logged per turn that carries a base (counts only; the link is never
+   stored, and logged only without its query string).
 7. **Word export.** First, the draft Markdown is normalised
    (`app/processing/draft_markdown.py`, SIM-202). Table rows are joined and
    given a separator. `\<Label\>` becomes `<Label>`. Headings deeper than
@@ -168,6 +189,8 @@ app page in `other_side`.
 | Matched template deleted | The card shows other matches or none | Card demoted and re-matched against the current library |
 | Draft storage bucket not configured (`GCS_DOCX_BUCKET_NAME`) | Draft shows, no Word download | Export returns nothing; Markdown still returned |
 | Word export fails | Draft shows, no Word download | Returns `draftDocument` without `downloadUrl` |
+| Latest version has open tracked changes or comments | "Accept or reject them in the editor, then ask again." | `draftRefusal: open_changes` with counts; no model call |
+| Latest version's link expired or file unreadable | "I could not open the latest version…" | `draftRefusal: base_unreadable`; no model call |
 | Suggestion generation fails | Empty Drafting Assistant panel | Returns an empty list; never blocks case creation |
 | Blueprint profiling fails | No approval screen for that template | Per-template failure is logged and skipped |
 
@@ -207,7 +230,14 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
   templates under a reserved owner, keyed by template id and version.
 - Draft sessions: the Qdrant workspace state cache (`drafting_session`).
 - Template DOCX skeletons and generated drafts: cloud storage
-  (`GCS_DOCX_BUCKET_NAME`), under `templates/` and `draft/` prefixes.
+  (`GCS_DOCX_BUCKET_NAME`, the same bucket the backend uses for
+  `templates/`, `letterheads/`, `avatars/` and `audio/`). AI skeletons under
+  `ai-templates/` (older ones stay under `templates/` and remain readable
+  through their stored gs:// URI); generated drafts under
+  `drafts/<workspaceId>/<uuid>.docx` (SIM-211), written only through
+  `app/storage/draft_files.upload_draft_docx`. The old
+  `draft/<userId>/<uuid>-<title>.docx` layout is removed by
+  `scripts/cleanup_legacy_draft_files.py`.
 - Suggestions: `_workspace_drafting_payload`, re-emitted on reconnect.
 
 ### Security

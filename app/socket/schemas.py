@@ -809,9 +809,10 @@ class UserMessageRequestPayload(BaseModel):
         default=None,
         validation_alias=AliasChoices("draftMode", "draft_mode"),
     )
-    # Optional layout hint sent by the frontend (reserved). Parsed and threaded
-    # through to the drafting agent for future layout-aware rendering; not yet
-    # consumed. Shape is frontend-defined — kept opaque here.
+    # The lawyer's chosen court / letterhead format ({id, name, type,
+    # formatting}). Applied to the draft's Word file (SIM-217,
+    # app/processing/draft_format.py). Kept opaque: the formatter reads only
+    # the keys it knows and reports the rest.
     formatLayout: Optional[Any] = Field(
         default=None,
         validation_alias=AliasChoices("formatLayout", "format_layout"),
@@ -831,6 +832,12 @@ class UserMessageRequestPayload(BaseModel):
     baseDocumentUrl: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("baseDocumentUrl", "base_document_url"),
+    )
+    # Backend draft-origin record; only `draftOrigin.formatLayout` is read, as
+    # a fallback when the top-level `formatLayout` is absent. Opaque.
+    draftOrigin: Optional[Any] = Field(
+        default=None,
+        validation_alias=AliasChoices("draftOrigin", "draft_origin"),
     )
 
 

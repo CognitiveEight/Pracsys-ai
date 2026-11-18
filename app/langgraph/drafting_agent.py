@@ -26,6 +26,7 @@ The agent reuses:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import re
@@ -77,6 +78,7 @@ from app.prompts.drafting import (
     infer_document_class,
 )
 from app.core.roles import DEFAULT_WORKSPACE_ROLE
+from app.processing.draft_format import select_format_layout, without_image_links
 from app.processing.draft_markdown import (
     count_placeholders,
     normalization_enabled,
@@ -95,6 +97,14 @@ from app.langgraph.template_store import GLOBAL_SCOPE, pin_template_version, ver
 # requested on every connect). Only drafting-session state still uses the
 # Qdrant cache.
 DRAFTING_SESSION_CACHE_KIND = "drafting_session"
+
+# SIM-217: the lawyer's chosen court / letterhead format for the turn being
+# handled — the request's own, else the one stored in the drafting session.
+# Read by `_export_draft_docx`, so every render route (first draft, revision,
+# translation, finalize) applies it without each caller passing it through.
+_TURN_FORMAT_LAYOUT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
+    contextvars.ContextVar("drafting_turn_format_layout", default=None)
+)
 
 # How many characters of the extracted template body to read when
 # classifying the document type. Indian legal documents often spend the
@@ -715,6 +725,16 @@ def _normalize_suggestions(raw: List[Any]) -> List[Dict[str, Any]]:
         )
     cleaned = _filter_forbidden_acts(_dedupe_suggestions(cleaned))
     return cleaned[:_MAX_SUGGESTIONS]
+
+
+def _incoming_format_layout(request_fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The request's chosen format: top-level ``formatLayout``, else
+    ``draftOrigin.formatLayout``; None when neither carries formatting."""
+    origin = (request_fields or {}).get("draftOrigin")
+    nested = None
+    if isinstance(origin, dict):
+        nested = origin.get("formatLayout", origin.get("format_layout"))
+    return select_format_layout((request_fields or {}).get("formatLayout"), nested)
 
 
 class DraftingAgent:
@@ -4240,6 +4260,7 @@ class DraftingAgent:
         started from a global template keeps reading the version it began on.
         """
         base_token = _TURN_REVISION_BASE.set(None)
+        token = _TURN_FORMAT_LAYOUT.set(None)
         try:
             with version_pins():
                 return await self._handle_turn(
@@ -4249,6 +4270,7 @@ class DraftingAgent:
                     conversation_history=conversation_history,
                 )
         finally:
+            _TURN_FORMAT_LAYOUT.reset(token)
             _TURN_REVISION_BASE.reset(base_token)
 
     async def _handle_turn(
@@ -4278,6 +4300,16 @@ class DraftingAgent:
         # ----- 3a. Load or initialize the session state -----
         session_state = await self._load_session_state(
             workspace_id=workspace_id, actionable_id=actionable_id
+        )
+
+        # SIM-217: the chosen format rides on every drafting message (top
+        # level or inside draftOrigin). A turn that omits it keeps the
+        # session's, so revisions, translations and finalize stay formatted.
+        incoming_format = _incoming_format_layout(request_fields)
+        stored_format = (session_state or {}).get("format_layout")
+        _TURN_FORMAT_LAYOUT.set(
+            incoming_format
+            or (stored_format if isinstance(stored_format, dict) else None)
         )
 
         # A global template is read at the version the draft started from: the
@@ -4720,6 +4752,13 @@ class DraftingAgent:
             # draft body be mistaken for an offered menu. Clear any stale
             # value so the next turn starts clean.
             session_state.pop("last_offered_options", None)
+
+        # SIM-217: keep the latest format (without its short-lived image
+        # links) so a later turn that omits it still applies it.
+        if incoming_format:
+            session_state["format_layout"] = without_image_links(incoming_format)
+        elif isinstance(stored_format, dict) and not session_state.get("format_layout"):
+            session_state["format_layout"] = stored_format
 
         # Persist the updated session state (best-effort).
         await self._save_session_state(
@@ -8035,6 +8074,12 @@ OUTPUT FORMAT:
                 lawyer_instructions=lawyer_instructions,
             )
 
+            # SIM-217: the lawyer's chosen format is applied last, so its page
+            # settings win over the template's and the standard layout, its
+            # letterhead replaces the header/footer, and its court block sits
+            # at the top. A failure ships the unformatted file.
+            docx_bytes = await self._apply_chosen_format(docx_bytes, route=path_used)
+
             # SIM-211: filed under drafts/<workspaceId>/ (the workspace purge
             # deletes that prefix), no title in the object name, short link.
             from app.storage.draft_files import upload_draft_docx
@@ -8258,6 +8303,56 @@ OUTPUT FORMAT:
 
         await self._log_docx_structure(path_used, markdown, docx_bytes)
         return docx_bytes, path_used
+
+    async def _apply_chosen_format(
+        self, docx_bytes: Optional[bytes], *, route: str
+    ) -> Optional[bytes]:
+        """Apply the turn's chosen court/letterhead format (SIM-217).
+
+        Never loses the draft: any failure logs and returns the file as it
+        was. Logs one summary line of counts and enum values only.
+        """
+        format_layout = _TURN_FORMAT_LAYOUT.get()
+        if not docx_bytes or not format_layout:
+            return docx_bytes
+        try:
+            from app.processing.draft_format import apply_format_layout, summary_fields
+            from app.processing.format_images import fetch_format_image
+
+            result = await asyncio.to_thread(
+                apply_format_layout,
+                docx_bytes,
+                format_layout,
+                fetch_image=fetch_format_image,
+            )
+        except asyncio.CancelledError:
+            logger.warning("draft_format cancelled route={}", route)
+            raise
+        except Exception as exc:
+            logger.opt(exception=exc).error(
+                "draft_format failed route={}; uploading the unformatted file", route
+            )
+            return docx_bytes
+        f = summary_fields(result)
+        logger.info(
+            "draft_format applied route={} type={} page={} watermark={} page_number={} "
+            "letterhead_blocks={} court_blocks={} court_duplicates={} images_ok={} "
+            "images_failed={} unknown_keys={} [{}] invalid={}",
+            route,
+            f["type"],
+            f["page"],
+            f["watermark"],
+            f["page_number"],
+            f["letterhead_blocks"],
+            f["court_blocks"],
+            f["court_duplicates"],
+            f["images_ok"],
+            f["images_failed"],
+            f["unknown_keys"],
+            f["unknown_names"],
+            f["invalid"],
+        )
+        return result.docx_bytes
 
     async def _lazy_backfill_template_skeleton(
         self,

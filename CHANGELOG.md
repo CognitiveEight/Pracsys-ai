@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **SIM-211: draft Word files are filed per workspace, expire quickly and are
+  erased with the workspace.** Generated drafts were stored under
+  `draft/<userId>/<uuid>-<title>.docx` with a link valid until 2050, and the
+  workspace purge never deleted them.
+  - New drafts go to `drafts/<workspaceId>/<uuid>.docx` (no title in the
+    name), through `app/storage/draft_files.py`, the only allowed upload path.
+  - The link expires after `DRAFT_DOCX_LINK_TTL_SECONDS` (default 900, the
+    backend's 15-minute signed-link expiry).
+    `generate_signed_url` no longer has a 2050 default.
+  - The workspace purge deletes the workspace's draft files; a storage error
+    retries and escalates like the rest of the purge.
+  - `scripts/cleanup_legacy_draft_files.py` removes the old `draft/` files:
+    dry run by default, `--execute` after sign-off, counts only.
+
 ### Added
 
 - **SIM-216: the backend can ask for a Word file built from a stored draft.**
@@ -86,6 +102,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Coverage: `tests/test_docx_review_state.py`,
     `tests/test_draft_revise_from_base.py`,
     `tests/offline/verify_draft_revise_from_base.py`.
+- **SIM-217: a draft's Word file follows the lawyer's chosen court or
+  letterhead format.** The format the lawyer picks when starting a draft
+  already arrived on every drafting message as `formatLayout`; it was parsed
+  and ignored. **No new payload fields:** the AI now consumes the existing
+  `formatLayout` (and `draftOrigin.formatLayout` as a fallback, accepted as an
+  optional opaque field).
+  - Page: font, size, line spacing, A4/Legal/Letter, orientation, margins,
+    justified or left body, a diagonal DRAFT/CONFIDENTIAL/URGENT watermark,
+    and a page number at the chosen position. These override the template's
+    own settings and the SIM-208 standard layout.
+  - Letterhead: header and footer from the Left/Center/Right blocks (text,
+    a safe subset of HTML, or images), on every page or the first only. It
+    replaces any header/footer the file had.
+  - Court: court name, jurisdiction, document type, case number and custom
+    fields inserted at the top, not repeated when the draft already starts
+    with them.
+  - Letterhead images must be fresh short-lived https links to PNG/JPEG;
+    one that cannot be fetched is skipped, never failing the draft.
+  - Applied on every export (draft, revision, translation, final draft); a
+    turn without the field keeps the session's format. A formatter failure
+    uploads the unformatted file. No model call is added. Log line:
+    `draft_format applied type= page= watermark= page_number= …` (counts and
+    enum values only).
 
 - **SIM-208: drafts without a template use the standard layout of their
   document type.**

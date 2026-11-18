@@ -153,6 +153,20 @@ app page in `other_side`.
    - yellow-highlighted `<Label>` placeholders;
    - line breaks inside signature blocks.
 
+   **The lawyer's chosen format is applied last (SIM-217).** The
+   `formatLayout` sent with every drafting message (court or letterhead) is
+   applied to the rendered file by `app/processing/draft_format.py`
+   (`apply_format_layout`), on every route: template fill, `llm_diff`,
+   heuristic fill, skeleton clone and defaults. Its page settings override
+   the template's and the SIM-208 standard layout; a letterhead replaces the
+   header and footer; a court block is inserted at the top unless the draft
+   already starts with it. Letterhead images are fetched once by
+   `app/processing/format_images.py`; a failed image is skipped. A formatter
+   failure uploads the unformatted file. One `draft_format applied type= …`
+   line (counts and enum values only) is logged per export. The function
+   works on any .docx, so it can later re-apply a format to a lawyer-edited
+   file.
+
    The file is uploaded to cloud storage and its link is returned as
    `draftDocument.downloadUrl`, with `docxStatus` and `placeholderCount`.
    One `docx_export route= tables= placeholders= leftover_markup=` line is
@@ -250,6 +264,8 @@ app page in `other_side`.
 - `app/langgraph/template_store.py` — in-memory template cache: lawyers' own
   libraries plus the Global Template Library (current version, admin drafts,
   older versions pinned by drafts).
+- `app/processing/draft_format.py` (chosen court/letterhead format, SIM-217)
+  and `app/processing/format_images.py` (its image fetcher).
 - `app/processing/docx_template_filler.py`, `app/processing/docx_generator.py`,
   `app/processing/pdf_to_docx.py`.
 - `app/prompts/drafting.py`; wire transform `drafting_payload_to_wire` in
@@ -299,6 +315,9 @@ Outbound:
 - `tests/test_draft_html.py` (HTML to Markdown) and
   `tests/offline/verify_docx_build.py` (`draft_docx_build_request`) cover
   the Word-file rebuild (SIM-216).
+- `tests/test_draft_format.py` covers the chosen format (SIM-217): page,
+  letterhead, court block, images, bad input, the export path and the
+  session copy.
 - No other dedicated drafting or template test suite exists. `drafting_assistant`
   appears only as one of the resumed panels in
   `tests/offline/verify_run_control.py` and in
@@ -324,3 +343,4 @@ Outbound:
 | 2026-10-21 | First version, written from the code | SIM-113 |
 | 2026-10-29 | Global Template Library feed, versions, global profiling; per-lawyer template events removed | SIM-173 |
 | 2026-11-17 | `draft_docx_build_request`: Word file from stored draft text (Markdown or editor HTML) | SIM-216 |
+| 2026-11-17 | The lawyer's chosen court/letterhead format is applied to the draft's Word file | SIM-217 |

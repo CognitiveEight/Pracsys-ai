@@ -195,6 +195,8 @@ def _batch(ids):
 class _DeleteControl:
     fail_times = 0  # how many delete_workspace calls raise before succeeding
     calls = 0
+    draft_fail_times = 0  # how many draft-file deletes raise before succeeding
+    draft_calls = 0
 
 
 DELETE = _DeleteControl()
@@ -252,6 +254,10 @@ def _install_stubs():
 
     def _delete_draft_files(workspace_id):
         ORDER.append(("draft_files_delete", workspace_id))
+        DELETE.draft_calls += 1
+        if DELETE.draft_fail_times:
+            DELETE.draft_fail_times -= 1
+            raise RuntimeError("simulated draft storage outage")
         return 2
     draft_files.delete_workspace_draft_files = _delete_draft_files
 
@@ -324,6 +330,8 @@ def _reset(*workspaces):
     ORDER.clear()
     DELETE.fail_times = 0
     DELETE.calls = 0
+    DELETE.draft_fail_times = 0
+    DELETE.draft_calls = 0
     SOCKET.fail_chats.clear()
     for ws in workspaces:
         WP.allow_workspace_persistence(ws)
@@ -513,6 +521,21 @@ async def check_purge():
         check("a failed purge attempt is retried and then completes",
               ws in H._purged_workspaces and DELETE.calls == 2,
               detail=f"calls={DELETE.calls}")
+
+        # 1f'. A draft-file storage error fails the attempt (SIM-211 AC-6):
+        #      the purge is not reported done, and the retry completes it.
+        ws = _ws("purge_draft_retry")
+        _reset(ws)
+        DELETE.draft_fail_times = 1
+        await H.handle("workspace_deleted", _deleted(
+            ws, purge_after=_iso(datetime.now(timezone.utc) - timedelta(seconds=1))))
+        await _until(lambda: ws in H._purged_workspaces)
+        check("a draft-file storage error fails the purge attempt, which is retried "
+              "and then completes (SIM-211)",
+              ws in H._purged_workspaces and DELETE.draft_calls == 2
+              and len(_audits("workspace_purged", ws)) == 1
+              and not _audits("workspace_purge_failed", ws),
+              detail=f"draft_calls={DELETE.draft_calls}")
 
         # 1g. Every attempt fails: critical + workspace_purge_failed.
         ws = _ws("purge_fail")

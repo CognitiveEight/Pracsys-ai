@@ -182,6 +182,25 @@ app page in `other_side`.
      - On any failure, the `llm_diff` chain runs.
    - Logs: `template fidelity built …` and `template_fill ops= applied= …`
      (counts only).
+9. **Rebuild Word file (SIM-216).** `draft_docx_build_request` builds a
+   .docx from a draft the backend already stores ("Rebuild Word file", and
+   the first Word file of an older draft) and always answers
+   `draft_docx_build_response`.
+   - `format: "markdown"` goes through the normaliser; `format: "html"` (the
+     in-app editor) is first converted to the same Markdown
+     (`app/processing/draft_html.py`: headings, bold/italic, nested lists,
+     tables, line breaks; scripts, styles and unknown tags dropped, no
+     attributes kept).
+   - Same renderer as the chat (`DraftingAgent.build_docx_from_text` →
+     `_render_draft_docx`): the template when `templateId` is given and
+     held, else the standard layout for the title. Uploaded through
+     `upload_draft_docx`, so the purge reaches it.
+   - Idempotent on `requestId` (in flight: swallowed; answered: replayed
+     for 10 minutes). Capped by `DRAFT_DOCX_BUILD_TIMEOUT_SECONDS` (120).
+     A deleted case is refused and its pending purge is not revoked. Stop
+     does not cancel it.
+   - One `draft_docx_build status= reason= format= route= template= chars=
+     placeholders=` line per build; never the title, text or link.
 
 ## Rules and limits
 
@@ -206,7 +225,8 @@ app page in `other_side`.
 | Template OCR finishes after suggestions were built | A card gains a template match later | Library count change triggers a re-match of unmatched cards |
 | Matched template deleted | The card shows other matches or none | Card demoted and re-matched against the current library |
 | Draft storage bucket not configured (`GCS_DOCX_BUCKET_NAME`) | Draft shows, no Word download | Export returns nothing; Markdown still returned |
-| Word export fails | Draft shows, no Word download | Returns `draftDocument` without `downloadUrl` |
+| Word export fails | Draft shows, no Word download | Returns `draftDocument` without `downloadUrl`; the backend can ask again with `draft_docx_build_request` |
+| Rebuild requested for a deleted case | Rebuild fails | `draft_docx_build_response` `failed` / `invalid_request`; the purge stays armed |
 | Latest version has open tracked changes or comments (including the AI's own suggested edits) | "…including any changes suggested by the AI. Accept or reject them in the editor, then ask again." | `draftRefusal: open_changes` with counts; no model call |
 | A tracked-changes revision rewrote most of the draft (SIM-220) | A clean new version, and one sentence saying why | Clean rebuild; `trackedChanges` absent; `reason=too_many_changes` |
 | Latest version's link expired or file unreadable | "I could not open the latest version…" | `draftRefusal: base_unreadable`; no model call |
@@ -223,6 +243,8 @@ app page in `other_side`.
 - `app/socket/handlers/drafting.py` — suggestions panel, re-match on library
   change.
 - `app/socket/handlers/chat.py` — `_handle_drafting_assistant_message`.
+- `app/socket/handlers/draft_docx_build.py` — `on_draft_docx_build_request`
+  (SIM-216); `app/processing/draft_html.py` — editor HTML to draft Markdown.
 - `app/langgraph/drafting_agent.py` — suggest, ingest, profile, match,
   `handle_turn`, `_export_draft_docx`.
 - `app/langgraph/template_store.py` — in-memory template cache: lawyers' own
@@ -237,10 +259,12 @@ app page in `other_side`.
 
 Inbound: `global_template_sync`, `global_template_sync_response`,
 `request_blueprint_proposal` (`scope: "global"`), `user_message_request`
-(drafting chat), `workspace_transferred`. Outbound:
+(drafting chat), `workspace_transferred`, `draft_docx_build_request`.
+Outbound:
 `request_global_template_sync` (every connect),
 `template_blueprint_proposal`, `document_feature_response`
-(`drafting_assistant`), `ai_response` (with draft fields). See
+(`drafting_assistant`), `ai_response` (with draft fields),
+`draft_docx_build_response`. See
 [the socket contract](../contracts/backend-ai-socket-events.md).
 
 ### Data
@@ -261,8 +285,10 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
 
 ### Security
 
-- Download links for generated drafts are long-lived signed URLs (about 25
-  years). Only `safe_url()` forms are logged.
+- Download links for generated drafts are short-lived signed URLs
+  (`DRAFT_DOCX_LINK_TTL_SECONDS`, default 15 minutes): a hand-off the backend
+  copies at once. No draft title in object names. Only `safe_url()` forms are
+  logged.
 - Drafting chat is not gated by sharing permission: a view-only collaborator
   can run a drafting session. Drafting does not change case panels.
 
@@ -270,6 +296,9 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
 
 - `tests/test_global_templates.py` covers the Global Template Library feed,
   global profiling and version pinning.
+- `tests/test_draft_html.py` (HTML to Markdown) and
+  `tests/offline/verify_docx_build.py` (`draft_docx_build_request`) cover
+  the Word-file rebuild (SIM-216).
 - No other dedicated drafting or template test suite exists. `drafting_assistant`
   appears only as one of the resumed panels in
   `tests/offline/verify_run_control.py` and in
@@ -283,8 +312,8 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
   (`llm_diff`) is not.
 - Template tables are not read at ingestion, so the model never sees a
   template's tables (`extract_text_from_docx` without `mark_pages`).
-- Generated draft files and template skeletons in cloud storage are never
-  deleted: not on template delete, and not by the workspace purge.
+- Template skeletons in cloud storage are not deleted on template delete.
+  Generated draft files are deleted by the workspace purge (SIM-211).
 - Approved blueprints and presets live in memory and rely on the backend
   re-sending them in the snapshot after a restart; this was not verified.
 
@@ -294,3 +323,4 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
 |---|---|---|
 | 2026-10-21 | First version, written from the code | SIM-113 |
 | 2026-10-29 | Global Template Library feed, versions, global profiling; per-lawyer template events removed | SIM-173 |
+| 2026-11-17 | `draft_docx_build_request`: Word file from stored draft text (Markdown or editor HTML) | SIM-216 |

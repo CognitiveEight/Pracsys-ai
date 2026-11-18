@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SIM-216: the backend can ask for a Word file built from a stored draft.**
+  **Socket payload change (additive): new events `draft_docx_build_request`
+  (backend → AI) and `draft_docx_build_response` (AI → backend).** Used for
+  "Rebuild Word file" and the first Word file of an older draft.
+  - `format: "markdown"` goes through the SIM-202 normaliser. `format: "html"`
+    (the in-app editor) is first converted to the same Markdown, so tables,
+    headings and nested lists come out the same. Scripts, styles, frames and
+    unknown tags are dropped or unwrapped; no attribute is kept.
+    `<Label>` fill-ins survive.
+  - Same renderer as the drafting chat: the template's formatting when
+    `templateId` is given and held (may call the model; the cost block is
+    sent only then), else the SIM-208 standard layout from the title. The
+    file is uploaded under `drafts/<workspaceId>/` with a short-lived link.
+  - Always answered: `ready`, or `failed` with `invalid_request`,
+    `empty_content`, `render_failed`, `upload_failed` or `timeout`.
+    Idempotent on `requestId`: a re-send in flight is swallowed, and an
+    answer is replayed for 10 minutes.
+  - Capped by the new `DRAFT_DOCX_BUILD_TIMEOUT_SECONDS` (default 120).
+  - A deleted case (pending or done purge) is refused as `invalid_request`
+    and its purge is not revoked; a build that finishes after the purge
+    started deletes its file again. Stop does not cancel a build.
+  - Contract: `docs/contracts/backend-ai-socket-events.md` now carries the
+    drafting Word-file sections, and says the backend copies
+    `draftDocument.downloadUrl` into its own encrypted storage instead of
+    serving it as-is.
+  - Coverage: `tests/test_draft_html.py`, `tests/offline/verify_docx_build.py`.
 - **SIM-220: a draft revision can come back as tracked changes in the
   lawyer's own file** (behind `DRAFT_REVISIONS_AS_TRACKED_CHANGES`, default
   off; off is exactly SIM-219).
@@ -132,6 +158,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SIM-211: draft Word files are filed per workspace, expire quickly and are
+  erased with the workspace.** Generated drafts were stored under
+  `draft/<userId>/<uuid>-<title>.docx` with a link valid until 2050, and the
+  workspace purge never deleted them.
+  - New drafts go to `drafts/<workspaceId>/<uuid>.docx` (no title in the
+    name), through `app/storage/draft_files.py`, the only allowed upload path.
+  - The link expires after `DRAFT_DOCX_LINK_TTL_SECONDS` (default 900, the
+    backend's 15-minute signed-link expiry).
+    `generate_signed_url` no longer has a 2050 default.
+  - The workspace purge deletes the workspace's draft files; a storage error
+    retries and escalates like the rest of the purge.
+  - `scripts/cleanup_legacy_draft_files.py` removes the old `draft/` files:
+    dry run by default, `--execute` after sign-off, counts only.
+  - The drafts bucket is shared with the backend, which owns `templates/`.
+    New AI template skeletons go to `ai-templates/`; skeletons saved earlier
+    stay readable through their stored gs:// URI.
 - **SIM-202: Drafting Assistant Word files no longer need manual repair.**
   Draft tables reached the Word file as lines of `| … |` text. `####`
   headings, `---` rules and escaped placeholders (`\<Bank Name\>`) were

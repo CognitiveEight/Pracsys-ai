@@ -85,6 +85,11 @@ def test_signed_url_has_no_default_expiry():
         gcs.generate_signed_url("b", "n")  # type: ignore[call-arg]
 
 
+def test_signed_url_refuses_explicit_none_expiry():
+    with pytest.raises(ValueError):
+        gcs.generate_signed_url("b", "n", expires_at=None)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize("bad", ["", "../other", "a/b", None])
 def test_invalid_workspace_id_is_refused(client, bad):
     with pytest.raises(ValueError):
@@ -109,6 +114,15 @@ def test_purge_deletes_only_that_workspace(client):
     assert not any(n.startswith(f"drafts/{WS}/") for n in client.objects)
     assert any(n.startswith("drafts/otherworkspace/") for n in client.objects)
     assert any(n.startswith("draft/") for n in client.objects)
+
+
+def test_purge_does_not_reach_a_workspace_whose_id_extends_it(client):
+    # "<WS>x" shares WS as a string prefix; the trailing "/" must keep it out.
+    draft_files.upload_draft_docx(WS, b"1")
+    draft_files.upload_draft_docx(WS + "x", b"2")
+
+    assert draft_files.delete_workspace_draft_files(WS) == 1
+    assert any(n.startswith(f"drafts/{WS}x/") for n in client.objects)
 
 
 def test_purge_raises_on_storage_error(client):

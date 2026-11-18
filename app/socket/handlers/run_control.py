@@ -129,9 +129,16 @@ _WORK_STARTING_EVENTS = CANCELLABLE_RUN_EVENTS | frozenset(
 )
 
 #: Events that never get a run scope. The stop must not fence itself, and a
-#: compliance purge / heartbeat emits no panels.
+#: compliance purge / heartbeat emits no panels. A Word-file build (SIM-216) is
+#: not part of an update: a stop must not cancel it and leave the backend
+#: without its answer.
 _UNSCOPED_EVENTS = frozenset(
-    {"workspace_stop_request", "workspace_deleted", "ai_heartbeat_ping"}
+    {
+        "workspace_stop_request",
+        "workspace_deleted",
+        "ai_heartbeat_ping",
+        "draft_docx_build_request",
+    }
 )
 
 #: The only emits the fence suppresses: the panel payload and the loader hint.

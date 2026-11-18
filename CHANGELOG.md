@@ -25,6 +25,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SIM-216: the backend can ask for a Word file built from a stored draft.**
+  **Socket payload change (additive): new events `draft_docx_build_request`
+  (backend → AI) and `draft_docx_build_response` (AI → backend).** Used for
+  "Rebuild Word file" and the first Word file of an older draft.
+  - `format: "markdown"` goes through the SIM-202 normaliser. `format: "html"`
+    (the in-app editor) is first converted to the same Markdown, so tables,
+    headings and nested lists come out the same. Scripts, styles, frames and
+    unknown tags are dropped or unwrapped; no attribute is kept.
+    `<Label>` fill-ins survive.
+  - Same renderer as the drafting chat: the template's formatting when
+    `templateId` is given and held (may call the model; the cost block is
+    sent only then), else the SIM-208 standard layout from the title. The
+    file is uploaded under `drafts/<workspaceId>/` with a short-lived link.
+  - Always answered: `ready`, or `failed` with `invalid_request`,
+    `empty_content`, `render_failed`, `upload_failed` or `timeout`.
+    Idempotent on `requestId`: a re-send in flight is swallowed, and an
+    answer is replayed for 10 minutes.
+  - Capped by the new `DRAFT_DOCX_BUILD_TIMEOUT_SECONDS` (default 120).
+  - A deleted case (pending or done purge) is refused as `invalid_request`
+    and its purge is not revoked; a build that finishes after the purge
+    started deletes its file again. Stop does not cancel a build.
+  - Contract: `docs/contracts/backend-ai-socket-events.md` now carries the
+    drafting Word-file sections, and says the backend copies
+    `draftDocument.downloadUrl` into its own encrypted storage instead of
+    serving it as-is.
+  - Coverage: `tests/test_draft_html.py`, `tests/offline/verify_docx_build.py`.
+- **SIM-220: a draft revision can come back as tracked changes in the
+  lawyer's own file** (behind `DRAFT_REVISIONS_AS_TRACKED_CHANGES`, default
+  off; off is exactly SIM-219).
+  - **Socket payload change (additive, optional).** `ai_response`
+    `draftDocument.trackedChanges: true` when `downloadUrl` is the lawyer's
+    file with the AI's edits as Word tracked changes (author "SimplerToday
+    AI"). Absent for a clean file.
+  - Deterministic (`app/processing/docx_track_changes.py`, no new model
+    call): blocks and then words are diffed, and only the differences are
+    written; formatting, letterhead, numbering, comments, headers, footers and
+    section properties are untouched. The base Markdown goes through the same
+    normaliser and totals check as the revision, so neither shows up as an AI
+    edit. The revision prompt gains a "copy untouched text verbatim"
+    instruction on this path only.
+  - Falls back to the SIM-219 clean file when the revision changes more than
+    `DRAFT_TRACKED_CHANGES_MAX_CHANGED_RATIO` (0.4) of the blocks (an intent
+    change, a full redraft, a translation; the reply says so), or for a
+    structure it cannot map (columns changed, fields, drawings, content
+    controls). One `draft_tracked_changes` count-only log line per revision.
+  - The AI's tracked changes count as open changes: the next revision is
+    refused until the lawyer accepts or rejects them, and the refusal message
+    now says the open changes may be the AI's own.
+  - Coverage: `tests/test_docx_track_changes.py`,
+    `tests/test_draft_tracked_revision.py`.
+
+- **SIM-219: a chat revision of a draft starts from the lawyer's latest
+  version, not the AI's own copy.** Editor changes are no longer erased by
+  the next revision.
+  - **Socket payload change (additive, optional; contract proposed, needs
+    backend sign-off).** `user_message_request` (DRAFTING_ASSISTANT) gains
+    `draftId`, `baseVersion`, `baseDocumentUrl`. `ai_response` gains
+    `draftDocument.draftId`, `draftDocument.baseVersion`, and `draftRefusal
+    {code: "open_changes" | "base_unreadable", trackedChanges, comments}`,
+    sent instead of `draftDocument`.
+  - The .docx at `baseDocumentUrl` is read once (30 s, 25 MB; settings
+    `DRAFT_BASE_DOWNLOAD_TIMEOUT_SECONDS`, `DRAFT_BASE_MAX_BYTES`) and never
+    stored. It is checked before any model call.
+  - Open tracked changes or comments (the contract's element list, in the
+    body, headers, footers, footnotes and endnotes; every comment counts):
+    refused with `open_changes` and the counts. A failed link or a file that
+    is not a .docx: refused with `base_unreadable`. A refusal makes no model
+    call, keeps `draftStatus: ready` and tells the lawyer what to do.
+  - Otherwise the file's body is read back into the drafting Markdown
+    (headings, GFM tables, lists, bold/italic) and revised as vN+1.
+  - Turns without `baseDocumentUrl` are unchanged.
+  - New: `app/processing/docx_review_state.py`, `docx_markdown.py`,
+    `draft_revision_base.py`. One `draft_revise_from_base outcome= tracked=
+    comments= chars=` line per turn; counts only.
+  - Coverage: `tests/test_docx_review_state.py`,
+    `tests/test_draft_revise_from_base.py`,
+    `tests/offline/verify_draft_revise_from_base.py`.
 - **SIM-217: a draft's Word file follows the lawyer's chosen court or
   letterhead format.** The format the lawyer picks when starting a draft
   already arrived on every drafting message as `formatLayout`; it was parsed
@@ -120,6 +197,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SIM-211: draft Word files are filed per workspace, expire quickly and are
+  erased with the workspace.** Generated drafts were stored under
+  `draft/<userId>/<uuid>-<title>.docx` with a link valid until 2050, and the
+  workspace purge never deleted them.
+  - New drafts go to `drafts/<workspaceId>/<uuid>.docx` (no title in the
+    name), through `app/storage/draft_files.py`, the only allowed upload path.
+  - The link expires after `DRAFT_DOCX_LINK_TTL_SECONDS` (default 900, the
+    backend's 15-minute signed-link expiry).
+    `generate_signed_url` no longer has a 2050 default.
+  - The workspace purge deletes the workspace's draft files; a storage error
+    retries and escalates like the rest of the purge.
+  - `scripts/cleanup_legacy_draft_files.py` removes the old `draft/` files:
+    dry run by default, `--execute` after sign-off, counts only.
+  - The drafts bucket is shared with the backend, which owns `templates/`.
+    New AI template skeletons go to `ai-templates/`; skeletons saved earlier
+    stay readable through their stored gs:// URI.
 - **SIM-202: Drafting Assistant Word files no longer need manual repair.**
   Draft tables reached the Word file as lines of `| … |` text. `####`
   headings, `---` rules and escaped placeholders (`\<Bank Name\>`) were

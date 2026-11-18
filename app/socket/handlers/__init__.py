@@ -18,6 +18,7 @@ from app.socket.handlers.law_relevance import LawRelevanceMixin
 from app.socket.handlers.panel_edits import PanelEditsMixin
 from app.socket.handlers.user_facts import UserFactsMixin
 from app.socket.handlers.docx_export import DocxExportMixin
+from app.socket.handlers.draft_docx_build import DraftDocxBuildMixin
 from app.socket.handlers.template_sync import TemplateSyncMixin
 from app.socket.handlers.knowledge_base import KnowledgeBaseMixin
 from app.socket.handlers.workspace_metadata import WorkspaceMetadataMixin
@@ -46,6 +47,7 @@ __all__ = [
     "PanelEditsMixin",
     "UserFactsMixin",
     "DocxExportMixin",
+    "DraftDocxBuildMixin",
     "TemplateSyncMixin",
     "KnowledgeBaseMixin",
     "WorkspaceMetadataMixin",

@@ -95,6 +95,45 @@ app page in `other_side`.
    from the case alone. Each reply carries `draftStatus` (analyzing,
    gathering_info, ready, revising), `openQuestions` and, when ready,
    `draftDocument` (Markdown).
+
+   **Revising the lawyer's latest version (SIM-219).** The backend stores
+   every version as a .docx, including the lawyer's edits made in the editor.
+   When a drafting turn carries `baseDocumentUrl` (with `baseVersion` and
+   `draftId`), the agent reads that file once, before any model call
+   (`app/processing/draft_revision_base.py`):
+   - tracked changes or comments still open (`docx_review_state.py`, the
+     contract's list) → refused with `draftRefusal.code: "open_changes"` and
+     the counts; the lawyer settles them in the editor first;
+   - link failed or expired, file too large, or not a .docx → refused with
+     `base_unreadable`;
+   - otherwise the body is read back into the drafting Markdown
+     (`docx_markdown.py`: headings, GFM tables, lists, bold/italic, line
+     breaks) and replaces the session's draft, so the revision is vN+1 of the
+     lawyer's vN. `draftDocument` echoes `draftId` and `baseVersion`.
+
+   A refusal makes no model call, sends no `draftDocument`, and keeps
+   `draftStatus: ready`. Turns without `baseDocumentUrl` behave as before.
+   One `draft_revise_from_base outcome= tracked= comments= chars=` line is
+   logged per turn that carries a base (counts only; the link is never
+   stored, and logged only without its query string).
+
+   **Revisions as tracked changes (SIM-220, `DRAFT_REVISIONS_AS_TRACKED_CHANGES`,
+   default off).** On a revision built from the lawyer's file, the AI returns
+   that same file with its edits as Word tracked changes (author
+   "SimplerToday AI"), so the lawyer accepts or rejects them in the editor.
+   `app/processing/docx_track_changes.py` lines up the file's paragraphs and
+   tables with the Markdown the model saw and with its revision (difflib on
+   blocks, then words) and writes only the differences: changed words as
+   `w:del`/`w:ins` with the neighbouring run's formatting, new and removed
+   paragraphs and table rows with their marks. Everything else keeps its XML;
+   other parts of the file are copied byte for byte. No model call is added;
+   the revision prompt gains one instruction to copy untouched text verbatim.
+   The file falls back to the clean rebuild (and `trackedChanges` is absent)
+   when the revision changed more than `DRAFT_TRACKED_CHANGES_MAX_CHANGED_RATIO`
+   (0.4) of the blocks (the reply then says so), when a table's columns
+   changed, or when a changed paragraph holds a field, drawing or content
+   control. One `draft_tracked_changes outcome= inserted= deleted=
+   changed_blocks= unmatched= reason=` line per revision.
 7. **Word export.** First, the draft Markdown is normalised
    (`app/processing/draft_markdown.py`, SIM-202). Table rows are joined and
    given a separator. `\<Label\>` becomes `<Label>`. Headings deeper than
@@ -157,6 +196,25 @@ app page in `other_side`.
      - On any failure, the `llm_diff` chain runs.
    - Logs: `template fidelity built …` and `template_fill ops= applied= …`
      (counts only).
+9. **Rebuild Word file (SIM-216).** `draft_docx_build_request` builds a
+   .docx from a draft the backend already stores ("Rebuild Word file", and
+   the first Word file of an older draft) and always answers
+   `draft_docx_build_response`.
+   - `format: "markdown"` goes through the normaliser; `format: "html"` (the
+     in-app editor) is first converted to the same Markdown
+     (`app/processing/draft_html.py`: headings, bold/italic, nested lists,
+     tables, line breaks; scripts, styles and unknown tags dropped, no
+     attributes kept).
+   - Same renderer as the chat (`DraftingAgent.build_docx_from_text` →
+     `_render_draft_docx`): the template when `templateId` is given and
+     held, else the standard layout for the title. Uploaded through
+     `upload_draft_docx`, so the purge reaches it.
+   - Idempotent on `requestId` (in flight: swallowed; answered: replayed
+     for 10 minutes). Capped by `DRAFT_DOCX_BUILD_TIMEOUT_SECONDS` (120).
+     A deleted case is refused and its pending purge is not revoked. Stop
+     does not cancel it.
+   - One `draft_docx_build status= reason= format= route= template= chars=
+     placeholders=` line per build; never the title, text or link.
 
 ## Rules and limits
 
@@ -181,7 +239,11 @@ app page in `other_side`.
 | Template OCR finishes after suggestions were built | A card gains a template match later | Library count change triggers a re-match of unmatched cards |
 | Matched template deleted | The card shows other matches or none | Card demoted and re-matched against the current library |
 | Draft storage bucket not configured (`GCS_DOCX_BUCKET_NAME`) | Draft shows, no Word download | Export returns nothing; Markdown still returned |
-| Word export fails | Draft shows, no Word download | Returns `draftDocument` without `downloadUrl` |
+| Word export fails | Draft shows, no Word download | Returns `draftDocument` without `downloadUrl`; the backend can ask again with `draft_docx_build_request` |
+| Rebuild requested for a deleted case | Rebuild fails | `draft_docx_build_response` `failed` / `invalid_request`; the purge stays armed |
+| Latest version has open tracked changes or comments (including the AI's own suggested edits) | "…including any changes suggested by the AI. Accept or reject them in the editor, then ask again." | `draftRefusal: open_changes` with counts; no model call |
+| A tracked-changes revision rewrote most of the draft (SIM-220) | A clean new version, and one sentence saying why | Clean rebuild; `trackedChanges` absent; `reason=too_many_changes` |
+| Latest version's link expired or file unreadable | "I could not open the latest version…" | `draftRefusal: base_unreadable`; no model call |
 | Suggestion generation fails | Empty Drafting Assistant panel | Returns an empty list; never blocks case creation |
 | Blueprint profiling fails | No approval screen for that template | Per-template failure is logged and skipped |
 
@@ -195,6 +257,8 @@ app page in `other_side`.
 - `app/socket/handlers/drafting.py` — suggestions panel, re-match on library
   change.
 - `app/socket/handlers/chat.py` — `_handle_drafting_assistant_message`.
+- `app/socket/handlers/draft_docx_build.py` — `on_draft_docx_build_request`
+  (SIM-216); `app/processing/draft_html.py` — editor HTML to draft Markdown.
 - `app/langgraph/drafting_agent.py` — suggest, ingest, profile, match,
   `handle_turn`, `_export_draft_docx`.
 - `app/langgraph/template_store.py` — in-memory template cache: lawyers' own
@@ -211,10 +275,12 @@ app page in `other_side`.
 
 Inbound: `global_template_sync`, `global_template_sync_response`,
 `request_blueprint_proposal` (`scope: "global"`), `user_message_request`
-(drafting chat), `workspace_transferred`. Outbound:
+(drafting chat), `workspace_transferred`, `draft_docx_build_request`.
+Outbound:
 `request_global_template_sync` (every connect),
 `template_blueprint_proposal`, `document_feature_response`
-(`drafting_assistant`), `ai_response` (with draft fields). See
+(`drafting_assistant`), `ai_response` (with draft fields),
+`draft_docx_build_response`. See
 [the socket contract](../contracts/backend-ai-socket-events.md).
 
 ### Data
@@ -246,6 +312,9 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
 
 - `tests/test_global_templates.py` covers the Global Template Library feed,
   global profiling and version pinning.
+- `tests/test_draft_html.py` (HTML to Markdown) and
+  `tests/offline/verify_docx_build.py` (`draft_docx_build_request`) cover
+  the Word-file rebuild (SIM-216).
 - `tests/test_draft_format.py` covers the chosen format (SIM-217): page,
   letterhead, court block, images, bad input, the export path and the
   session copy.
@@ -273,4 +342,5 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
 |---|---|---|
 | 2026-10-21 | First version, written from the code | SIM-113 |
 | 2026-10-29 | Global Template Library feed, versions, global profiling; per-lawyer template events removed | SIM-173 |
+| 2026-11-17 | `draft_docx_build_request`: Word file from stored draft text (Markdown or editor HTML) | SIM-216 |
 | 2026-11-17 | The lawyer's chosen court/letterhead format is applied to the draft's Word file | SIM-217 |

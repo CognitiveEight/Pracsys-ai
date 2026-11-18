@@ -102,32 +102,20 @@ DRAFTING_SESSION_CACHE_KIND = "drafting_session"
 # appears AFTER that boiler-plate, so a generous window matters.
 _CLASSIFY_CONTENT_CHARS = 4000
 
-# DOCX export — public bucket prefix for generated drafts, private prefix
-# for the original template skeletons we retain so future drafts can
-# reuse the lawyer's formatting.
+# DOCX export. Generated drafts are stored by app.storage.draft_files
+# (drafts/<workspaceId>/, SIM-211); this prefix holds the original template
+# skeletons we retain so future drafts can reuse the lawyer's formatting.
 _DOCX_MIME = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 )
-_TEMPLATE_GCS_PREFIX = "templates"
-_DRAFT_GCS_PREFIX = "draft"
+# The drafts bucket is shared with the backend, which owns `templates/`,
+# `letterheads/`, `avatars/` and `audio/`. The AI's template skeletons live
+# under their own prefix so the two can never overwrite each other. Skeletons
+# saved earlier under `templates/` stay readable: each template stores its full
+# gs:// URI (`template_docx_gcs_uri`).
+_TEMPLATE_GCS_PREFIX = "ai-templates"
 # Photo/scan template uploads that the SIM-206 reader can rebuild as .docx.
 _TEMPLATE_IMAGE_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "tif", "tiff", "bmp")
-
-
-def _safe_filename(name: str, *, default: str = "draft") -> str:
-    """Slugify a draft title for safe inclusion in a GCS object key.
-
-    Rules (matches the convention used elsewhere in the platform):
-      - Spaces → ``_``.
-      - Any character outside ``[A-Za-z0-9._-]`` is stripped.
-      - Empty result falls back to ``default``.
-    """
-    name = (name or "").strip()
-    if not name:
-        return default
-    name = name.replace(" ", "_")
-    cleaned = re.sub(r"[^A-Za-z0-9._-]", "", name)
-    return cleaned or default
 
 
 def _is_missing_object_error(exc: Exception) -> bool:
@@ -7932,35 +7920,17 @@ OUTPUT FORMAT:
 
             await self._log_docx_structure(path_used, markdown, docx_bytes)
 
-            # Object key convention (matches the rest of the platform):
-            #   draft/{userId}/{uuid4}-{safeOriginalName}.docx
-            # A fresh UUID per upload prevents collisions across revisions
-            # and across users re-using the same draft title. The user id
-            # scopes the object to its owner for easy lifecycle policies.
-            import uuid as _uuid
+            # SIM-211: filed under drafts/<workspaceId>/ (the workspace purge
+            # deletes that prefix), no title in the object name, short link.
+            from app.storage.draft_files import upload_draft_docx
 
-            safe_user = user_id or "anonymous"
-            safe_name = _safe_filename(draft_title) + ".docx"
-            file_uuid = _uuid.uuid4().hex
-            blob_name = (
-                f"{_DRAFT_GCS_PREFIX}/{safe_user}/{file_uuid}-{safe_name}"
-            )
-            await asyncio.to_thread(
-                _gcs.upload_bytes,
-                bucket,
-                blob_name,
-                docx_bytes,
-                _DOCX_MIME,
-            )
-            # V2 signed URL — long-lived (~25 years), works under UBLA.
-            # Matches the platform's TS uploader (expires 2050-01-01).
             url = await asyncio.to_thread(
-                _gcs.generate_signed_url, bucket, blob_name
+                upload_draft_docx, workspace_id, docx_bytes
             )
             logger.success(
                 "DOCX exported (user={}, workspace={}, session={}, "
                 "version={}, path={}): {}",
-                safe_user,
+                user_id or "-",
                 workspace_id or "-",
                 actionable_id or "-",
                 version,

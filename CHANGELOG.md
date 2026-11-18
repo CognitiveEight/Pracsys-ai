@@ -55,6 +55,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SIM-211: draft Word files are filed per workspace, expire quickly and are
+  erased with the workspace.** Generated drafts were stored under
+  `draft/<userId>/<uuid>-<title>.docx` with a link valid until 2050, and the
+  workspace purge never deleted them.
+  - New drafts go to `drafts/<workspaceId>/<uuid>.docx` (no title in the
+    name), through `app/storage/draft_files.py`, the only allowed upload path.
+  - The link expires after `DRAFT_DOCX_LINK_TTL_SECONDS` (default 900, the
+    backend's 15-minute signed-link expiry).
+    `generate_signed_url` no longer has a 2050 default.
+  - The workspace purge deletes the workspace's draft files; a storage error
+    retries and escalates like the rest of the purge.
+  - `scripts/cleanup_legacy_draft_files.py` removes the old `draft/` files:
+    dry run by default, `--execute` after sign-off, counts only.
+  - The drafts bucket is shared with the backend, which owns `templates/`.
+    New AI template skeletons go to `ai-templates/`; skeletons saved earlier
+    stay readable through their stored gs:// URI.
 - **SIM-202: Drafting Assistant Word files no longer need manual repair.**
   Draft tables reached the Word file as lines of `| … |` text. `####`
   headings, `---` rules and escaped placeholders (`\<Bank Name\>`) were

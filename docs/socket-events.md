@@ -98,7 +98,7 @@ running totals `totalInputTokens` … `totalServicePrice` (same names with a
 
 | Event | Payload (source) | Idempotency | Handler | Notes |
 |---|---|---|---|---|
-| `user_message_request` | `content: str`, `chat_type: str`, `timestamp: str`, `conversation_history: [{role: "USER" \| "AI", content: str}]`, `workspaceId?`, `userId?`, `chatId?: str`, `attachment?: {url: str, fileName?: str, mimeType?: str}`, `askedBy?: {userId: str, name?: str}`, `actionableId?`, `source?`, `suggestedDraftId?`, `suggestionTitle?`, `suggestionDescription?`, `templateId?`, `templateUrl?`, `templateOriginalName?`, `templateMimeType?`, `draftMode?: str`, `formatLayout?: any` (`UserMessageRequestPayload`; aliases accepted) | none | `on_user_message_request`, `handlers/chat.py` | Replies with `ai_response`. Fenced, never cancelled by a stop. `askedBy` present only for a non-owner |
+| `user_message_request` | `content: str`, `chat_type: str`, `timestamp: str`, `conversation_history: [{role: "USER" \| "AI", content: str}]`, `workspaceId?`, `userId?`, `chatId?: str`, `attachment?: {url: str, fileName?: str, mimeType?: str}`, `askedBy?: {userId: str, name?: str}`, `actionableId?`, `source?`, `suggestedDraftId?`, `suggestionTitle?`, `suggestionDescription?`, `templateId?`, `templateUrl?`, `templateOriginalName?`, `templateMimeType?`, `draftMode?: str`, `formatLayout?: any`, `draftId?: str`, `baseVersion?: int`, `baseDocumentUrl?: str` (SIM-219), `draftOrigin?: any` (only `draftOrigin.formatLayout` is read; SIM-217) (`UserMessageRequestPayload`; aliases accepted) | none | `on_user_message_request`, `handlers/chat.py` | Replies with `ai_response`. Fenced, never cancelled by a stop. `askedBy` present only for a non-owner |
 | `probing_prompts_request` | reads `workspaceId`, `userId`, `chatId`, `chatType`, `viewType`, `actionableId`, `maxPrompts`, `timestamp`, `lastUserMessage`, `lastAiResponse`, `conversationHistory` (snake_case aliases accepted) | none; responses throttled per workspace | `on_probing_prompts_request`, `handlers/chat.py` | Polled by the frontend; logs at DEBUG. No Pydantic model |
 
 ### Panel feedback and edits
@@ -143,7 +143,7 @@ delivery and never raises.
 |---|---|---|---|
 | `document_feature_response` | `featureType: str`, `workspaceId: str`, `userId: str`, `payload: object`, `metadata: Usage metadata` (envelope built in `_emit_document_feature`, `handlers/chat.py`) | `_emit_document_feature` and a few direct emits in `workspace_events.py`, `document_reload.py`, `run_control.py`, `objective_change.py` | The only event that clears a panel loader. Undelivered envelopes are buffered per `(workspaceId, featureType)` and re-sent on reconnect. Ingestion failure sends `{featureType: "document_assessments", workspaceId, userId, error: str, metadata}` |
 | `workspace:refresh` | `workspaceId: str`, `featureTypes: [str]`, `reason: str`, `refreshId: str`, `timestamp: str`, `userId?: str` (`_emit_workspace_refresh`, `handlers/objective_change.py`) | `_emit_workspace_refresh` | Arms one frontend loader per `featureTypes` entry. Each one needs a terminal `document_feature_response` |
-| `ai_response` | `chatId: str`, `workspaceId: str`, `userId: str`, `content: str`, `metadata?: Usage metadata`, `suggestionChips?: [str]`, `citations?: [Citation]`, `actionableId?`, `chat_type?: str`, `isDraft?: bool`, `draftStatus?: str`, `openQuestions?: [{id: str, label: str}]`, `draftDocument?: DraftDocument` (`AIResponsePayload`) | `SocketClient.emit_ai_response`, from `handlers/chat.py` | Last payload kept in `_pending_ai_response` and re-sent after a reconnect |
+| `ai_response` | `chatId: str`, `workspaceId: str`, `userId: str`, `content: str`, `metadata?: Usage metadata`, `suggestionChips?: [str]`, `citations?: [Citation]`, `actionableId?`, `chat_type?: str`, `isDraft?: bool`, `draftStatus?: str`, `openQuestions?: [{id: str, label: str}]`, `draftDocument?: DraftDocument`, `draftRefusal?: {code: "open_changes" \| "base_unreadable", trackedChanges?: int, comments?: int}` (SIM-219) (`AIResponsePayload`) | `SocketClient.emit_ai_response`, from `handlers/chat.py` | Last payload kept in `_pending_ai_response` and re-sent after a reconnect |
 | `probing_prompts_response` | `workspaceId`, `userId`, `actionableId`, `chatId`, `chatType`, `viewType` (echoed), `prompts: [str]`, `timestamp?` (echoed), `metadata?: Usage metadata` (built in `_handle_probing_prompts_request`, `handlers/chat.py`) | `handlers/chat.py` | Throttled per workspace (`PROBING_THROTTLE_SECONDS`) |
 | `applicable_law_relevance_response` | `workspaceId: str`, `userId: str`, `law: object`, `requestId?: str` (`handlers/law_relevance.py`) | `handlers/law_relevance.py` | Sent after a `document_feature_response` with `featureType: "applicable_law_relevance"` carrying the same body |
 | `case_law_document_response` | `workspaceId: str`, `userId: str`, `accepted: bool`, `requestId?: str`, `caseLaw?: {citation?, court?, summary?, referenceUrl?, referenceName?: str, relevance: "High" \| "Medium" \| "Low"}`, `rejectionReason?: str` (`CaseLawDocumentResponse`) | `handlers/case_laws.py` | Echoes `requestId` |
@@ -164,7 +164,31 @@ delivery and never raises.
 
 `DraftDocument`: `title: str`, `format: "markdown"`, `content: str`,
 `version: int`, `sourceTemplateId?`, `sourceTemplateName?`, `sourceType?:
-str`, `wordCount?: int`, `downloadUrl?: str`.
+str`, `wordCount?: int`, `downloadUrl?: str`, `docxStatus?: "ready" |
+"failed"`, `placeholderCount?: int` (SIM-202). `content` is normalised
+Markdown: GFM tables with contiguous rows, `<Label>` placeholders, headings
+`#`–`###`. When `docxStatus` is `"ready"`, `downloadUrl` is the finished Word
+file and should be served as-is.
+
+SIM-219 adds `draftId?: str` (echo of the request's `draftId`) and
+`baseVersion?: int` (the backend version this draft was revised from; absent
+for a first draft). When a drafting `user_message_request` carries
+`baseDocumentUrl`, the AI revises that .docx (the lawyer's latest version)
+instead of its own copy. If the file still has tracked changes or comments
+(`open_changes`), or cannot be fetched or read (`base_unreadable`), the reply
+carries `draftRefusal` instead of `draftDocument`, `draftStatus` stays
+`"ready"`, `content` is the lawyer-facing message, and no model is called.
+`baseDocumentUrl` is read once and never stored or logged in full.
+
+SIM-220 adds `trackedChanges?: bool` (additive). When
+`DRAFT_REVISIONS_AS_TRACKED_CHANGES` is on and a revision was built from
+`baseDocumentUrl`, `downloadUrl` is the lawyer's own file with the AI's edits
+as Word tracked changes (author "SimplerToday AI") and `trackedChanges` is
+`true`. Absent: a clean AI-built file, as before (setting off, a technical
+fallback, or a revision that rewrote most of the draft; in that last case
+`content` ends with one sentence saying so). `draftDocument.content` is the
+revised Markdown either way. The AI's tracked changes count as open changes,
+so the next revision is refused until the lawyer settles them.
 
 ## Not fully typed
 

@@ -617,6 +617,82 @@ class AnalysisDocxGenerateRequestPayload(BaseModel):
     timestamp: Optional[str] = None
 
 
+#: Largest draft text a draft_docx_build_request may carry (characters). A
+#: long pleading is a few hundred thousand; anything past this is refused as
+#: ``invalid_request`` rather than rendered.
+DRAFT_DOCX_BUILD_MAX_CONTENT_CHARS = 2_000_000
+
+
+class DraftDocxBuildRequestPayload(BaseModel):
+    """
+    Payload for draft_docx_build_request (Server -> AI, SIM-216).
+
+    Build a Word file from draft text the backend already holds: "Rebuild Word
+    file", and the first Word file of a draft saved before the AI produced
+    one. ``content`` is Markdown, or HTML from the in-app editor. Answered by
+    ``draft_docx_build_response``, always. ``title`` and ``content`` are case
+    content: never logged.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    requestId: str = Field(min_length=1)
+    workspaceId: str = Field(min_length=1)
+    userId: str = Field(min_length=1)  # the case owner
+    draftId: str = Field(min_length=1)
+    version: int = Field(ge=0)  # the backend version this file will become
+    title: str
+    content: str = Field(max_length=DRAFT_DOCX_BUILD_MAX_CONTENT_CHARS)
+    format: Literal["markdown", "html"]
+    templateId: Optional[str] = None
+    templateVersion: Optional[int] = None
+    templateScope: Optional[str] = None
+    timestamp: Optional[str] = None
+
+    @field_validator("requestId", "workspaceId", "userId", "draftId", mode="before")
+    @classmethod
+    def _strip_ids(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("format", mode="before")
+    @classmethod
+    def _lower_format(cls, value: Any) -> Any:
+        return value.strip().lower() if isinstance(value, str) else value
+
+
+class DraftDocxBuildResponsePayload(BaseModel):
+    """
+    Payload for draft_docx_build_response (AI -> Server, SIM-216).
+
+    ``reason`` only when ``status`` is ``failed``; ``downloadUrl`` only when it
+    is ``ready`` (a short-lived hand-off link the backend copies at once);
+    ``placeholderCount`` once the draft text was read; ``metadata`` (the usual
+    cost block) only when a model was called.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    requestId: str
+    workspaceId: Optional[str] = None
+    userId: Optional[str] = None
+    draftId: Optional[str] = None
+    version: Optional[int] = None
+    status: Literal["ready", "failed"]
+    reason: Optional[
+        Literal[
+            "invalid_request",
+            "empty_content",
+            "render_failed",
+            "upload_failed",
+            "timeout",
+        ]
+    ] = None
+    downloadUrl: Optional[str] = None
+    docxStatus: Literal["ready", "failed"]
+    placeholderCount: Optional[int] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
 class ConversationHistoryItem(BaseModel):
     """Schema for conversation history item."""
 
@@ -733,12 +809,35 @@ class UserMessageRequestPayload(BaseModel):
         default=None,
         validation_alias=AliasChoices("draftMode", "draft_mode"),
     )
-    # Optional layout hint sent by the frontend (reserved). Parsed and threaded
-    # through to the drafting agent for future layout-aware rendering; not yet
-    # consumed. Shape is frontend-defined — kept opaque here.
+    # The lawyer's chosen court / letterhead format ({id, name, type,
+    # formatting}). Applied to the draft's Word file (SIM-217,
+    # app/processing/draft_format.py). Kept opaque: the formatter reads only
+    # the keys it knows and reports the rest.
     formatLayout: Optional[Any] = Field(
         default=None,
         validation_alias=AliasChoices("formatLayout", "format_layout"),
+    )
+    # SIM-219: revise the backend's latest stored version, not the AI's own
+    # copy. `draftId` is echoed in draftDocument.draftId; `baseDocumentUrl` is
+    # a short-lived link to version `baseVersion`'s .docx, read once and never
+    # stored. Without it a turn behaves as before.
+    draftId: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("draftId", "draft_id"),
+    )
+    baseVersion: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("baseVersion", "base_version"),
+    )
+    baseDocumentUrl: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("baseDocumentUrl", "base_document_url"),
+    )
+    # Backend draft-origin record; only `draftOrigin.formatLayout` is read, as
+    # a fallback when the top-level `formatLayout` is absent. Opaque.
+    draftOrigin: Optional[Any] = Field(
+        default=None,
+        validation_alias=AliasChoices("draftOrigin", "draft_origin"),
     )
 
 
@@ -1046,6 +1145,33 @@ class DraftDocumentPayload(BaseModel):
     # Public HTTPS URL to the generated .docx blob uploaded to GCS.
     # Absent when DOCX generation or upload failed — markdown still ships.
     downloadUrl: Optional[str] = None
+    # SIM-202 (additive). "ready" when downloadUrl carries the AI-built Word
+    # file (serve it as-is), "failed" when no file could be produced.
+    docxStatus: Optional[Literal["ready", "failed"]] = None
+    # Distinct <Label> fill-ins still left in the draft for the lawyer.
+    placeholderCount: Optional[int] = None
+    # SIM-219 (additive). Echo of the request's draftId, and the backend
+    # version this draft was built from (absent for a first draft).
+    draftId: Optional[str] = None
+    baseVersion: Optional[int] = None
+    # SIM-220 (additive). True when downloadUrl is the lawyer's own file with
+    # the AI's edits as Word tracked changes; absent for a clean file.
+    trackedChanges: Optional[bool] = None
+
+
+class DraftRefusal(BaseModel):
+    """SIM-219: sent instead of ``draftDocument`` when the AI would not revise
+    the backend's latest version. No model was called for the turn.
+
+    ``open_changes``: the file has tracked changes or comments (counts given).
+    ``base_unreadable``: the link failed, expired, or is not a valid .docx.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    code: Literal["open_changes", "base_unreadable"]
+    trackedChanges: Optional[int] = None
+    comments: Optional[int] = None
 
 
 class Citation(BaseModel):
@@ -1127,6 +1253,8 @@ class AIResponsePayload(BaseModel):
     ] = None
     openQuestions: Optional[List[DraftOpenQuestion]] = None
     draftDocument: Optional[DraftDocumentPayload] = None
+    # SIM-219: present instead of draftDocument when a revision was refused.
+    draftRefusal: Optional[DraftRefusal] = None
 
     class Config:
         populate_by_name = True

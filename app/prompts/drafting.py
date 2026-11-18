@@ -560,6 +560,76 @@ placeholder.
   an annexure).
 
 ──────────────────────────────────────────────────────────────────
+11. RENT / LEAVE AND LICENCE / LEASE AGREEMENT (residential or commercial)
+──────────────────────────────────────────────────────────────────
+- Opening: title as a level-1 heading, then "This Agreement is made at
+  <place> on <date>", then the parties (owner/lessor/licensor and
+  tenant/lessee/licensee) each in its own paragraph with "BETWEEN" and
+  "AND" as separate short lines.
+- Recitals (WHEREAS) on ownership and the agreement to let.
+- Numbered clauses: term and lock-in, rent (a table for rent, deposit
+  and escalation), security deposit and refund, maintenance and charges,
+  use, repairs, sub-letting, termination and notice, stamp duty and
+  registration, governing law and jurisdiction.
+- Schedule of the premises on its own page (## SCHEDULE heading).
+- Execution: "IN WITNESS WHEREOF", a signature block per party, two
+  witnesses with name and address.
+
+──────────────────────────────────────────────────────────────────
+12. WILL (simple or with trusts and schedules)
+──────────────────────────────────────────────────────────────────
+- Opening: "LAST WILL AND TESTAMENT" (or "WILL") heading, then the
+  testator's declaration of identity, age, address and sound mind.
+- Numbered clauses: revocation of earlier wills, appointment of
+  executor(s) (and alternates), specific bequests (sub-clauses (a), (b)
+  ...), trusts for minors where needed, residuary clause, guardianship
+  if relevant.
+- Schedule(s) of assets as tables on their own page.
+- Attestation: testator's signature, then the attestation clause
+  ("Signed by the Testator in our presence ...") and two witnesses with
+  name, address and signature lines. No court heading.
+
+──────────────────────────────────────────────────────────────────
+13. SHAREHOLDERS' / SUBSCRIPTION AGREEMENT, ADDENDUM, MoU
+──────────────────────────────────────────────────────────────────
+- Opening: title heading, date and place, parties (company,
+  shareholders, investors) with CIN/addresses, each as a numbered party.
+- Recitals A, B, C ...
+- Clause 1 Definitions and Interpretation, then numbered operative
+  clauses (subscription or transaction, conditions precedent, closing,
+  board and governance, reserved matters, transfer restrictions — ROFR,
+  tag-along, drag-along —, anti-dilution, representations and
+  warranties, confidentiality, termination, dispute resolution,
+  governing law, miscellaneous), with 1.1 / (a) / (i) sub-numbering.
+- Capitalisation and similar data as tables; schedules on their own
+  pages; an execution page with a block per party and witnesses.
+
+──────────────────────────────────────────────────────────────────
+14. POWER OF ATTORNEY
+──────────────────────────────────────────────────────────────────
+- Opening: "GENERAL / SPECIAL POWER OF ATTORNEY" heading, then "KNOW ALL
+  MEN BY THESE PRESENTS that I, <principal> ...".
+- Recitals of why the power is given; then numbered powers granted to
+  the attorney; ratification clause; revocability.
+- Execution by the principal, acceptance by the attorney, two witnesses,
+  and a space for notarisation or registration.
+
+──────────────────────────────────────────────────────────────────
+15. UNDERTAKING / INDEMNITY BOND / DECLARATION
+──────────────────────────────────────────────────────────────────
+- Opening: heading, then "I/We, <name>, aged ..., residing at ...".
+- Numbered undertakings or indemnities; the consideration or occasion.
+- Signature of the executant with place and date; witnesses where the
+  document is a bond.
+
+──────────────────────────────────────────────────────────────────
+16. OTHER DEEDS (sale, gift, settlement, partnership, relinquishment)
+──────────────────────────────────────────────────────────────────
+- Title heading; date and place; parties; recitals; numbered operative
+  clauses; schedule of property on its own page; execution with
+  witnesses. Stamp duty and registration clause where the deed needs it.
+
+──────────────────────────────────────────────────────────────────
 FALLBACK (document type not in registry)
 ──────────────────────────────────────────────────────────────────
 If the requested document does not match any entry above, infer the
@@ -2387,6 +2457,22 @@ CONSTRAINTS:
     RULES in the base instruction DO NOT apply here.
   - Do not output any preamble, JSON, or commentary — output ONLY the
     Markdown draft body, starting with the document's title heading.
+
+FORMAT CONTRACT (the draft is converted to a Word file exactly as written):
+  - Tables: GitHub pipe tables. One header row, then the separator row
+    (| --- | --- |), then the data rows, with NO blank line between any two
+    rows of the same table. Every row has the same number of cells.
+  - Headings: use #, ## and ### only. Never #### or deeper; use bold text
+    for a lower-level caption instead.
+  - Sub-clauses under a list item are a nested list, indented two spaces
+    under their parent: "  - (a) …". Do not prefix a numbered clause with a
+    bullet ("- 3.2 …"); write "3.2 …" as its own paragraph.
+  - Unfilled values are written as <Label>. Never escape the angle brackets
+    (no \\<Label\\>).
+  - Do not use horizontal rules (---, ***). Start each schedule, annexure
+    and the execution page with its own ## heading.
+  - Signature and witness blocks: one item per line, ending each line with
+    two spaces so the line breaks are kept.
 """
 
 
@@ -3504,6 +3590,63 @@ def build_template_diff_prompt(
         "Markdown's content."
     )
     return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# SIM-204: write the draft INTO the template, paragraph by paragraph
+# ---------------------------------------------------------------------------
+
+TEMPLATE_MAP_FILL_INSTRUCTION = (
+    "You place a finished legal draft into the lawyer's own template so the "
+    "result looks exactly like the template: same fonts, headings, "
+    "numbering, tables, letterhead and spacing. You do not write or change "
+    "legal content — the DRAFT is the content; the TEMPLATE MAP is the form.\n\n"
+    "The TEMPLATE MAP lists every paragraph (p0, p1, ...) and every table row "
+    "(t0.r0, ...) with its cells (cell ids are <row id>.c0, .c1, ...). Tags in "
+    "[...] show style, alignment, label and emphasis.\n\n"
+    "Output ONE JSON object per line, nothing else (no array, no fences):\n"
+    '{"op":"replace","id":"p7","text":"..."}           replace a paragraph\'s text\n'
+    '{"op":"replace","id":"t0.r1.c2","text":"..."}     replace one cell\n'
+    '{"op":"insert_after","id":"p7","text":"...","like":"p8"}  new paragraph after p7, formatted like p8\n'
+    '{"op":"add_row","id":"t0.r3","cells":["...","..."]}   new row after t0.r3, formatted like it\n'
+    '{"op":"delete","id":"p9"}                          remove a paragraph, a row (t0.r4) or a table (t1)\n\n'
+    "Rules:\n"
+    "1. Walk the draft in order and give every part of it a place in the "
+    "template. Template text that already matches the draft needs no "
+    "operation (unnamed ids are kept as they are).\n"
+    "2. Replace placeholders, blanks, choice markers (He|She) and sample "
+    "values with the draft's values. Keep the template's wording wherever "
+    "the draft says the same thing.\n"
+    "3. Draft content with no slot in the template (an extra clause, party, "
+    "recital, schedule item) → insert_after the right paragraph, with "
+    "\"like\" = a template paragraph of the same kind and level (a clause "
+    "like a clause, a sub-clause like a sub-clause, a heading like a "
+    "heading), so it takes that paragraph's format.\n"
+    "4. Template content the draft does not use (instructions to the "
+    "lawyer, alternatives not chosen, sample clauses, empty optional "
+    "sections) → delete.\n"
+    "5. Tables: replace cells; add_row after the last data row for extra "
+    "rows (copy the row whose format fits, never a header row); delete "
+    "surplus rows. Keep the header row's text unless the draft changes it.\n"
+    "6. Numbering: for a paragraph tagged label=..., write the text WITH its "
+    "number exactly as the draft numbers it (e.g. \"3.2\\tThe Lessee shall "
+    "...\"). For a paragraph tagged auto-numbered, write the text WITHOUT a "
+    "number — Word numbers it.\n"
+    "7. In text: **bold**, *italic*, __underline__ only where the draft has "
+    "that emphasis; \\n for a line break inside the paragraph (signature and "
+    "address blocks). Keep unfilled values as <Label>.\n"
+    "8. Never touch the letterhead, header, footer or page numbers — they "
+    "are not in the map. Never invent facts; use only the draft."
+)
+
+
+def build_template_map_fill_prompt(*, template_map: str, draft_markdown: str) -> str:
+    """User prompt for the SIM-204 template fill (operations per template id)."""
+    return (
+        "TEMPLATE MAP:\n" + template_map.strip()
+        + "\n\nDRAFT (the final content, in reading order):\n" + draft_markdown.strip()
+        + "\n\nReturn the operations, one JSON object per line."
+    )
 
 
 def build_template_fill_prompt(

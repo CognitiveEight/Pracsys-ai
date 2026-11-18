@@ -372,6 +372,49 @@ class Settings(BaseSettings):
     # so the two pipelines can have independent retention / IAM policies
     # (drafts are public-read; audio uploads are private + ephemeral).
     gcs_docx_bucket_name: Optional[str] = None
+    # SIM-211: how long a draft .docx link works. The backend copies the file
+    # into its own storage as soon as the draft arrives, so the link only has
+    # to outlive that copy; matches the backend's GCS_SIGNED_URL_TTL_MINUTES (15). Never set
+    # this to years: a signed link cannot be revoked.
+    draft_docx_link_ttl_seconds: int = 900
+
+    # SIM-202: clean up the model's draft Markdown (tables, placeholders,
+    # headings, rules) before it is stored, emitted or exported, and check
+    # that a filled template kept the draft's tables and sections. False is
+    # the rollback switch.
+    draft_markdown_normalize: bool = True
+    # SIM-203 template fidelity. TEMPLATE_FILL_V2: write drafts INTO the
+    # template paragraph by paragraph (falls back to the llm_diff chain).
+    # TEMPLATE_FIDELITY_INGEST: rebuild PDF/scan/photo templates as a clean,
+    # editable .docx from their measured format (falls back to pdf2docx).
+    # TEMPLATE_SCAN_VISION: one routed Gemini vision call per scanned page
+    # for tables and font family (paid; off = measured styles only).
+    # SIM-209: a wrong table total is flagged in the draft ("<check total: X>");
+    # true replaces it with the computed figure instead.
+    draft_totals_fix: bool = False
+    template_fill_v2: bool = False
+    template_fidelity_ingest: bool = False
+    template_scan_vision: bool = True
+    # SIM-211: how long a draft .docx link works. The backend copies the file
+    # into its own storage as soon as the draft arrives, so the link only has
+    # to outlive that copy; matches the backend's GCS_SIGNED_URL_TTL_MINUTES (15). Never set
+    # this to years: a signed link cannot be revoked.
+    draft_docx_link_ttl_seconds: int = 900
+    # SIM-216: cap on one draft_docx_build_request (render + upload, and the
+    # template route's model call). Past it the backend is answered `timeout`.
+    draft_docx_build_timeout_seconds: int = 120
+    # SIM-219: the lawyer's latest draft .docx, read once per revision turn
+    # from the backend's short-lived link. Bounded so a slow or huge file
+    # cannot hold a drafting turn: past either limit the revision is refused
+    # as base_unreadable.
+    draft_base_download_timeout_seconds: float = 30.0
+    draft_base_max_bytes: int = 25 * 1024 * 1024
+    # SIM-220: return a revision as the lawyer's own file with the AI's edits
+    # written as Word tracked changes (author "SimplerToday AI"). Off: the
+    # SIM-219 clean rebuild. A revision that changes more than the ratio of
+    # the base's blocks (changed or removed / all) comes as a clean file.
+    draft_revisions_as_tracked_changes: bool = False
+    draft_tracked_changes_max_changed_ratio: float = 0.4
     chirp_region: str = "us"  # Speech-to-Text V2 regional endpoint (us / eu / asia)
     audio_languages: str = (
         "en-IN,hi-IN"  # Comma-separated language codes (Chirp 3 diarization-supported)

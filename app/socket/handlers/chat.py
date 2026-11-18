@@ -646,9 +646,16 @@ class ChatMixin:
             "templateScope": (payload.templateScope or "").strip().lower() or None,
             "templateVersion": payload.templateVersion,
             "draftMode": (payload.draftMode or "").strip().lower() or None,
-            # Reserved layout hint — threaded through for future layout-aware
-            # rendering; the drafting agent does not consume it yet.
+            # SIM-217: the chosen court/letterhead format, applied to the
+            # draft's Word file. The agent falls back to
+            # draftOrigin.formatLayout, then to the session's stored format.
             "formatLayout": payload.formatLayout,
+            # SIM-219: the backend's draft id and its latest stored version.
+            # The link is read once by the drafting agent and never stored.
+            "draftId": (payload.draftId or "").strip() or None,
+            "baseVersion": payload.baseVersion,
+            "baseDocumentUrl": (payload.baseDocumentUrl or "").strip() or None,
+            "draftOrigin": payload.draftOrigin,
         }
 
         # When the turn may need to resolve/match a template (a suggested-draft
@@ -706,6 +713,13 @@ class ChatMixin:
         }
         if ai_response_payload["draftDocument"] is None:
             ai_response_payload.pop("draftDocument", None)
+        # SIM-219: the agent refused to revise the backend's latest version
+        # (open tracked changes / comments, or the file could not be read).
+        # Sent instead of draftDocument; no model was called this turn.
+        draft_refusal = turn.get("draftRefusal")
+        if draft_refusal:
+            ai_response_payload["draftRefusal"] = draft_refusal
+            ai_response_payload.pop("draftDocument", None)
 
         # Generate drafting-specific chips so the bottom strip in the
         # Drafting Assistant panel shows draft-actionable prompts ("Adjust
@@ -714,7 +728,8 @@ class ChatMixin:
         try:
             import random as _random
 
-            chips = await self._generate_drafting_chips(
+            # A refusal makes no model call, chips included.
+            chips = [] if draft_refusal else await self._generate_drafting_chips(
                 workspace_id=workspace_id,
                 actionable_id=actionable_id,
                 draft_status=turn.get("draftStatus") or "",

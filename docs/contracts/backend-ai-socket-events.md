@@ -5,7 +5,7 @@ repo: Pracsys-ai
 owner: AI team
 status: current
 audience: everyone; engineers below "Messages"
-last_verified: 2026-10-21
+last_verified: 2026-11-17
 jira: SIM-113
 between: "backend, ai-service"
 owner_ours: AI team
@@ -78,7 +78,7 @@ says otherwise, `aiModel` is not used.
 | `document_reload_request` | backend → AI | Lawyer reloads one document, or it scored poorly | `requestId`, `workspaceId`, `userId`, `targetFile`, `evidenceFiles[]`, `currentState` (mandatory), `reason` | Resolve the document id from the payload, never invent one. Purge, re-read and re-run the suite. Swallow a re-send while in flight or just completed (180 s). Re-run after a failure. |
 | `workspace_stop_request` | backend → AI | Lawyer clicks Stop | `requestId`, `workspaceId`, `stoppedBy`, `receivedFeatures[]`, `pendingFeatures[]`, `stoppedAt` | **Never reply.** Bump the run epoch. Cancel the run's tasks. Drop buffered panels in memory and on disk. Ignore a stop older than newer work. Dedupe on `requestId` for 24 h. |
 | `workspace_resume_request` | backend → AI | Lawyer clicks "Finish update" | `requestId`, `workspaceId`, `userId`, `reEmitFeatures[]`, `evidenceFiles[]`, `currentState` | Emit `workspace:refresh` naming exactly `reEmitFeatures`. Then emit one panel per declared feature, in product order, and nothing else. Dedupe on `requestId` like a reload. |
-| `user_message_request` | backend → AI | Lawyer sends a chat message | `content`, `chatType`, `conversation_history[]`, `workspaceId`, `userId`, `chatId`, `timestamp`, `attachment`, `askedBy` (non-owner only), drafting fields (`actionableId`, `templateId`, `templateScope`, `templateVersion`, `templateUrl`, …), `aiModel` | Answer with one `ai_response`. A draft from a global template reads the `templateVersion` it started from. A `view` collaborator gets the answer but no case change. `aiModel` applies to this turn only. Chat is never cancelled by Stop. |
+| `user_message_request` | backend → AI | Lawyer sends a chat message | `content`, `chatType`, `conversation_history[]`, `workspaceId`, `userId`, `chatId`, `timestamp`, `attachment`, `askedBy` (non-owner only), drafting fields (`actionableId`, `templateId`, `templateScope`, `templateVersion`, `templateUrl`, `draftId`, `baseVersion`, `baseDocumentUrl`, `formatLayout` or `draftOrigin.formatLayout`, …), `aiModel` | Answer with one `ai_response`. A draft from a global template reads the `templateVersion` it started from. With `baseDocumentUrl` (SIM-219: short-lived link to the latest stored .docx, version `baseVersion`) the AI revises that file, not its own copy; it reads the link once and never keeps it. A draft's Word file applies the chosen `formatLayout.formatting` (see "Chosen draft format" below). A `view` collaborator gets the answer but no case change. `aiModel` applies to this turn only. Chat is never cancelled by Stop. |
 | `probing_prompts_request` | backend → AI | Frontend polls for suggestion chips | `workspaceId`, `userId`, `chatId`, `chatType`, `actionableId`, `viewType`, last messages (optional) | Reply with `probing_prompts_response`. Logged at DEBUG. |
 | `analysis_report_feedback` | backend → AI | Lawyer rejects a Missing Information or Risk item | `workspaceId`, `userId`, `workspaceRole`, `section`, `rejectedValue`, `isRejected`, `timestamp` | Remember the rejection. Recalculate the score. Re-emit `analysis_report`. |
 | `added_missing_information` | backend → AI | Lawyer supplies missing information | `workspaceId`, `userId`, `title`, `description`, `workspaceRole`, `timestamp` | Assess relevance. If related, adjust the score and its explanation. Re-emit `analysis_report`. |
@@ -88,6 +88,7 @@ says otherwise, `aiModel` is not used.
 | `case_law_document_request` | backend → AI | Lawyer uploads a judgment | `requestId`, `workspaceId`, `userId`, `documentUrl`, `documentName`, `mimeType` | Always reply `case_law_document_response` echoing `requestId`. On acceptance, also re-emit `case_laws`. |
 | `add_relevant_party` / `edit_relevant_party` / `delete_relevant_party` | backend → AI | Lawyer edits the Relevant Parties panel | `workspaceId`, `userId`, `partyId` (edit, delete), party fields | Apply the change. Re-emit `relevant_parties`. |
 | `analysis_docx_generate_request` | backend → AI | Export of the analysis to DOCX | `requestId`, `workspaceId`, `documentSource`, `contentHash`, `trigger` | Normalise the text. Reply `analysis_docx_generate_response`. |
+| `draft_docx_build_request` | backend → AI | "Rebuild Word file", or the first Word file of an older draft | `requestId`, `workspaceId`, `userId`, `draftId`, `version`, `title`, `content`, `format` (`markdown` / `html`), `templateId` / `templateVersion` / `templateScope` (optional) | Build the .docx from `content` and always reply `draft_docx_build_response`. Swallow a re-send while in flight; answer a re-send from cache for 10 minutes. A purged or pending-purge case is refused (`invalid_request`) and the purge is **not** revoked. Not cancelled by Stop. See "Drafting Word file" below (SIM-216). |
 | `request_blueprint_proposal` | backend → AI | Admin uploads or re-profiles a Global Template Library draft | `scope`, `templateId`, `fileHash`, `fileUrl`, `originalName`, `mimeType` (no `userId`) | Profile it as a draft (never suggested); a request without `scope` is treated as global. Reply `template_blueprint_proposal` with `scope: "global"`, no `userId`, the same `fileHash`; `status: "failed"` with a short `error` on failure. |
 | `global_template_sync` | backend → AI | Admin publishes, retires or deletes a global template (once for the platform) | `action` (`published`, `retired`, `deleted`), `templates[]` (`id`, `version`, `name`, `originalName`, `category`, `kind`, `extension`, `mimeType`, `size`, `fileHash`, `fileUrl`, `formatting`, `draftCategory`) | `published`: add or replace the current version; the same version and hash is a no-op. `retired`: stop suggesting it; drafts already started keep working. `deleted`: erase what is held. |
 | `global_template_sync_response` | backend → AI | Reply to `request_global_template_sync` | `requestId` (always echoed), `count`, `templates[]` | Full replace: hold every listed template as published; retire every held id not listed. An empty list is valid. |
@@ -105,14 +106,136 @@ says otherwise, `aiModel` is not used.
 | `document_feature_response` | AI → backend | One panel is ready, re-sent, or released | `featureType`, `workspaceId`, `userId`, `payload`, `metadata` (cost block, `messageId`, `aiModel`) | Store the panel. Clear that panel's loader. Record the cost under `metadata.messageId`. `featureType` is one of: `document_assessments`, `workspace_metadata`, `strategy_objective`, `analysis_report`, `list_of_dates`, `applicable_laws`, `procedural_timeline`, `relevant_parties`, `case_laws`, `drafting_assistant`, `applicable_law_relevance`. |
 | `document_feature_response` (`analysis_report`, after a reject) | AI → backend | Reply to `analysis_report_feedback` | the usual report, plus `rejectionFeedback`: `scoreChange` (applied) and `items[]` of `section`, `rejectedValue` (echoed), `isValidRejection`, `scoreIncrease`, `reason` (`RejectionFeedback` in `app/socket/schemas.py`) | Pass the field through to the frontend unchanged. Show `reason` beside the score so the lawyer sees why it did or did not move. An applied reject always raises the score by its section weight (missing info 5, weakness 5, risk 3; capped at 95% while items remain), so `isValidRejection` is `true` and `scoreIncrease` is that weight; a reject of an item already removed has `isValidRejection` `false` and `scoreIncrease` 0. It is present on this emit only; never store it on the report. |
 | `workspace:refresh` | AI → backend | Before a regeneration starts (objective change, resume, …) | `workspaceId`, `featureTypes[]`, `reason`, `refreshId`, `timestamp`, `userId` | Arm one loader per listed `featureType`. Only a matching `document_feature_response` clears it. |
-| `ai_response` | AI → backend | Chat answer | `chatId`, `workspaceId`, `userId`, `content`, `metadata`, `citations[]`, `suggestionChips[]`, drafting fields (`draftStatus`, `openQuestions`, `draftDocument`, `actionableId`) | Store and show the answer. Keep only citations whose `[n]` marker is in `content`. A citation with `type: "knowledge_base"` is a shared-shelf document: show its `title` (and `page`), never as a case annexure. Record the cost. |
+| `ai_response` | AI → backend | Chat answer | `chatId`, `workspaceId`, `userId`, `content`, `metadata`, `citations[]`, `suggestionChips[]`, drafting fields (`draftStatus`, `openQuestions`, `draftDocument` incl. `draftId` / `baseVersion`, `draftRefusal`, `actionableId`) | Store and show the answer. Keep only citations whose `[n]` marker is in `content`. A citation with `type: "knowledge_base"` is a shared-shelf document: show its `title` (and `page`), never as a case annexure. Record the cost. Drafts: when `docxStatus` is `"ready"`, copy the file at `draftDocument.downloadUrl` into the backend's own private, encrypted storage at once and serve download and "Generate final draft" from that copy. The link is a short-lived hand-off (`DRAFT_DOCX_LINK_TTL_SECONDS`), not a store, and the AI's file is deleted with the workspace (SIM-202, SIM-211). When the copy fails or no file came, ask for one with `draft_docx_build_request`. `draftDocument.draftId` echoes the request's `draftId`; `draftDocument.baseVersion` is the version the draft was built from. `draftDocument.trackedChanges: true` (SIM-220, additive, behind `DRAFT_REVISIONS_AS_TRACKED_CHANGES`, default off) means `downloadUrl` is the lawyer's own file with the AI's edits as Word tracked changes (author "SimplerToday AI"): store it as the new version as usual; the lawyer accepts or rejects them in the editor, and until then the next revision is refused with `open_changes`. Absent: a clean AI-built file. `draftRefusal` (SIM-219) comes instead of `draftDocument` when the AI would not revise the latest version: `code: "open_changes"` (the file has tracked changes or comments; `trackedChanges` and `comments` give the counts) or `code: "base_unreadable"` (link failed or expired, or not a valid .docx). Show `content` and leave the stored versions untouched; `draftStatus` stays `ready`. |
 | `probing_prompts_response` | AI → backend | Reply to `probing_prompts_request` | `workspaceId`, `userId`, `chatId`, `chatType`, `actionableId`, `viewType`, `prompts[]`, `metadata` (only when tokens were spent) | Show the chips. |
 | `applicable_law_relevance_response` | AI → backend | After the panel emit for the same request | `workspaceId`, `userId`, `law`, `requestId` | Match it to the request by `requestId`. |
 | `analysis_docx_generate_response` | AI → backend | Reply to the DOCX request | `requestId`, normalised document | Build the DOCX. |
+| `draft_docx_build_response` | AI → backend | Reply to every `draft_docx_build_request` | `requestId`, `workspaceId`, `userId`, `draftId`, `version` (echoed), `status`, `reason` (failed only), `downloadUrl` (ready only), `docxStatus`, `placeholderCount`, `metadata` (only when a model was called) | Match by `requestId`. On `ready`, copy the file at once into the backend's own storage as that `version`. On `failed`, keep the draft text and show the reason. Record the cost when `metadata` is present. |
 | `case_law_document_response` | AI → backend | Reply to an uploaded judgment | `requestId`, `workspaceId`, `userId`, `accepted`, `caseLaw`, `rejectionReason` | Close the request. Show the result or the rejection. |
 | `template_blueprint_proposal` | AI → backend | A template needs a blueprint | proposal for one template; a global one has `scope: "global"`, no `userId`, and the request's `fileHash` | Show it on the approval screen. Drop a global proposal whose `fileHash` no longer matches. |
 | `request_global_template_sync` | AI → backend | Every (re)connect | `requestId` | Reply `global_template_sync_response` with every published global template and the same `requestId`, even when empty. |
 | `ai_heartbeat_pong` | AI → backend | Every ping | `requestId`, `serverSentAt` (echoed), `aiTimestamp`, `status`, `version`, `uptimeMs` | Mark the AI link alive. |
+
+### Drafting Word file (SIM-211, SIM-216, SIM-219)
+
+Status: **proposed by the AI side, needs backend sign-off** (2026-11-17). All
+additions are optional and additive. The AI service implements
+`draft_docx_build_request` (SIM-216) and the link and storage rules (SIM-211);
+the open-changes check is SIM-219.
+
+#### `draft_docx_build_request` (backend → AI)
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `requestId` | string | yes | Idempotency key; re-sends with the same id are swallowed while in flight and answered from cache for 10 minutes after |
+| `workspaceId` | string | yes | Files the result under the workspace and bills any model cost to it |
+| `userId` | string | yes | Case owner |
+| `draftId` | string | yes | Echoed |
+| `version` | int | yes | The backend version this file will become; echoed |
+| `title` | string | yes | Draft title (used inside the document only, never in a file name or log) |
+| `content` | string | yes | Draft text |
+| `format` | `"markdown"` \| `"html"` | yes | `html` for drafts saved by the current in-app editor |
+| `templateId`, `templateVersion`, `templateScope` | | no | Build in that template's formatting; may call the model (billed) |
+
+Used for: **Rebuild Word file** (copy failed, or `docxStatus: "failed"`), and
+the first Word file of an older draft (SIM-218). Check that the AI is
+connected before sending; if it is not, show "Draft conversion is unavailable
+right now, try again shortly".
+
+AI-side behaviour:
+
+- `html` is converted to the same Markdown structure as a model-written draft
+  (headings, bold/italic, nested lists, tables, line breaks), so a table or
+  nested list comes out the same. Scripts, styles, frames and unknown tags are
+  dropped or unwrapped, and no attribute is carried over.
+- With `templateId`, the template is looked up as in the drafting chat. A
+  template the AI no longer holds is not fetched: the file is built with the
+  standard layout for the title instead, and still answered `ready`.
+- The build is capped at `DRAFT_DOCX_BUILD_TIMEOUT_SECONDS` (default 120).
+- A request for a case that is deleted (pending or done purge) is answered
+  `invalid_request`. It does **not** revoke a pending purge: a rebuild is the
+  backend serving a stored draft, not the lawyer working on the case.
+- Every answer, `failed` included, is replayed to a re-send of the same
+  `requestId` for 10 minutes. A new attempt needs a new `requestId`.
+
+#### `draft_docx_build_response` (AI → backend)
+
+| Field | Type | Meaning |
+|---|---|---|
+| `requestId`, `workspaceId`, `userId`, `draftId`, `version` | | Echoed |
+| `status` | `"ready"` \| `"failed"` | |
+| `reason` | `"invalid_request"` \| `"empty_content"` \| `"render_failed"` \| `"upload_failed"` \| `"timeout"` | Only when `failed` |
+| `downloadUrl` | string | Short-lived link (`drafts/<workspaceId>/…`); copy it at once |
+| `docxStatus` | `"ready"` \| `"failed"` | Same meaning as on `draftDocument` |
+| `placeholderCount` | int | `<Label>` fill-ins left. Absent when the request could not be read |
+| `metadata` | object | The usual cost block, only when a model was called |
+
+Always answered, success or failure; never silent. The only exception is a
+request with no readable `requestId`, which cannot be matched to anything.
+
+#### The "open changes" check (both sides use this list)
+
+A .docx has open changes when any of these parts:
+
+- `word/document.xml`
+- every `word/header*.xml` and `word/footer*.xml`
+- `word/footnotes.xml`, `word/endnotes.xml`
+
+contains any of these elements: `w:ins`, `w:del`, `w:moveFrom`, `w:moveTo`,
+`w:rPrChange`, `w:pPrChange`, `w:sectPrChange`, `w:tblPrChange`,
+`w:trPrChange`, `w:tcPrChange`, `w:tblGridChange`, `w:cellIns`, `w:cellDel`;
+
+or `word/comments.xml` contains at least one `w:comment`. **Any comment
+counts** until a file saved from ONLYOFFICE has been tested for how it marks
+resolved comments (SIM-214/SIM-215).
+
+#### Links and storage
+
+- Every draft file link the AI issues expires after
+  `DRAFT_DOCX_LINK_TTL_SECONDS` (default 3600). **Backend: tell us your
+  signed-link expiry and we set the same value.**
+- AI files live under `drafts/<workspaceId>/<uuid>.docx` in the drafts bucket
+  and are deleted by the workspace purge. The backend must copy the file
+  immediately into its own private, encrypted storage; the AI's copy is not a
+  store, and the link is a short-lived hand-off.
+
+### Chosen draft format (`formatLayout`, SIM-217)
+
+Every drafting `user_message_request` carries the lawyer's chosen format as
+`formatLayout` (`{id, name, type: "court" | "letterhead", formatting}`), top
+level or as `draftOrigin.formatLayout`. The AI applies `formatting` to the
+draft's Word file (`draftDocument.downloadUrl`) on every export: first draft,
+revision, translation and final draft. No field is new; the AI used to ignore
+this one.
+
+- **`formatting.page`** (both types): `font`, `fontSize`, `lineSpacing`,
+  `pageSize` (`A4` / `Legal` / `Letter`), `orientation`, `margins {top,
+  bottom, left, right}` ("1in", "2.54cm", "25mm", "72pt"; a bare number is
+  inches), `alignment` (`justified` / `left`), `watermark` (`None` / `DRAFT` /
+  `CONFIDENTIAL` / `URGENT`), `pageNumber` (`<left|center|right>_<top|bottom>`,
+  or `None`). These override the template's own settings.
+- **`formatting.letterhead`** (`type: "letterhead"` only): `headerType`,
+  `footerType` (`text` / `image`), `header{Text,Html,FontFamily,FontSize,
+  Spacing,Bold,Italic,Underline,Align,Show}{Left,Center,Right}`, the same
+  `footer…` keys, `headerImageUrl`, `headerImage{Left,Center,Right}`,
+  `footerImageUrl`, `pageApplication` (`all` / `first`). `header…Html…`, when
+  present (even `""`), replaces that block's text and bold; only `b`, `strong`,
+  `i`, `em`, `u`, `br`, `p` and `div` are kept. `header…Show…` unset means
+  shown. The letterhead replaces any header and footer the file had.
+- **`formatting.court`** (`type: "court"` only): `courtHeader`,
+  `jurisdiction`, `documentType`, `caseNumber`, `customFields[]`, each
+  `{text, font, fontSize, bold, italic, underline, uppercase, lineSpacing,
+  align}` (a custom field without `text` uses `label: value`). Inserted at the
+  top of the body in that order; a line the draft already starts with is not
+  repeated. The header is not touched.
+- **Images must be fresh, short-lived `https` links to PNG or JPEG.** The AI
+  downloads each once (about 10 s and 5 MB at most, public hosts only, no
+  redirects), never stores the link, and skips an image it cannot fetch. A
+  link to private storage the AI cannot read means no image, not a failed
+  draft.
+- Unknown keys and values are ignored, never an error; their key names (never
+  values) are counted in the `draft_format applied` log line. A turn without
+  the field keeps the session's last format, stored without image links.
 
 ## Rules both sides must follow
 
@@ -123,8 +246,8 @@ says otherwise, `aiModel` is not used.
    by them.
 3. **Re-sends are expected.** The AI service dedupes:
    - `workspace_deleted`, `workspace_stop_request`, `document_reload_request`,
-     `workspace_resume_request` and `missing_information_edited` on
-     `requestId`;
+     `workspace_resume_request`, `missing_information_edited` and
+     `draft_docx_build_request` on `requestId`;
    - `workspace_version_restore` on `versionId`;
    - `workspace_sync` on a 180 s content fingerprint.
 
@@ -152,6 +275,16 @@ says otherwise, `aiModel` is not used.
 9. **Resume emits only what it declared.** No extra panel types.
 10. **No personal data in logs.** Neither side logs payloads, names or
     signatures. The AI service logs event names, keys and counts.
+11. **Open changes block a revision (SIM-219).** Both sides use one list. A
+    draft .docx has open changes when `word/document.xml`, any
+    `word/header*.xml` / `word/footer*.xml`, `word/footnotes.xml` or
+    `word/endnotes.xml` contains `w:ins`, `w:del`, `w:moveFrom`, `w:moveTo`,
+    `w:rPrChange`, `w:pPrChange`, `w:sectPrChange`, `w:tblPrChange`,
+    `w:trPrChange`, `w:tcPrChange`, `w:tblGridChange`, `w:cellIns` or
+    `w:cellDel`, or when `word/comments.xml` has any `w:comment`. Every
+    comment counts, resolved or not, until ONLYOFFICE's marking of resolved
+    comments is tested (SIM-214/SIM-215). AI side:
+    `app/processing/docx_review_state.py`.
 
 ## Changing this contract
 
@@ -179,6 +312,10 @@ says otherwise, `aiModel` is not used.
   reconnect replaces the first.
 - `emit_ai_response` re-raises a socket error from `sio.emit`, unlike `emit`.
   Every caller wraps it today.
+- SIM-219 contract (draft revision from the latest stored .docx) is proposed
+  by the AI side and needs backend sign-off: field names, the refusal codes,
+  and whether `baseDocumentUrl` is sent on every drafting turn once v1
+  exists or only on revision turns (the AI handles both).
 - Could not verify from this repo: the backend's refusal handling, room names
   beyond `ai_service`, and how the backend persists `workspace:refresh`.
 
@@ -189,3 +326,7 @@ says otherwise, `aiModel` is not used.
 | 2026-10-21 | First version, written from the code | SIM-113 |
 | 2026-10-27 | `rejectionFeedback` on the analysis report sent after a reject (additive) | SIM-163 |
 | 2026-10-29 | AI handles `kb_document_added` / `kb_document_deleted` / `kb_sync`; chat citations gain `type: "knowledge_base"` (additive) | SIM-174 |
+| 2026-11-17 | New `draft_docx_build_request` / `draft_docx_build_response`; draft links are a short-lived hand-off the backend copies into its own encrypted storage (replaces "serve `downloadUrl` as-is"); open-changes list (proposed, needs backend sign-off) | SIM-216, SIM-211, SIM-219 |
+| 2026-11-17 | Drafting: `user_message_request` gains `draftId`, `baseVersion`, `baseDocumentUrl`; `ai_response` gains `draftDocument.draftId`, `draftDocument.baseVersion` and `draftRefusal` (additive, proposed) | SIM-219 |
+| 2026-11-17 | Drafting: `ai_response` gains `draftDocument.trackedChanges` (additive, optional; behind a setting, default off) | SIM-220 |
+| 2026-11-17 | AI applies the existing `formatLayout` (also read from `draftOrigin.formatLayout`) to the draft's Word file; letterhead images must be fresh https PNG/JPEG links | SIM-217 |

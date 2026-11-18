@@ -7,6 +7,258 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **SIM-211: draft Word files are filed per workspace, expire quickly and are
+  erased with the workspace.** Generated drafts were stored under
+  `draft/<userId>/<uuid>-<title>.docx` with a link valid until 2050, and the
+  workspace purge never deleted them.
+  - New drafts go to `drafts/<workspaceId>/<uuid>.docx` (no title in the
+    name), through `app/storage/draft_files.py`, the only allowed upload path.
+  - The link expires after `DRAFT_DOCX_LINK_TTL_SECONDS` (default 900, the
+    backend's 15-minute signed-link expiry).
+    `generate_signed_url` no longer has a 2050 default.
+  - The workspace purge deletes the workspace's draft files; a storage error
+    retries and escalates like the rest of the purge.
+  - `scripts/cleanup_legacy_draft_files.py` removes the old `draft/` files:
+    dry run by default, `--execute` after sign-off, counts only.
+
+### Added
+
+- **SIM-216: the backend can ask for a Word file built from a stored draft.**
+  **Socket payload change (additive): new events `draft_docx_build_request`
+  (backend → AI) and `draft_docx_build_response` (AI → backend).** Used for
+  "Rebuild Word file" and the first Word file of an older draft.
+  - `format: "markdown"` goes through the SIM-202 normaliser. `format: "html"`
+    (the in-app editor) is first converted to the same Markdown, so tables,
+    headings and nested lists come out the same. Scripts, styles, frames and
+    unknown tags are dropped or unwrapped; no attribute is kept.
+    `<Label>` fill-ins survive.
+  - Same renderer as the drafting chat: the template's formatting when
+    `templateId` is given and held (may call the model; the cost block is
+    sent only then), else the SIM-208 standard layout from the title. The
+    file is uploaded under `drafts/<workspaceId>/` with a short-lived link.
+  - Always answered: `ready`, or `failed` with `invalid_request`,
+    `empty_content`, `render_failed`, `upload_failed` or `timeout`.
+    Idempotent on `requestId`: a re-send in flight is swallowed, and an
+    answer is replayed for 10 minutes.
+  - Capped by the new `DRAFT_DOCX_BUILD_TIMEOUT_SECONDS` (default 120).
+  - A deleted case (pending or done purge) is refused as `invalid_request`
+    and its purge is not revoked; a build that finishes after the purge
+    started deletes its file again. Stop does not cancel a build.
+  - Contract: `docs/contracts/backend-ai-socket-events.md` now carries the
+    drafting Word-file sections, and says the backend copies
+    `draftDocument.downloadUrl` into its own encrypted storage instead of
+    serving it as-is.
+  - Coverage: `tests/test_draft_html.py`, `tests/offline/verify_docx_build.py`.
+- **SIM-220: a draft revision can come back as tracked changes in the
+  lawyer's own file** (behind `DRAFT_REVISIONS_AS_TRACKED_CHANGES`, default
+  off; off is exactly SIM-219).
+  - **Socket payload change (additive, optional).** `ai_response`
+    `draftDocument.trackedChanges: true` when `downloadUrl` is the lawyer's
+    file with the AI's edits as Word tracked changes (author "SimplerToday
+    AI"). Absent for a clean file.
+  - Deterministic (`app/processing/docx_track_changes.py`, no new model
+    call): blocks and then words are diffed, and only the differences are
+    written; formatting, letterhead, numbering, comments, headers, footers and
+    section properties are untouched. The base Markdown goes through the same
+    normaliser and totals check as the revision, so neither shows up as an AI
+    edit. The revision prompt gains a "copy untouched text verbatim"
+    instruction on this path only.
+  - Falls back to the SIM-219 clean file when the revision changes more than
+    `DRAFT_TRACKED_CHANGES_MAX_CHANGED_RATIO` (0.4) of the blocks (an intent
+    change, a full redraft, a translation; the reply says so), or for a
+    structure it cannot map (columns changed, fields, drawings, content
+    controls). One `draft_tracked_changes` count-only log line per revision.
+  - The AI's tracked changes count as open changes: the next revision is
+    refused until the lawyer accepts or rejects them, and the refusal message
+    now says the open changes may be the AI's own.
+  - Coverage: `tests/test_docx_track_changes.py`,
+    `tests/test_draft_tracked_revision.py`.
+
+- **SIM-219: a chat revision of a draft starts from the lawyer's latest
+  version, not the AI's own copy.** Editor changes are no longer erased by
+  the next revision.
+  - **Socket payload change (additive, optional; contract proposed, needs
+    backend sign-off).** `user_message_request` (DRAFTING_ASSISTANT) gains
+    `draftId`, `baseVersion`, `baseDocumentUrl`. `ai_response` gains
+    `draftDocument.draftId`, `draftDocument.baseVersion`, and `draftRefusal
+    {code: "open_changes" | "base_unreadable", trackedChanges, comments}`,
+    sent instead of `draftDocument`.
+  - The .docx at `baseDocumentUrl` is read once (30 s, 25 MB; settings
+    `DRAFT_BASE_DOWNLOAD_TIMEOUT_SECONDS`, `DRAFT_BASE_MAX_BYTES`) and never
+    stored. It is checked before any model call.
+  - Open tracked changes or comments (the contract's element list, in the
+    body, headers, footers, footnotes and endnotes; every comment counts):
+    refused with `open_changes` and the counts. A failed link or a file that
+    is not a .docx: refused with `base_unreadable`. A refusal makes no model
+    call, keeps `draftStatus: ready` and tells the lawyer what to do.
+  - Otherwise the file's body is read back into the drafting Markdown
+    (headings, GFM tables, lists, bold/italic) and revised as vN+1.
+  - Turns without `baseDocumentUrl` are unchanged.
+  - New: `app/processing/docx_review_state.py`, `docx_markdown.py`,
+    `draft_revision_base.py`. One `draft_revise_from_base outcome= tracked=
+    comments= chars=` line per turn; counts only.
+  - Coverage: `tests/test_docx_review_state.py`,
+    `tests/test_draft_revise_from_base.py`,
+    `tests/offline/verify_draft_revise_from_base.py`.
+- **SIM-217: a draft's Word file follows the lawyer's chosen court or
+  letterhead format.** The format the lawyer picks when starting a draft
+  already arrived on every drafting message as `formatLayout`; it was parsed
+  and ignored. **No new payload fields:** the AI now consumes the existing
+  `formatLayout` (and `draftOrigin.formatLayout` as a fallback, accepted as an
+  optional opaque field).
+  - Page: font, size, line spacing, A4/Legal/Letter, orientation, margins,
+    justified or left body, a diagonal DRAFT/CONFIDENTIAL/URGENT watermark,
+    and a page number at the chosen position. These override the template's
+    own settings and the SIM-208 standard layout.
+  - Letterhead: header and footer from the Left/Center/Right blocks (text,
+    a safe subset of HTML, or images), on every page or the first only. It
+    replaces any header/footer the file had.
+  - Court: court name, jurisdiction, document type, case number and custom
+    fields inserted at the top, not repeated when the draft already starts
+    with them.
+  - Letterhead images must be fresh short-lived https links to PNG/JPEG;
+    one that cannot be fetched is skipped, never failing the draft.
+  - Applied on every export (draft, revision, translation, final draft); a
+    turn without the field keeps the session's format. A formatter failure
+    uploads the unformatted file. No model call is added. Log line:
+    `draft_format applied type= page= watermark= page_number= …` (counts and
+    enum values only).
+
+- **SIM-208: drafts without a template use the standard layout of their
+  document type.**
+  - The type is inferred from the draft title: notice/letter, court filing,
+    affidavit, vakalatnama, agreement/deed.
+  - Each type sets its own margins (a wider left margin for court filings),
+    body size, line spacing and alignment.
+  - The title block is centred until the body starts: court name, case
+    number, "VERSUS" and the document title. Cause-title party lines and
+    letterheads stay left.
+  - The model's layout list gains rent/lease, will, SHA/addendum/MoU,
+    power of attorney, undertaking/indemnity and other deeds.
+  - These are conventional defaults, not any court's filing rules. Untitled
+    drafts are unchanged, and templates keep their own format.
+  - Coverage: `tests/test_draft_layouts.py`.
+
+- **SIM-209: table totals in drafts are re-added in code.**
+  - Every total, grand total or sub-total row in a draft's tables is checked
+    with exact decimals. This understands Indian and international grouping,
+    INR/Rs./₹/USD prefixes and percentages (with rounding tolerance).
+  - A wrong figure is flagged in place as a highlighted
+    `<check total: 1,000,000>`. `DRAFT_TOTALS_FIX=true` corrects it instead.
+  - Columns containing a placeholder or text are left alone.
+  - No model call; the log reports counts only.
+  - Coverage: `tests/test_draft_totals.py`.
+
+- **SIM-203 (SIM-204 to SIM-207): drafts follow any uploaded template's
+  format, whether .docx, text PDF, scanned PDF or photo.** All of it is off
+  by default. New package: `app/processing/template_fidelity/`.
+  - **Reading any template (SIM-205, SIM-206).** Every source is read into
+    one format model and rebuilt as a clean, editable .docx: real
+    paragraphs, numbering labels, tables (merged cells, header rows) and the
+    letterhead and logo in the header.
+    - **Text PDFs** are read from their spans: font, size, bold/italic,
+      position, underline strokes, ruled and borderless tables, and the
+      logo. This replaces pdf2docx's positioned text boxes. Ligatures are
+      expanded.
+    - **Scans and photos** are read from Vision OCR word positions, after
+      de-skewing both the words and the image. Bold, underline and the logo
+      are measured from the pixels; an optional Gemini vision pass adds
+      tables and the font family.
+    - **Layout** is measured from the document itself: line pitch,
+      justification, margins, running header/footer, "Page X of Y",
+      headings and title, page breaks, and signature blocks.
+  - **Writing into the template (SIM-204).** The model sees an ID for every
+    paragraph, row and cell, and returns one operation per line: `replace`,
+    `insert_after` with `like`, `add_row` or `delete`.
+    - Operations are applied inside the template, so every edit keeps that
+      paragraph's own formatting and new clauses and rows copy their
+      sibling's.
+    - Auto-numbering is never doubled, and the header and footer are never
+      touched.
+    - It falls back to the `llm_diff` chain.
+  - **Test corpus (SIM-207).** Six fictional document types (residential
+    and commercial rent, simple and complex will, simple and complex SHA)
+    in four deliberately different layouts, each as .docx, text PDF and
+    simulated scan, plus a format checklist. All 24 keep their format
+    through the PDF reader and the scan reader, including at 2° tilt.
+  - **Settings:**
+    - `TEMPLATE_FIDELITY_INGEST` (false);
+    - `TEMPLATE_FILL_V2` (false);
+    - `TEMPLATE_SCAN_VISION` (true). This is a paid Gemini call per scanned
+      page and only runs when ingest is on.
+  - **New paid calls,** both routed and metered:
+    - `template_fill`: one per export when `TEMPLATE_FILL_V2` is on;
+    - `template_scan_vision`: one per scanned page.
+  - No socket payload change.
+  - Coverage: `tests/test_template_fidelity.py`,
+    `tests/test_template_fill_route.py`.
+
+### Fixed
+
+- **SIM-211: draft Word files are filed per workspace, expire quickly and are
+  erased with the workspace.** Generated drafts were stored under
+  `draft/<userId>/<uuid>-<title>.docx` with a link valid until 2050, and the
+  workspace purge never deleted them.
+  - New drafts go to `drafts/<workspaceId>/<uuid>.docx` (no title in the
+    name), through `app/storage/draft_files.py`, the only allowed upload path.
+  - The link expires after `DRAFT_DOCX_LINK_TTL_SECONDS` (default 900, the
+    backend's 15-minute signed-link expiry).
+    `generate_signed_url` no longer has a 2050 default.
+  - The workspace purge deletes the workspace's draft files; a storage error
+    retries and escalates like the rest of the purge.
+  - `scripts/cleanup_legacy_draft_files.py` removes the old `draft/` files:
+    dry run by default, `--execute` after sign-off, counts only.
+  - The drafts bucket is shared with the backend, which owns `templates/`.
+    New AI template skeletons go to `ai-templates/`; skeletons saved earlier
+    stay readable through their stored gs:// URI.
+- **SIM-202: Drafting Assistant Word files no longer need manual repair.**
+  Draft tables reached the Word file as lines of `| … |` text. `####`
+  headings, `---` rules and escaped placeholders (`\<Bank Name\>`) were
+  printed literally, and `(a)` sub-clauses were flattened.
+  - New deterministic normaliser (`app/processing/draft_markdown.py`). It
+    joins table rows the model split with blank lines, adds a missing
+    separator row and pads ragged rows. It also unescapes placeholders,
+    lowers headings deeper than `###`, drops `---` rules and nests `(a)`
+    sub-clauses under their list item. It runs on render, revision,
+    translation and finalize, so older stored drafts are repaired on their
+    next export.
+  - Renderer (`app/processing/docx_generator.py`):
+    - GFM tables are now parsed. The commonmark preset had them off.
+    - Tables are real Word tables: a bold, shaded, repeating header row,
+      column alignment, widths that fit the page, and rows that do not split.
+    - Nested lists are supported. Ordered items carry their own number, so a
+      second list restarts at 1 instead of continuing in Word.
+    - Headings 1–6 are styled in black Times New Roman.
+    - Schedules, annexures and the execution page start on a new page.
+    - `<Label>` placeholders are highlighted in yellow.
+    - Signature and witness lines keep their line breaks.
+  - Template path: when the filled template lost tables or sections the
+    draft has, the full draft is rendered in the template's styles instead.
+  - The draft render prompt states a format contract: tables, heading depth,
+    placeholders, no rules.
+  - **Socket payload (additive):** `ai_response.draftDocument` gains
+    `docxStatus` (`ready` | `failed`) and `placeholderCount`. `content` is
+    the normalised Markdown. **Backend:** download and "Generate final
+    draft" should serve `downloadUrl` rather than building their own file
+    from `content`.
+  - Log: one `docx_export route= tables= placeholders= leftover_markup=`
+    line per export (counts only).
+  - Signature, witness and address blocks are left-aligned, single-spaced
+    and kept on one page. Word justifies every line that ends in a manual
+    break, so these blocks used to stretch across the page. A `_____`
+    signature line now stays inside its block.
+  - The draft body call has a stable route key, `draft_render`, so
+    `LLM_ROUTES` can send drafting alone to a stronger model (see
+    `docs/MODEL_PORTABILITY.md`). The default model is unchanged.
+  - Rollback: `DRAFT_MARKDOWN_NORMALIZE=false`.
+  - Coverage: `tests/test_draft_markdown.py`, `tests/test_docx_generator.py`.
+
+## [6.1.0] - 2026-11-16
+
+Release notes: `RELEASE.md`.
+
 ### Added
 
 - **SIM-186: Relevant Parties shows each party's address, email, phone and

@@ -132,6 +132,14 @@ There are three ways to reach open-weight models:
    Check base URLs and model names against each provider's current docs. The
    values above are examples.
 
+   The Drafting Assistant's draft body has the stable route key
+   `draft_render` (SIM-202). It can go to a stronger model while chat and
+   panels stay on the default, with Flash as the fallback:
+   `LLM_ROUTES={"draft_render": ["gemini:<pro-model-id>", "gemini:gemini-3.8-flash"]}`.
+   First, add the model's rates to `MODEL_PRICING` in `app/ai/pricing.py`.
+   A model missing from that table is billed at the default rates, which
+   under-reports the cost of a Pro model.
+
    Account options:
    - `base_url`
    - `api_key_env`

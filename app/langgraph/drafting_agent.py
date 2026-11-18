@@ -516,6 +516,22 @@ def _word_count(text: str) -> int:
     return len([t for t in re.split(r"\s+", text or "") if t])
 
 
+def _check_totals(markdown: str) -> str:
+    """Flag (or fix) wrong table totals; one count-only log line (SIM-209)."""
+    from app.processing.draft_totals import check_table_totals, totals_fix_enabled
+
+    try:
+        fix = totals_fix_enabled()
+        out, issues = check_table_totals(markdown, fix=fix)
+    except Exception as exc:
+        logger.opt(exception=exc).warning("draft totals check failed; draft unchanged")
+        return markdown
+    if issues:
+        logger.info("draft_totals wrong={} tables={} action={}", len(issues),
+                    len({i.table for i in issues}), "fixed" if fix else "flagged")
+    return out
+
+
 def _docx_delivery_fields(markdown: str, download_url: Optional[str]) -> Dict[str, Any]:
     """Additive ``draftDocument`` fields (SIM-202).
 
@@ -8275,6 +8291,8 @@ OUTPUT FORMAT:
             )
         # Re-translation is another model pass; normalise once more (idempotent).
         markdown = normalize_if_enabled(markdown)
+        # SIM-209: the model never does arithmetic — re-add every table total.
+        markdown = _check_totals(markdown)
 
         # Generate the .docx artifact, upload to GCS, and collect the
         # download URL. Any failure here is non-fatal — markdown still

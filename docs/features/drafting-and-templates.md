@@ -243,8 +243,10 @@ Outbound:
 
 ### Security
 
-- Download links for generated drafts are long-lived signed URLs (about 25
-  years). Only `safe_url()` forms are logged.
+- Download links for generated drafts are short-lived signed URLs
+  (`DRAFT_DOCX_LINK_TTL_SECONDS`, default 15 minutes): a hand-off the backend
+  copies at once. No draft title in object names. Only `safe_url()` forms are
+  logged.
 - Drafting chat is not gated by sharing permission: a view-only collaborator
   can run a drafting session. Drafting does not change case panels.
 
@@ -268,8 +270,8 @@ Outbound:
   (`llm_diff`) is not.
 - Template tables are not read at ingestion, so the model never sees a
   template's tables (`extract_text_from_docx` without `mark_pages`).
-- Generated draft files and template skeletons in cloud storage are never
-  deleted: not on template delete, and not by the workspace purge.
+- Template skeletons in cloud storage are not deleted on template delete.
+  Generated draft files are deleted by the workspace purge (SIM-211).
 - Approved blueprints and presets live in memory and rely on the backend
   re-sending them in the snapshot after a restart; this was not verified.
 

@@ -1,6 +1,7 @@
 """SIM-204: the template_fill export route (model call faked, fictional data)."""
 
 import asyncio
+import importlib
 from io import BytesIO
 
 from docx import Document
@@ -16,7 +17,7 @@ def _agent_cls():
 
 
 def test_template_fill_applies_model_ops(monkeypatch):
-    from app.ai import gemini_client as gc
+    gc = importlib.import_module("app.ai.gemini_client")  # the module: app.ai re-exports the instance under that name
 
     tpl = build_docx(build_template("simple_will", VARIANTS[0]))
     calls = {}
@@ -37,7 +38,7 @@ def test_template_fill_applies_model_ops(monkeypatch):
 
 
 def test_template_fill_falls_back_on_model_error(monkeypatch):
-    from app.ai import gemini_client as gc
+    gc = importlib.import_module("app.ai.gemini_client")  # the module: app.ai re-exports the instance under that name
 
     tpl = build_docx(build_template("simple_will", VARIANTS[0]))
 
@@ -49,7 +50,7 @@ def test_template_fill_falls_back_on_model_error(monkeypatch):
 
 
 def test_template_fill_falls_back_when_nothing_applies(monkeypatch):
-    from app.ai import gemini_client as gc
+    gc = importlib.import_module("app.ai.gemini_client")  # the module: app.ai re-exports the instance under that name
 
     tpl = build_docx(build_template("simple_will", VARIANTS[0]))
 

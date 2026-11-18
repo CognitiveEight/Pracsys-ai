@@ -372,6 +372,12 @@ class Settings(BaseSettings):
     # so the two pipelines can have independent retention / IAM policies
     # (drafts are public-read; audio uploads are private + ephemeral).
     gcs_docx_bucket_name: Optional[str] = None
+    # SIM-211: how long a draft .docx link works. The backend copies the file
+    # into its own storage as soon as the draft arrives, so the link only has
+    # to outlive that copy; matches the backend's GCS_SIGNED_URL_TTL_MINUTES (15). Never set
+    # this to years: a signed link cannot be revoked.
+    draft_docx_link_ttl_seconds: int = 900
+
     # SIM-202: clean up the model's draft Markdown (tables, placeholders,
     # headings, rules) before it is stored, emitted or exported, and check
     # that a filled template kept the draft's tables and sections. False is
@@ -394,6 +400,9 @@ class Settings(BaseSettings):
     # to outlive that copy; matches the backend's GCS_SIGNED_URL_TTL_MINUTES (15). Never set
     # this to years: a signed link cannot be revoked.
     draft_docx_link_ttl_seconds: int = 900
+    # SIM-216: cap on one draft_docx_build_request (render + upload, and the
+    # template route's model call). Past it the backend is answered `timeout`.
+    draft_docx_build_timeout_seconds: int = 120
     # SIM-219: the lawyer's latest draft .docx, read once per revision turn
     # from the backend's short-lived link. Bounded so a slow or huge file
     # cannot hold a drafting turn: past either limit the revision is refused

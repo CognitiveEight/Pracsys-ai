@@ -617,6 +617,82 @@ class AnalysisDocxGenerateRequestPayload(BaseModel):
     timestamp: Optional[str] = None
 
 
+#: Largest draft text a draft_docx_build_request may carry (characters). A
+#: long pleading is a few hundred thousand; anything past this is refused as
+#: ``invalid_request`` rather than rendered.
+DRAFT_DOCX_BUILD_MAX_CONTENT_CHARS = 2_000_000
+
+
+class DraftDocxBuildRequestPayload(BaseModel):
+    """
+    Payload for draft_docx_build_request (Server -> AI, SIM-216).
+
+    Build a Word file from draft text the backend already holds: "Rebuild Word
+    file", and the first Word file of a draft saved before the AI produced
+    one. ``content`` is Markdown, or HTML from the in-app editor. Answered by
+    ``draft_docx_build_response``, always. ``title`` and ``content`` are case
+    content: never logged.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    requestId: str = Field(min_length=1)
+    workspaceId: str = Field(min_length=1)
+    userId: str = Field(min_length=1)  # the case owner
+    draftId: str = Field(min_length=1)
+    version: int = Field(ge=0)  # the backend version this file will become
+    title: str
+    content: str = Field(max_length=DRAFT_DOCX_BUILD_MAX_CONTENT_CHARS)
+    format: Literal["markdown", "html"]
+    templateId: Optional[str] = None
+    templateVersion: Optional[int] = None
+    templateScope: Optional[str] = None
+    timestamp: Optional[str] = None
+
+    @field_validator("requestId", "workspaceId", "userId", "draftId", mode="before")
+    @classmethod
+    def _strip_ids(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("format", mode="before")
+    @classmethod
+    def _lower_format(cls, value: Any) -> Any:
+        return value.strip().lower() if isinstance(value, str) else value
+
+
+class DraftDocxBuildResponsePayload(BaseModel):
+    """
+    Payload for draft_docx_build_response (AI -> Server, SIM-216).
+
+    ``reason`` only when ``status`` is ``failed``; ``downloadUrl`` only when it
+    is ``ready`` (a short-lived hand-off link the backend copies at once);
+    ``placeholderCount`` once the draft text was read; ``metadata`` (the usual
+    cost block) only when a model was called.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    requestId: str
+    workspaceId: Optional[str] = None
+    userId: Optional[str] = None
+    draftId: Optional[str] = None
+    version: Optional[int] = None
+    status: Literal["ready", "failed"]
+    reason: Optional[
+        Literal[
+            "invalid_request",
+            "empty_content",
+            "render_failed",
+            "upload_failed",
+            "timeout",
+        ]
+    ] = None
+    downloadUrl: Optional[str] = None
+    docxStatus: Literal["ready", "failed"]
+    placeholderCount: Optional[int] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
 class ConversationHistoryItem(BaseModel):
     """Schema for conversation history item."""
 

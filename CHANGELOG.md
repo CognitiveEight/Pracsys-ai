@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SIM-216: the backend can ask for a Word file built from a stored draft.**
+  **Socket payload change (additive): new events `draft_docx_build_request`
+  (backend → AI) and `draft_docx_build_response` (AI → backend).** Used for
+  "Rebuild Word file" and the first Word file of an older draft.
+  - `format: "markdown"` goes through the SIM-202 normaliser. `format: "html"`
+    (the in-app editor) is first converted to the same Markdown, so tables,
+    headings and nested lists come out the same. Scripts, styles, frames and
+    unknown tags are dropped or unwrapped; no attribute is kept.
+    `<Label>` fill-ins survive.
+  - Same renderer as the drafting chat: the template's formatting when
+    `templateId` is given and held (may call the model; the cost block is
+    sent only then), else the SIM-208 standard layout from the title. The
+    file is uploaded under `drafts/<workspaceId>/` with a short-lived link.
+  - Always answered: `ready`, or `failed` with `invalid_request`,
+    `empty_content`, `render_failed`, `upload_failed` or `timeout`.
+    Idempotent on `requestId`: a re-send in flight is swallowed, and an
+    answer is replayed for 10 minutes.
+  - Capped by the new `DRAFT_DOCX_BUILD_TIMEOUT_SECONDS` (default 120).
+  - A deleted case (pending or done purge) is refused as `invalid_request`
+    and its purge is not revoked; a build that finishes after the purge
+    started deletes its file again. Stop does not cancel a build.
+  - Contract: `docs/contracts/backend-ai-socket-events.md` now carries the
+    drafting Word-file sections, and says the backend copies
+    `draftDocument.downloadUrl` into its own encrypted storage instead of
+    serving it as-is.
+  - Coverage: `tests/test_draft_html.py`, `tests/offline/verify_docx_build.py`.
+
 - **SIM-208: drafts without a template use the standard layout of their
   document type.**
   - The type is inferred from the draft title: notice/letter, court filing,

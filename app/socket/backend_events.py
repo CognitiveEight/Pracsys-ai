@@ -323,6 +323,21 @@ REQUEST_GLOBAL_TEMPLATE_SYNC = "request_global_template_sync"
 # Server → AI: the full published set, requestId echoed (even when empty).
 GLOBAL_TEMPLATE_SYNC_RESPONSE = "global_template_sync_response"
 
+# ============================================================================
+# Drafting Assistant — Word file from existing draft text (SIM-216)
+# ============================================================================
+
+# Server → AI: build a .docx from a stored draft's text ("Rebuild Word file",
+# first Word file of an older draft). Payload {requestId, workspaceId, userId,
+# draftId, version, title, content, format: "markdown"|"html", templateId?,
+# templateVersion?, templateScope?}. Idempotent on requestId.
+DRAFT_DOCX_BUILD_REQUEST = "draft_docx_build_request"
+
+# AI → Server: always answered. {requestId, workspaceId, userId, draftId,
+# version, status: "ready"|"failed", reason?, downloadUrl?, docxStatus,
+# placeholderCount?, metadata?}.
+DRAFT_DOCX_BUILD_RESPONSE = "draft_docx_build_response"
+
 
 class TemplateKind:
     """`kind` values for a global template item."""

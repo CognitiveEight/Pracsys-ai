@@ -30,6 +30,7 @@ from app.socket.auth import (
 from app.socket.backend_events import (
     AI_HEARTBEAT_PING,
     AI_HEARTBEAT_PONG,
+    DRAFT_DOCX_BUILD_REQUEST,
     KB_DOCUMENT_ADDED,
     KB_DOCUMENT_DELETED,
     KB_SYNC,
@@ -767,6 +768,14 @@ class SocketClient:
             AI returns processed document text via analysis_docx_generate_response.
             """
             await event_handler.handle("analysis_docx_generate_request", data)
+
+        @self.sio.on(DRAFT_DOCX_BUILD_REQUEST)
+        async def draft_docx_build_request(data):
+            """
+            Server → AI: build a Word file from a stored draft's text (SIM-216).
+            Always answered with draft_docx_build_response.
+            """
+            await event_handler.handle(DRAFT_DOCX_BUILD_REQUEST, data)
 
         @self.sio.event
         async def request_blueprint_proposal(data):

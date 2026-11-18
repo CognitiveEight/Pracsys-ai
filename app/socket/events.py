@@ -37,6 +37,7 @@ from app.socket.handlers import (
     PanelEditsMixin,
     UserFactsMixin,
     DocxExportMixin,
+    DraftDocxBuildMixin,
     TemplateSyncMixin,
     KnowledgeBaseMixin,
     WorkspaceMetadataMixin,
@@ -71,6 +72,7 @@ class SocketEventHandler(
     PanelEditsMixin,
     UserFactsMixin,
     DocxExportMixin,
+    DraftDocxBuildMixin,
     TemplateSyncMixin,
     KnowledgeBaseMixin,
     WorkspaceMetadataMixin,
@@ -383,6 +385,11 @@ class SocketEventHandler(
         self._stop_requests: Dict[str, Dict[str, float]] = {}
         # workspace_id -> {requestId: {status, ts}}, as _document_reload_requests.
         self._resume_requests: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        # --- draft_docx_build_request (see handlers/draft_docx_build.py)
+        # workspace_id -> {requestId: {status, ts, response}}. Re-sends are
+        # swallowed in flight and answered from `response` for 10 minutes.
+        # Keyed by workspace_id so the purge sweep erases it (links included).
+        self._draft_docx_build_requests: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._register_default_handlers()
 
     def set_graph_store(self, store) -> None:
@@ -454,6 +461,10 @@ class SocketEventHandler(
         self.register(
             "analysis_docx_generate_request",
             self.on_analysis_docx_generate_request,
+        )
+        # Drafting Assistant — Word file from a stored draft's text (SIM-216).
+        self.register(
+            "draft_docx_build_request", self.on_draft_docx_build_request
         )
         # Drafting Assistant — an admin's global template draft needs profiling
         # (upload or "Re-profile"); the AI emits a blueprint proposal.

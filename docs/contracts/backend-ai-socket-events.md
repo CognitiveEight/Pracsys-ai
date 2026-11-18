@@ -5,7 +5,7 @@ repo: Pracsys-ai
 owner: AI team
 status: current
 audience: everyone; engineers below "Messages"
-last_verified: 2026-10-21
+last_verified: 2026-11-17
 jira: SIM-113
 between: "backend, ai-service"
 owner_ours: AI team
@@ -88,6 +88,7 @@ says otherwise, `aiModel` is not used.
 | `case_law_document_request` | backend → AI | Lawyer uploads a judgment | `requestId`, `workspaceId`, `userId`, `documentUrl`, `documentName`, `mimeType` | Always reply `case_law_document_response` echoing `requestId`. On acceptance, also re-emit `case_laws`. |
 | `add_relevant_party` / `edit_relevant_party` / `delete_relevant_party` | backend → AI | Lawyer edits the Relevant Parties panel | `workspaceId`, `userId`, `partyId` (edit, delete), party fields | Apply the change. Re-emit `relevant_parties`. |
 | `analysis_docx_generate_request` | backend → AI | Export of the analysis to DOCX | `requestId`, `workspaceId`, `documentSource`, `contentHash`, `trigger` | Normalise the text. Reply `analysis_docx_generate_response`. |
+| `draft_docx_build_request` | backend → AI | "Rebuild Word file", or the first Word file of an older draft | `requestId`, `workspaceId`, `userId`, `draftId`, `version`, `title`, `content`, `format` (`markdown` / `html`), `templateId` / `templateVersion` / `templateScope` (optional) | Build the .docx from `content` and always reply `draft_docx_build_response`. Swallow a re-send while in flight; answer a re-send from cache for 10 minutes. A purged or pending-purge case is refused (`invalid_request`) and the purge is **not** revoked. Not cancelled by Stop. See "Drafting Word file" below (SIM-216). |
 | `request_blueprint_proposal` | backend → AI | Admin uploads or re-profiles a Global Template Library draft | `scope`, `templateId`, `fileHash`, `fileUrl`, `originalName`, `mimeType` (no `userId`) | Profile it as a draft (never suggested); a request without `scope` is treated as global. Reply `template_blueprint_proposal` with `scope: "global"`, no `userId`, the same `fileHash`; `status: "failed"` with a short `error` on failure. |
 | `global_template_sync` | backend → AI | Admin publishes, retires or deletes a global template (once for the platform) | `action` (`published`, `retired`, `deleted`), `templates[]` (`id`, `version`, `name`, `originalName`, `category`, `kind`, `extension`, `mimeType`, `size`, `fileHash`, `fileUrl`, `formatting`, `draftCategory`) | `published`: add or replace the current version; the same version and hash is a no-op. `retired`: stop suggesting it; drafts already started keep working. `deleted`: erase what is held. |
 | `global_template_sync_response` | backend → AI | Reply to `request_global_template_sync` | `requestId` (always echoed), `count`, `templates[]` | Full replace: hold every listed template as published; retire every held id not listed. An empty list is valid. |
@@ -105,14 +106,98 @@ says otherwise, `aiModel` is not used.
 | `document_feature_response` | AI → backend | One panel is ready, re-sent, or released | `featureType`, `workspaceId`, `userId`, `payload`, `metadata` (cost block, `messageId`, `aiModel`) | Store the panel. Clear that panel's loader. Record the cost under `metadata.messageId`. `featureType` is one of: `document_assessments`, `workspace_metadata`, `strategy_objective`, `analysis_report`, `list_of_dates`, `applicable_laws`, `procedural_timeline`, `relevant_parties`, `case_laws`, `drafting_assistant`, `applicable_law_relevance`. |
 | `document_feature_response` (`analysis_report`, after a reject) | AI → backend | Reply to `analysis_report_feedback` | the usual report, plus `rejectionFeedback`: `scoreChange` (applied) and `items[]` of `section`, `rejectedValue` (echoed), `isValidRejection`, `scoreIncrease`, `reason` (`RejectionFeedback` in `app/socket/schemas.py`) | Pass the field through to the frontend unchanged. Show `reason` beside the score so the lawyer sees why it did or did not move. An applied reject always raises the score by its section weight (missing info 5, weakness 5, risk 3; capped at 95% while items remain), so `isValidRejection` is `true` and `scoreIncrease` is that weight; a reject of an item already removed has `isValidRejection` `false` and `scoreIncrease` 0. It is present on this emit only; never store it on the report. |
 | `workspace:refresh` | AI → backend | Before a regeneration starts (objective change, resume, …) | `workspaceId`, `featureTypes[]`, `reason`, `refreshId`, `timestamp`, `userId` | Arm one loader per listed `featureType`. Only a matching `document_feature_response` clears it. |
-| `ai_response` | AI → backend | Chat answer | `chatId`, `workspaceId`, `userId`, `content`, `metadata`, `citations[]`, `suggestionChips[]`, drafting fields (`draftStatus`, `openQuestions`, `draftDocument`, `actionableId`) | Store and show the answer. Keep only citations whose `[n]` marker is in `content`. A citation with `type: "knowledge_base"` is a shared-shelf document: show its `title` (and `page`), never as a case annexure. Record the cost. Drafts: download and "Generate final draft" serve `draftDocument.downloadUrl` (the AI-built Word file, `docxStatus: "ready"`); build a file from `draftDocument.content` only when `downloadUrl` is absent (SIM-202). |
+| `ai_response` | AI → backend | Chat answer | `chatId`, `workspaceId`, `userId`, `content`, `metadata`, `citations[]`, `suggestionChips[]`, drafting fields (`draftStatus`, `openQuestions`, `draftDocument`, `actionableId`) | Store and show the answer. Keep only citations whose `[n]` marker is in `content`. A citation with `type: "knowledge_base"` is a shared-shelf document: show its `title` (and `page`), never as a case annexure. Record the cost. Drafts: when `docxStatus` is `"ready"`, copy the file at `draftDocument.downloadUrl` into the backend's own private, encrypted storage at once and serve download and "Generate final draft" from that copy. The link is a short-lived hand-off (`DRAFT_DOCX_LINK_TTL_SECONDS`), not a store, and the AI's file is deleted with the workspace (SIM-202, SIM-211). When the copy fails or no file came, ask for one with `draft_docx_build_request`. |
 | `probing_prompts_response` | AI → backend | Reply to `probing_prompts_request` | `workspaceId`, `userId`, `chatId`, `chatType`, `actionableId`, `viewType`, `prompts[]`, `metadata` (only when tokens were spent) | Show the chips. |
 | `applicable_law_relevance_response` | AI → backend | After the panel emit for the same request | `workspaceId`, `userId`, `law`, `requestId` | Match it to the request by `requestId`. |
 | `analysis_docx_generate_response` | AI → backend | Reply to the DOCX request | `requestId`, normalised document | Build the DOCX. |
+| `draft_docx_build_response` | AI → backend | Reply to every `draft_docx_build_request` | `requestId`, `workspaceId`, `userId`, `draftId`, `version` (echoed), `status`, `reason` (failed only), `downloadUrl` (ready only), `docxStatus`, `placeholderCount`, `metadata` (only when a model was called) | Match by `requestId`. On `ready`, copy the file at once into the backend's own storage as that `version`. On `failed`, keep the draft text and show the reason. Record the cost when `metadata` is present. |
 | `case_law_document_response` | AI → backend | Reply to an uploaded judgment | `requestId`, `workspaceId`, `userId`, `accepted`, `caseLaw`, `rejectionReason` | Close the request. Show the result or the rejection. |
 | `template_blueprint_proposal` | AI → backend | A template needs a blueprint | proposal for one template; a global one has `scope: "global"`, no `userId`, and the request's `fileHash` | Show it on the approval screen. Drop a global proposal whose `fileHash` no longer matches. |
 | `request_global_template_sync` | AI → backend | Every (re)connect | `requestId` | Reply `global_template_sync_response` with every published global template and the same `requestId`, even when empty. |
 | `ai_heartbeat_pong` | AI → backend | Every ping | `requestId`, `serverSentAt` (echoed), `aiTimestamp`, `status`, `version`, `uptimeMs` | Mark the AI link alive. |
+
+### Drafting Word file (SIM-211, SIM-216, SIM-219)
+
+Status: **proposed by the AI side, needs backend sign-off** (2026-11-17). All
+additions are optional and additive. The AI service implements
+`draft_docx_build_request` (SIM-216) and the link and storage rules (SIM-211);
+the open-changes check is SIM-219.
+
+#### `draft_docx_build_request` (backend → AI)
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `requestId` | string | yes | Idempotency key; re-sends with the same id are swallowed while in flight and answered from cache for 10 minutes after |
+| `workspaceId` | string | yes | Files the result under the workspace and bills any model cost to it |
+| `userId` | string | yes | Case owner |
+| `draftId` | string | yes | Echoed |
+| `version` | int | yes | The backend version this file will become; echoed |
+| `title` | string | yes | Draft title (used inside the document only, never in a file name or log) |
+| `content` | string | yes | Draft text |
+| `format` | `"markdown"` \| `"html"` | yes | `html` for drafts saved by the current in-app editor |
+| `templateId`, `templateVersion`, `templateScope` | | no | Build in that template's formatting; may call the model (billed) |
+
+Used for: **Rebuild Word file** (copy failed, or `docxStatus: "failed"`), and
+the first Word file of an older draft (SIM-218). Check that the AI is
+connected before sending; if it is not, show "Draft conversion is unavailable
+right now, try again shortly".
+
+AI-side behaviour:
+
+- `html` is converted to the same Markdown structure as a model-written draft
+  (headings, bold/italic, nested lists, tables, line breaks), so a table or
+  nested list comes out the same. Scripts, styles, frames and unknown tags are
+  dropped or unwrapped, and no attribute is carried over.
+- With `templateId`, the template is looked up as in the drafting chat. A
+  template the AI no longer holds is not fetched: the file is built with the
+  standard layout for the title instead, and still answered `ready`.
+- The build is capped at `DRAFT_DOCX_BUILD_TIMEOUT_SECONDS` (default 120).
+- A request for a case that is deleted (pending or done purge) is answered
+  `invalid_request`. It does **not** revoke a pending purge: a rebuild is the
+  backend serving a stored draft, not the lawyer working on the case.
+- Every answer, `failed` included, is replayed to a re-send of the same
+  `requestId` for 10 minutes. A new attempt needs a new `requestId`.
+
+#### `draft_docx_build_response` (AI → backend)
+
+| Field | Type | Meaning |
+|---|---|---|
+| `requestId`, `workspaceId`, `userId`, `draftId`, `version` | | Echoed |
+| `status` | `"ready"` \| `"failed"` | |
+| `reason` | `"invalid_request"` \| `"empty_content"` \| `"render_failed"` \| `"upload_failed"` \| `"timeout"` | Only when `failed` |
+| `downloadUrl` | string | Short-lived link (`drafts/<workspaceId>/…`); copy it at once |
+| `docxStatus` | `"ready"` \| `"failed"` | Same meaning as on `draftDocument` |
+| `placeholderCount` | int | `<Label>` fill-ins left. Absent when the request could not be read |
+| `metadata` | object | The usual cost block, only when a model was called |
+
+Always answered, success or failure; never silent. The only exception is a
+request with no readable `requestId`, which cannot be matched to anything.
+
+#### The "open changes" check (both sides use this list)
+
+A .docx has open changes when any of these parts:
+
+- `word/document.xml`
+- every `word/header*.xml` and `word/footer*.xml`
+- `word/footnotes.xml`, `word/endnotes.xml`
+
+contains any of these elements: `w:ins`, `w:del`, `w:moveFrom`, `w:moveTo`,
+`w:rPrChange`, `w:pPrChange`, `w:sectPrChange`, `w:tblPrChange`,
+`w:trPrChange`, `w:tcPrChange`, `w:tblGridChange`, `w:cellIns`, `w:cellDel`;
+
+or `word/comments.xml` contains at least one `w:comment`. **Any comment
+counts** until a file saved from ONLYOFFICE has been tested for how it marks
+resolved comments (SIM-214/SIM-215).
+
+#### Links and storage
+
+- Every draft file link the AI issues expires after
+  `DRAFT_DOCX_LINK_TTL_SECONDS` (default 3600). **Backend: tell us your
+  signed-link expiry and we set the same value.**
+- AI files live under `drafts/<workspaceId>/<uuid>.docx` in the drafts bucket
+  and are deleted by the workspace purge. The backend must copy the file
+  immediately into its own private, encrypted storage; the AI's copy is not a
+  store, and the link is a short-lived hand-off.
 
 ## Rules both sides must follow
 
@@ -123,8 +208,8 @@ says otherwise, `aiModel` is not used.
    by them.
 3. **Re-sends are expected.** The AI service dedupes:
    - `workspace_deleted`, `workspace_stop_request`, `document_reload_request`,
-     `workspace_resume_request` and `missing_information_edited` on
-     `requestId`;
+     `workspace_resume_request`, `missing_information_edited` and
+     `draft_docx_build_request` on `requestId`;
    - `workspace_version_restore` on `versionId`;
    - `workspace_sync` on a 180 s content fingerprint.
 
@@ -189,3 +274,4 @@ says otherwise, `aiModel` is not used.
 | 2026-10-21 | First version, written from the code | SIM-113 |
 | 2026-10-27 | `rejectionFeedback` on the analysis report sent after a reject (additive) | SIM-163 |
 | 2026-10-29 | AI handles `kb_document_added` / `kb_document_deleted` / `kb_sync`; chat citations gain `type: "knowledge_base"` (additive) | SIM-174 |
+| 2026-11-17 | New `draft_docx_build_request` / `draft_docx_build_response`; draft links are a short-lived hand-off the backend copies into its own encrypted storage (replaces "serve `downloadUrl` as-is"); open-changes list (proposed, needs backend sign-off) | SIM-216, SIM-211, SIM-219 |

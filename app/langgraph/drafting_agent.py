@@ -75,6 +75,11 @@ from app.prompts.drafting import (
     infer_document_class,
 )
 from app.core.roles import DEFAULT_WORKSPACE_ROLE
+from app.processing.draft_markdown import (
+    count_placeholders,
+    normalization_enabled,
+    normalize_if_enabled,
+)
 from app.langgraph.template_store import GLOBAL_SCOPE, pin_template_version, version_pins
 
 
@@ -507,6 +512,19 @@ def _template_skeleton_blob(
 
 def _word_count(text: str) -> int:
     return len([t for t in re.split(r"\s+", text or "") if t])
+
+
+def _docx_delivery_fields(markdown: str, download_url: Optional[str]) -> Dict[str, Any]:
+    """Additive ``draftDocument`` fields (SIM-202).
+
+    ``docxStatus`` tells the backend whether ``downloadUrl`` carries the AI's
+    Word file; ``placeholderCount`` is how many distinct ``<Label>`` fill-ins
+    the lawyer still has to complete.
+    """
+    return {
+        "docxStatus": "ready" if download_url else "failed",
+        "placeholderCount": count_placeholders(markdown),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -7024,6 +7042,7 @@ OUTPUT FORMAT:
         base_title_clean = re.sub(r"\s*\[[^\]]+\]\s*$", "", base_title).strip()
         new_title = f"{base_title_clean} [{target}]"
 
+        translated = normalize_if_enabled(translated)
         # Translated drafts get their own DOCX export too.
         translate_user_id = (
             session_state.get("user_id") or case_context.get("user_id") or ""
@@ -7063,6 +7082,7 @@ OUTPUT FORMAT:
             "language": target,
             "translatedFromVersion": prev_version or 1,
             "downloadUrl": translated_download_url,
+            **_docx_delivery_fields(translated, translated_download_url),
         }
 
         session_state["draft_status"] = "ready"
@@ -7557,6 +7577,44 @@ OUTPUT FORMAT:
         )
         return values or None
 
+    @staticmethod
+    async def _fill_lost_structure(markdown: str, docx_bytes: bytes, *, route: str) -> bool:
+        """True when a template fill dropped tables/sections the draft has."""
+        from app.processing.docx_generator import template_fill_lost_structure
+
+        try:
+            lost = await asyncio.to_thread(template_fill_lost_structure, markdown, docx_bytes)
+        except Exception as exc:
+            logger.opt(exception=exc).warning("docx_export structure check failed route={}", route)
+            return False
+        if lost:
+            logger.info(
+                "docx_export route={} dropped draft tables or sections; "
+                "rendering the full draft in the template's styles",
+                route,
+            )
+        return lost
+
+    @staticmethod
+    async def _log_docx_structure(route: str, markdown: str, docx_bytes: Optional[bytes]) -> None:
+        """One count-only line per export (SIM-202). Never logs text."""
+        if not docx_bytes:
+            return
+        from app.processing.docx_generator import docx_structure
+
+        try:
+            s = await asyncio.to_thread(docx_structure, docx_bytes)
+        except Exception as exc:
+            logger.opt(exception=exc).warning("docx_export structure scan failed route={}", route)
+            return
+        logger.info(
+            "docx_export route={} tables={} placeholders={} leftover_markup={}",
+            route,
+            s["tables"],
+            count_placeholders(markdown),
+            s["leftover_markup"],
+        )
+
     async def _export_draft_docx(
         self,
         *,
@@ -7710,11 +7768,23 @@ OUTPUT FORMAT:
                         exc,
                     )
 
+                # SIM-202: the diff only edits the template's own text, so a
+                # table or section the draft added never reaches the file.
+                # When the filled template lost structure the draft has,
+                # render the full draft in the template's styles instead.
+                lost_structure = False
+                if docx_bytes is not None and normalization_enabled():
+                    lost_structure = await self._fill_lost_structure(
+                        markdown, docx_bytes, route="llm_diff"
+                    )
+                    if lost_structure:
+                        docx_bytes = None
+
                 # Heuristic fallback chain — try sectional_fill /
                 # placeholder_fill before skeleton-clone so we still
                 # preserve template formatting when the LLM diff path
                 # didn't produce a result.
-                if docx_bytes is None:
+                if docx_bytes is None and not lost_structure:
                     docx_bytes = await self._fallback_heuristic_fill(
                         markdown=markdown,
                         template_docx_bytes=template_docx_bytes,
@@ -7727,6 +7797,10 @@ OUTPUT FORMAT:
                     )
                     if docx_bytes is not None:
                         path_used = "heuristic_fill"
+                        if normalization_enabled() and await self._fill_lost_structure(
+                            markdown, docx_bytes, route="heuristic_fill"
+                        ):
+                            docx_bytes = None
 
                 if docx_bytes is None:
                     path_used = "skeleton_clone"
@@ -7749,6 +7823,8 @@ OUTPUT FORMAT:
                     template_docx_bytes=None,
                     title=draft_title,
                 )
+
+            await self._log_docx_structure(path_used, markdown, docx_bytes)
 
             # SIM-211: filed under drafts/<workspaceId>/ (the workspace purge
             # deletes that prefix), no title in the object name, short link.
@@ -8001,12 +8077,15 @@ OUTPUT FORMAT:
             # MEDIUM/HIGH consumes ~60k on reasoning leaving only ~2-3k visible,
             # causing truncation. Matches the profile/kickoff long-form paths.
             # Falls back to legacy generate() if SDK absent.
+            # Stable route key: LLM_ROUTES={"draft_render": [...]} can send the
+            # draft itself to a stronger model without moving chat or panels.
             raw = await gemini_client.generate_longform(
                 prompt,
                 system_instruction=DRAFT_RENDER_INSTRUCTION,
                 temperature=0.35,
                 max_tokens=65536,
                 thinking_level="LOW",
+                task="draft_render",
             )
         except Exception as e:
             logger.error("Draft render LLM call failed: {}", e)
@@ -8025,6 +8104,10 @@ OUTPUT FORMAT:
                 "you have provided and try again."
             )
             return session_state
+        # SIM-202: repair tables, escaped placeholders, deep headings and
+        # rules before anything compares, stores or renders the draft — the
+        # regressed-value restore below matches on clean ``<Label>`` tokens.
+        markdown = normalize_if_enabled(markdown)
 
         # Re-render safety net: a revision/re-render must never re-blank a field
         # that was already filled (e.g. fill the execution date and lose the
@@ -8096,6 +8179,8 @@ OUTPUT FORMAT:
                 "sequence in the rendered draft",
                 _renumbered,
             )
+        # Re-translation is another model pass; normalise once more (idempotent).
+        markdown = normalize_if_enabled(markdown)
 
         # Generate the .docx artifact, upload to GCS, and collect the
         # download URL. Any failure here is non-fatal — markdown still
@@ -8129,6 +8214,7 @@ OUTPUT FORMAT:
             "sourceType": source_value,
             "wordCount": _word_count(markdown),
             "downloadUrl": download_url,
+            **_docx_delivery_fields(markdown, download_url),
         }
         # Log any slots that survived as unfilled placeholders — diagnostic
         # only; the draft ships regardless and the lawyer can fill gaps in a
@@ -8198,6 +8284,9 @@ OUTPUT FORMAT:
                 "document you would like me to draft and I will get started."
             )
             return session_state
+        # Drafts stored before SIM-202 are repaired on their next export.
+        markdown = normalize_if_enabled(markdown)
+        session_state["last_draft_markdown"] = markdown
 
         draft_title = session_state.get("draft_title") or "Final Draft"
         template_id: Optional[str] = session_state.get("template_id")
@@ -8267,6 +8356,7 @@ OUTPUT FORMAT:
             "sourceType": source_value,
             "wordCount": _word_count(markdown),
             "downloadUrl": download_url,
+            **_docx_delivery_fields(markdown, download_url),
         }
         session_state["draft_status"] = "ready"
         session_state["current_draft_version"] = new_version

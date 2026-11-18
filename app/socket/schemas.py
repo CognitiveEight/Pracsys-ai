@@ -1046,6 +1046,11 @@ class DraftDocumentPayload(BaseModel):
     # Public HTTPS URL to the generated .docx blob uploaded to GCS.
     # Absent when DOCX generation or upload failed — markdown still ships.
     downloadUrl: Optional[str] = None
+    # SIM-202 (additive). "ready" when downloadUrl carries the AI-built Word
+    # file (serve it as-is), "failed" when no file could be produced.
+    docxStatus: Optional[Literal["ready", "failed"]] = None
+    # Distinct <Label> fill-ins still left in the draft for the lawyer.
+    placeholderCount: Optional[int] = None
 
 
 class Citation(BaseModel):

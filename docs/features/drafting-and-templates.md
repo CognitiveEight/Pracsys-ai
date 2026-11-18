@@ -95,11 +95,30 @@ app page in `other_side`.
    from the case alone. Each reply carries `draftStatus` (analyzing,
    gathering_info, ready, revising), `openQuestions` and, when ready,
    `draftDocument` (Markdown).
-7. **Word export.** The draft is rendered to DOCX. With a template that has
-   placeholders, they are filled in place in the original file. Otherwise the
-   template is cloned and re-filled with its own styles. With no template,
-   default styles are used. The file is uploaded to cloud storage and its link
-   is returned as `draftDocument.downloadUrl`.
+7. **Word export.** First, the draft Markdown is normalised
+   (`app/processing/draft_markdown.py`, SIM-202). Table rows are joined and
+   given a separator. `\<Label\>` becomes `<Label>`. Headings deeper than
+   `###` are lowered and `---` rules are dropped. The draft is then rendered
+   to DOCX:
+   - **With a template:** it is filled in place in the original file. If the
+     filled file lost tables or sections the draft has, the full draft is
+     rendered in the template's styles instead.
+   - **With no template:** default styles are used.
+
+   The renderer emits:
+   - real Word tables (bold repeating header row, columns sized to fit the
+     page);
+   - nested lists;
+   - styled headings 1–6;
+   - a page break before schedules, annexures and the execution page;
+   - yellow-highlighted `<Label>` placeholders;
+   - line breaks inside signature blocks.
+
+   The file is uploaded to cloud storage and its link is returned as
+   `draftDocument.downloadUrl`, with `docxStatus` and `placeholderCount`.
+   One `docx_export route= tables= placeholders= leftover_markup=` line is
+   logged per export. `DRAFT_MARKDOWN_NORMALIZE=false` turns off the
+   normaliser and the template structure check.
 
 ## Rules and limits
 
@@ -194,8 +213,12 @@ Inbound: `global_template_sync`, `global_template_sync_response`,
 
 ### Known gaps
 
-- No automated tests for matching quality, the drafting conversation or Word
-  export.
+- No automated tests for matching quality or the drafting conversation.
+  Word export rendering is covered by `tests/test_docx_generator.py` and
+  `tests/test_draft_markdown.py` (SIM-202), but the template-diff path
+  (`llm_diff`) is not.
+- Template tables are not read at ingestion, so the model never sees a
+  template's tables (`extract_text_from_docx` without `mark_pages`).
 - Template skeletons in cloud storage are not deleted on template delete.
   Generated draft files are deleted by the workspace purge (SIM-211).
 - Approved blueprints and presets live in memory and rely on the backend

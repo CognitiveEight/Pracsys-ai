@@ -377,6 +377,12 @@ class Settings(BaseSettings):
     # to outlive that copy; matches the backend's GCS_SIGNED_URL_TTL_MINUTES (15). Never set
     # this to years: a signed link cannot be revoked.
     draft_docx_link_ttl_seconds: int = 900
+
+    # SIM-202: clean up the model's draft Markdown (tables, placeholders,
+    # headings, rules) before it is stored, emitted or exported, and check
+    # that a filled template kept the draft's tables and sections. False is
+    # the rollback switch.
+    draft_markdown_normalize: bool = True
     chirp_region: str = "us"  # Speech-to-Text V2 regional endpoint (us / eu / asia)
     audio_languages: str = (
         "en-IN,hi-IN"  # Comma-separated language codes (Chirp 3 diarization-supported)

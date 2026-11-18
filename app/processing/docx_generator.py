@@ -927,30 +927,37 @@ def _render_with_template_skeleton(
 # ---------------------------------------------------------------------------
 
 
-def _apply_legal_defaults(doc: _DocxDocument) -> None:
-    # Page margins — 1 inch on all sides.
+def _apply_legal_defaults(doc: _DocxDocument, layout=None) -> None:
+    """Page, body and heading styles; ``layout`` is a SIM-208 ``LayoutProfile``."""
+    left = layout.margin_left_in if layout else 1.0
+    right = layout.margin_right_in if layout else 1.0
+    top = layout.margin_top_in if layout else 1.0
+    bottom = layout.margin_bottom_in if layout else 1.0
+    body = layout.body_size if layout else 12.0
     for section in doc.sections:
-        section.top_margin = Inches(1)
-        section.bottom_margin = Inches(1)
-        section.left_margin = Inches(1)
-        section.right_margin = Inches(1)
+        section.top_margin = Inches(top)
+        section.bottom_margin = Inches(bottom)
+        section.left_margin = Inches(left)
+        section.right_margin = Inches(right)
 
-    # Normal style — Times New Roman 12 pt, 1.5 spacing, justified.
+    # Normal style — Times New Roman, the layout's size, spacing and alignment.
     try:
         normal = doc.styles["Normal"]
         normal.font.name = "Times New Roman"
-        normal.font.size = Pt(12)
+        normal.font.size = Pt(body)
         pf = normal.paragraph_format
-        pf.line_spacing = 1.5
+        pf.line_spacing = layout.line_spacing if layout else 1.5
         pf.space_after = Pt(6)
-        pf.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        pf.alignment = (WD_ALIGN_PARAGRAPH.JUSTIFY if (layout is None or layout.justify)
+                        else WD_ALIGN_PARAGRAPH.LEFT)
     except Exception:
         pass
 
     # Heading styles 1-6 — black, bold, Times New Roman, kept with the text
     # that follows. Word's defaults are blue theme headings, and levels 4-6
-    # were left unstyled.
-    for level, size in ((1, 16), (2, 14), (3, 12), (4, 12), (5, 12), (6, 12)):
+    # were left unstyled. Sizes follow the body size.
+    for level, size in ((1, body + 4), (2, body + 2), (3, body), (4, body), (5, body),
+                        (6, body)):
         try:
             hs = doc.styles[f"Heading {level}"]
             hs.font.name = "Times New Roman"
@@ -1012,18 +1019,31 @@ def _add_page_number_footer(doc: _DocxDocument) -> None:
             r.font.size = Pt(9)
 
 
-def _render_with_defaults(markdown_text: str) -> bytes:
-    doc = Document()
-    _apply_legal_defaults(doc)
-    _add_page_number_footer(doc)
+def _render_with_defaults(markdown_text: str, layout=None) -> bytes:
+    from app.processing.draft_layouts import is_title_line, is_versus, starts_body
 
+    doc = Document()
+    _apply_legal_defaults(doc, layout)
+    if layout is None or layout.page_numbers:
+        _add_page_number_footer(doc)
+
+    # SIM-208: the title block (court name, case number, cause title, the
+    # document's title) is centred until the body starts.
+    in_title = bool(layout and layout.centre_title_block)
+    centre_versus = layout is not None and layout.name != "default"
     blocks = parse_markdown_blocks(markdown_text)
     for bi, block in enumerate(blocks):
+        if in_title and isinstance(block, (Heading, Paragraph)) and starts_body(block.text):
+            in_title = False
+        if in_title and isinstance(block, (BulletList, OrderedList, Table)):
+            in_title = False
         if isinstance(block, Heading):
             level = min(max(block.level, 1), 9)
             p = doc.add_paragraph()
             _safe_set_style(p, f"Heading {level}")
             _add_runs(p, block.runs)
+            if in_title or (centre_versus and is_versus(block.text)):
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             if bi > 0 and _starts_new_part(block, level):
                 p.paragraph_format.page_break_before = True
             continue
@@ -1032,6 +1052,9 @@ def _render_with_defaults(markdown_text: str) -> bytes:
             _add_runs(p, block.runs)
             if _is_line_block(block.runs):
                 _format_line_block(p)
+            elif (in_title and is_title_line(block.text)) or (
+                    centre_versus and is_versus(block.text)):
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             continue
         if isinstance(block, (BulletList, OrderedList)):
             _write_list(doc, block, 0, bullet_style="List Bullet", run_style=None)
@@ -1054,13 +1077,19 @@ def render_markdown_to_docx(
     *,
     template_docx_bytes: Optional[bytes],
     title: str = "Draft",
+    document_type: Optional[str] = None,
 ) -> bytes:
     """Render the AI's Markdown draft into a ``.docx`` blob.
 
     Falls back to the defaults path if template rendering fails for any
     reason (the template path raising a docx parsing error should never
-    block draft delivery).
+    block draft delivery). Without a template, the layout comes from the
+    document's type (SIM-208): notice, court filing, affidavit, vakalatnama
+    or agreement.
     """
+    from app.processing.draft_layouts import infer_layout
+
+    layout = infer_layout(title, document_type)
     if template_docx_bytes:
         try:
             return _render_with_template_skeleton(markdown_text, template_docx_bytes)
@@ -1069,7 +1098,7 @@ def render_markdown_to_docx(
                 "Template-skeleton DOCX render failed, falling back to defaults: {}",
                 exc,
             )
-    return _render_with_defaults(markdown_text)
+    return _render_with_defaults(markdown_text, layout)
 
 
 # ---------------------------------------------------------------------------

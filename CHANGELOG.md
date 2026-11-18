@@ -35,6 +35,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `draftDocument.downloadUrl` into its own encrypted storage instead of
     serving it as-is.
   - Coverage: `tests/test_draft_html.py`, `tests/offline/verify_docx_build.py`.
+- **SIM-220: a draft revision can come back as tracked changes in the
+  lawyer's own file** (behind `DRAFT_REVISIONS_AS_TRACKED_CHANGES`, default
+  off; off is exactly SIM-219).
+  - **Socket payload change (additive, optional).** `ai_response`
+    `draftDocument.trackedChanges: true` when `downloadUrl` is the lawyer's
+    file with the AI's edits as Word tracked changes (author "SimplerToday
+    AI"). Absent for a clean file.
+  - Deterministic (`app/processing/docx_track_changes.py`, no new model
+    call): blocks and then words are diffed, and only the differences are
+    written; formatting, letterhead, numbering, comments, headers, footers and
+    section properties are untouched. The base Markdown goes through the same
+    normaliser and totals check as the revision, so neither shows up as an AI
+    edit. The revision prompt gains a "copy untouched text verbatim"
+    instruction on this path only.
+  - Falls back to the SIM-219 clean file when the revision changes more than
+    `DRAFT_TRACKED_CHANGES_MAX_CHANGED_RATIO` (0.4) of the blocks (an intent
+    change, a full redraft, a translation; the reply says so), or for a
+    structure it cannot map (columns changed, fields, drawings, content
+    controls). One `draft_tracked_changes` count-only log line per revision.
+  - The AI's tracked changes count as open changes: the next revision is
+    refused until the lawyer accepts or rejects them, and the refusal message
+    now says the open changes may be the AI's own.
+  - Coverage: `tests/test_docx_track_changes.py`,
+    `tests/test_draft_tracked_revision.py`.
+
 - **SIM-219: a chat revision of a draft starts from the lawyer's latest
   version, not the AI's own copy.** Editor changes are no longer erased by
   the next revision.

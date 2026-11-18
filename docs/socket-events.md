@@ -180,6 +180,16 @@ carries `draftRefusal` instead of `draftDocument`, `draftStatus` stays
 `"ready"`, `content` is the lawyer-facing message, and no model is called.
 `baseDocumentUrl` is read once and never stored or logged in full.
 
+SIM-220 adds `trackedChanges?: bool` (additive). When
+`DRAFT_REVISIONS_AS_TRACKED_CHANGES` is on and a revision was built from
+`baseDocumentUrl`, `downloadUrl` is the lawyer's own file with the AI's edits
+as Word tracked changes (author "SimplerToday AI") and `trackedChanges` is
+`true`. Absent: a clean AI-built file, as before (setting off, a technical
+fallback, or a revision that rewrote most of the draft; in that last case
+`content` ends with one sentence saying so). `draftDocument.content` is the
+revised Markdown either way. The AI's tracked changes count as open changes,
+so the next revision is refused until the lawyer settles them.
+
 ## Not fully typed
 
 These are listed above, but their shape is not pinned by a model:

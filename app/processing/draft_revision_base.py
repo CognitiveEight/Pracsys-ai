@@ -18,7 +18,7 @@ No model is called here. The URL is never stored and is logged only through
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from loguru import logger
@@ -31,8 +31,9 @@ OUTCOME_OPEN_CHANGES = "open_changes"
 OUTCOME_UNREADABLE = "base_unreadable"
 
 OPEN_CHANGES_MESSAGE = (
-    "This draft has tracked changes or comments that are still open. Accept "
-    "or reject them in the editor, then ask again."
+    "This draft has tracked changes or comments that are still open, "
+    "including any changes suggested by the AI. Accept or reject them in the "
+    "editor, then ask again."
 )
 UNREADABLE_MESSAGE = (
     "I could not open the latest version of this draft, so I have not "
@@ -56,6 +57,9 @@ class RevisionBase:
     tracked_changes: int = 0
     comments: int = 0
     reason: Optional[str] = None  # set when outcome is base_unreadable
+    # SIM-220: the file itself, kept for this turn only (the tracked-changes
+    # path edits it). Never stored in the session or logged.
+    docx_bytes: bytes = field(default=b"", repr=False)
 
     def refusal(self) -> Optional[dict]:
         """The ``draftRefusal`` object for the ai_response, or None."""
@@ -141,7 +145,7 @@ def _inspect(docx_bytes: bytes) -> RevisionBase:
         return RevisionBase(outcome=OUTCOME_UNREADABLE, reason="convert_failed")
     if not markdown.strip():
         return RevisionBase(outcome=OUTCOME_UNREADABLE, reason="empty_body")
-    return RevisionBase(outcome=OUTCOME_OK, markdown=markdown)
+    return RevisionBase(outcome=OUTCOME_OK, markdown=markdown, docx_bytes=docx_bytes)
 
 
 async def load_revision_base(url: str) -> RevisionBase:

@@ -116,6 +116,24 @@ app page in `other_side`.
    One `draft_revise_from_base outcome= tracked= comments= chars=` line is
    logged per turn that carries a base (counts only; the link is never
    stored, and logged only without its query string).
+
+   **Revisions as tracked changes (SIM-220, `DRAFT_REVISIONS_AS_TRACKED_CHANGES`,
+   default off).** On a revision built from the lawyer's file, the AI returns
+   that same file with its edits as Word tracked changes (author
+   "SimplerToday AI"), so the lawyer accepts or rejects them in the editor.
+   `app/processing/docx_track_changes.py` lines up the file's paragraphs and
+   tables with the Markdown the model saw and with its revision (difflib on
+   blocks, then words) and writes only the differences: changed words as
+   `w:del`/`w:ins` with the neighbouring run's formatting, new and removed
+   paragraphs and table rows with their marks. Everything else keeps its XML;
+   other parts of the file are copied byte for byte. No model call is added;
+   the revision prompt gains one instruction to copy untouched text verbatim.
+   The file falls back to the clean rebuild (and `trackedChanges` is absent)
+   when the revision changed more than `DRAFT_TRACKED_CHANGES_MAX_CHANGED_RATIO`
+   (0.4) of the blocks (the reply then says so), when a table's columns
+   changed, or when a changed paragraph holds a field, drawing or content
+   control. One `draft_tracked_changes outcome= inserted= deleted=
+   changed_blocks= unmatched= reason=` line per revision.
 7. **Word export.** First, the draft Markdown is normalised
    (`app/processing/draft_markdown.py`, SIM-202). Table rows are joined and
    given a separator. `\<Label\>` becomes `<Label>`. Headings deeper than
@@ -209,7 +227,8 @@ app page in `other_side`.
 | Draft storage bucket not configured (`GCS_DOCX_BUCKET_NAME`) | Draft shows, no Word download | Export returns nothing; Markdown still returned |
 | Word export fails | Draft shows, no Word download | Returns `draftDocument` without `downloadUrl`; the backend can ask again with `draft_docx_build_request` |
 | Rebuild requested for a deleted case | Rebuild fails | `draft_docx_build_response` `failed` / `invalid_request`; the purge stays armed |
-| Latest version has open tracked changes or comments | "Accept or reject them in the editor, then ask again." | `draftRefusal: open_changes` with counts; no model call |
+| Latest version has open tracked changes or comments (including the AI's own suggested edits) | "…including any changes suggested by the AI. Accept or reject them in the editor, then ask again." | `draftRefusal: open_changes` with counts; no model call |
+| A tracked-changes revision rewrote most of the draft (SIM-220) | A clean new version, and one sentence saying why | Clean rebuild; `trackedChanges` absent; `reason=too_many_changes` |
 | Latest version's link expired or file unreadable | "I could not open the latest version…" | `draftRefusal: base_unreadable`; no model call |
 | Suggestion generation fails | Empty Drafting Assistant panel | Returns an empty list; never blocks case creation |
 | Blueprint profiling fails | No approval screen for that template | Per-template failure is logged and skipped |

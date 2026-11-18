@@ -30,6 +30,7 @@ import hashlib
 import json
 import re
 from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -102,6 +103,28 @@ DRAFTING_SESSION_CACHE_KIND = "drafting_session"
 # NOTICE", "BAIL APPLICATION", "MOST RESPECTFULLY SHOWETH") commonly
 # appears AFTER that boiler-plate, so a generous window matters.
 _CLASSIFY_CONTENT_CHARS = 4000
+
+# SIM-220: the lawyer's base .docx and the Markdown adopted from it, for the
+# current turn only (set by _adopt_revision_base, cleared when handle_turn
+# returns). Never stored in the session or Qdrant.
+_TURN_REVISION_BASE: ContextVar[Optional[Tuple[bytes, str]]] = ContextVar(
+    "drafting_turn_revision_base", default=None
+)
+# Added to the revision prompt only when the result is delivered as tracked
+# changes: every character the model rewrites becomes a suggested change.
+TRACKED_REVISION_VERBATIM_INSTRUCTION = (
+    "TRACKED-CHANGES REVISION: your output is compared word by word with the "
+    "previous draft and every difference is shown to the lawyer as a "
+    "suggested change. Copy every paragraph, table cell and heading you are "
+    "not asked to change exactly, character for character (same wording, "
+    "punctuation, numbering and order). Change only what the request needs."
+)
+# Appended to the reply when a revision rewrote too much to be shown as
+# suggested changes (an intent change, a full redraft, a translation).
+TRACKED_FALLBACK_NOTICE = (
+    "This change rewrote most of the draft, so it comes as a new clean version "
+    "instead of suggested changes. The previous version is still in the history."
+)
 
 # DOCX export. Generated drafts are stored by app.storage.draft_files
 # (drafts/<workspaceId>/, SIM-211); this prefix holds the original template
@@ -567,6 +590,16 @@ class DocxBuildResult:
     route: str
     reason: Optional[str]
     template: str
+
+
+TRACKED_REASON_TOO_MANY = "too_many_changes"
+
+
+def _tracked_revisions_enabled() -> bool:
+    """SIM-220 switch: revisions as tracked changes in the lawyer's file."""
+    from app.core.config import settings as _settings
+
+    return bool(getattr(_settings, "draft_revisions_as_tracked_changes", False))
 
 
 def _docx_delivery_fields(markdown: str, download_url: Optional[str]) -> Dict[str, Any]:
@@ -4206,13 +4239,17 @@ class DraftingAgent:
         The turn runs under a fresh template version-pin table, so a draft
         started from a global template keeps reading the version it began on.
         """
-        with version_pins():
-            return await self._handle_turn(
-                user_message=user_message,
-                case_context=case_context,
-                request_fields=request_fields,
-                conversation_history=conversation_history,
-            )
+        base_token = _TURN_REVISION_BASE.set(None)
+        try:
+            with version_pins():
+                return await self._handle_turn(
+                    user_message=user_message,
+                    case_context=case_context,
+                    request_fields=request_fields,
+                    conversation_history=conversation_history,
+                )
+        finally:
+            _TURN_REVISION_BASE.reset(base_token)
 
     async def _handle_turn(
         self,
@@ -4781,6 +4818,9 @@ class DraftingAgent:
         if (state.get("draft_status") or "").strip() not in self._ACTIVE_DRAFT_STATUSES:
             # A stored version exists, so the draft is ready to revise.
             state["draft_status"] = "ready"
+        if base.docx_bytes:
+            # SIM-220: kept for this turn only, for the tracked-changes path.
+            _TURN_REVISION_BASE.set((base.docx_bytes, markdown))
         return None, state, len(markdown)
 
     async def _dispatch_classified_turn(
@@ -8338,6 +8378,66 @@ OUTPUT FORMAT:
 
     # ------------------------------------------------------------------ render
 
+    async def _export_tracked_revision(
+        self,
+        *,
+        base_docx: bytes,
+        base_markdown: str,
+        revised_markdown: str,
+        workspace_id: str,
+    ) -> Tuple[Optional[str], bool, str]:
+        """Upload the lawyer's file with the revision as tracked changes.
+
+        Returns ``(download_url, tracked_changes, reason)``. ``download_url``
+        is None on every fallback (the caller then builds the clean file);
+        ``reason`` is a fixed code. One ``draft_tracked_changes`` line.
+        """
+        from app.core.config import settings as _settings
+        from app.processing.docx_track_changes import build_tracked_revision
+        from app.storage.draft_files import draft_bucket, upload_draft_docx
+
+        ratio = float(getattr(_settings, "draft_tracked_changes_max_changed_ratio", 0.4))
+        # Compare like with like: the base goes through the same
+        # post-processing as the delivered revision, so the normaliser's
+        # repairs or a totals marker are never shown as the AI's edits.
+        base_for_diff = _check_totals(normalize_if_enabled(base_markdown))
+        result = None
+        reason = "error"
+        url: Optional[str] = None
+        try:
+            if not draft_bucket():
+                reason = "no_bucket"
+            else:
+                result = await asyncio.to_thread(
+                    build_tracked_revision,
+                    base_docx,
+                    base_for_diff,
+                    revised_markdown,
+                    max_changed_ratio=ratio,
+                )
+                reason = result.reason
+                if result.docx is not None:
+                    url = await asyncio.to_thread(upload_draft_docx, workspace_id, result.docx)
+        except asyncio.CancelledError:
+            logger.warning("draft_tracked_changes cancelled")
+            raise
+        except Exception as exc:
+            logger.warning("draft_tracked_changes failed: {}", type(exc).__name__)
+            reason = "upload_failed" if result is not None and result.docx is not None else "error"
+            url = None
+        tracked = bool(url) and result is not None and result.has_changes
+        logger.info(
+            "draft_tracked_changes outcome={} inserted={} deleted={} changed_blocks={} "
+            "unmatched={} reason={}",
+            "applied" if url else "fallback",
+            result.inserted if result else 0,
+            result.deleted if result else 0,
+            result.changed_blocks if result else 0,
+            result.unmatched if result else 0,
+            reason,
+        )
+        return url, tracked, reason
+
     async def _render_and_attach(
         self,
         *,
@@ -8369,6 +8469,13 @@ OUTPUT FORMAT:
             "template" if template_id else "blank"
         )
         mode = mode_override or source_value or "blank"
+        # SIM-220: a revision of the lawyer's own file (base adopted this
+        # turn) is delivered as tracked changes when the setting is on.
+        revision_base = (
+            _TURN_REVISION_BASE.get()
+            if mode == "revision" and _tracked_revisions_enabled()
+            else None
+        )
 
         # Template tone / filing context — drives the draft's voice (template
         # tone wins over the default register). Prefer the values carried in
@@ -8437,6 +8544,10 @@ OUTPUT FORMAT:
                 or ""
             ),
         )
+        if revision_base is not None:
+            # Untouched text must come back verbatim, or every rewording the
+            # model allows itself shows up as a suggested change.
+            prompt = f"{prompt}\n\n{TRACKED_REVISION_VERBATIM_INSTRUCTION}"
         try:
             # LOW thinking preserves the full 64k output budget for draft text;
             # MEDIUM/HIGH consumes ~60k on reasoning leaving only ~2-3k visible,
@@ -8555,21 +8666,40 @@ OUTPUT FORMAT:
         # omitted. Case context is forwarded so the placeholder-fill
         # path (when the template uses [bracket]-style slots) can map
         # each slot to a value from the lawyer's gathered facts.
-        download_url: Optional[str] = await self._export_draft_docx(
-            markdown=markdown,
-            draft_title=draft_title,
-            tpl=tpl,
-            user_id=user_id,
-            template_id=template_id,
-            workspace_id=session_state.get("workspace_id") or "",
-            actionable_id=session_state.get("actionable_id") or "",
-            version=new_version,
-            role=role,
-            case_summary=case_summary,
-            case_facts_brief=case_facts,
-            gathered_facts=gathered,
-            lawyer_instructions=lawyer_instructions,
-        )
+        # SIM-220: on a revision of the lawyer's own file, the file comes back
+        # with the AI's edits as tracked changes. Any fallback builds the
+        # clean file below, exactly as SIM-219 does.
+        download_url: Optional[str] = None
+        tracked_changes = False
+        tracked_reason: Optional[str] = None
+        if revision_base is not None:
+            download_url, tracked_changes, tracked_reason = await self._export_tracked_revision(
+                base_docx=revision_base[0],
+                base_markdown=revision_base[1],
+                revised_markdown=markdown,
+                workspace_id=session_state.get("workspace_id") or "",
+            )
+        elif mode == "revision" and _TURN_REVISION_BASE.get() is not None:
+            logger.info(
+                "draft_tracked_changes outcome=off inserted=0 deleted=0 "
+                "changed_blocks=0 unmatched=0 reason=setting_off"
+            )
+        if download_url is None:
+            download_url = await self._export_draft_docx(
+                markdown=markdown,
+                draft_title=draft_title,
+                tpl=tpl,
+                user_id=user_id,
+                template_id=template_id,
+                workspace_id=session_state.get("workspace_id") or "",
+                actionable_id=session_state.get("actionable_id") or "",
+                version=new_version,
+                role=role,
+                case_summary=case_summary,
+                case_facts_brief=case_facts,
+                gathered_facts=gathered,
+                lawyer_instructions=lawyer_instructions,
+            )
 
         draft_document = {
             "title": draft_title,
@@ -8583,6 +8713,8 @@ OUTPUT FORMAT:
             "downloadUrl": download_url,
             **_docx_delivery_fields(markdown, download_url),
         }
+        if tracked_changes:
+            draft_document["trackedChanges"] = True
         # Log any slots that survived as unfilled placeholders — diagnostic
         # only; the draft ships regardless and the lawyer can fill gaps in a
         # follow-up turn. Not surfaced in the user-facing message.
@@ -8621,6 +8753,12 @@ OUTPUT FORMAT:
         session_state["last_draft_markdown"] = markdown
         session_state["last_draft_document"] = draft_document
         session_state["last_assistant_message"] = markdown
+        if tracked_reason == TRACKED_REASON_TOO_MANY:
+            # Tell the lawyer why this revision is a clean file, not
+            # suggested changes. Technical fallbacks are only logged.
+            session_state["last_assistant_message"] = (
+                f"{markdown}\n\n{TRACKED_FALLBACK_NOTICE}"
+            )
         session_state["open_questions"] = []
         # Transient flag — true ONLY on the turn that just produced a draft
         # body, so BE can distinguish draft delivery from acknowledgements /

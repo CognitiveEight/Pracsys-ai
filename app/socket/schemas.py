@@ -1147,6 +1147,9 @@ class DraftDocumentPayload(BaseModel):
     # version this draft was built from (absent for a first draft).
     draftId: Optional[str] = None
     baseVersion: Optional[int] = None
+    # SIM-220 (additive). True when downloadUrl is the lawyer's own file with
+    # the AI's edits as Word tracked changes; absent for a clean file.
+    trackedChanges: Optional[bool] = None
 
 
 class DraftRefusal(BaseModel):

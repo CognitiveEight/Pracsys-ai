@@ -403,6 +403,12 @@ class Settings(BaseSettings):
     # SIM-216: cap on one draft_docx_build_request (render + upload, and the
     # template route's model call). Past it the backend is answered `timeout`.
     draft_docx_build_timeout_seconds: int = 120
+    # SIM-219: the lawyer's latest draft .docx, read once per revision turn
+    # from the backend's short-lived link. Bounded so a slow or huge file
+    # cannot hold a drafting turn: past either limit the revision is refused
+    # as base_unreadable.
+    draft_base_download_timeout_seconds: float = 30.0
+    draft_base_max_bytes: int = 25 * 1024 * 1024
     chirp_region: str = "us"  # Speech-to-Text V2 regional endpoint (us / eu / asia)
     audio_languages: str = (
         "en-IN,hi-IN"  # Comma-separated language codes (Chirp 3 diarization-supported)

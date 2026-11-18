@@ -35,6 +35,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `draftDocument.downloadUrl` into its own encrypted storage instead of
     serving it as-is.
   - Coverage: `tests/test_draft_html.py`, `tests/offline/verify_docx_build.py`.
+- **SIM-219: a chat revision of a draft starts from the lawyer's latest
+  version, not the AI's own copy.** Editor changes are no longer erased by
+  the next revision.
+  - **Socket payload change (additive, optional; contract proposed, needs
+    backend sign-off).** `user_message_request` (DRAFTING_ASSISTANT) gains
+    `draftId`, `baseVersion`, `baseDocumentUrl`. `ai_response` gains
+    `draftDocument.draftId`, `draftDocument.baseVersion`, and `draftRefusal
+    {code: "open_changes" | "base_unreadable", trackedChanges, comments}`,
+    sent instead of `draftDocument`.
+  - The .docx at `baseDocumentUrl` is read once (30 s, 25 MB; settings
+    `DRAFT_BASE_DOWNLOAD_TIMEOUT_SECONDS`, `DRAFT_BASE_MAX_BYTES`) and never
+    stored. It is checked before any model call.
+  - Open tracked changes or comments (the contract's element list, in the
+    body, headers, footers, footnotes and endnotes; every comment counts):
+    refused with `open_changes` and the counts. A failed link or a file that
+    is not a .docx: refused with `base_unreadable`. A refusal makes no model
+    call, keeps `draftStatus: ready` and tells the lawyer what to do.
+  - Otherwise the file's body is read back into the drafting Markdown
+    (headings, GFM tables, lists, bold/italic) and revised as vN+1.
+  - Turns without `baseDocumentUrl` are unchanged.
+  - New: `app/processing/docx_review_state.py`, `docx_markdown.py`,
+    `draft_revision_base.py`. One `draft_revise_from_base outcome= tracked=
+    comments= chars=` line per turn; counts only.
+  - Coverage: `tests/test_docx_review_state.py`,
+    `tests/test_draft_revise_from_base.py`,
+    `tests/offline/verify_draft_revise_from_base.py`.
 
 - **SIM-208: drafts without a template use the standard layout of their
   document type.**

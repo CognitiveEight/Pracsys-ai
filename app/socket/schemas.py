@@ -816,6 +816,22 @@ class UserMessageRequestPayload(BaseModel):
         default=None,
         validation_alias=AliasChoices("formatLayout", "format_layout"),
     )
+    # SIM-219: revise the backend's latest stored version, not the AI's own
+    # copy. `draftId` is echoed in draftDocument.draftId; `baseDocumentUrl` is
+    # a short-lived link to version `baseVersion`'s .docx, read once and never
+    # stored. Without it a turn behaves as before.
+    draftId: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("draftId", "draft_id"),
+    )
+    baseVersion: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("baseVersion", "base_version"),
+    )
+    baseDocumentUrl: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("baseDocumentUrl", "base_document_url"),
+    )
 
 
 # ============================================================================
@@ -1127,6 +1143,25 @@ class DraftDocumentPayload(BaseModel):
     docxStatus: Optional[Literal["ready", "failed"]] = None
     # Distinct <Label> fill-ins still left in the draft for the lawyer.
     placeholderCount: Optional[int] = None
+    # SIM-219 (additive). Echo of the request's draftId, and the backend
+    # version this draft was built from (absent for a first draft).
+    draftId: Optional[str] = None
+    baseVersion: Optional[int] = None
+
+
+class DraftRefusal(BaseModel):
+    """SIM-219: sent instead of ``draftDocument`` when the AI would not revise
+    the backend's latest version. No model was called for the turn.
+
+    ``open_changes``: the file has tracked changes or comments (counts given).
+    ``base_unreadable``: the link failed, expired, or is not a valid .docx.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    code: Literal["open_changes", "base_unreadable"]
+    trackedChanges: Optional[int] = None
+    comments: Optional[int] = None
 
 
 class Citation(BaseModel):
@@ -1208,6 +1243,8 @@ class AIResponsePayload(BaseModel):
     ] = None
     openQuestions: Optional[List[DraftOpenQuestion]] = None
     draftDocument: Optional[DraftDocumentPayload] = None
+    # SIM-219: present instead of draftDocument when a revision was refused.
+    draftRefusal: Optional[DraftRefusal] = None
 
     class Config:
         populate_by_name = True

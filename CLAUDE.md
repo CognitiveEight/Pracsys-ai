@@ -190,7 +190,10 @@ Pruning also snapshots each removed entry into the `REMOVED_DOCUMENTS` ledger, w
 persistence for the workspace **first** (`block_workspace_persistence` in `app/workspace/persistence.py`),
 because `persist_state` is fire-and-forget and an upsert already in flight would otherwise land after
 the delete and recreate the cache point. It then clears in-memory state, then deletes from Qdrant and
-disk.
+disk, then deletes the workspace's generated draft Word files (`drafts/<workspaceId>/`, SIM-211).
+Upload a draft file only through `app/storage/draft_files.upload_draft_docx`: it files by
+workspace, keeps the title out of the object name and signs a short link. `generate_signed_url`
+has no default expiry on purpose; a signed link cannot be revoked.
 
 `_clear_workspace_memory` **sweeps `self.__dict__`** rather than naming each cache. The handler owns
 dozens of per-workspace dicts and gains more with every feature; an explicit list would be correct

@@ -1,13 +1,17 @@
 """SIM-219: a drafting revision starts from the backend's latest .docx.
 
 The lawyer edits the draft in the editor; the backend stores that as a new
-version and sends its link (``baseDocumentUrl``) with the next revision turn.
+version and sends it with the next revision turn as ``latestVersion``
+{version, url, expiresAt, openChanges, sha256} (``baseDocumentUrl`` /
+``baseVersion`` are the earlier names, still read without it).
 The agent must revise THAT file, refuse (with no model call) when the file
 has open tracked changes / comments or cannot be read, and behave exactly as
 before when no link is sent. The download and the model are stubbed; the
 scan and the .docx -> Markdown conversion are real. Fictional data only.
 """
 
+import base64
+import hashlib
 import io
 import json
 import zipfile
@@ -21,6 +25,8 @@ from app.ai.gemini_client import gemini_client
 from app.langgraph.drafting_agent import drafting_agent
 from app.processing.docx_generator import render_markdown_to_docx
 from app.processing.docx_markdown import docx_to_draft_markdown
+from app.socket.handlers.chat import _revision_base_fields
+from app.socket.schemas import UserMessageRequestPayload
 
 LAWYER_SENTENCE = "The sender reserves the right to claim interest at eighteen percent per annum."
 AI_ONLY_SENTENCE = "This paragraph was in the assistant's own earlier copy only."
@@ -274,6 +280,113 @@ async def test_draft_id_is_echoed_without_a_base(monkeypatch, fakes):
     assert "baseVersion" not in turn["draftDocument"]
     # The persisted record is the AI's own; the echo is on a copy.
     assert "draftId" not in (fakes.session.get("last_draft_document") or {})
+
+
+# ------------------------------------------- latestVersion (backend contract)
+
+
+def _latest_fields(**latest):
+    """Request fields exactly as the chat handler builds them from a payload."""
+    payload = UserMessageRequestPayload(
+        content="Add a demand paragraph.",
+        chatType="DRAFTING_ASSISTANT",
+        timestamp="2026-11-19T10:00:00.000Z",
+        draftId="draft_fictional_1",
+        latestVersion=latest,
+    )
+    return {"draftId": payload.draftId, **_revision_base_fields(payload)}
+
+
+def test_latest_version_is_parsed_into_the_base_fields():
+    data = _lawyer_docx()
+    fields = _latest_fields(
+        version=3, url=FAKE_URL, expiresAt="2026-11-19T10:15:00.000Z",
+        openChanges=False, sha256=hashlib.sha256(data).hexdigest(),
+    )
+    assert fields["baseDocumentUrl"] == FAKE_URL
+    assert fields["baseVersion"] == 3
+    assert fields["baseRequired"] is True
+    assert fields["baseOpenChanges"] is False
+    assert fields["baseSha256"] == hashlib.sha256(data).hexdigest()
+
+
+@pytest.mark.parametrize("flag", [True, 2, ["word/document.xml"], "true"])
+def test_open_changes_flag_is_read_loosely(flag):
+    assert _latest_fields(version=3, url=FAKE_URL, openChanges=flag)["baseOpenChanges"] is True
+
+
+def test_legacy_base_fields_still_read_without_latest_version():
+    payload = UserMessageRequestPayload(
+        content="x", chatType="DRAFTING_ASSISTANT", timestamp="t",
+        baseDocumentUrl=FAKE_URL, baseVersion=2,
+    )
+    fields = _revision_base_fields(payload)
+    assert fields == {"baseDocumentUrl": FAKE_URL, "baseVersion": 2}
+
+
+async def test_latest_version_is_revised_from_the_lawyers_file(monkeypatch, fakes):
+    data = _lawyer_docx()
+    _stub_download(monkeypatch, fakes, data=data)
+    turn = await _turn(**_latest_fields(
+        version=3, url=FAKE_URL, openChanges=False,
+        sha256=hashlib.sha256(data).hexdigest(),
+    ))
+    assert fakes.downloads == [FAKE_URL]
+    assert LAWYER_SENTENCE in fakes.render_prompts[0]
+    assert AI_ONLY_SENTENCE not in fakes.render_prompts[0]
+    assert turn["draftDocument"]["version"] == 4
+    assert turn["draftDocument"]["baseVersion"] == 3
+
+
+async def test_base64_digest_is_accepted(monkeypatch, fakes):
+    data = _lawyer_docx()
+    _stub_download(monkeypatch, fakes, data=data)
+    digest = base64.b64encode(hashlib.sha256(data).digest()).decode()
+    turn = await _turn(**_latest_fields(version=3, url=FAKE_URL, sha256=digest))
+    assert "draftRefusal" not in turn
+
+
+async def test_backend_open_changes_flag_refuses_before_download(monkeypatch, fakes):
+    _stub_download(monkeypatch, fakes, data=_lawyer_docx())
+    turn = await _turn(**_latest_fields(version=3, url=FAKE_URL, openChanges=True))
+    assert fakes.downloads == []
+    assert fakes.router_prompts == [] and fakes.render_prompts == []
+    assert turn["draftRefusal"] == {"code": "open_changes"}
+    assert turn["draftDocument"] is None
+    assert turn["draftStatus"] == "ready"
+    assert fakes.saved == []
+
+
+async def test_latest_version_without_a_link_never_uses_the_ai_copy(monkeypatch, fakes):
+    _stub_download(monkeypatch, fakes, data=_lawyer_docx())
+    turn = await _turn(**_latest_fields(version=3))
+    assert fakes.downloads == []
+    assert fakes.render_prompts == []
+    assert turn["draftRefusal"] == {"code": "base_unreadable"}
+    assert fakes.session["last_draft_markdown"] == AI_COPY
+
+
+async def test_failed_latest_link_never_uses_the_ai_copy(monkeypatch, fakes):
+    _stub_download(monkeypatch, fakes, error=base_module.BaseUnreadable("http_403"))
+    turn = await _turn(**_latest_fields(version=3, url=FAKE_URL))
+    assert turn["draftRefusal"] == {"code": "base_unreadable"}
+    assert fakes.render_prompts == []
+
+
+async def test_digest_mismatch_refuses_as_unreadable(monkeypatch, fakes):
+    _stub_download(monkeypatch, fakes, data=_lawyer_docx())
+    turn = await _turn(**_latest_fields(version=3, url=FAKE_URL, sha256="0" * 64))
+    assert turn["draftRefusal"] == {"code": "base_unreadable"}
+    assert fakes.render_prompts == []
+    assert fakes.saved == []
+
+
+def test_digest_matches_rules():
+    data = b"fictional bytes"
+    assert base_module.digest_matches(data, None)
+    assert base_module.digest_matches(data, "")
+    assert base_module.digest_matches(data, hashlib.sha256(data).hexdigest().upper())
+    assert not base_module.digest_matches(data, hashlib.sha256(b"other").hexdigest())
 
 
 # ------------------------------------------------------------------ download

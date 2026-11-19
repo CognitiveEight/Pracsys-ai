@@ -400,7 +400,7 @@ class Settings(BaseSettings):
     # to outlive that copy; matches the backend's GCS_SIGNED_URL_TTL_MINUTES (15). Never set
     # this to years: a signed link cannot be revoked.
     draft_docx_link_ttl_seconds: int = 900
-    # SIM-216: cap on one draft_docx_build_request (render + upload, and the
+    # SIM-216: cap on one draft_file_build_request (render + upload, and the
     # template route's model call). Past it the backend is answered `timeout`.
     draft_docx_build_timeout_seconds: int = 120
     # SIM-219: the lawyer's latest draft .docx, read once per revision turn

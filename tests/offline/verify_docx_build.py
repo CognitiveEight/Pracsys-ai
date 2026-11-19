@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-verify_docx_build.py — Offline checks for `draft_docx_build_request` (SIM-216).
+verify_docx_build.py — Offline checks for `draft_file_build_request` (SIM-216).
 
 The backend asks for a Word file built from a stored draft's text ("Rebuild
 Word file", the first Word file of an older draft). The AI answers with
-`draft_docx_build_response`, always, success or failure.
+`draft_file_build_response`, always, success or failure.
 
 Exercises the real handler through `event_handler.handle(...)` and the real
 renderer; only the socket and the draft-file upload are stubbed. No API key,
 no backend, no bucket, no model call. Fictional text only.
 
 Covers:
-  1. ready_markdown — Markdown draft → ready, link, echo, placeholders, no metadata
+  1. ready_markdown — Markdown draft → ok, link, echo, placeholders, no metadata
   2. ready_html     — editor HTML → same table and placeholders as Markdown
   3. in_flight      — a re-send while the build runs is swallowed (one build)
   4. cached         — a re-send after completion gets the same answer, no rebuild
@@ -19,12 +19,15 @@ Covers:
   6. empty          — empty draft text → `empty_content`
   7. failures       — upload error → `upload_failed`; render error → `render_failed`
   8. timeout        — a build past DRAFT_DOCX_BUILD_TIMEOUT_SECONDS → `timeout`
-  9. template       — templateId not held → standard layout, still ready
+  9. template       — templateId not held → standard layout, still ok
  10. metadata       — the cost block appears only when a model was called
  11. purge          — pending purge refused (not revoked); purge mid-build
                       deletes the file; the ledger is swept by the purge
  12. stop           — the build is not part of a run a stop can cancel
  13. logs           — no title, draft text or link in any log line
+ 14. layout         — formatLayout (SIM-217) applied; a missing image or a null
+                      layout still builds
+ 15. title          — no title in the contract: inferred from the draft
 
 USAGE
     python tests/offline/verify_docx_build.py            # run everything
@@ -51,8 +54,8 @@ from app.socket.events import event_handler as H  # noqa: E402
 from app.socket.handlers import run_control  # noqa: E402
 from app.storage import draft_files  # noqa: E402
 
-EVENT = "draft_docx_build_request"
-RESPONSE = "draft_docx_build_response"
+EVENT = "draft_file_build_request"
+RESPONSE = "draft_file_build_response"
 
 RESULTS = []
 EMITS = []
@@ -66,7 +69,7 @@ TITLE = "Legal Notice for Recovery of Dues Zephyrine"
 SECRET_WORD = "Quillfeather"  # appears only in the draft text
 FAKE_LINK = "https://storage.example.invalid/drafts/x.docx?X-Goog-Signature=SIGNATUREVALUE"
 
-MARKDOWN = f"""# Legal Notice
+MARKDOWN = f"""# {TITLE}
 
 To,
 <Bank Name>
@@ -85,13 +88,41 @@ My client {SECRET_WORD} states:
 Pay to <Account Number>.
 """
 
-HTML = f"""<h1>Legal Notice</h1><p>To,<br>&lt;Bank Name&gt;</p>
+HTML = f"""<h1>{TITLE}</h1><p>To,<br>&lt;Bank Name&gt;</p>
 <p>My client {SECRET_WORD} states:</p>
 <ol><li>The account was opened in 2019.<ul><li>Statement A</li></ul></li>
 <li>The dues remain unpaid.</li></ol>
 <table><thead><tr><th>Item</th><th>Amount</th></tr></thead>
 <tbody><tr><td>Principal</td><td>1,00,000</td></tr><tr><td>Total</td><td>1,00,000</td></tr></tbody></table>
 <script>alert(1)</script><p>Pay to &lt;Account Number&gt;.</p>"""
+
+
+LETTERHEAD_TEXT = "Example Chambers Zephyrine"
+LETTERHEAD = {
+    "id": "fmt_lh",
+    "name": "Example letterhead",
+    "type": "letterhead",
+    "version": 4,
+    "formatting": {
+        "page": {"font": "Calibri", "fontSize": "11pt", "watermark": "None"},
+        "letterhead": {
+            "headerType": "text", "headerTextLeft": LETTERHEAD_TEXT,
+            "footerType": "text", "footerTextCenter": "1 Sample Road, Example City",
+            "pageApplication": "all",
+        },
+    },
+}
+LETTERHEAD_WITH_IMAGE = {
+    **LETTERHEAD,
+    "formatting": {
+        **LETTERHEAD["formatting"],
+        "letterhead": {
+            **LETTERHEAD["formatting"]["letterhead"],
+            "headerType": "image",
+            "headerImageUrl": FAKE_LINK,
+        },
+    },
+}
 
 
 class _FakeSocket:
@@ -155,11 +186,12 @@ def _req(ws, rid=None, **over):
         "requestId": rid or f"ddb_{uuid.uuid4().hex[:8]}",
         "workspaceId": ws,
         "userId": OWNER,
-        "draftId": "draft_0001",
-        "version": 3,
-        "title": TITLE,
+        "purpose": "rebuild",
+        "draftId": "user_draft_0001",
         "content": MARKDOWN,
         "format": "markdown",
+        "formatLayout": None,
+        "timestamp": "2026-11-19T10:00:00.000Z",
     }
     body.update(over)
     return body
@@ -201,17 +233,18 @@ async def check_ready_markdown():
     logs_before = len(LOG_LINES)
     await H.handle(EVENT, body)
     await _settle()
-    summary = [ln for ln in LOG_LINES[logs_before:] if "draft_docx_build status=" in ln]
+    summary = [ln for ln in LOG_LINES[logs_before:] if "draft_file_build status=" in ln]
     check("exactly one summary log line for the build", len(summary) == 1, str(len(summary)))
     res = _responses(body["requestId"])
     check("exactly one response", len(res) == 1, str(res))
     r = res[0] if res else {}
-    check("status ready / docxStatus ready",
-          r.get("status") == "ready" and r.get("docxStatus") == "ready", str(r))
+    check("status ok, no old-contract fields",
+          r.get("status") == "ok" and "docxStatus" not in r and "reason" not in r
+          and "version" not in r and "userId" not in r, str(r))
     check("downloadUrl is the uploaded link", r.get("downloadUrl") == FAKE_LINK)
-    check("no reason on success", "reason" not in r)
-    check("ids and version echoed",
-          all(r.get(k) == body[k] for k in ("requestId", "workspaceId", "userId", "draftId", "version")))
+    check("no errorCode on success", "errorCode" not in r)
+    check("ids echoed",
+          all(r.get(k) == body[k] for k in ("requestId", "workspaceId", "draftId")))
     check("placeholderCount counts <Label> fill-ins", r.get("placeholderCount") == 2, str(r.get("placeholderCount")))
     check("no metadata when no model was called", "metadata" not in r)
     check("uploaded once, under the workspace", len(UPLOADS) == 1 and UPLOADS[0][0] == ws)
@@ -228,7 +261,7 @@ async def check_ready_html():
     await H.handle(EVENT, body)
     await _settle()
     r = (_responses(body["requestId"]) or [{}])[0]
-    check("status ready", r.get("status") == "ready", str(r))
+    check("status ready", r.get("status") == "ok", str(r))
     check("placeholders survive the HTML", r.get("placeholderCount") == 2, str(r.get("placeholderCount")))
     data = UPLOADS[0][1] if UPLOADS else b""
     check("the table reached the Word file", data and _tables_in(data) == 1)
@@ -284,7 +317,7 @@ async def check_cached():
     await _settle()
     res2 = _responses(body2["requestId"])
     check("a failed answer is replayed, not rebuilt",
-          len(res2) == 2 and all(r.get("reason") == "upload_failed" for r in res2) and not UPLOADS,
+          len(res2) == 2 and all(r.get("errorCode") == "upload_failed" for r in res2) and not UPLOADS,
           str(res2))
 
 
@@ -296,7 +329,7 @@ async def check_invalid():
         "missing content": {k: v for k, v in _req(ws).items() if k != "content"},
         "unknown format": _req(ws, format="rtf"),
         "missing draftId": {k: v for k, v in _req(ws).items() if k != "draftId"},
-        "version not a number": _req(ws, version="three"),
+        "missing workspaceId": {k: v for k, v in _req(ws).items() if k != "workspaceId"},
         "content too long": _req(ws, content="x" * 2_000_001),
     }
     for label, body in cases.items():
@@ -304,9 +337,8 @@ async def check_invalid():
         await H.handle(EVENT, body)
         await _settle()
         r = (_responses(body["requestId"]) or [{}])[0]
-        check(f"{label}: answered failed/invalid_request",
-              r.get("status") == "failed" and r.get("reason") == "invalid_request"
-              and r.get("docxStatus") == "failed", str(r))
+        check(f"{label}: answered error/invalid_request",
+              r.get("status") == "error" and r.get("errorCode") == "invalid_request", str(r))
     check("ids echoed when readable",
           (_responses() or [{}])[-1].get("workspaceId") == ws)
     EMITS.clear()
@@ -314,8 +346,8 @@ async def check_invalid():
     await H.handle(EVENT, body)
     await _settle()
     r = (_responses(body["requestId"]) or [{}])[0]
-    check("invalid_request echoes every readable id and version",
-          all(r.get(k) == body[k] for k in ("requestId", "workspaceId", "userId", "draftId", "version")),
+    check("invalid_request echoes every readable id",
+          all(r.get(k) == body[k] for k in ("requestId", "workspaceId", "draftId")),
           str(r))
     EMITS.clear()
     body = _req(ws)
@@ -339,7 +371,7 @@ async def check_empty():
         await H.handle(EVENT, body)
         await _settle()
         r = (_responses(body["requestId"]) or [{}])[0]
-        check(f"{fmt}: failed/empty_content", r.get("reason") == "empty_content", str(r))
+        check(f"{fmt}: error/empty_content", r.get("errorCode") == "empty_content", str(r))
     check("nothing uploaded", not UPLOADS)
 
 
@@ -352,8 +384,8 @@ async def check_failures():
     await H.handle(EVENT, body)
     await _settle()
     r = (_responses(body["requestId"]) or [{}])[0]
-    check("upload error → upload_failed", r.get("reason") == "upload_failed", str(r))
-    check("no link on failure", "downloadUrl" not in r and r.get("docxStatus") == "failed")
+    check("upload error → upload_failed", r.get("errorCode") == "upload_failed", str(r))
+    check("no link on failure", "downloadUrl" not in r and r.get("status") == "error")
     check("placeholderCount still reported", r.get("placeholderCount") == 2)
     UPLOAD_MODE["mode"] = "ok"
 
@@ -370,9 +402,9 @@ async def check_failures():
     finally:
         docx_generator.render_markdown_to_docx = original
     r = (_responses(body["requestId"]) or [{}])[0]
-    check("render error → render_failed", r.get("reason") == "render_failed", str(r))
+    check("render error → render_failed", r.get("errorCode") == "render_failed", str(r))
     check("render_failed: no link, placeholderCount still reported",
-          "downloadUrl" not in r and r.get("docxStatus") == "failed"
+          "downloadUrl" not in r and r.get("status") == "error"
           and r.get("placeholderCount") == 2, str(r))
 
     old_bucket = draft_files.draft_bucket
@@ -384,9 +416,9 @@ async def check_failures():
     finally:
         draft_files.draft_bucket = old_bucket
     r = (_responses(body["requestId"]) or [{}])[0]
-    check("no bucket configured → upload_failed", r.get("reason") == "upload_failed", str(r))
+    check("no bucket configured → upload_failed", r.get("errorCode") == "upload_failed", str(r))
     check("no bucket: no link, placeholderCount still reported",
-          "downloadUrl" not in r and r.get("docxStatus") == "failed"
+          "downloadUrl" not in r and r.get("status") == "error"
           and r.get("placeholderCount") == 2, str(r))
 
 
@@ -406,7 +438,7 @@ async def check_timeout():
     finally:
         settings.draft_docx_build_timeout_seconds = old
     r = (_responses(body["requestId"]) or [{}])[0]
-    check("answered failed/timeout", r.get("reason") == "timeout", str(r))
+    check("answered error/timeout", r.get("errorCode") == "timeout", str(r))
     check("answered at the cap, not after the slow upload", elapsed < 0.95, f"{elapsed:.2f}s")
     await asyncio.sleep(0.9)  # let the abandoned upload thread finish
 
@@ -440,7 +472,7 @@ async def check_template_missing():
     check("no model call for a template the AI does not hold", not model_calls, str(model_calls))
     check("upload carries the standard-layout file", len(UPLOADS) == 1)
     r = (_responses(body["requestId"]) or [{}])[0]
-    check("built with the standard layout, ready", r.get("status") == "ready", str(r))
+    check("built with the standard layout, ok", r.get("status") == "ok", str(r))
     check("no metadata (no model called)", "metadata" not in r)
 
 
@@ -482,7 +514,7 @@ async def check_purge():
         await H.handle(EVENT, body)
         await _settle()
         r = (_responses(body["requestId"]) or [{}])[0]
-        check("pending purge → invalid_request", r.get("reason") == "invalid_request", str(r))
+        check("pending purge → invalid_request", r.get("errorCode") == "invalid_request", str(r))
         check("the pending purge is NOT revoked", ws in H._pending_purges)
         check("nothing built", not UPLOADS)
     finally:
@@ -501,7 +533,7 @@ async def check_purge():
     try:
         r = (_responses(body["requestId"]) or [{}])[0]
         check("purge mid-build → invalid_request, no link",
-              r.get("reason") == "invalid_request" and "downloadUrl" not in r, str(r))
+              r.get("errorCode") == "invalid_request" and "downloadUrl" not in r, str(r))
         check("the workspace's draft files were deleted again", DELETES == [ws2], str(DELETES))
         check("no cached answer kept for a purged workspace",
               body["requestId"] not in (H._draft_docx_build_requests.get(ws2) or {}))
@@ -532,13 +564,62 @@ async def check_stop():
     UPLOAD_GATE.set()
     await _settle()
     r = (_responses(body["requestId"]) or [{}])[0]
-    check("still answered ready", r.get("status") == "ready", str(r))
+    check("still answered ok", r.get("status") == "ok", str(r))
+
+
+async def check_layout():
+    print("\n[14] formatLayout applied (SIM-217 shape)")
+    _reset()
+    ws = _ws("ddblayout")
+    body = _req(ws, purpose="first_file", formatLayout=LETTERHEAD)
+    r = await _one(body)
+    check("status ok with a letterhead", r.get("status") == "ok", str(r))
+    data = UPLOADS[0][1] if UPLOADS else b""
+    check("letterhead text is in the Word file's header",
+          bool(data) and LETTERHEAD_TEXT.encode() in _header_xml(data))
+    # A letterhead image that cannot be fetched never fails the build.
+    _reset()
+    from app.processing import format_images
+
+    original = format_images.fetch_format_image
+    format_images.fetch_format_image = lambda *_a, **_k: None
+    try:
+        r = await _one(_req(ws, formatLayout=LETTERHEAD_WITH_IMAGE))
+    finally:
+        format_images.fetch_format_image = original
+    check("missing letterhead image: still ok", r.get("status") == "ok", str(r))
+    r = await _one(_req(ws, formatLayout=None))
+    check("formatLayout null: still ok", r.get("status") == "ok", str(r))
+
+
+async def check_title():
+    print("\n[15] Standard layout without a title in the payload")
+    from app.socket.handlers.draft_docx_build import _draft_title
+
+    check("first heading is the title", _draft_title(None, MARKDOWN) == TITLE)
+    check("an explicit title wins",
+          _draft_title("Bail Application", MARKDOWN) == "Bail Application")
+    court = ("IN THE COURT OF THE SESSIONS JUDGE\n\n"
+             "BAIL APPLICATION UNDER SECTION 483 BNSS\n\n1. That.")
+    check("no heading: the title block is read", "BAIL APPLICATION" in _draft_title("", court))
+    check("empty draft: a neutral title", _draft_title(None, "") == "Draft")
+
+
+async def _one(body):
+    await H.handle(EVENT, body)
+    await _settle()
+    return (_responses(body["requestId"]) or [{}])[0]
+
+
+def _header_xml(data):
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        return b"".join(zf.read(n) for n in zf.namelist() if n.startswith("word/header"))
 
 
 async def check_logs():
     print("\n[13] Log hygiene")
     joined = "\n".join(LOG_LINES)
-    check("summary line written", "draft_docx_build status=" in joined)
+    check("summary line written", "draft_file_build status=" in joined)
     check("no title in logs", TITLE not in joined)
     check("no draft text in logs", SECRET_WORD not in joined)
     check("no link or signature in logs",
@@ -564,6 +645,8 @@ CHECKS = [
     ("metadata", check_metadata),
     ("purge", check_purge),
     ("stop", check_stop),
+    ("layout", check_layout),
+    ("title", check_title),
     ("logs", check_logs),
 ]
 

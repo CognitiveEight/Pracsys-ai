@@ -98,21 +98,25 @@ app page in `other_side`.
 
    **Revising the lawyer's latest version (SIM-219).** The backend stores
    every version as a .docx, including the lawyer's edits made in the editor.
-   When a drafting turn carries `baseDocumentUrl` (with `baseVersion` and
-   `draftId`), the agent reads that file once, before any model call
+   When a drafting turn carries `latestVersion` `{version, url, expiresAt,
+   openChanges, sha256}` (or the earlier `baseDocumentUrl` / `baseVersion`),
+   the agent reads that file once, before any model call
    (`app/processing/draft_revision_base.py`):
+   - `latestVersion.openChanges` true → refused with `open_changes` before
+     any download (no counts);
    - tracked changes or comments still open (`docx_review_state.py`, the
      contract's list) → refused with `draftRefusal.code: "open_changes"` and
      the counts; the lawyer settles them in the editor first;
-   - link failed or expired, file too large, or not a .docx → refused with
-     `base_unreadable`;
+   - no link, link failed or expired, file too large, SHA-256 different from
+     `latestVersion.sha256`, or not a .docx → refused with `base_unreadable`.
+     The AI's own copy is never used instead;
    - otherwise the body is read back into the drafting Markdown
      (`docx_markdown.py`: headings, GFM tables, lists, bold/italic, line
      breaks) and replaces the session's draft, so the revision is vN+1 of the
      lawyer's vN. `draftDocument` echoes `draftId` and `baseVersion`.
 
    A refusal makes no model call, sends no `draftDocument`, and keeps
-   `draftStatus: ready`. Turns without `baseDocumentUrl` behave as before.
+   `draftStatus: ready`. Turns without `latestVersion` or `baseDocumentUrl` behave as before.
    One `draft_revise_from_base outcome= tracked= comments= chars=` line is
    logged per turn that carries a base (counts only; the link is never
    stored, and logged only without its query string).
@@ -196,10 +200,11 @@ app page in `other_side`.
      - On any failure, the `llm_diff` chain runs.
    - Logs: `template fidelity built …` and `template_fill ops= applied= …`
      (counts only).
-9. **Rebuild Word file (SIM-216).** `draft_docx_build_request` builds a
+9. **Rebuild Word file (SIM-216).** `draft_file_build_request` builds a
    .docx from a draft the backend already stores ("Rebuild Word file", and
-   the first Word file of an older draft) and always answers
-   `draft_docx_build_response`.
+   the first Word file of an older draft) with the request's `formatLayout`
+   applied, and always answers `draft_file_build_response` (`status: ok`
+   with `downloadUrl`, or `status: error` with `errorCode`).
    - `format: "markdown"` goes through the normaliser; `format: "html"` (the
      in-app editor) is first converted to the same Markdown
      (`app/processing/draft_html.py`: headings, bold/italic, nested lists,
@@ -239,8 +244,8 @@ app page in `other_side`.
 | Template OCR finishes after suggestions were built | A card gains a template match later | Library count change triggers a re-match of unmatched cards |
 | Matched template deleted | The card shows other matches or none | Card demoted and re-matched against the current library |
 | Draft storage bucket not configured (`GCS_DOCX_BUCKET_NAME`) | Draft shows, no Word download | Export returns nothing; Markdown still returned |
-| Word export fails | Draft shows, no Word download | Returns `draftDocument` without `downloadUrl`; the backend can ask again with `draft_docx_build_request` |
-| Rebuild requested for a deleted case | Rebuild fails | `draft_docx_build_response` `failed` / `invalid_request`; the purge stays armed |
+| Word export fails | Draft shows, no Word download | Returns `draftDocument` without `downloadUrl`; the backend can ask again with `draft_file_build_request` |
+| Rebuild requested for a deleted case | Rebuild fails | `draft_file_build_response` `error` / `invalid_request`; the purge stays armed |
 | Latest version has open tracked changes or comments (including the AI's own suggested edits) | "…including any changes suggested by the AI. Accept or reject them in the editor, then ask again." | `draftRefusal: open_changes` with counts; no model call |
 | A tracked-changes revision rewrote most of the draft (SIM-220) | A clean new version, and one sentence saying why | Clean rebuild; `trackedChanges` absent; `reason=too_many_changes` |
 | Latest version's link expired or file unreadable | "I could not open the latest version…" | `draftRefusal: base_unreadable`; no model call |
@@ -275,12 +280,12 @@ app page in `other_side`.
 
 Inbound: `global_template_sync`, `global_template_sync_response`,
 `request_blueprint_proposal` (`scope: "global"`), `user_message_request`
-(drafting chat), `workspace_transferred`, `draft_docx_build_request`.
+(drafting chat), `workspace_transferred`, `draft_file_build_request`.
 Outbound:
 `request_global_template_sync` (every connect),
 `template_blueprint_proposal`, `document_feature_response`
 (`drafting_assistant`), `ai_response` (with draft fields),
-`draft_docx_build_response`. See
+`draft_file_build_response`. See
 [the socket contract](../contracts/backend-ai-socket-events.md).
 
 ### Data
@@ -313,7 +318,7 @@ Outbound:
 - `tests/test_global_templates.py` covers the Global Template Library feed,
   global profiling and version pinning.
 - `tests/test_draft_html.py` (HTML to Markdown) and
-  `tests/offline/verify_docx_build.py` (`draft_docx_build_request`) cover
+  `tests/offline/verify_docx_build.py` (`draft_file_build_request`) cover
   the Word-file rebuild (SIM-216).
 - `tests/test_draft_format.py` covers the chosen format (SIM-217): page,
   letterhead, court block, images, bad input, the export path and the

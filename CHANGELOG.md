@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SIM-216 / SIM-219: the drafting Word-file events now match the backend's
+  merged contract.** Both were built against our own proposal, so neither
+  worked against the backend (backend #39 and the SIM-219 brief).
+  **Socket payload change (needs-human-review).**
+  - SIM-216: the events are `draft_file_build_request` /
+    `draft_file_build_response` (were `draft_docx_build_*`, which the backend
+    never sends). The request no longer requires `version` or `title`, which
+    the backend does not send, so every request would have been refused as
+    `invalid_request`. It reads `purpose` and `formatLayout`: the chosen
+    format is applied to the rebuilt file exactly as in the drafting chat, and
+    a missing letterhead image never fails the build. Without a title the
+    standard layout comes from the draft's first heading. The reply is
+    `{requestId, workspaceId, draftId, status: "ok" | "error", downloadUrl?,
+    errorCode?}`, plus the additive `placeholderCount` and `metadata`
+    (`reason`, `docxStatus`, `version` and `userId` are gone).
+  - SIM-219: `user_message_request.latestVersion {version, url, expiresAt,
+    openChanges, sha256}` is read (the turn ignored it, and revised the AI's
+    own older copy). With `latestVersion` the base is required: no link or a
+    failing link refuses with `base_unreadable` and never falls back to the
+    AI's copy, `openChanges` refuses with `open_changes` before any download,
+    and a file whose SHA-256 differs from `sha256` is refused as
+    `base_unreadable`. `baseDocumentUrl` / `baseVersion` are still read
+    when `latestVersion` is absent.
+  - Coverage: `tests/offline/verify_docx_build.py` (groups 14–15 new),
+    `tests/test_draft_revise_from_base.py`.
+
 - **SIM-211: draft Word files are filed per workspace, expire quickly and are
   erased with the workspace.** Generated drafts were stored under
   `draft/<userId>/<uuid>-<title>.docx` with a link valid until 2050, and the
@@ -26,8 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **SIM-216: the backend can ask for a Word file built from a stored draft.**
-  **Socket payload change (additive): new events `draft_docx_build_request`
-  (backend → AI) and `draft_docx_build_response` (AI → backend).** Used for
+  **Socket payload change (additive): new events `draft_file_build_request`
+  (backend → AI) and `draft_file_build_response` (AI → backend).** Used for
   "Rebuild Word file" and the first Word file of an older draft.
   - `format: "markdown"` goes through the SIM-202 normaliser. `format: "html"`
     (the in-app editor) is first converted to the same Markdown, so tables,
@@ -38,7 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `templateId` is given and held (may call the model; the cost block is
     sent only then), else the SIM-208 standard layout from the title. The
     file is uploaded under `drafts/<workspaceId>/` with a short-lived link.
-  - Always answered: `ready`, or `failed` with `invalid_request`,
+  - Always answered: `ok`, or `error` with an `errorCode` of `invalid_request`,
     `empty_content`, `render_failed`, `upload_failed` or `timeout`.
     Idempotent on `requestId`: a re-send in flight is swallowed, and an
     answer is replayed for 10 minutes.

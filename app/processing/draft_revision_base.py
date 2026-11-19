@@ -1,12 +1,12 @@
 """Load the lawyer's latest draft version as the base of a revision (SIM-219).
 
-On a drafting revision turn the backend sends ``baseDocumentUrl``: a
+On a drafting revision turn the backend sends ``latestVersion.url``: a
 short-lived link to the latest stored .docx of the draft, which includes the
 lawyer's own edits from the editor. This module reads that file once and
 decides what the turn may do with it:
 
-- ``base_unreadable``: the link failed or expired, the file is too large, or
-  it is not a valid .docx;
+- ``base_unreadable``: the link failed or expired, the file is too large, its
+  SHA-256 differs from ``latestVersion.sha256``, or it is not a valid .docx;
 - ``open_changes``: the file still has tracked changes or comments
   (``docx_review_state``); a revision would silently accept or drop them;
 - ``ok``: the body converted to drafting Markdown (``docx_markdown``).
@@ -18,6 +18,8 @@ No model is called here. The URL is never stored and is logged only through
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -64,6 +66,9 @@ class RevisionBase:
     def refusal(self) -> Optional[dict]:
         """The ``draftRefusal`` object for the ai_response, or None."""
         if self.outcome == OUTCOME_OPEN_CHANGES:
+            if self.reason == "backend_flag":
+                # The backend's own flag: the file was not read, so no counts.
+                return {"code": OUTCOME_OPEN_CHANGES}
             return {
                 "code": OUTCOME_OPEN_CHANGES,
                 "trackedChanges": self.tracked_changes,
@@ -148,8 +153,26 @@ def _inspect(docx_bytes: bytes) -> RevisionBase:
     return RevisionBase(outcome=OUTCOME_OK, markdown=markdown, docx_bytes=docx_bytes)
 
 
-async def load_revision_base(url: str) -> RevisionBase:
-    """Fetch and inspect the base file. Never raises except on cancellation."""
+def digest_matches(data: bytes, expected: Optional[str]) -> bool:
+    """True when ``expected`` (hex or base64 SHA-256) is absent or matches."""
+    want = (expected or "").strip()
+    if not want:
+        return True
+    digest = hashlib.sha256(data).digest()
+    if want.lower() == digest.hex():
+        return True
+    return want == base64.b64encode(digest).decode("ascii")
+
+
+async def load_revision_base(
+    url: str, *, expected_sha256: Optional[str] = None
+) -> RevisionBase:
+    """Fetch and inspect the base file. Never raises except on cancellation.
+
+    A file whose digest differs from ``expected_sha256`` (the backend's
+    ``latestVersion.sha256``) is not the version the backend means:
+    refused as unreadable.
+    """
     from app.core.config import settings
 
     try:
@@ -160,4 +183,6 @@ async def load_revision_base(url: str) -> RevisionBase:
         )
     except BaseUnreadable as exc:
         return RevisionBase(outcome=OUTCOME_UNREADABLE, reason=exc.reason)
+    if not digest_matches(data, expected_sha256):
+        return RevisionBase(outcome=OUTCOME_UNREADABLE, reason="sha256_mismatch")
     return await asyncio.to_thread(_inspect, data)

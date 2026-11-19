@@ -100,6 +100,29 @@ _CITED_PANELS = frozenset(
 REPLAY_DELIVERY_GRACE_SECONDS = 60.0
 
 
+def _revision_base_fields(payload: Any) -> Dict[str, Any]:
+    """SIM-219 request fields for the drafting agent.
+
+    ``latestVersion`` (the backend's contract) wins; the earlier proposed
+    ``baseDocumentUrl`` / ``baseVersion`` are read only without it. When
+    ``latestVersion`` is present the base is REQUIRED: a missing or failing
+    link is refused, never answered from the AI's own copy.
+    """
+    latest = getattr(payload, "latestVersion", None)
+    if latest is not None:
+        return {
+            "baseDocumentUrl": (latest.url or "").strip() or None,
+            "baseVersion": latest.version,
+            "baseRequired": True,
+            "baseOpenChanges": latest.has_open_changes,
+            "baseSha256": (latest.sha256 or "").strip() or None,
+        }
+    return {
+        "baseDocumentUrl": (getattr(payload, "baseDocumentUrl", None) or "").strip() or None,
+        "baseVersion": getattr(payload, "baseVersion", None),
+    }
+
+
 def _payload_fingerprint(payload: Any) -> str:
     """Stable hash of a panel payload, to tell an unchanged replay from a new one."""
     try:
@@ -653,8 +676,7 @@ class ChatMixin:
             # SIM-219: the backend's draft id and its latest stored version.
             # The link is read once by the drafting agent and never stored.
             "draftId": (payload.draftId or "").strip() or None,
-            "baseVersion": payload.baseVersion,
-            "baseDocumentUrl": (payload.baseDocumentUrl or "").strip() or None,
+            **_revision_base_fields(payload),
             "draftOrigin": payload.draftOrigin,
         }
 

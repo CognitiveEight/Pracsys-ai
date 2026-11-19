@@ -328,15 +328,15 @@ GLOBAL_TEMPLATE_SYNC_RESPONSE = "global_template_sync_response"
 # ============================================================================
 
 # Server → AI: build a .docx from a stored draft's text ("Rebuild Word file",
-# first Word file of an older draft). Payload {requestId, workspaceId, userId,
-# draftId, version, title, content, format: "markdown"|"html", templateId?,
-# templateVersion?, templateScope?}. Idempotent on requestId.
-DRAFT_DOCX_BUILD_REQUEST = "draft_docx_build_request"
+# first Word file of an older draft). Payload {requestId, purpose:
+# "rebuild"|"first_file", workspaceId, userId, draftId, content, format:
+# "markdown"|"html", formatLayout|null, timestamp}. Idempotent on requestId.
+DRAFT_DOCX_BUILD_REQUEST = "draft_file_build_request"
 
-# AI → Server: always answered. {requestId, workspaceId, userId, draftId,
-# version, status: "ready"|"failed", reason?, downloadUrl?, docxStatus,
+# AI → Server: always answered. {requestId, workspaceId, draftId, status:
+# "ok"|"error", downloadUrl? (ok only), errorCode? (error only, a short code),
 # placeholderCount?, metadata?}.
-DRAFT_DOCX_BUILD_RESPONSE = "draft_docx_build_response"
+DRAFT_DOCX_BUILD_RESPONSE = "draft_file_build_response"
 
 
 class TemplateKind:

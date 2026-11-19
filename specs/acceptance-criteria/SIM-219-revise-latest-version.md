@@ -24,7 +24,12 @@ All fixtures are fictional.
 | AC-15 | `draftId` without a base | a turn returns a `draftDocument` | `draftId` echoed; the persisted record is unchanged | `tests/test_draft_revise_from_base.py::test_draft_id_is_echoed_without_a_base` |
 | AC-16 | a download that is 403, oversize, or not http(s) | fetched | `BaseUnreadable` with `http_403` / `too_large` / `bad_url` | `tests/test_draft_revise_from_base.py::test_download_*` |
 | AC-17 | the new request fields in camelCase or snake_case | parsed | both parse; absent fields are None; emitted payloads validate | offline `schema`, every offline group's `payload validates` |
-| AC-18 | a real backend sending `baseDocumentUrl` | the lawyer edits in the editor, then asks for a change in chat | the new version keeps the editor change | **manual**: needs the backend change and model calls |
+| AC-19 | `latestVersion {version, url, expiresAt, openChanges, sha256}` on a `user_message_request` | parsed | mapped to the base url, version, required flag, open-changes flag and digest; `openChanges` read as bool, count, list or "true"; without it the old fields are read | `tests/test_draft_revise_from_base.py::test_latest_version_is_parsed_into_the_base_fields`, `::test_open_changes_flag_is_read_loosely`, `::test_legacy_base_fields_still_read_without_latest_version` |
+| AC-20 | a clean `latestVersion` whose `sha256` (hex or base64) matches | a turn runs | revised from the lawyer's file as vN+1 | `tests/test_draft_revise_from_base.py::test_latest_version_is_revised_from_the_lawyers_file`, `::test_base64_digest_is_accepted` |
+| AC-21 | `latestVersion.openChanges` true | a turn runs | `draftRefusal {open_changes}` (no counts) before any download; no model call; nothing saved | `tests/test_draft_revise_from_base.py::test_backend_open_changes_flag_refuses_before_download` |
+| AC-22 | `latestVersion` with no `url`, or a failing link | a turn runs | `base_unreadable`; the AI's own copy is never used | `tests/test_draft_revise_from_base.py::test_latest_version_without_a_link_never_uses_the_ai_copy`, `::test_failed_latest_link_never_uses_the_ai_copy` |
+| AC-23 | a downloaded file whose SHA-256 differs from `latestVersion.sha256` | a turn runs | `base_unreadable`; no model call; nothing saved | `tests/test_draft_revise_from_base.py::test_digest_mismatch_refuses_as_unreadable`, `::test_digest_matches_rules` |
+| AC-18 | a real backend sending `latestVersion` | the lawyer edits in the editor, then asks for a change in chat | the new version keeps the editor change | **manual**: needs the backend change and model calls |
 
 ## Negative and edge cases
 - Stop / disconnect: drafting chat turns are fenced, not cancelled; a

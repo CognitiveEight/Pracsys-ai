@@ -385,7 +385,7 @@ class SocketEventHandler(
         self._stop_requests: Dict[str, Dict[str, float]] = {}
         # workspace_id -> {requestId: {status, ts}}, as _document_reload_requests.
         self._resume_requests: Dict[str, Dict[str, Dict[str, Any]]] = {}
-        # --- draft_docx_build_request (see handlers/draft_docx_build.py)
+        # --- draft_file_build_request (see handlers/draft_docx_build.py)
         # workspace_id -> {requestId: {status, ts, response}}. Re-sends are
         # swallowed in flight and answered from `response` for 10 minutes.
         # Keyed by workspace_id so the purge sweep erases it (links included).
@@ -464,7 +464,7 @@ class SocketEventHandler(
         )
         # Drafting Assistant — Word file from a stored draft's text (SIM-216).
         self.register(
-            "draft_docx_build_request", self.on_draft_docx_build_request
+            "draft_file_build_request", self.on_draft_docx_build_request
         )
         # Drafting Assistant — an admin's global template draft needs profiling
         # (upload or "Re-profile"); the AI emits a blueprint proposal.

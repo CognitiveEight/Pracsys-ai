@@ -57,7 +57,7 @@ pre-split file plus a runtime method/handler-key diff).
 | `handlers/law_relevance.py` | `LawRelevanceMixin` | Lawyer-selected applicable-law relevance assessment (`on_applicable_law_relevance_request`). |
 | `handlers/panel_edits.py` | `PanelEditsMixin` | User add/edit/delete for Case Laws and Relevant Parties panels. |
 | `handlers/docx_export.py` | `DocxExportMixin` | `on_analysis_docx_generate_request`. |
-| `handlers/draft_docx_build.py` | `DraftDocxBuildMixin` | `on_draft_docx_build_request` (SIM-216) — Word file from stored draft text (Markdown or editor HTML), always answered with `draft_docx_build_response`. Owns its `requestId` ledger (in flight swallowed, answers replayed 10 min). Runs unscoped (not cancelled by Stop); refuses purged / pending-purge workspaces without revoking the purge. |
+| `handlers/draft_docx_build.py` | `DraftDocxBuildMixin` | `on_draft_docx_build_request` (`draft_file_build_request`, SIM-216) — Word file from stored draft text (Markdown or editor HTML), always answered with `draft_docx_build_response`. Owns its `requestId` ledger (in flight swallowed, answers replayed 10 min). Runs unscoped (not cancelled by Stop); refuses purged / pending-purge workspaces without revoking the purge. |
 | `handlers/template_sync.py` | `TemplateSyncMixin` | Global Template Library feed (`global_template_sync`, connect-time snapshot) + global blueprint proposals + `ensure_templates_synced`. |
 | `handlers/workspace_metadata.py` | `WorkspaceMetadataMixin` | Workspace title/summary/category/description generation + fallbacks. |
 | `handlers/workspace_events.py` | `WorkspaceEventsMixin` | Connection lifecycle, `_do_reemit_after_reconnect`, and the big `on_workspace_created` / `on_workspace_sync` entrypoints. |

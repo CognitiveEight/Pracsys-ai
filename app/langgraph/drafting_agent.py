@@ -4329,15 +4329,20 @@ class DraftingAgent:
         # SIM-219: the backend sends its latest stored .docx of the draft
         # (with the lawyer's own editor changes). Revise THAT, not our copy.
         # Checked before any model call: a refusal returns here, unsaved.
+        # With `latestVersion` the base is required (`baseRequired`): no link,
+        # a failed link or the backend's own open-changes flag refuses the
+        # turn; the AI's copy is never used instead.
         draft_id = (request_fields.get("draftId") or "").strip() or None
         base_url = (request_fields.get("baseDocumentUrl") or "").strip()
         base_version = request_fields.get("baseVersion")
         adopted_base_chars: Optional[int] = None
-        if base_url:
+        if base_url or request_fields.get("baseRequired"):
             refusal, session_state, adopted_base_chars = await self._adopt_revision_base(
                 base_url=base_url,
                 base_version=base_version,
                 session_state=session_state,
+                open_changes_flag=bool(request_fields.get("baseOpenChanges")),
+                expected_sha256=request_fields.get("baseSha256"),
             )
             if refusal is not None:
                 return refusal
@@ -4799,6 +4804,8 @@ class DraftingAgent:
         base_url: str,
         base_version: Any,
         session_state: Optional[Dict[str, Any]],
+        open_changes_flag: bool = False,
+        expected_sha256: Optional[str] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[int]]:
         """Read the backend's latest .docx and make it the session's draft.
 
@@ -4809,14 +4816,26 @@ class DraftingAgent:
         replaces ``last_draft_markdown`` so every later step of the turn
         (router preview, revision prompt, regressed-value restore, finalize,
         translate) works from the lawyer's version.
+
+        ``open_changes_flag`` (the backend's ``latestVersion.openChanges``)
+        refuses before any download; an empty ``base_url`` refuses as
+        unreadable; ``expected_sha256`` must match the downloaded bytes.
         """
         from app.processing.draft_revision_base import (
             OUTCOME_OK,
+            OUTCOME_OPEN_CHANGES,
+            OUTCOME_UNREADABLE,
+            RevisionBase,
             load_revision_base,
         )
 
         try:
-            base = await load_revision_base(base_url)
+            if open_changes_flag:
+                base = RevisionBase(outcome=OUTCOME_OPEN_CHANGES, reason="backend_flag")
+            elif not base_url:
+                base = RevisionBase(outcome=OUTCOME_UNREADABLE, reason="no_url")
+            else:
+                base = await load_revision_base(base_url, expected_sha256=expected_sha256)
         except asyncio.CancelledError:
             logger.warning("draft_revise_from_base cancelled while reading the base file")
             raise
@@ -7942,8 +7961,14 @@ OUTPUT FORMAT:
         template_version: Optional[int] = None,
         template_scope: Optional[str] = None,
         role: Optional[str] = None,
+        format_layout: Optional[Dict[str, Any]] = None,
     ) -> DocxBuildResult:
         """Build and upload a Word file from existing draft Markdown (SIM-216).
+
+        ``format_layout`` is the request's chosen court/letterhead format
+        (SIM-217); it is applied exactly as on a drafting turn, through
+        :meth:`_apply_chosen_format`, so a rebuild and the chat produce the
+        same file.
 
         Same renderer as the drafting chat (:meth:`_render_draft_docx`) and the
         same template lookup (:meth:`_resolve_template`, version-pinned like a
@@ -7984,6 +8009,7 @@ OUTPUT FORMAT:
                     )
                     tpl = None
                 template_state = "found" if tpl else "missing"
+            layout_token = _TURN_FORMAT_LAYOUT.set(format_layout or None)
             try:
                 docx_bytes, route = await self._render_draft_docx(
                     markdown=markdown,
@@ -7994,11 +8020,16 @@ OUTPUT FORMAT:
                     bucket=bucket,
                     role=(role or DEFAULT_WORKSPACE_ROLE).upper(),
                 )
+                docx_bytes = await self._apply_chosen_format(docx_bytes, route=route)
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 logger.warning(
                     "draft_docx_build: render failed ({})", type(exc).__name__
                 )
                 return DocxBuildResult(None, "none", "render_failed", template_state)
+            finally:
+                _TURN_FORMAT_LAYOUT.reset(layout_token)
         if not docx_bytes:
             return DocxBuildResult(None, route, "render_failed", template_state)
 
@@ -8127,7 +8158,7 @@ OUTPUT FORMAT:
 
         The render half of :meth:`_export_draft_docx` (see there for the
         routes). Raises on a render failure, so callers that must tell a
-        render failure from an upload failure (``draft_docx_build_request``,
+        render failure from an upload failure (``draft_file_build_request``,
         SIM-216) can; ``_export_draft_docx`` still swallows both.
         """
         from app.core.config import settings as _settings

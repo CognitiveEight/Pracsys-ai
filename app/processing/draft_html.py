@@ -1,6 +1,6 @@
 """Rich-text editor HTML → draft Markdown (SIM-216).
 
-Drafts saved by the in-app editor reach ``draft_docx_build_request`` as HTML.
+Drafts saved by the in-app editor reach ``draft_file_build_request`` as HTML.
 The Word renderer (``app.processing.docx_generator``) reads Markdown, so the
 HTML is turned into the same Markdown structure the drafting model writes:
 headings, paragraphs, bold/italic, nested bullet and numbered lists, GFM

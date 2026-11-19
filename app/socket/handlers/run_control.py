@@ -137,7 +137,7 @@ _UNSCOPED_EVENTS = frozenset(
         "workspace_stop_request",
         "workspace_deleted",
         "ai_heartbeat_ping",
-        "draft_docx_build_request",
+        "draft_file_build_request",
     }
 )
 

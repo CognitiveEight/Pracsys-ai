@@ -160,3 +160,22 @@ Outbound `ai_response`, all optional, additive:
   reuses `FileProcessor`'s list-marker logic.
 - **The refusal turn is not saved.** Nothing in the session changes, so the
   next turn starts from the same state.
+
+## Addendum (2026-11-19): `latestVersion` from the backend
+
+The backend sends `user_message_request.latestVersion {version, url,
+expiresAt, openChanges, sha256}` instead of the proposed `baseDocumentUrl` /
+`baseVersion` (branch `fix/SIM-216-align-backend-contract`):
+
+- `_revision_base_fields` (`app/socket/handlers/chat.py`) maps it to the
+  agent's `baseDocumentUrl`, `baseVersion`, plus `baseRequired`,
+  `baseOpenChanges` and `baseSha256`. The old fields are read only when
+  `latestVersion` is absent.
+- With `latestVersion` the base is required: no `url` refuses with
+  `base_unreadable` without a download, so the AI's own copy is never used.
+- `openChanges` (read as bool, count or list) refuses with `open_changes`
+  before any download; the refusal carries no counts.
+- `sha256` (hex or base64) must match the downloaded bytes, else
+  `base_unreadable` (`sha256_mismatch` in the log).
+- `expiresAt` is not checked locally: an expired link fails the download and
+  refuses the same way, without clock-skew false refusals.

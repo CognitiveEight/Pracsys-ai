@@ -770,10 +770,10 @@ class SocketClient:
             await event_handler.handle("analysis_docx_generate_request", data)
 
         @self.sio.on(DRAFT_DOCX_BUILD_REQUEST)
-        async def draft_docx_build_request(data):
+        async def draft_file_build_request(data):
             """
             Server → AI: build a Word file from a stored draft's text (SIM-216).
-            Always answered with draft_docx_build_response.
+            Always answered with draft_file_build_response.
             """
             await event_handler.handle(DRAFT_DOCX_BUILD_REQUEST, data)
 

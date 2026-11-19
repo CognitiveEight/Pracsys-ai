@@ -617,7 +617,7 @@ class AnalysisDocxGenerateRequestPayload(BaseModel):
     timestamp: Optional[str] = None
 
 
-#: Largest draft text a draft_docx_build_request may carry (characters). A
+#: Largest draft text a draft_file_build_request may carry (characters). A
 #: long pleading is a few hundred thousand; anything past this is refused as
 #: ``invalid_request`` rather than rendered.
 DRAFT_DOCX_BUILD_MAX_CONTENT_CHARS = 2_000_000
@@ -625,25 +625,30 @@ DRAFT_DOCX_BUILD_MAX_CONTENT_CHARS = 2_000_000
 
 class DraftDocxBuildRequestPayload(BaseModel):
     """
-    Payload for draft_docx_build_request (Server -> AI, SIM-216).
+    Payload for draft_file_build_request (Server -> AI, SIM-216).
 
     Build a Word file from draft text the backend already holds: "Rebuild Word
-    file", and the first Word file of a draft saved before the AI produced
-    one. ``content`` is Markdown, or HTML from the in-app editor. Answered by
-    ``draft_docx_build_response``, always. ``title`` and ``content`` are case
+    file" (``purpose: rebuild``), and the first Word file of a draft saved
+    before the AI produced one (``purpose: first_file``). ``content`` is
+    Markdown, or HTML from the in-app editor. ``formatLayout`` is the SIM-217
+    shape (letterhead images as 1-hour signed links), or null. Answered by
+    ``draft_file_build_response``, always. ``title`` and ``content`` are case
     content: never logged.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     requestId: str = Field(min_length=1)
+    purpose: Optional[str] = None  # "rebuild" | "first_file"; logged as an enum only
     workspaceId: str = Field(min_length=1)
     userId: str = Field(min_length=1)  # the case owner
     draftId: str = Field(min_length=1)
-    version: int = Field(ge=0)  # the backend version this file will become
-    title: str
     content: str = Field(max_length=DRAFT_DOCX_BUILD_MAX_CONTENT_CHARS)
     format: Literal["markdown", "html"]
+    formatLayout: Optional[Any] = None
+    # Not in the backend's contract; read when present. Without a title the
+    # standard layout is inferred from the draft's own first heading.
+    title: Optional[str] = None
     templateId: Optional[str] = None
     templateVersion: Optional[int] = None
     templateScope: Optional[str] = None
@@ -662,23 +667,23 @@ class DraftDocxBuildRequestPayload(BaseModel):
 
 class DraftDocxBuildResponsePayload(BaseModel):
     """
-    Payload for draft_docx_build_response (AI -> Server, SIM-216).
+    Payload for draft_file_build_response (AI -> Server, SIM-216).
 
-    ``reason`` only when ``status`` is ``failed``; ``downloadUrl`` only when it
-    is ``ready`` (a short-lived hand-off link the backend copies at once);
-    ``placeholderCount`` once the draft text was read; ``metadata`` (the usual
-    cost block) only when a model was called.
+    ``errorCode`` only when ``status`` is ``error`` (a short code, never text
+    or a URL); ``downloadUrl`` only when it is ``ok`` (a short-lived hand-off
+    link under ``drafts/<workspaceId>/`` the backend copies at once).
+    ``placeholderCount`` and ``metadata`` (the usual cost block, only when a
+    model was called) are additive extras the backend may ignore.
     """
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     requestId: str
     workspaceId: Optional[str] = None
-    userId: Optional[str] = None
     draftId: Optional[str] = None
-    version: Optional[int] = None
-    status: Literal["ready", "failed"]
-    reason: Optional[
+    status: Literal["ok", "error"]
+    downloadUrl: Optional[str] = None
+    errorCode: Optional[
         Literal[
             "invalid_request",
             "empty_content",
@@ -687,8 +692,6 @@ class DraftDocxBuildResponsePayload(BaseModel):
             "timeout",
         ]
     ] = None
-    downloadUrl: Optional[str] = None
-    docxStatus: Literal["ready", "failed"]
     placeholderCount: Optional[int] = None
     metadata: Optional[Dict[str, Any]] = None
 
@@ -726,6 +729,54 @@ class ChatAskedBy(BaseModel):
     name: Optional[str] = None
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
+class LatestDraftVersion(BaseModel):
+    """
+    ``user_message_request.latestVersion`` (SIM-219): the backend's latest
+    stored .docx of the draft being revised.
+
+    ``url`` is a 15-minute signed link, read once and never stored or logged
+    raw. ``openChanges`` is the backend's own open-changes flag (SIM-215); it
+    is read loosely (bool, count or list) because only "any open" matters.
+    ``sha256`` is the file's digest, checked against the downloaded bytes.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    version: Optional[int] = None
+    url: Optional[str] = None
+    expiresAt: Optional[str] = None
+    openChanges: Optional[Any] = None
+    sha256: Optional[str] = None
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def _int_version(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+        return value if isinstance(value, int) else None
+
+    @field_validator("expiresAt", mode="before")
+    @classmethod
+    def _str_expiry(cls, value: Any) -> Any:
+        return None if value is None else str(value)
+
+    @property
+    def has_open_changes(self) -> bool:
+        """True when the backend says the version has open changes."""
+        value = self.openChanges
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value > 0
+        if isinstance(value, (list, tuple, dict)):
+            return len(value) > 0
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "yes", "1")
+        return False
 
 
 class UserMessageRequestPayload(BaseModel):
@@ -818,12 +869,19 @@ class UserMessageRequestPayload(BaseModel):
         validation_alias=AliasChoices("formatLayout", "format_layout"),
     )
     # SIM-219: revise the backend's latest stored version, not the AI's own
-    # copy. `draftId` is echoed in draftDocument.draftId; `baseDocumentUrl` is
-    # a short-lived link to version `baseVersion`'s .docx, read once and never
-    # stored. Without it a turn behaves as before.
+    # copy. `draftId` is echoed in draftDocument.draftId. The backend sends
+    # `latestVersion` {version, url, expiresAt, openChanges, sha256}: `url` is
+    # a 15-minute link to that version's .docx, read once and never stored.
+    # `baseDocumentUrl` / `baseVersion` are the earlier proposed names, still
+    # read when `latestVersion` is absent. Without either a turn behaves as
+    # before.
     draftId: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("draftId", "draft_id"),
+    )
+    latestVersion: Optional[LatestDraftVersion] = Field(
+        default=None,
+        validation_alias=AliasChoices("latestVersion", "latest_version"),
     )
     baseVersion: Optional[int] = Field(
         default=None,

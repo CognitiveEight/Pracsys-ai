@@ -162,3 +162,23 @@ Both events are **new**; no existing payload changes. Field tables:
   parser is enough for editor HTML and keeps the attack surface small.
 - **SIM-209 totals check not applied.** The rebuild reproduces the text the
   lawyer saved; only the structural SIM-202 normaliser runs.
+
+## Addendum (2026-11-19): aligned with the backend's merged contract
+
+The backend merged its side (backend #39) with different names and fields;
+the AI now follows that contract (branch `fix/SIM-216-align-backend-contract`):
+
+- Events: `draft_file_build_request` / `draft_file_build_response`.
+- Request: `{requestId, purpose: rebuild | first_file, workspaceId, userId,
+  draftId, content, format, formatLayout | null, timestamp}`. `version` and
+  `title` are no longer required; `title`, `templateId`, `templateVersion`
+  and `templateScope` are still read when present.
+- `formatLayout` is applied through `DraftingAgent._apply_chosen_format`, the
+  same step as a drafting turn (`build_docx_from_text(format_layout=...)`).
+- Without a title, `_draft_title` takes the draft's first heading, else its
+  first few non-empty lines, for the SIM-208 layout inference.
+- Response: `{requestId, workspaceId, draftId, status: ok | error,
+  downloadUrl?, errorCode?}` plus the additive `placeholderCount` and
+  `metadata`. The error codes are unchanged.
+- Python names (`DraftDocxBuildMixin`, `DRAFT_DOCX_BUILD_*`,
+  `DRAFT_DOCX_BUILD_TIMEOUT_SECONDS`) are kept, so no setting changes.

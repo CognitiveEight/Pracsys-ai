@@ -4503,6 +4503,7 @@ class DraftingAgent:
                     "gathered_facts",
                     "incompatible",
                     "_draft_just_delivered",
+                    "unproductive_question_turns",
                 ):
                     session_state.pop(stale_key, None)
                 session_state["draft_status"] = "analyzing"
@@ -4646,6 +4647,7 @@ class DraftingAgent:
                         "incompatible",
                         "_draft_just_delivered",
                         "last_offered_options",
+                        "unproductive_question_turns",
                     ):
                         session_state.pop(stale_key, None)
                     session_state["draft_status"] = "analyzing"
@@ -5655,13 +5657,23 @@ class DraftingAgent:
         draft_title = session_state.get("draft_title") or "New Draft"
 
         # Map user's free-text response onto remaining open questions.
+        # An answer the lawyer defers ("to be confirmed", "pending") comes
+        # back as DEFERRED_ANSWER and is stored as a `<Title>` placeholder:
+        # the question is settled, and the render keeps the gap visible.
+        deferred_count = 0
         if open_qs and (user_message or "").strip():
             mapping = await self._map_answers_to_questions(
                 user_message=user_message,
                 open_questions=open_qs,
             )
+            labels = {q.get("id"): q.get("label") for q in open_qs}
             for qid, value in (mapping or {}).items():
-                if value:
+                if not value or qid not in labels:
+                    continue
+                if value == self.DEFERRED_ANSWER:
+                    gathered[qid] = self._deferred_placeholder(labels[qid], qid)
+                    deferred_count += 1
+                else:
                     gathered[qid] = value
         # Remaining open questions are those not in `gathered`.
         remaining = [q for q in open_qs if not gathered.get(q.get("id"))]
@@ -5670,29 +5682,53 @@ class DraftingAgent:
         session_state["open_questions"] = remaining
 
         if remaining:
-            # Render-now shortcut: when the lawyer's message is an ack /
-            # forward-action instruction ("ok", "proceed", "go ahead",
-            # "draft it") AND no new facts were extracted this turn,
-            # the lawyer is asking us to finalise with what we have.
-            # The render prompt already emits `<placeholder>` labels for
-            # any unanswered slots — see CONSTRAINTS in
-            # `build_draft_render_prompt`. This breaks the "static
-            # repeat" loop where the bot would re-ask the same scoping
-            # questions on every "ok" turn.
-            if (
-                not gathered_anything_new
-                and self._is_render_now_reply(user_message)
-            ):
-                return await self._render_and_attach(
-                    case_context=case_context,
-                    session_state=session_state,
-                    lawyer_instructions=(user_message or "").strip() or None,
-                    mode_override=None,
-                )
+            # Render-now shortcut: a turn that captured nothing new is the
+            # lawyer telling us to finalise with what we have when it is
+            #   - an ack / forward-action ("ok", "proceed", "draft it");
+            #   - a deferral ("to be confirmed", "pending", "will share
+            #     later") the mapper could not pin to individual questions;
+            #   - or ANY non-question reply to a list already re-asked once.
+            # The render prompt emits `<placeholder>` labels for unanswered
+            # slots (CONSTRAINTS in `build_draft_render_prompt`). Without
+            # the last two the bot re-asked the same list on every reply to
+            # a lawyer who had said, item by item, that the values were not
+            # yet available.
+            unproductive_turns = int(session_state.get("unproductive_question_turns") or 0)
+            if not gathered_anything_new:
+                reason = None
+                if self._is_render_now_reply(user_message):
+                    reason = "render_now"
+                elif self._is_deferral_reply(user_message):
+                    reason = "deferral"
+                elif unproductive_turns >= 1 and not self._is_question_reply(user_message):
+                    reason = "repeat_ask"
+                if reason:
+                    logger.info(
+                        "drafting rendering with placeholders reason={} open_questions={}",
+                        reason,
+                        len(remaining),
+                    )
+                    session_state["unproductive_question_turns"] = 0
+                    return await self._render_and_attach(
+                        case_context=case_context,
+                        session_state=session_state,
+                        lawyer_instructions=(user_message or "").strip() or None,
+                        mode_override=None,
+                    )
+                session_state["unproductive_question_turns"] = unproductive_turns + 1
+            else:
+                session_state["unproductive_question_turns"] = 0
             message = self._compose_questions_message(remaining, draft_title)
             session_state["draft_status"] = "gathering_info"
             session_state["last_assistant_message"] = message
             return session_state
+
+        session_state["unproductive_question_turns"] = 0
+        if deferred_count:
+            logger.info(
+                "drafting rendering with placeholders reason=deferred_answers deferred={}",
+                deferred_count,
+            )
 
         # All slots filled — render the final draft.
         return await self._render_and_attach(
@@ -5717,6 +5753,47 @@ class DraftingAgent:
             "go for it", "let's go", "lets go",
         }
     )
+
+    # Sentinel the answer mapper returns for a question the lawyer deferred.
+    DEFERRED_ANSWER = "__DEFERRED__"
+
+    # "Not available yet" wording. Matched only on a turn whose answers
+    # mapped to nothing, so a real answer that happens to contain "pending"
+    # ("a suit is pending in Delhi") is never mistaken for a deferral.
+    _DEFERRAL_RE = re.compile(
+        r"\b("
+        r"to be (?:confirmed|verified|provided|obtained|calculated|determined|shared|"
+        r"supplied|added|filled|decided|finali[sz]ed|ascertained)"
+        r"|tbc|tbd|tba|pending|not (?:yet )?(?:available|known|confirmed|ready)"
+        r"|(?:will|shall|would) (?:share|provide|confirm|send|update|give|add)\b.{0,30}\blater"
+        r"|(?:don'?t|do not|doesn'?t|does not) have (?:it|them|these|this|those)"
+        r"|leave (?:it |them |these |those )?(?:blank|empty|as placeholders?)"
+        r"|(?:use|keep|with) placeholders?"
+        r")\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _is_deferral_reply(cls, text: str) -> bool:
+        """True iff the reply says the asked-for values are not available yet."""
+        return bool(cls._DEFERRAL_RE.search(text or ""))
+
+    @staticmethod
+    def _is_question_reply(text: str) -> bool:
+        """True iff the reply is a clarifying question rather than an answer.
+
+        A question ("what do you mean by GMV?") must get the list again, not
+        a draft, so it never counts toward the repeat-ask render.
+        """
+        return (text or "").strip().endswith("?")
+
+    @staticmethod
+    def _deferred_placeholder(label: Any, qid: Any) -> str:
+        """`<Title>` for a deferred question, from its "Title: question" label."""
+        title = str(label or "").split(":", 1)[0].strip().strip("*").strip()
+        if not title:
+            title = str(qid or "").replace("_", " ").strip() or "to be confirmed"
+        return f"<{title}>"
 
     @classmethod
     def _is_render_now_reply(cls, text: str) -> bool:
@@ -7174,9 +7251,18 @@ TASK: Return a JSON object mapping each question id the lawyer answered to a
 short string capturing the answer. If the lawyer did not answer a particular
 question, omit that id. Do not invent answers. Do not include any other text.
 
+DEFERRED ANSWERS: when the lawyer's reply to a question says the value is not
+available yet — e.g. "to be confirmed", "to be verified", "pending", "TBC",
+"will provide later", "[AMOUNT TO BE CONFIRMED]", "leave blank" — map that id
+to exactly "{self.DEFERRED_ANSWER}". Never copy that wording as the answer
+itself, and never use "{self.DEFERRED_ANSWER}" for a question the reply does
+not address.
+
 OUTPUT FORMAT:
 {{"<id>": "<answer>", "...": "..."}}
 """
+        from app.llm.errors import is_generation_error
+
         try:
             raw = await gemini_client.generate(
                 prompt,
@@ -7188,8 +7274,13 @@ OUTPUT FORMAT:
                 max_tokens=12000,
                 response_mime_type="application/json",
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.debug("Answer mapping LLM call failed: {}", e)
+            logger.opt(exception=e).warning("drafting answer mapping call failed")
+            return {}
+        if not raw or is_generation_error(raw):
+            logger.warning("drafting answer mapping returned no usable result")
             return {}
         parsed = _parse_json_object(raw)
         if not parsed:
@@ -9547,7 +9638,17 @@ OUTPUT FORMAT:
                 lines.append(_fmt(counter, q))
                 counter += 1
             blocks.append("\n".join(lines))
+        if blocks:
+            blocks.append(self._PLACEHOLDER_HINT)
         return "\n\n".join(blocks)
+
+    # Tells the lawyer how to get the draft without every answer, so an
+    # unanswerable list is never a dead end.
+    _PLACEHOLDER_HINT = (
+        "_Don't have some of these yet? Answer what you can and say \"to be "
+        "confirmed\" for the rest, or reply **proceed**, and I will draft now "
+        "with clearly marked placeholders._"
+    )
 
     def _merge_full_questions_into_message(
         self,

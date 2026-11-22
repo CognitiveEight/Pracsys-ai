@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SIM-TBD: the drafting assistant no longer re-asks the same questions
+  forever.** A lawyer who answered the scoping questions with "to be
+  confirmed" / "pending" got the identical list back on every reply and never
+  received the draft: the answer mapper dropped deferred answers, and only a
+  bare "ok" / "proceed" broke the loop.
+  - A deferred answer is now recorded as a `<Title>` placeholder for that
+    question, and the draft renders with the gap clearly marked.
+  - A reply that captures nothing new renders with placeholders when it says
+    the values are not available yet, or when the same list has already been
+    re-asked once. A clarifying question (ending in `?`) still gets the list.
+  - The question list ends with a line telling the lawyer they can say "to be
+    confirmed" or reply **proceed** to draft now.
+  - The answer mapper now checks `is_generation_error()`, re-raises
+    `CancelledError` and logs failures at WARNING (was DEBUG).
+  - No socket payload change. Offline coverage:
+    `tests/test_drafting_question_loop.py`.
+
 - **SIM-216 / SIM-219: the drafting Word-file events now match the backend's
   merged contract.** Both were built against our own proposal, so neither
   worked against the backend (backend #39 and the SIM-219 brief).

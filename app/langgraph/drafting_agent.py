@@ -4401,12 +4401,18 @@ class DraftingAgent:
                 "suggested_draft_id"
             ) or ""
             _session_template = (session_state or {}).get("template_id") or ""
+            # The frontend re-sends the thread's templateId on every message.
+            # A template the lawyer set aside (incompatible-template option
+            # a/b/c) is therefore not a new pick: re-kicking on it re-flagged
+            # the same template and re-asked a/b/c on every reply.
+            _set_aside_template = (session_state or {}).get("set_aside_template_id") or ""
             _session_id_changed = (
                 _incoming_suggestion
                 and _incoming_suggestion != _session_suggestion
             ) or (
                 _incoming_template
                 and _incoming_template != _session_template
+                and _incoming_template != _set_aside_template
             )
             explicit_kickoff = has_explicit_template and (
                 not session_state or _session_id_changed
@@ -5812,6 +5818,23 @@ class DraftingAgent:
         normalised = cls._normalize_ack_text(raw)
         return normalised in cls._RENDER_NOW_PHRASES
 
+    @staticmethod
+    def _set_template_aside(
+        target: Dict[str, Any],
+        session_state: Dict[str, Any],
+        request_fields: Optional[Dict[str, Any]],
+    ) -> None:
+        """Remember the template the lawyer set aside, so the frontend's
+        re-sent templateId on the next message does not restart the session."""
+        template_id = (
+            session_state.get("template_id")
+            or (request_fields or {}).get("templateId")
+            or session_state.get("set_aside_template_id")
+            or ""
+        ).strip()
+        if template_id:
+            target["set_aside_template_id"] = template_id
+
     async def _handle_incompatible_reply(
         self,
         *,
@@ -5893,9 +5916,11 @@ class DraftingAgent:
             for k in ("actionable_id", "user_id", "workspace_id", "created_at"):
                 if session_state.get(k):
                     new_state[k] = session_state[k]
+            self._set_template_aside(new_state, session_state, request_fields)
             return new_state
 
         if intent == "change_template":
+            self._set_template_aside(session_state, session_state, request_fields)
             session_state["template_id"] = None
             session_state["template_name"] = None
             session_state["incompatible"] = False
@@ -5909,6 +5934,7 @@ class DraftingAgent:
             return session_state
 
         if intent == "cancel":
+            self._set_template_aside(session_state, session_state, request_fields)
             session_state["template_id"] = None
             session_state["template_name"] = None
             session_state["incompatible"] = False

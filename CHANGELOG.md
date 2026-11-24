@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SIM-TBD: choosing an option after "this template is incompatible" no
+  longer restarts the drafting session.** A lawyer who picked (a) "draft from
+  a fresh structure" and then answered the scoping questions got the same
+  (a)/(b)/(c) question back on every reply. The frontend re-sends the
+  thread's `templateId` with every message; once (a) cleared the session's
+  template, that re-sent id looked like a new template pick and re-ran the
+  kickoff.
+  - The session now remembers the template the lawyer set aside
+    (`set_aside_template_id`, on proceed-from-scratch, change-template and
+    cancel), and a re-sent copy of it no longer re-kicks. A different
+    template still starts a new session.
+  - No socket payload or schema change. Offline coverage:
+    `tests/test_drafting_incompatible_template_loop.py`.
+
 - **SIM-TBD: the drafting assistant no longer re-asks the same questions
   forever.** A lawyer who answered the scoping questions with "to be
   confirmed" / "pending" got the identical list back on every reply and never

@@ -395,6 +395,12 @@ class Settings(BaseSettings):
     template_fill_v2: bool = False
     template_fidelity_ingest: bool = False
     template_scan_vision: bool = True
+    # SIM-228: convert a legacy .doc template to .docx with LibreOffice at
+    # ingest, so it gets a Word skeleton and structured text like a .docx.
+    # Needs `soffice` on PATH (the image installs libreoffice-writer-nogui);
+    # without it, or on failure, the .doc keeps today's text-only handling.
+    template_doc_convert_enabled: bool = True
+    template_doc_convert_timeout_seconds: int = 120
     # SIM-211: how long a draft .docx link works. The backend copies the file
     # into its own storage as soon as the draft arrives, so the link only has
     # to outlive that copy; matches the backend's GCS_SIGNED_URL_TTL_MINUTES (15). Never set

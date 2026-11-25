@@ -20,7 +20,9 @@ the variable **names** come from `env.example`.
   process exits on a fatal error. Use the orchestrator's restart policy.
 - Container: `Dockerfile` (Python 3.12-slim, multi-stage). It installs
   `requirements.lock.txt` (the exact tested versions), adds `ffmpeg`,
-  `poppler-utils` and `antiword`, and runs as the unprivileged user `app`
+  `poppler-utils`, `antiword` and `libreoffice-writer-nogui` (legacy `.doc`
+  templates are converted to `.docx`, SIM-228; a host without Docker needs
+  `apt-get install libreoffice-writer-nogui`), and runs as the unprivileged user `app`
   (uid 10001). It writes to `/app/logs` and `/app/data`. Mount both as
   volumes.
 - Socket auth signs each handshake with a timestamp the backend accepts within

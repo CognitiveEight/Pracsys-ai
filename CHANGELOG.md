@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SIM-226: drafts made from an uploaded template keep the template's page
+  layout when a letterhead or court format is applied.** The format's margins
+  used to replace the template's while the template's paragraph indents
+  stayed, so templates converted from PDF came out squeezed, with titles one
+  letter per line in the editor. Template drafts now keep their page size,
+  margins, fonts, spacing and alignment; the format adds its letterhead,
+  court block, watermark and page number. Drafts without a template are
+  unchanged. The `draft_format applied` log line adds `body_layout` and
+  `body_skipped`. No socket payload change.
+
 - **SIM-TBD: choosing an option after "this template is incompatible" no
   longer restarts the drafting session.** A lawyer who picked (a) "draft from
   a fresh structure" and then answered the scoping questions got the same

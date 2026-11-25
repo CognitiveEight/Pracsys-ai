@@ -369,7 +369,12 @@ class TemplateSyncMixin:
         same_file = bool(current) and (current.get("file_hash") or "") == (
             item.fileHash or ""
         )
-        if same_version and same_file:
+        from app.langgraph.drafting_agent import needs_doc_conversion
+
+        # SIM-228: a .doc cached before conversion existed is re-ingested once,
+        # even on a re-send, with this sync's fresh fileUrl (the cached
+        # source_url is a short-lived signed link).
+        if same_version and same_file and not needs_doc_conversion(current):
             # A re-send: nothing changes, except a retired template coming back.
             await template_store.set_global_status(
                 template_id=item.id, status=STATUS_PUBLISHED

@@ -22,6 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with no format chosen get the repair too. The `draft_format applied` log line
   adds `page_numbers_repaired`. No socket payload change.
 
+- **SIM-228: drafts from a legacy Word 97-2003 `.doc` template follow the
+  template's own layout.** Template ingest stored a Word skeleton only for
+  `.docx`, PDFs and images, so a `.doc` drafted with generic styling, and its
+  text came from `antiword` or a raw scrape with no line breaks. A `.doc` is
+  now converted to `.docx` with LibreOffice (headless, own profile per call,
+  `TEMPLATE_DOC_CONVERT_TIMEOUT_SECONDS`, one at a time) before extraction, so
+  it gets structured text and a stored skeleton like a `.docx`. A `.doc`
+  cached before this is re-ingested once (and re-profiled) on its next sync;
+  the lazy backfill converts too. Without LibreOffice, or on a failed
+  conversion, nothing changes from before. **Deploy notes:** the image adds
+  `libreoffice-writer-nogui` (~300 MB); a host without Docker needs it
+  installed. New optional env: `TEMPLATE_DOC_CONVERT_ENABLED` (true),
+  `TEMPLATE_DOC_CONVERT_TIMEOUT_SECONDS` (120). The stored template payload
+  gains `doc_conversion`. No socket payload change.
 - **SIM-226: drafts made from an uploaded template keep the template's page
   layout when a letterhead or court format is applied.** The format's margins
   used to replace the template's while the template's paragraph indents

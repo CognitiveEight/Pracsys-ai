@@ -533,6 +533,41 @@ def _filename_for_extraction(name: Optional[str], extension: Optional[str]) -> s
     return filename_for_extraction((name or "").strip() or "template", extension)
 
 
+def needs_doc_conversion(payload: Optional[Dict[str, Any]]) -> bool:
+    """SIM-228: a cached .doc template that has never been through conversion.
+
+    True only when a converter is installed, so a host without LibreOffice
+    does not re-ingest (and re-profile) the template on every sync.
+    """
+    return bool(
+        payload
+        and (payload.get("extension") or "").lower() == "doc"
+        and not payload.get("doc_conversion")
+        and _doc_converter_available()
+    )
+
+
+def _doc_converter_available() -> bool:
+    """SIM-228: .doc templates can be converted (enabled and soffice on PATH)."""
+    from app.core.config import settings as _s
+    from app.processing.doc_to_docx import is_available
+
+    return bool(getattr(_s, "template_doc_convert_enabled", True)) and is_available()
+
+
+async def _convert_doc_template(data: bytes) -> Optional[bytes]:
+    """SIM-228: .doc → .docx off the event loop; None on any failure."""
+    from app.processing.doc_to_docx import convert_doc_to_docx
+
+    try:
+        return await asyncio.to_thread(convert_doc_to_docx, data)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.opt(exception=exc).warning("doc template conversion raised")
+        return None
+
+
 def _template_skeleton_blob(
     user_id: str, template_id: str, scope: Optional[str], version: Any
 ) -> str:
@@ -1869,6 +1904,17 @@ class DraftingAgent:
         # Skip re-extraction when content hash is stable.
         downloaded_bytes: Optional[bytes] = None
         ext_lower = (extension or "").lstrip(".").lower()
+        # SIM-228: the uploaded file's own type. A .doc is converted to .docx
+        # below and then handled as one (ext_lower becomes "docx"); the stored
+        # payload keeps the source type so a later re-download is converted too.
+        source_ext = ext_lower
+        doc_conversion: Optional[str] = (
+            previous_payload.get("doc_conversion") if previous_payload else None
+        )
+        # A .doc cached before SIM-228 has text but no skeleton: re-ingest it
+        # once (only when a converter is installed, so a host without one does
+        # not re-profile it on every sync).
+        reingest_doc = source_ext == "doc" and needs_doc_conversion(previous_payload)
         # True only when we just downloaded + extracted (vs. reused cached
         # text); gates the one-time LLM OCR cleanup pass below.
         fresh_extract = False
@@ -1877,6 +1923,7 @@ class DraftingAgent:
             and file_hash
             and previous_payload.get("file_hash") == file_hash
             and previous_payload.get("extracted_text")
+            and not reingest_doc
         ):
             logger.debug(
                 "Template {} content unchanged (hash match) — reusing cached extract",
@@ -1896,6 +1943,14 @@ class DraftingAgent:
                     file_url, filename
                 )
                 downloaded_bytes = content
+                if source_ext == "doc" and content:
+                    # SIM-228: give a .doc the .docx path end to end
+                    # (structured text, stored skeleton, template routes).
+                    converted = await _convert_doc_template(content)
+                    doc_conversion = "ok" if converted else "failed"
+                    if converted:
+                        content = downloaded_bytes = converted
+                        ext_lower = "docx"
             except Exception as e:
                 logger.error(
                     "Template download failed (user={}, template={}, url={}): {}",
@@ -1912,7 +1967,7 @@ class DraftingAgent:
                 extracted_text = await asyncio.to_thread(
                     file_processor.process_file_by_extension,
                     content,
-                    _filename_for_extraction(name, extension),
+                    _filename_for_extraction(name, ext_lower or extension),
                 )
             except Exception as e:
                 logger.error(
@@ -2072,6 +2127,9 @@ class DraftingAgent:
             previous_payload
             and file_hash
             and previous_payload.get("file_hash") == file_hash
+            # SIM-228: a .doc re-ingested for conversion is profiled again
+            # from its structured text (its cached profile came from a scrape).
+            and not reingest_doc
         )
         if (
             hash_stable
@@ -2182,7 +2240,8 @@ class DraftingAgent:
             "user_id": user_id,
             "category": category,
             "name": name,
-            "extension": ext_lower,
+            "extension": source_ext,
+            "doc_conversion": doc_conversion,
             "mime_type": mime_type or "",
             "file_hash": file_hash or "",
             "source_path": path or "",
@@ -8316,7 +8375,7 @@ OUTPUT FORMAT:
         if (
             template_docx_bytes is None
             and tpl
-            and (tpl.get("extension") or "").lower() in ("docx", "pdf")
+            and (tpl.get("extension") or "").lower() in ("docx", "pdf", "doc")
             and tpl.get("source_url")
         ):
             template_docx_bytes = await self._lazy_backfill_template_skeleton(
@@ -8580,6 +8639,13 @@ OUTPUT FORMAT:
                     user_id=user_id, template_id=template_id
                 )
             return None
+
+        # SIM-228: a .doc becomes its .docx before it is stored.
+        if ext == "doc":
+            converted = await _convert_doc_template(content)
+            if not converted:
+                return None
+            content = converted
 
         # PDFs need conversion before we can store them as an editable
         # DOCX skeleton. Conversion is best-effort; on failure we abort

@@ -8281,10 +8281,11 @@ OUTPUT FORMAT:
                 lawyer_instructions=lawyer_instructions,
             )
 
-            # SIM-217: the lawyer's chosen format is applied last, so its page
-            # settings win over the template's and the standard layout, its
-            # letterhead replaces the header/footer, and its court block sits
-            # at the top. A failure ships the unformatted file.
+            # SIM-217: the lawyer's chosen format is applied last: its
+            # letterhead replaces the header/footer and its court block sits at
+            # the top. Its page settings win over the standard layout only;
+            # a template draft keeps the template's page layout (SIM-226).
+            # A failure ships the unformatted file.
             docx_bytes = await self._apply_chosen_format(docx_bytes, route=path_used)
 
             # SIM-211: filed under drafts/<workspaceId>/ (the workspace purge
@@ -8518,6 +8519,10 @@ OUTPUT FORMAT:
 
         Never loses the draft: any failure logs and returns the file as it
         was. Logs one summary line of counts and enum values only.
+
+        SIM-226: every route except ``defaults`` built the file from an
+        uploaded template, so the template's own page layout is kept and the
+        format adds only its letterhead/court block, watermark and page number.
         """
         format_layout = _TURN_FORMAT_LAYOUT.get()
         if not docx_bytes or not format_layout:
@@ -8531,6 +8536,7 @@ OUTPUT FORMAT:
                 docx_bytes,
                 format_layout,
                 fetch_image=fetch_format_image,
+                keep_body_layout=route != "defaults",
             )
         except asyncio.CancelledError:
             logger.warning("draft_format cancelled route={}", route)
@@ -8544,7 +8550,8 @@ OUTPUT FORMAT:
         logger.info(
             "draft_format applied route={} type={} page={} watermark={} page_number={} "
             "letterhead_blocks={} court_blocks={} court_duplicates={} images_ok={} "
-            "images_failed={} unknown_keys={} [{}] invalid={}",
+            "images_failed={} unknown_keys={} [{}] invalid={} body_layout={} "
+            "body_skipped={}",
             route,
             f["type"],
             f["page"],
@@ -8558,6 +8565,8 @@ OUTPUT FORMAT:
             f["unknown_keys"],
             f["unknown_names"],
             f["invalid"],
+            f["body_layout"],
+            f["body_skipped"],
         )
         return result.docx_bytes
 

@@ -36,8 +36,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 #   ffmpeg        - audio evidence transcription (app/processing/audio_transcription.py)
 #   poppler-utils - pdf2image, used to OCR scanned PDFs (app/processing/file_handlers.py)
 #   antiword      - legacy .doc extraction fallback (app/processing/file_handlers.py)
+#   libreoffice-writer-nogui - legacy .doc templates converted to .docx so
+#                   drafts follow their layout (app/processing/doc_to_docx.py,
+#                   SIM-228); headless only, ~300 MB
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg poppler-utils antiword \
+        ffmpeg poppler-utils antiword libreoffice-writer-nogui \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/venv /opt/venv

@@ -8466,7 +8466,11 @@ OUTPUT FORMAT:
         format adds only its letterhead/court block, watermark and page number.
         """
         format_layout = _TURN_FORMAT_LAYOUT.get()
-        if not docx_bytes or not format_layout:
+        if not docx_bytes:
+            return docx_bytes
+        if not format_layout:
+            if route != "defaults":
+                docx_bytes = await self._repair_template_page_numbers(docx_bytes, route=route)
             return docx_bytes
         try:
             from app.processing.draft_format import apply_format_layout, summary_fields
@@ -8492,7 +8496,7 @@ OUTPUT FORMAT:
             "draft_format applied route={} type={} page={} watermark={} page_number={} "
             "letterhead_blocks={} court_blocks={} court_duplicates={} images_ok={} "
             "images_failed={} unknown_keys={} [{}] invalid={} body_layout={} "
-            "body_skipped={}",
+            "body_skipped={} page_numbers_repaired={}",
             route,
             f["type"],
             f["page"],
@@ -8508,8 +8512,29 @@ OUTPUT FORMAT:
             f["invalid"],
             f["body_layout"],
             f["body_skipped"],
+            f["page_numbers_repaired"],
         )
         return result.docx_bytes
+
+    async def _repair_template_page_numbers(self, docx_bytes: bytes, *, route: str) -> bytes:
+        """SIM-229: a template draft with no format chosen still gets its
+        flattened "Page X of Y" footer re-linked. Never loses the draft."""
+        try:
+            from app.processing.draft_format import repair_frozen_page_numbers_bytes
+
+            fixed_bytes, fixed = await asyncio.to_thread(
+                repair_frozen_page_numbers_bytes, docx_bytes
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.opt(exception=exc).warning(
+                "page number repair failed route={}; keeping the file as built", route
+            )
+            return docx_bytes
+        if fixed:
+            logger.info("page number repair route={} paragraphs={}", route, fixed)
+        return fixed_bytes
 
     async def _lazy_backfill_template_skeleton(
         self,

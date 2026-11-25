@@ -825,3 +825,155 @@ def test_chosen_format_keeps_layout_on_every_template_route(monkeypatch, route, 
         drafting_module._TURN_FORMAT_LAYOUT.reset(token)
     assert out == b"docx"
     assert seen["keep"] is keep
+
+
+# ---------------------------------------------------------------------------
+# SIM-229: a "Page X of Y" footer whose fields were flattened to plain text
+# ---------------------------------------------------------------------------
+
+_GALLERY_FOOTER = (
+    '<w:sdt xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+    '<w:sdtPr><w:docPartObj><w:docPartGallery w:val="Page Numbers (Bottom of Page)"/>'
+    '<w:docPartUnique/></w:docPartObj></w:sdtPr><w:sdtContent>'
+    '<w:sdt><w:sdtPr><w:docPartObj><w:docPartGallery w:val="Page Numbers (Top of Page)"/>'
+    '<w:docPartUnique/></w:docPartObj></w:sdtPr><w:sdtContent>'
+    '<w:p><w:pPr><w:jc w:val="center"/></w:pPr>'
+    '<w:r><w:t xml:space="preserve">{lead}</w:t></w:r>'
+    '<w:r><w:rPr><w:b/></w:rPr><w:t>3</w:t></w:r>'
+    '<w:r><w:t xml:space="preserve"> of </w:t></w:r>'
+    '<w:r><w:rPr><w:b/></w:rPr><w:t>16</w:t></w:r></w:p>'
+    '</w:sdtContent></w:sdt></w:sdtContent></w:sdt>'
+)
+
+
+def _frozen_docx(lead: str = "Page ", gallery: bool = True, footer_text: str = "") -> bytes:
+    from docx.oxml.parser import parse_xml
+
+    doc = Document()
+    for text in BODY:
+        doc.add_paragraph(text)
+    ftr = doc.sections[0].footer._element
+    for p in list(ftr):
+        ftr.remove(p)
+    if footer_text:
+        doc.sections[0].footer.add_paragraph(footer_text)
+    elif gallery:
+        ftr.append(parse_xml(_GALLERY_FOOTER.format(lead=lead)))
+    else:
+        p = doc.sections[0].footer.add_paragraph()
+        p.add_run(lead)
+        p.add_run("3")
+        p.add_run(" of ")
+        p.add_run("16")
+    doc.sections[0].footer.add_paragraph()
+    out = BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
+def _footer_fields(data: bytes):
+    doc = Document(BytesIO(data))
+    ftr = doc.sections[0].footer._element
+    return [(t.text or "").strip() for t in ftr.iter(qn("w:instrText"))]
+
+
+def _footer_text(data: bytes) -> str:
+    doc = Document(BytesIO(data))
+    return "".join(t.text or "" for t in doc.sections[0].footer._element.iter(qn("w:t")))
+
+
+@pytest.mark.parametrize("gallery", [True, False])
+def test_frozen_page_x_of_y_becomes_live_fields(gallery):
+    fixed, n = draft_format.repair_frozen_page_numbers_bytes(_frozen_docx(gallery=gallery))
+    assert n == 1
+    assert _footer_fields(fixed) == ["PAGE", "NUMPAGES"]
+    # The wording and the bold numbers stay as the template had them.
+    assert _footer_text(fixed) == "Page 3 of 16"
+    if not gallery:
+        return
+    doc = Document(BytesIO(fixed))
+    bold = [r for r in doc.sections[0].footer._element.iter(qn("w:r"))
+            if r.find(qn("w:instrText")) is not None]
+    assert all(r.find(qn("w:rPr")).find(qn("w:b")) is not None for r in bold)
+
+
+def test_bare_number_is_repaired_only_inside_a_page_number_gallery():
+    fixed, n = draft_format.repair_frozen_page_numbers_bytes(_frozen_docx(lead=""))
+    assert n == 1 and _footer_fields(fixed) == ["PAGE", "NUMPAGES"]
+    # Outside the gallery a bare "3 of 16" could be anything: left alone.
+    data = _frozen_docx(lead="", gallery=False)
+    assert draft_format.repair_frozen_page_numbers_bytes(data) == (data, 0)
+
+
+@pytest.mark.parametrize("text", [
+    "Registered office: Plot 16, Example Road",
+    "Page 3 of the schedule",
+    "Example Firm LLP",
+])
+def test_other_footer_text_is_never_touched(text):
+    data = _frozen_docx(footer_text=text)
+    assert draft_format.repair_frozen_page_numbers_bytes(data) == (data, 0)
+
+
+def test_body_text_is_never_touched():
+    doc = Document()
+    doc.add_paragraph("Page 3 of 16")
+    out = BytesIO()
+    doc.save(out)
+    data = out.getvalue()
+    assert draft_format.repair_frozen_page_numbers_bytes(data) == (data, 0)
+
+
+def test_template_draft_keeps_its_page_x_of_y_and_adds_no_second_number():
+    fmt = {"type": "letterhead", "formatting": {"page": {"pageNumber": "bottom-center"}}}
+    r = apply_format_layout(_frozen_docx(), fmt, keep_body_layout=True)
+    assert r.page_numbers_repaired == 1
+    assert r.page_number == "template"
+    assert _footer_fields(r.docx_bytes) == ["PAGE", "NUMPAGES"]
+
+
+def test_no_template_draft_takes_the_formats_page_number_once():
+    fmt = {"type": "letterhead", "formatting": {"page": {"pageNumber": "bottom-center"}}}
+    r = apply_format_layout(_frozen_docx(), fmt, keep_body_layout=False)
+    assert r.page_number == "center_bottom"
+    assert _footer_fields(r.docx_bytes) == ["PAGE"]
+    # The emptied nested page-number content controls are removed, not left empty.
+    ftr = Document(BytesIO(r.docx_bytes)).sections[0].footer._element
+    assert all(len(c) for c in ftr.iter(qn("w:sdtContent")))
+
+
+def test_page_number_none_removes_the_repaired_number():
+    fmt = {"type": "letterhead", "formatting": {"page": {"pageNumber": "none"}}}
+    r = apply_format_layout(_frozen_docx(), fmt, keep_body_layout=True)
+    assert r.page_number == "none"
+    assert _footer_fields(r.docx_bytes) == []
+    assert "16" not in _footer_text(r.docx_bytes)
+
+
+def test_format_page_number_elsewhere_replaces_the_templates():
+    fmt = {"type": "letterhead", "formatting": {"page": {"pageNumber": "top-right"}}}
+    r = apply_format_layout(_frozen_docx(), fmt, keep_body_layout=True)
+    assert r.page_number == "right_top"
+    assert _footer_fields(r.docx_bytes) == []
+    hdr = Document(BytesIO(r.docx_bytes)).sections[0].header._element
+    assert [(t.text or "").strip() for t in hdr.iter(qn("w:instrText"))] == ["PAGE"]
+
+
+def test_summary_reports_the_repair():
+    fmt = {"type": "letterhead", "formatting": {"page": {"watermark": "DRAFT"}}}
+    r = apply_format_layout(_frozen_docx(), fmt, keep_body_layout=True)
+    assert draft_format.summary_fields(r)["page_numbers_repaired"] == 1
+    assert _footer_fields(r.docx_bytes) == ["PAGE", "NUMPAGES"]
+
+
+async def test_template_draft_without_a_format_is_repaired(monkeypatch):
+    agent = drafting_module.DraftingAgent.__new__(drafting_module.DraftingAgent)
+    token = drafting_module._TURN_FORMAT_LAYOUT.set(None)
+    try:
+        out = await agent._apply_chosen_format(_frozen_docx(), route="skeleton_clone")
+        assert _footer_fields(out) == ["PAGE", "NUMPAGES"]
+        # A no-template draft is left exactly as built.
+        data = _frozen_docx()
+        assert await agent._apply_chosen_format(data, route="defaults") is data
+    finally:
+        drafting_module._TURN_FORMAT_LAYOUT.reset(token)

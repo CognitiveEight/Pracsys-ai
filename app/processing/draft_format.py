@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from io import BytesIO
@@ -63,6 +64,8 @@ class FormatResult:
     body_settings_skipped: int = 0
     watermark: str = "unchanged"
     page_number: str = "unchanged"
+    # SIM-229: header/footer "Page X of Y" lines re-linked to live fields.
+    page_numbers_repaired: int = 0
     letterhead_blocks: int = 0
     court_blocks: int = 0
     court_duplicates_skipped: int = 0
@@ -471,12 +474,139 @@ def _remove_paragraph(p_el) -> None:
                 p_el.remove(child)
         return
     parent.remove(p_el)
-    # A page-number gallery wraps its paragraph in a content control; an
-    # empty content control is invalid, so drop it with its last paragraph.
-    if parent.tag == qn("w:sdtContent") and len(parent) == 0:
+    # A page-number gallery wraps its paragraph in a content control, often
+    # two nested ones; an empty content control is invalid, so drop each one
+    # left empty, from the inside out.
+    while parent is not None and parent.tag == qn("w:sdtContent") and len(parent) == 0:
         sdt = parent.getparent()
-        if sdt is not None and sdt.getparent() is not None:
-            sdt.getparent().remove(sdt)
+        if sdt is None or sdt.getparent() is None:
+            break
+        parent = sdt.getparent()
+        parent.remove(sdt)
+
+
+# SIM-229: "Page 3 of 16" typed as plain text. Word's "Page X of Y" gallery
+# inserts PAGE and NUMPAGES fields, but a file whose fields were flattened
+# (copied, "unlinked", or round-tripped through another editor) keeps the
+# numbers that were showing, so every page reads "Page 3 of 16".
+_FROZEN_PAGE_RE = re.compile(
+    r"^(?P<lead>\s*page\s+)(?P<page>\d{1,4})"
+    r"(?:(?P<sep>\s*(?:of|/)\s*)(?P<total>\d{1,4}))?(?P<tail>\s*)$",
+    re.I,
+)
+_FROZEN_GALLERY_RE = re.compile(
+    r"^(?P<lead>\s*(?:page\s+)?)(?P<page>\d{1,4})"
+    r"(?:(?P<sep>\s*(?:of|/)\s*)(?P<total>\d{1,4}))?(?P<tail>\s*)$",
+    re.I,
+)
+_RUN_OK = {qn("w:rPr"), qn("w:t")}
+_PARA_OK = {qn("w:pPr"), qn("w:r"), qn("w:bookmarkStart"), qn("w:bookmarkEnd"),
+            qn("w:proofErr")}
+
+
+def _in_page_number_gallery(p_el) -> bool:
+    el = p_el.getparent()
+    while el is not None:
+        if el.tag == qn("w:sdt"):
+            for g in el.iter(qn("w:docPartGallery")):
+                if (g.get(qn("w:val")) or "").lower().startswith("page numbers"):
+                    return True
+        el = el.getparent()
+    return False
+
+
+def _field_run(instr: str, shown: str, rpr) -> Any:
+    r = OxmlElement("w:r")
+    if rpr is not None:
+        r.append(deepcopy(rpr))
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    code = OxmlElement("w:instrText")
+    code.set(qn("xml:space"), "preserve")
+    code.text = " {} ".format(instr)
+    sep = OxmlElement("w:fldChar")
+    sep.set(qn("w:fldCharType"), "separate")
+    t = OxmlElement("w:t")
+    t.text = shown
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    for el in (begin, code, sep, t, end):
+        r.append(el)
+    return r
+
+
+def _text_run(text: str, rpr) -> Any:
+    r = OxmlElement("w:r")
+    if rpr is not None:
+        r.append(deepcopy(rpr))
+    t = OxmlElement("w:t")
+    t.set(qn("xml:space"), "preserve")
+    t.text = text
+    r.append(t)
+    return r
+
+
+def _repair_frozen_paragraph(p_el) -> bool:
+    """Turn a plain-text "Page 3 of 16" into PAGE / NUMPAGES fields."""
+    if any(child.tag not in _PARA_OK for child in p_el):
+        return False
+    runs = p_el.findall(qn("w:r"))
+    if not runs or any(c.tag not in _RUN_OK for r in runs for c in r):
+        return False  # tabs, drawings or fields: not a plain frozen number
+    chars: List[Tuple[str, Any]] = []
+    for r in runs:
+        rpr = r.find(qn("w:rPr"))
+        for t in r.findall(qn("w:t")):
+            chars.extend((ch, rpr) for ch in (t.text or ""))
+    text = "".join(ch for ch, _ in chars)
+    m = _FROZEN_PAGE_RE.match(text)
+    if m is None and _in_page_number_gallery(p_el):
+        m = _FROZEN_GALLERY_RE.match(text)
+    if m is None:
+        return False
+    pieces = [("text", "lead"), ("PAGE", "page"), ("text", "sep"),
+              ("NUMPAGES", "total"), ("text", "tail")]
+    new_runs = []
+    for kind, group in pieces:
+        value = m.group(group)
+        if not value:
+            continue
+        rpr = chars[m.start(group)][1]
+        if kind == "text":
+            new_runs.append(_text_run(value, rpr))
+        else:
+            new_runs.append(_field_run(kind, value, rpr))
+    anchor = runs[0]
+    for r in new_runs:
+        anchor.addprevious(r)
+    for r in runs:
+        p_el.remove(r)
+    return True
+
+
+def repair_frozen_page_numbers(doc) -> int:
+    """Re-link "Page X of Y" footers whose fields were flattened to text.
+
+    Returns the number of paragraphs repaired. Only headers and footers are
+    touched, and only a paragraph that is nothing but the page wording.
+    """
+    fixed = 0
+    for hf in _all_stories(doc):
+        for p_el in list(hf._element.iter(qn("w:p"))):
+            if _repair_frozen_paragraph(p_el):
+                fixed += 1
+    return fixed
+
+
+def repair_frozen_page_numbers_bytes(docx_bytes: bytes) -> Tuple[bytes, int]:
+    """:func:`repair_frozen_page_numbers` on a file; unchanged when nothing to fix."""
+    doc = Document(BytesIO(docx_bytes))
+    fixed = repair_frozen_page_numbers(doc)
+    if not fixed:
+        return docx_bytes, 0
+    out = BytesIO()
+    doc.save(out)
+    return out.getvalue(), fixed
 
 
 def _all_stories(doc):
@@ -1236,6 +1366,16 @@ class _Formatter:
                 if _is_page_number_paragraph(p_el):
                     _remove_paragraph(p_el)
 
+    def has_page_numbers(self, vertical: str) -> bool:
+        """True when a header (top) or footer (bottom) already shows a page number."""
+        tag = qn("w:hdr") if vertical == "top" else qn("w:ftr")
+        for hf in _all_stories(self.doc):
+            if hf._element.tag != tag:
+                continue
+            if any(_is_page_number_paragraph(p) for p in hf._element.iter(qn("w:p"))):
+                return True
+        return False
+
     def add_page_number(self, horizontal: str, vertical: str) -> None:
         from app.processing.docx_generator import add_field
 
@@ -1315,6 +1455,13 @@ def apply_format_layout(
     ftype, formatting = extract_formatting(format_layout)
     if not formatting:
         return result
+    # SIM-229: before anything looks for page numbers, so a frozen
+    # "Page 3 of 16" counts as the page number it was meant to be (the
+    # format's own page number then replaces it instead of adding a second).
+    try:
+        result.page_numbers_repaired = repair_frozen_page_numbers(doc)
+    except Exception:
+        result.invalid_values.append("pageNumberRepair:error")
     result.format_type = ftype or "unknown"
     result.body_layout = "kept" if keep_body_layout else "applied"
     f = _Formatter(doc, result, fetch_image, keep_body_layout=keep_body_layout)
@@ -1357,7 +1504,14 @@ def apply_format_layout(
             safely("watermark", f.add_watermark, watermark)
         result.watermark = watermark.lower() if watermark == "NONE" else watermark
         result.page_settings += 1
-    if page_number is not None:
+    if page_number is not None and page_number != "none" and keep_body_layout and \
+            safely("pageNumber", f.has_page_numbers, page_number[1]):
+        # SIM-229: the template already numbers its pages where the format
+        # wants them ("Page X of Y" in the footer, say); keep its wording
+        # rather than swap it for a bare number or show two.
+        result.page_number = "template"
+        result.page_settings += 1
+    elif page_number is not None:
         safely("pageNumber", f.remove_page_numbers)
         if page_number == "none":
             result.page_number = "none"
@@ -1393,6 +1547,7 @@ def summary_fields(result: FormatResult) -> Dict[str, Any]:
         "invalid": len(result.invalid_values),
         "body_layout": result.body_layout,
         "body_skipped": result.body_settings_skipped,
+        "page_numbers_repaired": result.page_numbers_repaired,
     }
 
 

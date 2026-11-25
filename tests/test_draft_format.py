@@ -708,3 +708,120 @@ async def test_later_turn_uses_the_format_the_first_turn_stored(monkeypatch):
     assert seen2 == [stored["format_layout"]]
     assert "headerImageUrl" not in seen2[0]["formatting"]["letterhead"]
     assert seen2[0]["formatting"]["letterhead"]["headerTextLeft"] == "Example & Associates"
+
+
+# ---------------------------------------------------------------- SIM-226
+# A draft built from an uploaded template keeps the template's page layout.
+
+
+def _indent_laid_out_template() -> bytes:
+    """Like a PDF-converted template: near-zero margins, text placed by indents.
+
+    US Letter, so the format's A4 ``pageSize`` would visibly change it.
+    """
+    doc = Document()
+    s = doc.sections[0]
+    s.page_width, s.page_height = Inches(8.5), Inches(11)
+    s.left_margin, s.right_margin = Inches(0.42), Inches(0.08)
+    s.top_margin, s.bottom_margin = Inches(0.99), Inches(0.88)
+    title = doc.add_paragraph("SAMPLE AGREEMENT")
+    title.paragraph_format.left_indent = Inches(3.12)
+    title.paragraph_format.right_indent = Inches(3.45)
+    for text in BODY:
+        p = doc.add_paragraph(text)
+        p.paragraph_format.left_indent = Inches(0.63)
+        p.paragraph_format.right_indent = Inches(0.96)
+        p.runs[0].font.name = "Bookman Old Style"
+        p.runs[0].font.size = Pt(13)
+    out = BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
+@pytest.mark.parametrize("fmt", [COURT, LETTERHEAD], ids=["court", "letterhead"])
+def test_template_draft_keeps_page_layout(fmt):
+    before = Document(BytesIO(_indent_laid_out_template()))
+    result = apply_format_layout(_indent_laid_out_template(), fmt, keep_body_layout=True)
+    doc = _open(result)
+    s, s0 = doc.sections[0], before.sections[0]
+    for side in ("left", "right", "top", "bottom"):
+        assert getattr(s, f"{side}_margin") == getattr(s0, f"{side}_margin")
+    assert (s.page_width, s.page_height) == (s0.page_width, s0.page_height)
+    assert s.orientation == s0.orientation
+    # Style-level body formatting (what an unformatted run renders in).
+    n, n0 = doc.styles["Normal"], before.styles["Normal"]
+    assert (n.font.name, n.font.size) == (n0.font.name, n0.font.size)
+    assert n.paragraph_format.line_spacing == n0.paragraph_format.line_spacing
+    assert n.paragraph_format.alignment == n0.paragraph_format.alignment
+    paras = [p for p in doc.paragraphs if p.text in ["SAMPLE AGREEMENT", *BODY]]
+    paras0 = [p for p in before.paragraphs if p.text in ["SAMPLE AGREEMENT", *BODY]]
+    assert len(paras) == len(paras0) == 3
+    for p, p0 in zip(paras, paras0):
+        pf, pf0 = p.paragraph_format, p0.paragraph_format
+        assert (pf.left_indent, pf.right_indent) == (pf0.left_indent, pf0.right_indent)
+        assert pf.alignment == pf0.alignment
+        assert pf.line_spacing == pf0.line_spacing
+        assert [(r.font.name, r.font.size) for r in p.runs] == [
+            (r.font.name, r.font.size) for r in p0.runs
+        ]
+    assert result.body_layout == "kept"
+    assert result.body_settings_skipped > 0
+
+
+def test_template_draft_still_gets_letterhead_court_and_page_number():
+    lh = apply_format_layout(_indent_laid_out_template(), LETTERHEAD, keep_body_layout=True)
+    assert "Example &amp; Associates" in _header_xml(_open(lh))
+    assert lh.letterhead_blocks > 0
+
+    court = apply_format_layout(_indent_laid_out_template(), COURT, keep_body_layout=True)
+    doc = _open(court)
+    assert doc.paragraphs[0].text.upper().startswith("IN THE HIGH COURT OF EXAMPLE")
+    assert court.court_blocks > 0
+    assert court.page_number == "center_bottom"
+    assert "PAGE" in _header_xml(doc, "footer")
+
+
+def test_no_template_draft_still_gets_format_page_settings():
+    result = apply_format_layout(_indent_laid_out_template(), COURT)
+    doc = _open(result)
+    s = doc.sections[0]
+    assert s.left_margin == Inches(1.5) and s.right_margin == Inches(1)
+    assert s.top_margin == Inches(1) and s.bottom_margin == Inches(1)
+    assert abs(s.page_width - Mm(210)) < Mm(1) and abs(s.page_height - Mm(297)) < Mm(1)
+    body = [p for p in doc.paragraphs if p.text in BODY]
+    assert body and all(p.alignment == WD_ALIGN_PARAGRAPH.JUSTIFY for p in body)
+    assert doc.styles["Normal"].font.name == "Times New Roman"
+    assert result.body_layout == "applied"
+    assert result.body_settings_skipped == 0
+
+
+def test_summary_fields_report_body_layout():
+    kept = apply_format_layout(_indent_laid_out_template(), COURT, keep_body_layout=True)
+    f = draft_format.summary_fields(kept)
+    assert f["body_layout"] == "kept" and f["body_skipped"] == kept.body_settings_skipped
+    assert draft_format.summary_fields(apply_format_layout(_docx(), COURT))["body_layout"] == "applied"
+
+
+@pytest.mark.parametrize(
+    "route,keep",
+    [("defaults", False), ("llm_diff", True), ("template_fill", True),
+     ("heuristic_fill", True), ("skeleton_clone", True)],
+)
+def test_chosen_format_keeps_layout_on_every_template_route(monkeypatch, route, keep):
+    seen = {}
+
+    def fake_apply(docx_bytes, format_layout, *, fetch_image=None, keep_body_layout=False):
+        seen["keep"] = keep_body_layout
+        return draft_format.FormatResult(docx_bytes=docx_bytes)
+
+    monkeypatch.setattr(draft_format, "apply_format_layout", fake_apply)
+    agent = drafting_module.DraftingAgent.__new__(drafting_module.DraftingAgent)
+    token = drafting_module._TURN_FORMAT_LAYOUT.set(COURT)
+    try:
+        import asyncio
+
+        out = asyncio.run(agent._apply_chosen_format(b"docx", route=route))
+    finally:
+        drafting_module._TURN_FORMAT_LAYOUT.reset(token)
+    assert out == b"docx"
+    assert seen["keep"] is keep

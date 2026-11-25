@@ -57,6 +57,10 @@ class FormatResult:
     docx_bytes: bytes
     format_type: str = "none"
     page_settings: int = 0
+    # SIM-226: "kept" when the body's page layout was left as the template
+    # made it (only header/footer-level settings applied), else "applied".
+    body_layout: str = "applied"
+    body_settings_skipped: int = 0
     watermark: str = "unchanged"
     page_number: str = "unchanged"
     letterhead_blocks: int = 0
@@ -71,6 +75,11 @@ class FormatResult:
 # ---------------------------------------------------------------------------
 # Known keys (anything else is reported as unknown and ignored)
 # ---------------------------------------------------------------------------
+
+# Page settings that change the body's layout; skipped for template drafts.
+_BODY_LAYOUT_KEYS = (
+    "font", "fontSize", "lineSpacing", "pageSize", "orientation", "margins", "alignment",
+)
 
 _PAGE_KEYS = {
     "font", "fontSize", "lineSpacing", "pageSize", "orientation", "margins",
@@ -607,10 +616,17 @@ def html_to_lines(html: str) -> List[List[Segment]]:
 
 
 class _Formatter:
-    def __init__(self, doc, result: FormatResult, fetch_image: Optional[FetchImage]):
+    def __init__(
+        self,
+        doc,
+        result: FormatResult,
+        fetch_image: Optional[FetchImage],
+        keep_body_layout: bool = False,
+    ):
         self.doc = doc
         self.r = result
         self.fetch_image = fetch_image
+        self.keep_body_layout = keep_body_layout
         self.page_font: Optional[str] = None
 
     # -- reporting -----------------------------------------------------------
@@ -634,6 +650,17 @@ class _Formatter:
     def apply_page(self, page: Dict[str, Any]) -> Tuple[Optional[str], Any]:
         """Returns ``(watermark, page_number)`` to place after the letterhead."""
         self.check_keys(page, _PAGE_KEYS, "page")
+        if self.keep_body_layout:
+            # SIM-226: a draft built from an uploaded template keeps the
+            # template's page size, margins and body text formatting. Such
+            # templates (PDF conversions especially) position text with
+            # paragraph indents measured from their own margins; new margins
+            # would add to those indents and squeeze the text, down to one
+            # letter per line. Only header/footer-level settings apply.
+            self.r.body_settings_skipped = sum(
+                1 for k in _BODY_LAYOUT_KEYS if page.get(k) is not None
+            )
+            return self._header_footer_settings(page)
         doc = self.doc
 
         # Page size and orientation.
@@ -726,6 +753,9 @@ class _Formatter:
             self._apply_alignment(align)
             self.r.page_settings += 1
 
+        return self._header_footer_settings(page)
+
+    def _header_footer_settings(self, page: Dict[str, Any]) -> Tuple[Optional[str], Any]:
         # Watermark and page number are placed after the letterhead (which
         # replaces the header and footer they live in).
         watermark: Optional[str] = None
@@ -1268,8 +1298,14 @@ def apply_format_layout(
     format_layout: Any,
     *,
     fetch_image: Optional[FetchImage] = None,
+    keep_body_layout: bool = False,
 ) -> FormatResult:
     """Apply a chosen court or letterhead format to an existing .docx.
+
+    ``keep_body_layout`` (SIM-226): the file was built from an uploaded
+    template, so its page size, margins, fonts, spacing and alignment stay as
+    the template set them; the format adds only its letterhead or court block,
+    watermark and page number.
 
     Raises only when ``docx_bytes`` cannot be opened as a Word file. Any bad
     setting is skipped and reported in the result.
@@ -1280,7 +1316,8 @@ def apply_format_layout(
     if not formatting:
         return result
     result.format_type = ftype or "unknown"
-    f = _Formatter(doc, result, fetch_image)
+    result.body_layout = "kept" if keep_body_layout else "applied"
+    f = _Formatter(doc, result, fetch_image, keep_body_layout=keep_body_layout)
     f.check_keys(formatting, _TOP_KEYS, "")
 
     def safely(step: str, fn, *args):
@@ -1354,6 +1391,8 @@ def summary_fields(result: FormatResult) -> Dict[str, Any]:
         "unknown_keys": len(result.unknown_keys),
         "unknown_names": names or "-",
         "invalid": len(result.invalid_values),
+        "body_layout": result.body_layout,
+        "body_skipped": result.body_settings_skipped,
     }
 
 

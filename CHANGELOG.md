@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SIM-229: a template's "Page X of Y" footer counts the pages again.** A
+  template whose page-number fields had been flattened to plain text (copied,
+  unlinked, or saved through another editor) showed the same "Page 3 of 16" on
+  every page of the draft, and a chosen format added a second number under it.
+  Header/footer paragraphs that are only page wording ("Page 3 of 16",
+  "Page 3", or a bare "3 of 16" inside Word's page-number gallery) are re-linked
+  to live PAGE / NUMPAGES fields, keeping their wording and formatting. A
+  template draft keeps its own page numbering when the format wants the number
+  in the same place (`page_number=template`), so only one shows; `none` still
+  removes it, and a format placing it elsewhere still moves it. Template drafts
+  with no format chosen get the repair too. The `draft_format applied` log line
+  adds `page_numbers_repaired`. No socket payload change.
+
 - **SIM-228: drafts from a legacy Word 97-2003 `.doc` template follow the
   template's own layout.** Template ingest stored a Word skeleton only for
   `.docx`, PDFs and images, so a `.doc` drafted with generic styling, and its
